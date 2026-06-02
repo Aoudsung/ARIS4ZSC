@@ -1,0 +1,31 @@
+.DS_Store
+
+# Python caches and tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local environments and external dependencies
+.venv
+.venv/
+venv
+venv/
+external
+external/
+
+# Experiment outputs and large artifacts
+runs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.hdf5
+
+# Local transfer bundles
+*.tar.gz
+*.zip
