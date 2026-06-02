@@ -66,9 +66,26 @@ PYTHONPATH=. .venv/bin/python -m compileall -q raob tests
 PYTHONPATH=. PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q
 ```
 
+## Formal Classic Training Budget
+
+`formal-classic` defaults to the paper-style training budget:
+
+```bash
+PYTHONPATH=. .venv/bin/python -m raob.srvf_mappo formal-classic \
+  --device cuda \
+  --policy-device cuda \
+  --worker-policy-device cpu \
+  --workers 18 \
+  --torch-num-threads 1
+```
+
+By default, each seed trains until `cumulative_env_steps >= 100000000`.
+The loop counts actual rollout rows, so the stopping condition is independent
+of early episode termination or rollout batch-size changes. Passing
+`--updates N` switches back to fixed-update mode for smoke/debug runs.
+
 ## Status
 
-The current implementation target is benchmark plumbing: make the real classic
-Overcooked-AI rollout collector produce `RolloutBatch`, and make source
-interventional data produce `SourceBatch`. This is an engineering smoke stage,
-not a formal performance run.
+The current implementation exposes the real classic Overcooked-AI rollout
+collector, source IRF table construction, SRVF-MAPPO training, and held-out
+evaluation through `python -m raob.srvf_mappo formal-classic`.

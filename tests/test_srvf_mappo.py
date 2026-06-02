@@ -24,6 +24,8 @@ from raob.srvf_mappo import (
     source_table_to_batch,
     _concat_rollout_batches,
     _discounted_cumsum,
+    _env_step_progress,
+    _estimated_updates_remaining,
 )
 
 
@@ -363,6 +365,8 @@ def test_formal_classic_cli_args_are_parseable() -> None:
     assert args.workers == 3
     assert args.learner_epochs == 2
     assert args.torch_num_threads == 1
+    assert args.updates == 0
+    assert args.target_env_steps == 100_000_000
 
 
 def test_formal_classic_resource_defaults() -> None:
@@ -372,3 +376,24 @@ def test_formal_classic_resource_defaults() -> None:
     assert args.workers == 18
     assert args.learner_epochs == 4
     assert args.worker_policy_device == "cpu"
+    assert args.updates == 0
+    assert args.target_env_steps == 100_000_000
+
+
+def test_formal_classic_fixed_update_override_is_parseable() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args(["formal-classic", "--updates", "300"])
+
+    assert args.updates == 300
+    assert args.target_env_steps == 100_000_000
+
+
+def test_estimated_updates_remaining_uses_actual_rollout_rows() -> None:
+    target = 100_000_000
+
+    assert _estimated_updates_remaining(7_200, target, 1) == 13_888
+    assert _estimated_updates_remaining(target, target, 13_889) == 0
+    assert _estimated_updates_remaining(0, target, 0) == 0
+    assert _env_step_progress(50, 100) == 0.5
+    assert _env_step_progress(120, 100) == 1.0
+    assert _env_step_progress(120, 0) == 0.0

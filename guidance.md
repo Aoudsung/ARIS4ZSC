@@ -158,8 +158,21 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 ```
 
-当前工程阶段是 SRVF-MAPPO classic Overcooked batch plumbing smoke。不要运行
-OGC、OvercookedV2 或历史脚本路径。
+当前正式训练入口是 SRVF-MAPPO classic Overcooked：
+
+```bash
+PYTHONPATH=. .venv/bin/python -m raob.srvf_mappo formal-classic \
+  --device cuda \
+  --policy-device cuda \
+  --worker-policy-device cpu \
+  --workers 18 \
+  --torch-num-threads 1
+```
+
+默认训练预算按论文横轴口径对齐为每个 seed `100000000` environment steps。
+代码按每次 rollout 实际产生的 rows 累加 `cumulative_env_steps`，而不是把
+`1e8` 误当作 PPO update 数。显式传 `--updates N` 时才进入固定 update
+模式，适合 smoke/debug。不要运行 OGC、OvercookedV2 或历史脚本路径。
 
 验证后清理缓存，保持服务器项目干净：
 

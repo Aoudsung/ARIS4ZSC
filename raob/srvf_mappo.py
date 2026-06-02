@@ -78,6 +78,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 import json
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -2380,6 +2381,26 @@ def _append_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
         handle.write(json.dumps(_jsonable(payload), sort_keys=True) + "\n")
 
 
+def _estimated_updates_remaining(
+    cumulative_env_steps: int,
+    target_env_steps: int,
+    updates_completed: int,
+) -> int:
+    if target_env_steps <= 0 or updates_completed <= 0 or cumulative_env_steps <= 0:
+        return 0
+    remaining = max(int(target_env_steps) - int(cumulative_env_steps), 0)
+    if remaining == 0:
+        return 0
+    average_rows = float(cumulative_env_steps) / float(updates_completed)
+    return int(math.ceil(float(remaining) / max(average_rows, 1e-9)))
+
+
+def _env_step_progress(cumulative_env_steps: int, target_env_steps: int) -> float:
+    if target_env_steps <= 0:
+        return 0.0
+    return min(float(cumulative_env_steps) / float(target_env_steps), 1.0)
+
+
 def _normalize_rollout_advantages(batch: RolloutBatch) -> RolloutBatch:
     advantages = batch.advantages.to(dtype=torch.float32)
     if advantages.numel() > 1:
@@ -2937,8 +2958,27 @@ def train_one_seed(
     metrics_path = output_root / f"train_metrics_seed{seed}.jsonl"
     monitor_path = output_root / f"rollout_monitor_seed{seed}.jsonl"
     start_time = time.time()
+    fixed_update_limit = int(getattr(args, "updates", 0))
+    target_env_steps = int(getattr(args, "target_env_steps", 0))
+    if fixed_update_limit < 0:
+        raise ValueError("updates must be nonnegative")
+    if target_env_steps < 0:
+        raise ValueError("target_env_steps must be nonnegative")
+    step_budget_mode = fixed_update_limit <= 0
+    if step_budget_mode and target_env_steps <= 0:
+        raise ValueError("target_env_steps must be positive when updates is 0")
+    update_budget_mode = "target_env_steps" if step_budget_mode else "fixed_updates"
+    if not step_budget_mode:
+        target_env_steps = 0
+    cumulative_env_steps = 0
+    update_idx = 0
     try:
-        for update_idx in range(int(args.updates)):
+        while True:
+            if step_budget_mode:
+                if cumulative_env_steps >= target_env_steps:
+                    break
+            elif update_idx >= fixed_update_limit:
+                break
             update_start = time.time()
             collector_start = time.time()
             if executor is None:
@@ -3016,15 +3056,42 @@ def train_one_seed(
                 optimizer.step()
             learner_elapsed = time.time() - learner_start
             update_elapsed = time.time() - update_start
-            rows_per_sec = float(rollout.actions.numel()) / max(collector_elapsed, 1e-9)
+            rollout_rows = int(rollout.actions.numel())
+            cumulative_env_steps += rollout_rows
+            updates_completed = update_idx + 1
+            rows_per_sec = float(rollout_rows) / max(collector_elapsed, 1e-9)
+            estimated_updates_remaining = (
+                _estimated_updates_remaining(
+                    cumulative_env_steps,
+                    target_env_steps,
+                    updates_completed,
+                )
+                if step_budget_mode
+                else max(fixed_update_limit - updates_completed, 0)
+            )
+            env_step_progress = _env_step_progress(cumulative_env_steps, target_env_steps)
+            is_final_update = (
+                cumulative_env_steps >= target_env_steps
+                if step_budget_mode
+                else updates_completed >= fixed_update_limit
+            )
+            progress_payload = {
+                "update_budget_mode": update_budget_mode,
+                "updates_completed": updates_completed,
+                "target_env_steps": target_env_steps,
+                "cumulative_env_steps": cumulative_env_steps,
+                "env_step_progress": env_step_progress,
+                "estimated_updates_remaining": estimated_updates_remaining,
+            }
             monitor_every = max(1, int(getattr(args, "monitor_every", 1)))
             log_every = max(1, int(args.log_every))
-            if update_idx % monitor_every == 0 or update_idx == int(args.updates) - 1:
+            if update_idx % monitor_every == 0 or is_final_update:
                 _append_jsonl(
                     monitor_path,
                     {
                         "seed": int(seed),
                         "update": int(update_idx),
+                        **progress_payload,
                         "elapsed_sec": time.time() - start_time,
                         "collector_elapsed_sec": collector_elapsed,
                         "learner_elapsed_sec": learner_elapsed,
@@ -3035,14 +3102,31 @@ def train_one_seed(
                         **dict(rollout.monitor),
                     },
                 )
-            if update_idx % log_every == 0 or update_idx == int(args.updates) - 1:
+                _write_json(
+                    output_root / "status.json",
+                    {
+                        "status": "running",
+                        "stage": "train_eval_seed",
+                        "active_seed": int(seed),
+                        "completed_seeds": [
+                            int(value) for value in getattr(args, "completed_seeds", [])
+                        ],
+                        **progress_payload,
+                        "resource_mode": rollout.monitor.get("resource_mode", "unknown"),
+                        "worker_count": worker_count,
+                        "learner_epochs": learner_epochs,
+                        "run_dir": str(output_root),
+                    },
+                )
+            if update_idx % log_every == 0 or is_final_update:
                 _append_jsonl(
                     metrics_path,
                     {
                         "seed": int(seed),
                         "update": int(update_idx),
+                        **progress_payload,
                         "elapsed_sec": time.time() - start_time,
-                        "rollout_rows": int(rollout.actions.numel()),
+                        "rollout_rows": rollout_rows,
                         "collector_elapsed_sec": collector_elapsed,
                         "learner_elapsed_sec": learner_elapsed,
                         "optimizer_elapsed_sec": learner_elapsed,
@@ -3062,6 +3146,7 @@ def train_one_seed(
                         "fallback_rate": rollout.monitor.get("fallback_rate", 0.0),
                     },
                 )
+            update_idx += 1
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
@@ -3117,6 +3202,12 @@ def train_one_seed(
     result = {
         "seed": int(seed),
         "checkpoint": str(checkpoint_path),
+        "training": {
+            "update_budget_mode": update_budget_mode,
+            "updates_completed": int(update_idx),
+            "target_env_steps": int(target_env_steps),
+            "cumulative_env_steps": int(cumulative_env_steps),
+        },
         "closed_loop": closed_loop,
         "offline_regret": offline,
     }
@@ -3131,6 +3222,9 @@ def _write_report(path: Path, summary: Mapping[str, Any]) -> None:
         f"- Status: `{summary.get('status')}`",
         f"- Layout: `{summary.get('layout')}`",
         f"- Seeds: `{summary.get('seeds')}`",
+        f"- Update budget mode: `{summary.get('update_budget_mode')}`",
+        f"- Target env steps per seed: `{summary.get('target_env_steps')}`",
+        f"- Seed training: `{summary.get('seed_training')}`",
         f"- Source partners: `{summary.get('source_partner_ids')}`",
         f"- Target partners: `{summary.get('target_partner_ids')}`",
         "",
@@ -3165,7 +3259,8 @@ def run_formal_classic(args: argparse.Namespace) -> Mapping[str, Any]:
         args.reservoir_episodes = min(int(args.reservoir_episodes), 2)
         args.v0_episodes_per_partner = min(int(args.v0_episodes_per_partner), 1)
         args.v0_epochs = min(int(args.v0_epochs), 1)
-        args.updates = min(int(args.updates), 2)
+        args.updates = 2
+        args.target_env_steps = 0
         args.eval_episodes_per_partner = min(int(args.eval_episodes_per_partner), 1)
         args.horizon = min(int(args.horizon), 20)
         args.source_count = int(args.source_count or 2)
@@ -3322,13 +3417,23 @@ def run_formal_classic(args: argparse.Namespace) -> Mapping[str, Any]:
 
     seed_results = []
     for seed in [int(x) for x in str(args.seeds).split(",") if str(x).strip()]:
+        update_budget_mode = "target_env_steps" if int(getattr(args, "updates", 0)) <= 0 else "fixed_updates"
+        effective_target_env_steps = (
+            int(getattr(args, "target_env_steps", 0))
+            if update_budget_mode == "target_env_steps"
+            else 0
+        )
+        completed_seed_ids = [int(result["seed"]) for result in seed_results]
+        setattr(args, "completed_seeds", completed_seed_ids)
         _write_json(
             output_root / "status.json",
             {
                 "status": "running",
                 "stage": "train_eval_seed",
                 "active_seed": int(seed),
-                "completed_seeds": [int(result["seed"]) for result in seed_results],
+                "completed_seeds": completed_seed_ids,
+                "update_budget_mode": update_budget_mode,
+                "target_env_steps": effective_target_env_steps,
                 "resource_mode": (
                     "parallel_rollout_gpu_learner"
                     if int(getattr(args, "workers", 1)) > 1
@@ -3378,6 +3483,13 @@ def run_formal_classic(args: argparse.Namespace) -> Mapping[str, Any]:
         "run_id": run_id,
         "layout": args.layout,
         "seeds": [int(result["seed"]) for result in seed_results],
+        "update_budget_mode": "target_env_steps" if int(getattr(args, "updates", 0)) <= 0 else "fixed_updates",
+        "target_env_steps": (
+            int(getattr(args, "target_env_steps", 0))
+            if int(getattr(args, "updates", 0)) <= 0
+            else 0
+        ),
+        "seed_training": [result["training"] for result in seed_results],
         "source_partner_ids": [spec.partner_id for spec in source_specs],
         "target_partner_ids": [spec.partner_id for spec in target_specs],
         "closed_loop_mean_return": float(closed_returns.mean().item()),
@@ -3437,7 +3549,8 @@ def _add_common_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--alpha-high", type=float, default=1.0)
     parser.add_argument("--reliability-tau", type=float, default=0.0)
     parser.add_argument("--ood-alpha-cap", type=float, default=0.25)
-    parser.add_argument("--updates", type=int, default=300)
+    parser.add_argument("--updates", type=int, default=0)
+    parser.add_argument("--target-env-steps", type=int, default=100_000_000)
     parser.add_argument("--rollout-episodes-per-partner", type=int, default=1)
     parser.add_argument("--workers", type=int, default=18)
     parser.add_argument("--torch-num-threads", type=int, default=1)

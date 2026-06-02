@@ -36,6 +36,13 @@ rollout_batch:
   gae_lambda: 0.95
   deterministic: false
 
+training:
+  env_step_budget_scope: per_seed
+  target_env_steps: 100000000
+  updates: 0
+  estimated_rollout_rows_at_default_workers: 7200
+  estimated_updates_at_default_rollout_rows: 13889
+
 resources:
   device: cuda
   policy_device: cuda
