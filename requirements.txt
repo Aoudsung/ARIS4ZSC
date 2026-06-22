@@ -1,0 +1,8 @@
+numpy>=1.24
+pyyaml>=6.0
+jsonschema>=4.20
+# Optional for actual JAXMARL backend:
+# jaxmarl==0.1.0
+# chex
+# flax
+# brax

@@ -1,0 +1,19 @@
+backend: jaxmarl_overcooked_v2
+layout_id: grounded_coord_simple
+max_depth: 3
+max_steps: 8
+max_nodes: 5000
+seed: 0
+audited_agent_i: 0
+step_mode: vectorized
+batch_size: 512
+jit_batch_step: true
+reset_domain_tag: RESET_DEFAULT
+tau:
+  tau_id: tau_grounded_coord_simple_time_at_least_2
+  task_type: time_at_least
+  params:
+    time_min: 2
+env_kwargs:
+  random_reset: false
+  random_agent_positions: false

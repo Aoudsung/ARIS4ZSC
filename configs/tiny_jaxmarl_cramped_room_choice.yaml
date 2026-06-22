@@ -1,0 +1,24 @@
+backend: jaxmarl_overcooked_v2
+layout_id: cramped_room
+max_steps: 8
+max_depth: 1
+max_nodes: 300
+seed: 0
+reset_domain_tag: RESET_DEFAULT
+audited_agent_i: 0
+env_kwargs:
+  random_reset: false
+  random_agent_positions: false
+  start_cooking_interaction: true
+  negative_rewards: false
+  sample_recipe_on_delivery: true
+  indicate_successful_delivery: true
+  force_path_planning: false
+tau:
+  tau_id: tau_agent0_first_move_choice
+  task_type: agent_at_any_of
+  params:
+    agent_i: 0
+    positions:
+      - [2, 1]
+      - [3, 2]

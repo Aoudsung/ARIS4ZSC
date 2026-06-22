@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.aris4zsc/serd/m4_output_contract.schema.json",
+  "title": "SERD M4 output bundle static contract",
+  "description": "Machine-readable static contract for future SERD M4 claim-bearing output bundles. This file is not a validation result and was not applied to any bundle.",
+  "contract_version": 1,
+  "status": "static_contract_not_applied",
+  "claim_bearing": false,
+  "unlock_status": "M4_CLAIM_BEARING_SERD_READY_FOR_REVIEW",
+  "execution_boundary": "No local code, tests, runners, remote commands, Claude-review calls, paper helpers, LaTeX, submission, rebuttal, or camera-ready actions are implied by this contract.",
+  "bundle_root_pattern": "results/serd_m4/<policy>_<domain>_<timestamp>/",
+  "required_bundle_files": [
+    "summary.json",
+    "branch_records.csv",
+    "family_serd.csv",
+    "worst_serd.csv",
+    "pre_h_balance.csv",
+    "provenance.json",
+    "run_config.json",
+    "acceptance.md"
+  ],
+  "required_policy_families": [
+    "FCP",
+    "PECAN"
+  ],
+  "locked_target_domains": [
+    "Counter Circuit",
+    "CounterCircuit6_9",
+    "test_time_simple"
+  ],
+  "required_control_families": [
+    "random_lag",
+    "state_block",
+    "reward_shaping",
+    "naive_replanning"
+  ],
+  "tables": {
+    "branch_records.csv": {
+      "role": "raw matched branch table",
+      "required_columns": [
+        "probe_id",
+        "policy",
+        "domain",
+        "disruption",
+        "family",
+        "no_shock_return",
+        "branch_return",
+        "shock_magnitude",
+        "phi_pre_h"
+      ],
+      "forbidden_aliases": {
+        "policy": [
+          "policy_id"
+        ],
+        "family": [
+          "control_family"
+        ]
+      },
+      "requirements": [
+        "Rows must include semantic and matched control rows for the same probe_id values.",
+        "phi_pre_h must contain only pre-shock covariates.",
+        "The table must be compatible with experiments/serd/serd_core.py BranchRecord."
+      ]
+    },
+    "family_serd.csv": {
+      "role": "per-control-family SERD summary",
+      "required_columns": [
+        "policy",
+        "domain",
+        "disruption",
+        "family",
+        "mean_serd",
+        "ci95_low",
+        "ci95_high",
+        "n",
+        "classification"
+      ],
+      "requirements": [
+        "Every required control family must be present unless a prior written scope change removes it for a concrete reason.",
+        "classification must use the M4 delta_serd decision rule."
+      ]
+    },
+    "worst_serd.csv": {
+      "role": "primary paper-facing claim table",
+      "required_columns": [
+        "policy",
+        "domain",
+        "disruption",
+        "mean_serd_worst",
+        "ci95_low",
+        "ci95_high",
+        "n",
+        "classification",
+        "limiting_family"
+      ],
+      "requirements": [
+        "SERD_worst must be min_f SERD_f over required control families.",
+        "Paper claims must use this table, not best-family, average-family, or JSON-only embedded summaries.",
+        "A bundle without standalone worst_serd.csv maps to M4_BLOCKED_WORST_SERD_MISSING."
+      ]
+    },
+    "pre_h_balance.csv": {
+      "role": "pre-shock covariate balance table",
+      "required_columns": [
+        "policy",
+        "domain",
+        "disruption",
+        "family",
+        "covariate",
+        "semantic_mean",
+        "control_mean",
+        "smd",
+        "n"
+      ],
+      "requirements": [
+        "Balance must cover each policy/domain/disruption/family combination.",
+        "Post-treatment covariates must not be used for matching or balance claims."
+      ]
+    }
+  },
+  "json_files": {
+    "summary.json": {
+      "role": "bundle-level result summary",
+      "required_fields": [
+        "m4_status",
+        "policy_domain_pairs",
+        "delta_serd",
+        "n_branch_records",
+        "n_family_rows",
+        "n_worst_rows",
+        "n_balance_rows"
+      ]
+    },
+    "provenance.json": {
+      "role": "policy and environment provenance",
+      "required_fields": [
+        "policy_family",
+        "checkpoint_paths",
+        "checkpoint_hashes",
+        "source_repository_path",
+        "source_commit_hash",
+        "adapter_route",
+        "environment_name",
+        "target_domain",
+        "random_seeds",
+        "run_command_or_queue_manifest",
+        "m3_acceptance_artifact"
+      ]
+    },
+    "run_config.json": {
+      "role": "reproducibility configuration",
+      "required_fields": [
+        "probes_per_disruption",
+        "rollout_horizon",
+        "warmup_horizon",
+        "epsilon_shock",
+        "epsilon_phi",
+        "delta_serd",
+        "control_families",
+        "disruptions"
+      ]
+    }
+  },
+  "allowed_m4_statuses": [
+    "M4_CLAIM_BEARING_SERD_READY_FOR_REVIEW",
+    "M4_BLOCKED_FCP_NOT_ACCEPTED",
+    "M4_BLOCKED_PECAN_NOT_ACCEPTED",
+    "M4_BLOCKED_POLICY_DOMAIN_INCOMPLETE",
+    "M4_BLOCKED_BRANCH_RECORDS_MISSING",
+    "M4_BLOCKED_WORST_SERD_MISSING",
+    "M4_BLOCKED_FAMILY_COVERAGE",
+    "M4_BLOCKED_BALANCE_MISSING",
+    "M4_BLOCKED_PROVENANCE_MISSING",
+    "M4_PARTIAL_FCP_ONLY_NOT_WORKFLOW2",
+    "M4_PARTIAL_PECAN_ONLY_NOT_WORKFLOW2"
+  ],
+  "decision_rules": {
+    "survival": "ci95_low > delta_serd",
+    "collapse": "ci95_low >= -delta_serd and ci95_high <= delta_serd",
+    "adverse_semantic_gap": "ci95_high < -delta_serd",
+    "inconclusive": "interval crosses a decision boundary"
+  },
+  "forbidden_shortcuts": [
+    "M0/M1/M2 handcoded adapter gates",
+    "FCP checkpoint/config load",
+    "FCP eval smoke",
+    "PECAN cramped_room checkpoint discovery",
+    "PECAN target-domain candidate acceptance without M4 BranchRecords",
+    "FCP-only or PECAN-only partial outputs under the current locked Workflow-2 scope",
+    "JSON-only worst_serd summaries without standalone worst_serd.csv"
+  ]
+}

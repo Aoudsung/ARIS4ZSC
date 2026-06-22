@@ -1,4 +1,5 @@
 .DS_Store
+._*
 
 # Python caches and tooling
 __pycache__/
@@ -8,6 +9,7 @@ __pycache__/
 .mypy_cache/
 .coverage
 htmlcov/
+*.egg-info/
 
 # Local environments and external dependencies
 .venv
@@ -17,7 +19,9 @@ venv/
 external
 external/
 
-# Experiment outputs and large artifacts
+# Experiment outputs, reports, and large artifacts
+artifacts/
+reports/
 runs/
 checkpoints/
 *.pt
@@ -28,4 +32,5 @@ checkpoints/
 
 # Local transfer bundles
 *.tar.gz
+*.tgz
 *.zip

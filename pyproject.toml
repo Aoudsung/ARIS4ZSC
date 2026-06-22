@@ -1,20 +1,29 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "srvf-mappo-zsc"
-version = "0.4.0"
-description = "V0-anchored posterior-predictive SRVF-MAPPO for classic Overcooked zero-shot coordination."
+name = "tcaso-critic-gate3"
+version = "0.1.0"
+description = "TCASO-CRITIC Gate 3 thin vertical slice certifier for OvercookedV2"
 requires-python = ">=3.10"
-dependencies = ["torch", "numpy"]
+dependencies = [
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "jsonschema>=4.20",
+]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+jaxmarl = [
+  "jax>=0.4",
+  "jaxmarl==0.1.0",
+  "chex",
+  "flax",
+]
+dev = ["pytest>=8"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+[project.scripts]
+tcaso-gate3 = "tcaso_critic.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["raob*"]
+where = ["src"]
