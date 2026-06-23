@@ -37,7 +37,7 @@ Train graph variants for Exp 4 by changing `--graph_variant` to each of:
 
 - `full_support`
 - `overcomplete`
-- `overcomplete_minus_noncritical`
+- `overcomplete_minus_low_ce`
 - `minus_critical`
 - `random_same_size`
 - `complete_option_graph`
@@ -51,7 +51,7 @@ python experiments/toy_factor_game/evaluate.py \
   --seed 0 \
   --experiments 4 \
   --methods aris_bellman \
-  --graph_variants full_support,overcomplete,overcomplete_minus_noncritical,minus_critical,random_same_size,complete_option_graph,shuffled_routes,shuffled_relevance \
+  --graph_variants full_support,overcomplete,overcomplete_minus_low_ce,minus_critical,random_same_size,complete_option_graph,shuffled_routes,shuffled_relevance \
   --n_per_conv 5 \
   --max_steps 50 \
   --output_dir results/toy
@@ -61,6 +61,19 @@ The neural implementation no longer trains or evaluates deployment-time
 `gtvoi`, `mi`, `passive`, or `oracle` selectors. G-TVOI and MI are post-hoc
 trajectory diagnostics computed from real belief updates under the learned
 Bellman policy.
+
+V4.1 support graphs are induced from the all-convention CE expectation by
+default. One-convention CE estimates are available only as explicit diagnostics
+and are not used for graph induction.
+
+V4.1 checkpoints use schema `aris_bellman_v4.1`. Older `aris_bellman_v2`
+checkpoints were induced from the pre-fix CE path and should be treated as
+pre-v4.1 legacy outputs, not mixed into V4.1 tables.
+
+Exp 3 has two blocks: method comparison on `full_support`, and routing/relevance
+controls for `aris_bellman` on `full_support`, `shuffled_routes`,
+`shuffled_relevance`, and `random_same_size`. The routing/relevance block
+requires those checkpoints to exist and fails visibly if they are missing.
 
 The main baseline names are:
 

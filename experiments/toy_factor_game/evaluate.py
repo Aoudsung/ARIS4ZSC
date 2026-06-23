@@ -23,6 +23,16 @@ from toy_factor_game.train import all_conventions, collect_episode, model_output
 
 
 EVAL_METHODS = METHODS
+EXPERIMENT_SCHEMA = "aris_bellman_v4.1"
+EVAL_SCHEMA = "aris_bellman_eval_v4.1"
+PROPOSAL_VERSION = "v4"
+CODE_FIX_LEVEL = "ce-all-conventions-criticality-diagnostics"
+EXP3_ROUTING_CONDITIONS = (
+    ("aris_bellman", "full_support"),
+    ("aris_bellman", "shuffled_routes"),
+    ("aris_bellman", "shuffled_relevance"),
+    ("aris_bellman", "random_same_size"),
+)
 
 
 def model_path_for(output_dir: Path, seed: int, method: str, graph_variant: str) -> Path:
@@ -38,8 +48,8 @@ def load_checkpoint(model_path: Path, device):
         checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     except TypeError:
         checkpoint = torch.load(model_path, map_location=device)
-    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != "aris_bellman_v2":
-        raise RuntimeError(f"{model_path} is not an ARIS-Bellman v2 checkpoint")
+    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != EXPERIMENT_SCHEMA:
+        raise RuntimeError(f"{model_path} is not an ARIS-Bellman v4.1 checkpoint")
     return checkpoint["state_dict"]
 
 
@@ -102,6 +112,45 @@ def _safe_corr(xs: list[float], ys: list[float]) -> float | None:
     return float(np.corrcoef(x, y)[0, 1])
 
 
+def _uniform_like(marginal: torch.Tensor) -> torch.Tensor:
+    return torch.ones_like(marginal) / float(marginal.shape[-1])
+
+
+def _masked_values(q_values: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    if valid_mask.dim() == 1:
+        valid_mask = valid_mask.unsqueeze(0)
+    return q_values.masked_fill(~valid_mask.bool(), -1e9)
+
+
+def per_factor_swap_diagnostics(
+    agent,
+    obs: torch.Tensor,
+    marginals: list[torch.Tensor],
+    valid_mask: torch.Tensor,
+) -> list[dict]:
+    q_actual = _masked_values(agent.q_values(obs, marginals), valid_mask)
+    actual_action = int(q_actual.argmax(dim=-1).item())
+    rows = []
+    for factor_idx in range(len(marginals)):
+        swapped = [m.clone() for m in marginals]
+        swapped[factor_idx] = _uniform_like(swapped[factor_idx])
+        q_swap = _masked_values(agent.q_values(obs, swapped), valid_mask)
+        swapped_action = int(q_swap.argmax(dim=-1).item())
+        maxq_delta = float(q_actual.max().item() - q_swap.max().item())
+        rows.append(
+            {
+                "factor_idx": factor_idx,
+                "selected_delta": float(q_actual[0, actual_action].item() - q_swap[0, actual_action].item()),
+                "maxq_delta": maxq_delta,
+                "abs_maxq_delta": abs(maxq_delta),
+                "action_flip": int(actual_action != swapped_action),
+                "actual_action": actual_action,
+                "swapped_action": swapped_action,
+            }
+        )
+    return rows
+
+
 def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphConfig, gamma: float):
     if agent.method in ("base_only", "flat_latent", "global_gru", "oracle_belief_factorq", "oracle_belief_flatq", "random_policy"):
         return {
@@ -116,6 +165,17 @@ def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphCon
             "delta_info_future_return_corr": None,
             "mi_future_return_corr": None,
             "belief_swap_delta_q_mean": None,
+            "belief_swap_selected_delta_mean": None,
+            "belief_swap_maxq_delta_mean": None,
+            "belief_swap_abs_maxq_delta_mean": None,
+            "belief_swap_action_flip_rate": None,
+            "per_factor_abs_maxq_delta": None,
+            "per_factor_action_flip_rate": None,
+            "q_base_action": None,
+            "uniform_belief_action": None,
+            "full_q_action": None,
+            "diagnostic_count_base_reference": 0,
+            "diagnostic_count_uniform_reference": 0,
             "oracle_gap_closed_after_diagnostic": None,
             "oracle_gap_status": "not_applicable",
         }
@@ -124,22 +184,43 @@ def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphCon
     delta_values = []
     future_returns = []
     belief_swap_delta_q = []
+    belief_swap_maxq_delta = []
+    belief_swap_abs_maxq_delta = []
+    belief_swap_action_flip = []
+    per_factor_abs_maxq: dict[int, list[float]] = {}
+    per_factor_action_flip: dict[int, list[int]] = {}
+    q_base_actions = []
+    q_uniform_actions = []
+    q_full_actions = []
     opportunity_costs = []
     diagnostic_indices = []
+    diagnostic_uniform_indices = []
     high_delta_indices = []
     for t, evidence in enumerate(episode_data["evidence"]):
         obs_t = episode_data["obs"][t].unsqueeze(0).to(device)
         next_obs_t = episode_data["next_obs"][t].unsqueeze(0).to(device)
         before = agent.belief_model._marginals_from_h(factor_hidden)
-        q_task = agent.q_base_values(obs_t)
-        q_task = q_task.masked_fill(~episode_data["valid_masks"][t].unsqueeze(0).bool(), -1e9)
+        valid_mask_t = episode_data["valid_masks"][t].unsqueeze(0).to(device)
+        q_task = _masked_values(agent.q_base_values(obs_t), valid_mask_t)
         selected = int(episode_data["options"][t])
         best_task = int(q_task.argmax(dim=-1).item())
         opportunity_cost = max(0.0, float(q_task[0, best_task].item() - q_task[0, selected].item()))
         uniform_before = uniform_marginals(graph_config.factor_modes, 1, device)
-        q_actual = agent.q_values(obs_t, before)
-        q_uniform = agent.q_values(obs_t, uniform_before)
+        q_actual = _masked_values(agent.q_values(obs_t, before), valid_mask_t)
+        q_uniform = _masked_values(agent.q_values(obs_t, uniform_before), valid_mask_t)
+        best_uniform = int(q_uniform.argmax(dim=-1).item())
+        best_full = int(q_actual.argmax(dim=-1).item())
+        q_base_actions.append(best_task)
+        q_uniform_actions.append(best_uniform)
+        q_full_actions.append(best_full)
         belief_swap_delta_q.append(float(q_actual[0, selected].item() - q_uniform[0, selected].item()))
+        maxq_delta = float(q_actual.max().item() - q_uniform.max().item())
+        belief_swap_maxq_delta.append(maxq_delta)
+        belief_swap_abs_maxq_delta.append(abs(maxq_delta))
+        belief_swap_action_flip.append(int(best_full != best_uniform))
+        for swap_row in per_factor_swap_diagnostics(agent, obs_t, before, valid_mask_t):
+            per_factor_abs_maxq.setdefault(swap_row["factor_idx"], []).append(swap_row["abs_maxq_delta"])
+            per_factor_action_flip.setdefault(swap_row["factor_idx"], []).append(swap_row["action_flip"])
         with torch.no_grad():
             factor_hidden = agent.belief_model.step_history(evidence.to(device), factor_hidden)
             after = agent.belief_model._marginals_from_h(factor_hidden)
@@ -162,6 +243,8 @@ def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphCon
         if delta_info > 1e-3 and selected != best_task:
             diagnostic_indices.append(t)
             opportunity_costs.append(opportunity_cost)
+        if delta_info > 1e-3 and selected != best_uniform:
+            diagnostic_uniform_indices.append(t)
 
     first_reward = None
     if diagnostic_indices:
@@ -187,6 +270,21 @@ def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphCon
         "delta_info_future_return_corr": _safe_corr(delta_values, future_returns),
         "mi_future_return_corr": _safe_corr(mi_values, future_returns),
         "belief_swap_delta_q_mean": float(np.mean(belief_swap_delta_q)) if belief_swap_delta_q else None,
+        "belief_swap_selected_delta_mean": float(np.mean(belief_swap_delta_q)) if belief_swap_delta_q else None,
+        "belief_swap_maxq_delta_mean": float(np.mean(belief_swap_maxq_delta)) if belief_swap_maxq_delta else None,
+        "belief_swap_abs_maxq_delta_mean": float(np.mean(belief_swap_abs_maxq_delta)) if belief_swap_abs_maxq_delta else None,
+        "belief_swap_action_flip_rate": float(np.mean(belief_swap_action_flip)) if belief_swap_action_flip else None,
+        "per_factor_abs_maxq_delta": {
+            str(factor_idx): float(np.mean(values)) for factor_idx, values in sorted(per_factor_abs_maxq.items())
+        },
+        "per_factor_action_flip_rate": {
+            str(factor_idx): float(np.mean(values)) for factor_idx, values in sorted(per_factor_action_flip.items())
+        },
+        "q_base_action": int(q_base_actions[0]) if q_base_actions else None,
+        "uniform_belief_action": int(q_uniform_actions[0]) if q_uniform_actions else None,
+        "full_q_action": int(q_full_actions[0]) if q_full_actions else None,
+        "diagnostic_count_base_reference": int(len(diagnostic_indices)),
+        "diagnostic_count_uniform_reference": int(len(diagnostic_uniform_indices)),
         "oracle_gap_closed_after_diagnostic": None,
         "oracle_gap_status": "missing_oracle",
     }
@@ -262,6 +360,27 @@ def summarize_rows(rows: list[dict]) -> dict:
         [row["belief_swap_delta_q_mean"] for row in rows if row["belief_swap_delta_q_mean"] is not None],
         dtype=np.float64,
     )
+    belief_swap_maxq_delta = np.array(
+        [row["belief_swap_maxq_delta_mean"] for row in rows if row["belief_swap_maxq_delta_mean"] is not None],
+        dtype=np.float64,
+    )
+    belief_swap_abs_maxq_delta = np.array(
+        [row["belief_swap_abs_maxq_delta_mean"] for row in rows if row["belief_swap_abs_maxq_delta_mean"] is not None],
+        dtype=np.float64,
+    )
+    belief_swap_action_flip = np.array(
+        [row["belief_swap_action_flip_rate"] for row in rows if row["belief_swap_action_flip_rate"] is not None],
+        dtype=np.float64,
+    )
+    diagnostic_base_counts = np.array([row["diagnostic_count_base_reference"] for row in rows], dtype=np.float64)
+    diagnostic_uniform_counts = np.array([row["diagnostic_count_uniform_reference"] for row in rows], dtype=np.float64)
+    per_factor_abs: dict[str, list[float]] = {}
+    per_factor_flip: dict[str, list[float]] = {}
+    for row in rows:
+        for factor_idx, value in (row.get("per_factor_abs_maxq_delta") or {}).items():
+            per_factor_abs.setdefault(factor_idx, []).append(float(value))
+        for factor_idx, value in (row.get("per_factor_action_flip_rate") or {}).items():
+            per_factor_flip.setdefault(factor_idx, []).append(float(value))
     oracle_gap_statuses = sorted({row.get("oracle_gap_status") for row in rows if row.get("oracle_gap_status")})
 
     return {
@@ -288,6 +407,18 @@ def summarize_rows(rows: list[dict]) -> dict:
         "delta_info_future_return_corr_mean": float(delta_corrs.mean()) if len(delta_corrs) else None,
         "mi_future_return_corr_mean": float(mi_corrs.mean()) if len(mi_corrs) else None,
         "belief_swap_delta_q_mean": float(belief_swap_delta_q.mean()) if len(belief_swap_delta_q) else None,
+        "belief_swap_selected_delta_mean": float(belief_swap_delta_q.mean()) if len(belief_swap_delta_q) else None,
+        "belief_swap_maxq_delta_mean": float(belief_swap_maxq_delta.mean()) if len(belief_swap_maxq_delta) else None,
+        "belief_swap_abs_maxq_delta_mean": float(belief_swap_abs_maxq_delta.mean()) if len(belief_swap_abs_maxq_delta) else None,
+        "belief_swap_action_flip_rate": float(belief_swap_action_flip.mean()) if len(belief_swap_action_flip) else None,
+        "per_factor_abs_maxq_delta": {
+            factor_idx: float(np.mean(values)) for factor_idx, values in sorted(per_factor_abs.items())
+        },
+        "per_factor_action_flip_rate": {
+            factor_idx: float(np.mean(values)) for factor_idx, values in sorted(per_factor_flip.items())
+        },
+        "diagnostic_count_base_reference_mean": float(diagnostic_base_counts.mean()),
+        "diagnostic_count_uniform_reference_mean": float(diagnostic_uniform_counts.mean()),
         "oracle_gap_closed_after_diagnostic": None,
         "oracle_gap_status": ",".join(oracle_gap_statuses) if oracle_gap_statuses else "missing_oracle",
     }
@@ -342,6 +473,7 @@ def evaluate_method_for_graph(
     n_per_conv: int,
     max_steps: int,
     gamma: float,
+    require_checkpoint: bool = False,
 ):
     graph_config = get_graph_config(graph_variant)
     if method == "random_policy":
@@ -351,6 +483,11 @@ def evaluate_method_for_graph(
 
     path = model_path_for(output_dir, seed, method, graph_variant)
     if not path.exists():
+        if require_checkpoint:
+            raise FileNotFoundError(
+                f"Missing checkpoint for {method}/{graph_variant}: {path}. "
+                "Exp 3 routing controls require separately trained checkpoints."
+            )
         return {"status": "missing", "model_path": str(path)}
     agent = load_agent(path, device, graph_config, hidden_dim, method)
     rows = evaluate_agent(agent, device, graph_config, seed, n_per_conv, max_steps, gamma)
@@ -372,11 +509,33 @@ def exp1_policy_baselines(output_dir: Path, device, seed: int, hidden_dim: int, 
 
 
 def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], n_per_conv: int, max_steps: int, gamma: float):
-    return {
+    method_comparison = {
         method: evaluate_method_for_graph(
             output_dir, device, seed, "full_support", method, hidden_dim, n_per_conv, max_steps, gamma
         )
         for method in methods
+    }
+    routing_controls = {}
+    for method, graph_variant in EXP3_ROUTING_CONDITIONS:
+        routing_controls[f"{method}/{graph_variant}"] = evaluate_method_for_graph(
+            output_dir,
+            device,
+            seed,
+            graph_variant,
+            method,
+            hidden_dim,
+            n_per_conv,
+            max_steps,
+            gamma,
+            require_checkpoint=True,
+        )
+    return {
+        "method_comparison": method_comparison,
+        "routing_relevance_controls": routing_controls,
+        "routing_relevance_conditions": [
+            {"method": method, "graph_variant": graph_variant}
+            for method, graph_variant in EXP3_ROUTING_CONDITIONS
+        ],
     }
 
 
@@ -471,8 +630,11 @@ def main():
     results_path = output_dir / f"eval_results_seed{args.seed}.json"
     save_results(
         {
-            "schema_version": "aris_bellman_eval_v2",
+            "schema_version": EVAL_SCHEMA,
+            "proposal_version": PROPOSAL_VERSION,
+            "code_fix_level": CODE_FIX_LEVEL,
             "config": vars(args),
+            "ce_estimation": get_graph_config("full_support").ce_metadata(),
             "results": all_results,
             "diagnostic_note": (
                 "G-TVOI and MI are post-hoc trajectory diagnostics computed from real belief "

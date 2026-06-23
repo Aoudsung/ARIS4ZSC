@@ -1,14 +1,21 @@
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "experiments"))
 
-from toy_factor_game.ce_estimation import estimate_ce_matrix, induce_graph  # noqa: E402
+from toy_factor_game.ce_estimation import _all_conventions, estimate_ce_matrix, induce_graph  # noqa: E402
 from toy_factor_game.env import DELIVER_RIGHT, Action, ToyFactorGameEnv  # noqa: E402
+from toy_factor_game.evaluate import (  # noqa: E402
+    EVAL_SCHEMA,
+    EXP3_ROUTING_CONDITIONS,
+    EXPERIMENT_SCHEMA,
+    per_factor_swap_diagnostics,
+)
 from toy_factor_game.evidence import option_relevance_mask  # noqa: E402
 from toy_factor_game.graph_config import get_graph_config  # noqa: E402
 from toy_factor_game.options import NUM_OPTIONS, OptionID  # noqa: E402
@@ -78,11 +85,23 @@ def test_oracle_method_split_dispatches_to_matching_q_architecture():
 
 
 def test_full_support_is_induced_from_all_option_pair_ce_matrix():
-    ce_matrix = estimate_ce_matrix()
+    ce_matrix = estimate_ce_matrix(n_conventions=None, seed=42)
     expected_pairs = {(option_i, option_j) for option_i, option_j, _value in induce_graph(ce_matrix)}
     graph = get_graph_config("full_support")
     actual_pairs = {(factor.option_i, factor.option_j) for factor in graph.factors}
     assert actual_pairs == expected_pairs
+
+
+def test_ce_default_uses_all_conventions_and_metadata_records_it():
+    ce_default = estimate_ce_matrix(n_conventions=None, seed=42)
+    ce_all = estimate_ce_matrix(n_conventions=len(_all_conventions()), seed=42)
+    assert np.allclose(ce_default, ce_all)
+
+    graph = get_graph_config("full_support")
+    metadata = graph.ce_metadata()
+    assert metadata["mode"] == "all_conventions"
+    assert metadata["n_conventions"] == len(_all_conventions())
+    assert metadata["n_scenarios"] == 3
 
 
 def test_shuffled_route_and_relevance_ablate_different_graph_edges():
@@ -106,7 +125,32 @@ def test_old_method_and_graph_names_fail_visibly():
     with pytest.raises(ValueError):
         get_graph_config("full_graph")
     with pytest.raises(ValueError):
+        get_graph_config("overcomplete_minus_noncritical")
+    assert get_graph_config("overcomplete_minus_low_ce").name == "overcomplete_minus_low_ce"
+    with pytest.raises(ValueError):
         make_agent(get_graph_config("full_support"), method="oracle_belief")
+
+
+def test_per_factor_swap_reports_maxq_and_action_flip_fields():
+    graph = get_graph_config("full_support")
+    agent = make_agent(graph)
+    obs = torch.zeros(1, ToyFactorGameEnv().obs_dim)
+    marginals = uniform_marginals(graph.factor_modes, 1, obs.device)
+    valid_mask = torch.ones(1, NUM_OPTIONS, dtype=torch.bool)
+    rows = per_factor_swap_diagnostics(agent, obs, marginals, valid_mask)
+    assert rows
+    assert {"selected_delta", "maxq_delta", "abs_maxq_delta", "action_flip"}.issubset(rows[0])
+
+
+def test_exp3_contains_routing_and_relevance_controls():
+    assert ("aris_bellman", "shuffled_routes") in EXP3_ROUTING_CONDITIONS
+    assert ("aris_bellman", "shuffled_relevance") in EXP3_ROUTING_CONDITIONS
+    assert ("aris_bellman", "random_same_size") in EXP3_ROUTING_CONDITIONS
+
+
+def test_schema_bumped_to_v4_1():
+    assert EXPERIMENT_SCHEMA == "aris_bellman_v4.1"
+    assert EVAL_SCHEMA == "aris_bellman_eval_v4.1"
 
 
 def test_task_completion_terminates_episode():

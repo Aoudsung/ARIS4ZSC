@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import functools
 import random
 
-from .ce_estimation import DEFAULT_CE_THRESHOLD, estimate_ce_matrix
+from .ce_estimation import DEFAULT_CE_THRESHOLD, ce_metadata, estimate_ce_matrix
 from .env import NUM_FACTORS
 from .options import GROUND_TRUTH_FACTORS, OptionID
 
@@ -14,7 +14,7 @@ from .options import GROUND_TRUTH_FACTORS, OptionID
 GRAPH_VARIANTS = (
     "full_support",
     "overcomplete",
-    "overcomplete_minus_noncritical",
+    "overcomplete_minus_low_ce",
     "minus_critical",
     "random_same_size",
     "complete_option_graph",
@@ -77,6 +77,9 @@ class GraphConfig:
         max_ce = max(abs(factor.ce_value) for factor in self.factors) or 1.0
         return [max(0.1, abs(factor.ce_value) / max_ce) for factor in self.factors]
 
+    def ce_metadata(self) -> dict:
+        return ce_metadata(n_conventions=None, seed=42, threshold=DEFAULT_CE_THRESHOLD)
+
 
 def _chain_pairs(n_factors: int) -> tuple[tuple[int, int], ...]:
     if n_factors <= 1:
@@ -104,7 +107,7 @@ def _real_factor_for_option_pair(
 
 @functools.lru_cache(maxsize=1)
 def _all_pair_factor_specs() -> tuple[GraphFactorSpec, ...]:
-    ce_matrix = estimate_ce_matrix()
+    ce_matrix = estimate_ce_matrix(n_conventions=None, seed=42)
     specs = []
     for option_i in OptionID:
         for option_j in OptionID:
@@ -147,7 +150,7 @@ def _overcomplete_factors() -> tuple[GraphFactorSpec, ...]:
     return full + tuple(low_ce[:extra_count])
 
 
-def _overcomplete_minus_noncritical_factors() -> tuple[GraphFactorSpec, ...]:
+def _overcomplete_minus_low_ce_factors() -> tuple[GraphFactorSpec, ...]:
     full = _full_support_factors()
     full_pairs = {(factor.option_i, factor.option_j) for factor in full}
     extras = [
@@ -231,8 +234,8 @@ def get_graph_config(name: str) -> GraphConfig:
         factors = _full_support_factors()
     elif name == "overcomplete":
         factors = _overcomplete_factors()
-    elif name == "overcomplete_minus_noncritical":
-        factors = _overcomplete_minus_noncritical_factors()
+    elif name == "overcomplete_minus_low_ce":
+        factors = _overcomplete_minus_low_ce_factors()
     elif name == "minus_critical":
         factors = _minus_critical_factors()
     elif name == "random_same_size":

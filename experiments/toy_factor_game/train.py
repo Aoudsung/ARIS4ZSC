@@ -6,6 +6,7 @@ import argparse
 import copy
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,9 @@ from toy_factor_game.policy import METHODS, ORACLE_BELIEF_METHODS, ActiveFactorA
 
 
 TRAIN_METHODS = tuple(method for method in METHODS if method != "random_policy")
+EXPERIMENT_SCHEMA = "aris_bellman_v4.1"
+PROPOSAL_VERSION = "v4"
+CODE_FIX_LEVEL = "ce-all-conventions-criticality-diagnostics"
 
 
 def all_conventions() -> list[ConventionAssignment]:
@@ -522,9 +526,19 @@ def main():
 
     output_dir = model_output_dir(Path(args.output_dir), args.seed, args.method, args.graph_variant)
     output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "schema_version": EXPERIMENT_SCHEMA,
+        "proposal_version": PROPOSAL_VERSION,
+        "code_fix_level": CODE_FIX_LEVEL,
+        "method": args.method,
+        "graph_variant": args.graph_variant,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "ce_estimation": graph_config.ce_metadata(),
+        "criticality_source": "low_ce_heuristic" if args.graph_variant == "overcomplete_minus_low_ce" else None,
+    }
     save_results(
         {
-            "schema_version": "aris_bellman_v2",
+            **metadata,
             "config": vars(args),
             "graph": {
                 "name": graph_config.name,
@@ -537,7 +551,7 @@ def main():
         },
         str(output_dir / "results.json"),
     )
-    torch.save({"schema_version": "aris_bellman_v2", "state_dict": agent.state_dict()}, str(output_dir / "model.pt"))
+    torch.save({**metadata, "state_dict": agent.state_dict()}, str(output_dir / "model.pt"))
     print(f"Saved to {output_dir}")
 
 

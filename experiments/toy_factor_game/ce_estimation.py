@@ -96,11 +96,20 @@ def _rollout_return(
     return total, collisions, delivery_coverage
 
 
-@functools.lru_cache(maxsize=4)
-def estimate_ce_matrix(n_rollouts: int = 1, seed: int = 42) -> np.ndarray:
-    """Estimate CE(w_i, w_j) for every directed option pair from deterministic probes."""
-    _ = np.random.RandomState(seed)
-    conventions = _all_conventions()[: max(1, n_rollouts)]
+@functools.lru_cache(maxsize=None)
+def estimate_ce_matrix(n_conventions: int | None = None, seed: int = 42) -> np.ndarray:
+    """Estimate CE(w_i, w_j) averaged over conventions and probe scenarios.
+
+    The default is the all-convention expectation. Passing ``n_conventions`` is
+    an explicit sampled-CE diagnostic and is not used for support induction.
+    """
+    all_conventions = tuple(_all_conventions())
+    if n_conventions is None or n_conventions >= len(all_conventions):
+        conventions = all_conventions
+    else:
+        rng = np.random.RandomState(seed)
+        indices = rng.choice(len(all_conventions), size=max(1, n_conventions), replace=False)
+        conventions = tuple(all_conventions[int(idx)] for idx in sorted(indices))
     scenarios = _probe_scenarios()
     ce = np.zeros((NUM_OPTIONS, NUM_OPTIONS), dtype=np.float64)
 
@@ -122,6 +131,27 @@ def estimate_ce_matrix(n_rollouts: int = 1, seed: int = 42) -> np.ndarray:
 
     ce.flags.writeable = False
     return ce
+
+
+def ce_metadata(
+    n_conventions: int | None = None,
+    seed: int = 42,
+    threshold: float = DEFAULT_CE_THRESHOLD,
+) -> dict:
+    all_conventions = tuple(_all_conventions())
+    if n_conventions is None or n_conventions >= len(all_conventions):
+        count = len(all_conventions)
+        mode = "all_conventions"
+    else:
+        count = max(1, int(n_conventions))
+        mode = "sampled_conventions"
+    return {
+        "mode": mode,
+        "n_conventions": count,
+        "seed": int(seed),
+        "n_scenarios": len(_probe_scenarios()),
+        "threshold": float(threshold),
+    }
 
 
 def induce_graph(ce_matrix: np.ndarray, threshold: float = DEFAULT_CE_THRESHOLD) -> list[tuple[OptionID, OptionID, float]]:
