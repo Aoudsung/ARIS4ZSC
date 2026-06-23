@@ -2,15 +2,15 @@
 Symbolic diagnostic sanity suite for the toy factor game.
 
 This runner is intentionally separate from the neural ARIS-Bellman experiments.
-It checks whether a small set of hand-built toy states has a diagnostic gap:
-observing partner responses through task-valid options should create Bellman
-value, and that value should explain downstream return better than raw MI.
+It first synthesizes diagnostic-critical cases, then checks whether task-valid
+partner observations create Bellman value that predicts downstream return.
 """
 
 import argparse
 import copy
 import csv
 import math
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -44,6 +44,14 @@ DEFAULT_METHODS = ("gtvoi", "mi", "passive", "random", "oracle")
 ROLLOUT_DEPTH = 3
 ROLLOUT_GAMMA = 0.99
 DELTA_INFO_THRESHOLD = 0.05
+SYMBOLIC_SCHEMA = "symbolic_sanity_v4_phase3"
+DEFAULT_DELTA_GAP = 0.5
+DEFAULT_DELTA_ACTION = 0.3
+DEFAULT_DELTA_OBS = 0.3
+DEFAULT_DELTA_RETURN = 0.3
+DEFAULT_DELTA_MI = 0.1
+DEFAULT_DELTA_VALUE = 0.1
+DEFAULT_MIN_CASES = 3
 
 ConventionKey = tuple[int, ...]
 
@@ -64,7 +72,35 @@ class DiagnosticScenario:
     step_count: int = 0
 
 
-DIAGNOSTIC_SCENARIOS = (
+@dataclass(frozen=True)
+class DiagnosticCase:
+    case_id: str
+    case_type: str
+    scenario: DiagnosticScenario | None
+    conventions: tuple[ConventionKey, ...]
+    oracle_passive_gap: float | None = None
+    oracle_value: float | None = None
+    passive_value: float | None = None
+    oracle_first_actions: tuple[str, ...] = ()
+    passive_first_action: str | None = None
+    best_response_flip: bool = False
+    action_gap: float | None = None
+    best_diag_option: str | None = None
+    observation_separation: float | None = None
+    best_diag_return_gain: float | None = None
+    best_diag_delta_info: float | None = None
+    best_diag_mi_gain: float | None = None
+    high_mi_low_value_distractor: bool = False
+    mi_option: str | None = None
+    gtvoi_option: str | None = None
+    mi_gap: float | None = None
+    delta_info_gap: float | None = None
+    distractor_return_gap: float | None = None
+    passed_filters: bool = False
+    failure_reason: str | None = None
+
+
+HANDPICKED_DIAGNOSTIC_SCENARIOS = (
     DiagnosticScenario(
         name="bottleneck_critical",
         description="Agents face each other at the bottleneck; yielding convention changes best action.",
@@ -292,8 +328,10 @@ def factor_observation_weights(env: ToyFactorGameEnv, option: OptionID) -> np.nd
         resource_weight = 1.2
     if option in (OptionID.DELIVER_LEFT, OptionID.DELIVER_RIGHT, OptionID.DROP):
         delivery_weight = 1.2
-    if option in (OptionID.CROSS_CORRIDOR, OptionID.WAIT_AT_BOTTLENECK):
-        bottleneck_weight = 1.2
+    if option == OptionID.CROSS_CORRIDOR:
+        bottleneck_weight = 1.4
+    elif option == OptionID.WAIT_AT_BOTTLENECK:
+        bottleneck_weight = 1.15
     return np.array([bottleneck_weight, resource_weight, delivery_weight], dtype=np.float64)
 
 
@@ -383,18 +421,37 @@ def rollout_value(
     use_observation: bool,
     cache: dict[tuple, float] | None = None,
 ) -> float:
+    if depth <= 0:
+        return 0.0
     cache_key = None
     if cache is not None:
         cache_key = (
             "rollout",
             env_cache_key(env),
             belief_cache_key(belief),
+            int(depth),
             true_key,
             bool(use_observation),
         )
         if cache_key in cache:
             return cache[cache_key]
-    value = future_potential(env, belief)
+    options = valid_options(env)
+    if not options:
+        value = 0.0
+    else:
+        value = max(
+            option_lookahead_value(
+                env,
+                option,
+                belief,
+                gamma,
+                depth,
+                likelihood_error,
+                use_observation,
+                cache,
+            )
+            for option in options
+        )
     if cache is not None and cache_key is not None:
         cache[cache_key] = value
     return value
@@ -600,6 +657,434 @@ def choose_option(
     return option, diagnostics
 
 
+def env_for_scenario(
+    scenario: DiagnosticScenario | None,
+    convention: ConventionKey,
+    max_steps: int,
+    seed: int = 0,
+) -> ToyFactorGameEnv:
+    env = ToyFactorGameEnv(partner_convention=key_to_assignment(convention), max_steps=max_steps, seed=seed)
+    apply_scenario(env, scenario)
+    return env
+
+
+def option_values(
+    env: ToyFactorGameEnv,
+    belief: BeliefState,
+    depth: int,
+    likelihood_error: float,
+    use_observation: bool,
+    cache: dict[tuple, float] | None = None,
+) -> dict[OptionID, float]:
+    return {
+        option: option_lookahead_value(
+            env,
+            option,
+            belief,
+            ROLLOUT_GAMMA,
+            depth,
+            likelihood_error,
+            use_observation,
+            cache,
+        )
+        for option in valid_options(env)
+    }
+
+
+def best_option_and_values(
+    env: ToyFactorGameEnv,
+    belief: BeliefState,
+    depth: int,
+    likelihood_error: float,
+    use_observation: bool,
+    cache: dict[tuple, float] | None = None,
+) -> tuple[OptionID, dict[OptionID, float]]:
+    values = option_values(env, belief, depth, likelihood_error, use_observation, cache)
+    option = max(values, key=lambda candidate: (values[candidate], -int(candidate)))
+    return option, values
+
+
+def observation_distribution(
+    scenario: DiagnosticScenario,
+    option: OptionID,
+    convention: ConventionKey,
+    max_steps: int,
+) -> dict[int, float]:
+    env = env_for_scenario(scenario, convention, max_steps)
+    action = get_option_action(option, env.ego_pos, env.ego_carrying)
+    _obs, _reward, _done, info = env.step(action)
+    return {int(info["partner_action"]): 1.0}
+
+
+def total_variation(left: dict[int, float], right: dict[int, float]) -> float:
+    keys = set(left) | set(right)
+    return 0.5 * sum(abs(left.get(key, 0.0) - right.get(key, 0.0)) for key in keys)
+
+
+def observation_separation(
+    scenario: DiagnosticScenario,
+    option: OptionID,
+    conventions: tuple[ConventionKey, ConventionKey],
+    max_steps: int,
+) -> float:
+    left = observation_distribution(scenario, option, conventions[0], max_steps)
+    right = observation_distribution(scenario, option, conventions[1], max_steps)
+    return float(total_variation(left, right))
+
+
+def focused_convention_pairs(factor_idx: int) -> list[tuple[ConventionKey, ConventionKey]]:
+    pairs = []
+    keys = all_convention_keys()
+    for left in keys:
+        for right in keys:
+            if left >= right:
+                continue
+            if left[factor_idx] == right[factor_idx]:
+                continue
+            if all(left[idx] == right[idx] for idx in range(NUM_FACTORS) if idx != factor_idx):
+                pairs.append((left, right))
+    return pairs
+
+
+def candidate_scenarios() -> list[DiagnosticScenario]:
+    scenarios: list[DiagnosticScenario] = []
+
+    bottleneck_pairs = tuple(sorted({key for pair in focused_convention_pairs(0) for key in pair}))
+    delivery_pairs = tuple(sorted({key for pair in focused_convention_pairs(2) for key in pair}))
+    resource_pairs = tuple(sorted({key for pair in focused_convention_pairs(1) for key in pair}))
+
+    for offset, partner_col in enumerate((BOTTLENECK_COL + 1, BOTTLENECK_COL + 2)):
+        scenarios.append(
+            DiagnosticScenario(
+                name=f"candidate_bottleneck_carrying_{offset}",
+                description="Partner must cross the bottleneck while carrying; yielding convention changes collision risk.",
+                conventions=bottleneck_pairs,
+                ego_pos=(BOTTLENECK_ROW, BOTTLENECK_COL - 1),
+                partner_pos=(BOTTLENECK_ROW, partner_col),
+                partner_carrying=True,
+                resource_a_available=False,
+                resource_b_available=False,
+            )
+        )
+    for offset, partner_col in enumerate((BOTTLENECK_COL - 1, BOTTLENECK_COL - 2)):
+        scenarios.append(
+            DiagnosticScenario(
+                name=f"candidate_bottleneck_mirror_carrying_{offset}",
+                description="Mirrored bottleneck case where partner must cross right; yielding convention changes collision risk.",
+                conventions=bottleneck_pairs,
+                ego_pos=(BOTTLENECK_ROW, BOTTLENECK_COL + 1),
+                partner_pos=(BOTTLENECK_ROW, partner_col),
+                partner_carrying=True,
+                resource_a_available=False,
+                resource_b_available=False,
+            )
+        )
+
+    scenarios.extend(
+        [
+            DiagnosticScenario(
+                name="candidate_delivery_left_loaded",
+                description="Ego is at left delivery with soup; role convention determines whether to drop or reroute.",
+                conventions=delivery_pairs,
+                ego_pos=DELIVER_LEFT,
+                partner_pos=DELIVER_RIGHT,
+                ego_carrying=True,
+                partner_carrying=True,
+                resource_a_available=False,
+                resource_b_available=False,
+            ),
+            DiagnosticScenario(
+                name="candidate_delivery_right_loaded",
+                description="Ego is at right delivery with soup; role convention determines whether to drop or reroute.",
+                conventions=delivery_pairs,
+                ego_pos=DELIVER_RIGHT,
+                partner_pos=DELIVER_LEFT,
+                ego_carrying=True,
+                partner_carrying=True,
+                resource_a_available=False,
+                resource_b_available=False,
+            ),
+            DiagnosticScenario(
+                name="candidate_resource_a_contested",
+                description="Both agents are near resource A; ownership convention changes which resource ego should pursue.",
+                conventions=resource_pairs,
+                ego_pos=RESOURCE_A,
+                partner_pos=(RESOURCE_A[0] + 1, RESOURCE_A[1]),
+                resource_a_available=True,
+                resource_b_available=True,
+            ),
+            DiagnosticScenario(
+                name="candidate_resource_b_contested",
+                description="Ego is near resource B while partner approaches A; ownership convention changes target choice.",
+                conventions=resource_pairs,
+                ego_pos=RESOURCE_B,
+                partner_pos=(RESOURCE_A[0] + 1, RESOURCE_A[1]),
+                resource_a_available=True,
+                resource_b_available=True,
+            ),
+            DiagnosticScenario(
+                name="candidate_high_mi_low_value_distractor",
+                description="Resource signal is observable, but bottleneck yielding is the high-value control factor.",
+                conventions=((0, 0, 1), (1, 1, 1)),
+                ego_pos=(BOTTLENECK_ROW, BOTTLENECK_COL - 1),
+                partner_pos=(BOTTLENECK_ROW, BOTTLENECK_COL + 1),
+                partner_carrying=True,
+                resource_a_available=True,
+                resource_b_available=True,
+            ),
+        ]
+    )
+    return scenarios
+
+
+def scenario_convention_pairs(scenario: DiagnosticScenario) -> list[tuple[ConventionKey, ConventionKey]]:
+    if "bottleneck" in scenario.name:
+        delivery_mode = 0 if "mirror" in scenario.name else 1
+        return [
+            pair
+            for pair in focused_convention_pairs(0)
+            if pair[0][2] == delivery_mode and pair[1][2] == delivery_mode
+        ]
+    if "resource" in scenario.name:
+        return focused_convention_pairs(1)
+    if "delivery" in scenario.name:
+        return focused_convention_pairs(2)
+    if "distractor" in scenario.name:
+        if len(scenario.conventions) != 2:
+            raise ValueError(f"Distractor scenario {scenario.name} must define exactly two conventions")
+        return [(scenario.conventions[0], scenario.conventions[1])]
+    raise ValueError(f"No convention-pair generator for scenario {scenario.name}")
+
+
+def evaluate_candidate_case(
+    scenario: DiagnosticScenario,
+    conventions: tuple[ConventionKey, ConventionKey],
+    case_idx: int,
+    max_steps: int,
+    depth: int,
+    likelihood_error: float,
+    delta_gap: float,
+    delta_action: float,
+    delta_obs: float,
+    delta_return: float,
+    delta_mi: float,
+    delta_value: float,
+) -> DiagnosticCase:
+    belief = BeliefState.uniform(conventions)
+    env = env_for_scenario(scenario, conventions[0], max_steps)
+    cache: dict[tuple, float] = {}
+
+    passive_option, passive_values = best_option_and_values(
+        env, belief, depth, likelihood_error, use_observation=False, cache=cache
+    )
+    passive_value = passive_values[passive_option]
+
+    oracle_values = []
+    oracle_first_options = []
+    oracle_value_tables: list[dict[OptionID, float]] = []
+    for convention in conventions:
+        oracle_env = env_for_scenario(scenario, convention, max_steps)
+        oracle_belief = BeliefState.point_mass(convention)
+        oracle_option, values = best_option_and_values(
+            oracle_env,
+            oracle_belief,
+            depth,
+            likelihood_error,
+            use_observation=True,
+            cache=cache,
+        )
+        oracle_values.append(values[oracle_option])
+        oracle_first_options.append(oracle_option)
+        oracle_value_tables.append(values)
+
+    oracle_value = float(np.mean(oracle_values))
+    oracle_passive_gap = oracle_value - passive_value
+    if oracle_passive_gap < delta_gap:
+        return DiagnosticCase(
+            case_id=f"{scenario.name}_pair{case_idx}",
+            case_type="candidate",
+            scenario=scenario,
+            conventions=conventions,
+            oracle_passive_gap=float(oracle_passive_gap),
+            oracle_value=float(oracle_value),
+            passive_value=float(passive_value),
+            oracle_first_actions=tuple(OPTION_NAMES[option] for option in oracle_first_options),
+            passive_first_action=OPTION_NAMES[passive_option],
+            failure_reason="oracle_passive_gap",
+        )
+
+    best_response_flip = len(set(oracle_first_options)) > 1
+    if not best_response_flip:
+        return DiagnosticCase(
+            case_id=f"{scenario.name}_pair{case_idx}",
+            case_type="candidate",
+            scenario=scenario,
+            conventions=conventions,
+            oracle_passive_gap=float(oracle_passive_gap),
+            oracle_value=float(oracle_value),
+            passive_value=float(passive_value),
+            oracle_first_actions=tuple(OPTION_NAMES[option] for option in oracle_first_options),
+            passive_first_action=OPTION_NAMES[passive_option],
+            best_response_flip=False,
+            failure_reason="best_response_flip",
+        )
+
+    left_best, right_best = oracle_first_options
+    left_values, right_values = oracle_value_tables
+    wrong_action_regrets = [
+        left_values[left_best] - left_values.get(right_best, -1e9),
+        right_values[right_best] - right_values.get(left_best, -1e9),
+    ]
+    action_gap = max(wrong_action_regrets)
+    if action_gap < delta_action:
+        return DiagnosticCase(
+            case_id=f"{scenario.name}_pair{case_idx}",
+            case_type="candidate",
+            scenario=scenario,
+            conventions=conventions,
+            oracle_passive_gap=float(oracle_passive_gap),
+            oracle_value=float(oracle_value),
+            passive_value=float(passive_value),
+            oracle_first_actions=tuple(OPTION_NAMES[option] for option in oracle_first_options),
+            passive_first_action=OPTION_NAMES[passive_option],
+            best_response_flip=True,
+            action_gap=float(action_gap),
+            failure_reason="action_gap",
+        )
+
+    task_values = passive_values
+    best_diag: tuple[OptionID, float, float, float, float] | None = None
+    option_stats = []
+    before_entropy = belief.entropy_vector()
+    for option in valid_options(env):
+        separation = observation_separation(scenario, option, conventions, max_steps)
+        if separation < delta_obs:
+            continue
+        after_entropy = expected_entropy_after_option(env, option, belief, likelihood_error)
+        info_gain = np.maximum(before_entropy - after_entropy, 0.0)
+        mi_gain = float(np.dot(factor_observation_weights(env, option), info_gain))
+        value_with_observation = option_lookahead_value(
+            env,
+            option,
+            belief,
+            ROLLOUT_GAMMA,
+            depth,
+            likelihood_error,
+            use_observation=True,
+            cache=cache,
+        )
+        value_without_observation = task_values[option]
+        delta_info = value_with_observation - value_without_observation
+        return_gain = value_with_observation - passive_value
+        option_stats.append((option, mi_gain, delta_info, return_gain))
+        if return_gain < delta_return:
+            continue
+        candidate = (option, separation, return_gain, delta_info, mi_gain)
+        if best_diag is None or candidate[2] > best_diag[2]:
+            best_diag = candidate
+
+    if best_diag is None:
+        return DiagnosticCase(
+            case_id=f"{scenario.name}_pair{case_idx}",
+            case_type="candidate",
+            scenario=scenario,
+            conventions=conventions,
+            oracle_passive_gap=float(oracle_passive_gap),
+            oracle_value=float(oracle_value),
+            passive_value=float(passive_value),
+            oracle_first_actions=tuple(OPTION_NAMES[option] for option in oracle_first_options),
+            passive_first_action=OPTION_NAMES[passive_option],
+            best_response_flip=True,
+            action_gap=float(action_gap),
+            failure_reason="diagnostic_return_gain",
+        )
+
+    mi_option = max(option_stats, key=lambda item: (item[1], item[2], item[3])) if option_stats else None
+    gtvoi_option = max(option_stats, key=lambda item: (item[2], item[3], item[1])) if option_stats else None
+    high_mi_low_value = False
+    mi_gap = delta_info_gap = distractor_return_gap = None
+    if mi_option is not None and gtvoi_option is not None and mi_option[0] != gtvoi_option[0]:
+        mi_gap = mi_option[1] - gtvoi_option[1]
+        delta_info_gap = gtvoi_option[2] - mi_option[2]
+        distractor_return_gap = gtvoi_option[3] - mi_option[3]
+        high_mi_low_value = (
+            mi_gap >= delta_mi
+            and delta_info_gap >= delta_value
+            and distractor_return_gap >= delta_return
+        )
+
+    case_type = "high_mi_low_value_distractor" if high_mi_low_value else "diagnostic_critical"
+    return DiagnosticCase(
+        case_id=f"{scenario.name}_pair{case_idx}",
+        case_type=case_type,
+        scenario=scenario,
+        conventions=conventions,
+        oracle_passive_gap=float(oracle_passive_gap),
+        oracle_value=float(oracle_value),
+        passive_value=float(passive_value),
+        oracle_first_actions=tuple(OPTION_NAMES[option] for option in oracle_first_options),
+        passive_first_action=OPTION_NAMES[passive_option],
+        best_response_flip=True,
+        action_gap=float(action_gap),
+        best_diag_option=OPTION_NAMES[best_diag[0]],
+        observation_separation=float(best_diag[1]),
+        best_diag_return_gain=float(best_diag[2]),
+        best_diag_delta_info=float(best_diag[3]),
+        best_diag_mi_gain=float(best_diag[4]),
+        high_mi_low_value_distractor=high_mi_low_value,
+        mi_option=OPTION_NAMES[mi_option[0]] if mi_option is not None else None,
+        gtvoi_option=OPTION_NAMES[gtvoi_option[0]] if gtvoi_option is not None else None,
+        mi_gap=float(mi_gap) if mi_gap is not None else None,
+        delta_info_gap=float(delta_info_gap) if delta_info_gap is not None else None,
+        distractor_return_gap=float(distractor_return_gap) if distractor_return_gap is not None else None,
+        passed_filters=True,
+    )
+
+
+def synthesize_diagnostic_cases(
+    max_steps: int,
+    depth: int,
+    likelihood_error: float,
+    delta_gap: float,
+    delta_action: float,
+    delta_obs: float,
+    delta_return: float,
+    delta_mi: float,
+    delta_value: float,
+) -> tuple[list[DiagnosticCase], list[DiagnosticCase]]:
+    accepted: list[DiagnosticCase] = []
+    rejected: list[DiagnosticCase] = []
+    for scenario in candidate_scenarios():
+        for pair_idx, pair in enumerate(scenario_convention_pairs(scenario)):
+            case = evaluate_candidate_case(
+                scenario=scenario,
+                conventions=pair,
+                case_idx=pair_idx,
+                max_steps=max_steps,
+                depth=depth,
+                likelihood_error=likelihood_error,
+                delta_gap=delta_gap,
+                delta_action=delta_action,
+                delta_obs=delta_obs,
+                delta_return=delta_return,
+                delta_mi=delta_mi,
+                delta_value=delta_value,
+            )
+            if case.passed_filters:
+                accepted.append(case)
+            else:
+                rejected.append(case)
+    accepted.sort(
+        key=lambda case: (
+            bool(case.high_mi_low_value_distractor),
+            case.oracle_passive_gap or 0.0,
+            case.best_diag_return_gain or 0.0,
+        ),
+        reverse=True,
+    )
+    return accepted, rejected
+
+
 def is_aligned(belief: BeliefState, truth: ConventionKey, threshold: float) -> bool:
     predictions = belief.mode_predictions()
     for factor_idx in range(NUM_FACTORS):
@@ -627,12 +1112,14 @@ def run_episode(
     beta: float,
     likelihood_error: float,
     alignment_weight_threshold: float,
-    scenario: DiagnosticScenario | None,
+    case: DiagnosticCase,
+    shared_value_cache: dict[tuple, float] | None = None,
 ) -> dict[str, float | int | str | None]:
+    scenario = case.scenario
     rng = np.random.RandomState(seed)
     env = ToyFactorGameEnv(partner_convention=key_to_assignment(convention), max_steps=max_steps, seed=seed)
     apply_scenario(env, scenario)
-    belief = BeliefState.uniform(scenario.conventions if scenario is not None else None)
+    belief = BeliefState.uniform(case.conventions if scenario is not None else None)
 
     total_reward = 0.0
     early_reward = 0.0
@@ -650,7 +1137,7 @@ def run_episode(
     rewards: list[float] = []
     reward_after_first_diagnostic: float | None = None
     first_diagnostic_step: int | None = None
-    value_cache: dict[tuple, float] = {}
+    value_cache: dict[tuple, float] = shared_value_cache if shared_value_cache is not None else {}
 
     for step_idx in range(max_steps):
         env_before = copy.deepcopy(env)
@@ -726,10 +1213,22 @@ def run_episode(
     top_k = sorted_delta[: min(3, len(sorted_delta))]
 
     row: dict[str, float | int | str | None] = {
+        "case_id": case.case_id,
+        "case_type": case.case_type,
         "scenario": scenario.name if scenario is not None else "default_start",
         "method": method,
         "convention": convention_label(convention),
         "seed": seed,
+        "oracle_passive_gap": case.oracle_passive_gap,
+        "oracle_first_actions": ",".join(case.oracle_first_actions),
+        "passive_first_action": case.passive_first_action,
+        "best_response_flip": int(case.best_response_flip),
+        "action_gap": case.action_gap,
+        "best_diag_option": case.best_diag_option,
+        "observation_separation": case.observation_separation,
+        "best_diag_return_gain": case.best_diag_return_gain,
+        "high_mi_low_value_distractor": int(case.high_mi_low_value_distractor),
+        "first_action": selected_options[0] if selected_options else None,
         "episode_reward": float(total_reward),
         "early_reward": float(early_reward),
         "probe_cost": float(diagnostic_cost_total),
@@ -820,59 +1319,133 @@ def summarize_method(rows: list[dict[str, float | int | str | None]]) -> dict[st
 
 def add_oracle_regrets(rows: list[dict[str, float | int | str | None]]) -> None:
     oracle_by_case = {
-        (row["scenario"], row["seed"], row["convention"]): row
+        (row["case_id"], row["seed"], row["convention"]): row
         for row in rows
         if row["method"] == "oracle"
     }
     for row in rows:
-        oracle = oracle_by_case[(row["scenario"], row["seed"], row["convention"])]
+        oracle = oracle_by_case[(row["case_id"], row["seed"], row["convention"])]
         row["regret_to_oracle"] = float(oracle["episode_reward"]) - float(row["episode_reward"])
         row["early_regret_to_oracle"] = float(oracle["early_reward"]) - float(row["early_reward"])
 
 
-def tiered_validation(summary: dict[str, dict], rows: list[dict[str, float | int | str | None]]) -> dict:
-    required = [method for method in DEFAULT_METHODS if method in summary]
-    missing = [method for method in DEFAULT_METHODS if method not in summary]
-    max_delta_info = max(float(row["max_delta_info"]) for row in rows) if rows else 0.0
-    oracle_gap = (
-        summary["oracle"]["episode_reward_mean"] - summary["passive"]["episode_reward_mean"]
-        if "oracle" in summary and "passive" in summary
-        else float("nan")
-    )
+def _case_metric(case_rows: list[dict[str, object]], key: str, default: float = 0.0) -> float:
+    vals = [float(row[key]) for row in case_rows if row.get(key) is not None]
+    return float(np.median(vals)) if vals else default
 
-    tier0 = {
-        "oracle_gap": float(oracle_gap),
-        "oracle_gap_threshold": 0.3,
-        "max_delta_info": float(max_delta_info),
-        "max_delta_info_threshold": DELTA_INFO_THRESHOLD,
-        "status": "PASS" if oracle_gap > 0.3 and max_delta_info > DELTA_INFO_THRESHOLD else "SKIP_NOT_DIAGNOSTIC_CRITICAL",
+
+def _mean_reward_for(
+    rows: list[dict[str, float | int | str | None]],
+    method: str,
+    case_type: str | None = None,
+) -> float | None:
+    vals = [
+        float(row["episode_reward"])
+        for row in rows
+        if row["method"] == method and (case_type is None or row.get("case_type") == case_type)
+    ]
+    return float(np.mean(vals)) if vals else None
+
+
+def tiered_validation(
+    summary: dict[str, dict],
+    rows: list[dict[str, float | int | str | None]],
+    case_rows: list[dict[str, object]],
+    methods: list[str],
+    min_cases: int,
+    delta_gap: float,
+    delta_action: float,
+    delta_return: float,
+) -> dict:
+    required = [method for method in DEFAULT_METHODS if method in methods]
+    missing = [method for method in DEFAULT_METHODS if method not in summary]
+    accepted_cases = [row for row in case_rows if row.get("passed_filters")]
+    distractor_cases = [
+        row for row in accepted_cases if row.get("high_mi_low_value_distractor")
+    ]
+    median_gap = _case_metric(accepted_cases, "oracle_passive_gap")
+    median_action_gap = _case_metric(accepted_cases, "action_gap")
+    median_return_gain = _case_metric(accepted_cases, "best_diag_return_gain")
+    action_flip_rate = float(np.mean([float(row.get("best_response_flip", 0.0)) for row in accepted_cases])) if accepted_cases else 0.0
+    tier0_checks = {
+        "n_cases_ge_min": len(accepted_cases) >= min_cases,
+        "median_oracle_passive_gap_ge_threshold": median_gap >= delta_gap,
+        "action_flip_rate_positive": action_flip_rate > 0.0,
+        "median_action_gap_ge_threshold": median_action_gap >= delta_action,
+        "median_best_diag_return_gain_ge_threshold": median_return_gain >= delta_return,
     }
+    tier0 = {
+        "n_cases": len(accepted_cases),
+        "min_cases": min_cases,
+        "n_high_mi_low_value_distractor_cases": len(distractor_cases),
+        "median_oracle_passive_gap": float(median_gap),
+        "oracle_passive_gap_threshold": float(delta_gap),
+        "action_flip_rate": float(action_flip_rate),
+        "median_action_gap": float(median_action_gap),
+        "action_gap_threshold": float(delta_action),
+        "median_best_diag_return_gain": float(median_return_gain),
+        "diagnosis_return_gain_threshold": float(delta_return),
+        "checks": tier0_checks,
+        "status": "PASS" if all(tier0_checks.values()) else "FAIL_CASE_CONSTRUCTION",
+    }
+
     tier1_checks = {
-        "oracle_ge_gtvoi": "oracle" in summary and "gtvoi" in summary
-        and summary["oracle"]["episode_reward_mean"] >= summary["gtvoi"]["episode_reward_mean"],
-        "directed_gt_random": all(
-            method in summary
-            and "random" in summary
-            and summary[method]["episode_reward_mean"] > summary["random"]["episode_reward_mean"]
-            for method in ("gtvoi", "mi", "passive")
+        "oracle_ge_passive": (
+            "oracle" in summary
+            and "passive" in summary
+            and summary["oracle"]["episode_reward_mean"] >= summary["passive"]["episode_reward_mean"]
         ),
-        "gtvoi_has_diagnostics": "gtvoi" in summary and summary["gtvoi"]["diagnostic_count_mean"] > 0.0,
-        "mi_has_diagnostics": "mi" in summary and summary["mi"]["diagnostic_count_mean"] > 0.0,
+        "oracle_ge_all_directed": (
+            "oracle" in summary
+            and all(
+                method not in summary
+                or method == "oracle"
+                or summary["oracle"]["episode_reward_mean"] >= summary[method]["episode_reward_mean"]
+                for method in ("gtvoi", "mi", "passive")
+            )
+        ),
     }
     tier1 = {
         "checks": tier1_checks,
-        "status": "PASS" if tier0["status"] == "PASS" and all(tier1_checks.values()) else "FAIL",
+        "status": "PASS" if tier0["status"] == "PASS" and all(tier1_checks.values()) else "NOT_EVALUATED" if tier0["status"] != "PASS" else "FAIL",
     }
+
+    gtvoi_reward = summary.get("gtvoi", {}).get("episode_reward_mean")
+    passive_reward = summary.get("passive", {}).get("episode_reward_mean")
+    gtvoi_distractor = _mean_reward_for(rows, "gtvoi", "high_mi_low_value_distractor")
+    mi_distractor = _mean_reward_for(rows, "mi", "high_mi_low_value_distractor")
     tier2_checks = {
-        "gtvoi_cost_le_mi": "gtvoi" in summary and "mi" in summary
-        and summary["gtvoi"]["diagnostic_cost_mean"] <= summary["mi"]["diagnostic_cost_mean"],
-        "gtvoi_reward_ge_mi": "gtvoi" in summary and "mi" in summary
-        and summary["gtvoi"]["episode_reward_mean"] >= summary["mi"]["episode_reward_mean"],
+        "gtvoi_ge_passive": (
+            gtvoi_reward is not None
+            and passive_reward is not None
+            and gtvoi_reward >= passive_reward
+        ),
+        "distractor_subset_available": len(distractor_cases) > 0,
+        "gtvoi_ge_mi_on_distractor_subset": (
+            gtvoi_distractor is not None
+            and mi_distractor is not None
+            and gtvoi_distractor >= mi_distractor
+        ),
+        "gtvoi_cost_le_mi": (
+            "gtvoi" in summary
+            and "mi" in summary
+            and summary["gtvoi"]["diagnostic_cost_mean"] <= summary["mi"]["diagnostic_cost_mean"]
+        ),
     }
     tier2 = {
         "checks": tier2_checks,
-        "status": "PASS" if tier1["status"] == "PASS" and any(tier2_checks.values()) else "FAIL",
+        "status": (
+            "PASS"
+            if tier1["status"] == "PASS"
+            and tier2_checks["gtvoi_ge_passive"]
+            and (
+                tier2_checks["gtvoi_ge_mi_on_distractor_subset"]
+                or tier2_checks["gtvoi_cost_le_mi"]
+            )
+            else "NOT_EVALUATED" if tier1["status"] != "PASS" else "FAIL"
+        ),
     }
+
     gtvoi_delta_corr = summary.get("gtvoi", {}).get("future_return_delta_info_corr_mean")
     gtvoi_mi_corr = summary.get("gtvoi", {}).get("future_return_mi_corr_mean")
     tier3_checks = {
@@ -888,20 +1461,22 @@ def tiered_validation(summary: dict[str, dict], rows: list[dict[str, float | int
         "status": "SOFT_PASS" if all(tier3_checks.values()) else "WARN",
     }
     if missing:
-        overall = "FAIL"
+        overall = "FAIL_MISSING_METHODS"
     elif tier0["status"] != "PASS":
-        overall = "SKIP_NOT_DIAGNOSTIC_CRITICAL"
-    elif tier1["status"] == "PASS" and tier2["status"] == "PASS":
-        overall = "PASS"
+        overall = "FAIL_CASE_CONSTRUCTION"
+    elif tier1["status"] != "PASS":
+        overall = "FAIL_ORACLE_SANITY"
+    elif tier2["status"] != "PASS":
+        overall = "FAIL_DIAGNOSTIC_POLICY"
     else:
-        overall = "FAIL"
+        overall = "PASS"
 
     return {
         "required_methods": required,
         "missing_methods": missing,
-        "tier0_environment": tier0,
-        "tier1_methods": tier1,
-        "tier2_gtvoi_vs_mi": tier2,
+        "tier0_case_validity": tier0,
+        "tier1_oracle_sanity": tier1,
+        "tier2_diagnostic_policy": tier2,
         "tier3_soft_correlation": tier3,
         "overall_status": overall,
     }
@@ -910,10 +1485,22 @@ def tiered_validation(summary: dict[str, dict], rows: list[dict[str, float | int
 def write_csv(rows: list[dict[str, float | int | str | None]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
+        "case_id",
+        "case_type",
         "scenario",
         "method",
         "convention",
         "seed",
+        "oracle_passive_gap",
+        "oracle_first_actions",
+        "passive_first_action",
+        "best_response_flip",
+        "action_gap",
+        "best_diag_option",
+        "observation_separation",
+        "best_diag_return_gain",
+        "high_mi_low_value_distractor",
+        "first_action",
         "episode_reward",
         "early_reward",
         "regret_to_oracle",
@@ -954,6 +1541,72 @@ def write_csv(rows: list[dict[str, float | int | str | None]], path: Path) -> No
             writer.writerow({key: row.get(key) for key in fieldnames})
 
 
+def case_to_row(case: DiagnosticCase) -> dict[str, object]:
+    return {
+        "case_id": case.case_id,
+        "case_type": case.case_type,
+        "scenario": case.scenario.name if case.scenario is not None else "default_start",
+        "description": case.scenario.description if case.scenario is not None else "Original reset state",
+        "conventions": ",".join(convention_label(convention) for convention in case.conventions),
+        "oracle_passive_gap": case.oracle_passive_gap,
+        "oracle_value": case.oracle_value,
+        "passive_value": case.passive_value,
+        "oracle_first_actions": ",".join(case.oracle_first_actions),
+        "passive_first_action": case.passive_first_action,
+        "best_response_flip": int(case.best_response_flip),
+        "action_gap": case.action_gap,
+        "best_diag_option": case.best_diag_option,
+        "observation_separation": case.observation_separation,
+        "best_diag_return_gain": case.best_diag_return_gain,
+        "best_diag_delta_info": case.best_diag_delta_info,
+        "best_diag_mi_gain": case.best_diag_mi_gain,
+        "high_mi_low_value_distractor": int(case.high_mi_low_value_distractor),
+        "mi_option": case.mi_option,
+        "gtvoi_option": case.gtvoi_option,
+        "mi_gap": case.mi_gap,
+        "delta_info_gap": case.delta_info_gap,
+        "distractor_return_gap": case.distractor_return_gap,
+        "passed_filters": int(case.passed_filters),
+        "failure_reason": case.failure_reason,
+    }
+
+
+def write_cases_csv(case_rows: list[dict[str, object]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "case_id",
+        "case_type",
+        "scenario",
+        "description",
+        "conventions",
+        "oracle_passive_gap",
+        "oracle_value",
+        "passive_value",
+        "oracle_first_actions",
+        "passive_first_action",
+        "best_response_flip",
+        "action_gap",
+        "best_diag_option",
+        "observation_separation",
+        "best_diag_return_gain",
+        "best_diag_delta_info",
+        "best_diag_mi_gain",
+        "high_mi_low_value_distractor",
+        "mi_option",
+        "gtvoi_option",
+        "mi_gap",
+        "delta_info_gap",
+        "distractor_return_gap",
+        "passed_filters",
+        "failure_reason",
+    ]
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in case_rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+
+
 def parse_int_list(raw: str) -> list[int]:
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
@@ -968,36 +1621,108 @@ def parse_method_list(raw: str) -> list[str]:
     return methods
 
 
-def build_cases(scenario_set: str, max_conventions: int) -> list[tuple[DiagnosticScenario | None, ConventionKey]]:
+def git_value(args: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(args, cwd=Path(__file__).resolve().parents[2], text=True).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def git_metadata() -> dict[str, str | None]:
+    return {
+        "git_commit": git_value(["git", "rev-parse", "--short", "HEAD"]),
+        "branch": git_value(["git", "branch", "--show-current"]),
+    }
+
+
+def build_cases(
+    scenario_set: str,
+    max_conventions: int,
+    max_steps: int,
+    depth: int,
+    likelihood_error: float,
+    delta_gap: float,
+    delta_action: float,
+    delta_obs: float,
+    delta_return: float,
+    delta_mi: float,
+    delta_value: float,
+) -> tuple[list[DiagnosticCase], list[DiagnosticCase]]:
     if scenario_set == "default_start":
         conventions = all_convention_keys()
         if max_conventions > 0:
             conventions = conventions[:max_conventions]
-        return [(None, convention) for convention in conventions]
+        cases = [
+            DiagnosticCase(
+                case_id=f"default_start_{convention_label(convention)}",
+                case_type="default_start",
+                scenario=None,
+                conventions=(convention,),
+                passed_filters=True,
+            )
+            for convention in conventions
+        ]
+        return cases, []
+    if scenario_set == "handpicked":
+        cases: list[DiagnosticCase] = []
+        for scenario in HANDPICKED_DIAGNOSTIC_SCENARIOS:
+            if len(scenario.conventions) < 2:
+                raise ValueError(f"Diagnostic scenario {scenario.name} must include at least two conventions")
+            conventions = list(scenario.conventions)
+            if max_conventions > 0:
+                conventions = conventions[:max_conventions]
+            cases.append(
+                DiagnosticCase(
+                    case_id=scenario.name,
+                    case_type="handpicked",
+                    scenario=scenario,
+                    conventions=tuple(conventions),
+                    passed_filters=True,
+                )
+            )
+        return cases, []
     if scenario_set != "diagnostic":
-        raise ValueError("--scenario_set must be one of: diagnostic, default_start")
+        raise ValueError("--scenario_set must be one of: diagnostic, handpicked, default_start")
 
-    cases: list[tuple[DiagnosticScenario | None, ConventionKey]] = []
-    for scenario in DIAGNOSTIC_SCENARIOS:
-        if len(scenario.conventions) < 2:
-            raise ValueError(f"Diagnostic scenario {scenario.name} must include at least two conventions")
-        conventions = list(scenario.conventions)
-        if max_conventions > 0:
-            conventions = conventions[:max_conventions]
-        cases.extend((scenario, convention) for convention in conventions)
-    return cases
+    accepted, rejected = synthesize_diagnostic_cases(
+        max_steps=max_steps,
+        depth=depth,
+        likelihood_error=likelihood_error,
+        delta_gap=delta_gap,
+        delta_action=delta_action,
+        delta_obs=delta_obs,
+        delta_return=delta_return,
+        delta_mi=delta_mi,
+        delta_value=delta_value,
+    )
+    if max_conventions > 0:
+        accepted = accepted[:max_conventions]
+    return accepted, rejected
 
 
-def scenario_metadata(scenario_set: str) -> list[dict[str, object]]:
+def scenario_metadata(scenario_set: str, cases: list[DiagnosticCase]) -> list[dict[str, object]]:
     if scenario_set == "default_start":
         return [{"name": "default_start", "description": "Original reset state over convention assignments"}]
+    if scenario_set == "diagnostic":
+        return [
+            {
+                "case_id": case.case_id,
+                "case_type": case.case_type,
+                "scenario": case.scenario.name if case.scenario is not None else "default_start",
+                "conventions": [convention_label(convention) for convention in case.conventions],
+                "oracle_passive_gap": case.oracle_passive_gap,
+                "best_diag_return_gain": case.best_diag_return_gain,
+                "high_mi_low_value_distractor": case.high_mi_low_value_distractor,
+            }
+            for case in cases
+        ]
     return [
         {
             "name": scenario.name,
             "description": scenario.description,
             "conventions": [convention_label(convention) for convention in scenario.conventions],
         }
-        for scenario in DIAGNOSTIC_SCENARIOS
+        for scenario in HANDPICKED_DIAGNOSTIC_SCENARIOS
     ]
 
 
@@ -1009,12 +1734,20 @@ def main() -> None:
     parser.add_argument("--max_conventions", type=int, default=0,
                         help="Use the first N convention assignments/case conventions; 0 means all")
     parser.add_argument("--scenario_set", type=str, default="diagnostic",
-                        choices=("diagnostic", "default_start"))
+                        choices=("diagnostic", "handpicked", "default_start"))
     parser.add_argument("--methods", type=str, default=",".join(DEFAULT_METHODS))
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--likelihood_error", type=float, default=0.05)
     parser.add_argument("--alignment_weight_threshold", type=float, default=0.5)
+    parser.add_argument("--case_horizon", type=int, default=ROLLOUT_DEPTH)
+    parser.add_argument("--min_cases", type=int, default=DEFAULT_MIN_CASES)
+    parser.add_argument("--delta_gap", type=float, default=DEFAULT_DELTA_GAP)
+    parser.add_argument("--delta_action", type=float, default=DEFAULT_DELTA_ACTION)
+    parser.add_argument("--delta_obs", type=float, default=DEFAULT_DELTA_OBS)
+    parser.add_argument("--delta_return", type=float, default=DEFAULT_DELTA_RETURN)
+    parser.add_argument("--delta_mi", type=float, default=DEFAULT_DELTA_MI)
+    parser.add_argument("--delta_value", type=float, default=DEFAULT_DELTA_VALUE)
     parser.add_argument("--output_dir", type=str, default="results/toy_symbolic")
     parser.add_argument("--progress_every", type=int, default=0,
                         help="Print progress every N completed method episodes; 0 disables")
@@ -1030,59 +1763,119 @@ def main() -> None:
         raise ValueError("--max_steps must be positive")
     if args.max_conventions < 0:
         raise ValueError("--max_conventions must be non-negative")
+    if args.case_horizon <= 0:
+        raise ValueError("--case_horizon must be positive")
+    if args.min_cases < 0:
+        raise ValueError("--min_cases must be non-negative")
     if args.progress_every < 0:
         raise ValueError("--progress_every must be non-negative")
     set_seed(min(seeds) if seeds else 0)
 
     rows: list[dict[str, float | int | str | None]] = []
-    cases = build_cases(args.scenario_set, args.max_conventions)
-    total_runs = len(seeds) * len(cases) * args.episodes_per_convention * len(methods)
+    shared_value_cache: dict[tuple, float] = {}
+    cases, rejected_cases = build_cases(
+        args.scenario_set,
+        args.max_conventions,
+        args.max_steps,
+        args.case_horizon,
+        args.likelihood_error,
+        args.delta_gap,
+        args.delta_action,
+        args.delta_obs,
+        args.delta_return,
+        args.delta_mi,
+        args.delta_value,
+    )
+    case_rows = [case_to_row(case) for case in cases] + [case_to_row(case) for case in rejected_cases]
+    total_runs = (
+        len(seeds)
+        * sum(len(case.conventions) for case in cases)
+        * args.episodes_per_convention
+        * len(methods)
+    )
     completed_runs = 0
     for seed in seeds:
-        for scenario, convention in cases:
-            for repeat_idx in range(args.episodes_per_convention):
-                episode_seed = seed * 1000 + repeat_idx
-                for method in methods:
-                    rows.append(
-                        run_episode(
-                            method=method,
-                            convention=convention,
-                            seed=episode_seed,
-                            max_steps=args.max_steps,
-                            alpha=args.alpha,
-                            beta=args.beta,
-                            likelihood_error=args.likelihood_error,
-                            alignment_weight_threshold=args.alignment_weight_threshold,
-                            scenario=scenario,
+        for case in cases:
+            for convention in case.conventions:
+                for repeat_idx in range(args.episodes_per_convention):
+                    episode_seed = seed * 1000 + repeat_idx
+                    for method in methods:
+                        rows.append(
+                            run_episode(
+                                method=method,
+                                convention=convention,
+                                seed=episode_seed,
+                                max_steps=args.max_steps,
+                                alpha=args.alpha,
+                                beta=args.beta,
+                                likelihood_error=args.likelihood_error,
+                                alignment_weight_threshold=args.alignment_weight_threshold,
+                                case=case,
+                                shared_value_cache=shared_value_cache,
+                            )
                         )
-                    )
-                    completed_runs += 1
-                    if args.progress_every and completed_runs % args.progress_every == 0:
-                        print(f"Completed {completed_runs}/{total_runs} method episodes", flush=True)
+                        completed_runs += 1
+                        if args.progress_every and completed_runs % args.progress_every == 0:
+                            print(f"Completed {completed_runs}/{total_runs} method episodes", flush=True)
 
-    add_oracle_regrets(rows)
+    if rows:
+        add_oracle_regrets(rows)
     summary = {
         method: summarize_method([row for row in rows if row["method"] == method])
         for method in methods
+        if any(row["method"] == method for row in rows)
     }
 
-    costs = np.array([summary[method]["probe_cost_mean"] for method in methods], dtype=np.float64)
-    rewards = np.array([summary[method]["episode_reward_mean"] for method in methods], dtype=np.float64)
-    frontier_idx = pareto_frontier(costs, rewards)
-    frontier_methods = [methods[int(idx)] for idx in frontier_idx]
+    summary_methods = [method for method in methods if method in summary]
+    if summary_methods:
+        costs = np.array([summary[method]["probe_cost_mean"] for method in summary_methods], dtype=np.float64)
+        rewards = np.array([summary[method]["episode_reward_mean"] for method in summary_methods], dtype=np.float64)
+        frontier_idx = pareto_frontier(costs, rewards)
+        frontier_methods = [summary_methods[int(idx)] for idx in frontier_idx]
+    else:
+        frontier_methods = []
 
     output_dir = Path(args.output_dir)
+    validation = tiered_validation(
+        summary,
+        rows,
+        case_rows,
+        methods,
+        args.min_cases,
+        args.delta_gap,
+        args.delta_action,
+        args.delta_return,
+    )
     output = {
-        "schema": "toy_symbolic_v4_sanity",
+        "schema": SYMBOLIC_SCHEMA,
+        **git_metadata(),
         "config": vars(args),
         "methods": methods,
         "scenario_set": args.scenario_set,
-        "scenarios": scenario_metadata(args.scenario_set),
+        "scenarios": scenario_metadata(args.scenario_set, cases),
+        "case_synthesis": {
+            "thresholds": {
+                "delta_gap": args.delta_gap,
+                "delta_action": args.delta_action,
+                "delta_obs": args.delta_obs,
+                "delta_return": args.delta_return,
+                "delta_mi": args.delta_mi,
+                "delta_value": args.delta_value,
+            },
+            "case_horizon": args.case_horizon,
+            "n_accepted_cases": len(cases),
+            "n_rejected_cases": len(rejected_cases),
+            "rejection_counts": {
+                reason: sum(1 for case in rejected_cases if case.failure_reason == reason)
+                for reason in sorted({case.failure_reason for case in rejected_cases if case.failure_reason})
+            },
+        },
         "n_cases": len(cases),
-        "n_conventions": len({convention for _scenario, convention in cases}),
+        "n_candidate_cases": len(cases) + len(rejected_cases),
+        "n_conventions": len({convention for case in cases for convention in case.conventions}),
         "n_rows": len(rows),
         "summary": summary,
-        "validation": tiered_validation(summary, rows),
+        "validation": validation,
         "reward_probe_cost_pareto_methods": frontier_methods,
         "ground_truth_note": (
             "Factor accuracy, confidence, ECE, and regret use the toy environment's "
@@ -1091,19 +1884,20 @@ def main() -> None:
     }
     save_results(output, str(output_dir / "summary.json"))
     write_csv(rows, output_dir / "episodes.csv")
+    write_cases_csv(case_rows, output_dir / "cases.csv")
 
     print(f"Saved symbolic toy pilot summary to {output_dir / 'summary.json'}")
     print(f"Saved per-episode rows to {output_dir / 'episodes.csv'}")
-    validation = output["validation"]
+    print(f"Saved diagnostic case rows to {output_dir / 'cases.csv'}")
     print(
         "Tiered validation:",
         validation["overall_status"],
         "| Tier0",
-        validation["tier0_environment"]["status"],
+        validation["tier0_case_validity"]["status"],
         "| Tier1",
-        validation["tier1_methods"]["status"],
+        validation["tier1_oracle_sanity"]["status"],
         "| Tier2",
-        validation["tier2_gtvoi_vs_mi"]["status"],
+        validation["tier2_diagnostic_policy"]["status"],
         "| Tier3",
         validation["tier3_soft_correlation"]["status"],
     )
