@@ -1607,6 +1607,124 @@ def write_cases_csv(case_rows: list[dict[str, object]], path: Path) -> None:
             writer.writerow({key: row.get(key) for key in fieldnames})
 
 
+def write_scenario_debug_csv(
+    rows: list[dict[str, float | int | str | None]],
+    case_rows: list[dict[str, object]],
+    path: Path,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    case_by_id = {str(row["case_id"]): row for row in case_rows if row.get("passed_filters")}
+    oracle_rewards: dict[str, float] = {}
+    passive_rewards: dict[str, float] = {}
+    for case_id in case_by_id:
+        oracle_vals = [
+            float(row["episode_reward"])
+            for row in rows
+            if row["case_id"] == case_id and row["method"] == "oracle"
+        ]
+        passive_vals = [
+            float(row["episode_reward"])
+            for row in rows
+            if row["case_id"] == case_id and row["method"] == "passive"
+        ]
+        oracle_rewards[case_id] = float(np.mean(oracle_vals)) if oracle_vals else float("nan")
+        passive_rewards[case_id] = float(np.mean(passive_vals)) if passive_vals else float("nan")
+
+    fieldnames = [
+        "case_id",
+        "case_type",
+        "scenario",
+        "method",
+        "n",
+        "conventions",
+        "seeds",
+        "episode_reward_mean",
+        "oracle_reward_mean",
+        "passive_reward_mean",
+        "oracle_passive_gap_case",
+        "oracle_passive_gap_realized",
+        "regret_to_oracle_mean",
+        "first_actions",
+        "oracle_first_actions",
+        "passive_first_action",
+        "first_action_matches_oracle_rate",
+        "max_delta_info_mean",
+        "max_delta_info_max",
+        "mean_delta_info_mean",
+        "mean_mi_gain_mean",
+        "future_return_delta_info_corr_mean",
+        "future_return_mi_corr_mean",
+        "diagnostic_cost_mean",
+        "diagnostic_count_mean",
+        "reward_after_first_diagnostic_mean",
+        "best_response_flip",
+        "action_gap",
+        "best_diag_option",
+        "observation_separation",
+        "best_diag_return_gain",
+        "high_mi_low_value_distractor",
+    ]
+    grouped: dict[tuple[str, str], list[dict[str, float | int | str | None]]] = {}
+    for row in rows:
+        grouped.setdefault((str(row["case_id"]), str(row["method"])), []).append(row)
+
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for (case_id, method), group in sorted(grouped.items()):
+            case = case_by_id.get(case_id, {})
+            oracle_actions = set(str(group[0].get("oracle_first_actions", "")).split(","))
+            first_actions = [str(row.get("first_action")) for row in group if row.get("first_action")]
+            match_rate = (
+                float(np.mean([action in oracle_actions for action in first_actions]))
+                if first_actions
+                else float("nan")
+            )
+            realized_gap = oracle_rewards.get(case_id, float("nan")) - passive_rewards.get(case_id, float("nan"))
+            writer.writerow(
+                {
+                    "case_id": case_id,
+                    "case_type": group[0].get("case_type"),
+                    "scenario": group[0].get("scenario"),
+                    "method": method,
+                    "n": len(group),
+                    "conventions": ",".join(sorted({str(row["convention"]) for row in group})),
+                    "seeds": ",".join(sorted({str(row["seed"]) for row in group})),
+                    "episode_reward_mean": _mean_numeric(group, "episode_reward"),
+                    "oracle_reward_mean": oracle_rewards.get(case_id),
+                    "passive_reward_mean": passive_rewards.get(case_id),
+                    "oracle_passive_gap_case": case.get("oracle_passive_gap"),
+                    "oracle_passive_gap_realized": realized_gap,
+                    "regret_to_oracle_mean": _mean_numeric(group, "regret_to_oracle"),
+                    "first_actions": ",".join(sorted(set(first_actions))),
+                    "oracle_first_actions": group[0].get("oracle_first_actions"),
+                    "passive_first_action": group[0].get("passive_first_action"),
+                    "first_action_matches_oracle_rate": match_rate,
+                    "max_delta_info_mean": _mean_numeric(group, "max_delta_info"),
+                    "max_delta_info_max": max(float(row["max_delta_info"]) for row in group),
+                    "mean_delta_info_mean": _mean_numeric(group, "mean_delta_info"),
+                    "mean_mi_gain_mean": _mean_numeric(group, "mean_mi_gain"),
+                    "future_return_delta_info_corr_mean": _mean_numeric(
+                        group, "future_return_delta_info_corr", default=float("nan")
+                    ),
+                    "future_return_mi_corr_mean": _mean_numeric(
+                        group, "future_return_mi_corr", default=float("nan")
+                    ),
+                    "diagnostic_cost_mean": _mean_numeric(group, "diagnostic_cost"),
+                    "diagnostic_count_mean": _mean_numeric(group, "diagnostic_count"),
+                    "reward_after_first_diagnostic_mean": _mean_numeric(
+                        group, "reward_after_first_diagnostic", default=float("nan")
+                    ),
+                    "best_response_flip": case.get("best_response_flip"),
+                    "action_gap": case.get("action_gap"),
+                    "best_diag_option": case.get("best_diag_option"),
+                    "observation_separation": case.get("observation_separation"),
+                    "best_diag_return_gain": case.get("best_diag_return_gain"),
+                    "high_mi_low_value_distractor": case.get("high_mi_low_value_distractor"),
+                }
+            )
+
+
 def parse_int_list(raw: str) -> list[int]:
     return [int(part.strip()) for part in raw.split(",") if part.strip()]
 
@@ -1885,10 +2003,12 @@ def main() -> None:
     save_results(output, str(output_dir / "summary.json"))
     write_csv(rows, output_dir / "episodes.csv")
     write_cases_csv(case_rows, output_dir / "cases.csv")
+    write_scenario_debug_csv(rows, case_rows, output_dir / "scenario_debug.csv")
 
     print(f"Saved symbolic toy pilot summary to {output_dir / 'summary.json'}")
     print(f"Saved per-episode rows to {output_dir / 'episodes.csv'}")
     print(f"Saved diagnostic case rows to {output_dir / 'cases.csv'}")
+    print(f"Saved per-scenario debug rows to {output_dir / 'scenario_debug.csv'}")
     print(
         "Tiered validation:",
         validation["overall_status"],

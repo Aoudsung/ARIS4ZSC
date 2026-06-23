@@ -15,6 +15,7 @@ from toy_factor_game.run_symbolic_pilot import (  # noqa: E402
     ROLLOUT_DEPTH,
     SYMBOLIC_SCHEMA,
     case_to_row,
+    write_scenario_debug_csv,
     synthesize_diagnostic_cases,
     tiered_validation,
 )
@@ -107,3 +108,71 @@ def test_symbolic_case_rows_include_phase3_metadata():
     assert row["oracle_passive_gap"] is not None
     assert row["best_diag_option"]
     assert row["passed_filters"] == 1
+
+
+def test_symbolic_scenario_debug_csv_contains_requested_columns(tmp_path):
+    accepted, _rejected = synthesize_diagnostic_cases(
+        max_steps=50,
+        depth=ROLLOUT_DEPTH,
+        likelihood_error=0.05,
+        delta_gap=DEFAULT_DELTA_GAP,
+        delta_action=DEFAULT_DELTA_ACTION,
+        delta_obs=DEFAULT_DELTA_OBS,
+        delta_return=DEFAULT_DELTA_RETURN,
+        delta_mi=DEFAULT_DELTA_MI,
+        delta_value=DEFAULT_DELTA_VALUE,
+    )
+    case = accepted[0]
+    case_rows = [case_to_row(case)]
+    rows = [
+        {
+            "case_id": case.case_id,
+            "case_type": case.case_type,
+            "scenario": case.scenario.name,
+            "method": "oracle",
+            "convention": "0-0-0",
+            "seed": 0,
+            "episode_reward": 1.0,
+            "regret_to_oracle": 0.0,
+            "first_action": case.oracle_first_actions[0],
+            "oracle_first_actions": ",".join(case.oracle_first_actions),
+            "passive_first_action": case.passive_first_action,
+            "max_delta_info": 0.2,
+            "mean_delta_info": 0.1,
+            "mean_mi_gain": 0.05,
+            "future_return_delta_info_corr": 0.1,
+            "future_return_mi_corr": 0.0,
+            "diagnostic_cost": 0.0,
+            "diagnostic_count": 0,
+            "reward_after_first_diagnostic": None,
+        },
+        {
+            "case_id": case.case_id,
+            "case_type": case.case_type,
+            "scenario": case.scenario.name,
+            "method": "passive",
+            "convention": "0-0-0",
+            "seed": 0,
+            "episode_reward": 0.5,
+            "regret_to_oracle": 0.5,
+            "first_action": case.passive_first_action,
+            "oracle_first_actions": ",".join(case.oracle_first_actions),
+            "passive_first_action": case.passive_first_action,
+            "max_delta_info": 0.1,
+            "mean_delta_info": 0.05,
+            "mean_mi_gain": 0.05,
+            "future_return_delta_info_corr": None,
+            "future_return_mi_corr": None,
+            "diagnostic_cost": 0.0,
+            "diagnostic_count": 0,
+            "reward_after_first_diagnostic": None,
+        },
+    ]
+    path = tmp_path / "scenario_debug.csv"
+    write_scenario_debug_csv(rows, case_rows, path)
+    header = path.read_text().splitlines()[0].split(",")
+
+    assert "case_id" in header
+    assert "oracle_passive_gap_realized" in header
+    assert "first_action_matches_oracle_rate" in header
+    assert "best_diag_return_gain" in header
