@@ -24,8 +24,5 @@ jaxmarl = [
 ]
 dev = ["pytest>=8"]
 
-[project.scripts]
-tcaso-gate3 = "tcaso_critic.cli:main"
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["experiments"]

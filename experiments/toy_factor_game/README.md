@@ -1,9 +1,7 @@
 # Toy Factor Game Experiments
 
 This directory contains the current ARIS-Bellman toy implementation for
-zero-shot coordination via interaction-factor beliefs. Legacy TCASO code under
-`src/tcaso_critic/` is retained for historical context and is not used for
-ARIS-Bellman claims.
+zero-shot coordination via interaction-factor beliefs.
 
 ## ARIS-Bellman Neural Toy Path
 
