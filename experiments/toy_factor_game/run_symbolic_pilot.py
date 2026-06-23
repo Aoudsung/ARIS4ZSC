@@ -1,12 +1,10 @@
 """
-Symbolic toy pilot for the first experiment-bridge milestone.
+Symbolic diagnostic sanity suite for the toy factor game.
 
-This runner targets the plan's first toy-game priority before any OvercookedV2
-work: compare G-TVOI, MI probing, passive inference, random task-valid options,
-and an oracle diagnostic policy on known ground-truth interaction factors.
-
-It deliberately evaluates against the toy environment's ground-truth convention
-assignment. No method is scored against another model's output.
+This runner is intentionally separate from the neural ARIS-Bellman experiments.
+It checks whether a small set of hand-built toy states has a diagnostic gap:
+observing partner responses through task-valid options should create Bellman
+value, and that value should explain downstream return better than raw MI.
 """
 
 import argparse
@@ -26,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.metrics import bootstrap_ci, expected_calibration_error, pareto_frontier
 from common.utils import save_results, set_seed
 from toy_factor_game.env import (
+    BOTTLENECK_COL,
+    BOTTLENECK_ROW,
     DELIVER_LEFT,
     DELIVER_RIGHT,
     FACTOR_MODES,
@@ -39,17 +39,65 @@ from toy_factor_game.env import (
 from toy_factor_game.options import OPTION_NAMES, OptionID, get_option_action
 
 
-METHODS = ("gtvoi", "mi", "passive", "random", "oracle")
-DIAGNOSTIC_OPTIONS = {
-    OptionID.CROSS_CORRIDOR,
-    OptionID.WAIT_AT_BOTTLENECK,
-    OptionID.GOTO_RESOURCE_A,
-    OptionID.DELIVER_LEFT,
-    OptionID.DELIVER_RIGHT,
-}
-
+METHODS = ("gtvoi", "mi", "passive", "random", "oracle", "oracle_greedy")
+DEFAULT_METHODS = ("gtvoi", "mi", "passive", "random", "oracle")
+ROLLOUT_DEPTH = 3
+ROLLOUT_GAMMA = 0.99
+DELTA_INFO_THRESHOLD = 0.05
 
 ConventionKey = tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class DiagnosticScenario:
+    name: str
+    description: str
+    conventions: tuple[ConventionKey, ...]
+    ego_pos: tuple[int, int]
+    partner_pos: tuple[int, int]
+    ego_carrying: bool = False
+    partner_carrying: bool = False
+    resource_a_available: bool = True
+    resource_b_available: bool = True
+    deliveries_left: int = 0
+    deliveries_right: int = 0
+    step_count: int = 0
+
+
+DIAGNOSTIC_SCENARIOS = (
+    DiagnosticScenario(
+        name="bottleneck_critical",
+        description="Agents face each other at the bottleneck; yielding convention changes best action.",
+        conventions=((0, 0, 0), (1, 0, 0), (2, 0, 0)),
+        ego_pos=(BOTTLENECK_ROW, BOTTLENECK_COL - 1),
+        partner_pos=(BOTTLENECK_ROW, BOTTLENECK_COL + 1),
+    ),
+    DiagnosticScenario(
+        name="resource_critical",
+        description="Ego is near resource A; ownership convention determines whether A or B is valuable.",
+        conventions=((0, 0, 0), (0, 1, 0)),
+        ego_pos=(RESOURCE_A[0], RESOURCE_A[1] - 1),
+        partner_pos=(RESOURCE_A[0] + 1, RESOURCE_A[1]),
+    ),
+    DiagnosticScenario(
+        name="delivery_critical",
+        description="Both agents carry soup; delivery role convention changes the correct target.",
+        conventions=((0, 0, 0), (0, 0, 1)),
+        ego_pos=(BOTTLENECK_ROW - 1, BOTTLENECK_COL),
+        partner_pos=(BOTTLENECK_ROW + 1, BOTTLENECK_COL),
+        ego_carrying=True,
+        partner_carrying=True,
+        resource_a_available=False,
+        resource_b_available=False,
+    ),
+    DiagnosticScenario(
+        name="high_mi_low_value_distractor",
+        description="Resource observations are easy, but bottleneck yielding is the value-critical factor.",
+        conventions=((0, 0, 0), (1, 1, 0)),
+        ego_pos=(BOTTLENECK_ROW, BOTTLENECK_COL - 1),
+        partner_pos=(BOTTLENECK_ROW, BOTTLENECK_COL + 1),
+    ),
+)
 
 
 def all_convention_keys() -> list[ConventionKey]:
@@ -62,11 +110,11 @@ def all_convention_keys() -> list[ConventionKey]:
 
 
 def key_to_assignment(key: ConventionKey) -> ConventionAssignment:
-    return ConventionAssignment(modes={f: key[f] for f in range(NUM_FACTORS)})
+    return ConventionAssignment(modes={factor: key[factor] for factor in range(NUM_FACTORS)})
 
 
 def convention_label(key: ConventionKey) -> str:
-    return "-".join(str(v) for v in key)
+    return "-".join(str(value) for value in key)
 
 
 def entropy(probs: np.ndarray) -> float:
@@ -83,10 +131,10 @@ class BeliefState:
     weights: dict[ConventionKey, float]
 
     @classmethod
-    def uniform(cls) -> "BeliefState":
-        keys = all_convention_keys()
-        p = 1.0 / len(keys)
-        return cls({key: p for key in keys})
+    def uniform(cls, keys: Iterable[ConventionKey] | None = None) -> "BeliefState":
+        keys = list(keys) if keys is not None else all_convention_keys()
+        prob = 1.0 / len(keys)
+        return cls({key: prob for key in keys})
 
     @classmethod
     def point_mass(cls, key: ConventionKey) -> "BeliefState":
@@ -99,21 +147,21 @@ class BeliefState:
         return BeliefState({key: value / total for key, value in self.weights.items()})
 
     def marginals(self) -> list[np.ndarray]:
-        out = [np.zeros(FACTOR_MODES[f], dtype=np.float64) for f in range(NUM_FACTORS)]
+        out = [np.zeros(FACTOR_MODES[factor], dtype=np.float64) for factor in range(NUM_FACTORS)]
         for key, prob in self.weights.items():
             for factor_idx, mode in enumerate(key):
                 out[factor_idx][mode] += prob
         return out
 
     def entropy_vector(self) -> np.ndarray:
-        return np.array([entropy(m) for m in self.marginals()], dtype=np.float64)
+        return np.array([entropy(marginal) for marginal in self.marginals()], dtype=np.float64)
 
     def mode_predictions(self) -> list[int]:
-        return [int(np.argmax(m)) for m in self.marginals()]
+        return [int(np.argmax(marginal)) for marginal in self.marginals()]
 
     def confidence_for_truth(self, truth: ConventionKey) -> list[float]:
         marginals = self.marginals()
-        return [float(marginals[f][truth[f]]) for f in range(NUM_FACTORS)]
+        return [float(marginals[factor][truth[factor]]) for factor in range(NUM_FACTORS)]
 
     def update_from_partner_action(
         self,
@@ -137,6 +185,44 @@ def predict_partner_action(env_before: ToyFactorGameEnv, convention: ConventionK
     candidate = copy.deepcopy(env_before)
     candidate.partner_convention = key_to_assignment(convention)
     return candidate._partner_action()
+
+
+def env_cache_key(env: ToyFactorGameEnv) -> tuple:
+    return (
+        tuple(env.ego_pos),
+        tuple(env.partner_pos),
+        bool(env.ego_carrying),
+        bool(env.partner_carrying),
+        bool(env.resource_a_available),
+        bool(env.resource_b_available),
+        int(env.deliveries_left),
+        int(env.deliveries_right),
+        int(env.step_count),
+    )
+
+
+def belief_cache_key(belief: BeliefState) -> tuple[float, ...]:
+    return tuple(
+        value
+        for key, prob in sorted(belief.weights.items())
+        for value in (*key, round(float(prob), 8))
+    )
+
+
+def apply_scenario(env: ToyFactorGameEnv, scenario: DiagnosticScenario | None) -> None:
+    if scenario is None:
+        return
+    env.step_count = scenario.step_count
+    env.ego_pos = list(scenario.ego_pos)
+    env.partner_pos = list(scenario.partner_pos)
+    env.ego_carrying = scenario.ego_carrying
+    env.partner_carrying = scenario.partner_carrying
+    env.resource_a_available = scenario.resource_a_available
+    env.resource_b_available = scenario.resource_b_available
+    env.deliveries_left = scenario.deliveries_left
+    env.deliveries_right = scenario.deliveries_right
+    env.collisions = 0
+    env.total_reward = 0.0
 
 
 def valid_options(env: ToyFactorGameEnv) -> list[OptionID]:
@@ -165,9 +251,9 @@ def option_target(option: OptionID):
     if option == OptionID.DELIVER_RIGHT:
         return DELIVER_RIGHT
     if option == OptionID.CROSS_CORRIDOR:
-        return (3, 3)
+        return (BOTTLENECK_ROW, BOTTLENECK_COL)
     if option == OptionID.WAIT_AT_BOTTLENECK:
-        return (3, 2)
+        return (BOTTLENECK_ROW, BOTTLENECK_COL - 1)
     return None
 
 
@@ -175,14 +261,6 @@ def manhattan(a: Iterable[int], b: Iterable[int]) -> int:
     ar, ac = a
     br, bc = b
     return abs(ar - br) + abs(ac - bc)
-
-
-def option_cost(option: OptionID) -> float:
-    if option in (OptionID.NOOP, OptionID.WAIT_AT_BOTTLENECK):
-        return 1.5
-    if option == OptionID.CROSS_CORRIDOR:
-        return 1.2
-    return 1.0
 
 
 def greedy_task_option(env: ToyFactorGameEnv, belief: BeliefState) -> OptionID:
@@ -205,27 +283,71 @@ def greedy_task_option(env: ToyFactorGameEnv, belief: BeliefState) -> OptionID:
     return OptionID.NOOP
 
 
-def progress_bonus(env: ToyFactorGameEnv, option: OptionID, belief: BeliefState) -> float:
-    target = option_target(option)
+def factor_observation_weights(env: ToyFactorGameEnv, option: OptionID) -> np.ndarray:
+    target = option_target(option) or tuple(env.ego_pos)
+    bottleneck_weight = 1.0 if manhattan(target, (BOTTLENECK_ROW, BOTTLENECK_COL)) <= 2 else 0.2
+    resource_weight = 1.0 if min(manhattan(target, RESOURCE_A), manhattan(target, RESOURCE_B)) <= 3 else 0.25
+    delivery_weight = 1.0 if min(manhattan(target, DELIVER_LEFT), manhattan(target, DELIVER_RIGHT)) <= 3 else 0.2
+    if option in (OptionID.GOTO_RESOURCE_A, OptionID.GOTO_RESOURCE_B, OptionID.PICKUP):
+        resource_weight = 1.2
+    if option in (OptionID.DELIVER_LEFT, OptionID.DELIVER_RIGHT, OptionID.DROP):
+        delivery_weight = 1.2
+    if option in (OptionID.CROSS_CORRIDOR, OptionID.WAIT_AT_BOTTLENECK):
+        bottleneck_weight = 1.2
+    return np.array([bottleneck_weight, resource_weight, delivery_weight], dtype=np.float64)
+
+
+def option_coordination_bonus(env: ToyFactorGameEnv, option: OptionID, belief: BeliefState) -> float:
+    marginals = belief.marginals()
     bonus = 0.0
-    if target is not None:
-        bonus -= 0.05 * manhattan(env.ego_pos, target)
-    if option == greedy_task_option(env, belief):
-        bonus += 0.5
-    if option in (OptionID.PICKUP, OptionID.DROP):
-        bonus += 0.3
-    return bonus
+    near_bottleneck = (
+        env.ego_pos[0] == BOTTLENECK_ROW
+        or env.partner_pos[0] == BOTTLENECK_ROW
+        or option in (OptionID.CROSS_CORRIDOR, OptionID.WAIT_AT_BOTTLENECK)
+    )
+    if near_bottleneck:
+        if option == OptionID.CROSS_CORRIDOR:
+            bonus += 2.0 * marginals[0][1] + 0.7 * marginals[0][2] - 2.0 * marginals[0][0]
+        elif option == OptionID.WAIT_AT_BOTTLENECK:
+            bonus += 1.6 * marginals[0][0] + 0.4 * marginals[0][2] - 0.9 * marginals[0][1]
+
+    if not env.ego_carrying and (env.resource_a_available or env.resource_b_available):
+        if option == OptionID.GOTO_RESOURCE_A:
+            bonus += 1.7 * marginals[1][0] - 1.2 * marginals[1][1]
+        elif option == OptionID.GOTO_RESOURCE_B:
+            bonus += 1.5 * marginals[1][1] - 0.7 * marginals[1][0]
+
+    if env.ego_carrying:
+        if option == OptionID.DELIVER_LEFT:
+            bonus += 2.0 * marginals[2][0] - 1.1 * marginals[2][1]
+        elif option == OptionID.DELIVER_RIGHT:
+            bonus += 2.0 * marginals[2][1] - 1.1 * marginals[2][0]
+    return float(bonus)
 
 
-def expected_step_reward(env: ToyFactorGameEnv, option: OptionID, belief: BeliefState) -> float:
-    action = get_option_action(option, env.ego_pos, env.ego_carrying)
-    reward = 0.0
-    for key, prob in belief.weights.items():
-        branch = copy.deepcopy(env)
-        branch.partner_convention = key_to_assignment(key)
-        _obs, step_reward, _done, _info = branch.step(action)
-        reward += prob * step_reward
-    return float(reward)
+def progress_potential(env: ToyFactorGameEnv, belief: BeliefState) -> float:
+    if env.deliveries_left > 0 and env.deliveries_right > 0:
+        return 0.0
+    marginals = belief.marginals()
+    if env.ego_carrying:
+        target = DELIVER_LEFT if marginals[2][0] >= marginals[2][1] else DELIVER_RIGHT
+        return 3.0 - 0.25 * manhattan(env.ego_pos, target)
+    if tuple(env.ego_pos) in (RESOURCE_A, RESOURCE_B):
+        return 2.0
+    if env.resource_a_available and env.resource_b_available:
+        target = RESOURCE_A if marginals[1][0] >= marginals[1][1] else RESOURCE_B
+        return 1.5 - 0.2 * manhattan(env.ego_pos, target)
+    if env.resource_a_available:
+        return 1.2 - 0.2 * manhattan(env.ego_pos, RESOURCE_A)
+    if env.resource_b_available:
+        return 1.2 - 0.2 * manhattan(env.ego_pos, RESOURCE_B)
+    return 0.0
+
+
+def future_potential(env: ToyFactorGameEnv, belief: BeliefState) -> float:
+    options = valid_options(env)
+    coordination = max((option_coordination_bonus(env, option, belief) for option in options), default=0.0)
+    return float(progress_potential(env, belief) + coordination)
 
 
 def expected_entropy_after_option(
@@ -251,55 +373,202 @@ def expected_entropy_after_option(
     return expected
 
 
-def value_weights(env: ToyFactorGameEnv, option: OptionID) -> np.ndarray:
-    near_bottleneck = (
-        env.ego_pos[0] == 3
-        or env.partner_pos[0] == 3
-        or option in (OptionID.CROSS_CORRIDOR, OptionID.WAIT_AT_BOTTLENECK)
-    )
-    resource_active = (not env.ego_carrying) and (env.resource_a_available or env.resource_b_available)
-    delivery_active = env.ego_carrying
-    return np.array(
-        [
-            1.0 if near_bottleneck else 0.25,
-            1.0 if resource_active else 0.15,
-            1.0 if delivery_active else 0.15,
-        ],
-        dtype=np.float64,
-    )
+def rollout_value(
+    env: ToyFactorGameEnv,
+    belief: BeliefState,
+    depth: int,
+    gamma: float,
+    true_key: ConventionKey,
+    likelihood_error: float,
+    use_observation: bool,
+    cache: dict[tuple, float] | None = None,
+) -> float:
+    cache_key = None
+    if cache is not None:
+        cache_key = (
+            "rollout",
+            env_cache_key(env),
+            belief_cache_key(belief),
+            true_key,
+            bool(use_observation),
+        )
+        if cache_key in cache:
+            return cache[cache_key]
+    value = future_potential(env, belief)
+    if cache is not None and cache_key is not None:
+        cache[cache_key] = value
+    return value
 
 
-def score_option(
+def option_lookahead_value(
     env: ToyFactorGameEnv,
     option: OptionID,
+    belief: BeliefState,
+    gamma: float,
+    depth: int,
+    likelihood_error: float,
+    use_observation: bool,
+    cache: dict[tuple, float] | None = None,
+) -> float:
+    cache_key = None
+    if cache is not None:
+        cache_key = (
+            "option",
+            env_cache_key(env),
+            belief_cache_key(belief),
+            int(option),
+            int(depth),
+            bool(use_observation),
+        )
+        if cache_key in cache:
+            return cache[cache_key]
+    action = get_option_action(option, env.ego_pos, env.ego_carrying)
+    total = 0.0
+    for key, prob in belief.weights.items():
+        if prob <= 0.0:
+            continue
+        branch = copy.deepcopy(env)
+        branch.partner_convention = key_to_assignment(key)
+        env_before = copy.deepcopy(branch)
+        _obs, reward, done, info = branch.step(action)
+        if done:
+            total += prob * float(reward)
+            continue
+        posterior = (
+            belief.update_from_partner_action(env_before, int(info["partner_action"]), likelihood_error)
+            if use_observation
+            else belief
+        )
+        future = rollout_value(branch, posterior, depth - 1, gamma, key, likelihood_error, use_observation, cache)
+        total += prob * (float(reward) + gamma * future)
+    value = float(total)
+    if cache is not None and cache_key is not None:
+        cache[cache_key] = value
+    return value
+
+
+def state_value(
+    env: ToyFactorGameEnv,
+    belief: BeliefState,
+    gamma: float,
+    depth: int,
+    likelihood_error: float,
+    use_observation: bool,
+    cache: dict[tuple, float] | None = None,
+) -> float:
+    options = valid_options(env)
+    if not options:
+        return 0.0
+    return max(
+        option_lookahead_value(env, option, belief, gamma, depth, likelihood_error, use_observation, cache)
+        for option in options
+    )
+
+
+def score_options(
+    env: ToyFactorGameEnv,
     belief: BeliefState,
     method: str,
     alpha: float,
     beta: float,
     likelihood_error: float,
-) -> tuple[float, dict[str, float]]:
-    task_value = expected_step_reward(env, option, belief) + progress_bonus(env, option, belief)
-    before_entropy = belief.entropy_vector()
-    after_entropy = expected_entropy_after_option(env, option, belief, likelihood_error)
-    info_gain = np.maximum(before_entropy - after_entropy, 0.0)
-
-    if method == "mi":
-        active_gain = float(info_gain.sum())
-    elif method in ("gtvoi", "oracle"):
-        active_gain = float(np.dot(value_weights(env, option), info_gain))
-    else:
-        active_gain = 0.0
-
-    cost = option_cost(option)
-    score = task_value + alpha * active_gain - beta * cost
-    diagnostics = {
-        "task_value": float(task_value),
-        "active_gain": active_gain,
-        "cost": cost,
-        "entropy_gain_total": float(info_gain.sum()),
-        "entropy_gain_value_weighted": float(np.dot(value_weights(env, option), info_gain)),
+    truth: ConventionKey,
+    cache: dict[tuple, float] | None = None,
+) -> list[tuple[float, dict[str, float | str], OptionID]]:
+    options = valid_options(env)
+    task_values = {
+        option: option_lookahead_value(
+            env,
+            option,
+            belief,
+            ROLLOUT_GAMMA,
+            ROLLOUT_DEPTH,
+            likelihood_error,
+            use_observation=False,
+            cache=cache,
+        )
+        for option in options
     }
-    return float(score), diagnostics
+    task_best_option = max(options, key=lambda option: (task_values[option], -int(option)))
+    task_best_value = task_values[task_best_option]
+    before_entropy = belief.entropy_vector()
+
+    scored = []
+    for option in options:
+        after_entropy = expected_entropy_after_option(env, option, belief, likelihood_error)
+        info_gain = np.maximum(before_entropy - after_entropy, 0.0)
+        weighted_mi = float(np.dot(factor_observation_weights(env, option), info_gain))
+        bellman_value = option_lookahead_value(
+            env,
+            option,
+            belief,
+            ROLLOUT_GAMMA,
+            ROLLOUT_DEPTH,
+            likelihood_error,
+            use_observation=True,
+            cache=cache,
+        )
+        delta_info = bellman_value - task_values[option]
+        diagnostic_cost = max(0.0, task_best_value - task_values[option])
+
+        if method == "passive":
+            score = task_values[option]
+            active_gain = 0.0
+        elif method == "gtvoi":
+            score = bellman_value + alpha * max(delta_info, 0.0) - beta * diagnostic_cost
+            active_gain = delta_info
+        elif method == "mi":
+            score = task_values[option] + alpha * weighted_mi - beta * diagnostic_cost
+            active_gain = weighted_mi
+        elif method == "oracle_greedy":
+            true_belief = BeliefState.point_mass(truth)
+            score = option_lookahead_value(
+                env,
+                option,
+                true_belief,
+                ROLLOUT_GAMMA,
+                ROLLOUT_DEPTH,
+                likelihood_error,
+                use_observation=False,
+                cache=cache,
+            )
+            active_gain = 0.0
+        elif method == "oracle":
+            true_belief = BeliefState.point_mass(truth)
+            score = option_lookahead_value(
+                env,
+                option,
+                true_belief,
+                ROLLOUT_GAMMA,
+                ROLLOUT_DEPTH,
+                likelihood_error,
+                use_observation=True,
+                cache=cache,
+            )
+            active_gain = 0.0
+        else:
+            raise ValueError(f"Unsupported deterministic method: {method}")
+
+        scored.append(
+            (
+                float(score),
+                {
+                    "task_value": float(task_values[option]),
+                    "bellman_value": float(bellman_value),
+                    "active_gain": float(active_gain),
+                    "cost": float(diagnostic_cost),
+                    "entropy_gain_total": float(info_gain.sum()),
+                    "entropy_gain_value_weighted": weighted_mi,
+                    "delta_info": float(delta_info),
+                    "mi_gain": weighted_mi,
+                    "task_best_option": OPTION_NAMES[task_best_option],
+                    "task_best_value": float(task_best_value),
+                    "diagnostic_cost": float(diagnostic_cost),
+                },
+                option,
+            )
+        )
+    return scored
 
 
 def choose_option(
@@ -311,66 +580,42 @@ def choose_option(
     beta: float,
     likelihood_error: float,
     truth: ConventionKey,
-) -> tuple[OptionID, dict[str, float]]:
+    cache: dict[tuple, float] | None = None,
+) -> tuple[OptionID, dict[str, float | str]]:
     options = valid_options(env)
 
     if method == "random":
         option = options[int(rng.randint(0, len(options)))]
-        return option, {
-            "task_value": 0.0,
-            "active_gain": 0.0,
-            "cost": option_cost(option),
-            "entropy_gain_total": 0.0,
-            "entropy_gain_value_weighted": 0.0,
-        }
+        scored = score_options(env, belief, "passive", alpha, beta, likelihood_error, truth, cache)
+        diag_by_option = {scored_option: diagnostics for _score, diagnostics, scored_option in scored}
+        diagnostics = dict(diag_by_option[option])
+        diagnostics["active_gain"] = 0.0
+        diagnostics["score"] = 0.0
+        return option, diagnostics
 
-    if method == "oracle":
-        true_belief = BeliefState.point_mass(truth)
-        scored = []
-        for option in options:
-            task_value = expected_step_reward(env, option, true_belief) + progress_bonus(
-                env, option, true_belief
-            )
-            before_entropy = belief.entropy_vector()
-            after_entropy = expected_entropy_after_option(env, option, belief, likelihood_error)
-            info_gain = np.maximum(before_entropy - after_entropy, 0.0)
-            active_gain = float(np.dot(value_weights(env, option), info_gain))
-            cost = option_cost(option)
-            score = task_value + alpha * active_gain - beta * cost
-            scored.append(
-                (
-                    (
-                        score,
-                        {
-                            "task_value": float(task_value),
-                            "active_gain": active_gain,
-                            "cost": cost,
-                            "entropy_gain_total": float(info_gain.sum()),
-                            "entropy_gain_value_weighted": active_gain,
-                        },
-                    ),
-                    option,
-                )
-            )
-    else:
-        scored = [
-            (
-                score_option(env, option, belief, method, alpha, beta, likelihood_error),
-                option,
-            )
-            for option in options
-        ]
-    (score, diagnostics), option = max(scored, key=lambda item: (item[0][0], -int(item[1])))
-    diagnostics["score"] = score
+    scored = score_options(env, belief, method, alpha, beta, likelihood_error, truth, cache)
+    score, diagnostics, option = max(scored, key=lambda item: (item[0], -int(item[2])))
+    diagnostics = dict(diagnostics)
+    diagnostics["score"] = float(score)
     return option, diagnostics
 
 
-def is_aligned(belief: BeliefState, truth: ConventionKey, weights: np.ndarray, threshold: float) -> bool:
+def is_aligned(belief: BeliefState, truth: ConventionKey, threshold: float) -> bool:
     predictions = belief.mode_predictions()
-    for factor_idx, weight in enumerate(weights):
-        if weight >= threshold and predictions[factor_idx] != truth[factor_idx]:
+    for factor_idx in range(NUM_FACTORS):
+        if belief.confidence_for_truth(truth)[factor_idx] >= threshold and predictions[factor_idx] != truth[factor_idx]:
             return False
     return True
+
+
+def safe_corr(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    x = np.array(xs, dtype=np.float64)
+    y = np.array(ys, dtype=np.float64)
+    if np.std(x) <= 1e-12 or np.std(y) <= 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
 
 
 def run_episode(
@@ -382,20 +627,30 @@ def run_episode(
     beta: float,
     likelihood_error: float,
     alignment_weight_threshold: float,
-) -> dict[str, float | int | str]:
+    scenario: DiagnosticScenario | None,
+) -> dict[str, float | int | str | None]:
     rng = np.random.RandomState(seed)
     env = ToyFactorGameEnv(partner_convention=key_to_assignment(convention), max_steps=max_steps, seed=seed)
-    belief = BeliefState.uniform()
+    apply_scenario(env, scenario)
+    belief = BeliefState.uniform(scenario.conventions if scenario is not None else None)
 
     total_reward = 0.0
     early_reward = 0.0
-    probe_cost = 0.0
-    probe_count = 0
+    diagnostic_cost_total = 0.0
+    diagnostic_count = 0
+    positive_delta_count = 0
     collisions = 0
     alignment_time = max_steps + 1
     total_option_cost = 0.0
     selected_options: list[str] = []
-    active_gains = []
+    active_gains: list[float] = []
+    delta_infos: list[float] = []
+    mi_gains: list[float] = []
+    diagnostic_costs: list[float] = []
+    rewards: list[float] = []
+    reward_after_first_diagnostic: float | None = None
+    first_diagnostic_step: int | None = None
+    value_cache: dict[tuple, float] = {}
 
     for step_idx in range(max_steps):
         env_before = copy.deepcopy(env)
@@ -408,49 +663,88 @@ def run_episode(
             beta,
             likelihood_error,
             convention,
+            value_cache,
         )
         action = get_option_action(option, env.ego_pos, env.ego_carrying)
         _obs, reward, done, info = env.step(action)
+        posterior = belief.update_from_partner_action(env_before, int(info["partner_action"]), likelihood_error)
 
-        belief = belief.update_from_partner_action(env_before, int(info["partner_action"]), likelihood_error)
+        delta_info = float(diagnostics["delta_info"])
+        mi_gain = float(diagnostics["mi_gain"])
+        task_best_option = str(diagnostics["task_best_option"])
+        is_diagnostic = (
+            method not in ("random", "oracle", "oracle_greedy")
+            and delta_info > DELTA_INFO_THRESHOLD
+            and OPTION_NAMES[option] != task_best_option
+        )
+        diagnostic_cost = float(diagnostics["diagnostic_cost"]) if is_diagnostic else 0.0
 
         selected_options.append(OPTION_NAMES[option])
         total_reward += reward
+        rewards.append(float(reward))
         if step_idx < max(1, max_steps // 5):
             early_reward += reward
         collisions += int(info["collision"])
-        total_option_cost += diagnostics["cost"]
-        active_gains.append(diagnostics["active_gain"])
+        total_option_cost += float(diagnostics["diagnostic_cost"])
+        active_gains.append(float(diagnostics["active_gain"]))
+        delta_infos.append(delta_info)
+        mi_gains.append(mi_gain)
+        diagnostic_costs.append(diagnostic_cost)
 
-        is_probe = option in DIAGNOSTIC_OPTIONS and (
-            method == "random" or diagnostics["active_gain"] > 1e-6
-        )
-        if is_probe:
-            probe_count += 1
-            probe_cost += diagnostics["cost"]
+        if delta_info > DELTA_INFO_THRESHOLD:
+            positive_delta_count += 1
+        if is_diagnostic:
+            diagnostic_count += 1
+            diagnostic_cost_total += diagnostic_cost
+            if first_diagnostic_step is None:
+                first_diagnostic_step = step_idx
 
-        weights = value_weights(env, option)
+        belief = posterior
         if alignment_time == max_steps + 1 and is_aligned(
-            belief, convention, weights, alignment_weight_threshold
+            belief, convention, alignment_weight_threshold
         ):
             alignment_time = step_idx + 1
 
         if done:
             break
 
+    if first_diagnostic_step is not None:
+        reward_after_first_diagnostic = float(sum(rewards[first_diagnostic_step:]))
+
+    future_returns = []
+    running = 0.0
+    for reward in reversed(rewards):
+        running = reward + ROLLOUT_GAMMA * running
+        future_returns.append(running)
+    future_returns = list(reversed(future_returns))
+
     final_entropies = belief.entropy_vector()
     final_predictions = belief.mode_predictions()
     truth_confidences = belief.confidence_for_truth(convention)
-    final_factor_correct = [int(final_predictions[f] == convention[f]) for f in range(NUM_FACTORS)]
+    final_factor_correct = [int(final_predictions[factor] == convention[factor]) for factor in range(NUM_FACTORS)]
+    sorted_delta = sorted(delta_infos, reverse=True)
+    top_k = sorted_delta[: min(3, len(sorted_delta))]
 
-    row = {
+    row: dict[str, float | int | str | None] = {
+        "scenario": scenario.name if scenario is not None else "default_start",
         "method": method,
         "convention": convention_label(convention),
         "seed": seed,
         "episode_reward": float(total_reward),
         "early_reward": float(early_reward),
-        "probe_cost": float(probe_cost),
-        "probe_count": int(probe_count),
+        "probe_cost": float(diagnostic_cost_total),
+        "probe_count": int(diagnostic_count),
+        "diagnostic_cost": float(diagnostic_cost_total),
+        "diagnostic_count": int(diagnostic_count),
+        "positive_delta_info_count": int(positive_delta_count),
+        "positive_delta_info_rate": float(positive_delta_count / max(1, len(delta_infos))),
+        "max_delta_info": float(max(delta_infos) if delta_infos else 0.0),
+        "top_delta_info_mean": float(np.mean(top_k)) if top_k else 0.0,
+        "mean_delta_info": float(np.mean(delta_infos)) if delta_infos else 0.0,
+        "mean_mi_gain": float(np.mean(mi_gains)) if mi_gains else 0.0,
+        "future_return_delta_info_corr": safe_corr(delta_infos, future_returns),
+        "future_return_mi_corr": safe_corr(mi_gains, future_returns),
+        "reward_after_first_diagnostic": reward_after_first_diagnostic,
         "total_option_cost": float(total_option_cost),
         "collisions": int(collisions),
         "time_to_alignment": int(alignment_time),
@@ -467,12 +761,17 @@ def run_episode(
     return row
 
 
-def summarize_method(rows: list[dict[str, float | int | str]]) -> dict[str, float | list[float]]:
-    rewards = np.array([float(r["episode_reward"]) for r in rows], dtype=np.float64)
-    probe_costs = np.array([float(r["probe_cost"]) for r in rows], dtype=np.float64)
-    regrets = np.array([float(r["regret_to_oracle"]) for r in rows], dtype=np.float64)
-    early_regrets = np.array([float(r["early_regret_to_oracle"]) for r in rows], dtype=np.float64)
-    alignments = np.array([float(r["time_to_alignment"]) for r in rows], dtype=np.float64)
+def _mean_numeric(rows: list[dict[str, float | int | str | None]], key: str, default: float = 0.0) -> float:
+    vals = [float(row[key]) for row in rows if row.get(key) is not None]
+    return float(np.mean(vals)) if vals else default
+
+
+def summarize_method(rows: list[dict[str, float | int | str | None]]) -> dict[str, float | list[float] | None]:
+    rewards = np.array([float(row["episode_reward"]) for row in rows], dtype=np.float64)
+    probe_costs = np.array([float(row["probe_cost"]) for row in rows], dtype=np.float64)
+    regrets = np.array([float(row["regret_to_oracle"]) for row in rows], dtype=np.float64)
+    early_regrets = np.array([float(row["early_regret_to_oracle"]) for row in rows], dtype=np.float64)
+    alignments = np.array([float(row["time_to_alignment"]) for row in rows], dtype=np.float64)
     factor_confidences = np.array(
         [
             float(row[f"factor_{factor_idx}_confidence"])
@@ -489,7 +788,9 @@ def summarize_method(rows: list[dict[str, float | int | str]]) -> dict[str, floa
         ],
         dtype=np.float64,
     )
-    episode_correct = np.array([float(r["final_factor_accuracy"]) for r in rows], dtype=np.float64)
+    episode_correct = np.array([float(row["final_factor_accuracy"]) for row in rows], dtype=np.float64)
+    delta_corr = [float(row["future_return_delta_info_corr"]) for row in rows if row.get("future_return_delta_info_corr") is not None]
+    mi_corr = [float(row["future_return_mi_corr"]) for row in rows if row.get("future_return_mi_corr") is not None]
 
     reward_ci = bootstrap_ci(rewards)
     regret_ci = bootstrap_ci(regrets)
@@ -498,6 +799,16 @@ def summarize_method(rows: list[dict[str, float | int | str]]) -> dict[str, floa
         "episode_reward_mean": float(rewards.mean()),
         "episode_reward_ci": list(reward_ci),
         "probe_cost_mean": float(probe_costs.mean()),
+        "diagnostic_cost_mean": _mean_numeric(rows, "diagnostic_cost"),
+        "diagnostic_count_mean": _mean_numeric(rows, "diagnostic_count"),
+        "positive_delta_info_rate_mean": _mean_numeric(rows, "positive_delta_info_rate"),
+        "max_delta_info_mean": _mean_numeric(rows, "max_delta_info"),
+        "top_delta_info_mean": _mean_numeric(rows, "top_delta_info_mean"),
+        "mean_delta_info": _mean_numeric(rows, "mean_delta_info"),
+        "mean_mi_gain": _mean_numeric(rows, "mean_mi_gain"),
+        "future_return_delta_info_corr_mean": float(np.mean(delta_corr)) if delta_corr else None,
+        "future_return_mi_corr_mean": float(np.mean(mi_corr)) if mi_corr else None,
+        "reward_after_first_diagnostic_mean": _mean_numeric(rows, "reward_after_first_diagnostic", default=float("nan")),
         "regret_to_oracle_mean": float(regrets.mean()),
         "regret_to_oracle_ci": list(regret_ci),
         "early_regret_to_oracle_mean": float(early_regrets.mean()),
@@ -507,21 +818,99 @@ def summarize_method(rows: list[dict[str, float | int | str]]) -> dict[str, floa
     }
 
 
-def add_oracle_regrets(rows: list[dict[str, float | int | str]]) -> None:
+def add_oracle_regrets(rows: list[dict[str, float | int | str | None]]) -> None:
     oracle_by_case = {
-        (row["seed"], row["convention"]): row
+        (row["scenario"], row["seed"], row["convention"]): row
         for row in rows
         if row["method"] == "oracle"
     }
     for row in rows:
-        oracle = oracle_by_case[(row["seed"], row["convention"])]
+        oracle = oracle_by_case[(row["scenario"], row["seed"], row["convention"])]
         row["regret_to_oracle"] = float(oracle["episode_reward"]) - float(row["episode_reward"])
         row["early_regret_to_oracle"] = float(oracle["early_reward"]) - float(row["early_reward"])
 
 
-def write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
+def tiered_validation(summary: dict[str, dict], rows: list[dict[str, float | int | str | None]]) -> dict:
+    required = [method for method in DEFAULT_METHODS if method in summary]
+    missing = [method for method in DEFAULT_METHODS if method not in summary]
+    max_delta_info = max(float(row["max_delta_info"]) for row in rows) if rows else 0.0
+    oracle_gap = (
+        summary["oracle"]["episode_reward_mean"] - summary["passive"]["episode_reward_mean"]
+        if "oracle" in summary and "passive" in summary
+        else float("nan")
+    )
+
+    tier0 = {
+        "oracle_gap": float(oracle_gap),
+        "oracle_gap_threshold": 0.3,
+        "max_delta_info": float(max_delta_info),
+        "max_delta_info_threshold": DELTA_INFO_THRESHOLD,
+        "status": "PASS" if oracle_gap > 0.3 and max_delta_info > DELTA_INFO_THRESHOLD else "SKIP_NOT_DIAGNOSTIC_CRITICAL",
+    }
+    tier1_checks = {
+        "oracle_ge_gtvoi": "oracle" in summary and "gtvoi" in summary
+        and summary["oracle"]["episode_reward_mean"] >= summary["gtvoi"]["episode_reward_mean"],
+        "directed_gt_random": all(
+            method in summary
+            and "random" in summary
+            and summary[method]["episode_reward_mean"] > summary["random"]["episode_reward_mean"]
+            for method in ("gtvoi", "mi", "passive")
+        ),
+        "gtvoi_has_diagnostics": "gtvoi" in summary and summary["gtvoi"]["diagnostic_count_mean"] > 0.0,
+        "mi_has_diagnostics": "mi" in summary and summary["mi"]["diagnostic_count_mean"] > 0.0,
+    }
+    tier1 = {
+        "checks": tier1_checks,
+        "status": "PASS" if tier0["status"] == "PASS" and all(tier1_checks.values()) else "FAIL",
+    }
+    tier2_checks = {
+        "gtvoi_cost_le_mi": "gtvoi" in summary and "mi" in summary
+        and summary["gtvoi"]["diagnostic_cost_mean"] <= summary["mi"]["diagnostic_cost_mean"],
+        "gtvoi_reward_ge_mi": "gtvoi" in summary and "mi" in summary
+        and summary["gtvoi"]["episode_reward_mean"] >= summary["mi"]["episode_reward_mean"],
+    }
+    tier2 = {
+        "checks": tier2_checks,
+        "status": "PASS" if tier1["status"] == "PASS" and any(tier2_checks.values()) else "FAIL",
+    }
+    gtvoi_delta_corr = summary.get("gtvoi", {}).get("future_return_delta_info_corr_mean")
+    gtvoi_mi_corr = summary.get("gtvoi", {}).get("future_return_mi_corr_mean")
+    tier3_checks = {
+        "delta_corr_positive": gtvoi_delta_corr is not None and gtvoi_delta_corr > 0.0,
+        "delta_corr_ge_mi_corr": (
+            gtvoi_delta_corr is not None
+            and gtvoi_mi_corr is not None
+            and gtvoi_delta_corr >= gtvoi_mi_corr
+        ),
+    }
+    tier3 = {
+        "checks": tier3_checks,
+        "status": "SOFT_PASS" if all(tier3_checks.values()) else "WARN",
+    }
+    if missing:
+        overall = "FAIL"
+    elif tier0["status"] != "PASS":
+        overall = "SKIP_NOT_DIAGNOSTIC_CRITICAL"
+    elif tier1["status"] == "PASS" and tier2["status"] == "PASS":
+        overall = "PASS"
+    else:
+        overall = "FAIL"
+
+    return {
+        "required_methods": required,
+        "missing_methods": missing,
+        "tier0_environment": tier0,
+        "tier1_methods": tier1,
+        "tier2_gtvoi_vs_mi": tier2,
+        "tier3_soft_correlation": tier3,
+        "overall_status": overall,
+    }
+
+
+def write_csv(rows: list[dict[str, float | int | str | None]], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
+        "scenario",
         "method",
         "convention",
         "seed",
@@ -531,6 +920,17 @@ def write_csv(rows: list[dict[str, float | int | str]], path: Path) -> None:
         "early_regret_to_oracle",
         "probe_cost",
         "probe_count",
+        "diagnostic_cost",
+        "diagnostic_count",
+        "positive_delta_info_count",
+        "positive_delta_info_rate",
+        "max_delta_info",
+        "top_delta_info_mean",
+        "mean_delta_info",
+        "mean_mi_gain",
+        "future_return_delta_info_corr",
+        "future_return_mi_corr",
+        "reward_after_first_diagnostic",
         "total_option_cost",
         "collisions",
         "time_to_alignment",
@@ -568,14 +968,49 @@ def parse_method_list(raw: str) -> list[str]:
     return methods
 
 
+def build_cases(scenario_set: str, max_conventions: int) -> list[tuple[DiagnosticScenario | None, ConventionKey]]:
+    if scenario_set == "default_start":
+        conventions = all_convention_keys()
+        if max_conventions > 0:
+            conventions = conventions[:max_conventions]
+        return [(None, convention) for convention in conventions]
+    if scenario_set != "diagnostic":
+        raise ValueError("--scenario_set must be one of: diagnostic, default_start")
+
+    cases: list[tuple[DiagnosticScenario | None, ConventionKey]] = []
+    for scenario in DIAGNOSTIC_SCENARIOS:
+        if len(scenario.conventions) < 2:
+            raise ValueError(f"Diagnostic scenario {scenario.name} must include at least two conventions")
+        conventions = list(scenario.conventions)
+        if max_conventions > 0:
+            conventions = conventions[:max_conventions]
+        cases.extend((scenario, convention) for convention in conventions)
+    return cases
+
+
+def scenario_metadata(scenario_set: str) -> list[dict[str, object]]:
+    if scenario_set == "default_start":
+        return [{"name": "default_start", "description": "Original reset state over convention assignments"}]
+    return [
+        {
+            "name": scenario.name,
+            "description": scenario.description,
+            "conventions": [convention_label(convention) for convention in scenario.conventions],
+        }
+        for scenario in DIAGNOSTIC_SCENARIOS
+    ]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seeds", type=str, default="0,1,2")
     parser.add_argument("--episodes_per_convention", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=50)
     parser.add_argument("--max_conventions", type=int, default=0,
-                        help="Use the first N convention assignments; 0 means all")
-    parser.add_argument("--methods", type=str, default="gtvoi,mi,passive,random,oracle")
+                        help="Use the first N convention assignments/case conventions; 0 means all")
+    parser.add_argument("--scenario_set", type=str, default="diagnostic",
+                        choices=("diagnostic", "default_start"))
+    parser.add_argument("--methods", type=str, default=",".join(DEFAULT_METHODS))
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=0.2)
     parser.add_argument("--likelihood_error", type=float, default=0.05)
@@ -599,14 +1034,12 @@ def main() -> None:
         raise ValueError("--progress_every must be non-negative")
     set_seed(min(seeds) if seeds else 0)
 
-    rows: list[dict[str, float | int | str]] = []
-    conventions = all_convention_keys()
-    if args.max_conventions > 0:
-        conventions = conventions[:args.max_conventions]
-    total_runs = len(seeds) * len(conventions) * args.episodes_per_convention * len(methods)
+    rows: list[dict[str, float | int | str | None]] = []
+    cases = build_cases(args.scenario_set, args.max_conventions)
+    total_runs = len(seeds) * len(cases) * args.episodes_per_convention * len(methods)
     completed_runs = 0
     for seed in seeds:
-        for convention in conventions:
+        for scenario, convention in cases:
             for repeat_idx in range(args.episodes_per_convention):
                 episode_seed = seed * 1000 + repeat_idx
                 for method in methods:
@@ -620,14 +1053,12 @@ def main() -> None:
                             beta=args.beta,
                             likelihood_error=args.likelihood_error,
                             alignment_weight_threshold=args.alignment_weight_threshold,
+                            scenario=scenario,
                         )
                     )
                     completed_runs += 1
                     if args.progress_every and completed_runs % args.progress_every == 0:
-                        print(
-                            f"Completed {completed_runs}/{total_runs} method episodes",
-                            flush=True,
-                        )
+                        print(f"Completed {completed_runs}/{total_runs} method episodes", flush=True)
 
     add_oracle_regrets(rows)
     summary = {
@@ -642,11 +1073,16 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output = {
+        "schema": "toy_symbolic_v4_sanity",
         "config": vars(args),
         "methods": methods,
-        "n_conventions": len(conventions),
+        "scenario_set": args.scenario_set,
+        "scenarios": scenario_metadata(args.scenario_set),
+        "n_cases": len(cases),
+        "n_conventions": len({convention for _scenario, convention in cases}),
         "n_rows": len(rows),
         "summary": summary,
+        "validation": tiered_validation(summary, rows),
         "reward_probe_cost_pareto_methods": frontier_methods,
         "ground_truth_note": (
             "Factor accuracy, confidence, ECE, and regret use the toy environment's "
@@ -658,6 +1094,19 @@ def main() -> None:
 
     print(f"Saved symbolic toy pilot summary to {output_dir / 'summary.json'}")
     print(f"Saved per-episode rows to {output_dir / 'episodes.csv'}")
+    validation = output["validation"]
+    print(
+        "Tiered validation:",
+        validation["overall_status"],
+        "| Tier0",
+        validation["tier0_environment"]["status"],
+        "| Tier1",
+        validation["tier1_methods"]["status"],
+        "| Tier2",
+        validation["tier2_gtvoi_vs_mi"]["status"],
+        "| Tier3",
+        validation["tier3_soft_correlation"]["status"],
+    )
 
 
 if __name__ == "__main__":
