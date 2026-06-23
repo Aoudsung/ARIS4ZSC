@@ -52,6 +52,9 @@ DEFAULT_DELTA_RETURN = 0.3
 DEFAULT_DELTA_MI = 0.1
 DEFAULT_DELTA_VALUE = 0.1
 DEFAULT_MIN_CASES = 3
+DEFAULT_MAX_DIAGNOSTIC_COST = 1.0
+DEFAULT_ORACLE_MARGIN = 0.1
+DEFAULT_DEBUG_TOP_K = 20
 
 ConventionKey = tuple[int, ...]
 
@@ -87,9 +90,11 @@ class DiagnosticCase:
     action_gap: float | None = None
     best_diag_option: str | None = None
     observation_separation: float | None = None
+    diagnostic_opportunity_cost: float | None = None
     best_diag_return_gain: float | None = None
     best_diag_delta_info: float | None = None
     best_diag_mi_gain: float | None = None
+    max_delta_info: float | None = None
     high_mi_low_value_distractor: bool = False
     mi_option: str | None = None
     gtvoi_option: str | None = None
@@ -869,6 +874,7 @@ def evaluate_candidate_case(
     delta_return: float,
     delta_mi: float,
     delta_value: float,
+    max_diagnostic_cost: float,
 ) -> DiagnosticCase:
     belief = BeliefState.uniform(conventions)
     env = env_for_scenario(scenario, conventions[0], max_steps)
@@ -935,7 +941,7 @@ def evaluate_candidate_case(
         left_values[left_best] - left_values.get(right_best, -1e9),
         right_values[right_best] - right_values.get(left_best, -1e9),
     ]
-    action_gap = max(wrong_action_regrets)
+    action_gap = min(wrong_action_regrets)
     if action_gap < delta_action:
         return DiagnosticCase(
             case_id=f"{scenario.name}_pair{case_idx}",
@@ -953,8 +959,9 @@ def evaluate_candidate_case(
         )
 
     task_values = passive_values
-    best_diag: tuple[OptionID, float, float, float, float] | None = None
+    best_diag: tuple[OptionID, float, float, float, float, float] | None = None
     option_stats = []
+    high_delta_low_return: tuple[OptionID, float, float, float, float, float] | None = None
     before_entropy = belief.entropy_vector()
     for option in valid_options(env):
         separation = observation_separation(scenario, option, conventions, max_steps)
@@ -976,14 +983,23 @@ def evaluate_candidate_case(
         value_without_observation = task_values[option]
         delta_info = value_with_observation - value_without_observation
         return_gain = value_with_observation - passive_value
-        option_stats.append((option, mi_gain, delta_info, return_gain))
+        diagnostic_cost = max(0.0, passive_value - task_values[option])
+        option_stats.append((option, mi_gain, delta_info, return_gain, diagnostic_cost))
+        if delta_info >= DELTA_INFO_THRESHOLD and return_gain < delta_return:
+            artifact_candidate = (option, separation, return_gain, delta_info, mi_gain, diagnostic_cost)
+            if high_delta_low_return is None or artifact_candidate[3] > high_delta_low_return[3]:
+                high_delta_low_return = artifact_candidate
+        if diagnostic_cost > max_diagnostic_cost:
+            continue
         if return_gain < delta_return:
             continue
-        candidate = (option, separation, return_gain, delta_info, mi_gain)
+        candidate = (option, separation, return_gain, delta_info, mi_gain, diagnostic_cost)
         if best_diag is None or candidate[2] > best_diag[2]:
             best_diag = candidate
 
     if best_diag is None:
+        artifact_reason = high_delta_low_return is not None
+        fallback = high_delta_low_return
         return DiagnosticCase(
             case_id=f"{scenario.name}_pair{case_idx}",
             case_type="candidate",
@@ -996,7 +1012,18 @@ def evaluate_candidate_case(
             passive_first_action=OPTION_NAMES[passive_option],
             best_response_flip=True,
             action_gap=float(action_gap),
-            failure_reason="diagnostic_return_gain",
+            best_diag_option=OPTION_NAMES[fallback[0]] if fallback is not None else None,
+            observation_separation=float(fallback[1]) if fallback is not None else None,
+            best_diag_return_gain=float(fallback[2]) if fallback is not None else None,
+            best_diag_delta_info=float(fallback[3]) if fallback is not None else None,
+            best_diag_mi_gain=float(fallback[4]) if fallback is not None else None,
+            diagnostic_opportunity_cost=float(fallback[5]) if fallback is not None else None,
+            max_delta_info=float(fallback[3]) if fallback is not None else None,
+            failure_reason=(
+                "HIGH_DELTA_INFO_LOW_RETURN_ARTIFACT"
+                if artifact_reason
+                else "diagnostic_return_gain"
+            ),
         )
 
     mi_option = max(option_stats, key=lambda item: (item[1], item[2], item[3])) if option_stats else None
@@ -1028,9 +1055,11 @@ def evaluate_candidate_case(
         action_gap=float(action_gap),
         best_diag_option=OPTION_NAMES[best_diag[0]],
         observation_separation=float(best_diag[1]),
+        diagnostic_opportunity_cost=float(best_diag[5]),
         best_diag_return_gain=float(best_diag[2]),
         best_diag_delta_info=float(best_diag[3]),
         best_diag_mi_gain=float(best_diag[4]),
+        max_delta_info=float(max((item[2] for item in option_stats), default=0.0)),
         high_mi_low_value_distractor=high_mi_low_value,
         mi_option=OPTION_NAMES[mi_option[0]] if mi_option is not None else None,
         gtvoi_option=OPTION_NAMES[gtvoi_option[0]] if gtvoi_option is not None else None,
@@ -1051,6 +1080,7 @@ def synthesize_diagnostic_cases(
     delta_return: float,
     delta_mi: float,
     delta_value: float,
+    max_diagnostic_cost: float = DEFAULT_MAX_DIAGNOSTIC_COST,
 ) -> tuple[list[DiagnosticCase], list[DiagnosticCase]]:
     accepted: list[DiagnosticCase] = []
     rejected: list[DiagnosticCase] = []
@@ -1069,6 +1099,7 @@ def synthesize_diagnostic_cases(
                 delta_return=delta_return,
                 delta_mi=delta_mi,
                 delta_value=delta_value,
+                max_diagnostic_cost=max_diagnostic_cost,
             )
             if case.passed_filters:
                 accepted.append(case)
@@ -1137,6 +1168,8 @@ def run_episode(
     rewards: list[float] = []
     reward_after_first_diagnostic: float | None = None
     first_diagnostic_step: int | None = None
+    first_high_delta_step: int | None = None
+    reward_after_first_high_delta_info: float | None = None
     value_cache: dict[tuple, float] = shared_value_cache if shared_value_cache is not None else {}
 
     for step_idx in range(max_steps):
@@ -1180,6 +1213,8 @@ def run_episode(
 
         if delta_info > DELTA_INFO_THRESHOLD:
             positive_delta_count += 1
+            if first_high_delta_step is None:
+                first_high_delta_step = step_idx
         if is_diagnostic:
             diagnostic_count += 1
             diagnostic_cost_total += diagnostic_cost
@@ -1197,6 +1232,8 @@ def run_episode(
 
     if first_diagnostic_step is not None:
         reward_after_first_diagnostic = float(sum(rewards[first_diagnostic_step:]))
+    if first_high_delta_step is not None:
+        reward_after_first_high_delta_info = float(sum(rewards[first_high_delta_step:]))
 
     future_returns = []
     running = 0.0
@@ -1236,14 +1273,21 @@ def run_episode(
         "diagnostic_cost": float(diagnostic_cost_total),
         "diagnostic_count": int(diagnostic_count),
         "positive_delta_info_count": int(positive_delta_count),
+        "high_delta_info_count": int(positive_delta_count),
         "positive_delta_info_rate": float(positive_delta_count / max(1, len(delta_infos))),
         "max_delta_info": float(max(delta_infos) if delta_infos else 0.0),
+        "max_mi": float(max(mi_gains) if mi_gains else 0.0),
         "top_delta_info_mean": float(np.mean(top_k)) if top_k else 0.0,
         "mean_delta_info": float(np.mean(delta_infos)) if delta_infos else 0.0,
         "mean_mi_gain": float(np.mean(mi_gains)) if mi_gains else 0.0,
         "future_return_delta_info_corr": safe_corr(delta_infos, future_returns),
         "future_return_mi_corr": safe_corr(mi_gains, future_returns),
         "reward_after_first_diagnostic": reward_after_first_diagnostic,
+        "first_high_delta_step": first_high_delta_step,
+        "reward_after_first_high_delta_info": reward_after_first_high_delta_info,
+        "future_reward_gain_after_high_delta_info": None,
+        "oracle_gap_before_high_delta_info": None,
+        "oracle_gap_after_high_delta_info": None,
         "total_option_cost": float(total_option_cost),
         "collisions": int(collisions),
         "time_to_alignment": int(alignment_time),
@@ -1253,6 +1297,7 @@ def run_episode(
         "final_factor_confidence": float(np.mean(truth_confidences)),
         "mean_active_gain": float(np.mean(active_gains)) if active_gains else 0.0,
         "selected_options": ",".join(selected_options),
+        "_rewards": rewards,
     }
     for factor_idx in range(NUM_FACTORS):
         row[f"factor_{factor_idx}_correct"] = int(final_factor_correct[factor_idx])
@@ -1290,6 +1335,7 @@ def summarize_method(rows: list[dict[str, float | int | str | None]]) -> dict[st
     episode_correct = np.array([float(row["final_factor_accuracy"]) for row in rows], dtype=np.float64)
     delta_corr = [float(row["future_return_delta_info_corr"]) for row in rows if row.get("future_return_delta_info_corr") is not None]
     mi_corr = [float(row["future_return_mi_corr"]) for row in rows if row.get("future_return_mi_corr") is not None]
+    high_delta_counts = np.array([float(row.get("high_delta_info_count", 0.0)) for row in rows], dtype=np.float64)
 
     reward_ci = bootstrap_ci(rewards)
     regret_ci = bootstrap_ci(regrets)
@@ -1300,13 +1346,25 @@ def summarize_method(rows: list[dict[str, float | int | str | None]]) -> dict[st
         "probe_cost_mean": float(probe_costs.mean()),
         "diagnostic_cost_mean": _mean_numeric(rows, "diagnostic_cost"),
         "diagnostic_count_mean": _mean_numeric(rows, "diagnostic_count"),
+        "high_delta_info_count_mean": _mean_numeric(rows, "high_delta_info_count"),
         "positive_delta_info_rate_mean": _mean_numeric(rows, "positive_delta_info_rate"),
         "max_delta_info_mean": _mean_numeric(rows, "max_delta_info"),
+        "max_mi_mean": _mean_numeric(rows, "max_mi"),
         "top_delta_info_mean": _mean_numeric(rows, "top_delta_info_mean"),
         "mean_delta_info": _mean_numeric(rows, "mean_delta_info"),
         "mean_mi_gain": _mean_numeric(rows, "mean_mi_gain"),
         "future_return_delta_info_corr_mean": float(np.mean(delta_corr)) if delta_corr else None,
         "future_return_mi_corr_mean": float(np.mean(mi_corr)) if mi_corr else None,
+        "future_reward_gain_after_high_delta_info_mean": _mean_numeric(
+            rows, "future_reward_gain_after_high_delta_info", default=float("nan")
+        ),
+        "oracle_gap_before_high_delta_info_mean": _mean_numeric(
+            rows, "oracle_gap_before_high_delta_info", default=float("nan")
+        ),
+        "oracle_gap_after_high_delta_info_mean": _mean_numeric(
+            rows, "oracle_gap_after_high_delta_info", default=float("nan")
+        ),
+        "high_delta_count_reward_corr": safe_corr(list(high_delta_counts), list(rewards)),
         "reward_after_first_diagnostic_mean": _mean_numeric(rows, "reward_after_first_diagnostic", default=float("nan")),
         "regret_to_oracle_mean": float(regrets.mean()),
         "regret_to_oracle_ci": list(regret_ci),
@@ -1323,10 +1381,37 @@ def add_oracle_regrets(rows: list[dict[str, float | int | str | None]]) -> None:
         for row in rows
         if row["method"] == "oracle"
     }
+    passive_by_case = {
+        (row["case_id"], row["seed"], row["convention"]): row
+        for row in rows
+        if row["method"] == "passive"
+    }
     for row in rows:
-        oracle = oracle_by_case[(row["case_id"], row["seed"], row["convention"])]
+        key = (row["case_id"], row["seed"], row["convention"])
+        oracle = oracle_by_case[key]
         row["regret_to_oracle"] = float(oracle["episode_reward"]) - float(row["episode_reward"])
         row["early_regret_to_oracle"] = float(oracle["early_reward"]) - float(row["early_reward"])
+        first_high_delta_step = row.get("first_high_delta_step")
+        if first_high_delta_step is None:
+            continue
+        step = int(first_high_delta_step)
+        row_rewards = [float(value) for value in row.get("_rewards", [])]
+        oracle_rewards = [float(value) for value in oracle.get("_rewards", [])]
+        passive_rewards = [
+            float(value)
+            for value in passive_by_case.get(key, {}).get("_rewards", [])
+        ]
+        if step >= len(row_rewards):
+            continue
+        row_after = float(sum(row_rewards[step:]))
+        oracle_after = float(sum(oracle_rewards[step:])) if step < len(oracle_rewards) else float("nan")
+        passive_after = float(sum(passive_rewards[step:])) if step < len(passive_rewards) else float("nan")
+        row["reward_after_first_high_delta_info"] = row_after
+        if not math.isnan(passive_after):
+            row["future_reward_gain_after_high_delta_info"] = row_after - passive_after
+        row["oracle_gap_before_high_delta_info"] = row["regret_to_oracle"]
+        if not math.isnan(oracle_after):
+            row["oracle_gap_after_high_delta_info"] = oracle_after - row_after
 
 
 def _case_metric(case_rows: list[dict[str, object]], key: str, default: float = 0.0) -> float:
@@ -1356,6 +1441,7 @@ def tiered_validation(
     delta_gap: float,
     delta_action: float,
     delta_return: float,
+    oracle_margin: float,
 ) -> dict:
     required = [method for method in DEFAULT_METHODS if method in methods]
     missing = [method for method in DEFAULT_METHODS if method not in summary]
@@ -1374,6 +1460,13 @@ def tiered_validation(
         "median_action_gap_ge_threshold": median_action_gap >= delta_action,
         "median_best_diag_return_gain_ge_threshold": median_return_gain >= delta_return,
     }
+    tier0_status = (
+        "PASS"
+        if all(tier0_checks.values())
+        else "NO_DIAGNOSTIC_CRITICAL_CASES_FOUND"
+        if not accepted_cases
+        else "FAIL_CASE_CONSTRUCTION"
+    )
     tier0 = {
         "n_cases": len(accepted_cases),
         "min_cases": min_cases,
@@ -1386,14 +1479,15 @@ def tiered_validation(
         "median_best_diag_return_gain": float(median_return_gain),
         "diagnosis_return_gain_threshold": float(delta_return),
         "checks": tier0_checks,
-        "status": "PASS" if all(tier0_checks.values()) else "FAIL_CASE_CONSTRUCTION",
+        "status": tier0_status,
     }
 
     tier1_checks = {
-        "oracle_ge_passive": (
+        "oracle_ge_passive_plus_margin": (
             "oracle" in summary
             and "passive" in summary
-            and summary["oracle"]["episode_reward_mean"] >= summary["passive"]["episode_reward_mean"]
+            and summary["oracle"]["episode_reward_mean"]
+            >= summary["passive"]["episode_reward_mean"] + oracle_margin
         ),
         "oracle_ge_all_directed": (
             "oracle" in summary
@@ -1407,6 +1501,7 @@ def tiered_validation(
     }
     tier1 = {
         "checks": tier1_checks,
+        "oracle_margin": float(oracle_margin),
         "status": "PASS" if tier0["status"] == "PASS" and all(tier1_checks.values()) else "NOT_EVALUATED" if tier0["status"] != "PASS" else "FAIL",
     }
 
@@ -1448,6 +1543,9 @@ def tiered_validation(
 
     gtvoi_delta_corr = summary.get("gtvoi", {}).get("future_return_delta_info_corr_mean")
     gtvoi_mi_corr = summary.get("gtvoi", {}).get("future_return_mi_corr_mean")
+    gtvoi_gap_before = summary.get("gtvoi", {}).get("oracle_gap_before_high_delta_info_mean")
+    gtvoi_gap_after = summary.get("gtvoi", {}).get("oracle_gap_after_high_delta_info_mean")
+    gtvoi_high_delta_count_corr = summary.get("gtvoi", {}).get("high_delta_count_reward_corr")
     tier3_checks = {
         "delta_corr_positive": gtvoi_delta_corr is not None and gtvoi_delta_corr > 0.0,
         "delta_corr_ge_mi_corr": (
@@ -1455,15 +1553,26 @@ def tiered_validation(
             and gtvoi_mi_corr is not None
             and gtvoi_delta_corr >= gtvoi_mi_corr
         ),
+        "oracle_gap_drops_after_high_delta_info": (
+            gtvoi_gap_before is not None
+            and gtvoi_gap_after is not None
+            and not math.isnan(float(gtvoi_gap_before))
+            and not math.isnan(float(gtvoi_gap_after))
+            and float(gtvoi_gap_after) < float(gtvoi_gap_before)
+        ),
+        "high_delta_count_predicts_reward": (
+            gtvoi_high_delta_count_corr is not None
+            and gtvoi_high_delta_count_corr > 0.0
+        ),
     }
     tier3 = {
         "checks": tier3_checks,
         "status": "SOFT_PASS" if all(tier3_checks.values()) else "WARN",
     }
-    if missing:
+    if tier0["status"] != "PASS":
+        overall = tier0["status"]
+    elif missing:
         overall = "FAIL_MISSING_METHODS"
-    elif tier0["status"] != "PASS":
-        overall = "FAIL_CASE_CONSTRUCTION"
     elif tier1["status"] != "PASS":
         overall = "FAIL_ORACLE_SANITY"
     elif tier2["status"] != "PASS":
@@ -1510,13 +1619,20 @@ def write_csv(rows: list[dict[str, float | int | str | None]], path: Path) -> No
         "diagnostic_cost",
         "diagnostic_count",
         "positive_delta_info_count",
+        "high_delta_info_count",
         "positive_delta_info_rate",
         "max_delta_info",
+        "max_mi",
         "top_delta_info_mean",
         "mean_delta_info",
         "mean_mi_gain",
         "future_return_delta_info_corr",
         "future_return_mi_corr",
+        "first_high_delta_step",
+        "reward_after_first_high_delta_info",
+        "future_reward_gain_after_high_delta_info",
+        "oracle_gap_before_high_delta_info",
+        "oracle_gap_after_high_delta_info",
         "reward_after_first_diagnostic",
         "total_option_cost",
         "collisions",
@@ -1557,9 +1673,11 @@ def case_to_row(case: DiagnosticCase) -> dict[str, object]:
         "action_gap": case.action_gap,
         "best_diag_option": case.best_diag_option,
         "observation_separation": case.observation_separation,
+        "diagnostic_opportunity_cost": case.diagnostic_opportunity_cost,
         "best_diag_return_gain": case.best_diag_return_gain,
         "best_diag_delta_info": case.best_diag_delta_info,
         "best_diag_mi_gain": case.best_diag_mi_gain,
+        "max_delta_info": case.max_delta_info,
         "high_mi_low_value_distractor": int(case.high_mi_low_value_distractor),
         "mi_option": case.mi_option,
         "gtvoi_option": case.gtvoi_option,
@@ -1588,9 +1706,11 @@ def write_cases_csv(case_rows: list[dict[str, object]], path: Path) -> None:
         "action_gap",
         "best_diag_option",
         "observation_separation",
+        "diagnostic_opportunity_cost",
         "best_diag_return_gain",
         "best_diag_delta_info",
         "best_diag_mi_gain",
+        "max_delta_info",
         "high_mi_low_value_distractor",
         "mi_option",
         "gtvoi_option",
@@ -1611,7 +1731,7 @@ def write_scenario_debug_csv(
     rows: list[dict[str, float | int | str | None]],
     case_rows: list[dict[str, object]],
     path: Path,
-) -> None:
+) -> list[dict[str, object]]:
     path.parent.mkdir(parents=True, exist_ok=True)
     case_by_id = {str(row["case_id"]): row for row in case_rows if row.get("passed_filters")}
     oracle_rewards: dict[str, float] = {}
@@ -1650,10 +1770,14 @@ def write_scenario_debug_csv(
         "first_action_matches_oracle_rate",
         "max_delta_info_mean",
         "max_delta_info_max",
+        "max_mi",
         "mean_delta_info_mean",
         "mean_mi_gain_mean",
         "future_return_delta_info_corr_mean",
         "future_return_mi_corr_mean",
+        "future_reward_gain_after_high_delta_info",
+        "oracle_gap_after_high_delta_info_mean",
+        "high_delta_info_count_mean",
         "diagnostic_cost_mean",
         "diagnostic_count_mean",
         "reward_after_first_diagnostic_mean",
@@ -1668,61 +1792,132 @@ def write_scenario_debug_csv(
     for row in rows:
         grouped.setdefault((str(row["case_id"]), str(row["method"])), []).append(row)
 
+    debug_rows: list[dict[str, object]] = []
+    for (case_id, method), group in sorted(grouped.items()):
+        case = case_by_id.get(case_id, {})
+        oracle_actions = set(str(group[0].get("oracle_first_actions", "")).split(","))
+        first_actions = [str(row.get("first_action")) for row in group if row.get("first_action")]
+        match_rate = (
+            float(np.mean([action in oracle_actions for action in first_actions]))
+            if first_actions
+            else float("nan")
+        )
+        realized_gap = oracle_rewards.get(case_id, float("nan")) - passive_rewards.get(case_id, float("nan"))
+        debug_rows.append(
+            {
+                "case_id": case_id,
+                "case_type": group[0].get("case_type"),
+                "scenario": group[0].get("scenario"),
+                "method": method,
+                "n": len(group),
+                "conventions": ",".join(sorted({str(row["convention"]) for row in group})),
+                "seeds": ",".join(sorted({str(row["seed"]) for row in group})),
+                "episode_reward_mean": _mean_numeric(group, "episode_reward"),
+                "oracle_reward_mean": oracle_rewards.get(case_id),
+                "passive_reward_mean": passive_rewards.get(case_id),
+                "oracle_passive_gap_case": case.get("oracle_passive_gap"),
+                "oracle_passive_gap_realized": realized_gap,
+                "regret_to_oracle_mean": _mean_numeric(group, "regret_to_oracle"),
+                "first_actions": ",".join(sorted(set(first_actions))),
+                "oracle_first_actions": group[0].get("oracle_first_actions"),
+                "passive_first_action": group[0].get("passive_first_action"),
+                "first_action_matches_oracle_rate": match_rate,
+                "max_delta_info_mean": _mean_numeric(group, "max_delta_info"),
+                "max_delta_info_max": max(float(row["max_delta_info"]) for row in group),
+                "max_mi": max(float(row.get("max_mi", 0.0)) for row in group),
+                "mean_delta_info_mean": _mean_numeric(group, "mean_delta_info"),
+                "mean_mi_gain_mean": _mean_numeric(group, "mean_mi_gain"),
+                "future_return_delta_info_corr_mean": _mean_numeric(
+                    group, "future_return_delta_info_corr", default=float("nan")
+                ),
+                "future_return_mi_corr_mean": _mean_numeric(
+                    group, "future_return_mi_corr", default=float("nan")
+                ),
+                "future_reward_gain_after_high_delta_info": _mean_numeric(
+                    group, "future_reward_gain_after_high_delta_info", default=float("nan")
+                ),
+                "oracle_gap_after_high_delta_info_mean": _mean_numeric(
+                    group, "oracle_gap_after_high_delta_info", default=float("nan")
+                ),
+                "high_delta_info_count_mean": _mean_numeric(group, "high_delta_info_count"),
+                "diagnostic_cost_mean": _mean_numeric(group, "diagnostic_cost"),
+                "diagnostic_count_mean": _mean_numeric(group, "diagnostic_count"),
+                "reward_after_first_diagnostic_mean": _mean_numeric(
+                    group, "reward_after_first_diagnostic", default=float("nan")
+                ),
+                "best_response_flip": case.get("best_response_flip"),
+                "action_gap": case.get("action_gap"),
+                "best_diag_option": case.get("best_diag_option"),
+                "observation_separation": case.get("observation_separation"),
+                "best_diag_return_gain": case.get("best_diag_return_gain"),
+                "high_mi_low_value_distractor": case.get("high_mi_low_value_distractor"),
+            }
+        )
+
     with path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for (case_id, method), group in sorted(grouped.items()):
-            case = case_by_id.get(case_id, {})
-            oracle_actions = set(str(group[0].get("oracle_first_actions", "")).split(","))
-            first_actions = [str(row.get("first_action")) for row in group if row.get("first_action")]
-            match_rate = (
-                float(np.mean([action in oracle_actions for action in first_actions]))
-                if first_actions
-                else float("nan")
-            )
-            realized_gap = oracle_rewards.get(case_id, float("nan")) - passive_rewards.get(case_id, float("nan"))
-            writer.writerow(
-                {
-                    "case_id": case_id,
-                    "case_type": group[0].get("case_type"),
-                    "scenario": group[0].get("scenario"),
-                    "method": method,
-                    "n": len(group),
-                    "conventions": ",".join(sorted({str(row["convention"]) for row in group})),
-                    "seeds": ",".join(sorted({str(row["seed"]) for row in group})),
-                    "episode_reward_mean": _mean_numeric(group, "episode_reward"),
-                    "oracle_reward_mean": oracle_rewards.get(case_id),
-                    "passive_reward_mean": passive_rewards.get(case_id),
-                    "oracle_passive_gap_case": case.get("oracle_passive_gap"),
-                    "oracle_passive_gap_realized": realized_gap,
-                    "regret_to_oracle_mean": _mean_numeric(group, "regret_to_oracle"),
-                    "first_actions": ",".join(sorted(set(first_actions))),
-                    "oracle_first_actions": group[0].get("oracle_first_actions"),
-                    "passive_first_action": group[0].get("passive_first_action"),
-                    "first_action_matches_oracle_rate": match_rate,
-                    "max_delta_info_mean": _mean_numeric(group, "max_delta_info"),
-                    "max_delta_info_max": max(float(row["max_delta_info"]) for row in group),
-                    "mean_delta_info_mean": _mean_numeric(group, "mean_delta_info"),
-                    "mean_mi_gain_mean": _mean_numeric(group, "mean_mi_gain"),
-                    "future_return_delta_info_corr_mean": _mean_numeric(
-                        group, "future_return_delta_info_corr", default=float("nan")
-                    ),
-                    "future_return_mi_corr_mean": _mean_numeric(
-                        group, "future_return_mi_corr", default=float("nan")
-                    ),
-                    "diagnostic_cost_mean": _mean_numeric(group, "diagnostic_cost"),
-                    "diagnostic_count_mean": _mean_numeric(group, "diagnostic_count"),
-                    "reward_after_first_diagnostic_mean": _mean_numeric(
-                        group, "reward_after_first_diagnostic", default=float("nan")
-                    ),
-                    "best_response_flip": case.get("best_response_flip"),
-                    "action_gap": case.get("action_gap"),
-                    "best_diag_option": case.get("best_diag_option"),
-                    "observation_separation": case.get("observation_separation"),
-                    "best_diag_return_gain": case.get("best_diag_return_gain"),
-                    "high_mi_low_value_distractor": case.get("high_mi_low_value_distractor"),
-                }
-            )
+        for row in debug_rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
+    return debug_rows
+
+
+def _finite_or_low(value: object) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return -float("inf")
+    if math.isnan(numeric):
+        return -float("inf")
+    return numeric
+
+
+def write_scenario_debug_views(
+    debug_rows: list[dict[str, object]],
+    output_dir: Path,
+    top_k: int,
+) -> dict[str, dict[str, str | int]]:
+    view_specs = {
+        "top_oracle_passive_gap": (
+            "scenario_debug_top_oracle_passive_gap.csv",
+            "oracle_passive_gap_realized",
+            lambda row: _finite_or_low(row.get("oracle_passive_gap_realized")),
+        ),
+        "top_max_delta_info": (
+            "scenario_debug_top_max_delta_info.csv",
+            "max_delta_info_max",
+            lambda row: _finite_or_low(row.get("max_delta_info_max")),
+        ),
+        "top_delta_info_but_low_return": (
+            "scenario_debug_top_delta_info_but_low_return.csv",
+            "max_delta_info_max_minus_future_reward_gain_after_high_delta_info",
+            lambda row: _finite_or_low(row.get("max_delta_info_max"))
+            - max(0.0, _finite_or_low(row.get("future_reward_gain_after_high_delta_info"))),
+        ),
+        "top_mi_but_low_return": (
+            "scenario_debug_top_mi_but_low_return.csv",
+            "max_mi_minus_future_reward_gain_after_high_delta_info",
+            lambda row: _finite_or_low(row.get("max_mi"))
+            - max(0.0, _finite_or_low(row.get("future_reward_gain_after_high_delta_info"))),
+        ),
+    }
+    fieldnames = list(debug_rows[0].keys()) if debug_rows else []
+    metadata: dict[str, dict[str, str | int]] = {}
+    for name, (filename, sort_key, key_fn) in view_specs.items():
+        path = output_dir / filename
+        sorted_rows = sorted(debug_rows, key=key_fn, reverse=True)[:top_k]
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in sorted_rows:
+                writer.writerow({key: row.get(key) for key in fieldnames})
+        metadata[name] = {
+            "file": filename,
+            "sort_key": sort_key,
+            "order": "desc",
+            "top_k": top_k,
+        }
+    return metadata
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -1765,6 +1960,7 @@ def build_cases(
     delta_return: float,
     delta_mi: float,
     delta_value: float,
+    max_diagnostic_cost: float,
 ) -> tuple[list[DiagnosticCase], list[DiagnosticCase]]:
     if scenario_set == "default_start":
         conventions = all_convention_keys()
@@ -1812,6 +2008,7 @@ def build_cases(
         delta_return=delta_return,
         delta_mi=delta_mi,
         delta_value=delta_value,
+        max_diagnostic_cost=max_diagnostic_cost,
     )
     if max_conventions > 0:
         accepted = accepted[:max_conventions]
@@ -1866,6 +2063,9 @@ def main() -> None:
     parser.add_argument("--delta_return", type=float, default=DEFAULT_DELTA_RETURN)
     parser.add_argument("--delta_mi", type=float, default=DEFAULT_DELTA_MI)
     parser.add_argument("--delta_value", type=float, default=DEFAULT_DELTA_VALUE)
+    parser.add_argument("--max_diagnostic_cost", type=float, default=DEFAULT_MAX_DIAGNOSTIC_COST)
+    parser.add_argument("--oracle_margin", type=float, default=DEFAULT_ORACLE_MARGIN)
+    parser.add_argument("--debug_top_k", type=int, default=DEFAULT_DEBUG_TOP_K)
     parser.add_argument("--output_dir", type=str, default="results/toy_symbolic")
     parser.add_argument("--progress_every", type=int, default=0,
                         help="Print progress every N completed method episodes; 0 disables")
@@ -1885,6 +2085,12 @@ def main() -> None:
         raise ValueError("--case_horizon must be positive")
     if args.min_cases < 0:
         raise ValueError("--min_cases must be non-negative")
+    if args.max_diagnostic_cost < 0:
+        raise ValueError("--max_diagnostic_cost must be non-negative")
+    if args.oracle_margin < 0:
+        raise ValueError("--oracle_margin must be non-negative")
+    if args.debug_top_k <= 0:
+        raise ValueError("--debug_top_k must be positive")
     if args.progress_every < 0:
         raise ValueError("--progress_every must be non-negative")
     set_seed(min(seeds) if seeds else 0)
@@ -1903,6 +2109,7 @@ def main() -> None:
         args.delta_return,
         args.delta_mi,
         args.delta_value,
+        args.max_diagnostic_cost,
     )
     case_rows = [case_to_row(case) for case in cases] + [case_to_row(case) for case in rejected_cases]
     total_runs = (
@@ -1963,7 +2170,10 @@ def main() -> None:
         args.delta_gap,
         args.delta_action,
         args.delta_return,
+        args.oracle_margin,
     )
+    debug_rows = write_scenario_debug_csv(rows, case_rows, output_dir / "scenario_debug.csv")
+    debug_views = write_scenario_debug_views(debug_rows, output_dir, args.debug_top_k)
     output = {
         "schema": SYMBOLIC_SCHEMA,
         **git_metadata(),
@@ -1979,6 +2189,8 @@ def main() -> None:
                 "delta_return": args.delta_return,
                 "delta_mi": args.delta_mi,
                 "delta_value": args.delta_value,
+                "max_diagnostic_cost": args.max_diagnostic_cost,
+                "oracle_margin": args.oracle_margin,
             },
             "case_horizon": args.case_horizon,
             "n_accepted_cases": len(cases),
@@ -1994,6 +2206,7 @@ def main() -> None:
         "n_rows": len(rows),
         "summary": summary,
         "validation": validation,
+        "debug_views": debug_views,
         "reward_probe_cost_pareto_methods": frontier_methods,
         "ground_truth_note": (
             "Factor accuracy, confidence, ECE, and regret use the toy environment's "
@@ -2003,12 +2216,12 @@ def main() -> None:
     save_results(output, str(output_dir / "summary.json"))
     write_csv(rows, output_dir / "episodes.csv")
     write_cases_csv(case_rows, output_dir / "cases.csv")
-    write_scenario_debug_csv(rows, case_rows, output_dir / "scenario_debug.csv")
 
     print(f"Saved symbolic toy pilot summary to {output_dir / 'summary.json'}")
     print(f"Saved per-episode rows to {output_dir / 'episodes.csv'}")
     print(f"Saved diagnostic case rows to {output_dir / 'cases.csv'}")
     print(f"Saved per-scenario debug rows to {output_dir / 'scenario_debug.csv'}")
+    print(f"Saved per-scenario debug top-k views to {output_dir}")
     print(
         "Tiered validation:",
         validation["overall_status"],
