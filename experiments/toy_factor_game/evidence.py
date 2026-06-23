@@ -43,13 +43,22 @@ def relevance_options_for_factor(factor: GraphFactorSpec) -> set[OptionID]:
 def option_relevance_mask(graph_config: GraphConfig) -> list[list[bool]]:
     mask = [[False for _ in range(NUM_OPTIONS)] for _ in range(graph_config.n_factors)]
     for factor_idx, factor in enumerate(graph_config.factors):
-        for option in relevance_options_for_factor(factor):
+        relevance_factor = factor
+        if graph_config.relevance_permutation is not None:
+            relevance_factor = graph_config.factors[graph_config.relevance_permutation[factor_idx]]
+        for option in relevance_options_for_factor(relevance_factor):
             mask[factor_idx][int(option)] = True
     return mask
 
 
 def route_event_to_factors(event: dict, graph_config: GraphConfig) -> list[list[float]]:
-    return [_route_event_to_factor(event, factor) for factor in graph_config.factors]
+    routed = []
+    for factor_idx, factor in enumerate(graph_config.factors):
+        route_factor = factor
+        if graph_config.route_permutation is not None:
+            route_factor = graph_config.factors[graph_config.route_permutation[factor_idx]]
+        routed.append(_route_event_to_factor(event, route_factor))
+    return routed
 
 
 def _route_event_to_factor(event: dict, factor: GraphFactorSpec) -> list[float]:

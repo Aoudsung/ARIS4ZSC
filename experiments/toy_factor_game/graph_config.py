@@ -1,20 +1,25 @@
 """Graph variant definitions for toy factor-game experiments."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 import functools
+import random
 
-from .env import NUM_FACTORS
 from .ce_estimation import DEFAULT_CE_THRESHOLD, estimate_ce_matrix
-from .options import GROUND_TRUTH_FACTORS, IRRELEVANT_FACTORS, NON_CRITICAL_FACTORS, OptionID
+from .env import NUM_FACTORS
+from .options import GROUND_TRUTH_FACTORS, OptionID
 
 
 GRAPH_VARIANTS = (
-    "full_graph",
-    "plus_irrelevant",
-    "minus_noncritical",
+    "full_support",
+    "overcomplete",
+    "overcomplete_minus_noncritical",
     "minus_critical",
-    "random_graph",
-    "complete_graph",
+    "random_same_size",
+    "complete_option_graph",
+    "shuffled_routes",
+    "shuffled_relevance",
 )
 
 
@@ -38,6 +43,8 @@ class GraphConfig:
     name: str
     factors: tuple[GraphFactorSpec, ...]
     pairwise_pairs: tuple[tuple[int, int], ...]
+    route_permutation: tuple[int, ...] | None = None
+    relevance_permutation: tuple[int, ...] | None = None
 
     @property
     def n_factors(self) -> int:
@@ -71,143 +78,181 @@ class GraphConfig:
         return [max(0.1, abs(factor.ce_value) / max_ce) for factor in self.factors]
 
 
-def _from_interaction_factor(factor, env_factor_id: int | None = None) -> GraphFactorSpec:
-    return GraphFactorSpec(
-        name=factor.description,
-        option_i=factor.option_i,
-        option_j=factor.option_j,
-        n_modes=factor.n_modes,
-        env_factor_id=env_factor_id if env_factor_id is not None else factor.factor_id,
-        ce_value=factor.ce_value,
-    )
-
-
 def _chain_pairs(n_factors: int) -> tuple[tuple[int, int], ...]:
     if n_factors <= 1:
         return ()
     return tuple((i, i + 1) for i in range(n_factors - 1))
 
 
-def _real_factor_for_option_pair(option_i: OptionID, option_j: OptionID) -> GraphFactorSpec | None:
+def _real_factor_for_option_pair(
+    option_i: OptionID,
+    option_j: OptionID,
+    ce_value: float,
+) -> GraphFactorSpec | None:
     for factor in GROUND_TRUTH_FACTORS:
         if factor.option_i == option_i and factor.option_j == option_j:
-            return _from_interaction_factor(factor, env_factor_id=factor.factor_id)
+            return GraphFactorSpec(
+                name=factor.description,
+                option_i=option_i,
+                option_j=option_j,
+                n_modes=factor.n_modes,
+                env_factor_id=factor.factor_id,
+                ce_value=ce_value,
+            )
     return None
 
 
 @functools.lru_cache(maxsize=1)
-def _candidate_factor_specs() -> tuple[GraphFactorSpec, ...]:
+def _all_pair_factor_specs() -> tuple[GraphFactorSpec, ...]:
     ce_matrix = estimate_ce_matrix()
     specs = []
-    for factor in (GROUND_TRUTH_FACTORS + NON_CRITICAL_FACTORS + IRRELEVANT_FACTORS):
-        env_factor_id = factor.factor_id if factor in GROUND_TRUTH_FACTORS else None
-        specs.append(
-            GraphFactorSpec(
-                name=factor.description,
-                option_i=factor.option_i,
-                option_j=factor.option_j,
-                n_modes=factor.n_modes,
-                env_factor_id=env_factor_id,
-                ce_value=float(ce_matrix[int(factor.option_i), int(factor.option_j)]),
-                sparsity_weight=1.0 if env_factor_id is not None else 1.5,
-            )
-        )
+    for option_i in OptionID:
+        for option_j in OptionID:
+            ce_value = float(ce_matrix[int(option_i), int(option_j)])
+            real = _real_factor_for_option_pair(option_i, option_j, ce_value)
+            if real is not None:
+                specs.append(real)
+            else:
+                specs.append(
+                    GraphFactorSpec(
+                        name=f"ce:{option_i.name}:{option_j.name}",
+                        option_i=option_i,
+                        option_j=option_j,
+                        n_modes=2,
+                        env_factor_id=None,
+                        ce_value=ce_value,
+                        sparsity_weight=1.5,
+                    )
+                )
     return tuple(specs)
 
 
 @functools.lru_cache(maxsize=4)
-def _induced_full_factors(threshold: float = DEFAULT_CE_THRESHOLD) -> tuple[GraphFactorSpec, ...]:
-    factors = tuple(
-        factor for factor in _candidate_factor_specs()
-        if factor.ce_value > threshold
-    )
-    true_pairs = {(factor.option_i, factor.option_j) for factor in factors if factor.env_factor_id is not None}
-    required_pairs = {(factor.option_i, factor.option_j) for factor in GROUND_TRUTH_FACTORS}
-    if not required_pairs.issubset(true_pairs):
-        missing = sorted((a.name, b.name) for a, b in (required_pairs - true_pairs))
-        raise RuntimeError(
-            f"CE induction with threshold={threshold} missed required toy support pairs: {missing}"
-        )
+def _full_support_factors(threshold: float = DEFAULT_CE_THRESHOLD) -> tuple[GraphFactorSpec, ...]:
+    factors = tuple(factor for factor in _all_pair_factor_specs() if factor.ce_value > threshold)
+    if not factors:
+        raise RuntimeError(f"CE induction with threshold={threshold} produced an empty support graph")
     return factors
+
+
+def _overcomplete_factors() -> tuple[GraphFactorSpec, ...]:
+    full = _full_support_factors()
+    full_pairs = {(factor.option_i, factor.option_j) for factor in full}
+    low_ce = [
+        factor for factor in _all_pair_factor_specs()
+        if (factor.option_i, factor.option_j) not in full_pairs and factor.ce_value > 0.0
+    ]
+    low_ce.sort(key=lambda factor: (-factor.ce_value, factor.option_i.name, factor.option_j.name))
+    extra_count = min(len(low_ce), max(1, len(full)))
+    return full + tuple(low_ce[:extra_count])
+
+
+def _overcomplete_minus_noncritical_factors() -> tuple[GraphFactorSpec, ...]:
+    full = _full_support_factors()
+    full_pairs = {(factor.option_i, factor.option_j) for factor in full}
+    extras = [
+        factor for factor in _overcomplete_factors()
+        if (factor.option_i, factor.option_j) not in full_pairs
+    ]
+    if not extras:
+        return full
+    extras.sort(key=lambda factor: (factor.ce_value, factor.option_i.name, factor.option_j.name))
+    remove_count = max(1, len(extras) // 2)
+    removed_pairs = {(factor.option_i, factor.option_j) for factor in extras[:remove_count]}
+    return tuple(
+        factor for factor in _overcomplete_factors()
+        if (factor.option_i, factor.option_j) not in removed_pairs
+    )
+
+
+def _minus_critical_factors() -> tuple[GraphFactorSpec, ...]:
+    full = _full_support_factors()
+    critical = max(full, key=lambda factor: factor.ce_value)
+    return tuple(
+        factor for factor in full
+        if (factor.option_i, factor.option_j) != (critical.option_i, critical.option_j)
+    )
+
+
+def _random_same_size_factors() -> tuple[GraphFactorSpec, ...]:
+    full = _full_support_factors()
+    full_pairs = {(factor.option_i, factor.option_j) for factor in full}
+    candidates = [
+        factor for factor in _all_pair_factor_specs()
+        if (factor.option_i, factor.option_j) not in full_pairs
+    ]
+    if len(candidates) < len(full):
+        candidates = list(_all_pair_factor_specs())
+    rng = random.Random(17)
+    selected = rng.sample(candidates, k=len(full))
+    return tuple(
+        GraphFactorSpec(
+            name=f"random:{factor.option_i.name}:{factor.option_j.name}",
+            option_i=factor.option_i,
+            option_j=factor.option_j,
+            n_modes=2,
+            env_factor_id=None,
+            ce_value=factor.ce_value,
+            sparsity_weight=1.5,
+        )
+        for factor in selected
+    )
+
+
+def _complete_option_graph_factors() -> tuple[GraphFactorSpec, ...]:
+    return tuple(
+        GraphFactorSpec(
+            name=factor.name if factor.env_factor_id is not None else f"complete:{factor.option_i.name}:{factor.option_j.name}",
+            option_i=factor.option_i,
+            option_j=factor.option_j,
+            n_modes=factor.n_modes,
+            env_factor_id=factor.env_factor_id,
+            ce_value=factor.ce_value,
+            sparsity_weight=factor.sparsity_weight if factor.env_factor_id is None else 1.0,
+        )
+        for factor in _all_pair_factor_specs()
+    )
+
+
+def _rotated_permutation(n_items: int) -> tuple[int, ...] | None:
+    if n_items <= 1:
+        return None
+    return tuple((idx + 1) % n_items for idx in range(n_items))
 
 
 def get_graph_config(name: str) -> GraphConfig:
     if name not in GRAPH_VARIANTS:
         raise ValueError(f"Unknown graph variant {name!r}; expected one of {GRAPH_VARIANTS}")
 
-    induced_full = _induced_full_factors()
+    route_permutation = None
+    relevance_permutation = None
 
-    if name == "full_graph":
-        factors = induced_full
-    elif name == "plus_irrelevant":
-        induced_pairs = {(factor.option_i, factor.option_j) for factor in induced_full}
-        synthetic = tuple(
-            GraphFactorSpec(
-                name=factor.description,
-                option_i=factor.option_i,
-                option_j=factor.option_j,
-                n_modes=factor.n_modes,
-                env_factor_id=None,
-                ce_value=next(
-                    spec.ce_value for spec in _candidate_factor_specs()
-                    if spec.option_i == factor.option_i and spec.option_j == factor.option_j
-                ),
-                sparsity_weight=1.5,
-            )
-            for factor in (NON_CRITICAL_FACTORS + IRRELEVANT_FACTORS)
-            if (factor.option_i, factor.option_j) not in induced_pairs
-        )
-        factors = induced_full + synthetic
-    elif name == "minus_noncritical":
-        real_factors = [factor for factor in induced_full if factor.env_factor_id is not None]
-        lowest_ce_id = min(real_factors, key=lambda factor: factor.ce_value).env_factor_id
-        factors = tuple(
-            factor for factor in real_factors if factor.env_factor_id != lowest_ce_id
-        )
+    if name == "full_support":
+        factors = _full_support_factors()
+    elif name == "overcomplete":
+        factors = _overcomplete_factors()
+    elif name == "overcomplete_minus_noncritical":
+        factors = _overcomplete_minus_noncritical_factors()
     elif name == "minus_critical":
-        real_factors = [factor for factor in induced_full if factor.env_factor_id is not None]
-        highest_ce_id = max(real_factors, key=lambda factor: factor.ce_value).env_factor_id
-        factors = tuple(
-            factor for factor in real_factors if factor.env_factor_id != highest_ce_id
-        )
-    elif name == "random_graph":
-        factors = (
-            GraphFactorSpec("random cross/resource", OptionID.CROSS_CORRIDOR, OptionID.GOTO_RESOURCE_B, 2, None, 1.0),
-            GraphFactorSpec("random wait/deliver", OptionID.WAIT_AT_BOTTLENECK, OptionID.DELIVER_RIGHT, 2, None, 1.0),
-            GraphFactorSpec("random noop/pickup", OptionID.NOOP, OptionID.PICKUP, 2, None, 1.0),
-        )
+        factors = _minus_critical_factors()
+    elif name == "random_same_size":
+        factors = _random_same_size_factors()
+    elif name == "complete_option_graph":
+        factors = _complete_option_graph_factors()
+    elif name == "shuffled_routes":
+        factors = _full_support_factors()
+        route_permutation = _rotated_permutation(len(factors))
     else:
-        complete_factors = []
-        ce_matrix = estimate_ce_matrix()
-        for option_i in OptionID:
-            for option_j in OptionID:
-                real = _real_factor_for_option_pair(option_i, option_j)
-                if real is not None:
-                    complete_factors.append(
-                        GraphFactorSpec(
-                            name=real.name,
-                            option_i=option_i,
-                            option_j=option_j,
-                            n_modes=real.n_modes,
-                            env_factor_id=real.env_factor_id,
-                            ce_value=float(ce_matrix[int(option_i), int(option_j)]),
-                        )
-                    )
-                else:
-                    complete_factors.append(
-                        GraphFactorSpec(
-                            name=f"complete:{option_i.name}:{option_j.name}",
-                            option_i=option_i,
-                            option_j=option_j,
-                            n_modes=2,
-                            env_factor_id=None,
-                            ce_value=float(ce_matrix[int(option_i), int(option_j)]),
-                            sparsity_weight=2.0,
-                        )
-                    )
-        factors = tuple(complete_factors)
+        factors = _full_support_factors()
+        relevance_permutation = _rotated_permutation(len(factors))
 
-    return GraphConfig(name=name, factors=factors, pairwise_pairs=_chain_pairs(len(factors)))
+    return GraphConfig(
+        name=name,
+        factors=factors,
+        pairwise_pairs=_chain_pairs(len(factors)),
+        route_permutation=route_permutation,
+        relevance_permutation=relevance_permutation,
+    )
 
 
 def stable_convention_seed(base_seed: int, convention: dict[int, int], trial: int = 0) -> int:

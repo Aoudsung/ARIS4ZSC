@@ -1,7 +1,9 @@
 # Toy Factor Game Experiments
 
-This directory contains the toy-game implementation for the first
-experiment-bridge milestone in `idea-stage/refine-logs/EXPERIMENT_PLAN.md`.
+This directory contains the current ARIS-Bellman toy implementation for
+zero-shot coordination via interaction-factor beliefs. Legacy TCASO code under
+`src/tcaso_critic/` is retained for historical context and is not used for
+ARIS-Bellman claims.
 
 ## ARIS-Bellman Neural Toy Path
 
@@ -13,7 +15,7 @@ python experiments/toy_factor_game/train.py \
   --n_episodes 8000 \
   --eval_every 200 \
   --method aris_bellman \
-  --graph_variant full_graph \
+  --graph_variant full_support \
   --max_steps 50 \
   --output_dir results/toy
 ```
@@ -24,8 +26,8 @@ Run Exp 1 policy/baseline evaluation:
 python experiments/toy_factor_game/evaluate.py \
   --seed 0 \
   --experiments 1 \
-  --methods aris_bellman,flat_latent,global_gru,oracle_belief,random_policy \
-  --exp1_graph_variants full_graph,plus_irrelevant \
+  --methods base_only,aris_bellman,flat_latent,global_gru,oracle_belief_factorq,oracle_belief_flatq,random_policy \
+  --exp1_graph_variants full_support,overcomplete \
   --n_per_conv 5 \
   --max_steps 50 \
   --output_dir results/toy
@@ -33,12 +35,14 @@ python experiments/toy_factor_game/evaluate.py \
 
 Train graph variants for Exp 4 by changing `--graph_variant` to each of:
 
-- `full_graph`
-- `plus_irrelevant`
-- `minus_noncritical`
+- `full_support`
+- `overcomplete`
+- `overcomplete_minus_noncritical`
 - `minus_critical`
-- `random_graph`
-- `complete_graph`
+- `random_same_size`
+- `complete_option_graph`
+- `shuffled_routes`
+- `shuffled_relevance`
 
 Then run:
 
@@ -47,7 +51,7 @@ python experiments/toy_factor_game/evaluate.py \
   --seed 0 \
   --experiments 4 \
   --methods aris_bellman \
-  --graph_variants full_graph,plus_irrelevant,minus_noncritical,minus_critical,random_graph,complete_graph \
+  --graph_variants full_support,overcomplete,overcomplete_minus_noncritical,minus_critical,random_same_size,complete_option_graph,shuffled_routes,shuffled_relevance \
   --n_per_conv 5 \
   --max_steps 50 \
   --output_dir results/toy
@@ -57,6 +61,16 @@ The neural implementation no longer trains or evaluates deployment-time
 `gtvoi`, `mi`, `passive`, or `oracle` selectors. G-TVOI and MI are post-hoc
 trajectory diagnostics computed from real belief updates under the learned
 Bellman policy.
+
+The main baseline names are:
+
+- `base_only`: task-only `Q_base(s, option)`.
+- `aris_bellman`: factor-local belief state and factor-local Q residuals.
+- `flat_latent`: unrestricted latent-belief Q baseline.
+- `global_gru`: global-history shortcut baseline.
+- `oracle_belief_factorq`: true factor labels with factor-local Q.
+- `oracle_belief_flatq`: true factor labels with unrestricted flat Q.
+- `random_policy`: uniformly sampled valid options.
 
 ## Symbolic Pilot
 

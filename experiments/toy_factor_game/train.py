@@ -27,7 +27,7 @@ from toy_factor_game.options import (
     get_option_cost,
     get_valid_options,
 )
-from toy_factor_game.policy import METHODS, ActiveFactorAgent, labels_to_marginals
+from toy_factor_game.policy import METHODS, ORACLE_BELIEF_METHODS, ActiveFactorAgent
 
 
 TRAIN_METHODS = tuple(method for method in METHODS if method != "random_policy")
@@ -65,12 +65,31 @@ def oracle_marginals(
     batch_size: int,
     device: torch.device,
 ) -> list[torch.Tensor]:
-    labels = torch.tensor(
-        [graph_config.labels_from_convention(convention)] * batch_size,
-        dtype=torch.long,
-        device=device,
-    )
-    return labels_to_marginals(labels, graph_config.factor_modes)
+    marginals = []
+    for factor, n_modes in zip(graph_config.factors, graph_config.factor_modes):
+        if factor.env_factor_id is None:
+            marginals.append(torch.ones(batch_size, n_modes, device=device) / float(n_modes))
+            continue
+        label = int(convention[factor.env_factor_id])
+        labels = torch.full((batch_size,), label, dtype=torch.long, device=device)
+        marginals.append(F.one_hot(labels, num_classes=n_modes).float())
+    return marginals
+
+
+def labels_to_oracle_marginals(
+    factor_labels: torch.Tensor,
+    graph_config: GraphConfig,
+) -> list[torch.Tensor]:
+    marginals = []
+    batch_size = factor_labels.shape[0]
+    device = factor_labels.device
+    for factor_idx, (factor, n_modes) in enumerate(zip(graph_config.factors, graph_config.factor_modes)):
+        if factor.env_factor_id is None:
+            marginals.append(torch.ones(batch_size, n_modes, device=device) / float(n_modes))
+            continue
+        labels = factor_labels[:, factor_idx].clamp(min=0, max=n_modes - 1)
+        marginals.append(F.one_hot(labels, num_classes=n_modes).float())
+    return marginals
 
 
 def _masked_q(q_values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -118,7 +137,7 @@ def collect_episode(
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         mask_t = valid_option_mask(env, device)
 
-        if agent.method == "oracle_belief":
+        if agent.method in ORACLE_BELIEF_METHODS:
             marginals = oracle_marginals(graph_config, env.partner_convention.modes, 1, device)
         elif agent.method == "global_gru":
             marginals = None
@@ -248,8 +267,8 @@ def _current_marginals(
     factor_hidden: torch.Tensor,
     factor_labels: torch.Tensor,
 ) -> list[torch.Tensor] | None:
-    if agent.method == "oracle_belief":
-        return labels_to_marginals(factor_labels, graph_config.factor_modes)
+    if agent.method in ORACLE_BELIEF_METHODS:
+        return labels_to_oracle_marginals(factor_labels, graph_config)
     if agent.method == "global_gru":
         return None
     return agent.belief_model._marginals_from_h(factor_hidden)
@@ -399,7 +418,7 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--method", type=str, default="aris_bellman", choices=TRAIN_METHODS)
-    parser.add_argument("--graph_variant", type=str, default="full_graph", choices=GRAPH_VARIANTS)
+    parser.add_argument("--graph_variant", type=str, default="full_support", choices=GRAPH_VARIANTS)
     parser.add_argument("--explore_eps", type=float, default=0.15)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--target_update_every", type=int, default=50)
@@ -505,7 +524,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     save_results(
         {
-            "schema_version": "aris_bellman_v1",
+            "schema_version": "aris_bellman_v2",
             "config": vars(args),
             "graph": {
                 "name": graph_config.name,
@@ -518,7 +537,7 @@ def main():
         },
         str(output_dir / "results.json"),
     )
-    torch.save({"schema_version": "aris_bellman_v1", "state_dict": agent.state_dict()}, str(output_dir / "model.pt"))
+    torch.save({"schema_version": "aris_bellman_v2", "state_dict": agent.state_dict()}, str(output_dir / "model.pt"))
     print(f"Saved to {output_dir}")
 
 

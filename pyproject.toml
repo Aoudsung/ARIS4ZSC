@@ -3,14 +3,16 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tcaso-critic-gate3"
+name = "aris4zsc"
 version = "0.1.0"
-description = "TCASO-CRITIC Gate 3 thin vertical slice certifier for OvercookedV2"
+description = "ARIS-Bellman toy experiments for zero-shot coordination via interaction-factor beliefs"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
+  "torch>=2.0",
   "pyyaml>=6.0",
   "jsonschema>=4.20",
+  "pytest>=8",
 ]
 
 [project.optional-dependencies]

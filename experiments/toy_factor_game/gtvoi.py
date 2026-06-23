@@ -6,9 +6,6 @@ real transition using the observed belief update.
 
 import torch
 
-from .policy import belief_to_features, compute_belief_dim
-
-
 def compute_mi(
     marginals_before: list[torch.Tensor],
     marginals_after: list[torch.Tensor],

@@ -18,8 +18,8 @@ from toy_factor_game.env import NUM_FACTORS, ToyFactorGameEnv
 from toy_factor_game.graph_config import GRAPH_VARIANTS, GraphConfig, get_graph_config, stable_convention_seed
 from toy_factor_game.gtvoi import bellman_delta_info, compute_mi
 from toy_factor_game.options import NUM_OPTIONS
-from toy_factor_game.policy import METHODS, ActiveFactorAgent, labels_to_marginals
-from toy_factor_game.train import all_conventions, collect_episode, model_output_dir
+from toy_factor_game.policy import METHODS, ORACLE_BELIEF_METHODS, ActiveFactorAgent, uniform_marginals
+from toy_factor_game.train import all_conventions, collect_episode, model_output_dir, oracle_marginals
 
 
 EVAL_METHODS = METHODS
@@ -38,8 +38,8 @@ def load_checkpoint(model_path: Path, device):
         checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     except TypeError:
         checkpoint = torch.load(model_path, map_location=device)
-    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != "aris_bellman_v1":
-        raise RuntimeError(f"{model_path} is not an ARIS-Bellman checkpoint")
+    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != "aris_bellman_v2":
+        raise RuntimeError(f"{model_path} is not an ARIS-Bellman v2 checkpoint")
     return checkpoint["state_dict"]
 
 
@@ -71,16 +71,15 @@ def random_agent(device, graph_config: GraphConfig, hidden_dim: int):
 
 
 def factor_metrics(agent, device, episode_data: dict, graph_config: GraphConfig) -> tuple[list[float], list[int]]:
-    if agent.method in ("global_gru", "random_policy"):
+    if agent.method in ("base_only", "global_gru", "random_policy"):
         return [], []
     if not episode_data["evidence"]:
         return [], []
     evidence_seq = torch.stack(episode_data["evidence"]).unsqueeze(0).to(device)
     labels = graph_config.labels_from_convention(episode_data["infos"][0]["convention"])
     with torch.no_grad():
-        if agent.method == "oracle_belief":
-            label_tensor = torch.tensor([labels], dtype=torch.long, device=device)
-            marginals = labels_to_marginals(label_tensor, graph_config.factor_modes)
+        if agent.method in ORACLE_BELIEF_METHODS:
+            marginals = oracle_marginals(graph_config, episode_data["infos"][0]["convention"], 1, device)
         else:
             marginals = agent.belief_model(evidence_seq)
     probs, correct = [], []
@@ -93,30 +92,54 @@ def factor_metrics(agent, device, episode_data: dict, graph_config: GraphConfig)
     return probs, correct
 
 
+def _safe_corr(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    x = np.array(xs, dtype=np.float64)
+    y = np.array(ys, dtype=np.float64)
+    if float(np.std(x)) == 0.0 or float(np.std(y)) == 0.0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphConfig, gamma: float):
-    if agent.method in ("global_gru", "random_policy", "oracle_belief"):
+    if agent.method in ("base_only", "flat_latent", "global_gru", "oracle_belief_factorq", "oracle_belief_flatq", "random_policy"):
         return {
             "actual_mi_mean": None,
             "delta_info_mean": None,
+            "positive_delta_info_rate": None,
+            "topk_delta_info_mean": None,
             "diagnostic_action_count": 0,
             "diagnostic_opportunity_cost": 0.0,
             "reward_after_first_diagnostic": None,
+            "reward_after_first_high_delta_info": None,
+            "delta_info_future_return_corr": None,
+            "mi_future_return_corr": None,
+            "belief_swap_delta_q_mean": None,
             "oracle_gap_closed_after_diagnostic": None,
+            "oracle_gap_status": "not_applicable",
         }
     factor_hidden = agent.belief_model.initial_hidden(1, device)
     mi_values = []
     delta_values = []
+    future_returns = []
+    belief_swap_delta_q = []
     opportunity_costs = []
     diagnostic_indices = []
+    high_delta_indices = []
     for t, evidence in enumerate(episode_data["evidence"]):
         obs_t = episode_data["obs"][t].unsqueeze(0).to(device)
         next_obs_t = episode_data["next_obs"][t].unsqueeze(0).to(device)
         before = agent.belief_model._marginals_from_h(factor_hidden)
-        q_before = agent.q_values(obs_t, before)
-        q_before = q_before.masked_fill(~episode_data["valid_masks"][t].unsqueeze(0).bool(), -1e9)
+        q_task = agent.q_base_values(obs_t)
+        q_task = q_task.masked_fill(~episode_data["valid_masks"][t].unsqueeze(0).bool(), -1e9)
         selected = int(episode_data["options"][t])
-        best = int(q_before.argmax(dim=-1).item())
-        opportunity_cost = max(0.0, float(q_before[0, best].item() - q_before[0, selected].item()))
+        best_task = int(q_task.argmax(dim=-1).item())
+        opportunity_cost = max(0.0, float(q_task[0, best_task].item() - q_task[0, selected].item()))
+        uniform_before = uniform_marginals(graph_config.factor_modes, 1, device)
+        q_actual = agent.q_values(obs_t, before)
+        q_uniform = agent.q_values(obs_t, uniform_before)
+        belief_swap_delta_q.append(float(q_actual[0, selected].item() - q_uniform[0, selected].item()))
         with torch.no_grad():
             factor_hidden = agent.belief_model.step_history(evidence.to(device), factor_hidden)
             after = agent.belief_model._marginals_from_h(factor_hidden)
@@ -133,7 +156,10 @@ def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphCon
             )
         mi_values.append(mi)
         delta_values.append(delta_info)
-        if delta_info > 1e-3 and selected != best:
+        future_returns.append(float(sum(episode_data["env_rewards"][t + 1:])))
+        if delta_info > 1e-3:
+            high_delta_indices.append(t)
+        if delta_info > 1e-3 and selected != best_task:
             diagnostic_indices.append(t)
             opportunity_costs.append(opportunity_cost)
 
@@ -141,13 +167,28 @@ def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphCon
     if diagnostic_indices:
         first = diagnostic_indices[0]
         first_reward = float(sum(episode_data["env_rewards"][first:]))
+    first_high_delta_reward = None
+    if high_delta_indices:
+        first = high_delta_indices[0]
+        first_high_delta_reward = float(sum(episode_data["env_rewards"][first:]))
+    topk_delta = None
+    if delta_values:
+        k = min(3, len(delta_values))
+        topk_delta = float(np.mean(sorted(delta_values, reverse=True)[:k]))
     return {
         "actual_mi_mean": float(np.mean(mi_values)) if mi_values else None,
         "delta_info_mean": float(np.mean(delta_values)) if delta_values else None,
+        "positive_delta_info_rate": float(np.mean([value > 1e-3 for value in delta_values])) if delta_values else None,
+        "topk_delta_info_mean": topk_delta,
         "diagnostic_action_count": int(len(diagnostic_indices)),
         "diagnostic_opportunity_cost": float(np.sum(opportunity_costs)) if opportunity_costs else 0.0,
         "reward_after_first_diagnostic": first_reward,
+        "reward_after_first_high_delta_info": first_high_delta_reward,
+        "delta_info_future_return_corr": _safe_corr(delta_values, future_returns),
+        "mi_future_return_corr": _safe_corr(mi_values, future_returns),
+        "belief_swap_delta_q_mean": float(np.mean(belief_swap_delta_q)) if belief_swap_delta_q else None,
         "oracle_gap_closed_after_diagnostic": None,
+        "oracle_gap_status": "missing_oracle",
     }
 
 
@@ -193,10 +234,35 @@ def summarize_rows(rows: list[dict]) -> dict:
         [row["actual_mi_mean"] for row in rows if row["actual_mi_mean"] is not None],
         dtype=np.float64,
     )
+    positive_delta_rates = np.array(
+        [row["positive_delta_info_rate"] for row in rows if row["positive_delta_info_rate"] is not None],
+        dtype=np.float64,
+    )
+    topk_delta_infos = np.array(
+        [row["topk_delta_info_mean"] for row in rows if row["topk_delta_info_mean"] is not None],
+        dtype=np.float64,
+    )
     reward_after_diag = np.array(
         [row["reward_after_first_diagnostic"] for row in rows if row["reward_after_first_diagnostic"] is not None],
         dtype=np.float64,
     )
+    reward_after_high_delta = np.array(
+        [row["reward_after_first_high_delta_info"] for row in rows if row["reward_after_first_high_delta_info"] is not None],
+        dtype=np.float64,
+    )
+    delta_corrs = np.array(
+        [row["delta_info_future_return_corr"] for row in rows if row["delta_info_future_return_corr"] is not None],
+        dtype=np.float64,
+    )
+    mi_corrs = np.array(
+        [row["mi_future_return_corr"] for row in rows if row["mi_future_return_corr"] is not None],
+        dtype=np.float64,
+    )
+    belief_swap_delta_q = np.array(
+        [row["belief_swap_delta_q_mean"] for row in rows if row["belief_swap_delta_q_mean"] is not None],
+        dtype=np.float64,
+    )
+    oracle_gap_statuses = sorted({row.get("oracle_gap_status") for row in rows if row.get("oracle_gap_status")})
 
     return {
         "status": "done",
@@ -210,11 +276,20 @@ def summarize_rows(rows: list[dict]) -> dict:
         "collisions_mean": float(collisions.mean()),
         "factor_accuracy_mean": float(factor_correct.mean()) if len(factor_correct) else None,
         "ece": expected_calibration_error(factor_probs, factor_correct) if len(factor_correct) else None,
+        "factor_metrics_note": "sanity_only_ground_truth_factors_excluding_synthetic",
         "actual_mi_mean": float(actual_mis.mean()) if len(actual_mis) else None,
         "delta_info_mean": float(delta_infos.mean()) if len(delta_infos) else None,
+        "positive_delta_info_rate": float(positive_delta_rates.mean()) if len(positive_delta_rates) else None,
+        "topk_delta_info_mean": float(topk_delta_infos.mean()) if len(topk_delta_infos) else None,
         "diagnostic_action_count_mean": float(diagnostic_counts.mean()),
         "diagnostic_opportunity_cost_mean": float(diagnostic_costs.mean()),
         "reward_after_first_diagnostic_mean": float(reward_after_diag.mean()) if len(reward_after_diag) else None,
+        "reward_after_first_high_delta_info_mean": float(reward_after_high_delta.mean()) if len(reward_after_high_delta) else None,
+        "delta_info_future_return_corr_mean": float(delta_corrs.mean()) if len(delta_corrs) else None,
+        "mi_future_return_corr_mean": float(mi_corrs.mean()) if len(mi_corrs) else None,
+        "belief_swap_delta_q_mean": float(belief_swap_delta_q.mean()) if len(belief_swap_delta_q) else None,
+        "oracle_gap_closed_after_diagnostic": None,
+        "oracle_gap_status": ",".join(oracle_gap_statuses) if oracle_gap_statuses else "missing_oracle",
     }
 
 
@@ -299,19 +374,38 @@ def exp1_policy_baselines(output_dir: Path, device, seed: int, hidden_dim: int, 
 def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], n_per_conv: int, max_steps: int, gamma: float):
     return {
         method: evaluate_method_for_graph(
-            output_dir, device, seed, "full_graph", method, hidden_dim, n_per_conv, max_steps, gamma
+            output_dir, device, seed, "full_support", method, hidden_dim, n_per_conv, max_steps, gamma
         )
         for method in methods
     }
 
 
 def exp4_graph_robustness(output_dir: Path, device, seed: int, hidden_dim: int, method: str, graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float):
-    return {
+    results = {
         graph_variant: evaluate_method_for_graph(
             output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma
         )
         for graph_variant in graph_variants
     }
+    full_reward = None
+    if "full_support" in results and results["full_support"].get("status") == "done":
+        full_reward = results["full_support"].get("episode_reward_mean")
+    for graph_variant, summary in results.items():
+        if summary.get("status") != "done" or full_reward is None:
+            summary["delta_return_vs_full_support"] = None
+            summary["counterfactual_delta_status"] = "missing_full_support_or_variant"
+            continue
+        summary["delta_return_vs_full_support"] = float(summary["episode_reward_mean"] - full_reward)
+        if graph_variant == "minus_critical":
+            summary["counterfactual_delta_type"] = "factor_deletion_delta_return"
+        elif graph_variant == "shuffled_routes":
+            summary["counterfactual_delta_type"] = "route_deletion_delta_return"
+        elif graph_variant == "shuffled_relevance":
+            summary["counterfactual_delta_type"] = "relevance_deletion_delta_return"
+        else:
+            summary["counterfactual_delta_type"] = "graph_variant_delta_return"
+        summary["counterfactual_delta_status"] = "computed_against_full_support"
+    return results
 
 
 def parse_csv(raw: str, allowed: tuple[str, ...]) -> list[str]:
@@ -328,9 +422,13 @@ def main():
     parser.add_argument("--output_dir", type=str, default="results/toy")
     parser.add_argument("--experiments", type=str, default="1,3,4")
     parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--methods", type=str, default="aris_bellman,flat_latent,global_gru,oracle_belief,random_policy")
+    parser.add_argument(
+        "--methods",
+        type=str,
+        default="base_only,aris_bellman,flat_latent,global_gru,oracle_belief_factorq,oracle_belief_flatq,random_policy",
+    )
     parser.add_argument("--graph_variants", type=str, default=",".join(GRAPH_VARIANTS))
-    parser.add_argument("--exp1_graph_variants", type=str, default="full_graph,plus_irrelevant")
+    parser.add_argument("--exp1_graph_variants", type=str, default="full_support,overcomplete")
     parser.add_argument("--n_per_conv", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=50)
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -348,7 +446,10 @@ def main():
     methods = parse_csv(args.methods, EVAL_METHODS)
     graph_variants = parse_csv(args.graph_variants, GRAPH_VARIANTS)
     exp1_graph_variants = parse_csv(args.exp1_graph_variants, GRAPH_VARIANTS)
-    exp4_method = next((method for method in methods if method != "random_policy"), "aris_bellman")
+    exp4_method = "aris_bellman" if "aris_bellman" in methods else next(
+        (method for method in methods if method != "random_policy"),
+        "aris_bellman",
+    )
 
     all_results = {}
     if 1 in experiments:
@@ -370,7 +471,7 @@ def main():
     results_path = output_dir / f"eval_results_seed{args.seed}.json"
     save_results(
         {
-            "schema_version": "aris_bellman_eval_v1",
+            "schema_version": "aris_bellman_eval_v2",
             "config": vars(args),
             "results": all_results,
             "diagnostic_note": (

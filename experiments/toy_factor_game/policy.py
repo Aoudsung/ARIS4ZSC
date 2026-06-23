@@ -16,7 +16,17 @@ from .factor_belief import FactorBeliefModel
 from .options import NUM_OPTIONS
 
 
-METHODS = ("aris_bellman", "flat_latent", "global_gru", "oracle_belief", "random_policy")
+METHODS = (
+    "base_only",
+    "aris_bellman",
+    "flat_latent",
+    "global_gru",
+    "oracle_belief_factorq",
+    "oracle_belief_flatq",
+    "random_policy",
+)
+
+ORACLE_BELIEF_METHODS = ("oracle_belief_factorq", "oracle_belief_flatq")
 
 
 def belief_to_features(marginals: list[torch.Tensor]) -> torch.Tensor:
@@ -94,24 +104,39 @@ class FactorLocalQNetwork(nn.Module):
         self.obs_proj = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU())
         self.factor_embedding = nn.Embedding(max(self.n_factors, 1), hidden_dim)
         self.option_embedding = nn.Embedding(n_options, hidden_dim)
-        self.advantage = nn.Sequential(
-            nn.Linear(hidden_dim * 3 + self.max_modes, hidden_dim),
+        self.residual_weight = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, self.max_modes),
         )
         mask = torch.tensor(relevance_mask, dtype=torch.float32)
         if mask.numel() == 0:
             mask = torch.zeros(self.n_factors, n_options, dtype=torch.float32)
         self.register_buffer("relevance_mask", mask)
 
+    def q_base_values(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.base(obs)
+
+    def q_uniform_values(self, obs: torch.Tensor) -> torch.Tensor:
+        marginals = uniform_marginals(self.factor_modes, obs.shape[0], obs.device)
+        return self.forward(obs, marginals)
+
+    def _uniform_padded(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        uniform = torch.zeros(batch_size, self.n_factors, self.max_modes, device=device, dtype=dtype)
+        for factor_idx, n_modes in enumerate(self.factor_modes):
+            uniform[:, factor_idx, :n_modes] = 1.0 / float(n_modes)
+        return uniform
+
     def forward(self, obs: torch.Tensor, marginals: list[torch.Tensor]) -> torch.Tensor:
-        q_base = self.base(obs)
+        q_base = self.q_base_values(obs)
         if self.n_factors == 0:
             return q_base
 
         batch_size = obs.shape[0]
         obs_context = self.obs_proj(obs)
         belief = pad_marginals(marginals, self.factor_modes)
+        uniform = self._uniform_padded(batch_size, obs.device, belief.dtype)
+        centered_belief = belief - uniform
         factor_ids = torch.arange(self.n_factors, device=obs.device)
         option_ids = torch.arange(self.n_options, device=obs.device)
         factor_emb = self.factor_embedding(factor_ids)
@@ -120,9 +145,9 @@ class FactorLocalQNetwork(nn.Module):
         obs_term = obs_context[:, None, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
         factor_term = factor_emb[None, :, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
         option_term = option_emb[None, None, :, :].expand(batch_size, self.n_factors, self.n_options, -1)
-        belief_term = belief[:, :, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
-        adv_in = torch.cat([obs_term, factor_term, option_term, belief_term], dim=-1)
-        adv = self.advantage(adv_in).squeeze(-1)
+        weight_in = torch.cat([obs_term, factor_term, option_term], dim=-1)
+        weights = self.residual_weight(weight_in)
+        adv = (weights * centered_belief[:, :, None, :]).sum(dim=-1)
         masked_adv = adv * self.relevance_mask[None, :, :]
         return q_base + masked_adv.sum(dim=1)
 
@@ -238,12 +263,20 @@ class ActiveFactorAgent(nn.Module):
     ) -> torch.Tensor:
         if self.method == "random_policy":
             return torch.zeros(obs.shape[0], self.n_options, device=obs.device)
+        if self.method == "base_only":
+            return self.factor_q.q_base_values(obs)
         if self.method == "global_gru":
             if global_hidden is None:
                 global_hidden = self.global_q.initial_hidden(obs.shape[0], obs.device)
             return self.global_q(obs, global_hidden)
         if marginals is None:
             marginals = uniform_marginals(self.factor_modes, obs.shape[0], obs.device)
-        if self.method == "flat_latent" or self.method == "oracle_belief":
+        if self.method in ("flat_latent", "oracle_belief_flatq"):
             return self.flat_q(obs, marginals)
         return self.factor_q(obs, marginals)
+
+    def q_base_values(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.factor_q.q_base_values(obs)
+
+    def q_uniform_values(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.factor_q.q_uniform_values(obs)
