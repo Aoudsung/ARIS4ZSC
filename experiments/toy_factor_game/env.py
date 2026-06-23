@@ -228,6 +228,16 @@ class ToyFactorGameEnv:
             if partner_action_override is not None
             else self._partner_action()
         )
+        before = {
+            "ego_pos": tuple(self.ego_pos),
+            "partner_pos": tuple(self.partner_pos),
+            "ego_carrying": self.ego_carrying,
+            "partner_carrying": self.partner_carrying,
+            "resource_a_available": self.resource_a_available,
+            "resource_b_available": self.resource_b_available,
+            "deliveries_left": self.deliveries_left,
+            "deliveries_right": self.deliveries_right,
+        }
 
         new_ego = self._move(self.ego_pos, ego_action)
         new_partner = self._move(self.partner_pos, partner_action)
@@ -281,12 +291,37 @@ class ToyFactorGameEnv:
 
         self.step_count += 1
         self.total_reward += reward
-        done = self.step_count >= self.max_steps
+        completed = self.deliveries_left > 0 and self.deliveries_right > 0
+        done = self.step_count >= self.max_steps or completed
+        event = {
+            "ego_pos_before": before["ego_pos"],
+            "partner_pos_before": before["partner_pos"],
+            "ego_pos_after": tuple(self.ego_pos),
+            "partner_pos_after": tuple(self.partner_pos),
+            "ego_carrying_before": before["ego_carrying"],
+            "partner_carrying_before": before["partner_carrying"],
+            "ego_carrying_after": self.ego_carrying,
+            "partner_carrying_after": self.partner_carrying,
+            "resource_a_available_before": before["resource_a_available"],
+            "resource_b_available_before": before["resource_b_available"],
+            "resource_a_available_after": self.resource_a_available,
+            "resource_b_available_after": self.resource_b_available,
+            "deliveries_left_before": before["deliveries_left"],
+            "deliveries_right_before": before["deliveries_right"],
+            "deliveries_left_after": self.deliveries_left,
+            "deliveries_right_after": self.deliveries_right,
+            "ego_action": int(ego_action),
+            "partner_action": int(partner_action),
+            "collision": collision,
+            "completed": completed,
+        }
         info = {
             "collision": collision,
             "partner_action": int(partner_action),
             "step": self.step_count,
             "convention": self.partner_convention.modes.copy(),
+            "completed": completed,
+            "event": event,
         }
         return self._obs(), reward, done, info
 

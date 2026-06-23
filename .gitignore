@@ -1,36 +1,29 @@
-.DS_Store
-._*
-
-# Python caches and tooling
 __pycache__/
 *.py[cod]
+.DS_Store
+/.claude/settings.local.json
 .pytest_cache/
-.ruff_cache/
 .mypy_cache/
-.coverage
-htmlcov/
-*.egg-info/
-
-# Local environments and external dependencies
-.venv
+.ruff_cache/
 .venv/
-venv
 venv/
-external
-external/
-
-# Experiment outputs, reports, and large artifacts
 artifacts/
 reports/
 runs/
-checkpoints/
+results/
+*.egg-info/
 *.pt
 *.pth
 *.ckpt
-*.h5
-*.hdf5
-
-# Local transfer bundles
+*.tar
 *.tar.gz
-*.tgz
 *.zip
+._*
+CUSTOMER.md
+AGENTS.md
+CLAUDE.md
+.agents/
+.aris/
+.claude/
+literature/
+idea-stage/

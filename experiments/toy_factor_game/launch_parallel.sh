@@ -3,7 +3,7 @@ set -euo pipefail
 
 TASK="${1:-}"
 if [[ -z "$TASK" ]]; then
-  echo "usage: $0 exp3|exp4 [--seed N] [--output_dir DIR] [--hidden_dim N] [--max_steps N] [--n_episodes N] [--gpus CSV] [--jobs_per_gpu N] [--batch_size N] [--dry_run]" >&2
+  echo "usage: $0 exp1|exp3|exp4 [--seed N] [--output_dir DIR] [--hidden_dim N] [--max_steps N] [--n_episodes N] [--gpus CSV] [--jobs_per_gpu N] [--batch_size N] [--dry_run]" >&2
   exit 2
 fi
 shift
@@ -41,16 +41,20 @@ if [[ "$MAX_PARALLEL" -le 0 ]]; then
 fi
 
 case "$TASK" in
+  exp1)
+    GRAPH_VARIANTS=(full_graph full_graph full_graph full_graph plus_irrelevant plus_irrelevant plus_irrelevant plus_irrelevant)
+    METHODS=(aris_bellman flat_latent global_gru oracle_belief aris_bellman flat_latent global_gru oracle_belief)
+    ;;
   exp3)
-    GRAPH_VARIANTS=(full_graph full_graph full_graph)
-    LOSS_VARIANTS=(response_only response_value full)
+    GRAPH_VARIANTS=(full_graph full_graph full_graph full_graph)
+    METHODS=(aris_bellman flat_latent global_gru oracle_belief)
     ;;
   exp4)
     GRAPH_VARIANTS=(full_graph plus_irrelevant minus_noncritical minus_critical random_graph complete_graph)
-    LOSS_VARIANTS=(full full full full full full)
+    METHODS=(aris_bellman aris_bellman aris_bellman aris_bellman aris_bellman aris_bellman)
     ;;
   *)
-    echo "unknown task: $TASK; expected exp3 or exp4" >&2
+    echo "unknown task: $TASK; expected exp1, exp3, or exp4" >&2
     exit 2
     ;;
 esac
@@ -59,15 +63,14 @@ running=0
 for idx in "${!GRAPH_VARIANTS[@]}"; do
   gpu="${GPU_LIST[$(( idx % ${#GPU_LIST[@]} ))]}"
   graph="${GRAPH_VARIANTS[$idx]}"
-  loss="${LOSS_VARIANTS[$idx]}"
+  method="${METHODS[$idx]}"
   cmd=(
     python experiments/toy_factor_game/train.py
     --seed "$SEED"
     --n_episodes "$N_EPISODES"
     --hidden_dim "$HIDDEN_DIM"
+    --method "$method"
     --graph_variant "$graph"
-    --loss_variant "$loss"
-    --mode gtvoi
     --max_steps "$MAX_STEPS"
     --batch_size "$BATCH_SIZE"
     --output_dir "$OUTPUT_DIR"

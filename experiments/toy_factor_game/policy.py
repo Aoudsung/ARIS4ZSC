@@ -1,129 +1,189 @@
+"""ARIS-Bellman agents for the toy factor game.
+
+The main method uses factor-local beliefs and a factor-local Bellman Q
+decomposition. Auxiliary response, calibration, sparsity, transition, and
+selector losses are intentionally absent from training.
 """
-Belief-conditioned Bayes-adaptive controller for the toy factor game.
-Unified training with L_response + L_value + L_control + KL + sparsity + calibration.
-"""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .evidence import EVIDENCE_DIM, option_relevance_mask
 from .factor_belief import FactorBeliefModel
-from .gtvoi import OptionQNetwork, ValueNetwork, belief_to_features, compute_belief_dim
+from .options import NUM_OPTIONS
 
 
-def brier_calibration_loss(
-    marginals: list[torch.Tensor],
+METHODS = ("aris_bellman", "flat_latent", "global_gru", "oracle_belief", "random_policy")
+
+
+def belief_to_features(marginals: list[torch.Tensor]) -> torch.Tensor:
+    if not marginals:
+        raise ValueError("belief_to_features requires at least one factor marginal")
+    flat = torch.cat(marginals, dim=-1)
+    entropies = []
+    for marginal in marginals:
+        entropies.append(
+            -(marginal * (marginal + 1e-8).log()).sum(dim=-1, keepdim=True)
+        )
+    ent_vec = torch.cat(entropies, dim=-1)
+    unresolved = (ent_vec > 0.3).float().sum(dim=-1, keepdim=True)
+    return torch.cat([flat, ent_vec, unresolved], dim=-1)
+
+
+def compute_belief_dim(factor_modes: list[int]) -> int:
+    return sum(factor_modes) + len(factor_modes) + 1
+
+
+def pad_marginals(marginals: list[torch.Tensor], factor_modes: list[int]) -> torch.Tensor:
+    if not marginals:
+        batch = 0
+        return torch.empty(batch, 0, 0)
+    batch_size = marginals[0].shape[0]
+    max_modes = max(factor_modes)
+    padded = marginals[0].new_zeros(batch_size, len(marginals), max_modes)
+    for factor_idx, marginal in enumerate(marginals):
+        padded[:, factor_idx, :marginal.shape[-1]] = marginal
+    return padded
+
+
+def uniform_marginals(
+    factor_modes: list[int], batch_size: int, device: torch.device
+) -> list[torch.Tensor]:
+    return [
+        torch.ones(batch_size, n_modes, device=device) / float(n_modes)
+        for n_modes in factor_modes
+    ]
+
+
+def labels_to_marginals(
     factor_labels: torch.Tensor,
     factor_modes: list[int],
-    gt_mask: list[bool] | None = None,
-) -> torch.Tensor:
-    loss = torch.tensor(0.0, device=factor_labels.device)
-    count = 0
-    for i, m in enumerate(marginals):
-        if gt_mask is not None and not gt_mask[i]:
-            continue
-        labels_i = factor_labels[:, i]
-        one_hot = F.one_hot(labels_i, num_classes=factor_modes[i]).float()
-        loss = loss + F.mse_loss(m, one_hot)
-        count += 1
-    if count == 0:
-        return loss
-    return loss / count
+) -> list[torch.Tensor]:
+    marginals = []
+    for factor_idx, n_modes in enumerate(factor_modes):
+        labels = factor_labels[:, factor_idx].clamp(min=0, max=n_modes - 1)
+        marginals.append(F.one_hot(labels, num_classes=n_modes).float())
+    return marginals
 
 
-def factor_activity_loss(
-    marginals: list[torch.Tensor],
-    factor_modes: list[int],
-    sparsity_weights: torch.Tensor | None = None,
-) -> torch.Tensor:
-    entropies = []
-    for m in marginals:
-        entropies.append(-(m * (m + 1e-8).log()).sum(dim=-1))
-    entropy_tensor = torch.stack(entropies, dim=-1)
-    max_entropies = torch.tensor(
-        [float(torch.log(torch.tensor(n_modes, dtype=torch.float32))) for n_modes in factor_modes],
-        device=entropy_tensor.device,
-    )
-    activity = 1.0 - entropy_tensor / max_entropies.clamp_min(1e-8)
-    if sparsity_weights is not None:
-        weights = sparsity_weights.to(device=entropy_tensor.device, dtype=activity.dtype).view(1, -1)
-        activity = activity * weights
-    return activity.mean()
-
-
-class ResponsePredictor(nn.Module):
-    def __init__(self, hidden_dim: int, n_partner_actions: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_partner_actions),
-        )
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.net(h)
-
-
-class BeliefTransitionModel(nn.Module):
+class FactorLocalQNetwork(nn.Module):
     def __init__(
         self,
-        belief_dim: int,
+        obs_dim: int,
         n_options: int,
         factor_modes: list[int],
-        hidden_dim: int = 64,
+        relevance_mask: list[list[bool]],
+        hidden_dim: int = 128,
     ):
         super().__init__()
         self.n_options = n_options
         self.factor_modes = factor_modes
-        self.net = nn.Sequential(
-            nn.Linear(belief_dim + n_options, hidden_dim),
+        self.n_factors = len(factor_modes)
+        self.max_modes = max(factor_modes) if factor_modes else 1
+
+        self.base = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, sum(factor_modes)),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_options),
+        )
+        self.obs_proj = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU())
+        self.factor_embedding = nn.Embedding(max(self.n_factors, 1), hidden_dim)
+        self.option_embedding = nn.Embedding(n_options, hidden_dim)
+        self.advantage = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + self.max_modes, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        mask = torch.tensor(relevance_mask, dtype=torch.float32)
+        if mask.numel() == 0:
+            mask = torch.zeros(self.n_factors, n_options, dtype=torch.float32)
+        self.register_buffer("relevance_mask", mask)
+
+    def forward(self, obs: torch.Tensor, marginals: list[torch.Tensor]) -> torch.Tensor:
+        q_base = self.base(obs)
+        if self.n_factors == 0:
+            return q_base
+
+        batch_size = obs.shape[0]
+        obs_context = self.obs_proj(obs)
+        belief = pad_marginals(marginals, self.factor_modes)
+        factor_ids = torch.arange(self.n_factors, device=obs.device)
+        option_ids = torch.arange(self.n_options, device=obs.device)
+        factor_emb = self.factor_embedding(factor_ids)
+        option_emb = self.option_embedding(option_ids)
+
+        obs_term = obs_context[:, None, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
+        factor_term = factor_emb[None, :, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
+        option_term = option_emb[None, None, :, :].expand(batch_size, self.n_factors, self.n_options, -1)
+        belief_term = belief[:, :, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
+        adv_in = torch.cat([obs_term, factor_term, option_term, belief_term], dim=-1)
+        adv = self.advantage(adv_in).squeeze(-1)
+        masked_adv = adv * self.relevance_mask[None, :, :]
+        return q_base + masked_adv.sum(dim=1)
+
+
+class FlatLatentQNetwork(nn.Module):
+    def __init__(self, obs_dim: int, belief_dim: int, n_options: int, hidden_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + belief_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_options),
         )
 
-    def forward_marginals(
-        self, belief_features: torch.Tensor, option_onehot: torch.Tensor
-    ) -> list[torch.Tensor]:
-        logits = self.net(torch.cat([belief_features, option_onehot], dim=-1))
-        marginals = []
-        offset = 0
-        for n_modes in self.factor_modes:
-            factor_logits = logits[:, offset:offset + n_modes]
-            marginals.append(F.softmax(factor_logits, dim=-1))
-            offset += n_modes
-        return marginals
+    def forward(self, obs: torch.Tensor, marginals: list[torch.Tensor]) -> torch.Tensor:
+        return self.net(torch.cat([obs, belief_to_features(marginals)], dim=-1))
 
-    def forward(self, belief_features: torch.Tensor, option_onehot: torch.Tensor) -> torch.Tensor:
-        return belief_to_features(self.forward_marginals(belief_features, option_onehot))
 
-    def forward_all_options(
-        self, belief_features: torch.Tensor
-    ) -> tuple[list[list[torch.Tensor]], list[torch.Tensor]]:
-        batch_size = belief_features.shape[0]
-        option_onehot = F.one_hot(
-            torch.arange(self.n_options, device=belief_features.device),
-            num_classes=self.n_options,
-        ).float()
-        option_onehot = option_onehot.unsqueeze(0).expand(batch_size, -1, -1)
-        belief_expanded = belief_features.unsqueeze(1).expand(-1, self.n_options, -1)
-        logits = self.net(
-            torch.cat([belief_expanded, option_onehot], dim=-1).reshape(
-                batch_size * self.n_options, -1
-            )
-        ).view(batch_size, self.n_options, -1)
+class GlobalGRUQNetwork(nn.Module):
+    def __init__(self, obs_dim: int, n_actions: int, n_options: int, hidden_dim: int = 128):
+        super().__init__()
+        self.encoder = nn.GRU(
+            input_size=obs_dim + n_actions + n_actions,
+            hidden_size=hidden_dim,
+            batch_first=True,
+        )
+        self.q = nn.Sequential(
+            nn.Linear(obs_dim + hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, n_options),
+        )
 
-        per_option_marginals = []
-        per_option_features = []
-        for option_id in range(self.n_options):
-            marginals = []
-            offset = 0
-            for n_modes in self.factor_modes:
-                factor_logits = logits[:, option_id, offset:offset + n_modes]
-                marginals.append(F.softmax(factor_logits, dim=-1))
-                offset += n_modes
-            per_option_marginals.append(marginals)
-            per_option_features.append(belief_to_features(marginals))
-        return per_option_marginals, per_option_features
+    def initial_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(1, batch_size, self.encoder.hidden_size, device=device)
+
+    def step_history(
+        self,
+        obs_t: torch.Tensor,
+        ego_action_t: torch.Tensor,
+        partner_action_t: torch.Tensor,
+        hidden: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if obs_t.dim() == 1:
+            obs_t = obs_t.unsqueeze(0)
+        if ego_action_t.dim() == 1:
+            ego_action_t = ego_action_t.unsqueeze(0)
+        if partner_action_t.dim() == 1:
+            partner_action_t = partner_action_t.unsqueeze(0)
+        if hidden is None:
+            hidden = self.initial_hidden(obs_t.shape[0], obs_t.device)
+        x = torch.cat([obs_t, ego_action_t, partner_action_t], dim=-1).unsqueeze(1)
+        _, next_hidden = self.encoder(x, hidden)
+        return next_hidden
+
+    def forward(self, obs: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        if hidden.dim() == 3:
+            hidden = hidden.squeeze(0)
+        return self.q(torch.cat([obs, hidden], dim=-1))
 
 
 class ActiveFactorAgent(nn.Module):
@@ -132,126 +192,58 @@ class ActiveFactorAgent(nn.Module):
         obs_dim: int,
         n_actions: int,
         n_options: int,
-        n_factors: int,
-        factor_modes: list[int],
+        graph_config,
         hidden_dim: int = 128,
-        pairwise_pairs: list[tuple[int, int]] | None = None,
+        method: str = "aris_bellman",
     ):
         super().__init__()
+        if method not in METHODS:
+            raise ValueError(f"Unknown method {method!r}; expected one of {METHODS}")
         self.obs_dim = obs_dim
         self.n_actions = n_actions
         self.n_options = n_options
-        self.factor_modes = factor_modes
-
-        belief_dim = compute_belief_dim(factor_modes)
+        self.factor_modes = graph_config.factor_modes
+        self.method = method
 
         self.belief_model = FactorBeliefModel(
-            obs_dim=obs_dim,
-            n_actions=n_actions,
-            n_factors=n_factors,
-            factor_modes=factor_modes,
+            evidence_dim=EVIDENCE_DIM,
+            n_factors=graph_config.n_factors,
+            factor_modes=graph_config.factor_modes,
             hidden_dim=hidden_dim,
-            pairwise_pairs=pairwise_pairs,
         )
 
-        self.q_net = OptionQNetwork(obs_dim, belief_dim, n_options, hidden_dim)
-        self.value_net = ValueNetwork(obs_dim, belief_dim, hidden_dim)
-        self.belief_transition = BeliefTransitionModel(
-            belief_dim=belief_dim,
+        belief_dim = compute_belief_dim(graph_config.factor_modes)
+        self.factor_q = FactorLocalQNetwork(
+            obs_dim=obs_dim,
             n_options=n_options,
-            factor_modes=factor_modes,
-            hidden_dim=max(64, hidden_dim // 2),
+            factor_modes=graph_config.factor_modes,
+            relevance_mask=option_relevance_mask(graph_config),
+            hidden_dim=hidden_dim,
         )
-        self.response_predictor = ResponsePredictor(hidden_dim, n_actions)
+        self.flat_q = FlatLatentQNetwork(obs_dim, belief_dim, n_options, hidden_dim)
+        self.global_q = GlobalGRUQNetwork(obs_dim, n_actions, n_options, hidden_dim)
 
     def get_belief(
-        self, obs_seq: torch.Tensor, ego_act_seq: torch.Tensor, partner_act_seq: torch.Tensor
-    ) -> list[torch.Tensor]:
-        return self.belief_model(obs_seq, ego_act_seq, partner_act_seq)
-
-    def get_option_logits(
-        self, obs: torch.Tensor, belief_features: torch.Tensor
-    ) -> torch.Tensor:
-        return self.q_net(obs, belief_features)
-
-    def compute_factor_losses(
         self,
-        obs_seq: torch.Tensor,
-        ego_act_seq: torch.Tensor,
-        partner_act_seq: torch.Tensor,
-        partner_actions_next: torch.Tensor,
-        factor_labels: torch.Tensor,
+        evidence_seq: torch.Tensor,
         lengths: torch.Tensor | None = None,
-        obs_at_eval: torch.Tensor | None = None,
-        value_target: torch.Tensor | None = None,
-        value_coef: float = 0.0,
-        beta_kl: float = 0.01,
-        gamma_sparsity: float = 0.1,
-        mu_cal: float = 0.5,
-        sparsity_weights: torch.Tensor | None = None,
-        gt_mask: list[bool] | None = None,
-        return_intermediates: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        h = self.belief_model.encode_history(
-            obs_seq, ego_act_seq, partner_act_seq, lengths=lengths
-        )
-        marginals = self.belief_model._marginals_from_h(h)
+    ) -> list[torch.Tensor]:
+        return self.belief_model(evidence_seq, lengths=lengths)
 
-        response_logits = self.response_predictor(h)
-        l_response = F.cross_entropy(response_logits, partner_actions_next)
-
-        l_kl = torch.tensor(0.0, device=obs_seq.device)
-        for i, m in enumerate(marginals):
-            n_modes = self.factor_modes[i]
-            uniform = torch.ones_like(m) / n_modes
-            kl = (m * ((m + 1e-8).log() - uniform.log())).sum(dim=-1).mean()
-            l_kl += kl
-
-        l_sparsity = factor_activity_loss(marginals, self.factor_modes, sparsity_weights)
-
-        if factor_labels is not None:
-            l_calibration = brier_calibration_loss(
-                marginals, factor_labels, self.factor_modes, gt_mask=gt_mask
-            )
-        else:
-            l_calibration = torch.tensor(0.0, device=obs_seq.device)
-
-        belief_features = None
-        if (
-            value_coef > 0.0
-            and obs_at_eval is not None
-            and value_target is not None
-        ) or return_intermediates:
-            belief_features = belief_to_features(marginals)
-
-        l_value = torch.tensor(0.0, device=obs_seq.device)
-        if value_coef > 0.0 and obs_at_eval is not None and value_target is not None:
-            v_pred = self.value_net(obs_at_eval, belief_features)
-            l_value = F.mse_loss(v_pred, value_target)
-
-        total = (
-            l_response
-            + beta_kl * l_kl
-            + gamma_sparsity * l_sparsity
-            + mu_cal * l_calibration
-            + value_coef * l_value
-        )
-
-        result = {
-            "total": total,
-            "response": l_response,
-            "kl": l_kl,
-            "sparsity": l_sparsity,
-            "calibration": l_calibration,
-            "belief_value": l_value,
-        }
-        if return_intermediates:
-            result.update({
-                "marginals": marginals,
-                "h": h,
-                "belief_features": belief_features,
-            })
-        return result
-
-    def compute_losses(self, *args, **kwargs) -> dict[str, torch.Tensor]:
-        return self.compute_factor_losses(*args, **kwargs)
+    def q_values(
+        self,
+        obs: torch.Tensor,
+        marginals: list[torch.Tensor] | None = None,
+        global_hidden: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.method == "random_policy":
+            return torch.zeros(obs.shape[0], self.n_options, device=obs.device)
+        if self.method == "global_gru":
+            if global_hidden is None:
+                global_hidden = self.global_q.initial_hidden(obs.shape[0], obs.device)
+            return self.global_q(obs, global_hidden)
+        if marginals is None:
+            marginals = uniform_marginals(self.factor_modes, obs.shape[0], obs.device)
+        if self.method == "flat_latent" or self.method == "oracle_belief":
+            return self.flat_q(obs, marginals)
+        return self.factor_q(obs, marginals)

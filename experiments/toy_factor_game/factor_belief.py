@@ -1,196 +1,146 @@
-"""
-Latent factor belief model: q_φ(Z_F | h_t, H_l).
-Factor graph posterior with factor-factor dependencies.
+"""Factor-local belief model for ARIS-Bellman.
+
+Each latent interaction factor receives only its routed local evidence stream.
+There is no global history encoder feeding all factor heads.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence
-
-
-class FactorPotential(nn.Module):
-    def __init__(self, hidden_dim: int, n_modes: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_modes),
-        )
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return self.net(h)
-
-
-class PairwisePotential(nn.Module):
-    def __init__(self, hidden_dim: int, n_modes_i: int, n_modes_j: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_modes_i * n_modes_j),
-        )
-        self.n_modes_i = n_modes_i
-        self.n_modes_j = n_modes_j
-
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        logits = self.net(h)
-        return logits.view(-1, self.n_modes_i, self.n_modes_j)
 
 
 class FactorBeliefModel(nn.Module):
     def __init__(
         self,
-        obs_dim: int,
-        n_actions: int,
+        evidence_dim: int,
         n_factors: int,
         factor_modes: list[int],
         hidden_dim: int = 128,
-        pairwise_pairs: list[tuple[int, int]] | None = None,
+        factor_embed_dim: int = 16,
     ):
         super().__init__()
+        self.evidence_dim = evidence_dim
         self.n_factors = n_factors
         self.factor_modes = factor_modes
         self.hidden_dim = hidden_dim
+        self.factor_embed_dim = factor_embed_dim
 
-        self.history_encoder = nn.GRU(
-            input_size=obs_dim + n_actions + n_actions,
-            hidden_size=hidden_dim,
-            batch_first=True,
+        self.factor_embedding = nn.Embedding(max(n_factors, 1), factor_embed_dim)
+        self.input_proj = nn.Sequential(
+            nn.Linear(evidence_dim + factor_embed_dim, hidden_dim),
+            nn.ReLU(),
+        )
+        self.filter_cell = nn.GRUCell(hidden_dim, hidden_dim)
+        self.unary_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim + factor_embed_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(hidden_dim, n_modes),
+                )
+                for n_modes in factor_modes
+            ]
         )
 
-        self.unary_potentials = nn.ModuleList([
-            FactorPotential(hidden_dim, fm) for fm in factor_modes
-        ])
+    def initial_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros(batch_size, self.n_factors, self.hidden_dim, device=device)
 
-        self.pairwise_pairs = pairwise_pairs or []
-        self.pairwise_potentials = nn.ModuleList([
-            PairwisePotential(hidden_dim, factor_modes[i], factor_modes[j])
-            for i, j in self.pairwise_pairs
-        ])
-        self.n_bp_iters = 3
-
-    def encode_history(
-        self,
-        obs_seq: torch.Tensor,
-        ego_act_seq: torch.Tensor,
-        partner_act_seq: torch.Tensor,
-        lengths: torch.Tensor | None = None,
-        initial_hidden: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        x = torch.cat([obs_seq, ego_act_seq, partner_act_seq], dim=-1)
-        h0 = initial_hidden
-        if h0 is not None and h0.dim() == 2:
-            h0 = h0.unsqueeze(0)
-        if lengths is not None:
-            packed = pack_padded_sequence(
-                x,
-                lengths.detach().cpu(),
-                batch_first=True,
-                enforce_sorted=False,
-            )
-            _, h = self.history_encoder(packed, h0)
-        else:
-            _, h = self.history_encoder(x, h0)
-        return h.squeeze(0)
+    def _factor_embeddings(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self.n_factors == 0:
+            return torch.zeros(batch_size, 0, self.factor_embed_dim, device=device)
+        ids = torch.arange(self.n_factors, device=device)
+        emb = self.factor_embedding(ids)
+        return emb.unsqueeze(0).expand(batch_size, -1, -1)
 
     def step_history(
         self,
-        obs_t: torch.Tensor,
-        ego_act_t: torch.Tensor,
-        partner_act_t: torch.Tensor,
+        evidence_t: torch.Tensor,
         hidden: torch.Tensor | None = None,
+        active_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if obs_t.dim() == 1:
-            obs_t = obs_t.unsqueeze(0)
-        if ego_act_t.dim() == 1:
-            ego_act_t = ego_act_t.unsqueeze(0)
-        if partner_act_t.dim() == 1:
-            partner_act_t = partner_act_t.unsqueeze(0)
-        x = torch.cat([obs_t, ego_act_t, partner_act_t], dim=-1).unsqueeze(1)
-        h0 = hidden
-        if h0 is not None and h0.dim() == 2:
-            h0 = h0.unsqueeze(0)
-        _, h = self.history_encoder(x, h0)
-        return h
+        if evidence_t.dim() == 2:
+            evidence_t = evidence_t.unsqueeze(0)
+        batch_size = evidence_t.shape[0]
+        if hidden is None:
+            hidden = self.initial_hidden(batch_size, evidence_t.device)
 
-    def _marginals_from_h(self, h: torch.Tensor) -> list[torch.Tensor]:
-        if h.dim() == 3:
-            h = h.squeeze(0)
+        if self.n_factors == 0:
+            return hidden
+
+        factor_emb = self._factor_embeddings(batch_size, evidence_t.device)
+        x = self.input_proj(torch.cat([evidence_t, factor_emb], dim=-1))
+        next_hidden = self.filter_cell(
+            x.reshape(batch_size * self.n_factors, -1),
+            hidden.reshape(batch_size * self.n_factors, -1),
+        ).view(batch_size, self.n_factors, self.hidden_dim)
+
+        if active_mask is None:
+            return next_hidden
+        mask = active_mask.to(dtype=next_hidden.dtype, device=next_hidden.device).view(batch_size, 1, 1)
+        return next_hidden * mask + hidden * (1.0 - mask)
+
+    def encode_history(
+        self,
+        evidence_seq: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+        initial_hidden: torch.Tensor | None = None,
+        return_sequence: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if evidence_seq.dim() != 4:
+            raise ValueError("evidence_seq must have shape [batch, time, n_factors, evidence_dim]")
+        batch_size, max_time = evidence_seq.shape[:2]
+        hidden = initial_hidden
+        if hidden is None:
+            hidden = self.initial_hidden(batch_size, evidence_seq.device)
+
+        hidden_after_steps = []
+        for t in range(max_time):
+            active_mask = None
+            if lengths is not None:
+                active_mask = t < lengths.to(evidence_seq.device)
+            hidden = self.step_history(evidence_seq[:, t], hidden, active_mask=active_mask)
+            if return_sequence:
+                hidden_after_steps.append(hidden)
+
+        if not return_sequence:
+            return hidden
+        if hidden_after_steps:
+            sequence = torch.stack(hidden_after_steps, dim=1)
+        else:
+            sequence = hidden.new_zeros(batch_size, 0, self.n_factors, self.hidden_dim)
+        return hidden, sequence
+
+    def _marginals_from_h(self, hidden: torch.Tensor) -> list[torch.Tensor]:
+        if hidden.dim() == 4:
+            raise ValueError("Pass a single hidden state [batch, n_factors, hidden_dim]")
+        if hidden.dim() == 2:
+            hidden = hidden.unsqueeze(0)
+        batch_size = hidden.shape[0]
+        if self.n_factors == 0:
+            return []
+
+        factor_emb = self._factor_embeddings(batch_size, hidden.device)
         marginals = []
-        unary_logits = [pot(h) for pot in self.unary_potentials]
-
-        if not self.pairwise_pairs:
-            for logits in unary_logits:
-                marginals.append(F.softmax(logits, dim=-1))
-            return marginals
-
-        msgs_to_j = [
-            torch.zeros_like(unary_logits[j])
-            for i, j in self.pairwise_pairs
-        ]
-        msgs_to_i = [
-            torch.zeros_like(unary_logits[i])
-            for i, j in self.pairwise_pairs
-        ]
-
-        for _iteration in range(self.n_bp_iters):
-            new_msgs_to_j = []
-            new_msgs_to_i = []
-            for pair_idx, (i, j) in enumerate(self.pairwise_pairs):
-                pairwise = self.pairwise_potentials[pair_idx](h)
-
-                log_belief_i = unary_logits[i].clone()
-                log_belief_j = unary_logits[j].clone()
-                for other_idx, (oi, oj) in enumerate(self.pairwise_pairs):
-                    if other_idx == pair_idx:
-                        continue
-                    if oj == i:
-                        log_belief_i = log_belief_i + msgs_to_j[other_idx]
-                    elif oi == i:
-                        log_belief_i = log_belief_i + msgs_to_i[other_idx]
-                    if oj == j:
-                        log_belief_j = log_belief_j + msgs_to_j[other_idx]
-                    elif oi == j:
-                        log_belief_j = log_belief_j + msgs_to_i[other_idx]
-
-                msg_i_to_j = torch.logsumexp(
-                    log_belief_i.unsqueeze(-1) + pairwise, dim=-2
-                )
-                msg_j_to_i = torch.logsumexp(
-                    log_belief_j.unsqueeze(-2) + pairwise, dim=-1
-                )
-                new_msgs_to_j.append(msg_i_to_j - msg_i_to_j.logsumexp(dim=-1, keepdim=True))
-                new_msgs_to_i.append(msg_j_to_i - msg_j_to_i.logsumexp(dim=-1, keepdim=True))
-            msgs_to_j = new_msgs_to_j
-            msgs_to_i = new_msgs_to_i
-
-        for node_idx, logits in enumerate(unary_logits):
-            log_belief = logits.clone()
-            for pair_idx, (i, j) in enumerate(self.pairwise_pairs):
-                if j == node_idx:
-                    log_belief = log_belief + msgs_to_j[pair_idx]
-                elif i == node_idx:
-                    log_belief = log_belief + msgs_to_i[pair_idx]
-            marginals.append(F.softmax(log_belief, dim=-1))
+        for factor_idx, head in enumerate(self.unary_heads):
+            logits = head(torch.cat([hidden[:, factor_idx], factor_emb[:, factor_idx]], dim=-1))
+            marginals.append(F.softmax(logits, dim=-1))
         return marginals
 
     def forward(
         self,
-        obs_seq: torch.Tensor,
-        ego_act_seq: torch.Tensor,
-        partner_act_seq: torch.Tensor,
+        evidence_seq: torch.Tensor,
         lengths: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
-        h = self.encode_history(obs_seq, ego_act_seq, partner_act_seq, lengths=lengths)
-        return self._marginals_from_h(h)
+        hidden = self.encode_history(evidence_seq, lengths=lengths)
+        return self._marginals_from_h(hidden)
 
     def get_entropy(self, marginals: list[torch.Tensor]) -> torch.Tensor:
-        entropies = []
-        for m in marginals:
-            ent = -(m * (m + 1e-8).log()).sum(dim=-1)
-            entropies.append(ent)
-        return torch.stack(entropies, dim=-1)
+        if not marginals:
+            return torch.empty(0)
+        return torch.stack(
+            [-(m * (m + 1e-8).log()).sum(dim=-1) for m in marginals],
+            dim=-1,
+        )
 
     def predict_factor_modes(self, marginals: list[torch.Tensor]) -> list[torch.Tensor]:
         return [m.argmax(dim=-1) for m in marginals]

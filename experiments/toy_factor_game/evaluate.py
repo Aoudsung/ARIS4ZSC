@@ -1,9 +1,6 @@
-"""
-Evaluation for the toy factor game.
+"""Evaluation for ARIS-Bellman Toy Factor Game experiments."""
 
-Exp 1 compares deployment-time option selection modes on one trained model.
-Exp 4 compares independently trained graph-variant models.
-"""
+from __future__ import annotations
 
 import argparse
 import json
@@ -15,98 +12,147 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from common.metrics import bootstrap_ci, expected_calibration_error, pareto_frontier
+from common.metrics import bootstrap_ci, expected_calibration_error
 from common.utils import get_device, save_results, set_seed
-from toy_factor_game.env import NUM_FACTORS, ConventionAssignment, ToyFactorGameEnv
+from toy_factor_game.env import NUM_FACTORS, ToyFactorGameEnv
 from toy_factor_game.graph_config import GRAPH_VARIANTS, GraphConfig, get_graph_config, stable_convention_seed
+from toy_factor_game.gtvoi import bellman_delta_info, compute_mi
 from toy_factor_game.options import NUM_OPTIONS
-from toy_factor_game.policy import ActiveFactorAgent
-from toy_factor_game.gtvoi import belief_to_features
-from toy_factor_game.train import MODES, all_conventions, collect_episode
+from toy_factor_game.policy import METHODS, ActiveFactorAgent, labels_to_marginals
+from toy_factor_game.train import all_conventions, collect_episode, model_output_dir
 
 
-def model_path_for(output_dir: Path, seed: int, graph_variant: str, loss_variant: str) -> Path:
-    return output_dir / f"seed{seed}" / graph_variant / loss_variant / "model.pt"
+EVAL_METHODS = METHODS
 
 
-def load_state_dict_file(model_path: Path, device):
+def model_path_for(output_dir: Path, seed: int, method: str, graph_variant: str) -> Path:
+    return model_output_dir(output_dir, seed, method, graph_variant) / "model.pt"
+
+
+def results_path_for(output_dir: Path, seed: int, method: str, graph_variant: str) -> Path:
+    return model_output_dir(output_dir, seed, method, graph_variant) / "results.json"
+
+
+def load_checkpoint(model_path: Path, device):
     try:
-        return torch.load(model_path, map_location=device, weights_only=True)
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
     except TypeError:
-        return torch.load(model_path, map_location=device)
+        checkpoint = torch.load(model_path, map_location=device)
+    if not isinstance(checkpoint, dict) or checkpoint.get("schema_version") != "aris_bellman_v1":
+        raise RuntimeError(f"{model_path} is not an ARIS-Bellman checkpoint")
+    return checkpoint["state_dict"]
 
 
-def load_agent(model_path: Path, device, graph_config: GraphConfig, hidden_dim: int):
+def load_agent(model_path: Path, device, graph_config: GraphConfig, hidden_dim: int, method: str):
     env = ToyFactorGameEnv()
     agent = ActiveFactorAgent(
         obs_dim=env.obs_dim,
         n_actions=env.n_actions,
         n_options=NUM_OPTIONS,
-        n_factors=graph_config.n_factors,
-        factor_modes=graph_config.factor_modes,
+        graph_config=graph_config,
         hidden_dim=hidden_dim,
-        pairwise_pairs=list(graph_config.pairwise_pairs),
+        method=method,
     ).to(device)
-    agent.load_state_dict(load_state_dict_file(model_path, device))
+    agent.load_state_dict(load_checkpoint(model_path, device))
     agent.eval()
     return agent
 
 
-def episode_diagnostics(agent, device, episode_data: dict, conv: ConventionAssignment, graph_config: GraphConfig):
-    if len(episode_data["obs_history"]) < 3:
-        return {
-            "factor_probs": [],
-            "factor_correct": [],
-            "partner_pred_correct": None,
-            "posterior_entropy": None,
-            "per_factor_entropy": [],
-            "value_gap_abs": None,
-        }
-    split = max(1, len(episode_data["obs_history"]) // 2)
-    obs_seq = torch.stack(episode_data["obs_history"][:split]).unsqueeze(0).to(device)
-    ego_seq = torch.stack(episode_data["ego_act_history"][:split]).unsqueeze(0).to(device)
-    partner_seq = torch.stack(episode_data["partner_act_history"][:split]).unsqueeze(0).to(device)
-    with torch.no_grad():
-        h = agent.belief_model.encode_history(obs_seq, ego_seq, partner_seq)
-        marginals = agent.belief_model._marginals_from_h(h)
-        response_logits = agent.response_predictor(h)
-        belief_features = belief_to_features(marginals)
-        value_pred = agent.value_net(
-            episode_data["obs_history"][split].unsqueeze(0).to(device),
-            belief_features,
-        )
+def random_agent(device, graph_config: GraphConfig, hidden_dim: int):
+    env = ToyFactorGameEnv()
+    return ActiveFactorAgent(
+        obs_dim=env.obs_dim,
+        n_actions=env.n_actions,
+        n_options=NUM_OPTIONS,
+        graph_config=graph_config,
+        hidden_dim=hidden_dim,
+        method="random_policy",
+    ).to(device).eval()
 
-    probs = []
-    labels = []
-    factor_labels = graph_config.labels_from_convention(conv.modes)
-    for factor_idx, label in enumerate(factor_labels):
+
+def factor_metrics(agent, device, episode_data: dict, graph_config: GraphConfig) -> tuple[list[float], list[int]]:
+    if agent.method in ("global_gru", "random_policy"):
+        return [], []
+    if not episode_data["evidence"]:
+        return [], []
+    evidence_seq = torch.stack(episode_data["evidence"]).unsqueeze(0).to(device)
+    labels = graph_config.labels_from_convention(episode_data["infos"][0]["convention"])
+    with torch.no_grad():
+        if agent.method == "oracle_belief":
+            label_tensor = torch.tensor([labels], dtype=torch.long, device=device)
+            marginals = labels_to_marginals(label_tensor, graph_config.factor_modes)
+        else:
+            marginals = agent.belief_model(evidence_seq)
+    probs, correct = [], []
+    for factor_idx, label in enumerate(labels):
         if not graph_config.ground_truth_mask[factor_idx]:
             continue
-        pred = marginals[factor_idx][0].argmax().item()
+        pred = int(marginals[factor_idx][0].argmax().item())
         probs.append(float(marginals[factor_idx][0].max().item()))
-        labels.append(int(pred == label))
+        correct.append(int(pred == int(label)))
+    return probs, correct
 
-    entropies = agent.belief_model.get_entropy(marginals)[0]
-    gt_entropies = [
-        float(entropies[i].item())
-        for i, is_gt in enumerate(graph_config.ground_truth_mask)
-        if is_gt
-    ]
-    partner_pred = response_logits.argmax(dim=-1)
-    actual_partner = episode_data["partner_act_history"][split].argmax().to(device)
-    future_return = float(sum(episode_data["rewards"][split:]))
+
+def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphConfig, gamma: float):
+    if agent.method in ("global_gru", "random_policy", "oracle_belief"):
+        return {
+            "actual_mi_mean": None,
+            "delta_info_mean": None,
+            "diagnostic_action_count": 0,
+            "diagnostic_opportunity_cost": 0.0,
+            "reward_after_first_diagnostic": None,
+            "oracle_gap_closed_after_diagnostic": None,
+        }
+    factor_hidden = agent.belief_model.initial_hidden(1, device)
+    mi_values = []
+    delta_values = []
+    opportunity_costs = []
+    diagnostic_indices = []
+    for t, evidence in enumerate(episode_data["evidence"]):
+        obs_t = episode_data["obs"][t].unsqueeze(0).to(device)
+        next_obs_t = episode_data["next_obs"][t].unsqueeze(0).to(device)
+        before = agent.belief_model._marginals_from_h(factor_hidden)
+        q_before = agent.q_values(obs_t, before)
+        q_before = q_before.masked_fill(~episode_data["valid_masks"][t].unsqueeze(0).bool(), -1e9)
+        selected = int(episode_data["options"][t])
+        best = int(q_before.argmax(dim=-1).item())
+        opportunity_cost = max(0.0, float(q_before[0, best].item() - q_before[0, selected].item()))
+        with torch.no_grad():
+            factor_hidden = agent.belief_model.step_history(evidence.to(device), factor_hidden)
+            after = agent.belief_model._marginals_from_h(factor_hidden)
+            mi = float(compute_mi(before, after).item())
+            delta_info = float(
+                bellman_delta_info(
+                    agent,
+                    next_obs_t,
+                    before,
+                    after,
+                    valid_mask=episode_data["next_valid_masks"][t].unsqueeze(0).to(device),
+                    gamma=gamma,
+                ).item()
+            )
+        mi_values.append(mi)
+        delta_values.append(delta_info)
+        if delta_info > 1e-3 and selected != best:
+            diagnostic_indices.append(t)
+            opportunity_costs.append(opportunity_cost)
+
+    first_reward = None
+    if diagnostic_indices:
+        first = diagnostic_indices[0]
+        first_reward = float(sum(episode_data["env_rewards"][first:]))
     return {
-        "factor_probs": probs,
-        "factor_correct": labels,
-        "partner_pred_correct": int(partner_pred.item() == actual_partner.item()),
-        "posterior_entropy": float(np.mean(gt_entropies)) if gt_entropies else None,
-        "per_factor_entropy": gt_entropies,
-        "value_gap_abs": abs(float(value_pred.item()) - future_return),
+        "actual_mi_mean": float(np.mean(mi_values)) if mi_values else None,
+        "delta_info_mean": float(np.mean(delta_values)) if delta_values else None,
+        "diagnostic_action_count": int(len(diagnostic_indices)),
+        "diagnostic_opportunity_cost": float(np.sum(opportunity_costs)) if opportunity_costs else 0.0,
+        "reward_after_first_diagnostic": first_reward,
+        "oracle_gap_closed_after_diagnostic": None,
     }
 
 
-def training_efficiency(output_dir: Path, seed: int, graph_variant: str, loss_variant: str) -> dict:
-    path = output_dir / f"seed{seed}" / graph_variant / loss_variant / "results.json"
+def training_efficiency(output_dir: Path, seed: int, method: str, graph_variant: str) -> dict:
+    path = results_path_for(output_dir, seed, method, graph_variant)
     if not path.exists():
         return {"eval_reward_auc": None, "first_eval_episode_reward_ge_0": None}
     data = json.loads(path.read_text())
@@ -126,102 +172,56 @@ def training_efficiency(output_dir: Path, seed: int, graph_variant: str, loss_va
     }
 
 
-def summarize_rows(rows: list[dict], oracle_rows: dict[tuple[str, int], dict] | None = None) -> dict:
+def summarize_rows(rows: list[dict]) -> dict:
+    if not rows:
+        return {"status": "empty", "n": 0}
     rewards = np.array([row["episode_reward"] for row in rows], dtype=np.float64)
+    td_rewards = np.array([row["td_reward"] for row in rows], dtype=np.float64)
     early_rewards = np.array([row["early_reward"] for row in rows], dtype=np.float64)
-    probe_costs = np.array([row["probe_cost"] for row in rows], dtype=np.float64)
-    alignments = np.array([row["time_to_alignment"] for row in rows], dtype=np.float64)
     collisions = np.array([row["collisions"] for row in rows], dtype=np.float64)
+    completions = np.array([row["completion"] for row in rows], dtype=np.float64)
+    times = np.array([row["time_to_completion"] for row in rows], dtype=np.float64)
     factor_probs = np.array([p for row in rows for p in row["factor_probs"]], dtype=np.float64)
     factor_correct = np.array([c for row in rows for c in row["factor_correct"]], dtype=np.float64)
-    partner_pred = np.array(
-        [row["partner_pred_correct"] for row in rows if row["partner_pred_correct"] is not None],
+    diagnostic_counts = np.array([row["diagnostic_action_count"] for row in rows], dtype=np.float64)
+    diagnostic_costs = np.array([row["diagnostic_opportunity_cost"] for row in rows], dtype=np.float64)
+    delta_infos = np.array(
+        [row["delta_info_mean"] for row in rows if row["delta_info_mean"] is not None],
         dtype=np.float64,
     )
-    posterior_entropy = np.array(
-        [row["posterior_entropy"] for row in rows if row["posterior_entropy"] is not None],
+    actual_mis = np.array(
+        [row["actual_mi_mean"] for row in rows if row["actual_mi_mean"] is not None],
         dtype=np.float64,
     )
-    value_gaps = np.array(
-        [row["value_gap_abs"] for row in rows if row["value_gap_abs"] is not None],
+    reward_after_diag = np.array(
+        [row["reward_after_first_diagnostic"] for row in rows if row["reward_after_first_diagnostic"] is not None],
         dtype=np.float64,
     )
 
-    summary = {
+    return {
         "status": "done",
         "n": len(rows),
         "episode_reward_mean": float(rewards.mean()),
         "episode_reward_ci": list(bootstrap_ci(rewards)),
+        "td_reward_mean": float(td_rewards.mean()),
         "early_reward_mean": float(early_rewards.mean()),
-        "probe_cost_mean": float(probe_costs.mean()),
-        "time_to_alignment_mean": float(alignments.mean()),
+        "completion_rate": float(completions.mean()),
+        "time_to_completion_mean": float(times.mean()),
         "collisions_mean": float(collisions.mean()),
-        "factor_accuracy_mean": float(factor_correct.mean()) if len(factor_correct) else 0.0,
-        "ece": expected_calibration_error(factor_probs, factor_correct),
-        "partner_pred_accuracy": float(partner_pred.mean()) if len(partner_pred) else None,
-        "posterior_entropy_mean": float(posterior_entropy.mean()) if len(posterior_entropy) else None,
-        "value_gap_entropy_corr": None,
+        "factor_accuracy_mean": float(factor_correct.mean()) if len(factor_correct) else None,
+        "ece": expected_calibration_error(factor_probs, factor_correct) if len(factor_correct) else None,
+        "actual_mi_mean": float(actual_mis.mean()) if len(actual_mis) else None,
+        "delta_info_mean": float(delta_infos.mean()) if len(delta_infos) else None,
+        "diagnostic_action_count_mean": float(diagnostic_counts.mean()),
+        "diagnostic_opportunity_cost_mean": float(diagnostic_costs.mean()),
+        "reward_after_first_diagnostic_mean": float(reward_after_diag.mean()) if len(reward_after_diag) else None,
     }
-    if len(value_gaps) > 1 and len(posterior_entropy) == len(value_gaps):
-        if np.std(value_gaps) > 0 and np.std(posterior_entropy) > 0:
-            summary["value_gap_entropy_corr"] = float(np.corrcoef(value_gaps, posterior_entropy)[0, 1])
-
-    if oracle_rows is not None:
-        regrets = []
-        early_regrets = []
-        for row in rows:
-            oracle = oracle_rows[(row["convention"], row["trial"])]
-            regrets.append(oracle["episode_reward"] - row["episode_reward"])
-            early_regrets.append(oracle["early_reward"] - row["early_reward"])
-        summary["regret_to_oracle_mean"] = float(np.mean(regrets))
-        summary["early_regret_to_oracle_mean"] = float(np.mean(early_regrets))
-    return summary
 
 
-def real_factor_belief_aligned(
-    marginals: list[torch.Tensor],
-    conv: ConventionAssignment,
-    graph_config: GraphConfig,
-) -> bool:
-    checked = False
-    for factor_idx, factor in enumerate(graph_config.factors):
-        if factor.env_factor_id is None:
-            continue
-        checked = True
-        label = int(conv.modes[factor.env_factor_id])
-        pred = int(marginals[factor_idx][0].argmax().item())
-        if pred != label:
-            return False
-    return checked
-
-
-def first_alignment_time(
-    agent,
-    device,
-    episode_data: dict,
-    conv: ConventionAssignment,
-    graph_config: GraphConfig,
-    max_steps: int,
-) -> int:
-    hidden = None
-    for idx in range(len(episode_data["obs_history"])):
-        with torch.no_grad():
-            hidden = agent.belief_model.step_history(
-                episode_data["obs_history"][idx].to(device),
-                episode_data["ego_act_history"][idx].to(device),
-                episode_data["partner_act_history"][idx].to(device),
-                hidden,
-            )
-            marginals = agent.belief_model._marginals_from_h(hidden)
-        if real_factor_belief_aligned(marginals, conv, graph_config):
-            return idx + 1
-    return max_steps + 1
-
-
-def evaluate_mode(agent, device, graph_config: GraphConfig, mode: str, seed: int, n_per_conv: int, max_steps: int):
+def evaluate_agent(agent, device, graph_config: GraphConfig, seed: int, n_per_conv: int, max_steps: int, gamma: float):
     rows = []
     for conv in all_conventions():
-        convention_key = "-".join(str(conv.modes[f]) for f in range(NUM_FACTORS))
+        convention_key = "-".join(str(conv.modes[factor_id]) for factor_id in range(NUM_FACTORS))
         for trial in range(n_per_conv):
             env_seed = stable_convention_seed(seed, conv.modes, trial)
             env = ToyFactorGameEnv(partner_convention=conv, max_steps=max_steps, seed=env_seed)
@@ -230,92 +230,88 @@ def evaluate_mode(agent, device, graph_config: GraphConfig, mode: str, seed: int
                     env,
                     agent,
                     device,
-                    mode=mode,
                     graph_config=graph_config,
                     explore_eps=0.0,
                     deterministic=True,
                 )
-            rewards = episode_data["rewards"]
-            diagnostics = episode_diagnostics(agent, device, episode_data, conv, graph_config)
+            rewards = episode_data["env_rewards"]
             early_k = max(1, len(rewards) // 5)
+            factor_probs, factor_correct = factor_metrics(agent, device, episode_data, graph_config)
+            diagnostics = diagnostic_metrics(agent, device, episode_data, graph_config, gamma)
+            completed = any(info.get("completed", False) for info in episode_data["infos"])
             rows.append(
                 {
                     "convention": convention_key,
                     "trial": trial,
                     "episode_reward": float(sum(rewards)),
+                    "td_reward": float(sum(episode_data["rewards"])),
                     "early_reward": float(sum(rewards[:early_k])),
-                    "probe_cost": float(sum(episode_data["probe_costs"])),
-                    "time_to_alignment": first_alignment_time(
-                        agent, device, episode_data, conv, graph_config, max_steps
-                    ),
+                    "completion": float(completed),
+                    "time_to_completion": len(rewards) if completed else max_steps + 1,
                     "collisions": float(sum(1 for info in episode_data["infos"] if info["collision"])),
+                    "factor_probs": factor_probs,
+                    "factor_correct": factor_correct,
                     **diagnostics,
                 }
             )
     return rows
 
 
-def evaluate_modes_for_graph(output_dir: Path, device, seed: int, graph_variant: str, loss_variant: str, hidden_dim: int, modes: list[str], n_per_conv: int, max_steps: int):
+def evaluate_method_for_graph(
+    output_dir: Path,
+    device,
+    seed: int,
+    graph_variant: str,
+    method: str,
+    hidden_dim: int,
+    n_per_conv: int,
+    max_steps: int,
+    gamma: float,
+):
     graph_config = get_graph_config(graph_variant)
-    path = model_path_for(output_dir, seed, graph_variant, loss_variant)
+    if method == "random_policy":
+        agent = random_agent(device, graph_config, hidden_dim)
+        rows = evaluate_agent(agent, device, graph_config, seed, n_per_conv, max_steps, gamma)
+        return summarize_rows(rows)
+
+    path = model_path_for(output_dir, seed, method, graph_variant)
     if not path.exists():
         return {"status": "missing", "model_path": str(path)}
-    agent = load_agent(path, device, graph_config, hidden_dim)
-    oracle_rows_list = evaluate_mode(agent, device, graph_config, "oracle", seed, n_per_conv, max_steps)
-    oracle_rows = {(row["convention"], row["trial"]): row for row in oracle_rows_list}
-    efficiency = training_efficiency(output_dir, seed, graph_variant, loss_variant)
-    results = {}
-    for mode in modes:
-        rows = oracle_rows_list if mode == "oracle" else evaluate_mode(
-            agent, device, graph_config, mode, seed, n_per_conv, max_steps
-        )
-        results[mode] = summarize_rows(rows, oracle_rows)
-        results[mode].update(efficiency)
-
-    costs = np.array([results[mode]["probe_cost_mean"] for mode in modes], dtype=np.float64)
-    rewards = np.array([results[mode]["episode_reward_mean"] for mode in modes], dtype=np.float64)
-    frontier_idx = pareto_frontier(costs, rewards)
-    results["reward_probe_cost_pareto_modes"] = [modes[int(idx)] for idx in frontier_idx]
-    return results
+    agent = load_agent(path, device, graph_config, hidden_dim, method)
+    rows = evaluate_agent(agent, device, graph_config, seed, n_per_conv, max_steps, gamma)
+    summary = summarize_rows(rows)
+    summary.update(training_efficiency(output_dir, seed, method, graph_variant))
+    return summary
 
 
-def exp1_gtvoi_vs_mi(output_dir: Path, device, seed: int, loss_variant: str, hidden_dim: int, modes: list[str], n_per_conv: int, max_steps: int, graph_variants: list[str]):
+def exp1_policy_baselines(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float):
     return {
-        graph_variant: evaluate_modes_for_graph(
-            output_dir, device, seed, graph_variant, loss_variant, hidden_dim, modes, n_per_conv, max_steps
-        )
+        graph_variant: {
+            method: evaluate_method_for_graph(
+                output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma
+            )
+            for method in methods
+        }
         for graph_variant in graph_variants
     }
 
 
-def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int, n_per_conv: int, max_steps: int):
-    graph_config = get_graph_config("full_graph")
-    results = {}
-    for loss_variant in ["response_only", "response_value", "full"]:
-        path = model_path_for(output_dir, seed, "full_graph", loss_variant)
-        if not path.exists():
-            results[loss_variant] = {"status": "missing", "model_path": str(path)}
-            continue
-        agent = load_agent(path, device, graph_config, hidden_dim)
-        rows = evaluate_mode(agent, device, graph_config, "gtvoi", seed, n_per_conv, max_steps)
-        results[loss_variant] = summarize_rows(rows)
-        results[loss_variant].update(training_efficiency(output_dir, seed, "full_graph", loss_variant))
-    return results
+def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], n_per_conv: int, max_steps: int, gamma: float):
+    return {
+        method: evaluate_method_for_graph(
+            output_dir, device, seed, "full_graph", method, hidden_dim, n_per_conv, max_steps, gamma
+        )
+        for method in methods
+    }
 
 
-def exp4_graph_robustness(output_dir: Path, device, seed: int, loss_variant: str, hidden_dim: int, graph_variants: list[str], n_per_conv: int, max_steps: int):
-    results = {}
-    for graph_variant in graph_variants:
-        graph_config = get_graph_config(graph_variant)
-        path = model_path_for(output_dir, seed, graph_variant, loss_variant)
-        if not path.exists():
-            results[graph_variant] = {"status": "missing", "model_path": str(path)}
-            continue
-        agent = load_agent(path, device, graph_config, hidden_dim)
-        rows = evaluate_mode(agent, device, graph_config, "gtvoi", seed, n_per_conv, max_steps)
-        results[graph_variant] = summarize_rows(rows)
-        results[graph_variant].update(training_efficiency(output_dir, seed, graph_variant, loss_variant))
-    return results
+def exp4_graph_robustness(output_dir: Path, device, seed: int, hidden_dim: int, method: str, graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float):
+    return {
+        graph_variant: evaluate_method_for_graph(
+            output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma
+        )
+        for graph_variant in graph_variants
+    }
 
 
 def parse_csv(raw: str, allowed: tuple[str, ...]) -> list[str]:
@@ -330,16 +326,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="results/toy")
-    parser.add_argument("--experiments", type=str, default="1,3,4",
-                        help="Comma-separated experiment numbers to run")
-    parser.add_argument("--loss_variant", type=str, default="full",
-                        choices=["full", "response_only", "response_value"])
+    parser.add_argument("--experiments", type=str, default="1,3,4")
     parser.add_argument("--hidden_dim", type=int, default=128)
-    parser.add_argument("--modes", type=str, default="gtvoi,mi,passive,random,oracle")
-    parser.add_argument("--exp1_graph_variants", type=str, default="full_graph,plus_irrelevant")
+    parser.add_argument("--methods", type=str, default="aris_bellman,flat_latent,global_gru,oracle_belief,random_policy")
     parser.add_argument("--graph_variants", type=str, default=",".join(GRAPH_VARIANTS))
+    parser.add_argument("--exp1_graph_variants", type=str, default="full_graph,plus_irrelevant")
     parser.add_argument("--n_per_conv", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=50)
+    parser.add_argument("--gamma", type=float, default=0.99)
     args = parser.parse_args()
 
     if args.n_per_conv <= 0:
@@ -350,36 +344,43 @@ def main():
     set_seed(args.seed)
     device = get_device()
     output_dir = Path(args.output_dir)
-    exps = [int(x) for x in args.experiments.split(",") if x.strip()]
-    modes = parse_csv(args.modes, MODES)
-    exp1_graph_variants = parse_csv(args.exp1_graph_variants, GRAPH_VARIANTS)
+    experiments = [int(part) for part in args.experiments.split(",") if part.strip()]
+    methods = parse_csv(args.methods, EVAL_METHODS)
     graph_variants = parse_csv(args.graph_variants, GRAPH_VARIANTS)
+    exp1_graph_variants = parse_csv(args.exp1_graph_variants, GRAPH_VARIANTS)
+    exp4_method = next((method for method in methods if method != "random_policy"), "aris_bellman")
 
     all_results = {}
-    if 1 in exps:
-        all_results["exp1"] = exp1_gtvoi_vs_mi(
-            output_dir, device, args.seed, args.loss_variant, args.hidden_dim,
-            modes, args.n_per_conv, args.max_steps, exp1_graph_variants
+    if 1 in experiments:
+        all_results["exp1"] = exp1_policy_baselines(
+            output_dir, device, args.seed, args.hidden_dim, methods, exp1_graph_variants,
+            args.n_per_conv, args.max_steps, args.gamma,
         )
-    if 3 in exps:
+    if 3 in experiments:
         all_results["exp3"] = exp3_value_sufficiency(
-            output_dir, device, args.seed, args.hidden_dim, args.n_per_conv, args.max_steps
+            output_dir, device, args.seed, args.hidden_dim, methods,
+            args.n_per_conv, args.max_steps, args.gamma,
         )
-    if 4 in exps:
+    if 4 in experiments:
         all_results["exp4"] = exp4_graph_robustness(
-            output_dir, device, args.seed, args.loss_variant, args.hidden_dim, graph_variants, args.n_per_conv, args.max_steps
+            output_dir, device, args.seed, args.hidden_dim, exp4_method, graph_variants,
+            args.n_per_conv, args.max_steps, args.gamma,
         )
 
     results_path = output_dir / f"eval_results_seed{args.seed}.json"
     save_results(
         {
+            "schema_version": "aris_bellman_eval_v1",
             "config": vars(args),
             "results": all_results,
-            "ground_truth_note": (
-                "Factor accuracy and ECE are computed against ToyFactorGameEnv ConventionAssignment labels, "
-                "not another model's outputs. Synthetic graph factors are excluded from these metrics."
+            "diagnostic_note": (
+                "G-TVOI and MI are post-hoc trajectory diagnostics computed from real belief "
+                "updates. They are not selectors, losses, or training signals."
             ),
-            "oracle_note": "oracle mode uses perfect belief with the same Q/cost scoring, i.e. perfect_belief_q_only.",
+            "ground_truth_note": (
+                "Factor accuracy and ECE are computed only for ToyFactorGameEnv ground-truth "
+                "factors; synthetic graph factors are excluded."
+            ),
         },
         str(results_path),
     )

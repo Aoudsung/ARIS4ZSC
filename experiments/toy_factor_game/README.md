@@ -3,29 +3,29 @@
 This directory contains the toy-game implementation for the first
 experiment-bridge milestone in `idea-stage/refine-logs/EXPERIMENT_PLAN.md`.
 
-## Neural Toy Path
+## ARIS-Bellman Neural Toy Path
 
 Train a full-graph model:
 
 ```bash
 python experiments/toy_factor_game/train.py \
   --seed 0 \
-  --n_episodes 2000 \
+  --n_episodes 8000 \
   --eval_every 200 \
+  --method aris_bellman \
   --graph_variant full_graph \
-  --loss_variant full \
-  --mode gtvoi \
   --max_steps 50 \
   --output_dir results/toy
 ```
 
-Run Exp 1 on the same trained full-graph model:
+Run Exp 1 policy/baseline evaluation:
 
 ```bash
 python experiments/toy_factor_game/evaluate.py \
   --seed 0 \
   --experiments 1 \
-  --modes gtvoi,mi,passive,random,oracle \
+  --methods aris_bellman,flat_latent,global_gru,oracle_belief,random_policy \
+  --exp1_graph_variants full_graph,plus_irrelevant \
   --n_per_conv 5 \
   --max_steps 50 \
   --output_dir results/toy
@@ -46,16 +46,22 @@ Then run:
 python experiments/toy_factor_game/evaluate.py \
   --seed 0 \
   --experiments 4 \
+  --methods aris_bellman \
   --graph_variants full_graph,plus_irrelevant,minus_noncritical,minus_critical,random_graph,complete_graph \
   --n_per_conv 5 \
   --max_steps 50 \
   --output_dir results/toy
 ```
 
+The neural implementation no longer trains or evaluates deployment-time
+`gtvoi`, `mi`, `passive`, or `oracle` selectors. G-TVOI and MI are post-hoc
+trajectory diagnostics computed from real belief updates under the learned
+Bellman policy.
+
 ## Symbolic Pilot
 
-`run_symbolic_pilot.py` is the current sanity-stage runner for the first planned
-toy comparison:
+`run_symbolic_pilot.py` is a retained historical smoke/debug tool for the first
+planned symbolic comparison:
 
 - `gtvoi`
 - `mi`
@@ -63,9 +69,9 @@ toy comparison:
 - `random`
 - `oracle`
 
-It is retained as a smoke/debug tool. It is not the formal neural Exp 1 or Exp 4
-implementation. It evaluates against `ToyFactorGameEnv` ground-truth
-`ConventionAssignment` labels, not another model's predictions.
+It is not the formal neural Exp 1, Exp 3, or Exp 4 implementation and should not
+be used for ARIS-Bellman claims. It evaluates against `ToyFactorGameEnv`
+ground-truth `ConventionAssignment` labels, not another model's predictions.
 
 Example command:
 
