@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
 from pathlib import Path
@@ -17,8 +18,8 @@ from common.utils import get_device, save_results, set_seed
 from toy_factor_game.env import NUM_FACTORS, ToyFactorGameEnv
 from toy_factor_game.graph_config import GRAPH_VARIANTS, GraphConfig, get_graph_config, stable_convention_seed
 from toy_factor_game.gtvoi import bellman_delta_info, compute_mi
-from toy_factor_game.options import NUM_OPTIONS
-from toy_factor_game.policy import METHODS, ORACLE_BELIEF_METHODS, ActiveFactorAgent, uniform_marginals
+from toy_factor_game.options import NUM_OPTIONS, OptionID, get_option_action, get_option_cost, get_valid_options
+from toy_factor_game.policy import METHODS, TRUE_BELIEF_METHODS, ActiveFactorAgent, uniform_marginals
 from toy_factor_game.train import all_conventions, collect_episode, model_output_dir, oracle_marginals
 
 
@@ -26,7 +27,7 @@ EVAL_METHODS = METHODS
 EXPERIMENT_SCHEMA = "aris_bellman_v4.1"
 EVAL_SCHEMA = "aris_bellman_eval_v4.1"
 PROPOSAL_VERSION = "v4"
-CODE_FIX_LEVEL = "ce-all-conventions-criticality-diagnostics"
+CODE_FIX_LEVEL = "ce-all-conventions-criticality-diagnostics-oracle-planner"
 EXP3_ROUTING_CONDITIONS = (
     ("aris_bellman", "full_support"),
     ("aris_bellman", "shuffled_routes"),
@@ -80,6 +81,111 @@ def random_agent(device, graph_config: GraphConfig, hidden_dim: int):
     ).to(device).eval()
 
 
+def _empty_diagnostics(oracle_gap_status: str = "not_applicable") -> dict:
+    return {
+        "actual_mi_mean": None,
+        "delta_info_mean": None,
+        "positive_delta_info_rate": None,
+        "topk_delta_info_mean": None,
+        "diagnostic_action_count": 0,
+        "diagnostic_opportunity_cost": 0.0,
+        "reward_after_first_diagnostic": None,
+        "reward_after_first_high_delta_info": None,
+        "delta_info_future_return_corr": None,
+        "mi_future_return_corr": None,
+        "belief_swap_delta_q_mean": None,
+        "belief_swap_selected_delta_mean": None,
+        "belief_swap_maxq_delta_mean": None,
+        "belief_swap_abs_maxq_delta_mean": None,
+        "belief_swap_action_flip_rate": None,
+        "per_factor_abs_maxq_delta": None,
+        "per_factor_action_flip_rate": None,
+        "q_base_action": None,
+        "uniform_belief_action": None,
+        "full_q_action": None,
+        "diagnostic_count_base_reference": 0,
+        "diagnostic_count_uniform_reference": 0,
+        "oracle_gap_closed_after_diagnostic": None,
+        "oracle_gap_status": oracle_gap_status,
+    }
+
+
+def _env_terminal(env: ToyFactorGameEnv) -> bool:
+    return env.step_count >= env.max_steps or (env.deliveries_left > 0 and env.deliveries_right > 0)
+
+
+def _planner_state_key(env: ToyFactorGameEnv, horizon: int) -> tuple:
+    return (
+        horizon,
+        tuple(env.ego_pos),
+        tuple(env.partner_pos),
+        bool(env.ego_carrying),
+        bool(env.partner_carrying),
+        bool(env.resource_a_available),
+        bool(env.resource_b_available),
+        int(env.deliveries_left),
+        int(env.deliveries_right),
+        int(env.step_count),
+        tuple(sorted(env.partner_convention.modes.items())),
+    )
+
+
+def oracle_planner_option_value(
+    env: ToyFactorGameEnv,
+    option: OptionID,
+    horizon: int,
+    gamma: float,
+    memo: dict[tuple, float] | None = None,
+) -> float:
+    if horizon <= 0 or _env_terminal(env):
+        return 0.0
+    sim_env = copy.deepcopy(env)
+    action = get_option_action(option, sim_env.ego_pos, sim_env.ego_carrying)
+    _obs, reward, done, _info = sim_env.step(action)
+    value = float(reward - get_option_cost(option))
+    if not done and horizon > 1:
+        value += gamma * oracle_planner_value(sim_env, horizon - 1, gamma, memo)
+    return value
+
+
+def oracle_planner_value(
+    env: ToyFactorGameEnv,
+    horizon: int,
+    gamma: float,
+    memo: dict[tuple, float] | None = None,
+) -> float:
+    if horizon <= 0 or _env_terminal(env):
+        return 0.0
+    if memo is None:
+        memo = {}
+    key = _planner_state_key(env, horizon)
+    if key in memo:
+        return memo[key]
+    valid_options = get_valid_options(env)
+    if not valid_options:
+        memo[key] = 0.0
+        return 0.0
+    best = max(
+        oracle_planner_option_value(env, option, horizon, gamma, memo)
+        for option in valid_options
+    )
+    memo[key] = float(best)
+    return memo[key]
+
+
+def oracle_planner_select(env: ToyFactorGameEnv, horizon: int, gamma: float) -> OptionID:
+    valid_options = get_valid_options(env)
+    if not valid_options:
+        return OptionID.NOOP
+    memo: dict[tuple, float] = {}
+    scored = [
+        (oracle_planner_option_value(env, option, horizon, gamma, memo), int(option), option)
+        for option in valid_options
+    ]
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return scored[0][2]
+
+
 def factor_metrics(agent, device, episode_data: dict, graph_config: GraphConfig) -> tuple[list[float], list[int]]:
     if agent.method in ("base_only", "global_gru", "random_policy"):
         return [], []
@@ -88,7 +194,7 @@ def factor_metrics(agent, device, episode_data: dict, graph_config: GraphConfig)
     evidence_seq = torch.stack(episode_data["evidence"]).unsqueeze(0).to(device)
     labels = graph_config.labels_from_convention(episode_data["infos"][0]["convention"])
     with torch.no_grad():
-        if agent.method in ORACLE_BELIEF_METHODS:
+        if agent.method in TRUE_BELIEF_METHODS:
             marginals = oracle_marginals(graph_config, episode_data["infos"][0]["convention"], 1, device)
         else:
             marginals = agent.belief_model(evidence_seq)
@@ -152,33 +258,8 @@ def per_factor_swap_diagnostics(
 
 
 def diagnostic_metrics(agent, device, episode_data: dict, graph_config: GraphConfig, gamma: float):
-    if agent.method in ("base_only", "flat_latent", "global_gru", "oracle_belief_factorq", "oracle_belief_flatq", "random_policy"):
-        return {
-            "actual_mi_mean": None,
-            "delta_info_mean": None,
-            "positive_delta_info_rate": None,
-            "topk_delta_info_mean": None,
-            "diagnostic_action_count": 0,
-            "diagnostic_opportunity_cost": 0.0,
-            "reward_after_first_diagnostic": None,
-            "reward_after_first_high_delta_info": None,
-            "delta_info_future_return_corr": None,
-            "mi_future_return_corr": None,
-            "belief_swap_delta_q_mean": None,
-            "belief_swap_selected_delta_mean": None,
-            "belief_swap_maxq_delta_mean": None,
-            "belief_swap_abs_maxq_delta_mean": None,
-            "belief_swap_action_flip_rate": None,
-            "per_factor_abs_maxq_delta": None,
-            "per_factor_action_flip_rate": None,
-            "q_base_action": None,
-            "uniform_belief_action": None,
-            "full_q_action": None,
-            "diagnostic_count_base_reference": 0,
-            "diagnostic_count_uniform_reference": 0,
-            "oracle_gap_closed_after_diagnostic": None,
-            "oracle_gap_status": "not_applicable",
-        }
+    if agent.method in ("base_only", "flat_latent", "global_gru", "true_belief_factorq", "true_belief_flatq", "random_policy"):
+        return _empty_diagnostics()
     factor_hidden = agent.belief_model.initial_hidden(1, device)
     mi_values = []
     delta_values = []
@@ -463,6 +544,73 @@ def evaluate_agent(agent, device, graph_config: GraphConfig, seed: int, n_per_co
     return rows
 
 
+def collect_oracle_planner_episode(
+    env: ToyFactorGameEnv,
+    gamma: float,
+    horizon: int,
+) -> dict:
+    obs = env.reset()
+    transitions = {
+        "obs": [],
+        "next_obs": [],
+        "options": [],
+        "rewards": [],
+        "env_rewards": [],
+        "done": [],
+        "infos": [],
+    }
+    for _t in range(env.max_steps):
+        option = oracle_planner_select(env, horizon, gamma)
+        action = get_option_action(option, env.ego_pos, env.ego_carrying)
+        next_obs, env_reward, done, info = env.step(action)
+        transitions["obs"].append(torch.tensor(obs, dtype=torch.float32))
+        transitions["next_obs"].append(torch.tensor(next_obs, dtype=torch.float32))
+        transitions["options"].append(int(option))
+        transitions["rewards"].append(float(env_reward - get_option_cost(option)))
+        transitions["env_rewards"].append(float(env_reward))
+        transitions["done"].append(bool(done))
+        transitions["infos"].append(info)
+        obs = next_obs
+        if done:
+            break
+    return transitions
+
+
+def evaluate_oracle_planner(
+    seed: int,
+    n_per_conv: int,
+    max_steps: int,
+    gamma: float,
+    horizon: int,
+) -> list[dict]:
+    rows = []
+    for conv in all_conventions():
+        convention_key = "-".join(str(conv.modes[factor_id]) for factor_id in range(NUM_FACTORS))
+        for trial in range(n_per_conv):
+            env_seed = stable_convention_seed(seed, conv.modes, trial)
+            env = ToyFactorGameEnv(partner_convention=conv, max_steps=max_steps, seed=env_seed)
+            episode_data = collect_oracle_planner_episode(env, gamma=gamma, horizon=horizon)
+            rewards = episode_data["env_rewards"]
+            early_k = max(1, len(rewards) // 5) if rewards else 1
+            completed = any(info.get("completed", False) for info in episode_data["infos"])
+            rows.append(
+                {
+                    "convention": convention_key,
+                    "trial": trial,
+                    "episode_reward": float(sum(rewards)),
+                    "td_reward": float(sum(episode_data["rewards"])),
+                    "early_reward": float(sum(rewards[:early_k])),
+                    "completion": float(completed),
+                    "time_to_completion": len(rewards) if completed else max_steps + 1,
+                    "collisions": float(sum(1 for info in episode_data["infos"] if info["collision"])),
+                    "factor_probs": [],
+                    "factor_correct": [],
+                    **_empty_diagnostics("planning_oracle"),
+                }
+            )
+    return rows
+
+
 def evaluate_method_for_graph(
     output_dir: Path,
     device,
@@ -473,9 +621,16 @@ def evaluate_method_for_graph(
     n_per_conv: int,
     max_steps: int,
     gamma: float,
+    oracle_horizon: int,
     require_checkpoint: bool = False,
 ):
     graph_config = get_graph_config(graph_variant)
+    if method == "oracle_planner":
+        rows = evaluate_oracle_planner(seed, n_per_conv, max_steps, gamma, oracle_horizon)
+        summary = summarize_rows(rows)
+        summary["baseline_type"] = "planning_oracle"
+        summary["oracle_horizon"] = int(oracle_horizon)
+        return summary
     if method == "random_policy":
         agent = random_agent(device, graph_config, hidden_dim)
         rows = evaluate_agent(agent, device, graph_config, seed, n_per_conv, max_steps, gamma)
@@ -496,11 +651,11 @@ def evaluate_method_for_graph(
     return summary
 
 
-def exp1_policy_baselines(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float):
+def exp1_policy_baselines(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float, oracle_horizon: int):
     return {
         graph_variant: {
             method: evaluate_method_for_graph(
-                output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma
+                output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma, oracle_horizon
             )
             for method in methods
         }
@@ -508,10 +663,10 @@ def exp1_policy_baselines(output_dir: Path, device, seed: int, hidden_dim: int, 
     }
 
 
-def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], n_per_conv: int, max_steps: int, gamma: float):
+def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int, methods: list[str], n_per_conv: int, max_steps: int, gamma: float, oracle_horizon: int):
     method_comparison = {
         method: evaluate_method_for_graph(
-            output_dir, device, seed, "full_support", method, hidden_dim, n_per_conv, max_steps, gamma
+            output_dir, device, seed, "full_support", method, hidden_dim, n_per_conv, max_steps, gamma, oracle_horizon
         )
         for method in methods
     }
@@ -527,6 +682,7 @@ def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int,
             n_per_conv,
             max_steps,
             gamma,
+            oracle_horizon,
             require_checkpoint=True,
         )
     return {
@@ -539,10 +695,10 @@ def exp3_value_sufficiency(output_dir: Path, device, seed: int, hidden_dim: int,
     }
 
 
-def exp4_graph_robustness(output_dir: Path, device, seed: int, hidden_dim: int, method: str, graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float):
+def exp4_graph_robustness(output_dir: Path, device, seed: int, hidden_dim: int, method: str, graph_variants: list[str], n_per_conv: int, max_steps: int, gamma: float, oracle_horizon: int):
     results = {
         graph_variant: evaluate_method_for_graph(
-            output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma
+            output_dir, device, seed, graph_variant, method, hidden_dim, n_per_conv, max_steps, gamma, oracle_horizon
         )
         for graph_variant in graph_variants
     }
@@ -584,19 +740,22 @@ def main():
     parser.add_argument(
         "--methods",
         type=str,
-        default="base_only,aris_bellman,flat_latent,global_gru,oracle_belief_factorq,oracle_belief_flatq,random_policy",
+        default="base_only,aris_bellman,flat_latent,global_gru,true_belief_factorq,true_belief_flatq,oracle_planner,random_policy",
     )
     parser.add_argument("--graph_variants", type=str, default=",".join(GRAPH_VARIANTS))
     parser.add_argument("--exp1_graph_variants", type=str, default="full_support,overcomplete")
     parser.add_argument("--n_per_conv", type=int, default=5)
     parser.add_argument("--max_steps", type=int, default=50)
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--oracle_horizon", type=int, default=6)
     args = parser.parse_args()
 
     if args.n_per_conv <= 0:
         raise ValueError("--n_per_conv must be positive")
     if args.max_steps <= 0:
         raise ValueError("--max_steps must be positive")
+    if args.oracle_horizon <= 0:
+        raise ValueError("--oracle_horizon must be positive")
 
     set_seed(args.seed)
     device = get_device()
@@ -606,7 +765,7 @@ def main():
     graph_variants = parse_csv(args.graph_variants, GRAPH_VARIANTS)
     exp1_graph_variants = parse_csv(args.exp1_graph_variants, GRAPH_VARIANTS)
     exp4_method = "aris_bellman" if "aris_bellman" in methods else next(
-        (method for method in methods if method != "random_policy"),
+        (method for method in methods if method not in ("random_policy", "oracle_planner")),
         "aris_bellman",
     )
 
@@ -614,17 +773,17 @@ def main():
     if 1 in experiments:
         all_results["exp1"] = exp1_policy_baselines(
             output_dir, device, args.seed, args.hidden_dim, methods, exp1_graph_variants,
-            args.n_per_conv, args.max_steps, args.gamma,
+            args.n_per_conv, args.max_steps, args.gamma, args.oracle_horizon,
         )
     if 3 in experiments:
         all_results["exp3"] = exp3_value_sufficiency(
             output_dir, device, args.seed, args.hidden_dim, methods,
-            args.n_per_conv, args.max_steps, args.gamma,
+            args.n_per_conv, args.max_steps, args.gamma, args.oracle_horizon,
         )
     if 4 in experiments:
         all_results["exp4"] = exp4_graph_robustness(
             output_dir, device, args.seed, args.hidden_dim, exp4_method, graph_variants,
-            args.n_per_conv, args.max_steps, args.gamma,
+            args.n_per_conv, args.max_steps, args.gamma, args.oracle_horizon,
         )
 
     results_path = output_dir / f"eval_results_seed{args.seed}.json"

@@ -43,11 +43,11 @@ fi
 case "$TASK" in
   exp1)
     GRAPH_VARIANTS=(full_support full_support full_support full_support full_support full_support overcomplete overcomplete overcomplete overcomplete overcomplete overcomplete)
-    METHODS=(base_only aris_bellman flat_latent global_gru oracle_belief_factorq oracle_belief_flatq base_only aris_bellman flat_latent global_gru oracle_belief_factorq oracle_belief_flatq)
+    METHODS=(base_only aris_bellman flat_latent global_gru true_belief_factorq true_belief_flatq base_only aris_bellman flat_latent global_gru true_belief_factorq true_belief_flatq)
     ;;
   exp3)
     GRAPH_VARIANTS=(full_support full_support full_support full_support full_support full_support shuffled_routes shuffled_relevance random_same_size)
-    METHODS=(base_only aris_bellman flat_latent global_gru oracle_belief_factorq oracle_belief_flatq aris_bellman aris_bellman aris_bellman)
+    METHODS=(base_only aris_bellman flat_latent global_gru true_belief_factorq true_belief_flatq aris_bellman aris_bellman aris_bellman)
     ;;
   exp4)
     GRAPH_VARIANTS=(full_support overcomplete overcomplete_minus_low_ce minus_critical random_same_size complete_option_graph shuffled_routes shuffled_relevance)

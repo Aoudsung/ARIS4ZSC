@@ -24,7 +24,7 @@ Run Exp 1 policy/baseline evaluation:
 python experiments/toy_factor_game/evaluate.py \
   --seed 0 \
   --experiments 1 \
-  --methods base_only,aris_bellman,flat_latent,global_gru,oracle_belief_factorq,oracle_belief_flatq,random_policy \
+  --methods base_only,aris_bellman,flat_latent,global_gru,true_belief_factorq,true_belief_flatq,oracle_planner,random_policy \
   --exp1_graph_variants full_support,overcomplete \
   --n_per_conv 5 \
   --max_steps 50 \
@@ -79,8 +79,10 @@ The main baseline names are:
 - `aris_bellman`: factor-local belief state and factor-local Q residuals.
 - `flat_latent`: unrestricted latent-belief Q baseline.
 - `global_gru`: global-history shortcut baseline.
-- `oracle_belief_factorq`: true factor labels with factor-local Q.
-- `oracle_belief_flatq`: true factor labels with unrestricted flat Q.
+- `true_belief_factorq`: true factor labels with factor-local learned Q.
+- `true_belief_flatq`: true factor labels with unrestricted learned Q.
+- `oracle_planner`: ground-truth convention plus environment-model finite-horizon
+  planning upper bound. It is evaluation-only and has no checkpoint.
 - `random_policy`: uniformly sampled valid options.
 
 ## Symbolic Pilot

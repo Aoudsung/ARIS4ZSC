@@ -14,6 +14,7 @@ BATCH_SIZE=16
 HIDDEN_DIM=128
 MAX_STEPS=50
 N_PER_CONV=5
+ORACLE_HORIZON=6
 MAX_MEMORY_USED_MB=20000
 PYTHON_BIN=".venv/bin/python"
 DRY_RUN=0
@@ -33,6 +34,7 @@ Options:
   --hidden_dim N              Default: 128
   --max_steps N               Default: 50
   --n_per_conv N              Default: 5
+  --oracle_horizon N          Default: 6
   --max_memory_used_mb N      Default: 20000
   --python_bin PATH           Default: .venv/bin/python
   --force                     Retrain even when model.pt and results.json exist
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --hidden_dim) HIDDEN_DIM="$2"; shift 2 ;;
     --max_steps) MAX_STEPS="$2"; shift 2 ;;
     --n_per_conv) N_PER_CONV="$2"; shift 2 ;;
+    --oracle_horizon) ORACLE_HORIZON="$2"; shift 2 ;;
     --max_memory_used_mb) MAX_MEMORY_USED_MB="$2"; shift 2 ;;
     --python_bin) PYTHON_BIN="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
@@ -84,6 +87,7 @@ require_positive_int "--batch_size" "$BATCH_SIZE"
 require_positive_int "--hidden_dim" "$HIDDEN_DIM"
 require_positive_int "--max_steps" "$MAX_STEPS"
 require_positive_int "--n_per_conv" "$N_PER_CONV"
+require_positive_int "--oracle_horizon" "$ORACLE_HORIZON"
 require_nonnegative_int "--max_memory_used_mb" "$MAX_MEMORY_USED_MB"
 
 IFS=',' read -r -a SEED_LIST <<< "$SEEDS"
@@ -98,8 +102,8 @@ if [[ "${#REQUESTED_GPUS[@]}" -eq 0 || -z "${REQUESTED_GPUS[0]}" ]]; then
 fi
 
 TRAIN_METHODS=(
-  base_only aris_bellman flat_latent global_gru oracle_belief_factorq oracle_belief_flatq
-  base_only aris_bellman flat_latent global_gru oracle_belief_factorq oracle_belief_flatq
+  base_only aris_bellman flat_latent global_gru true_belief_factorq true_belief_flatq
+  base_only aris_bellman flat_latent global_gru true_belief_factorq true_belief_flatq
   aris_bellman aris_bellman aris_bellman aris_bellman aris_bellman aris_bellman
 )
 TRAIN_GRAPHS=(
@@ -197,12 +201,13 @@ eval_cmd_for() {
     --seed "$seed" \
     --output_dir "$OUTPUT_DIR" \
     --experiments 1,3,4 \
-    --methods base_only,aris_bellman,flat_latent,global_gru,oracle_belief_factorq,oracle_belief_flatq,random_policy \
+    --methods base_only,aris_bellman,flat_latent,global_gru,true_belief_factorq,true_belief_flatq,oracle_planner,random_policy \
     --exp1_graph_variants full_support,overcomplete \
     --graph_variants full_support,overcomplete,overcomplete_minus_low_ce,minus_critical,random_same_size,complete_option_graph,shuffled_routes,shuffled_relevance \
     --hidden_dim "$HIDDEN_DIM" \
     --n_per_conv "$N_PER_CONV" \
-    --max_steps "$MAX_STEPS"
+    --max_steps "$MAX_STEPS" \
+    --oracle_horizon "$ORACLE_HORIZON"
 }
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

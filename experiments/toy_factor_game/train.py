@@ -28,13 +28,13 @@ from toy_factor_game.options import (
     get_option_cost,
     get_valid_options,
 )
-from toy_factor_game.policy import METHODS, ORACLE_BELIEF_METHODS, ActiveFactorAgent
+from toy_factor_game.policy import METHODS, TRUE_BELIEF_METHODS, ActiveFactorAgent
 
 
-TRAIN_METHODS = tuple(method for method in METHODS if method != "random_policy")
+TRAIN_METHODS = tuple(method for method in METHODS if method not in ("random_policy", "oracle_planner"))
 EXPERIMENT_SCHEMA = "aris_bellman_v4.1"
 PROPOSAL_VERSION = "v4"
-CODE_FIX_LEVEL = "ce-all-conventions-criticality-diagnostics"
+CODE_FIX_LEVEL = "ce-all-conventions-criticality-diagnostics-oracle-planner"
 
 
 def all_conventions() -> list[ConventionAssignment]:
@@ -141,7 +141,7 @@ def collect_episode(
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         mask_t = valid_option_mask(env, device)
 
-        if agent.method in ORACLE_BELIEF_METHODS:
+        if agent.method in TRUE_BELIEF_METHODS:
             marginals = oracle_marginals(graph_config, env.partner_convention.modes, 1, device)
         elif agent.method == "global_gru":
             marginals = None
@@ -271,7 +271,7 @@ def _current_marginals(
     factor_hidden: torch.Tensor,
     factor_labels: torch.Tensor,
 ) -> list[torch.Tensor] | None:
-    if agent.method in ORACLE_BELIEF_METHODS:
+    if agent.method in TRUE_BELIEF_METHODS:
         return labels_to_oracle_marginals(factor_labels, graph_config)
     if agent.method == "global_gru":
         return None

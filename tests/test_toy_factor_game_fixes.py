@@ -1,3 +1,4 @@
+import copy
 import sys
 from pathlib import Path
 
@@ -14,12 +15,15 @@ from toy_factor_game.evaluate import (  # noqa: E402
     EVAL_SCHEMA,
     EXP3_ROUTING_CONDITIONS,
     EXPERIMENT_SCHEMA,
+    oracle_planner_option_value,
+    oracle_planner_select,
     per_factor_swap_diagnostics,
 )
 from toy_factor_game.evidence import option_relevance_mask  # noqa: E402
 from toy_factor_game.graph_config import get_graph_config  # noqa: E402
-from toy_factor_game.options import NUM_OPTIONS, OptionID  # noqa: E402
+from toy_factor_game.options import NUM_OPTIONS, OptionID, get_option_action, get_option_cost, get_valid_options  # noqa: E402
 from toy_factor_game.policy import ActiveFactorAgent, uniform_marginals  # noqa: E402
+from toy_factor_game.train import TRAIN_METHODS  # noqa: E402
 
 
 def make_agent(graph, method="aris_bellman", hidden_dim=16):
@@ -72,13 +76,13 @@ def test_base_only_ignores_belief():
     assert torch.allclose(agent.q_values(obs, uniform), agent.q_base_values(obs))
 
 
-def test_oracle_method_split_dispatches_to_matching_q_architecture():
+def test_true_belief_methods_dispatch_to_matching_q_architecture():
     graph = get_graph_config("full_support")
     obs = torch.zeros(1, ToyFactorGameEnv().obs_dim)
     marginals = uniform_marginals(graph.factor_modes, 1, obs.device)
 
-    factor_agent = make_agent(graph, method="oracle_belief_factorq")
-    flat_agent = make_agent(graph, method="oracle_belief_flatq")
+    factor_agent = make_agent(graph, method="true_belief_factorq")
+    flat_agent = make_agent(graph, method="true_belief_flatq")
 
     assert torch.allclose(factor_agent.q_values(obs, marginals), factor_agent.factor_q(obs, marginals))
     assert torch.allclose(flat_agent.q_values(obs, marginals), flat_agent.flat_q(obs, marginals))
@@ -129,6 +133,46 @@ def test_old_method_and_graph_names_fail_visibly():
     assert get_graph_config("overcomplete_minus_low_ce").name == "overcomplete_minus_low_ce"
     with pytest.raises(ValueError):
         make_agent(get_graph_config("full_support"), method="oracle_belief")
+    with pytest.raises(ValueError):
+        make_agent(get_graph_config("full_support"), method="oracle_belief_factorq")
+    with pytest.raises(ValueError):
+        make_agent(get_graph_config("full_support"), method="oracle_belief_flatq")
+
+
+def test_oracle_planner_is_evaluation_only():
+    graph = get_graph_config("full_support")
+    assert "oracle_planner" not in TRAIN_METHODS
+    assert "random_policy" not in TRAIN_METHODS
+    planner_agent = make_agent(graph, method="oracle_planner")
+    obs = torch.zeros(1, ToyFactorGameEnv().obs_dim)
+    marginals = uniform_marginals(graph.factor_modes, 1, obs.device)
+    with pytest.raises(RuntimeError):
+        planner_agent.q_values(obs, marginals)
+
+
+def test_oracle_planner_horizon_one_matches_one_step_enumeration():
+    env = ToyFactorGameEnv(max_steps=5, seed=0)
+    gamma = 0.99
+    selected = oracle_planner_select(env, horizon=1, gamma=gamma)
+    enumerated = []
+    for option in get_valid_options(env):
+        sim_env = copy.deepcopy(env)
+        action = get_option_action(option, sim_env.ego_pos, sim_env.ego_carrying)
+        _obs, reward, _done, _info = sim_env.step(action)
+        enumerated.append((float(reward - get_option_cost(option)), int(option), option))
+    enumerated.sort(key=lambda item: (-item[0], item[1]))
+    assert selected == enumerated[0][2]
+
+
+def test_oracle_planner_higher_horizon_not_worse_when_first_step_completes():
+    env = ToyFactorGameEnv(max_steps=5, seed=0)
+    env.ego_pos = list(DELIVER_RIGHT)
+    env.ego_carrying = True
+    env.deliveries_left = 1
+    option = OptionID.DROP
+    value_h1 = oracle_planner_option_value(env, option, horizon=1, gamma=0.99)
+    value_h2 = oracle_planner_option_value(env, option, horizon=2, gamma=0.99)
+    assert value_h2 >= value_h1
 
 
 def test_per_factor_swap_reports_maxq_and_action_flip_fields():

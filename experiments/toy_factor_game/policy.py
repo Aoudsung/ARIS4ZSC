@@ -21,12 +21,13 @@ METHODS = (
     "aris_bellman",
     "flat_latent",
     "global_gru",
-    "oracle_belief_factorq",
-    "oracle_belief_flatq",
+    "true_belief_factorq",
+    "true_belief_flatq",
+    "oracle_planner",
     "random_policy",
 )
 
-ORACLE_BELIEF_METHODS = ("oracle_belief_factorq", "oracle_belief_flatq")
+TRUE_BELIEF_METHODS = ("true_belief_factorq", "true_belief_flatq")
 
 
 def belief_to_features(marginals: list[torch.Tensor]) -> torch.Tensor:
@@ -261,6 +262,8 @@ class ActiveFactorAgent(nn.Module):
         marginals: list[torch.Tensor] | None = None,
         global_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.method == "oracle_planner":
+            raise RuntimeError("oracle_planner is evaluation-only and does not use learned Q")
         if self.method == "random_policy":
             return torch.zeros(obs.shape[0], self.n_options, device=obs.device)
         if self.method == "base_only":
@@ -271,7 +274,7 @@ class ActiveFactorAgent(nn.Module):
             return self.global_q(obs, global_hidden)
         if marginals is None:
             marginals = uniform_marginals(self.factor_modes, obs.shape[0], obs.device)
-        if self.method in ("flat_latent", "oracle_belief_flatq"):
+        if self.method in ("flat_latent", "true_belief_flatq"):
             return self.flat_q(obs, marginals)
         return self.factor_q(obs, marginals)
 
