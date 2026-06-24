@@ -10,6 +10,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from src.aris_bellman.factor_q import (
+    FactorLocalQNetwork,
+    pad_marginals,
+    uniform_marginals,
+)
 
 from .evidence import EVIDENCE_DIM, option_relevance_mask
 from .factor_belief import FactorBeliefModel
@@ -48,27 +53,6 @@ def compute_belief_dim(factor_modes: list[int]) -> int:
     return sum(factor_modes) + len(factor_modes) + 1
 
 
-def pad_marginals(marginals: list[torch.Tensor], factor_modes: list[int]) -> torch.Tensor:
-    if not marginals:
-        batch = 0
-        return torch.empty(batch, 0, 0)
-    batch_size = marginals[0].shape[0]
-    max_modes = max(factor_modes)
-    padded = marginals[0].new_zeros(batch_size, len(marginals), max_modes)
-    for factor_idx, marginal in enumerate(marginals):
-        padded[:, factor_idx, :marginal.shape[-1]] = marginal
-    return padded
-
-
-def uniform_marginals(
-    factor_modes: list[int], batch_size: int, device: torch.device
-) -> list[torch.Tensor]:
-    return [
-        torch.ones(batch_size, n_modes, device=device) / float(n_modes)
-        for n_modes in factor_modes
-    ]
-
-
 def labels_to_marginals(
     factor_labels: torch.Tensor,
     factor_modes: list[int],
@@ -78,79 +62,6 @@ def labels_to_marginals(
         labels = factor_labels[:, factor_idx].clamp(min=0, max=n_modes - 1)
         marginals.append(F.one_hot(labels, num_classes=n_modes).float())
     return marginals
-
-
-class FactorLocalQNetwork(nn.Module):
-    def __init__(
-        self,
-        obs_dim: int,
-        n_options: int,
-        factor_modes: list[int],
-        relevance_mask: list[list[bool]],
-        hidden_dim: int = 128,
-    ):
-        super().__init__()
-        self.n_options = n_options
-        self.factor_modes = factor_modes
-        self.n_factors = len(factor_modes)
-        self.max_modes = max(factor_modes) if factor_modes else 1
-
-        self.base = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_options),
-        )
-        self.obs_proj = nn.Sequential(nn.Linear(obs_dim, hidden_dim), nn.ReLU())
-        self.factor_embedding = nn.Embedding(max(self.n_factors, 1), hidden_dim)
-        self.option_embedding = nn.Embedding(n_options, hidden_dim)
-        self.residual_weight = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, self.max_modes),
-        )
-        mask = torch.tensor(relevance_mask, dtype=torch.float32)
-        if mask.numel() == 0:
-            mask = torch.zeros(self.n_factors, n_options, dtype=torch.float32)
-        self.register_buffer("relevance_mask", mask)
-
-    def q_base_values(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.base(obs)
-
-    def q_uniform_values(self, obs: torch.Tensor) -> torch.Tensor:
-        marginals = uniform_marginals(self.factor_modes, obs.shape[0], obs.device)
-        return self.forward(obs, marginals)
-
-    def _uniform_padded(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        uniform = torch.zeros(batch_size, self.n_factors, self.max_modes, device=device, dtype=dtype)
-        for factor_idx, n_modes in enumerate(self.factor_modes):
-            uniform[:, factor_idx, :n_modes] = 1.0 / float(n_modes)
-        return uniform
-
-    def forward(self, obs: torch.Tensor, marginals: list[torch.Tensor]) -> torch.Tensor:
-        q_base = self.q_base_values(obs)
-        if self.n_factors == 0:
-            return q_base
-
-        batch_size = obs.shape[0]
-        obs_context = self.obs_proj(obs)
-        belief = pad_marginals(marginals, self.factor_modes)
-        uniform = self._uniform_padded(batch_size, obs.device, belief.dtype)
-        centered_belief = belief - uniform
-        factor_ids = torch.arange(self.n_factors, device=obs.device)
-        option_ids = torch.arange(self.n_options, device=obs.device)
-        factor_emb = self.factor_embedding(factor_ids)
-        option_emb = self.option_embedding(option_ids)
-
-        obs_term = obs_context[:, None, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
-        factor_term = factor_emb[None, :, None, :].expand(batch_size, self.n_factors, self.n_options, -1)
-        option_term = option_emb[None, None, :, :].expand(batch_size, self.n_factors, self.n_options, -1)
-        weight_in = torch.cat([obs_term, factor_term, option_term], dim=-1)
-        weights = self.residual_weight(weight_in)
-        adv = (weights * centered_belief[:, :, None, :]).sum(dim=-1)
-        masked_adv = adv * self.relevance_mask[None, :, :]
-        return q_base + masked_adv.sum(dim=1)
 
 
 class FlatLatentQNetwork(nn.Module):

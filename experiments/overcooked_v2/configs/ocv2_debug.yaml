@@ -1,0 +1,51 @@
+layout: cramped_room
+
+env:
+  max_steps: 200
+  observation_type: featurized
+  negative_rewards: true
+  sample_recipe_on_delivery: true
+  random_reset: false
+  random_agent_positions: false
+  force_path_planning: true
+
+options:
+  max_option_steps: 6
+
+graph:
+  ce_path: null
+  ce_episodes: 1
+  ce_max_options_per_episode: 1
+  ce_min_weight: 1.0
+  ce_eta: 0.0
+  max_factors: 16
+  local_return_horizon_options: 3
+  debug_fallback_topk_when_empty: true
+  modes:
+    bottleneck: 3
+    resource: 2
+    handoff: 3
+    serving: 2
+    pot_allocation: 2
+    recipe_indicator: 2
+    generic_option_pair: 3
+
+training:
+  total_updates: 500
+  updates_per_transition: 8
+  batch_size: 8
+  warmup_transitions: 8
+  replay_size: 5000
+  gamma: 0.99
+  cost_coef: 0.02
+  cost_per_step: 1.0
+  shaped_reward_coef: 1.0
+  learning_rate: 0.0003
+  hidden_dim: 64
+  evidence_window: 4
+  target_update_interval: 50
+  grad_clip_norm: 5.0
+  epsilon_start: 0.35
+  epsilon_end: 0.05
+  max_episode_options: 5
+  log_interval: 50

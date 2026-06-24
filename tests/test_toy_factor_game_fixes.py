@@ -7,6 +7,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "experiments"))
 
 from toy_factor_game.ce_estimation import _all_conventions, estimate_ce_matrix, induce_graph  # noqa: E402

@@ -15,7 +15,10 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.optim import Adam
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
+for import_path in (REPO_ROOT, EXPERIMENTS_ROOT):
+    sys.path.insert(0, str(import_path))
 
 from common.utils import get_device, save_results, set_seed
 from toy_factor_game.env import ConventionAssignment, FACTOR_MODES, NUM_FACTORS, ToyFactorGameEnv

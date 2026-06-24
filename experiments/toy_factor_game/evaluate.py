@@ -11,7 +11,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+EXPERIMENTS_ROOT = REPO_ROOT / "experiments"
+for import_path in (REPO_ROOT, EXPERIMENTS_ROOT):
+    sys.path.insert(0, str(import_path))
 
 from common.metrics import bootstrap_ci, expected_calibration_error
 from common.utils import get_device, save_results, set_seed
