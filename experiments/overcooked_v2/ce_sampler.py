@@ -16,6 +16,7 @@ if __package__ in {None, ""}:  # pragma: no cover - script execution path
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import OCV2Event, extract_event
 from experiments.overcooked_v2.layout_parser import parse_layout
+from experiments.overcooked_v2.option_termination import OptionRuntime
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.state_utils import (
@@ -43,6 +44,7 @@ class OptionReplayRow:
     reward_to_go: float
     event_summary: dict[str, Any]
     partner_name: str
+    partner_id: int
 
 
 def collect_option_replay(
@@ -57,6 +59,8 @@ def collect_option_replay(
     gamma: float = 0.99,
     horizon_options: int = 5,
     cost_per_step: float = 1.0,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
 ) -> list[OptionReplayRow]:
     rng = np.random.default_rng(seed)
     layout = layout_name or getattr(env, "layout_name", "unknown_layout")
@@ -93,7 +97,13 @@ def collect_option_replay(
                 obs = env.obs or obs
                 t_option += 1
 
-    compute_local_returns(rows, gamma=gamma, horizon=horizon_options)
+    compute_local_returns(
+        rows,
+        gamma=gamma,
+        horizon=horizon_options,
+        cost_coef=cost_coef,
+        shaped_reward_coef=shaped_reward_coef,
+    )
     compute_reward_to_go(rows, gamma=gamma)
     return rows
 
@@ -102,6 +112,8 @@ def compute_local_returns(
     option_rows: list[OptionReplayRow],
     gamma: float,
     horizon: int,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
 ) -> list[OptionReplayRow]:
     for idx, row in enumerate(option_rows):
         ret = 0.0
@@ -110,7 +122,11 @@ def compute_local_returns(
             next_row = option_rows[jdx]
             if next_row.episode_id != row.episode_id:
                 break
-            ret += discount * (next_row.reward_sum - next_row.realized_cost)
+            ret += discount * (
+                next_row.reward_sum
+                + float(shaped_reward_coef) * next_row.shaped_reward_sum
+                - float(cost_coef) * next_row.realized_cost
+            )
             discount *= gamma ** max(1, next_row.duration)
         row.local_return_h = float(ret)
     return option_rows
@@ -227,6 +243,80 @@ def refine_empirical_ce(
     return refined, metadata
 
 
+def refine_interventional_ce(
+    ce_matrix: np.ndarray,
+    replay: list[OptionReplayRow],
+    num_options: int,
+    *,
+    top_k: int = 16,
+    samples_per_pair: int = 4,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
+    seed: int = 17,
+    intervention_runner: Any | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if intervention_runner is None:
+        raise ValueError(
+            "refine_interventional_ce requires an intervention_runner; scalar "
+            "empirical replay bootstrap is available via refine_empirical_ce."
+        )
+    if samples_per_pair <= 0:
+        raise ValueError("samples_per_pair must be positive.")
+
+    rng = np.random.default_rng(seed)
+    refined = np.asarray(ce_matrix, dtype=np.float32).copy()
+    top_pairs = _top_pairs(refined, top_k)
+    if not top_pairs:
+        return refined, {
+            "refine_mode": "interventional_topk",
+            "top_k": 0,
+            "samples_per_pair": int(samples_per_pair),
+            "cost_coef": float(cost_coef),
+            "forced_intervention": True,
+        }
+
+    replay_returns = np.asarray(
+        [
+            row.reward_sum
+            + float(shaped_reward_coef) * row.shaped_reward_sum
+            - float(cost_coef) * row.realized_cost
+            for row in replay
+        ],
+        dtype=np.float32,
+    )
+    baseline = float(replay_returns.mean()) if replay_returns.size else 0.0
+    changed_pairs: list[list[int]] = []
+    sample_counts: dict[str, int] = {}
+    for _, ego_option, partner_option in top_pairs:
+        values = []
+        for sample_idx in range(int(samples_per_pair)):
+            values.append(
+                float(
+                    intervention_runner(
+                        int(ego_option),
+                        int(partner_option),
+                        int(rng.integers(0, 2**31 - 1)),
+                        sample_idx,
+                    )
+                )
+            )
+        refined[int(ego_option), int(partner_option)] = abs(float(np.mean(values)) - baseline)
+        changed_pairs.append([int(ego_option), int(partner_option)])
+        sample_counts[f"{ego_option},{partner_option}"] = len(values)
+
+    metadata = {
+        "refine_mode": "interventional_topk",
+        "top_k": len(top_pairs),
+        "intervention_top_k": len(top_pairs),
+        "samples_per_pair": int(samples_per_pair),
+        "sample_counts": sample_counts,
+        "changed_pairs": changed_pairs,
+        "cost_coef": float(cost_coef),
+        "forced_intervention": True,
+    }
+    return refined, metadata
+
+
 def save_replay_npz(
     path: str | Path,
     rows: list[OptionReplayRow],
@@ -263,6 +353,7 @@ def _rollout_option(
 ) -> tuple[OptionReplayRow, bool]:
     opt = option_lib.options[option_id]
     start_state = env.state
+    runtime = OptionRuntime(option_id=int(option_id), start_pos=get_agent_pos(start_state, 0))
     state_key = _state_key(start_state)
     reward_sum = 0.0
     shaped_reward_sum = 0.0
@@ -308,6 +399,7 @@ def _rollout_option(
             event,
             agent_id=0,
             elapsed=duration,
+            runtime=runtime,
         )
         obs = step.obs
         if done or terminated:
@@ -336,6 +428,7 @@ def _rollout_option(
         reward_to_go=0.0,
         event_summary=summary,
         partner_name=str(getattr(partner, "name", "partner")),
+        partner_id=int(getattr(partner, "partner_id", -1)),
     )
     return row, done
 
@@ -378,10 +471,17 @@ def _empty_event_summary() -> dict[str, Any]:
         "object_pickup_or_drop": 0,
         "recipe_indicator_event": 0,
         "button_pressed": 0,
+        "pot_became_full": 0,
+        "pot_became_cooked": 0,
+        "pot_became_ready": 0,
+        "plate_picked": 0,
+        "soup_picked": 0,
+        "correct_delivery": 0,
         "collision_or_block": 0,
         "ego_waited": 0,
         "partner_waited": 0,
         "changed_cells": 0,
+        "pot_changed_cells": 0,
     }
 
 
@@ -393,12 +493,19 @@ def _accumulate_event_summary(summary: dict[str, Any], event: OCV2Event) -> None
         "object_pickup_or_drop",
         "recipe_indicator_event",
         "button_pressed",
+        "pot_became_full",
+        "pot_became_cooked",
+        "pot_became_ready",
+        "plate_picked",
+        "soup_picked",
+        "correct_delivery",
         "collision_or_block",
         "ego_waited",
         "partner_waited",
     ):
         summary[key] += int(bool(getattr(event, key)))
     summary["changed_cells"] += len(event.changed_cells)
+    summary["pot_changed_cells"] += len(getattr(event, "pot_changed_cells", ()))
 
 
 def _average_partner_dist(dists: list[np.ndarray]) -> np.ndarray | None:
@@ -461,6 +568,7 @@ def _row_to_json_dict(row: OptionReplayRow) -> dict[str, Any]:
 def _row_from_json_dict(data: dict[str, Any]) -> OptionReplayRow:
     dist = data.get("partner_option_dist")
     data["partner_option_dist"] = None if dist is None else np.asarray(dist, dtype=np.float32)
+    data.setdefault("partner_id", -1)
     return OptionReplayRow(**data)
 
 
@@ -505,6 +613,8 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         gamma=args.gamma,
         horizon_options=args.horizon_options,
         cost_per_step=args.cost_per_step,
+        cost_coef=args.cost_coef,
+        shaped_reward_coef=args.shaped_reward_coef,
     )
     save_replay_npz(
         args.output,
@@ -514,6 +624,9 @@ def _cmd_collect(args: argparse.Namespace) -> None:
             "episodes_per_partner": args.episodes,
             "num_rows": len(rows),
             "partners": [partner.name for partner in partners],
+            "cost_coef": float(args.cost_coef),
+            "cost_per_step": float(args.cost_per_step),
+            "shaped_reward_coef": float(args.shaped_reward_coef),
         },
     )
 
@@ -564,6 +677,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     collect.add_argument("--seed", type=int, default=0)
     collect.add_argument("--gamma", type=float, default=0.99)
     collect.add_argument("--cost_per_step", type=float, default=1.0)
+    collect.add_argument("--cost_coef", type=float, default=1.0)
+    collect.add_argument("--shaped_reward_coef", type=float, default=0.0)
     collect.add_argument("--max_steps", type=int, default=200)
     collect.add_argument("--max_option_steps", type=int, default=12)
     collect.add_argument("--max_options_per_episode", type=int, default=None)

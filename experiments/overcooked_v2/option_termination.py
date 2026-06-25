@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from jaxmarl.environments.overcooked_v2.common import Actions
@@ -18,6 +19,16 @@ from .state_utils import (
 GridPos = tuple[int, int]
 
 
+@dataclass
+class OptionRuntime:
+    option_id: int
+    start_pos: GridPos
+    elapsed: int = 0
+    reached_region: bool = False
+    wait_elapsed_after_arrival: int = 0
+    entry_side: GridPos | None = None
+
+
 def option_terminated(
     opt: OptionSpec,
     prev_state: Any,
@@ -25,7 +36,11 @@ def option_terminated(
     event: Any,
     agent_id: int,
     elapsed: int,
+    runtime: OptionRuntime | None = None,
 ) -> tuple[bool, str]:
+    if runtime is not None:
+        runtime.elapsed = int(elapsed)
+
     if opt.kind == "noop":
         return True, "noop"
 
@@ -76,28 +91,34 @@ def option_terminated(
         return False, "running"
 
     if opt.kind == "cross_bottleneck":
-        if _agent_in_region(next_state, agent_id, opt):
-            return True, "reached_bottleneck"
-        if crossed_region(
-            prev_state,
-            next_state,
-            agent_id,
-            opt.region_ids,
-            region_cells=_region_cells(opt),
-        ):
+        if cross_bottleneck_terminated(runtime, prev_state, next_state, opt, agent_id):
             return True, "crossed_bottleneck"
         return False, "running"
 
     if opt.kind == "wait_at_bottleneck":
-        wait_duration = (opt.metadata or {}).get("wait_duration", 2)
-        if elapsed >= wait_duration:
-            return True, "wait_duration"
-        if partner_response_observed_near_region(
+        wait_duration = int((opt.metadata or {}).get("wait_duration", 2))
+        reached = wait_bottleneck_update_runtime(
+            runtime,
+            prev_state,
+            next_state,
             event,
-            opt.region_ids,
-            region_cells=_region_cells(opt),
+            opt,
+            agent_id,
+        )
+        if (
+            reached
+            and partner_response_observed_near_region(
+                event,
+                opt.region_ids,
+                region_cells=_region_cells(opt),
+            )
         ):
             return True, "partner_response_observed"
+        if runtime is not None:
+            if runtime.wait_elapsed_after_arrival >= wait_duration:
+                return True, "wait_duration_after_arrival"
+        elif _agent_in_region(next_state, agent_id, opt) and elapsed >= wait_duration:
+            return True, "wait_duration_after_arrival"
         return False, "running"
 
     if opt.kind == "handoff_counter":
@@ -106,6 +127,72 @@ def option_terminated(
         return False, "running"
 
     return False, "running"
+
+
+def cross_bottleneck_terminated(
+    runtime: OptionRuntime | None,
+    prev_state: Any,
+    next_state: Any,
+    opt: OptionSpec,
+    agent_id: int,
+) -> bool:
+    region = _region_cells(opt)
+    if not region:
+        return False
+
+    prev_pos = get_agent_pos(prev_state, agent_id)
+    next_pos = get_agent_pos(next_state, agent_id)
+    if runtime is None:
+        return crossed_region(
+            prev_state,
+            next_state,
+            agent_id,
+            opt.region_ids,
+            region_cells=region,
+        )
+
+    if not runtime.reached_region:
+        if prev_pos not in region and next_pos in region:
+            runtime.reached_region = True
+            runtime.entry_side = prev_pos
+        elif prev_pos in region:
+            runtime.reached_region = True
+            if runtime.start_pos not in region:
+                runtime.entry_side = runtime.start_pos
+
+    if not runtime.reached_region or next_pos in region:
+        return False
+    if runtime.entry_side is None:
+        return False
+    return _crossed_to_other_side(runtime.entry_side, next_pos, region)
+
+
+def wait_bottleneck_update_runtime(
+    runtime: OptionRuntime | None,
+    prev_state: Any,
+    next_state: Any,
+    event: Any,
+    opt: OptionSpec,
+    agent_id: int,
+) -> bool:
+    if runtime is None:
+        return _agent_in_region(next_state, agent_id, opt)
+
+    region = _region_cells(opt)
+    prev_pos = get_agent_pos(prev_state, agent_id)
+    next_pos = get_agent_pos(next_state, agent_id)
+    was_in_region = prev_pos in region
+    is_in_region = next_pos in region
+    if is_in_region:
+        runtime.reached_region = True
+    if (
+        runtime.reached_region
+        and was_in_region
+        and is_in_region
+        and bool(getattr(event, "ego_waited", False))
+    ):
+        runtime.wait_elapsed_after_arrival += 1
+    return runtime.reached_region
 
 
 def pot_changed_near_target(
@@ -207,6 +294,17 @@ def _counter_event_cells(opt: OptionSpec) -> tuple[GridPos, ...]:
     if opt.target_pos is not None:
         return (opt.target_pos,)
     return tuple(metadata.get("interaction_cells", ()))
+
+
+def _crossed_to_other_side(
+    entry_side: GridPos,
+    exit_pos: GridPos,
+    region_cells: Iterable[GridPos],
+) -> bool:
+    return any(
+        _opposite_adjacent_sides(entry_side, exit_pos, cell)
+        for cell in tuple(region_cells)
+    )
 
 
 def _opposite_adjacent_sides(

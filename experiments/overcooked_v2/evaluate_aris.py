@@ -16,7 +16,7 @@ if __package__ in {None, ""}:  # pragma: no cover - script execution path
 
 from src.aris_bellman.factor_belief import FactorLocalBeliefModel
 from src.aris_bellman.replay import EvidenceBuffer
-from src.aris_bellman.specs import FactorSpec, GraphSpec, OptionSpec
+from src.aris_bellman.specs import GraphSpec
 
 from experiments.overcooked_v2.diagnostics import (
     belief_swap_top_pairs,
@@ -32,14 +32,17 @@ from experiments.overcooked_v2.event_extractor import extract_event
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_encoder import infer_obs_dim
+from experiments.overcooked_v2.option_termination import OptionRuntime
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.state_utils import get_agent_pos
 from experiments.overcooked_v2.train_aris import (
     _build_belief_model,
     _build_env,
     _build_q_network,
     _graph_tensors,
     _obs_vector,
+    _partner_id_tensor,
     _q_forward_kwargs,
     _state_repr,
     _tensor,
@@ -99,21 +102,27 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 random_policy=False,
                 collect_diagnostics=True,
             )
-            deletion = _factor_deletion_q_proxy_diagnostics(
-                ctx,
-                aggregate["mean_return"],
-            )
-            results.append(
-                {
-                    "method": ctx.method,
-                    "graph_variant": ctx.graph_variant,
-                    "partner": partner_name,
-                    "checkpoint": str(ctx.checkpoint_path),
-                    "aggregate": aggregate,
-                    "episodes": episodes,
-                    "factor_deletion_return_drop": deletion,
-                }
-            )
+            result = {
+                "method": ctx.method,
+                "graph_variant": ctx.graph_variant,
+                "partner": partner_name,
+                "checkpoint": str(ctx.checkpoint_path),
+                "aggregate": aggregate,
+                "episodes": episodes,
+                "factor_deletion_q_proxy": _factor_deletion_q_proxy_diagnostics(ctx),
+            }
+            if int(args.factor_deletion_episodes) > 0:
+                result["factor_deletion_return_drop"] = (
+                    _factor_deletion_rollout_diagnostics(
+                        ctx,
+                        partner_name,
+                        float(aggregate["mean_return"]),
+                        episodes=int(args.factor_deletion_episodes),
+                        seed=seed + 400_000,
+                        max_episode_options=max_episode_options,
+                    )
+                )
+            results.append(result)
 
     baselines = _random_baselines(
         contexts[0],
@@ -122,7 +131,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         seed=seed + 200_000,
         max_episode_options=max_episode_options,
     )
-    _attach_reference_gaps(results, baselines)
+    external_references = None
+    if args.reference_base_checkpoint or args.reference_ref_checkpoint:
+        if not args.reference_base_checkpoint or not args.reference_ref_checkpoint:
+            raise ValueError(
+                "reference_gap_closure requires both --reference_base_checkpoint and "
+                "--reference_ref_checkpoint."
+            )
+        external_references = _external_reference_baselines(
+            args,
+            partner_names,
+            episodes=int(args.episodes),
+            seed=seed + 600_000,
+            max_episode_options=max_episode_options,
+        )
+        _attach_external_reference_gaps(results, external_references)
+    else:
+        _attach_within_run_relative_returns(results, baselines)
 
     return {
         "schema_version": "ocv2_eval_v1",
@@ -133,13 +158,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "max_episode_options": max_episode_options,
         "diagnostic_granularity": "option",
         "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
-        "reference_gap_semantics": {
-            "r_base": "random_policy_rollout",
-            "r_ref": "best_mean_return_among_requested_graph_variants_per_partner",
-            "reference_type": "within_run_relative_not_external_oracle",
-        },
+        "reference_gap_semantics": _reference_semantics(external_references is not None),
         "results": results,
         "reference_baselines": baselines,
+        "external_reference_baselines": external_references,
         "summary": _summary(results, baselines, time.time() - start),
     }
 
@@ -151,7 +173,7 @@ def _load_context(checkpoint_path: Path, variant: str) -> EvalContext:
         )
     checkpoint = _torch_load(checkpoint_path)
     config = checkpoint["config"]
-    graph = graph_from_json(checkpoint["graph"])
+    graph = GraphSpec.from_json_dict(checkpoint["graph"])
     method = str(checkpoint["method"])
 
     env = _build_env(graph.layout_name, config)
@@ -245,6 +267,7 @@ def _run_episode(
         evidence_dim=D_EVID,
     )
     evidence_buffer.reset()
+    router.reset()
     obs, _ = env.reset(seed)
     partner.reset(seed)
 
@@ -261,7 +284,16 @@ def _run_episode(
     done = False
 
     while not done and option_count < max_episode_options:
-        option_id = _select_option(ctx, obs, env.state, evidence_buffer, graph, rng, random_policy)
+        option_id = _select_option(
+            ctx,
+            obs,
+            env.state,
+            evidence_buffer,
+            graph,
+            rng,
+            random_policy,
+            partner_id=int(getattr(partner, "partner_id", 0)),
+        )
         option_return, done, obs, info = _execute_eval_option(
             ctx,
             env,
@@ -314,6 +346,10 @@ def _execute_eval_option(
     rng: np.random.Generator,
 ) -> tuple[float, bool, dict[str, np.ndarray], dict[str, Any]]:
     opt = ctx.option_lib.options[int(option_id)]
+    runtime = OptionRuntime(
+        option_id=int(option_id),
+        start_pos=get_agent_pos(env.state, 0),
+    )
     reward_sum = 0.0
     realized_cost = 0.0
     duration = 0
@@ -341,12 +377,16 @@ def _execute_eval_option(
             partner_action.option_id,
             partner_action.option_dist,
         )
-        x_f = router.route(event, ego_option_id=int(option_id))
-        evidence_buffer.append(x_f)
-
         reward_sum += _training_reward(step, ctx.config, "agent_0")
         realized_cost += float(ctx.config["training"].get("cost_per_step", 1.0))
         duration += 1
+        x_f = router.route(
+            event,
+            ego_option_id=int(option_id),
+            ego_option_elapsed=duration,
+            ego_option_max_steps=opt.max_steps,
+        )
+        evidence_buffer.append(x_f)
         blocking_events += int(bool(event.collision_or_block))
         delivery_seen = bool(
             delivery_seen
@@ -361,6 +401,7 @@ def _execute_eval_option(
             event,
             agent_id=0,
             elapsed=duration,
+            runtime=runtime,
         )
         obs = step.obs
         if done or terminated:
@@ -408,7 +449,7 @@ def _option_diagnostics(
     graph: GraphSpec,
 ) -> dict[str, Any]:
     graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
-    obs_tensor = _tensor(_obs_vector(obs_next, "agent_0")[None, :], torch.device("cpu"))
+    obs_tensor = _tensor(_obs_vector(obs_next, "agent_0")[None, ...], torch.device("cpu"))
     with torch.no_grad():
         delta = realized_delta_info(
             ctx.q_net,
@@ -449,6 +490,7 @@ def _select_option(
     graph: GraphSpec,
     rng: np.random.Generator,
     random_policy: bool,
+    partner_id: int | None = None,
 ) -> int:
     valid = ctx.option_lib.valid_options(state, 0)
     valid_ids = np.flatnonzero(valid)
@@ -459,31 +501,75 @@ def _select_option(
 
     with torch.no_grad():
         graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
-        obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, :], torch.device("cpu"))
+        obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], torch.device("cpu"))
         belief = _current_belief(ctx, evidence_buffer, graph)
-        q_values = ctx.q_net(obs_tensor, belief, **_q_forward_kwargs(graph_batch)).squeeze(0)
+        q_values = ctx.q_net(
+            obs_tensor,
+            belief,
+            **_q_forward_kwargs(graph_batch),
+            partner_id=_partner_id_tensor(partner_id, 1, torch.device("cpu")),
+        ).squeeze(0)
         valid_tensor = torch.as_tensor(valid, dtype=torch.bool)
         q_values = q_values.masked_fill(~valid_tensor, -1e9)
         return int(torch.argmax(q_values).item())
 
 
-def _factor_deletion_q_proxy_diagnostics(
-    ctx: EvalContext,
-    base_return: float,
-) -> list[dict[str, Any]]:
+def _factor_deletion_q_proxy_diagnostics(ctx: EvalContext) -> list[dict[str, Any]]:
     if ctx.graph.num_factors == 0:
         return []
 
     q_drops = _factor_deletion_q_proxy(ctx)
+    rows = []
+    for factor in ctx.graph.factors:
+        rows.append(
+            {
+                "factor_id": int(factor.id),
+                "factor_kind": factor.factor_kind,
+                "option_i": int(factor.option_i),
+                "option_j": int(factor.option_j),
+                "q_proxy_drop": float(q_drops[int(factor.id)]),
+                "ablation_mode": "q_proxy_factor_mask",
+                "ablation_scope": "single_initial_state_empty_evidence",
+                "rollout_episodes": 0,
+            }
+        )
+    rows.sort(key=lambda row: (-row["q_proxy_drop"], row["factor_id"]))
+    return rows
 
-    def eval_deleted(factor_id: int) -> float:
-        return float(base_return - q_drops[int(factor_id)])
 
-    rows = factor_deletion_return_drop(ctx.graph, base_return, eval_deleted)
+def _factor_deletion_rollout_diagnostics(
+    ctx: EvalContext,
+    partner_name: str,
+    base_return: float,
+    *,
+    episodes: int,
+    seed: int,
+    max_episode_options: int,
+) -> list[dict[str, Any]]:
+    deleted_returns: dict[int, float] = {}
+    for factor in ctx.graph.factors:
+        deleted_graph = graph_with_deleted_factor(ctx.graph, int(factor.id))
+        aggregate, _ = _evaluate_partner(
+            ctx,
+            partner_name,
+            episodes=episodes,
+            seed=seed + int(factor.id),
+            max_episode_options=max_episode_options,
+            graph_override=deleted_graph,
+            random_policy=False,
+            collect_diagnostics=False,
+        )
+        deleted_returns[int(factor.id)] = float(aggregate["mean_return"])
+
+    rows = factor_deletion_return_drop(
+        ctx.graph,
+        base_return,
+        lambda factor_id: deleted_returns[int(factor_id)],
+    )
     for row in rows:
-        row["ablation_mode"] = "q_proxy_factor_mask"
-        row["ablation_scope"] = "single_initial_state_empty_evidence"
-        row["rollout_episodes"] = 0
+        row["ablation_mode"] = "rollout_factor_mask"
+        row["ablation_scope"] = "factor_mask_relevance_mode_disabled"
+        row["rollout_episodes"] = int(episodes)
     return rows
 
 
@@ -495,7 +581,7 @@ def _factor_deletion_q_proxy(ctx: EvalContext) -> dict[int, float]:
         window=int(ctx.config["training"]["evidence_window"]),
         evidence_dim=D_EVID,
     )
-    obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, :], torch.device("cpu"))
+    obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], torch.device("cpu"))
     base_graph_batch = _graph_tensors(ctx.graph, 1, torch.device("cpu"))
     base_belief = _current_belief(ctx, evidence_buffer, ctx.graph)
     with torch.no_grad():
@@ -549,7 +635,70 @@ def _random_baselines(
     return baselines
 
 
-def _attach_reference_gaps(
+def _external_reference_baselines(
+    args: argparse.Namespace,
+    partner_names: list[str],
+    *,
+    episodes: int,
+    seed: int,
+    max_episode_options: int,
+) -> dict[str, Any]:
+    base_ctx = _load_context(
+        _resolve_checkpoint_path(Path(args.reference_base_checkpoint)),
+        "reference_base",
+    )
+    ref_ctx = _load_context(
+        _resolve_checkpoint_path(Path(args.reference_ref_checkpoint)),
+        "reference_ref",
+    )
+    baselines: dict[str, Any] = {}
+    for idx, partner_name in enumerate(partner_names):
+        base_aggregate, _ = _evaluate_partner(
+            base_ctx,
+            partner_name,
+            episodes=episodes,
+            seed=seed + idx,
+            max_episode_options=max_episode_options,
+            graph_override=base_ctx.graph,
+            random_policy=False,
+            collect_diagnostics=False,
+        )
+        ref_aggregate, _ = _evaluate_partner(
+            ref_ctx,
+            partner_name,
+            episodes=episodes,
+            seed=seed + 10_000 + idx,
+            max_episode_options=max_episode_options,
+            graph_override=ref_ctx.graph,
+            random_policy=False,
+            collect_diagnostics=False,
+        )
+        baselines[partner_name] = {
+            "base_checkpoint": str(base_ctx.checkpoint_path),
+            "ref_checkpoint": str(ref_ctx.checkpoint_path),
+            "base_method": base_ctx.method,
+            "ref_method": ref_ctx.method,
+            "base_mean_return": base_aggregate["mean_return"],
+            "ref_mean_return": ref_aggregate["mean_return"],
+            "episodes": int(episodes),
+        }
+    return baselines
+
+
+def _attach_external_reference_gaps(
+    results: list[dict[str, Any]],
+    references: dict[str, Any],
+) -> None:
+    for row in results:
+        reference = references[row["partner"]]
+        row["aggregate"]["reference_gap_closure"] = reference_gap_closure(
+            float(row["aggregate"]["mean_return"]),
+            float(reference["base_mean_return"]),
+            float(reference["ref_mean_return"]),
+        )
+
+
+def _attach_within_run_relative_returns(
     results: list[dict[str, Any]],
     baselines: dict[str, Any],
 ) -> None:
@@ -560,11 +709,25 @@ def _attach_reference_gaps(
         r_base = float(baselines[partner]["mean_return"])
         r_ref = max(float(row["aggregate"]["mean_return"]) for row in rows)
         for row in rows:
-            row["aggregate"]["reference_gap_closure"] = reference_gap_closure(
+            row["aggregate"]["within_run_relative_return"] = reference_gap_closure(
                 float(row["aggregate"]["mean_return"]),
                 r_base,
                 r_ref,
             )
+
+
+def _reference_semantics(has_external_references: bool) -> dict[str, str]:
+    if has_external_references:
+        return {
+            "r_base": "external_reference_base_checkpoint",
+            "r_ref": "external_reference_ref_checkpoint",
+            "reference_type": "external_checkpoint_reference_gap_closure",
+        }
+    return {
+        "r_base": "random_policy_rollout",
+        "r_ref": "best_mean_return_among_requested_graph_variants_per_partner",
+        "reference_type": "within_run_relative_return_not_reference_gap_closure",
+    }
 
 
 def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
@@ -634,83 +797,16 @@ def _torch_load(path: Path) -> dict[str, Any]:
         return torch.load(path, map_location="cpu")
 
 
-def graph_from_json(data: dict[str, Any]) -> GraphSpec:
-    options = [
-        OptionSpec(
-            id=int(item["id"]),
-            name=str(item["name"]),
-            kind=str(item["kind"]),
-            target_id=item.get("target_id"),
-            target_pos=_pos_or_none(item.get("target_pos")),
-            entity_ids=tuple(item.get("entity_ids", ())),
-            region_ids=tuple(item.get("region_ids", ())),
-            max_steps=int(item["max_steps"]),
-            interruptible=bool(item.get("interruptible", True)),
-            terminal_event=item.get("terminal_event"),
-            metadata=item.get("metadata"),
-        )
-        for item in data["options"]
-    ]
-    factors = [
-        FactorSpec(
-            id=int(item["id"]),
-            option_i=int(item["option_i"]),
-            option_j=int(item["option_j"]),
-            ce_score=float(item["ce_score"]),
-            num_modes=int(item["num_modes"]),
-            entity_ids=tuple(item.get("entity_ids", ())),
-            region_ids=tuple(item.get("region_ids", ())),
-            factor_kind=str(item.get("factor_kind", "generic_option_pair")),
-            metadata=item.get("metadata"),
-        )
-        for item in data["factors"]
-    ]
-    return GraphSpec(
-        layout_name=str(data["layout_name"]),
-        options=options,
-        factors=factors,
-        relevance=np.asarray(data["relevance"], dtype=bool),
-        option_mask=np.asarray(data["option_mask"], dtype=bool),
-        factor_mask=np.asarray(data["factor_mask"], dtype=bool),
-        mode_mask=np.asarray(data["mode_mask"], dtype=bool),
-        route_map={
-            int(key): tuple(int(value) for value in values)
-            for key, values in data.get("route_map", {}).items()
-        },
-        option_features=_array_or_none(data.get("option_features")),
-        factor_features=_array_or_none(data.get("factor_features")),
-        metadata=data.get("metadata") or {},
-    )
-
-
-def _array_or_none(value: Any) -> np.ndarray | None:
-    if value is None:
-        return None
-    return np.asarray(value, dtype=np.float32)
-
-
-def _pos_or_none(value: Any) -> tuple[int, int] | None:
-    if value is None:
-        return None
-    return int(value[0]), int(value[1])
-
-
 def _summary(
     results: list[dict[str, Any]],
     baselines: dict[str, Any],
     wall: float,
 ) -> dict[str, Any]:
-    closures = [
-        row["aggregate"]["reference_gap_closure"]["value"]
-        for row in results
-        if row["aggregate"]["reference_gap_closure"]["value"] is not None
-    ]
-    raw_closures = [
-        row["aggregate"]["reference_gap_closure"]["raw_value"]
-        for row in results
-        if row["aggregate"]["reference_gap_closure"].get("raw_value") is not None
-    ]
-    return {
+    closures = _relative_values(results, "reference_gap_closure", "value")
+    raw_closures = _relative_values(results, "reference_gap_closure", "raw_value")
+    within_run = _relative_values(results, "within_run_relative_return", "value")
+    raw_within_run = _relative_values(results, "within_run_relative_return", "raw_value")
+    summary = {
         "num_results": len(results),
         "partners": sorted(baselines),
         "mean_return": _mean_or_zero(
@@ -722,13 +818,36 @@ def _summary(
         "mean_blocking_rate": _mean_or_zero(
             [float(row["aggregate"]["blocking_rate"]) for row in results]
         ),
-        "mean_reference_gap_closure": _mean_or_zero(closures),
-        "mean_reference_gap_closure_raw": _mean_or_zero(raw_closures),
-        "num_negative_raw_reference_gaps": int(
-            sum(1 for value in raw_closures if float(value) < 0.0)
-        ),
         "wall_time_sec": float(wall),
     }
+    if closures:
+        summary["mean_reference_gap_closure"] = _mean_or_zero(closures)
+    if raw_closures:
+        summary["mean_reference_gap_closure_raw"] = _mean_or_zero(raw_closures)
+        summary["num_negative_raw_reference_gaps"] = int(
+            sum(1 for value in raw_closures if float(value) < 0.0)
+        )
+    if within_run:
+        summary["mean_within_run_relative_return"] = _mean_or_zero(within_run)
+    if raw_within_run:
+        summary["mean_within_run_relative_return_raw"] = _mean_or_zero(raw_within_run)
+    return summary
+
+
+def _relative_values(
+    results: list[dict[str, Any]],
+    key: str,
+    value_key: str,
+) -> list[float]:
+    values = []
+    for row in results:
+        metric = row["aggregate"].get(key)
+        if not isinstance(metric, dict):
+            continue
+        value = metric.get(value_key)
+        if value is not None:
+            values.append(float(value))
+    return values
 
 
 def _finite_summary(values: list[float]) -> dict[str, Any]:
@@ -834,6 +953,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_episode_options", type=int, default=0)
+    parser.add_argument("--factor_deletion_episodes", type=int, default=0)
+    parser.add_argument("--reference_base_checkpoint", default=None)
+    parser.add_argument("--reference_ref_checkpoint", default=None)
     return parser
 
 

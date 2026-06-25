@@ -34,11 +34,17 @@ GRAPH_VARIANTS = (
     "overcomplete",
     "overcomplete_minus_low_ce",
     "minus_critical",
+    "minus_high_ce",
     "random_same_size",
     "complete_option_graph",
     "shuffled_routes",
     "shuffled_relevance",
 )
+
+# Noop is useful as an action baseline, but it is not an interaction factor.
+# Including noop in CE support makes the graph reflect option duration/cost rather
+# than coordination externality.
+EXCLUDED_FACTOR_OPTION_KINDS = {"noop"}
 
 
 def infer_factor_kind(option_i: OptionSpec, option_j: OptionSpec) -> str:
@@ -71,7 +77,7 @@ def build_support_graph(
     factors = _factor_specs_from_pairs(
         layout_name,
         options,
-        _top_pairs_above_eta(ce_matrix, eta, max_factors),
+        _top_pairs_above_eta(ce_matrix, options, eta, max_factors),
         mode_config,
     )
     return make_graph_spec(
@@ -82,6 +88,7 @@ def build_support_graph(
             "graph_variant": "full_support",
             "eta": float(eta),
             "max_factors": int(max_factors),
+            "full_max_factors": int(max_factors),
         },
     )
 
@@ -139,22 +146,34 @@ def build_graph_variant(
     *,
     eta: float,
     max_factors: int,
+    full_max_factors: int | None = None,
+    overcomplete_extra_factors: int = 0,
     mode_config: dict[str, int] | None = None,
     criticality_scores: Any | None = None,
     seed: int = 17,
 ) -> GraphSpec:
+    full_budget = int(full_max_factors if full_max_factors is not None else max_factors)
     if variant == "full_support":
-        return full_support_graph(layout_name, options, ce_matrix, eta, max_factors, mode_config)
+        return full_support_graph(layout_name, options, ce_matrix, eta, full_budget, mode_config)
     if variant == "overcomplete":
-        return overcomplete_graph(layout_name, options, ce_matrix, eta, max_factors, mode_config)
+        return overcomplete_graph(
+            layout_name,
+            options,
+            ce_matrix,
+            eta,
+            full_budget,
+            mode_config,
+            overcomplete_extra_factors=overcomplete_extra_factors,
+        )
     if variant == "overcomplete_minus_low_ce":
         return overcomplete_minus_low_ce_graph(
             layout_name,
             options,
             ce_matrix,
             eta,
-            max_factors,
+            full_budget,
             mode_config,
+            overcomplete_extra_factors=overcomplete_extra_factors,
         )
     if variant == "minus_critical":
         return minus_critical_graph(
@@ -162,9 +181,18 @@ def build_graph_variant(
             options,
             ce_matrix,
             eta,
-            max_factors,
+            full_budget,
             mode_config,
             criticality_scores,
+        )
+    if variant == "minus_high_ce":
+        return minus_high_ce_graph(
+            layout_name,
+            options,
+            ce_matrix,
+            eta,
+            full_budget,
+            mode_config,
         )
     if variant == "random_same_size":
         return random_same_size_graph(
@@ -172,21 +200,21 @@ def build_graph_variant(
             options,
             ce_matrix,
             eta,
-            max_factors,
+            full_budget,
             mode_config,
             seed,
         )
     if variant == "complete_option_graph":
         return complete_option_graph(layout_name, options, ce_matrix, mode_config)
     if variant == "shuffled_routes":
-        return shuffled_routes_graph(layout_name, options, ce_matrix, eta, max_factors, mode_config)
+        return shuffled_routes_graph(layout_name, options, ce_matrix, eta, full_budget, mode_config)
     if variant == "shuffled_relevance":
         return shuffled_relevance_graph(
             layout_name,
             options,
             ce_matrix,
             eta,
-            max_factors,
+            full_budget,
             mode_config,
         )
     raise ValueError(f"Unknown graph variant {variant!r}; expected one of {GRAPH_VARIANTS}.")
@@ -208,17 +236,20 @@ def overcomplete_graph(
     options: list[OptionSpec],
     ce_matrix: np.ndarray,
     eta: float,
-    max_factors: int,
+    full_max_factors: int,
     mode_config: dict[str, int] | None = None,
+    *,
+    overcomplete_extra_factors: int = 0,
 ) -> GraphSpec:
-    full_pairs = _top_pairs_above_eta(ce_matrix, eta, max_factors)
+    full_pairs = _top_pairs_above_eta(ce_matrix, options, eta, full_max_factors)
     full_keys = {(i, j) for _, i, j in full_pairs}
     extras = [
         pair
-        for pair in _all_positive_pairs(ce_matrix)
+        for pair in _all_positive_pairs(ce_matrix, options)
         if (pair[1], pair[2]) not in full_keys
     ]
-    selected = (full_pairs + extras)[:max_factors]
+    extra_pairs = extras[: max(0, int(overcomplete_extra_factors))]
+    selected = full_pairs + extra_pairs
     factors = _factor_specs_from_pairs(layout_name, options, selected, mode_config)
     return make_graph_spec(
         layout_name,
@@ -227,8 +258,10 @@ def overcomplete_graph(
         metadata={
             "graph_variant": "overcomplete",
             "eta": float(eta),
-            "max_factors": int(max_factors),
-            "full_support_count": len(full_pairs),
+            "full_max_factors": int(full_max_factors),
+            "overcomplete_extra_factors": int(overcomplete_extra_factors),
+            "full_count": len(full_pairs),
+            "extra_count": len(extra_pairs),
         },
     )
 
@@ -238,17 +271,20 @@ def overcomplete_minus_low_ce_graph(
     options: list[OptionSpec],
     ce_matrix: np.ndarray,
     eta: float,
-    max_factors: int,
+    full_max_factors: int,
     mode_config: dict[str, int] | None = None,
+    *,
+    overcomplete_extra_factors: int = 0,
 ) -> GraphSpec:
-    full_pairs = _top_pairs_above_eta(ce_matrix, eta, max_factors)
+    full_pairs = _top_pairs_above_eta(ce_matrix, options, eta, full_max_factors)
     overcomplete = overcomplete_graph(
         layout_name,
         options,
         ce_matrix,
         eta,
-        max_factors,
+        full_max_factors,
         mode_config,
+        overcomplete_extra_factors=overcomplete_extra_factors,
     )
     full_keys = {(i, j) for _, i, j in full_pairs}
     extras = [
@@ -277,7 +313,8 @@ def overcomplete_minus_low_ce_graph(
         metadata={
             "graph_variant": "overcomplete_minus_low_ce",
             "eta": float(eta),
-            "max_factors": int(max_factors),
+            "full_max_factors": int(full_max_factors),
+            "overcomplete_extra_factors": int(overcomplete_extra_factors),
             "removed_pairs": sorted([list(pair) for pair in removed]),
         },
     )
@@ -292,8 +329,12 @@ def minus_critical_graph(
     mode_config: dict[str, int] | None = None,
     criticality_scores: Any | None = None,
 ) -> GraphSpec:
+    if criticality_scores is None:
+        raise ValueError("minus_critical requires validation criticality scores.")
     full = build_support_graph(layout_name, options, ce_matrix, eta, max_factors, mode_config)
     critical_pair, source = _critical_pair(full.factors, criticality_scores)
+    if critical_pair is None:
+        raise ValueError("minus_critical could not resolve a critical factor from scores.")
     factors = [
         factor
         for factor in full.factors
@@ -307,8 +348,39 @@ def minus_critical_graph(
             "graph_variant": "minus_critical",
             "eta": float(eta),
             "max_factors": int(max_factors),
+            "full_max_factors": int(max_factors),
             "critical_pair": list(critical_pair) if critical_pair is not None else None,
             "criticality_source": source,
+        },
+    )
+
+
+def minus_high_ce_graph(
+    layout_name: str,
+    options: list[OptionSpec],
+    ce_matrix: np.ndarray,
+    eta: float,
+    max_factors: int,
+    mode_config: dict[str, int] | None = None,
+) -> GraphSpec:
+    full = build_support_graph(layout_name, options, ce_matrix, eta, max_factors, mode_config)
+    high_pair = _high_ce_pair(full.factors)
+    factors = [
+        factor
+        for factor in full.factors
+        if (factor.option_i, factor.option_j) != high_pair
+    ]
+    return make_graph_spec(
+        layout_name,
+        options,
+        _renumber_factors(factors),
+        metadata={
+            "graph_variant": "minus_high_ce",
+            "eta": float(eta),
+            "max_factors": int(max_factors),
+            "full_max_factors": int(max_factors),
+            "removed_pair": list(high_pair) if high_pair is not None else None,
+            "criticality_source": "ce_highest_debug",
         },
     )
 
@@ -322,15 +394,15 @@ def random_same_size_graph(
     mode_config: dict[str, int] | None = None,
     seed: int = 17,
 ) -> GraphSpec:
-    full_pairs = _top_pairs_above_eta(ce_matrix, eta, max_factors)
+    full_pairs = _top_pairs_above_eta(ce_matrix, options, eta, max_factors)
     full_keys = {(i, j) for _, i, j in full_pairs}
     candidates = [
         pair
-        for pair in _all_pairs(ce_matrix)
+        for pair in _all_pairs(ce_matrix, options)
         if (pair[1], pair[2]) not in full_keys
     ]
     if len(candidates) < len(full_pairs):
-        candidates = _all_pairs(ce_matrix)
+        candidates = _all_pairs(ce_matrix, options)
     rng = random.Random(seed)
     selected = rng.sample(candidates, k=min(len(full_pairs), len(candidates)))
     factors = _factor_specs_from_pairs(layout_name, options, selected, mode_config)
@@ -341,6 +413,7 @@ def random_same_size_graph(
         metadata={
             "graph_variant": "random_same_size",
             "eta": float(eta),
+            "full_max_factors": int(max_factors),
             "seed": int(seed),
             "full_support_count": len(full_pairs),
         },
@@ -353,7 +426,7 @@ def complete_option_graph(
     ce_matrix: np.ndarray,
     mode_config: dict[str, int] | None = None,
 ) -> GraphSpec:
-    factors = _factor_specs_from_pairs(layout_name, options, _all_pairs(ce_matrix), mode_config)
+    factors = _factor_specs_from_pairs(layout_name, options, _all_pairs(ce_matrix, options), mode_config)
     return make_graph_spec(
         layout_name,
         options,
@@ -385,6 +458,7 @@ def shuffled_routes_graph(
         metadata={
             "graph_variant": "shuffled_routes",
             "eta": float(eta),
+            "full_max_factors": int(max_factors),
             "route_permutation": permutation,
         },
     )
@@ -409,6 +483,7 @@ def shuffled_relevance_graph(
         metadata={
             "graph_variant": "shuffled_relevance",
             "eta": float(eta),
+            "full_max_factors": int(max_factors),
             "relevance_permutation": permutation,
         },
     )
@@ -444,31 +519,55 @@ def _factor_specs_from_pairs(
 
 def _top_pairs_above_eta(
     ce_matrix: np.ndarray,
+    options: list[OptionSpec],
     eta: float,
     max_factors: int,
 ) -> list[tuple[float, int, int]]:
     pairs = [
         pair
-        for pair in _all_pairs(ce_matrix)
+        for pair in _all_pairs(ce_matrix, options)
         if pair[0] > float(eta)
     ]
     return pairs[: max(0, int(max_factors))]
 
 
-def _all_positive_pairs(ce_matrix: np.ndarray) -> list[tuple[float, int, int]]:
-    return [pair for pair in _all_pairs(ce_matrix) if pair[0] > 0.0]
+def _all_positive_pairs(
+    ce_matrix: np.ndarray,
+    options: list[OptionSpec],
+) -> list[tuple[float, int, int]]:
+    return [pair for pair in _all_pairs(ce_matrix, options) if pair[0] > 0.0]
 
 
-def _all_pairs(ce_matrix: np.ndarray) -> list[tuple[float, int, int]]:
+def _all_pairs(
+    ce_matrix: np.ndarray,
+    options: list[OptionSpec],
+) -> list[tuple[float, int, int]]:
     ce = np.asarray(ce_matrix, dtype=float)
     pairs = [
         (float(ce[i, j]), int(i), int(j))
         for i in range(ce.shape[0])
         for j in range(ce.shape[1])
+        if _factorable_option_pair(options, int(i), int(j))
     ]
     pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
     return pairs
 
+
+def _factorable_option_pair(
+    options: list[OptionSpec],
+    option_i: int,
+    option_j: int,
+) -> bool:
+    if option_i == option_j:
+        return False
+    if option_i < 0 or option_j < 0:
+        return False
+    if option_i >= len(options) or option_j >= len(options):
+        return False
+    return (
+        options[option_i].kind not in EXCLUDED_FACTOR_OPTION_KINDS
+        and options[option_j].kind not in EXCLUDED_FACTOR_OPTION_KINDS
+    )
 
 def _relevant_options_for_factor(
     factor: FactorSpec,
@@ -511,8 +610,14 @@ def _critical_pair(
     scored_pair = _critical_pair_from_scores(factors, criticality_scores)
     if scored_pair is not None:
         return scored_pair, "validation_return_drop"
-    critical = max(factors, key=lambda factor: factor.ce_score)
-    return (int(critical.option_i), int(critical.option_j)), "ce_fallback"
+    return None, "missing_validation_scores"
+
+
+def _high_ce_pair(factors: list[FactorSpec]) -> tuple[int, int] | None:
+    if not factors:
+        return None
+    factor = max(factors, key=lambda item: item.ce_score)
+    return int(factor.option_i), int(factor.option_j)
 
 
 def _critical_pair_from_scores(
@@ -583,6 +688,8 @@ def _cmd_build(args: argparse.Namespace) -> None:
         ce_matrix,
         eta=args.eta,
         max_factors=args.max_factors,
+        full_max_factors=args.full_max_factors,
+        overcomplete_extra_factors=args.overcomplete_extra_factors,
         mode_config=_load_mode_config(args.mode_config),
         criticality_scores=_load_criticality(args.criticality),
         seed=args.seed,
@@ -598,6 +705,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ce", required=True)
     parser.add_argument("--eta", type=float, default=0.2)
     parser.add_argument("--max_factors", type=int, default=16)
+    parser.add_argument("--full_max_factors", type=int, default=None)
+    parser.add_argument("--overcomplete_extra_factors", type=int, default=0)
     parser.add_argument("--output", required=True)
     parser.add_argument("--variant", choices=GRAPH_VARIANTS, default="full_support")
     parser.add_argument("--mode_config", default=None)

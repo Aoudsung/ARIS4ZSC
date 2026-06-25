@@ -21,13 +21,25 @@ def aris_td_loss(
     graph_batch: dict[str, Any],
     gamma: float,
     cost_coef: float,
+    q_extra_t: dict[str, Any] | None = None,
+    q_extra_next: dict[str, Any] | None = None,
 ) -> torch.Tensor:
-    q_all = q_net(obs_feat_t, belief_t, **_graph_kwargs(graph_batch, next_step=False))
+    q_all = q_net(
+        obs_feat_t,
+        belief_t,
+        **_graph_kwargs(graph_batch, next_step=False),
+        **(q_extra_t or {}),
+    )
     q_pred = q_all.gather(1, option_id.long()[:, None]).squeeze(1)
 
     with torch.no_grad():
         next_kwargs = _graph_kwargs(graph_batch, next_step=True)
-        q_next = target_q_net(obs_feat_next, belief_next, **next_kwargs)
+        q_next = target_q_net(
+            obs_feat_next,
+            belief_next,
+            **next_kwargs,
+            **(q_extra_next or {}),
+        )
         option_mask_next = graph_batch.get(
             "option_mask_next",
             next_kwargs.get("option_mask"),

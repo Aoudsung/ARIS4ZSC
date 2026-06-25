@@ -2,22 +2,23 @@ from __future__ import annotations
 
 from typing import Any
 
-import jax.numpy as jnp
 import numpy as np
 
-from jaxmarl.environments.overcooked_v2.common import Actions, Direction, Position
-from jaxmarl.environments.overcooked_v2.utils import OvercookedPathPlanner
+from jaxmarl.environments.overcooked_v2.common import Actions
 from src.aris_bellman.specs import OptionSpec
 
 from .layout_parser import GridPos, LayoutGraph, adjacent_passable_cells
-from .option_termination import option_terminated
+from .option_termination import OptionRuntime, option_terminated
 from .state_utils import (
     agent_facing_pos,
     get_agent_pos,
+    get_pot_contents,
     get_inventory,
     has_plate,
     is_empty_inventory,
     is_ingredient,
+    is_pot_ready,
+    is_pot_usable_for_ingredient,
     is_plated_cooked_soup,
 )
 
@@ -38,21 +39,10 @@ _ACTION_BY_DELTA = {
     (0, -1): int(Actions.up),
 }
 
-_DIRECTION_BY_DELTA = {
-    (0, -1): Direction.UP,
-    (0, 1): Direction.DOWN,
-    (1, 0): Direction.RIGHT,
-    (-1, 0): Direction.LEFT,
-}
-
-
 class OCV2OptionLibrary:
     def __init__(self, layout_graph: LayoutGraph, max_option_steps: int = 20):
         self.layout_graph = layout_graph
         self.max_option_steps = max_option_steps
-        self.path_planner = OvercookedPathPlanner(
-            jnp.asarray(layout_graph.passable, dtype=jnp.bool_)
-        )
         self.options = self._build_options()
 
     @property
@@ -64,16 +54,27 @@ class OCV2OptionLibrary:
         valid = np.zeros((self.num_options,), dtype=bool)
 
         for opt in self.options:
+            candidate = False
             if opt.kind in {"noop", "cross_bottleneck", "wait_at_bottleneck"}:
-                valid[opt.id] = True
+                candidate = True
             elif is_empty_inventory(inventory):
-                valid[opt.id] = opt.kind in {"fetch_ingredient", "pick_plate"}
+                candidate = opt.kind in {
+                    "fetch_ingredient",
+                    "pick_plate",
+                    "press_recipe_button",
+                }
             elif is_plated_cooked_soup(inventory):
-                valid[opt.id] = opt.kind == "serve_soup"
+                candidate = opt.kind == "serve_soup"
             elif is_ingredient(inventory):
-                valid[opt.id] = opt.kind == "deliver_ingredient_to_pot"
+                candidate = opt.kind == "deliver_ingredient_to_pot"
             elif has_plate(inventory):
-                valid[opt.id] = opt.kind == "plate_soup"
+                candidate = opt.kind == "plate_soup"
+
+            valid[opt.id] = bool(
+                candidate
+                and np.isfinite(self.expected_cost(state, agent_id, opt.id))
+                and self._task_precondition(state, agent_id, opt)
+            )
 
         return valid
 
@@ -134,6 +135,7 @@ class OCV2OptionLibrary:
         event: Any,
         agent_id: int,
         elapsed: int,
+        runtime: OptionRuntime | None = None,
     ) -> tuple[bool, str]:
         return option_terminated(
             option,
@@ -142,6 +144,7 @@ class OCV2OptionLibrary:
             event,
             agent_id,
             elapsed,
+            runtime,
         )
 
     def _build_options(self) -> list[OptionSpec]:
@@ -159,6 +162,9 @@ class OCV2OptionLibrary:
 
         for entity_id in self._entity_ids_by_kind("delivery"):
             self._add_entity_option(options, "serve_soup", entity_id)
+
+        for entity_id in self._entity_ids_by_kind("button_recipe_indicator"):
+            self._add_entity_option(options, "press_recipe_button", entity_id)
 
         for idx, bottleneck in enumerate(self.layout_graph.bottlenecks):
             region_id = f"bottleneck:{idx}"
@@ -280,23 +286,20 @@ class OCV2OptionLibrary:
         if not targets:
             return None
 
-        mask = np.zeros_like(self.layout_graph.passable, dtype=bool)
-        for x, y in targets:
-            mask[y, x] = True
-
         current = get_agent_pos(state, agent_id)
-        position = Position(
-            x=jnp.asarray(current[0], dtype=jnp.int32),
-            y=jnp.asarray(current[1], dtype=jnp.int32),
-        )
-        target_pos, is_valid = self.path_planner.get_closest_target_pos(
-            jnp.asarray(mask, dtype=jnp.bool_),
-            position,
-            jnp.asarray(_direction_from_state(state, agent_id), dtype=jnp.int32),
-        )
-        if not bool(np.asarray(is_valid).item()):
+        best_target: GridPos | None = None
+        best_dist = float("inf")
+        for target in targets:
+            dist = self.layout_graph.shortest_path_dist.get(
+                (current, target),
+                float("inf"),
+            )
+            if dist < best_dist:
+                best_target = target
+                best_dist = dist
+        if not np.isfinite(best_dist):
             return None
-        return (int(np.asarray(target_pos.x).item()), int(np.asarray(target_pos.y).item()))
+        return best_target
 
     def _next_cell_toward(self, current: GridPos, target: GridPos) -> GridPos | None:
         current_dist = self.layout_graph.shortest_path_dist.get(
@@ -319,12 +322,37 @@ class OCV2OptionLibrary:
                 return candidate
         return None
 
-
-def _direction_from_state(state: Any, agent_id: int) -> int:
-    current = get_agent_pos(state, agent_id)
-    facing = agent_facing_pos(state, agent_id)
-    delta = (facing[0] - current[0], facing[1] - current[1])
-    return int(_DIRECTION_BY_DELTA.get(delta, Direction.UP))
+    def _task_precondition(self, state: Any, agent_id: int, opt: OptionSpec) -> bool:
+        if opt.kind in {"fetch_ingredient", "pick_plate"}:
+            return opt.target_pos is not None and bool(self._target_cells(opt))
+        if opt.kind in {"noop", "cross_bottleneck"}:
+            return True
+        if opt.kind == "wait_at_bottleneck":
+            return bool(_region_cells(opt))
+        if opt.kind == "deliver_ingredient_to_pot":
+            return (
+                opt.target_pos is not None
+                and bool(self._target_cells(opt))
+                and is_pot_usable_for_ingredient(get_pot_contents(state, opt.target_pos))
+            )
+        if opt.kind == "plate_soup":
+            return (
+                opt.target_pos is not None
+                and bool(self._target_cells(opt))
+                and is_pot_ready(get_pot_contents(state, opt.target_pos))
+            )
+        if opt.kind == "serve_soup":
+            return opt.target_pos is not None and bool(self._target_cells(opt))
+        if opt.kind == "press_recipe_button":
+            target_kind = str((opt.metadata or {}).get("target_kind", ""))
+            return (
+                opt.target_pos is not None
+                and bool(self._target_cells(opt))
+                and target_kind == "button_recipe_indicator"
+            )
+        if opt.kind == "handoff_counter":
+            return bool(_counter_cells(opt))
+        return True
 
 
 def _action_from_to(current: GridPos, target: GridPos) -> int:
@@ -339,7 +367,21 @@ def _terminal_event_for_kind(kind: str) -> str | None:
         "pick_plate": "picked_plate",
         "plate_soup": "plated_soup",
         "serve_soup": "served_soup",
+        "press_recipe_button": "recipe_button_effect",
         "cross_bottleneck": "crossed_bottleneck",
-        "wait_at_bottleneck": "wait_duration",
+        "wait_at_bottleneck": "wait_duration_after_arrival",
         "noop": "noop",
     }.get(kind)
+
+
+def _region_cells(opt: OptionSpec) -> tuple[GridPos, ...]:
+    return tuple((opt.metadata or {}).get("region_cells", ()))
+
+
+def _counter_cells(opt: OptionSpec) -> tuple[GridPos, ...]:
+    metadata = opt.metadata or {}
+    if "counter_cells" in metadata:
+        return tuple(metadata["counter_cells"])
+    if opt.target_pos is not None:
+        return (opt.target_pos,)
+    return tuple(metadata.get("interaction_cells", ()))

@@ -6,16 +6,36 @@ import numpy as np
 
 from src.aris_bellman.specs import OptionSpec, PartnerAction
 
+from .partner_option_classifier import (
+    PartnerOptionClassifier,
+    classifier_action,
+    load_partner_option_classifier,
+)
 from .state_utils import get_agent_pos
 
 GridPos = tuple[int, int]
 
 
 class PartnerOptionInferencer:
-    def __init__(self, option_library: Any, temperature: float = 1.0):
+    def __init__(
+        self,
+        option_library: Any,
+        temperature: float = 1.0,
+        classifier_checkpoint: str | None = None,
+        allow_heuristic: bool = False,
+    ):
         self.option_library = option_library
         self.temperature = temperature
         self.belief: np.ndarray | None = None
+        self.classifier: PartnerOptionClassifier | None = None
+        self.allow_heuristic = bool(allow_heuristic)
+        if classifier_checkpoint is not None:
+            self.classifier = load_partner_option_classifier(classifier_checkpoint)
+        elif not self.allow_heuristic:
+            raise ValueError(
+                "PartnerOptionInferencer requires classifier_checkpoint when "
+                "allow_heuristic=False."
+            )
 
     def reset(self, state: Any) -> None:
         valid = self.option_library.valid_options(state, agent_id=1)
@@ -28,8 +48,17 @@ class PartnerOptionInferencer:
         next_state: Any,
         event: Any,
     ) -> PartnerAction:
-        # TODO: Replace this first-pass online likelihood filter with a learned
-        # option classifier once scripted rollout labels are available.
+        if self.classifier is not None:
+            option_id, confidence, dist = classifier_action(self.classifier, event)
+            self.belief = dist.copy()
+            return PartnerAction(
+                primitive_action=int(primitive_action),
+                option_id=option_id,
+                option_confidence=confidence,
+                option_dist=dist,
+                source="classifier",
+            )
+
         if self.belief is None or self.belief.shape[0] != self.option_library.num_options:
             self.reset(prev_state)
 

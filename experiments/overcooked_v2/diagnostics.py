@@ -216,7 +216,11 @@ def graph_with_deleted_factor(graph: GraphSpec, factor_id: int) -> GraphSpec:
         option_mask=np.asarray(graph.option_mask, dtype=bool).copy(),
         factor_mask=factor_mask,
         mode_mask=mode_mask,
-        route_map=dict(graph.route_map),
+        route_map={
+            int(key): tuple(value)
+            for key, value in graph.route_map.items()
+            if int(key) != int(factor_id)
+        },
         option_features=graph.option_features,
         factor_features=graph.factor_features,
         metadata=metadata,

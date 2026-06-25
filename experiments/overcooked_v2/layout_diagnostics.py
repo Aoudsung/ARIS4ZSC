@@ -34,11 +34,13 @@ def preflight_layout(
         layout_graph,
         max_option_steps=int(_cfg(config, "options.max_option_steps", 12)),
     )
-    eta = float(_cfg(config, "graph.eta", 0.2))
+    eta = float(_cfg(config, "graph.ce_eta", _cfg(config, "graph.eta", 0.2)))
     max_factors = int(_cfg(config, "graph.max_factors", 16))
-    min_weight = float(_cfg(config, "graph.min_weight", 20.0))
+    min_weight = float(_cfg(config, "graph.ce_min_weight", _cfg(config, "graph.min_weight", 20.0)))
     gamma = float(_cfg(config, "training.gamma", 0.99))
     horizon = int(_cfg(config, "graph.local_return_horizon_options", 5))
+    cost_coef = float(_cfg(config, "training.cost_coef", 1.0))
+    shaped_reward_coef = float(_cfg(config, "training.shaped_reward_coef", 0.0))
 
     ce_matrix, replay_rows, ce_source = _ce_matrix_and_replay(
         env,
@@ -48,8 +50,10 @@ def preflight_layout(
         gamma=gamma,
         horizon_options=horizon,
         min_weight=min_weight,
+        cost_coef=cost_coef,
+        shaped_reward_coef=shaped_reward_coef,
     )
-    ce_stats = _ce_stats(ce_matrix, eta, max_factors)
+    ce_stats = _ce_stats(ce_matrix, eta, max_factors, option_lib.options)
     proxy_stats = _partner_return_proxy_stats(
         env,
         option_lib,
@@ -58,6 +62,8 @@ def preflight_layout(
         replay_rows,
         gamma=gamma,
         horizon_options=horizon,
+        cost_coef=cost_coef,
+        shaped_reward_coef=shaped_reward_coef,
     )
 
     reference_gap = proxy_stats["partner_return_variance_proxy"]
@@ -114,9 +120,12 @@ def estimate_reference_base_gap_proxy(
     *,
     layout_name: str,
     episodes: int = 100,
+    max_options_per_episode: int | None = None,
     seed: int = 0,
     gamma: float = 0.99,
     horizon_options: int = 5,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
 ) -> dict[str, Any]:
     rows = collect_option_replay(
         env,
@@ -124,9 +133,12 @@ def estimate_reference_base_gap_proxy(
         option_lib,
         layout_name=layout_name,
         episodes=episodes,
+        max_options_per_episode=max_options_per_episode,
         seed=seed,
         gamma=gamma,
         horizon_options=horizon_options,
+        cost_coef=cost_coef,
+        shaped_reward_coef=shaped_reward_coef,
     )
     return _partner_return_stats(rows)
 
@@ -140,6 +152,8 @@ def _ce_matrix_and_replay(
     gamma: float,
     horizon_options: int,
     min_weight: float,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
 ) -> tuple[np.ndarray, list[OptionReplayRow] | None, str]:
     ce_path = _cfg(config, "graph.ce_path", None)
     replay_path = _cfg(config, "graph.replay_path", None)
@@ -160,15 +174,20 @@ def _ce_matrix_and_replay(
     if ce_matrix is None:
         partners = make_training_partners(option_lib)
         episodes = int(_cfg(config, "graph.ce_episodes", 100))
+        max_options_per_episode = int(_cfg(config, "graph.ce_max_options_per_episode", 20))
         replay_rows = collect_option_replay(
             env,
             partners,
             option_lib,
             layout_name=layout_name,
             episodes=episodes,
+            max_options_per_episode=max_options_per_episode,
             seed=int(_cfg(config, "diagnostics.seed", 0)),
             gamma=gamma,
             horizon_options=horizon_options,
+            cost_per_step=float(_cfg(config, "training.cost_per_step", 1.0)),
+            cost_coef=cost_coef,
+            shaped_reward_coef=shaped_reward_coef,
         )
         ce_matrix = estimate_empirical_ce(
             replay_rows,
@@ -188,30 +207,49 @@ def _partner_return_proxy_stats(
     *,
     gamma: float,
     horizon_options: int,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
 ) -> dict[str, Any]:
     if replay_rows:
-        return _partner_return_stats(replay_rows)
+        return _partner_return_stats(
+            replay_rows,
+            cost_coef=cost_coef,
+            shaped_reward_coef=shaped_reward_coef,
+        )
 
     partners = make_training_partners(option_lib)
     episodes = int(_cfg(config, "diagnostics.proxy_episodes", 100))
+    max_options_per_episode = int(_cfg(config, "graph.ce_max_options_per_episode", 20))
     return estimate_reference_base_gap_proxy(
         env,
         option_lib,
         partners,
         layout_name=layout_name,
         episodes=episodes,
+        max_options_per_episode=max_options_per_episode,
         seed=int(_cfg(config, "diagnostics.seed", 0)),
         gamma=gamma,
         horizon_options=horizon_options,
+        cost_coef=cost_coef,
+        shaped_reward_coef=shaped_reward_coef,
     )
 
 
-def _partner_return_stats(rows: list[OptionReplayRow]) -> dict[str, Any]:
+def _partner_return_stats(
+    rows: list[OptionReplayRow],
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
+) -> dict[str, Any]:
     returns: dict[str, dict[int, float]] = {}
     for row in rows:
         returns.setdefault(row.partner_name, {})
+        training_return = (
+            row.reward_sum
+            + float(shaped_reward_coef) * row.shaped_reward_sum
+            - float(cost_coef) * row.realized_cost
+        )
         returns[row.partner_name][row.episode_id] = (
-            returns[row.partner_name].get(row.episode_id, 0.0) + row.reward_sum
+            returns[row.partner_name].get(row.episode_id, 0.0) + training_return
         )
 
     mean_by_partner = {
@@ -241,14 +279,20 @@ def _ce_stats(
     ce_matrix: np.ndarray,
     eta: float,
     max_factors: int,
+    options: list[Any] | None = None,
 ) -> dict[str, Any]:
     ce = np.asarray(ce_matrix, dtype=float)
     positive = ce > float(eta)
+    if options is not None:
+        for i in range(ce.shape[0]):
+            for j in range(ce.shape[1]):
+                if not _factorable_for_stats(options, i, j):
+                    positive[i, j] = False
     top_pairs = [
         (float(ce[i, j]), int(i), int(j))
         for i in range(ce.shape[0])
         for j in range(ce.shape[1])
-        if ce[i, j] > 0.0
+        if ce[i, j] > 0.0 and _factorable_for_stats(options, i, j)
     ]
     top_pairs.sort(key=lambda item: (-item[0], item[1], item[2]))
     top_scores = [score for score, _, _ in top_pairs[:max_factors]]
@@ -261,6 +305,14 @@ def _ce_stats(
             for score, i, j in top_pairs[:max_factors]
         ],
     }
+
+
+def _factorable_for_stats(options: list[Any] | None, i: int, j: int) -> bool:
+    if options is None:
+        return i != j
+    if i == j or i >= len(options) or j >= len(options):
+        return False
+    return getattr(options[i], "kind", None) != "noop" and getattr(options[j], "kind", None) != "noop"
 
 
 def _resource_contention_score(layout_graph: LayoutGraph) -> float:

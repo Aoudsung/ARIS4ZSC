@@ -1,4 +1,4 @@
-layout: cramped_room
+layout: test_time_simple
 
 env:
   max_steps: 200
@@ -13,14 +13,17 @@ options:
   max_option_steps: 6
 
 graph:
+  graph_path: null
   ce_path: null
-  ce_episodes: 1
-  ce_max_options_per_episode: 1
-  ce_min_weight: 1.0
+  preflight_path: null
+  ce_episodes: 20
+  ce_max_options_per_episode: 100
+  ce_min_weight: 5.0
   ce_eta: 0.0
   max_factors: 16
+  full_max_factors: 16
+  overcomplete_extra_factors: 8
   local_return_horizon_options: 3
-  debug_fallback_topk_when_empty: true
   modes:
     bottleneck: 3
     resource: 2
@@ -31,7 +34,8 @@ graph:
     generic_option_pair: 3
 
 training:
-  total_updates: 500
+  require_preflight_accepted: true
+  total_updates: 1000
   updates_per_transition: 8
   batch_size: 8
   warmup_transitions: 8
@@ -42,10 +46,12 @@ training:
   shaped_reward_coef: 1.0
   learning_rate: 0.0003
   hidden_dim: 64
+  obs_encoder: auto
+  num_partners: 6
   evidence_window: 4
   target_update_interval: 50
   grad_clip_norm: 5.0
   epsilon_start: 0.35
   epsilon_end: 0.05
-  max_episode_options: 5
-  log_interval: 50
+  max_episode_options: 20
+  log_interval: 100

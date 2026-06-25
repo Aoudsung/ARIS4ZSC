@@ -24,32 +24,38 @@ from src.aris_bellman.replay import EvidenceBuffer, OptionReplayBuffer
 from src.aris_bellman.specs import GraphSpec, OptionTransition
 from src.aris_bellman.td import aris_td_loss
 
-from experiments.overcooked_v2.ce_sampler import (
-    collect_option_replay,
-    estimate_empirical_ce,
-)
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import extract_event
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.graph_builder import build_graph_variant
+from experiments.overcooked_v2.layout_diagnostics import preflight_layout
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
+from experiments.overcooked_v2.option_termination import OptionRuntime
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.state_utils import get_agent_pos
 
 METHODS = (
     "base_only",
     "aris_bellman",
     "flat_factor",
     "global_gru",
+    "partner_id_q",
     "random_policy",
 )
 
 
 class ArisBellmanQNetwork(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int, graph: GraphSpec):
+    def __init__(
+        self,
+        obs_dim: Any,
+        hidden_dim: int,
+        graph: GraphSpec,
+        encoder_type: str = "auto",
+    ):
         super().__init__()
-        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim)
+        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.q_net = FactorLocalQNetwork(
             obs_dim=hidden_dim,
             max_options=graph.num_options,
@@ -60,14 +66,21 @@ class ArisBellmanQNetwork(nn.Module):
         )
 
     def forward(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        graph_kwargs.pop("partner_id", None)
         encoded = self.encoder(obs_feat)
         return self.q_net(encoded, belief, **graph_kwargs)
 
 
 class BaseOnlyQNetwork(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int, num_options: int):
+    def __init__(
+        self,
+        obs_dim: Any,
+        hidden_dim: int,
+        num_options: int,
+        encoder_type: str = "auto",
+    ):
         super().__init__()
-        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim)
+        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
@@ -89,14 +102,15 @@ class BaseOnlyQNetwork(nn.Module):
 class FlatFactorQNetwork(nn.Module):
     def __init__(
         self,
-        obs_dim: int,
+        obs_dim: Any,
         hidden_dim: int,
         num_options: int,
         num_factors: int,
         max_modes: int,
+        encoder_type: str = "auto",
     ):
         super().__init__()
-        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim)
+        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.flat_dim = max(0, int(num_factors) * int(max_modes))
         self.head = nn.Sequential(
             nn.Linear(hidden_dim + self.flat_dim, hidden_dim),
@@ -120,14 +134,15 @@ class FlatFactorQNetwork(nn.Module):
 class GlobalGRUQNetwork(nn.Module):
     def __init__(
         self,
-        obs_dim: int,
+        obs_dim: Any,
         hidden_dim: int,
         num_options: int,
         num_factors: int,
         evidence_dim: int,
+        encoder_type: str = "auto",
     ):
         super().__init__()
-        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim)
+        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.history_input_dim = max(1, int(num_factors) * int(evidence_dim))
         self.history = nn.GRU(
             input_size=self.history_input_dim,
@@ -165,6 +180,46 @@ class GlobalGRUQNetwork(nn.Module):
         return _mask_q_values(q_values, option_mask)
 
 
+class PartnerIDQNetwork(nn.Module):
+    def __init__(
+        self,
+        obs_dim: Any,
+        hidden_dim: int,
+        num_options: int,
+        num_partners: int,
+        encoder_type: str = "auto",
+    ):
+        super().__init__()
+        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
+        self.partner_embedding = nn.Embedding(max(1, int(num_partners)), hidden_dim)
+        self.head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, num_options),
+        )
+
+    def forward(
+        self,
+        obs_feat: torch.Tensor,
+        belief: torch.Tensor,
+        option_mask: torch.Tensor | None = None,
+        partner_id: torch.Tensor | None = None,
+        **_: Any,
+    ) -> torch.Tensor:
+        del belief
+        encoded = self.encoder(obs_feat)
+        if partner_id is None:
+            partner_id = torch.zeros(
+                encoded.shape[0],
+                dtype=torch.long,
+                device=encoded.device,
+            )
+        partner_id = partner_id.long().clamp(min=0, max=self.partner_embedding.num_embeddings - 1)
+        partner_context = self.partner_embedding(partner_id.reshape(-1))
+        q_values = self.head(torch.cat([encoded, partner_context], dim=-1))
+        return _mask_q_values(q_values, option_mask)
+
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_config(args.config)
     _apply_cli_overrides(config, args)
@@ -178,12 +233,19 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         layout_graph,
         max_option_steps=int(config["options"]["max_option_steps"]),
     )
+    output_dir = _result_dir(config, args, layout_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    preflight_gate = _enforce_preflight_gate(layout_name, config, args)
+    _write_json(output_dir / "preflight_gate.json", preflight_gate)
+
     graph = _build_graph(env, layout_graph, option_lib, config, args)
+    graph.metadata = {
+        **(graph.metadata or {}),
+        "preflight_gate": preflight_gate,
+    }
     router = OCV2EvidenceRouter(graph, layout_graph.cell_to_entity, layout_graph.region_cells)
     obs_dim = infer_obs_dim(env, obs)
 
-    output_dir = _result_dir(config, args, layout_name)
-    output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(output_dir / "resolved_config.json", config)
     _write_json(output_dir / "graph.json", graph.to_json_dict())
     _capture_git_metadata(output_dir)
@@ -218,7 +280,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     partners = make_training_partners(option_lib)
     rng = np.random.default_rng(args.seed)
     metrics = _empty_metrics(args.method, graph, output_dir)
-    obs, _ = _reset_episode(env, evidence_buffer, partners, rng, args.seed)
+    obs, _, current_partner = _reset_episode(
+        env,
+        evidence_buffer,
+        partners,
+        rng,
+        args.seed,
+        router,
+    )
     episode_return = 0.0
     episode_options = 0
     updates_done = 0
@@ -227,7 +296,14 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     while updates_done < int(config["training"]["total_updates"]):
         if episode_options >= int(config["training"]["max_episode_options"]):
             metrics["episode_returns"].append(float(episode_return))
-            obs, _ = _reset_episode(env, evidence_buffer, partners, rng, args.seed)
+            obs, _, current_partner = _reset_episode(
+                env,
+                evidence_buffer,
+                partners,
+                rng,
+                args.seed,
+                router,
+            )
             episode_return = 0.0
             episode_options = 0
 
@@ -244,12 +320,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             updates_done,
             rng,
             device,
+            partner_id=int(getattr(current_partner, "partner_id", 0)),
         )
-        partner = partners[int(rng.integers(0, len(partners)))]
         transition, done, obs = _execute_option(
             env,
             obs,
-            partner,
+            current_partner,
             option_lib,
             router,
             evidence_buffer,
@@ -263,10 +339,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         episode_options += 1
         metrics["option_durations"].append(int(transition.duration))
         _increment_count(metrics["termination_counts"], transition.termination_reason)
+        _update_task_progress_metrics(metrics, transition)
 
         if done:
             metrics["episode_returns"].append(float(episode_return))
-            obs, _ = _reset_episode(env, evidence_buffer, partners, rng, args.seed)
+            obs, _, current_partner = _reset_episode(
+                env,
+                evidence_buffer,
+                partners,
+                rng,
+                args.seed,
+                router,
+            )
             episode_return = 0.0
             episode_options = 0
 
@@ -318,6 +402,64 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     return metrics
 
 
+
+def _enforce_preflight_gate(
+    layout_name: str,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Require an accepted preflight report before any training run.
+
+    This is intentionally a hard gate: a run on
+    a rejected layout does not test ARIS-Bellman's diagnostic setting and must be
+    executed through a separate engineering-smoke harness, not through the formal
+    trainer.
+    """
+    preflight_cfg = dict(config.get("preflight", {}))
+    graph_cfg = dict(config.get("graph", {}))
+    preflight_path = (
+        getattr(args, "preflight_path", None)
+        or preflight_cfg.get("path")
+        or graph_cfg.get("preflight_path")
+    )
+    if not preflight_path:
+        raise ValueError(
+            "OvercookedV2 training requires an accepted preflight report. "
+            "Run layout_diagnostics.py first and pass --preflight_path or "
+            "preflight.path. Rejected-layout engineering smoke must use a separate "
+            "smoke script, not train_aris.py."
+        )
+
+    data = json.loads(Path(preflight_path).read_text(encoding="utf-8"))
+    entries = data if isinstance(data, list) else [data]
+    selected = None
+    for entry in entries:
+        if str(entry.get("layout_name", entry.get("layout", ""))) == str(layout_name):
+            selected = entry
+            break
+    if selected is None:
+        raise ValueError(
+            f"Preflight report {preflight_path} has no entry for layout {layout_name!r}."
+        )
+
+    accepted = bool(selected.get("accepted", False))
+    result = {
+        "layout": layout_name,
+        "required": True,
+        "accepted": accepted,
+        "preflight_path": str(preflight_path),
+        "stats": selected,
+        "formal_experiment": accepted,
+        "status": "accepted" if accepted else "rejected",
+    }
+    if not accepted:
+        raise RuntimeError(
+            "Layout failed preflight; refusing formal experiment. "
+            f"Stats: {json.dumps(_jsonable(selected), sort_keys=True)}"
+        )
+    return result
+
+
 def _build_env(layout_name: str, config: dict[str, Any]) -> OCV2Adapter:
     env_cfg = dict(config.get("env", {}))
     return OCV2Adapter(
@@ -341,71 +483,75 @@ def _build_graph(
     args: argparse.Namespace,
 ) -> GraphSpec:
     graph_cfg = config.get("graph", {})
-    ce_path = graph_cfg.get("ce_path")
-    if ce_path:
-        ce_matrix = np.load(Path(ce_path))
-    else:
-        partners = make_training_partners(option_lib)
-        replay = collect_option_replay(
-            env,
-            partners,
-            option_lib,
-            layout_name=layout_graph.layout_name,
-            episodes=int(graph_cfg.get("ce_episodes", 2)),
-            max_options_per_episode=graph_cfg.get("ce_max_options_per_episode"),
-            seed=args.seed,
-            gamma=float(config["training"].get("gamma", 0.99)),
-            horizon_options=int(graph_cfg.get("local_return_horizon_options", 3)),
-            cost_per_step=float(config["training"].get("cost_per_step", 1.0)),
+    graph_path = graph_cfg.get("graph_path")
+    if graph_path:
+        graph = GraphSpec.from_json_dict(
+            json.loads(Path(graph_path).read_text(encoding="utf-8"))
         )
-        ce_matrix = estimate_empirical_ce(
-            replay,
-            option_lib.num_options,
-            min_weight=float(graph_cfg.get("ce_min_weight", 1.0)),
-        )
+        if graph.num_factors == 0:
+            raise RuntimeError("Loaded GraphSpec has zero factors; cannot train ARIS.")
+        graph.metadata = {
+            **(graph.metadata or {}),
+            "formal_experiment": True,
+            "graph_source": "precomputed_graph",
+        }
+        return graph
 
+    ce_path = graph_cfg.get("ce_path")
+    graph_source = "precomputed_ce"
+    if not ce_path:
+        raise ValueError(
+            "Formal training requires graph.graph_path or graph.ce_path. "
+            "Run ce_sampler.py and graph_builder.py before train_aris.py; "
+            "online CE construction inside training is disabled."
+        )
+    ce_matrix = np.load(Path(ce_path))
+
+    max_factors = int(graph_cfg.get("max_factors", 16))
     graph = build_graph_variant(
         args.graph_variant,
         layout_graph.layout_name,
         option_lib.options,
         ce_matrix,
         eta=float(graph_cfg.get("ce_eta", 0.0)),
-        max_factors=int(graph_cfg.get("max_factors", 16)),
+        max_factors=max_factors,
+        full_max_factors=int(graph_cfg.get("full_max_factors", max_factors)),
+        overcomplete_extra_factors=int(graph_cfg.get("overcomplete_extra_factors", 0)),
         mode_config=graph_cfg.get("modes"),
         seed=args.seed,
     )
-    if graph.num_factors == 0 and bool(graph_cfg.get("debug_fallback_topk_when_empty", True)):
-        graph = build_graph_variant(
-            args.graph_variant,
-            layout_graph.layout_name,
-            option_lib.options,
-            ce_matrix,
-            eta=-1.0,
-            max_factors=int(graph_cfg.get("max_factors", 16)),
-            mode_config=graph_cfg.get("modes"),
-            seed=args.seed,
-        )
+    if graph_source == "online_debug_ce":
         graph.metadata = {
             **(graph.metadata or {}),
-            "debug_empty_graph_fallback": True,
-            "original_eta": float(graph_cfg.get("ce_eta", 0.0)),
+            "formal_experiment": False,
+            "graph_source": graph_source,
+        }
+    else:
+        graph.metadata = {
+            **(graph.metadata or {}),
+            "formal_experiment": True,
+            "graph_source": graph_source,
         }
     if graph.num_factors == 0:
-        raise RuntimeError("Graph construction produced zero factors; cannot train ARIS.")
+        raise RuntimeError(
+            "Graph construction produced zero factors. Run layout_preflight or lower "
+            "eta explicitly; empty graphs are invalid for ARIS training."
+        )
     return graph
 
 
 def _build_q_network(
     method: str,
-    obs_dim: int,
+    obs_dim: Any,
     graph: GraphSpec,
     config: dict[str, Any],
 ) -> nn.Module:
     hidden_dim = int(config["training"]["hidden_dim"])
+    encoder_type = str(config["training"].get("obs_encoder", "auto"))
     if method == "aris_bellman":
-        return ArisBellmanQNetwork(obs_dim, hidden_dim, graph)
+        return ArisBellmanQNetwork(obs_dim, hidden_dim, graph, encoder_type)
     if method == "base_only":
-        return BaseOnlyQNetwork(obs_dim, hidden_dim, graph.num_options)
+        return BaseOnlyQNetwork(obs_dim, hidden_dim, graph.num_options, encoder_type)
     if method == "flat_factor":
         return FlatFactorQNetwork(
             obs_dim,
@@ -413,6 +559,7 @@ def _build_q_network(
             graph.num_options,
             graph.num_factors,
             graph.max_modes,
+            encoder_type,
         )
     if method == "global_gru":
         return GlobalGRUQNetwork(
@@ -421,6 +568,15 @@ def _build_q_network(
             graph.num_options,
             graph.num_factors,
             D_EVID,
+            encoder_type,
+        )
+    if method == "partner_id_q":
+        return PartnerIDQNetwork(
+            obs_dim,
+            hidden_dim,
+            graph.num_options,
+            int(config["training"].get("num_partners", 6)),
+            encoder_type,
         )
     raise ValueError(f"Unsupported trainable method {method!r}.")
 
@@ -451,7 +607,14 @@ def _run_random_policy(
         window=int(config["training"]["evidence_window"]),
         evidence_dim=D_EVID,
     )
-    obs, _ = _reset_episode(env, evidence_buffer, partners, rng, args.seed)
+    obs, _, current_partner = _reset_episode(
+        env,
+        evidence_buffer,
+        partners,
+        rng,
+        args.seed,
+        router,
+    )
     metrics = _empty_metrics(args.method, router.graph, output_dir)
     episode_return = 0.0
     episode_options = 0
@@ -460,16 +623,22 @@ def _run_random_policy(
     for update_idx in range(int(config["training"]["total_updates"])):
         if episode_options >= int(config["training"]["max_episode_options"]):
             metrics["episode_returns"].append(float(episode_return))
-            obs, _ = _reset_episode(env, evidence_buffer, partners, rng, args.seed)
+            obs, _, current_partner = _reset_episode(
+                env,
+                evidence_buffer,
+                partners,
+                rng,
+                args.seed,
+                router,
+            )
             episode_return = 0.0
             episode_options = 0
 
         option_id = _sample_valid_option(option_lib, env.state, 0, rng)
-        partner = partners[int(rng.integers(0, len(partners)))]
         transition, done, obs = _execute_option(
             env,
             obs,
-            partner,
+            current_partner,
             option_lib,
             router,
             evidence_buffer,
@@ -482,9 +651,17 @@ def _run_random_policy(
         episode_options += 1
         metrics["option_durations"].append(int(transition.duration))
         _increment_count(metrics["termination_counts"], transition.termination_reason)
+        _update_task_progress_metrics(metrics, transition)
         if done:
             metrics["episode_returns"].append(float(episode_return))
-            obs, _ = _reset_episode(env, evidence_buffer, partners, rng, args.seed)
+            obs, _, current_partner = _reset_episode(
+                env,
+                evidence_buffer,
+                partners,
+                rng,
+                args.seed,
+                router,
+            )
             episode_return = 0.0
             episode_options = 0
         if update_idx % int(config["training"]["log_interval"]) == 0:
@@ -509,6 +686,10 @@ def _execute_option(
     config: dict[str, Any],
 ) -> tuple[OptionTransition, bool, dict[str, np.ndarray]]:
     opt = option_lib.options[int(option_id)]
+    runtime = OptionRuntime(
+        option_id=int(option_id),
+        start_pos=get_agent_pos(env.state, 0),
+    )
     evidence_t = evidence_buffer.snapshot()
     obs_feat_t = _obs_vector(obs, "agent_0")
     expected_cost = option_lib.expected_cost(env.state, 0, int(option_id))
@@ -517,6 +698,7 @@ def _execute_option(
     duration = 0
     done = False
     termination_reason = "running"
+    event_summary = _empty_event_summary()
 
     while duration < opt.max_steps:
         ego_action = option_lib.primitive_action(env.state, 0, int(option_id))
@@ -533,10 +715,18 @@ def _execute_option(
             partner_action.option_id,
             partner_action.option_dist,
         )
-        evidence_buffer.append(router.route(event, ego_option_id=int(option_id)))
+        _accumulate_event_summary(event_summary, event)
         reward_sum += _training_reward(step, config, "agent_0")
         realized_cost += float(config["training"].get("cost_per_step", 1.0))
         duration += 1
+        evidence_buffer.append(
+            router.route(
+                event,
+                ego_option_id=int(option_id),
+                ego_option_elapsed=duration,
+                ego_option_max_steps=opt.max_steps,
+            )
+        )
         done = bool(step.dones.get("__all__", False))
         terminated, termination_reason = option_lib.option_terminated(
             opt,
@@ -545,6 +735,7 @@ def _execute_option(
             event,
             agent_id=0,
             elapsed=duration,
+            runtime=runtime,
         )
         obs = step.obs
         if done or terminated:
@@ -564,6 +755,8 @@ def _execute_option(
             done=bool(done),
             termination_reason=termination_reason,
             graph_id=f"{graph.layout_name}:{graph.metadata.get('graph_variant', 'graph')}",
+            partner_id=int(getattr(partner, "partner_id", 0)),
+            event_summary=event_summary,
         ),
         done,
         obs,
@@ -609,6 +802,8 @@ def _td_update(
         graph_batch,
         gamma=float(config["training"]["gamma"]),
         cost_coef=float(config["training"]["cost_coef"]),
+        q_extra_t=_q_extra_kwargs(method, batch, device),
+        q_extra_next=_q_extra_kwargs(method, batch, device),
     )
     loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -654,6 +849,7 @@ def _select_option(
     update_idx: int,
     rng: np.random.Generator,
     device: torch.device,
+    partner_id: int | None = None,
 ) -> int:
     valid = option_lib.valid_options(state, 0)
     valid_ids = np.flatnonzero(valid)
@@ -663,11 +859,16 @@ def _select_option(
         return int(rng.choice(valid_ids))
 
     with torch.no_grad():
-        obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, :], device)
+        obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], device)
         evidence = _tensor(evidence_buffer.snapshot()[None, ...], device)
         graph_batch = _graph_tensors(graph, 1, device)
         state_repr = _state_repr(method, belief_model, evidence, graph_batch)
-        q_values = q_net(obs_tensor, state_repr, **_q_forward_kwargs(graph_batch)).squeeze(0)
+        q_values = q_net(
+            obs_tensor,
+            state_repr,
+            **_q_forward_kwargs(graph_batch),
+            partner_id=_partner_id_tensor(partner_id, 1, device),
+        ).squeeze(0)
         valid_tensor = torch.as_tensor(valid, dtype=torch.bool, device=device)
         q_values = q_values.masked_fill(~valid_tensor, -1e9)
         return int(torch.argmax(q_values).item())
@@ -682,6 +883,34 @@ def _q_forward_kwargs(graph_batch: dict[str, Any]) -> dict[str, Any]:
         "option_features": graph_batch.get("option_features"),
         "factor_features": graph_batch.get("factor_features"),
     }
+
+
+def _q_extra_kwargs(
+    method: str,
+    batch: dict[str, Any],
+    device: torch.device,
+) -> dict[str, Any]:
+    if method != "partner_id_q":
+        return {}
+    partner_ids = batch.get("partner_id")
+    if partner_ids is None:
+        return {"partner_id": _partner_id_tensor(None, len(batch["option_id"]), device)}
+    return {
+        "partner_id": torch.as_tensor(
+            np.asarray(partner_ids, dtype=np.int64),
+            dtype=torch.long,
+            device=device,
+        )
+    }
+
+
+def _partner_id_tensor(
+    partner_id: int | None,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    value = 0 if partner_id is None else int(partner_id)
+    return torch.full((int(batch_size),), value, dtype=torch.long, device=device)
 
 
 def _graph_tensors(graph: GraphSpec, batch_size: int, device: torch.device) -> dict[str, Any]:
@@ -717,13 +946,67 @@ def _reset_episode(
     partners: list[Any],
     rng: np.random.Generator,
     base_seed: int,
-) -> tuple[dict[str, np.ndarray], Any]:
+    router: OCV2EvidenceRouter | None = None,
+) -> tuple[dict[str, np.ndarray], Any, Any]:
     evidence_buffer.reset()
+    if router is not None:
+        router.reset()
     seed = int(rng.integers(0, 2**31 - 1)) ^ int(base_seed)
     obs, state = env.reset(seed)
-    for partner in partners:
-        partner.reset(seed)
-    return obs, state
+    if not partners:
+        raise ValueError("_reset_episode() requires at least one partner.")
+    partner = partners[int(rng.integers(0, len(partners)))]
+    partner.reset(seed)
+    return obs, state, partner
+
+
+
+def _empty_event_summary() -> dict[str, int]:
+    return {
+        "delivery_event": 0,
+        "wrong_delivery_event": 0,
+        "pot_changed": 0,
+        "object_pickup_or_drop": 0,
+        "recipe_indicator_event": 0,
+        "button_pressed": 0,
+        "pot_became_full": 0,
+        "pot_became_cooked": 0,
+        "pot_became_ready": 0,
+        "plate_picked": 0,
+        "soup_picked": 0,
+        "correct_delivery": 0,
+        "collision_or_block": 0,
+        "ego_waited": 0,
+        "partner_waited": 0,
+    }
+
+
+def _accumulate_event_summary(summary: dict[str, int], event: Any) -> None:
+    for key in tuple(summary.keys()):
+        summary[key] += int(bool(getattr(event, key, False)))
+
+
+def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTransition) -> None:
+    counts = metrics.setdefault("task_progress_counts", _empty_progress_summary())
+    summary = transition.event_summary or {}
+    if transition.termination_reason == "picked_ingredient":
+        counts["picked_ingredient"] = int(counts.get("picked_ingredient", 0)) + 1
+    if transition.termination_reason == "ingredient_delivered_to_pot":
+        counts["ingredient_delivered_to_pot"] = int(counts.get("ingredient_delivered_to_pot", 0)) + 1
+    for key in (
+        "pot_became_ready",
+        "plate_picked",
+        "soup_picked",
+        "correct_delivery",
+        "wrong_delivery_event",
+        "collision_or_block",
+        "recipe_indicator_event",
+        "button_pressed",
+        "delivery_event",
+        "pot_changed",
+    ):
+        if key in summary:
+            counts[key] = int(counts.get(key, 0)) + int(summary.get(key, 0))
 
 
 def _training_reward(step: Any, config: dict[str, Any], agent_key: str) -> float:
@@ -765,6 +1048,7 @@ def _empty_metrics(method: str, graph: GraphSpec, output_dir: Path) -> dict[str,
         "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
         "option_durations": [],
         "termination_counts": {},
+        "task_progress_counts": {},
         "checkpoint_load_ok": False,
     }
 
@@ -788,6 +1072,11 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     rewards = np.asarray(metrics.get("episode_returns", []), dtype=np.float64)
     first_mean = _window_mean(losses, first=True)
     last_mean = _window_mean(losses, first=False)
+    progress = metrics.get("task_progress_counts", {}) or {}
+    terminations = metrics.get("termination_counts", {}) or {}
+    total_terminations = max(1, sum(int(v) for v in terminations.values()))
+    noop_count = int(terminations.get("noop", 0))
+    max_steps_count = int(terminations.get("max_steps", 0))
     return {
         "finite_td_loss": bool(losses.size == 0 or np.all(np.isfinite(losses))),
         "td_loss_first_window": first_mean,
@@ -796,6 +1085,13 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "reward_mean": float(np.mean(rewards)) if rewards.size else None,
         "reward_variance": float(np.var(rewards)) if rewards.size else None,
         "finite_rewards": bool(rewards.size == 0 or np.all(np.isfinite(rewards))),
+        "noop_count": int(metrics.get("termination_counts", {}).get("noop", 0)),
+        "max_steps_count": int(metrics.get("termination_counts", {}).get("max_steps", 0)),
+        "delivery_event_count": int(metrics.get("task_progress_counts", {}).get("delivery_event", 0)),
+        "pot_changed_count": int(metrics.get("task_progress_counts", {}).get("pot_changed", 0)),
+        "plate_picked_count": int(metrics.get("task_progress_counts", {}).get("plate_picked", 0)),
+        "soup_picked_count": int(metrics.get("task_progress_counts", {}).get("soup_picked", 0)),
+        "task_progress_events": int(sum(int(value) for value in progress.values())),
     }
 
 
@@ -880,6 +1176,8 @@ def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> No
         config["training"]["total_updates"] = int(args.updates)
     if args.output_dir is not None:
         config["output_dir"] = str(args.output_dir)
+    if getattr(args, "preflight_path", None) is not None:
+        config.setdefault("preflight", {})["path"] = str(args.preflight_path)
 
 
 def _set_seeds(seed: int) -> None:
@@ -918,7 +1216,7 @@ def _noop_option_id(option_lib: OCV2OptionLibrary) -> int:
 
 
 def _obs_vector(obs: dict[str, np.ndarray], agent_key: str) -> np.ndarray:
-    return np.asarray(obs[agent_key], dtype=np.float32).reshape(-1)
+    return np.asarray(obs[agent_key], dtype=np.float32)
 
 
 def _tensor(value: Any, device: torch.device) -> torch.Tensor:
@@ -947,6 +1245,51 @@ def _mask_q_values(
 
 def _increment_count(counts: dict[str, int], key: str) -> None:
     counts[key] = int(counts.get(key, 0)) + 1
+
+
+def _empty_progress_summary() -> dict[str, int]:
+    return {
+        "picked_ingredient": 0,
+        "ingredient_delivered_to_pot": 0,
+        "pot_became_ready": 0,
+        "plate_picked": 0,
+        "soup_picked": 0,
+        "correct_delivery": 0,
+        "delivery_event": 0,
+        "pot_changed": 0,
+        "wrong_delivery_event": 0,
+        "collision_or_block": 0,
+        "recipe_indicator_event": 0,
+        "button_pressed": 0,
+    }
+
+
+def _accumulate_progress_summary(summary: dict[str, int], event: Any) -> None:
+    if bool(getattr(event, "ego_inventory_before", 0) == 0 and getattr(event, "ego_inventory_after", 0) != 0):
+        # Inventory changes are coarse; specific categories below add more semantics.
+        pass
+    summary["ingredient_delivered_to_pot"] += int(bool(getattr(event, "pot_became_full", False)))
+    summary["pot_became_ready"] += int(bool(getattr(event, "pot_became_ready", False)))
+    summary["plate_picked"] += int(bool(getattr(event, "plate_picked", False)))
+    summary["soup_picked"] += int(bool(getattr(event, "soup_picked", False)))
+    summary["correct_delivery"] += int(bool(getattr(event, "correct_delivery", False)))
+    summary["wrong_delivery_event"] += int(bool(getattr(event, "wrong_delivery_event", False)))
+    summary["collision_or_block"] += int(bool(getattr(event, "collision_or_block", False)))
+    summary["recipe_indicator_event"] += int(bool(getattr(event, "recipe_indicator_event", False)))
+    summary["button_pressed"] += int(bool(getattr(event, "button_pressed", False)))
+    # Treat ingredient pickup as any inventory pickup that is not plate/soup.
+    before = int(getattr(event, "ego_inventory_before", 0))
+    after = int(getattr(event, "ego_inventory_after", 0))
+    if before == 0 and after != 0 and not bool(getattr(event, "plate_picked", False)) and not bool(getattr(event, "soup_picked", False)):
+        summary["picked_ingredient"] += 1
+
+
+def _merge_progress_counts(metrics: dict[str, Any], summary: dict[str, Any] | None) -> None:
+    if summary is None:
+        return
+    counts = metrics.setdefault("progress_counts", _empty_progress_summary())
+    for key in _empty_progress_summary():
+        counts[key] = int(counts.get(key, 0)) + int(summary.get(key, 0))
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -980,6 +1323,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--preflight_path", default=None)
     return parser
 
 

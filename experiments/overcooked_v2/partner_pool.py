@@ -5,8 +5,10 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from jaxmarl.environments.overcooked_v2.common import Actions
 from src.aris_bellman.specs import OptionSpec, PartnerAction
 
+from .option_termination import OptionRuntime, cross_bottleneck_terminated
 from .state_utils import get_agent_pos, get_inventory, is_empty_inventory
 
 GridPos = tuple[int, int]
@@ -64,25 +66,36 @@ class ScriptedProtocolPartner:
     name: str
     option_library: Any
     protocol: ProtocolSpec
+    partner_id: int = 0
     current_option: int | None = None
     last_state: Any | None = None
+    last_primitive_action: int | None = None
+    option_runtime: OptionRuntime | None = None
     elapsed: int = 0
 
     def reset(self, seed: int) -> None:
         self.current_option = None
         self.last_state = None
+        self.last_primitive_action = None
+        self.option_runtime = None
         self.elapsed = 0
 
     def act(self, obs_partner: Any, state: Any, rng: np.random.Generator) -> PartnerAction:
         del obs_partner
 
+        self._update_option_runtime(state, agent_id=1)
         if self.current_option is None or self._option_done(state, agent_id=1):
             valid = self.option_library.valid_options(state, agent_id=1)
             self.current_option = self._choose_option(state, valid, rng)
+            self.option_runtime = OptionRuntime(
+                option_id=int(self.current_option),
+                start_pos=get_agent_pos(state, 1),
+            )
             self.elapsed = 0
 
         primitive = self.option_library.primitive_action(state, 1, self.current_option)
         self.last_state = state
+        self.last_primitive_action = int(primitive)
         self.elapsed += 1
         return PartnerAction(
             primitive_action=int(primitive),
@@ -154,16 +167,48 @@ class ScriptedProtocolPartner:
             return True
         if opt.kind == "wait_at_bottleneck":
             wait_duration = (opt.metadata or {}).get("wait_duration", 2)
-            return self.elapsed >= wait_duration
+            if self.option_runtime is None:
+                return False
+            return self.option_runtime.wait_elapsed_after_arrival >= int(wait_duration)
         if opt.kind == "cross_bottleneck":
-            return get_agent_pos(state, agent_id) in _region_cells(opt)
+            if self.option_runtime is None or self.last_state is None:
+                return False
+            return cross_bottleneck_terminated(
+                self.option_runtime,
+                self.last_state,
+                state,
+                opt,
+                agent_id,
+            )
         return False
+
+    def _update_option_runtime(self, state: Any, agent_id: int) -> None:
+        if self.current_option is None or self.option_runtime is None:
+            return
+        opt = self.option_library.options[self.current_option]
+        if opt.kind == "wait_at_bottleneck" and get_agent_pos(state, agent_id) in _region_cells(opt):
+            self.option_runtime.reached_region = True
+            if self.last_primitive_action == int(Actions.stay):
+                self.option_runtime.wait_elapsed_after_arrival += 1
+        elif opt.kind == "cross_bottleneck" and self.last_state is not None:
+            cross_bottleneck_terminated(
+                self.option_runtime,
+                self.last_state,
+                state,
+                opt,
+                agent_id,
+            )
 
 
 def make_training_partners(option_library: Any) -> list[ScriptedProtocolPartner]:
     return [
-        ScriptedProtocolPartner(name=name, option_library=option_library, protocol=protocol)
-        for name, protocol in TRAINING_PROTOCOLS
+        ScriptedProtocolPartner(
+            name=name,
+            option_library=option_library,
+            protocol=protocol,
+            partner_id=partner_id,
+        )
+        for partner_id, (name, protocol) in enumerate(TRAINING_PROTOCOLS)
     ]
 
 

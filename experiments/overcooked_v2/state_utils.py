@@ -39,14 +39,26 @@ def is_cooked(inv: int) -> bool:
     return (int(inv) & int(DynamicObject.COOKED)) == int(DynamicObject.COOKED)
 
 
+def has_ingredient_bits(inv: int) -> bool:
+    return (int(inv) >> 2) != 0
+
+
 def is_ingredient(inv: int) -> bool:
     obj = int(inv)
-    return (obj >> 2) != 0 and not has_plate(obj)
+    return has_ingredient_bits(obj) and not has_plate(obj)
 
 
 def is_plated_cooked_soup(inv: int) -> bool:
     obj = int(inv)
-    return has_plate(obj) and is_cooked(obj) and (obj >> 2) != 0
+    return has_plate(obj) and is_cooked(obj) and has_ingredient_bits(obj)
+
+
+def is_pot_ready(contents: int) -> bool:
+    return is_cooked(contents) and has_ingredient_bits(contents) and not has_plate(contents)
+
+
+def is_pot_usable_for_ingredient(contents: int) -> bool:
+    return not is_cooked(contents) and not has_plate(contents)
 
 
 def get_pot_contents(state: Any, pos: GridPos) -> int:

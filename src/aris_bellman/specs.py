@@ -95,6 +95,55 @@ class GraphSpec:
             "metadata": self.metadata or {},
         }
 
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any]) -> "GraphSpec":
+        options = [
+            OptionSpec(
+                id=int(item["id"]),
+                name=str(item["name"]),
+                kind=str(item["kind"]),
+                target_id=item.get("target_id"),
+                target_pos=_pos_or_none(item.get("target_pos")),
+                entity_ids=tuple(item.get("entity_ids", ())),
+                region_ids=tuple(item.get("region_ids", ())),
+                max_steps=int(item["max_steps"]),
+                interruptible=bool(item.get("interruptible", True)),
+                terminal_event=item.get("terminal_event"),
+                metadata=item.get("metadata"),
+            )
+            for item in data["options"]
+        ]
+        factors = [
+            FactorSpec(
+                id=int(item["id"]),
+                option_i=int(item["option_i"]),
+                option_j=int(item["option_j"]),
+                ce_score=float(item["ce_score"]),
+                num_modes=int(item["num_modes"]),
+                entity_ids=tuple(item.get("entity_ids", ())),
+                region_ids=tuple(item.get("region_ids", ())),
+                factor_kind=str(item.get("factor_kind", "generic_option_pair")),
+                metadata=item.get("metadata"),
+            )
+            for item in data["factors"]
+        ]
+        return cls(
+            layout_name=str(data["layout_name"]),
+            options=options,
+            factors=factors,
+            relevance=np.asarray(data["relevance"], dtype=bool),
+            option_mask=np.asarray(data["option_mask"], dtype=bool),
+            factor_mask=np.asarray(data["factor_mask"], dtype=bool),
+            mode_mask=np.asarray(data["mode_mask"], dtype=bool),
+            route_map={
+                int(key): tuple(int(value) for value in values)
+                for key, values in data.get("route_map", {}).items()
+            },
+            option_features=_array_or_none(data.get("option_features")),
+            factor_features=_array_or_none(data.get("factor_features")),
+            metadata=data.get("metadata") or {},
+        )
+
 
 @dataclass(frozen=True)
 class PartnerAction:
@@ -119,3 +168,18 @@ class OptionTransition:
     done: bool
     termination_reason: str
     graph_id: str | None = None
+    partner_id: int | None = None
+    event_summary: dict[str, Any] | None = None
+    event_summary: dict[str, Any] | None = None
+
+
+def _array_or_none(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    return np.asarray(value, dtype=np.float32)
+
+
+def _pos_or_none(value: Any) -> GridPos | None:
+    if value is None:
+        return None
+    return int(value[0]), int(value[1])
