@@ -87,7 +87,10 @@ class OCV2OptionLibrary:
         if target is None or current == target:
             return int(Actions.stay)
 
-        next_cell = self._next_cell_toward(current, target)
+        partner_pos = get_agent_pos(state, 1 - agent_id)
+        next_cell = self._next_cell_toward(
+            current, target, blocked=frozenset({partner_pos})
+        )
         if next_cell is None:
             return int(Actions.stay)
 
@@ -314,7 +317,12 @@ class OCV2OptionLibrary:
             return None
         return best_target
 
-    def _next_cell_toward(self, current: GridPos, target: GridPos) -> GridPos | None:
+    def _next_cell_toward(
+        self,
+        current: GridPos,
+        target: GridPos,
+        blocked: frozenset[GridPos] = frozenset(),
+    ) -> GridPos | None:
         current_dist = self.layout_graph.shortest_path_dist.get(
             (current, target),
             float("inf"),
@@ -331,7 +339,7 @@ class OCV2OptionLibrary:
                 (candidate, target),
                 float("inf"),
             )
-            if candidate_dist < current_dist:
+            if candidate_dist < current_dist and candidate not in blocked:
                 return candidate
         return None
 

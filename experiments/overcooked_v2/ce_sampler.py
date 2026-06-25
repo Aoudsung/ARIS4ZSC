@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import sys
@@ -62,13 +63,19 @@ def collect_option_replay(
     cost_coef: float = 1.0,
     shaped_reward_coef: float = 0.0,
 ) -> list[OptionReplayRow]:
+    import time as _time
     rng = np.random.default_rng(seed)
     layout = layout_name or getattr(env, "layout_name", "unknown_layout")
     rows: list[OptionReplayRow] = []
     partners = list(partner_pool)
+    _t0 = _time.monotonic()
 
     for partner_idx, partner in enumerate(partners):
+        print(f"  partner {partner_idx+1}/{len(partners)}: {getattr(partner, 'name', '?')}", flush=True)
         for episode_idx in range(episodes):
+            if episode_idx > 0 and episode_idx % 20 == 0:
+                _elapsed = _time.monotonic() - _t0
+                print(f"    ep {episode_idx}/{episodes}, {len(rows)} rows, {_elapsed:.1f}s", flush=True)
             episode_id = partner_idx * episodes + episode_idx
             reset_seed = int(rng.integers(0, 2**31 - 1))
             obs, _ = env.reset(reset_seed)
@@ -142,6 +149,240 @@ def compute_reward_to_go(
         row.reward_to_go = float(row.reward_sum + (gamma ** max(1, row.duration)) * running)
         running_by_episode[row.episode_id] = row.reward_to_go
     return option_rows
+
+
+@dataclass
+class _EnvSlot:
+    episode_id: int
+    t_option: int
+    option_id: int | None
+    option_runtime: Any
+    state_key: str | None
+    reward_sum: float
+    shaped_reward_sum: float
+    duration: int
+    summary: dict[str, Any]
+    partner_dists: list[np.ndarray]
+    partner_options: list[int]
+    partner_confidences: list[float]
+    partner: Any
+    done: bool
+    needs_new_option: bool
+    episodes_remaining: int
+    rng_seed_base: int
+
+
+def collect_option_replay_batched(
+    env: Any,
+    partner_pool: Iterable[Any],
+    option_lib: "OCV2OptionLibrary",
+    *,
+    layout_name: str | None = None,
+    episodes: int = 100,
+    max_options_per_episode: int | None = None,
+    seed: int = 0,
+    gamma: float = 0.99,
+    horizon_options: int = 5,
+    cost_per_step: float = 1.0,
+    cost_coef: float = 1.0,
+    shaped_reward_coef: float = 0.0,
+    batch_size: int = 64,
+) -> list[OptionReplayRow]:
+    from experiments.overcooked_v2.batched_rollout import BatchedEnvPool
+
+    rng = np.random.default_rng(seed)
+    layout = layout_name or getattr(env, "layout_name", "unknown_layout")
+    rows: list[OptionReplayRow] = []
+    partners = list(partner_pool)
+    raw_env = getattr(env, "env", env)
+    pool = BatchedEnvPool(raw_env, batch_size)
+    option_limit = max_options_per_episode or getattr(env, "max_steps", 400)
+
+    import time as _time
+    _t0 = _time.monotonic()
+
+    for partner_idx, partner_template in enumerate(partners):
+        print(f"  partner {partner_idx+1}/{len(partners)}: {getattr(partner_template, 'name', '?')}", flush=True)
+        episode_base = partner_idx * episodes
+        slots = [
+            _EnvSlot(
+                episode_id=episode_base + i,
+                t_option=0,
+                option_id=None,
+                option_runtime=None,
+                state_key=None,
+                reward_sum=0.0,
+                shaped_reward_sum=0.0,
+                duration=0,
+                summary=_empty_event_summary(),
+                partner_dists=[],
+                partner_options=[],
+                partner_confidences=[],
+                partner=copy.deepcopy(partner_template),
+                done=i >= episodes,
+                needs_new_option=True,
+                episodes_remaining=max(0, episodes - i),
+                rng_seed_base=int(rng.integers(0, 2**31 - 1)),
+            )
+            for i in range(batch_size)
+        ]
+
+        init_seeds = np.array([
+            int(rng.integers(0, 2**31 - 1)) for _ in range(batch_size)
+        ], dtype=np.int64)
+        pool.reset(init_seeds)
+        for slot in slots:
+            if not slot.done and hasattr(slot.partner, "reset"):
+                slot.partner.reset(int(init_seeds[slots.index(slot)]))
+
+        active_count = sum(1 for s in slots if not s.done)
+        ego_actions = np.zeros(batch_size, dtype=np.int32)
+        partner_actions = np.zeros(batch_size, dtype=np.int32)
+        prev_states: list[Any] = [None] * batch_size
+
+        while active_count > 0:
+            pre_snap = pool.snapshot()
+            obs_np = pool.snapshot_obs()
+
+            for i, slot in enumerate(slots):
+                if slot.done:
+                    ego_actions[i] = 5  # Actions.stay
+                    partner_actions[i] = 5
+                    continue
+
+                state_i = pre_snap[i]
+
+                if slot.needs_new_option:
+                    slot.option_id = _sample_valid_option(option_lib, state_i, 0, rng)
+                    slot.option_runtime = OptionRuntime(
+                        option_id=int(slot.option_id),
+                        start_pos=get_agent_pos(state_i, 0),
+                    )
+                    slot.state_key = _state_key(state_i)
+                    slot.reward_sum = 0.0
+                    slot.shaped_reward_sum = 0.0
+                    slot.duration = 0
+                    slot.summary = _empty_event_summary()
+                    slot.partner_dists = []
+                    slot.partner_options = []
+                    slot.partner_confidences = []
+                    slot.needs_new_option = False
+
+                ego_actions[i] = option_lib.primitive_action(state_i, 0, slot.option_id)
+                partner_obs = obs_np.get("agent_1")
+                partner_obs_i = partner_obs[i] if partner_obs is not None else None
+                pa = slot.partner.act(partner_obs_i, state_i, rng)
+                partner_actions[i] = int(pa.primitive_action)
+                if pa.option_dist is not None:
+                    slot.partner_dists.append(np.asarray(pa.option_dist, dtype=np.float32))
+                if pa.option_id is not None:
+                    slot.partner_options.append(int(pa.option_id))
+                slot.partner_confidences.append(float(pa.option_confidence))
+                prev_states[i] = state_i
+
+            _, _, rewards, dones, info = pool.step(ego_actions, partner_actions)
+
+            post_snap = pool.snapshot()
+            rewards_np = {k: np.asarray(v) for k, v in rewards.items()}
+            dones_np = {k: np.asarray(v) for k, v in dones.items()}
+
+            reset_indices = []
+            reset_seeds = []
+
+            for i, slot in enumerate(slots):
+                if slot.done:
+                    continue
+
+                state_i = post_snap[i]
+                opt = option_lib.options[slot.option_id]
+                info_i = pool.get_info_i(i, info)
+                reward_i = float(rewards_np["agent_0"][i])
+                done_i = bool(dones_np["__all__"][i])
+                shaped_i = _shaped_reward_for_agent(info_i, "agent_0")
+
+                event = extract_event(
+                    prev_states[i],
+                    int(ego_actions[i]),
+                    int(partner_actions[i]),
+                    state_i,
+                    info_i,
+                    partner_option=slot.partner_options[-1] if slot.partner_options else None,
+                    partner_option_dist=slot.partner_dists[-1] if slot.partner_dists else None,
+                )
+                _accumulate_event_summary(slot.summary, event)
+                slot.reward_sum += reward_i
+                slot.shaped_reward_sum += shaped_i
+                slot.duration += 1
+
+                terminated, reason = option_lib.option_terminated(
+                    opt, prev_states[i], state_i, event,
+                    agent_id=0, elapsed=slot.duration, runtime=slot.option_runtime,
+                )
+                if done_i and not terminated:
+                    reason = "env_max_steps"
+                    terminated = True
+
+                if terminated:
+                    slot.summary["termination_reason"] = reason
+                    slot.summary["done"] = done_i
+                    slot.summary["option_kind"] = opt.kind
+                    slot.summary["option_success"] = option_success(opt.kind, reason)
+                    p_dist = _average_partner_dist(slot.partner_dists)
+                    p_opt = _partner_option_from_trace(p_dist, slot.partner_options)
+                    p_conf = _partner_confidence(p_dist, slot.partner_confidences)
+                    rows.append(OptionReplayRow(
+                        layout=layout,
+                        episode_id=slot.episode_id,
+                        t_option=slot.t_option,
+                        ego_option=slot.option_id,
+                        partner_option=p_opt,
+                        partner_option_dist=p_dist,
+                        partner_option_confidence=p_conf,
+                        state_key=slot.state_key or "",
+                        duration=slot.duration,
+                        reward_sum=slot.reward_sum,
+                        shaped_reward_sum=slot.shaped_reward_sum,
+                        realized_cost=float(slot.duration * cost_per_step),
+                        local_return_h=0.0,
+                        reward_to_go=0.0,
+                        event_summary=slot.summary,
+                        partner_name=str(getattr(slot.partner, "name", "partner")),
+                        partner_id=int(getattr(slot.partner, "partner_id", -1)),
+                    ))
+                    slot.t_option += 1
+                    slot.needs_new_option = True
+
+                if done_i or slot.t_option >= option_limit:
+                    slot.episodes_remaining -= 1
+                    if slot.episodes_remaining > 0:
+                        slot.episode_id = episode_base + (episodes - slot.episodes_remaining)
+                        slot.t_option = 0
+                        slot.needs_new_option = True
+                        new_seed = int(rng.integers(0, 2**31 - 1))
+                        reset_indices.append(i)
+                        reset_seeds.append(new_seed)
+                        if hasattr(slot.partner, "reset"):
+                            slot.partner.reset(new_seed)
+                    else:
+                        slot.done = True
+                        active_count -= 1
+
+            if reset_indices:
+                pool.reset_indices(
+                    np.array(reset_indices, dtype=np.int32),
+                    np.array(reset_seeds, dtype=np.int64),
+                )
+
+        _elapsed = _time.monotonic() - _t0
+        _ep_done = sum(episodes - s.episodes_remaining for s in slots)
+        print(f"    → {_ep_done}/{episodes} episodes done, {len(rows)} rows, {_elapsed:.1f}s elapsed", flush=True)
+
+    compute_local_returns(
+        rows, gamma=gamma, horizon=horizon_options,
+        cost_coef=cost_coef, shaped_reward_coef=shaped_reward_coef,
+    )
+    compute_reward_to_go(rows, gamma=gamma)
+    return rows
 
 
 def option_kind_stats(
@@ -698,10 +939,8 @@ def _cmd_collect(args: argparse.Namespace) -> None:
             "Phase 4 CE collection supports scripted_debug/train/all partner selectors."
         )
     partners = make_training_partners(option_lib)
-    rows = collect_option_replay(
-        env,
-        partners,
-        option_lib,
+    collect_fn = collect_option_replay_batched if args.batch_size > 1 else collect_option_replay
+    collect_kwargs = dict(
         layout_name=args.layout,
         episodes=args.episodes,
         max_options_per_episode=args.max_options_per_episode,
@@ -712,6 +951,9 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         cost_coef=args.cost_coef,
         shaped_reward_coef=args.shaped_reward_coef,
     )
+    if args.batch_size > 1:
+        collect_kwargs["batch_size"] = args.batch_size
+    rows = collect_fn(env, partners, option_lib, **collect_kwargs)
     coverage = replay_coverage(rows, option_lib.options)
     coverage_gate = replay_coverage_gate(
         coverage,
@@ -788,6 +1030,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     collect.add_argument("--max_options_per_episode", type=int, default=None)
     collect.add_argument("--observation_type", default="default")
     collect.add_argument("--require_full_task_coverage", action="store_true")
+    collect.add_argument("--batch_size", type=int, default=1)
     collect.set_defaults(func=_cmd_collect)
 
     estimate = subparsers.add_parser("estimate")
