@@ -677,7 +677,12 @@ def _load_criticality(path: str | None) -> Any | None:
 
 
 def _cmd_build(args: argparse.Namespace) -> None:
-    env = OCV2Adapter(args.layout, max_steps=args.max_steps)
+    env = OCV2Adapter(
+        args.layout,
+        max_steps=args.max_steps,
+        observation_type="default",
+        force_path_planning=False,
+    )
     layout_graph = parse_layout(env, args.layout)
     option_lib = OCV2OptionLibrary(layout_graph, max_option_steps=args.max_option_steps)
     ce_matrix = np.load(args.ce)

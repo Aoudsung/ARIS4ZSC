@@ -30,6 +30,7 @@ from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.graph_builder import build_graph_variant
 from experiments.overcooked_v2.layout_diagnostics import preflight_layout
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
+from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
 from experiments.overcooked_v2.option_termination import OptionRuntime
 from experiments.overcooked_v2.options import OCV2OptionLibrary
@@ -227,8 +228,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     layout_name = str(config["layout"])
     env = _build_env(layout_name, config)
-    obs, _ = env.reset(args.seed)
     layout_graph = parse_layout(env, layout_name)
+    env.set_featurizer(NumpyFeaturizer(layout_graph))
+    obs, _ = env.reset(args.seed)
     option_lib = OCV2OptionLibrary(
         layout_graph,
         max_option_steps=int(config["options"]["max_option_steps"]),
@@ -461,17 +463,19 @@ def _enforce_preflight_gate(
 
 
 def _build_env(layout_name: str, config: dict[str, Any]) -> OCV2Adapter:
-    env_cfg = dict(config.get("env", {}))
+    env_cfg = config.setdefault("env", {})
+    env_cfg["observation_type"] = "default"
+    env_cfg["force_path_planning"] = False
     return OCV2Adapter(
         layout=layout_name,
         max_steps=int(env_cfg.get("max_steps", 200)),
-        observation_type=str(env_cfg.get("observation_type", "featurized")),
+        observation_type="default",
         agent_view_size=env_cfg.get("agent_view_size"),
         negative_rewards=bool(env_cfg.get("negative_rewards", True)),
         sample_recipe_on_delivery=bool(env_cfg.get("sample_recipe_on_delivery", True)),
         random_reset=bool(env_cfg.get("random_reset", False)),
         random_agent_positions=bool(env_cfg.get("random_agent_positions", False)),
-        force_path_planning=bool(env_cfg.get("force_path_planning", True)),
+        force_path_planning=False,
     )
 
 

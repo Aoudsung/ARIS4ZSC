@@ -31,6 +31,7 @@ from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import extract_event
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
+from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import infer_obs_dim
 from experiments.overcooked_v2.option_termination import OptionRuntime
 from experiments.overcooked_v2.options import OCV2OptionLibrary
@@ -177,8 +178,9 @@ def _load_context(checkpoint_path: Path, variant: str) -> EvalContext:
     method = str(checkpoint["method"])
 
     env = _build_env(graph.layout_name, config)
-    obs, _ = env.reset(0)
     layout_graph = parse_layout(env, graph.layout_name)
+    env.set_featurizer(NumpyFeaturizer(layout_graph))
+    obs, _ = env.reset(0)
     option_lib = OCV2OptionLibrary(
         layout_graph,
         max_option_steps=int(config["options"]["max_option_steps"]),
@@ -218,6 +220,7 @@ def _evaluate_partner(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     rng = np.random.default_rng(seed)
     env = _build_env(graph_override.layout_name, ctx.config)
+    env.set_featurizer(NumpyFeaturizer(ctx.layout_graph))
     router = OCV2EvidenceRouter(
         graph_override,
         ctx.layout_graph.cell_to_entity,
@@ -575,6 +578,7 @@ def _factor_deletion_rollout_diagnostics(
 
 def _factor_deletion_q_proxy(ctx: EvalContext) -> dict[int, float]:
     env = _build_env(ctx.graph.layout_name, ctx.config)
+    env.set_featurizer(NumpyFeaturizer(ctx.layout_graph))
     obs, _ = env.reset(0)
     evidence_buffer = EvidenceBuffer(
         num_factors=ctx.graph.num_factors,

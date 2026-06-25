@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +41,7 @@ class OCV2Adapter:
         random_reset: bool = False,
         random_agent_positions: bool = False,
         force_path_planning: bool = True,
+        featurizer: Callable[[Any], dict[str, np.ndarray]] | None = None,
     ):
         self.env = OvercookedV2(
             layout=layout,
@@ -55,6 +56,9 @@ class OCV2Adapter:
         )
         self.layout_name = layout
         self.max_steps = max_steps
+        self.featurizer = featurizer
+        self._jit_reset = jax.jit(self.env.reset)
+        self._jit_step = jax.jit(self.env.step_env)
         self.key = None
         self.state = None
         self.obs: dict[str, np.ndarray] | None = None
@@ -63,11 +67,17 @@ class OCV2Adapter:
     def layout(self) -> Any:
         return self.env.layout
 
+    def set_featurizer(
+        self,
+        featurizer: Callable[[Any], dict[str, np.ndarray]] | None,
+    ) -> None:
+        self.featurizer = featurizer
+
     def reset(self, seed: int) -> tuple[dict[str, np.ndarray], Any]:
         self.key = jax.random.PRNGKey(seed)
         self.key, subkey = jax.random.split(self.key)
-        obs, state = self.env.reset(subkey)
-        self.obs = self._to_numpy_obs(obs)
+        obs, state = self._jit_reset(subkey)
+        self.obs = self._apply_featurizer(obs, state)
         self.state = state
         return self.obs, self.state
 
@@ -80,13 +90,13 @@ class OCV2Adapter:
             "agent_0": jnp.asarray(ego_action, dtype=jnp.int32),
             "agent_1": jnp.asarray(partner_action, dtype=jnp.int32),
         }
-        obs, state, rewards, dones, info = self.env.step_env(
+        obs, state, rewards, dones, info = self._jit_step(
             subkey,
             self.state,
             actions,
         )
         self.state = state
-        self.obs = self._to_numpy_obs(obs)
+        self.obs = self._apply_featurizer(obs, state)
         return OCV2Step(
             obs=self.obs,
             state=state,
@@ -98,6 +108,19 @@ class OCV2Adapter:
     @staticmethod
     def _to_numpy_obs(obs: Mapping[str, Any]) -> dict[str, np.ndarray]:
         return {key: np.asarray(value) for key, value in obs.items()}
+
+    def _apply_featurizer(
+        self,
+        raw_obs: Mapping[str, Any],
+        state: Any,
+    ) -> dict[str, np.ndarray]:
+        raw_np = self._to_numpy_obs(raw_obs)
+        if self.featurizer is None:
+            return raw_np
+        return {
+            key: np.asarray(value, dtype=np.float32)
+            for key, value in self.featurizer(state).items()
+        }
 
     @staticmethod
     def _to_numpy_info(info: Mapping[str, Any]) -> dict[str, Any]:

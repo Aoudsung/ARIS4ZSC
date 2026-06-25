@@ -20,8 +20,10 @@ from experiments.overcooked_v2.batched_rollout import (
 )
 from experiments.overcooked_v2.event_extractor import extract_event
 from experiments.overcooked_v2.evidence_router import EVIDENCE_INDEX, OCV2EvidenceRouter
+from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.graph_builder import build_graph_variant
 from experiments.overcooked_v2.layout_parser import LayoutGraph, all_pairs_shortest_paths
+from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder
 from experiments.overcooked_v2.option_inferencer import PartnerOptionInferencer
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_terminated
@@ -114,18 +116,29 @@ def _event(**overrides):
     return SimpleNamespace(**data)
 
 
-def _state(agent0_pos, inventory0=0, grid=None, agent1_pos=(5, 5), inventory1=0):
+def _state(
+    agent0_pos,
+    inventory0=0,
+    grid=None,
+    agent1_pos=(5, 5),
+    inventory1=0,
+    dir0=0,
+    dir1=0,
+    recipe=None,
+):
     if grid is None:
         grid = np.zeros((6, 6, 2), dtype=np.int32)
+    if recipe is None:
+        recipe = _recipe(0, 0, 0)
     agents = SimpleNamespace(
         pos=SimpleNamespace(
             x=np.asarray([agent0_pos[0], agent1_pos[0]]),
             y=np.asarray([agent0_pos[1], agent1_pos[1]]),
         ),
-        dir=np.asarray([0, 0]),
+        dir=np.asarray([dir0, dir1]),
         inventory=np.asarray([inventory0, inventory1]),
     )
-    return SimpleNamespace(agents=agents, grid=grid)
+    return SimpleNamespace(agents=agents, grid=grid, recipe=np.asarray(recipe))
 
 
 def _layout_graph_for_entities(entities):
@@ -168,6 +181,155 @@ def _grid_with_static(pos, static_obj, dynamic_obj=0):
     grid[y, x, 0] = int(static_obj)
     grid[y, x, 1] = int(dynamic_obj)
     return grid
+
+
+def _grid_with_cells(cells, *, channels=3):
+    grid = np.zeros((4, 4, channels), dtype=np.int32)
+    for item in cells:
+        pos, static_obj, dynamic_obj, *rest = item
+        timer = rest[0] if rest else 0
+        x, y = pos
+        grid[y, x, 0] = int(static_obj)
+        grid[y, x, 1] = int(dynamic_obj)
+        if channels > 2:
+            grid[y, x, 2] = int(timer)
+    return grid
+
+
+def _recipe(*ingredients):
+    return sum(int(DynamicObject.ingredient(idx)) for idx in ingredients)
+
+
+def test_numpy_featurizer_outputs_fixed_dim_and_agent_order():
+    layout = _layout_graph_for_entities([])
+    state = _state(
+        (1, 1),
+        agent1_pos=(2, 2),
+        grid=np.zeros((4, 4, 3), dtype=np.int32),
+        dir0=2,
+        dir1=3,
+        recipe=_recipe(0, 0, 1),
+    )
+
+    obs = NumpyFeaturizer(layout)(state)
+
+    assert set(obs) == {"agent_0", "agent_1"}
+    assert obs["agent_0"].shape == (96,)
+    assert obs["agent_1"].shape == (96,)
+    assert obs["agent_0"].dtype == np.float32
+    np.testing.assert_array_equal(obs["agent_0"][0:4], np.asarray([0, 0, 1, 0]))
+    np.testing.assert_array_equal(obs["agent_0"][46:50], np.asarray([0, 0, 0, 1]))
+    np.testing.assert_array_equal(obs["agent_0"][92:94], np.asarray([1, 1]))
+    np.testing.assert_array_equal(obs["agent_0"][94:96], np.asarray([1, 1]))
+
+
+def test_numpy_featurizer_uses_interaction_distance_for_targets():
+    layout = _layout_graph_for_entities(
+        [
+            ("ingredient_pile:0:2:1", "ingredient_pile:0", (2, 1)),
+            ("delivery:1:0", "delivery", (1, 0)),
+            ("counter:0:1", "counter", (0, 1)),
+            ("counter:3:1", "counter", (3, 1)),
+        ]
+    )
+    grid = _grid_with_cells(
+        [
+            ((2, 1), int(StaticObject.INGREDIENT_PILE_BASE), 0),
+            ((1, 0), StaticObject.GOAL, 0),
+            ((0, 1), StaticObject.WALL, 0),
+            ((3, 1), StaticObject.WALL, DynamicObject.PLATE),
+        ]
+    )
+    state = _state((1, 1), agent1_pos=(1, 2), grid=grid)
+
+    obs0 = NumpyFeaturizer(layout)(state)["agent_0"]
+
+    np.testing.assert_array_equal(obs0[8:10], np.asarray([1, 0]))
+    np.testing.assert_array_equal(obs0[12:14], np.asarray([2, 0]))
+    np.testing.assert_array_equal(obs0[18:20], np.asarray([0, -1]))
+    np.testing.assert_array_equal(obs0[20:22], np.asarray([-1, 0]))
+
+
+def test_numpy_featurizer_encodes_recipe_soup_and_pot_features():
+    recipe = _recipe(0, 0, 1)
+    soup = recipe | int(DynamicObject.COOKED) | int(DynamicObject.PLATE)
+    layout = _layout_graph_for_entities(
+        [
+            ("pot:2:1", "pot", (2, 1)),
+            ("counter:1:0", "counter", (1, 0)),
+        ]
+    )
+    grid = _grid_with_cells(
+        [
+            ((2, 1), StaticObject.POT, recipe | int(DynamicObject.COOKED), 0),
+            ((1, 0), StaticObject.WALL, soup, 0),
+        ]
+    )
+    state = _state((1, 1), agent1_pos=(1, 2), grid=grid, recipe=recipe)
+
+    obs0 = NumpyFeaturizer(layout)(state)["agent_0"]
+
+    np.testing.assert_array_equal(obs0[14:16], np.asarray([0, -1]))
+    np.testing.assert_array_equal(obs0[16:18], np.asarray([2, 1]))
+    np.testing.assert_array_equal(
+        obs0[22:32],
+        np.asarray([1, 0, 1, 0, 1, 2, 1, 0, 1, 0], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(obs0[32:42], np.zeros(10, dtype=np.float32))
+
+
+def test_numpy_featurizer_defaults_missing_fake_grid_timer_to_zero():
+    recipe = _recipe(0, 0, 0)
+    layout = _layout_graph_for_entities([("pot:2:1", "pot", (2, 1))])
+    grid = _grid_with_static((2, 1), StaticObject.POT, recipe)
+    state = _state((1, 1), agent1_pos=(1, 2), grid=grid, recipe=recipe)
+
+    obs0 = NumpyFeaturizer(layout)(state)["agent_0"]
+
+    assert obs0[22 + 7] == 0.0
+
+
+def test_numpy_featurizer_rejects_non_two_agent_contract():
+    layout = _layout_graph_for_entities([])
+    with pytest.raises(ValueError, match="exactly 2 agents"):
+        NumpyFeaturizer(layout, num_agents=3)
+
+
+def test_ocv2_adapter_applies_optional_featurizer_only_when_present():
+    adapter = OCV2Adapter.__new__(OCV2Adapter)
+    adapter.featurizer = None
+    raw = {"agent_0": np.asarray([1]), "agent_1": np.asarray([2])}
+
+    passthrough = adapter._apply_featurizer(raw, object())
+    np.testing.assert_array_equal(passthrough["agent_0"], np.asarray([1]))
+
+    adapter.set_featurizer(
+        lambda _state: {
+            "agent_0": np.ones(96, dtype=np.float32),
+            "agent_1": np.zeros(96, dtype=np.float32),
+        }
+    )
+    featurized = adapter._apply_featurizer(raw, object())
+    assert featurized["agent_0"].shape == (96,)
+    assert featurized["agent_0"].dtype == np.float32
+
+
+def test_train_eval_and_preflight_use_default_env_without_path_planning():
+    train_build_env = inspect.getsource(train_aris._build_env)
+    assert 'observation_type="default"' in train_build_env
+    assert "force_path_planning=False" in train_build_env
+
+    preflight_make_env = inspect.getsource(layout_diagnostics._make_env)
+    assert 'observation_type="default"' in preflight_make_env
+    assert "force_path_planning=False" in preflight_make_env
+
+    assert "NumpyFeaturizer(layout_graph)" in inspect.getsource(evaluate_aris._load_context)
+    assert "NumpyFeaturizer(ctx.layout_graph)" in inspect.getsource(
+        evaluate_aris._evaluate_partner
+    )
+    assert "NumpyFeaturizer(ctx.layout_graph)" in inspect.getsource(
+        evaluate_aris._factor_deletion_q_proxy
+    )
 
 
 def test_option_library_uses_python_shortest_paths_not_jax_path_planner():

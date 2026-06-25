@@ -412,6 +412,9 @@ def _load_config(path: str | None) -> dict[str, Any]:
 def _candidate_layouts(config: dict[str, Any], explicit_layout: str | None) -> list[str]:
     if explicit_layout:
         return [explicit_layout]
+    configured_layout = config.get("layout")
+    if configured_layout:
+        return [str(configured_layout)]
     candidates = _cfg(config, "layouts.candidate", None)
     if not candidates:
         raise ValueError("No layout supplied. Use --layout or layouts.candidate in config.")
@@ -419,16 +422,18 @@ def _candidate_layouts(config: dict[str, Any], explicit_layout: str | None) -> l
 
 
 def _make_env(layout: str, config: dict[str, Any]) -> OCV2Adapter:
-    env_cfg = config.get("env", {})
+    env_cfg = config.setdefault("env", {})
+    env_cfg["observation_type"] = "default"
+    env_cfg["force_path_planning"] = False
     return OCV2Adapter(
         layout,
         max_steps=int(env_cfg.get("max_steps", 200)),
-        observation_type=str(env_cfg.get("observation_type", "featurized")),
+        observation_type="default",
         negative_rewards=bool(env_cfg.get("negative_rewards", True)),
         sample_recipe_on_delivery=bool(env_cfg.get("sample_recipe_on_delivery", True)),
         random_reset=bool(env_cfg.get("random_reset", False)),
         random_agent_positions=bool(env_cfg.get("random_agent_positions", False)),
-        force_path_planning=bool(env_cfg.get("force_path_planning", True)),
+        force_path_planning=False,
     )
 
 

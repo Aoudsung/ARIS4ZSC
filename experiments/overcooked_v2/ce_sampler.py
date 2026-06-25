@@ -589,6 +589,7 @@ def _build_default_stack(args: argparse.Namespace) -> tuple[OCV2Adapter, OCV2Opt
         args.layout,
         max_steps=args.max_steps,
         observation_type=args.observation_type,
+        force_path_planning=False,
     )
     layout_graph = parse_layout(env, args.layout)
     option_lib = OCV2OptionLibrary(layout_graph, max_option_steps=args.max_option_steps)
@@ -682,7 +683,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     collect.add_argument("--max_steps", type=int, default=200)
     collect.add_argument("--max_option_steps", type=int, default=12)
     collect.add_argument("--max_options_per_episode", type=int, default=None)
-    collect.add_argument("--observation_type", default="featurized")
+    collect.add_argument("--observation_type", default="default")
     collect.set_defaults(func=_cmd_collect)
 
     estimate = subparsers.add_parser("estimate")
