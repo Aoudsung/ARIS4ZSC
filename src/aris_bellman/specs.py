@@ -17,6 +17,8 @@ OptionKind = Literal[
     "cross_bottleneck",
     "wait_at_bottleneck",
     "handoff_counter",
+    "drop_item_to_counter",
+    "clear_interaction_cell",
     "reroute",
     "noop",
 ]

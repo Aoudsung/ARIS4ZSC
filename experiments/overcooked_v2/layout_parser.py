@@ -73,6 +73,9 @@ def parse_layout(env, layout_name: str) -> LayoutGraph:
             elif is_ingredient_pile(obj):
                 ingredient_idx = obj - int(StaticObject.INGREDIENT_PILE_BASE)
                 add(f"ingredient_pile:{ingredient_idx}", x, y)
+            elif obj == int(StaticObject.WALL):
+                if adjacent_passable_cells((x, y), passable):
+                    add("counter", x, y)
 
     interaction_cells = {
         entity_id: adjacent_passable_cells(entity.pos, passable)

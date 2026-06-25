@@ -33,7 +33,7 @@ from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import infer_obs_dim
-from experiments.overcooked_v2.option_termination import OptionRuntime
+from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.state_utils import get_agent_pos
@@ -284,6 +284,7 @@ def _run_episode(
     diagnostic_cost_values: list[float] = []
     swap_values: list[dict[str, Any]] = []
     termination_counts: dict[str, int] = {}
+    option_kind_stats: dict[str, dict[str, Any]] = {}
     done = False
 
     while not done and option_count < max_episode_options:
@@ -319,6 +320,11 @@ def _run_episode(
         diagnostic_cost_values.extend(info["diagnostic_cost"])
         swap_values.extend(info["belief_swap"])
         _increment(termination_counts, str(info["termination_reason"]))
+        _update_option_kind_stats(
+            option_kind_stats,
+            graph.options[int(option_id)].kind,
+            str(info["termination_reason"]),
+        )
 
     return {
         "return": float(episode_return),
@@ -333,6 +339,7 @@ def _run_episode(
         "diagnostic_count": len(delta_values),
         "belief_swap": _aggregate_swap(swap_values),
         "termination_counts": termination_counts,
+        "option_kind_stats": option_kind_stats,
     }
 
 
@@ -406,6 +413,8 @@ def _execute_eval_option(
             elapsed=duration,
             runtime=runtime,
         )
+        if done and not terminated:
+            termination_reason = "env_max_steps"
         obs = step.obs
         if done or terminated:
             break
@@ -739,9 +748,37 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     primitive_steps = sum(int(row["primitive_steps"]) for row in episodes)
     blocking_events = sum(int(row["blocking_events"]) for row in episodes)
     term_counts: dict[str, int] = {}
+    option_kind_stats: dict[str, dict[str, Any]] = {}
     for row in episodes:
         for key, value in row["termination_counts"].items():
             term_counts[key] = term_counts.get(key, 0) + int(value)
+        for kind, item in row.get("option_kind_stats", {}).items():
+            aggregate = option_kind_stats.setdefault(
+                kind,
+                {
+                    "attempt_count": 0,
+                    "success_count": 0,
+                    "timeout_count": 0,
+                    "success_rate": 0.0,
+                    "termination_reason_histogram": {},
+                },
+            )
+            aggregate["attempt_count"] = int(aggregate["attempt_count"]) + int(
+                item.get("attempt_count", 0)
+            )
+            aggregate["success_count"] = int(aggregate["success_count"]) + int(
+                item.get("success_count", 0)
+            )
+            aggregate["timeout_count"] = int(aggregate["timeout_count"]) + int(
+                item.get("timeout_count", 0)
+            )
+            histogram = aggregate["termination_reason_histogram"]
+            for reason, count in item.get("termination_reason_histogram", {}).items():
+                histogram[reason] = int(histogram.get(reason, 0)) + int(count)
+    for item in option_kind_stats.values():
+        item["success_rate"] = float(
+            int(item["success_count"]) / max(1, int(item["attempt_count"]))
+        )
     return {
         "mean_return": _mean_or_zero(returns),
         "return_std": float(np.std(returns)) if returns else 0.0,
@@ -750,6 +787,7 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_duration": _mean_or_zero([float(row["primitive_steps"]) for row in episodes]),
         "primitive_steps": int(primitive_steps),
         "termination_counts": term_counts,
+        "option_kind_stats": option_kind_stats,
         "delta_info": _weighted_episode_summary(episodes, "delta_info_mean"),
         "mi": _weighted_episode_summary(episodes, "mi_mean"),
         "diagnostic_cost": _weighted_episode_summary(episodes, "diagnostic_cost_mean"),
@@ -926,6 +964,36 @@ def _noop_option_id(option_lib: OCV2OptionLibrary) -> int:
 
 def _increment(counts: dict[str, int], key: str) -> None:
     counts[key] = int(counts.get(key, 0)) + 1
+
+
+def _update_option_kind_stats(
+    stats: dict[str, dict[str, Any]],
+    option_kind: str,
+    termination_reason: str,
+) -> None:
+    item = stats.setdefault(
+        str(option_kind),
+        {
+            "attempt_count": 0,
+            "success_count": 0,
+            "timeout_count": 0,
+            "success_rate": 0.0,
+            "termination_reason_histogram": {},
+        },
+    )
+    item["attempt_count"] = int(item["attempt_count"]) + 1
+    item["success_count"] = int(item["success_count"]) + int(
+        option_success(option_kind, termination_reason)
+    )
+    item["timeout_count"] = int(item["timeout_count"]) + int(
+        str(termination_reason) in {"max_steps", "env_max_steps"}
+    )
+    histogram = item["termination_reason_histogram"]
+    reason = str(termination_reason)
+    histogram[reason] = int(histogram.get(reason, 0)) + 1
+    item["success_rate"] = float(
+        int(item["success_count"]) / max(1, int(item["attempt_count"]))
+    )
 
 
 def _parse_csv(value: str) -> list[str]:

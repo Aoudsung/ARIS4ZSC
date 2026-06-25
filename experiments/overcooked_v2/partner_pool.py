@@ -9,7 +9,13 @@ from jaxmarl.environments.overcooked_v2.common import Actions
 from src.aris_bellman.specs import OptionSpec, PartnerAction
 
 from .option_termination import OptionRuntime, cross_bottleneck_terminated
-from .state_utils import get_agent_pos, get_inventory, is_empty_inventory
+from .state_utils import (
+    get_agent_pos,
+    get_inventory,
+    is_empty_inventory,
+    is_ingredient,
+    pot_accepts_inventory_ingredient,
+)
 
 GridPos = tuple[int, int]
 
@@ -141,6 +147,24 @@ class ScriptedProtocolPartner:
                 self.protocol.pot_preference,
                 agent_id=1,
             )
+        if opt.kind == "fetch_ingredient" and not _fetch_has_current_pot_sink(
+            self.option_library,
+            opt,
+            state,
+        ):
+            score -= 10.0
+        if opt.kind == "drop_item_to_counter" and _carrying_unusable_item(
+            self.option_library,
+            state,
+            agent_id=1,
+        ):
+            score += 100.0
+        if opt.kind == "clear_interaction_cell" and _blocking_critical_cell(
+            self.option_library,
+            state,
+            agent_id=1,
+        ):
+            score += 100.0
         if opt.kind in {"cross_bottleneck", "wait_at_bottleneck"}:
             score += _bottleneck_bonus(opt, self.protocol.bottleneck_policy, self.elapsed)
         if opt.kind == "serve_soup":
@@ -216,6 +240,44 @@ def _one_hot(option_id: int, num_options: int) -> np.ndarray:
     dist = np.zeros((num_options,), dtype=np.float32)
     dist[int(option_id)] = 1.0
     return dist
+
+
+def _fetch_has_current_pot_sink(option_library: Any, opt: OptionSpec, state: Any) -> bool:
+    ingredient_obj = option_library._ingredient_object_for_pile(opt)
+    if ingredient_obj is None:
+        return False
+    for entity_id in option_library._entity_ids_by_kind("pot"):
+        pot_pos = option_library.layout_graph.entities[entity_id].pos
+        if pot_accepts_inventory_ingredient(
+            state,
+            pot_pos,
+            ingredient_obj,
+            require_recipe_useful=True,
+        ):
+            return True
+    return False
+
+
+def _carrying_unusable_item(option_library: Any, state: Any, agent_id: int) -> bool:
+    inv = get_inventory(state, agent_id)
+    if is_empty_inventory(inv):
+        return False
+    if not is_ingredient(inv):
+        return False
+    for entity_id in option_library._entity_ids_by_kind("pot"):
+        pot_pos = option_library.layout_graph.entities[entity_id].pos
+        if pot_accepts_inventory_ingredient(
+            state,
+            pot_pos,
+            inv,
+            require_recipe_useful=True,
+        ):
+            return False
+    return True
+
+
+def _blocking_critical_cell(option_library: Any, state: Any, agent_id: int) -> bool:
+    return bool(option_library._is_blocking_critical_interaction_cell(state, agent_id))
 
 
 def _task_progress_score(opt: OptionSpec, state: Any) -> float:

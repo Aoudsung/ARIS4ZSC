@@ -16,7 +16,7 @@ if __package__ in {None, ""}:  # pragma: no cover - script execution path
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import OCV2Event, extract_event
 from experiments.overcooked_v2.layout_parser import parse_layout
-from experiments.overcooked_v2.option_termination import OptionRuntime
+from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.state_utils import (
@@ -142,6 +142,97 @@ def compute_reward_to_go(
         row.reward_to_go = float(row.reward_sum + (gamma ** max(1, row.duration)) * running)
         running_by_episode[row.episode_id] = row.reward_to_go
     return option_rows
+
+
+def option_kind_stats(
+    rows: list[OptionReplayRow],
+    options: list[Any],
+) -> dict[str, dict[str, Any]]:
+    stats: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        kind = _option_kind_for_row(row, options)
+        reason = str((row.event_summary or {}).get("termination_reason", "unknown"))
+        item = stats.setdefault(
+            kind,
+            {
+                "attempt_count": 0,
+                "success_count": 0,
+                "timeout_count": 0,
+                "success_rate": 0.0,
+                "termination_reason_histogram": {},
+            },
+        )
+        item["attempt_count"] = int(item["attempt_count"]) + 1
+        item["success_count"] = int(item["success_count"]) + int(option_success(kind, reason))
+        item["timeout_count"] = int(item["timeout_count"]) + int(
+            reason in {"max_steps", "env_max_steps"}
+        )
+        histogram = item["termination_reason_histogram"]
+        histogram[reason] = int(histogram.get(reason, 0)) + 1
+
+    for item in stats.values():
+        attempts = max(1, int(item["attempt_count"]))
+        item["success_rate"] = float(int(item["success_count"]) / attempts)
+    return stats
+
+
+def replay_coverage(
+    rows: list[OptionReplayRow],
+    options: list[Any],
+) -> dict[str, int]:
+    coverage = {
+        "picked_ingredient": 0,
+        "ingredient_delivered_to_pot": 0,
+        "pot_became_ready": 0,
+        "plate_picked": 0,
+        "plated_soup": 0,
+        "served_soup": 0,
+        "drop_item_to_counter": 0,
+        "cleared_interaction_cell": 0,
+    }
+    for row in rows:
+        summary = row.event_summary or {}
+        reason = str(summary.get("termination_reason", "unknown"))
+        coverage["picked_ingredient"] += int(reason == "picked_ingredient")
+        coverage["ingredient_delivered_to_pot"] += int(
+            reason == "ingredient_delivered_to_pot"
+        )
+        coverage["pot_became_ready"] += int(summary.get("pot_became_ready", 0))
+        coverage["plate_picked"] += int(summary.get("plate_picked", 0))
+        coverage["plated_soup"] += max(
+            int(reason == "plated_soup"),
+            int(summary.get("soup_picked", 0)),
+        )
+        coverage["served_soup"] += max(
+            int(reason == "served_soup"),
+            int(summary.get("delivery_event", 0)),
+        )
+        coverage["drop_item_to_counter"] += int(reason == "dropped_item_to_counter")
+        coverage["cleared_interaction_cell"] += int(reason == "cleared_interaction_cell")
+    return {key: int(value) for key, value in coverage.items()}
+
+
+def replay_coverage_gate(
+    coverage: dict[str, int],
+    *,
+    require_full_task_coverage: bool,
+) -> dict[str, Any]:
+    required = ("plated_soup", "served_soup")
+    missing = [key for key in required if int(coverage.get(key, 0)) <= 0]
+    result = {
+        "require_full_task_coverage": bool(require_full_task_coverage),
+        "missing_required_coverage": missing,
+        "status": "passed" if not missing else "missing_required_coverage",
+    }
+    if require_full_task_coverage and missing:
+        raise RuntimeError(f"CE replay lacks required task coverage: {missing}")
+    return result
+
+
+def _option_kind_for_row(row: OptionReplayRow, options: list[Any]) -> str:
+    if 0 <= int(row.ego_option) < len(options):
+        return str(options[int(row.ego_option)].kind)
+    return str((row.event_summary or {}).get("option_kind", "unknown"))
 
 
 def estimate_empirical_ce(
@@ -401,6 +492,8 @@ def _rollout_option(
             elapsed=duration,
             runtime=runtime,
         )
+        if done and not terminated:
+            termination_reason = "env_max_steps"
         obs = step.obs
         if done or terminated:
             break
@@ -410,6 +503,8 @@ def _rollout_option(
     partner_confidence = _partner_confidence(partner_dist, partner_confidences)
     summary["termination_reason"] = termination_reason
     summary["done"] = done
+    summary["option_kind"] = opt.kind
+    summary["option_success"] = option_success(opt.kind, termination_reason)
 
     row = OptionReplayRow(
         layout=layout,
@@ -617,6 +712,11 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         cost_coef=args.cost_coef,
         shaped_reward_coef=args.shaped_reward_coef,
     )
+    coverage = replay_coverage(rows, option_lib.options)
+    coverage_gate = replay_coverage_gate(
+        coverage,
+        require_full_task_coverage=bool(args.require_full_task_coverage),
+    )
     save_replay_npz(
         args.output,
         rows,
@@ -628,6 +728,9 @@ def _cmd_collect(args: argparse.Namespace) -> None:
             "cost_coef": float(args.cost_coef),
             "cost_per_step": float(args.cost_per_step),
             "shaped_reward_coef": float(args.shaped_reward_coef),
+            "coverage": coverage,
+            "coverage_gate": coverage_gate,
+            "option_kind_stats": option_kind_stats(rows, option_lib.options),
         },
     )
 
@@ -684,6 +787,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     collect.add_argument("--max_option_steps", type=int, default=12)
     collect.add_argument("--max_options_per_episode", type=int, default=None)
     collect.add_argument("--observation_type", default="default")
+    collect.add_argument("--require_full_task_coverage", action="store_true")
     collect.set_defaults(func=_cmd_collect)
 
     estimate = subparsers.add_parser("estimate")

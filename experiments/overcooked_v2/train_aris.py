@@ -27,12 +27,12 @@ from src.aris_bellman.td import aris_td_loss
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import extract_event
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
-from experiments.overcooked_v2.graph_builder import build_graph_variant
+from experiments.overcooked_v2.graph_builder import build_graph_variant, validate_task_stage_coverage
 from experiments.overcooked_v2.layout_diagnostics import preflight_layout
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
-from experiments.overcooked_v2.option_termination import OptionRuntime
+from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.state_utils import get_agent_pos
@@ -341,6 +341,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         episode_options += 1
         metrics["option_durations"].append(int(transition.duration))
         _increment_count(metrics["termination_counts"], transition.termination_reason)
+        _update_option_kind_metrics(
+            metrics,
+            graph.options[int(transition.option_id)].kind,
+            transition.termination_reason,
+        )
         _update_task_progress_metrics(metrics, transition)
 
         if done:
@@ -494,6 +499,7 @@ def _build_graph(
         )
         if graph.num_factors == 0:
             raise RuntimeError("Loaded GraphSpec has zero factors; cannot train ARIS.")
+        validate_task_stage_coverage(graph)
         graph.metadata = {
             **(graph.metadata or {}),
             "formal_experiment": True,
@@ -523,6 +529,7 @@ def _build_graph(
         overcomplete_extra_factors=int(graph_cfg.get("overcomplete_extra_factors", 0)),
         mode_config=graph_cfg.get("modes"),
         seed=args.seed,
+        require_task_stage_coverage=True,
     )
     if graph_source == "online_debug_ce":
         graph.metadata = {
@@ -655,6 +662,11 @@ def _run_random_policy(
         episode_options += 1
         metrics["option_durations"].append(int(transition.duration))
         _increment_count(metrics["termination_counts"], transition.termination_reason)
+        _update_option_kind_metrics(
+            metrics,
+            router.graph.options[int(transition.option_id)].kind,
+            transition.termination_reason,
+        )
         _update_task_progress_metrics(metrics, transition)
         if done:
             metrics["episode_returns"].append(float(episode_return))
@@ -741,6 +753,8 @@ def _execute_option(
             elapsed=duration,
             runtime=runtime,
         )
+        if done and not terminated:
+            termination_reason = "env_max_steps"
         obs = step.obs
         if done or terminated:
             break
@@ -997,6 +1011,14 @@ def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTra
         counts["picked_ingredient"] = int(counts.get("picked_ingredient", 0)) + 1
     if transition.termination_reason == "ingredient_delivered_to_pot":
         counts["ingredient_delivered_to_pot"] = int(counts.get("ingredient_delivered_to_pot", 0)) + 1
+    if transition.termination_reason == "plated_soup":
+        counts["plated_soup"] = int(counts.get("plated_soup", 0)) + 1
+    if transition.termination_reason == "served_soup":
+        counts["served_soup"] = int(counts.get("served_soup", 0)) + 1
+    if transition.termination_reason == "dropped_item_to_counter":
+        counts["drop_item_to_counter"] = int(counts.get("drop_item_to_counter", 0)) + 1
+    if transition.termination_reason == "cleared_interaction_cell":
+        counts["cleared_interaction_cell"] = int(counts.get("cleared_interaction_cell", 0)) + 1
     for key in (
         "pot_became_ready",
         "plate_picked",
@@ -1052,6 +1074,7 @@ def _empty_metrics(method: str, graph: GraphSpec, output_dir: Path) -> dict[str,
         "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
         "option_durations": [],
         "termination_counts": {},
+        "option_kind_stats": {},
         "task_progress_counts": {},
         "checkpoint_load_ok": False,
     }
@@ -1091,10 +1114,22 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "finite_rewards": bool(rewards.size == 0 or np.all(np.isfinite(rewards))),
         "noop_count": int(metrics.get("termination_counts", {}).get("noop", 0)),
         "max_steps_count": int(metrics.get("termination_counts", {}).get("max_steps", 0)),
+        "env_max_steps_count": int(
+            metrics.get("termination_counts", {}).get("env_max_steps", 0)
+        ),
+        "option_kind_stats": metrics.get("option_kind_stats", {}),
         "delivery_event_count": int(metrics.get("task_progress_counts", {}).get("delivery_event", 0)),
         "pot_changed_count": int(metrics.get("task_progress_counts", {}).get("pot_changed", 0)),
         "plate_picked_count": int(metrics.get("task_progress_counts", {}).get("plate_picked", 0)),
         "soup_picked_count": int(metrics.get("task_progress_counts", {}).get("soup_picked", 0)),
+        "plated_soup_count": int(metrics.get("task_progress_counts", {}).get("plated_soup", 0)),
+        "served_soup_count": int(metrics.get("task_progress_counts", {}).get("served_soup", 0)),
+        "drop_item_to_counter_count": int(
+            metrics.get("task_progress_counts", {}).get("drop_item_to_counter", 0)
+        ),
+        "cleared_interaction_cell_count": int(
+            metrics.get("task_progress_counts", {}).get("cleared_interaction_cell", 0)
+        ),
         "task_progress_events": int(sum(int(value) for value in progress.values())),
     }
 
@@ -1251,12 +1286,47 @@ def _increment_count(counts: dict[str, int], key: str) -> None:
     counts[key] = int(counts.get(key, 0)) + 1
 
 
+def _update_option_kind_metrics(
+    metrics: dict[str, Any],
+    option_kind: str,
+    termination_reason: str,
+) -> None:
+    stats = metrics.setdefault("option_kind_stats", {})
+    item = stats.setdefault(
+        str(option_kind),
+        {
+            "attempt_count": 0,
+            "success_count": 0,
+            "timeout_count": 0,
+            "success_rate": 0.0,
+            "termination_reason_histogram": {},
+        },
+    )
+    item["attempt_count"] = int(item["attempt_count"]) + 1
+    item["success_count"] = int(item["success_count"]) + int(
+        option_success(option_kind, termination_reason)
+    )
+    item["timeout_count"] = int(item["timeout_count"]) + int(
+        str(termination_reason) in {"max_steps", "env_max_steps"}
+    )
+    histogram = item["termination_reason_histogram"]
+    reason = str(termination_reason)
+    histogram[reason] = int(histogram.get(reason, 0)) + 1
+    item["success_rate"] = float(
+        int(item["success_count"]) / max(1, int(item["attempt_count"]))
+    )
+
+
 def _empty_progress_summary() -> dict[str, int]:
     return {
         "picked_ingredient": 0,
         "ingredient_delivered_to_pot": 0,
         "pot_became_ready": 0,
         "plate_picked": 0,
+        "plated_soup": 0,
+        "served_soup": 0,
+        "drop_item_to_counter": 0,
+        "cleared_interaction_cell": 0,
         "soup_picked": 0,
         "correct_delivery": 0,
         "delivery_event": 0,

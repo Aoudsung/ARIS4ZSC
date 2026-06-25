@@ -46,6 +46,12 @@ GRAPH_VARIANTS = (
 # than coordination externality.
 EXCLUDED_FACTOR_OPTION_KINDS = {"noop"}
 
+REQUIRED_TASK_STAGE_OPTION_KINDS = {
+    "deliver_ingredient_to_pot",
+    "plate_soup",
+    "serve_soup",
+}
+
 
 def infer_factor_kind(option_i: OptionSpec, option_j: OptionSpec) -> str:
     kinds = {option_i.kind, option_j.kind}
@@ -138,6 +144,22 @@ def make_graph_spec(
     )
 
 
+def validate_task_stage_coverage(
+    graph: GraphSpec,
+    required_option_kinds: set[str] | None = None,
+) -> None:
+    required = set(required_option_kinds or REQUIRED_TASK_STAGE_OPTION_KINDS)
+    covered: set[str] = set()
+    for factor in graph.factors:
+        if 0 <= int(factor.option_i) < len(graph.options):
+            covered.add(str(graph.options[int(factor.option_i)].kind))
+        if 0 <= int(factor.option_j) < len(graph.options):
+            covered.add(str(graph.options[int(factor.option_j)].kind))
+    missing = sorted(required - covered)
+    if missing:
+        raise RuntimeError(f"CE graph lacks required task-stage options: {missing}")
+
+
 def build_graph_variant(
     variant: str,
     layout_name: str,
@@ -151,12 +173,13 @@ def build_graph_variant(
     mode_config: dict[str, int] | None = None,
     criticality_scores: Any | None = None,
     seed: int = 17,
+    require_task_stage_coverage: bool = False,
 ) -> GraphSpec:
     full_budget = int(full_max_factors if full_max_factors is not None else max_factors)
     if variant == "full_support":
-        return full_support_graph(layout_name, options, ce_matrix, eta, full_budget, mode_config)
-    if variant == "overcomplete":
-        return overcomplete_graph(
+        graph = full_support_graph(layout_name, options, ce_matrix, eta, full_budget, mode_config)
+    elif variant == "overcomplete":
+        graph = overcomplete_graph(
             layout_name,
             options,
             ce_matrix,
@@ -165,8 +188,8 @@ def build_graph_variant(
             mode_config,
             overcomplete_extra_factors=overcomplete_extra_factors,
         )
-    if variant == "overcomplete_minus_low_ce":
-        return overcomplete_minus_low_ce_graph(
+    elif variant == "overcomplete_minus_low_ce":
+        graph = overcomplete_minus_low_ce_graph(
             layout_name,
             options,
             ce_matrix,
@@ -175,8 +198,8 @@ def build_graph_variant(
             mode_config,
             overcomplete_extra_factors=overcomplete_extra_factors,
         )
-    if variant == "minus_critical":
-        return minus_critical_graph(
+    elif variant == "minus_critical":
+        graph = minus_critical_graph(
             layout_name,
             options,
             ce_matrix,
@@ -185,8 +208,8 @@ def build_graph_variant(
             mode_config,
             criticality_scores,
         )
-    if variant == "minus_high_ce":
-        return minus_high_ce_graph(
+    elif variant == "minus_high_ce":
+        graph = minus_high_ce_graph(
             layout_name,
             options,
             ce_matrix,
@@ -194,8 +217,8 @@ def build_graph_variant(
             full_budget,
             mode_config,
         )
-    if variant == "random_same_size":
-        return random_same_size_graph(
+    elif variant == "random_same_size":
+        graph = random_same_size_graph(
             layout_name,
             options,
             ce_matrix,
@@ -204,12 +227,12 @@ def build_graph_variant(
             mode_config,
             seed,
         )
-    if variant == "complete_option_graph":
-        return complete_option_graph(layout_name, options, ce_matrix, mode_config)
-    if variant == "shuffled_routes":
-        return shuffled_routes_graph(layout_name, options, ce_matrix, eta, full_budget, mode_config)
-    if variant == "shuffled_relevance":
-        return shuffled_relevance_graph(
+    elif variant == "complete_option_graph":
+        graph = complete_option_graph(layout_name, options, ce_matrix, mode_config)
+    elif variant == "shuffled_routes":
+        graph = shuffled_routes_graph(layout_name, options, ce_matrix, eta, full_budget, mode_config)
+    elif variant == "shuffled_relevance":
+        graph = shuffled_relevance_graph(
             layout_name,
             options,
             ce_matrix,
@@ -217,7 +240,12 @@ def build_graph_variant(
             full_budget,
             mode_config,
         )
-    raise ValueError(f"Unknown graph variant {variant!r}; expected one of {GRAPH_VARIANTS}.")
+    else:
+        raise ValueError(f"Unknown graph variant {variant!r}; expected one of {GRAPH_VARIANTS}.")
+
+    if require_task_stage_coverage:
+        validate_task_stage_coverage(graph)
+    return graph
 
 
 def full_support_graph(
@@ -698,6 +726,7 @@ def _cmd_build(args: argparse.Namespace) -> None:
         mode_config=_load_mode_config(args.mode_config),
         criticality_scores=_load_criticality(args.criticality),
         seed=args.seed,
+        require_task_stage_coverage=bool(args.require_task_stage_coverage),
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -719,6 +748,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--max_steps", type=int, default=200)
     parser.add_argument("--max_option_steps", type=int, default=12)
+    parser.add_argument("--require_task_stage_coverage", action="store_true")
     parser.set_defaults(func=_cmd_build)
     return parser
 
