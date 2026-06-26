@@ -27,9 +27,12 @@ METHODS = (
 )
 VARIANTS = ("full_support", "minus_high_ce", "overcomplete", "shuffled_relevance")
 SEEDS = (0, 1, 2)
-GPUS = [0, 1, 2, 4, 5, 6, 7]
+GPUS = [0, 2, 4, 5, 6, 7]
 
 EVAL_EPISODES = 3
+EVAL_VARIANTS: dict[str, tuple[str, ...]] = {
+    "aris_bellman": VARIANTS,
+}
 
 
 def _job_key(method: str, variant: str, seed: int) -> str:
@@ -73,109 +76,189 @@ def _run_train_job(gpu: int, method: str, variant: str, seed: int) -> dict[str, 
 
 
 def run_training_phase() -> list[dict[str, Any]]:
-    jobs = [
+    all_jobs = [
         (method, variant, seed)
         for method in METHODS
         for variant in VARIANTS
         for seed in SEEDS
     ]
-    print(f"=== Phase 2: Training {len(jobs)} jobs on {len(GPUS)} GPUs ===")
+    print(f"=== Phase 2: Training {len(all_jobs)} jobs on {len(GPUS)} GPUs ===")
 
     results: list[dict[str, Any]] = []
-    gpu_cycle = 0
-
-    with ProcessPoolExecutor(max_workers=len(GPUS)) as pool:
-        futures = {}
-        for method, variant, seed in jobs:
-            ckpt = _checkpoint_dir(method, variant, seed) / "checkpoint.pt"
-            if ckpt.exists():
-                results.append({
-                    "key": _job_key(method, variant, seed),
-                    "method": method, "variant": variant, "seed": seed,
-                    "gpu": -1, "returncode": 0, "elapsed": 0,
-                    "checkpoint_exists": True, "stderr_tail": "",
-                })
-                print(
-                    f"  [{len(results):2d}/{len(jobs)}] "
-                    f"{_job_key(method, variant, seed):45s} CACHED"
-                )
-                continue
-            gpu = GPUS[gpu_cycle % len(GPUS)]
-            gpu_cycle += 1
-            future = pool.submit(_run_train_job, gpu, method, variant, seed)
-            futures[future] = _job_key(method, variant, seed)
-
-        for future in as_completed(futures):
-            info = future.result()
-            results.append(info)
-            status = "OK" if info["checkpoint_exists"] else "FAIL"
+    pending: list[tuple[str, str, int]] = []
+    for method, variant, seed in all_jobs:
+        ckpt = _checkpoint_dir(method, variant, seed) / "checkpoint.pt"
+        if ckpt.exists():
+            results.append({
+                "key": _job_key(method, variant, seed),
+                "method": method, "variant": variant, "seed": seed,
+                "gpu": -1, "returncode": 0, "elapsed": 0,
+                "checkpoint_exists": True, "stderr_tail": "",
+            })
             print(
-                f"  [{len(results):2d}/{len(jobs)}] {info['key']:45s} "
-                f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)"
+                f"  [{len(results):2d}/{len(all_jobs)}] "
+                f"{_job_key(method, variant, seed):45s} CACHED"
             )
-            if info["returncode"] != 0:
-                print(f"    stderr: {info['stderr_tail']}")
+        else:
+            pending.append((method, variant, seed))
+
+    if pending:
+        gpu_pool = list(GPUS)
+        with ProcessPoolExecutor(max_workers=len(GPUS)) as pool:
+            active: dict[Any, int] = {}
+            job_iter = iter(pending)
+
+            def _submit_train() -> bool:
+                if not gpu_pool:
+                    return False
+                try:
+                    method, variant, seed = next(job_iter)
+                except StopIteration:
+                    return False
+                gpu = gpu_pool.pop(0)
+                future = pool.submit(_run_train_job, gpu, method, variant, seed)
+                active[future] = gpu
+                return True
+
+            for _ in range(min(len(GPUS), len(pending))):
+                _submit_train()
+
+            while active:
+                done_futures = [f for f in active if f.done()]
+                if not done_futures:
+                    time.sleep(0.5)
+                    continue
+                for future in done_futures:
+                    freed_gpu = active.pop(future)
+                    gpu_pool.append(freed_gpu)
+                    info = future.result()
+                    results.append(info)
+                    status = "OK" if info["checkpoint_exists"] else "FAIL"
+                    print(
+                        f"  [{len(results):2d}/{len(all_jobs)}] {info['key']:45s} "
+                        f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)"
+                    )
+                    if info["returncode"] != 0:
+                        print(f"    stderr: {info['stderr_tail']}")
+                    _submit_train()
 
     ok = sum(1 for r in results if r["checkpoint_exists"])
-    print(f"\nTraining complete: {ok}/{len(jobs)} checkpoints saved")
+    print(f"\nTraining complete: {ok}/{len(all_jobs)} checkpoints saved")
     return results
 
 
-def _run_eval_job(method: str, seed: int) -> dict[str, Any]:
+def _eval_variants_for(method: str) -> tuple[str, ...]:
+    return EVAL_VARIANTS.get(method, ("full_support",))
+
+
+def _run_eval_job(gpu: int, method: str, seed: int) -> dict[str, Any]:
+    variants = _eval_variants_for(method)
     ckpt_dir = _checkpoint_dir(method, "full_support", seed)
     out_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}.json"
     cmd = [
         sys.executable,
         str(REPO_ROOT / "experiments" / "overcooked_v2" / "evaluate_aris.py"),
         "--checkpoint", str(ckpt_dir),
-        "--graph_variants", ",".join(VARIANTS),
+        "--graph_variants", ",".join(variants),
         "--partners", "all",
         "--episodes", str(EVAL_EPISODES),
         "--seed", str(seed),
         "--output", str(out_path),
     ]
-    eval_env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in GPUS)}
+    if out_path.exists():
+        out_path.unlink()
+    eval_env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": str(gpu),
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
+    t0 = time.time()
     try:
         result = subprocess.run(
             cmd, env=eval_env, cwd=str(REPO_ROOT),
             capture_output=True, text=True, timeout=7200,
         )
+        elapsed = time.time() - t0
+        ok = result.returncode == 0 and out_path.exists()
         return {
             "method": method,
             "seed": seed,
+            "gpu": gpu,
+            "variants": variants,
             "returncode": result.returncode,
+            "elapsed": elapsed,
             "output_path": str(out_path),
-            "output_exists": out_path.exists(),
+            "ok": ok,
             "stderr_tail": result.stderr[-500:] if result.returncode != 0 else "",
         }
     except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
         return {
             "method": method,
             "seed": seed,
+            "gpu": gpu,
+            "variants": variants,
             "returncode": -1,
+            "elapsed": elapsed,
             "output_path": str(out_path),
-            "output_exists": out_path.exists(),
+            "ok": False,
             "stderr_tail": "TIMEOUT after 7200s",
         }
 
 
 def run_evaluation_phase() -> list[dict[str, Any]]:
-    eval_jobs = [(m, s) for m in METHODS if m != "random_policy" for s in SEEDS]
-    print(f"\n=== Phase 4: Evaluation ({len(eval_jobs)} runs) ===")
+    pending = [
+        (m, s)
+        for m in METHODS if m != "random_policy"
+        for s in SEEDS
+        if (_checkpoint_dir(m, "full_support", s) / "checkpoint.pt").exists()
+    ]
+    print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(GPUS)} GPUs parallel) ===")
 
     results: list[dict[str, Any]] = []
-    for method, seed in eval_jobs:
-        ckpt = _checkpoint_dir(method, "full_support", seed) / "checkpoint.pt"
-        if not ckpt.exists():
-            print(f"  SKIP eval {method}/seed{seed} — no checkpoint")
-            continue
-        info = _run_eval_job(method, seed)
-        results.append(info)
-        status = "OK" if info["output_exists"] else "FAIL"
-        print(f"  [{len(results):2d}/{len(eval_jobs)}] {method}/seed{seed} {status}")
-        if info["returncode"] != 0:
-            print(f"    stderr: {info['stderr_tail']}")
+    gpu_pool = list(GPUS)
+    with ProcessPoolExecutor(max_workers=len(GPUS)) as pool:
+        active: dict[Any, int] = {}
+        job_iter = iter(pending)
 
+        def _submit_next() -> bool:
+            if not gpu_pool:
+                return False
+            try:
+                method, seed = next(job_iter)
+            except StopIteration:
+                return False
+            gpu = gpu_pool.pop(0)
+            future = pool.submit(_run_eval_job, gpu, method, seed)
+            active[future] = gpu
+            return True
+
+        for _ in range(min(len(GPUS), len(pending))):
+            _submit_next()
+
+        while active:
+            done_futures = [f for f in active if f.done()]
+            if not done_futures:
+                time.sleep(1)
+                continue
+            for future in done_futures:
+                freed_gpu = active.pop(future)
+                gpu_pool.append(freed_gpu)
+                info = future.result()
+                results.append(info)
+                status = "OK" if info["ok"] else "FAIL"
+                vcount = len(info["variants"])
+                print(
+                    f"  [{len(results):2d}/{len(pending)}] "
+                    f"{info['method']}/seed{info['seed']} "
+                    f"GPU:{info['gpu']} {vcount}v {status} ({info['elapsed']:.0f}s)"
+                )
+                if not info["ok"]:
+                    print(f"    stderr: {info['stderr_tail']}")
+                _submit_next()
+
+    ok = sum(1 for r in results if r["ok"])
+    print(f"\nEvaluation complete: {ok}/{len(pending)} succeeded")
     return results
 
 
