@@ -18,7 +18,7 @@ OUTPUT_DIR = "results/ocv2_step4"
 LAYOUT = "cramped_room"
 
 METHODS = ("aris_bellman", "base_only", "flat_factor", "random_policy")
-VARIANTS = ("full_support", "minus_critical", "random_same_size", "shuffled_relevance")
+VARIANTS = ("full_support", "minus_high_ce", "overcomplete", "shuffled_relevance")
 SEEDS = (0, 1, 2)
 GPUS = [0, 1, 2, 4, 5, 6, 7]
 
@@ -207,8 +207,8 @@ def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
     ab_fs = _mean("aris_bellman", "full_support")
     bo_fs = _mean("base_only", "full_support")
     rp_fs = _mean("random_policy", "full_support")
-    ab_rs = _mean("aris_bellman", "random_same_size")
-    ab_mc = _mean("aris_bellman", "minus_critical")
+    ab_mh = _mean("aris_bellman", "minus_high_ce")
+    ab_oc = _mean("aris_bellman", "overcomplete")
 
     def _gate(name: str, left: float | None, right: float | None, desc: str) -> None:
         if left is None or right is None:
@@ -224,12 +224,12 @@ def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
     _gate("G1_method_superiority", ab_fs, bo_fs,
           "aris_bellman/full_support > base_only/full_support")
-    _gate("G2_graph_structure", ab_fs, ab_rs,
-          "aris_bellman/full_support > aris_bellman/random_same_size")
+    _gate("G2_minus_high_ce", ab_fs, ab_mh,
+          "aris_bellman/full_support > aris_bellman/minus_high_ce")
     _gate("G3_above_random", ab_fs, rp_fs,
           "aris_bellman/full_support > random_policy/full_support")
-    _gate("G4_critical_factor", ab_fs, ab_mc,
-          "aris_bellman/full_support > aris_bellman/minus_critical")
+    _gate("G4_overcomplete", ab_fs, ab_oc,
+          "aris_bellman/full_support > aris_bellman/overcomplete")
 
     all_pass = all(g["passed"] for g in gates.values() if g["status"] != "SKIP")
     print(f"\n  Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")

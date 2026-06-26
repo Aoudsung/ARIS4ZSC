@@ -75,6 +75,12 @@ class OCV2EvidenceRouter:
             region_id: [tuple(cell) for cell in cells]
             for region_id, cells in region_cells.items()
         }
+        for opt in graph.options:
+            for rid in opt.region_ids:
+                if rid not in self.region_cells and opt.metadata and rid in opt.metadata:
+                    self.region_cells[rid] = [
+                        tuple(c) for c in opt.metadata[rid]
+                    ]
         self.entity_to_cell = {
             entity_id: tuple(cell)
             for cell, entity_id in self.cell_to_entity.items()
