@@ -1,12 +1,28 @@
-"""Step 4: Micro-train across (method × graph_variant × seed) and build evaluation matrix."""
+"""Step 4: Micro-train across (method × graph_variant × seed) and build evaluation matrix.
+
+Phase-separable + host-configurable orchestrator. The two execution hosts are the
+same physical machine sharing /apps/users/cxw/.../CPR_REPO, so checkpoints written by
+the training phase are visible to the eval phase on the other container:
+
+  - Training is GPU-bound  → run on the 8-GPU container (CPU-capped at 8 cores):
+        run_step4 --phase train --gpus 0,2,4,5,6,7 --updates 5000 --seeds 0
+  - Eval (esp. full diagnostics) is CPU-bound → run on the 1-GPU / 144-core container:
+        run_step4 --phase eval --eval-workers 24 --full-diagnostics --seeds 0
+  - Build the matrix + gates from the eval JSONs on either host:
+        run_step4 --phase matrix --seeds 0
+
+Per-job values (gpu, updates, episodes, full_diagnostics, timeout) are passed as
+function arguments so they survive ProcessPoolExecutor workers under any start method.
+"""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -26,14 +42,8 @@ METHODS = (
     "random_policy",
 )
 VARIANTS = ("full_support", "minus_high_ce", "overcomplete", "shuffled_relevance")
-SEEDS = (0, 1, 2)
-# Single-GPU Docker (1x L40, 144 CPU cores). Over-subscribe the one physical GPU:
-# training is light (hidden_dim=64, 1000 updates) so 3 share GPU 0 with XLA prealloc off;
-# eval runs PyTorch on CPU (GPU does only light JAX env steps) so it parallelizes on cores.
-GPUS = [0, 0, 0]
-EVAL_GPUS = [0, 0, 0, 0, 0, 0]
-
-EVAL_EPISODES = 3
+# Only aris_bellman is evaluated across all graph variants (graph-causality row);
+# the other trainable methods are only needed at full_support for the method gates.
 EVAL_VARIANTS: dict[str, tuple[str, ...]] = {
     "aris_bellman": VARIANTS,
 }
@@ -47,7 +57,11 @@ def _checkpoint_dir(method: str, variant: str, seed: int) -> Path:
     return REPO_ROOT / OUTPUT_DIR / LAYOUT / method / variant / f"seed{seed}"
 
 
-def _run_train_job(gpu: int, method: str, variant: str, seed: int) -> dict[str, Any]:
+# --------------------------------------------------------------------------- train
+
+def _run_train_job(
+    gpu: int, method: str, variant: str, seed: int, updates: int, timeout: int
+) -> dict[str, Any]:
     key = _job_key(method, variant, seed)
     env = {
         **os.environ,
@@ -61,13 +75,18 @@ def _run_train_job(gpu: int, method: str, variant: str, seed: int) -> dict[str, 
         "--graph_variant", variant,
         "--method", method,
         "--seed", str(seed),
+        "--updates", str(updates),
         "--output_dir", str(REPO_ROOT / OUTPUT_DIR),
     ]
     t0 = time.time()
-    result = subprocess.run(
-        cmd, env=env, cwd=str(REPO_ROOT),
-        capture_output=True, text=True, timeout=1800,
-    )
+    try:
+        result = subprocess.run(
+            cmd, env=env, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        rc, stderr_tail = result.returncode, result.stderr[-500:]
+    except subprocess.TimeoutExpired:
+        rc, stderr_tail = -1, f"TIMEOUT after {timeout}s"
     elapsed = time.time() - t0
     ckpt = _checkpoint_dir(method, variant, seed) / "checkpoint.pt"
     return {
@@ -76,21 +95,24 @@ def _run_train_job(gpu: int, method: str, variant: str, seed: int) -> dict[str, 
         "variant": variant,
         "seed": seed,
         "gpu": gpu,
-        "returncode": result.returncode,
+        "returncode": rc,
         "elapsed": elapsed,
         "checkpoint_exists": ckpt.exists(),
-        "stderr_tail": result.stderr[-500:] if result.returncode != 0 else "",
+        "stderr_tail": stderr_tail if rc != 0 else "",
     }
 
 
-def run_training_phase() -> list[dict[str, Any]]:
+def run_training_phase(
+    gpus: list[int], seeds: tuple[int, ...], updates: int, timeout: int
+) -> list[dict[str, Any]]:
     all_jobs = [
         (method, variant, seed)
         for method in METHODS
         for variant in VARIANTS
-        for seed in SEEDS
+        for seed in seeds
     ]
-    print(f"=== Phase 2: Training {len(all_jobs)} jobs on {len(GPUS)} GPUs ===")
+    print(f"=== Phase 2: Training {len(all_jobs)} jobs on {len(gpus)} GPU slots "
+          f"(updates={updates}) ===")
 
     results: list[dict[str, Any]] = []
     pending: list[tuple[str, str, int]] = []
@@ -103,16 +125,14 @@ def run_training_phase() -> list[dict[str, Any]]:
                 "gpu": -1, "returncode": 0, "elapsed": 0,
                 "checkpoint_exists": True, "stderr_tail": "",
             })
-            print(
-                f"  [{len(results):2d}/{len(all_jobs)}] "
-                f"{_job_key(method, variant, seed):45s} CACHED"
-            )
+            print(f"  [{len(results):2d}/{len(all_jobs)}] "
+                  f"{_job_key(method, variant, seed):45s} CACHED")
         else:
             pending.append((method, variant, seed))
 
     if pending:
-        gpu_pool = list(GPUS)
-        with ProcessPoolExecutor(max_workers=len(GPUS)) as pool:
+        gpu_pool = list(gpus)
+        with ProcessPoolExecutor(max_workers=len(gpus)) as pool:
             active: dict[Any, int] = {}
             job_iter = iter(pending)
 
@@ -124,11 +144,13 @@ def run_training_phase() -> list[dict[str, Any]]:
                 except StopIteration:
                     return False
                 gpu = gpu_pool.pop(0)
-                future = pool.submit(_run_train_job, gpu, method, variant, seed)
+                future = pool.submit(
+                    _run_train_job, gpu, method, variant, seed, updates, timeout
+                )
                 active[future] = gpu
                 return True
 
-            for _ in range(min(len(GPUS), len(pending))):
+            for _ in range(min(len(gpus), len(pending))):
                 _submit_train()
 
             while active:
@@ -142,10 +164,8 @@ def run_training_phase() -> list[dict[str, Any]]:
                     info = future.result()
                     results.append(info)
                     status = "OK" if info["checkpoint_exists"] else "FAIL"
-                    print(
-                        f"  [{len(results):2d}/{len(all_jobs)}] {info['key']:45s} "
-                        f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)"
-                    )
+                    print(f"  [{len(results):2d}/{len(all_jobs)}] {info['key']:45s} "
+                          f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)")
                     if info["returncode"] != 0:
                         print(f"    stderr: {info['stderr_tail']}")
                     _submit_train()
@@ -155,7 +175,12 @@ def run_training_phase() -> list[dict[str, Any]]:
     return results
 
 
-def _run_eval_job(gpu: int, method: str, seed: int, variant: str = "full_support") -> dict[str, Any]:
+# ---------------------------------------------------------------------------- eval
+
+def _run_eval_job(
+    gpu: int, method: str, seed: int, variant: str,
+    episodes: int, full_diagnostics: bool, timeout: int,
+) -> dict[str, Any]:
     ckpt_dir = _checkpoint_dir(method, variant, seed)
     suffix = f"_{variant}" if variant != "full_support" else ""
     out_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}{suffix}.json"
@@ -165,11 +190,12 @@ def _run_eval_job(gpu: int, method: str, seed: int, variant: str = "full_support
         "--checkpoint", str(ckpt_dir),
         "--graph_variants", variant,
         "--partners", "all",
-        "--episodes", str(EVAL_EPISODES),
+        "--episodes", str(episodes),
         "--seed", str(seed),
         "--output", str(out_path),
-        "--fast",
     ]
+    if not full_diagnostics:
+        cmd.append("--fast")
     if out_path.exists():
         out_path.unlink()
     eval_env = {
@@ -181,51 +207,45 @@ def _run_eval_job(gpu: int, method: str, seed: int, variant: str = "full_support
     try:
         result = subprocess.run(
             cmd, env=eval_env, cwd=str(REPO_ROOT),
-            capture_output=True, text=True, timeout=7200,
+            capture_output=True, text=True, timeout=timeout,
         )
-        elapsed = time.time() - t0
-        ok = result.returncode == 0 and out_path.exists()
-        return {
-            "method": method,
-            "seed": seed,
-            "gpu": gpu,
-            "variant": variant,
-            "returncode": result.returncode,
-            "elapsed": elapsed,
-            "output_path": str(out_path),
-            "ok": ok,
-            "stderr_tail": result.stderr[-500:] if result.returncode != 0 else "",
-        }
+        rc, stderr_tail = result.returncode, result.stderr[-500:]
     except subprocess.TimeoutExpired:
-        elapsed = time.time() - t0
-        return {
-            "method": method,
-            "seed": seed,
-            "gpu": gpu,
-            "variant": variant,
-            "returncode": -1,
-            "elapsed": elapsed,
-            "output_path": str(out_path),
-            "ok": False,
-            "stderr_tail": "TIMEOUT after 7200s",
-        }
+        rc, stderr_tail = -1, f"TIMEOUT after {timeout}s"
+    elapsed = time.time() - t0
+    ok = rc == 0 and out_path.exists()
+    return {
+        "method": method,
+        "seed": seed,
+        "gpu": gpu,
+        "variant": variant,
+        "returncode": rc,
+        "elapsed": elapsed,
+        "output_path": str(out_path),
+        "ok": ok,
+        "stderr_tail": stderr_tail if rc != 0 else "",
+    }
 
 
-def run_evaluation_phase() -> list[dict[str, Any]]:
+def run_evaluation_phase(
+    eval_gpus: list[int], seeds: tuple[int, ...],
+    episodes: int, full_diagnostics: bool, timeout: int,
+) -> list[dict[str, Any]]:
     pending: list[tuple[str, int, str]] = []
     for m in METHODS:
         if m == "random_policy":
             continue
-        variants = EVAL_VARIANTS.get(m, ("full_support",))
-        for v in variants:
-            for s in SEEDS:
+        for v in EVAL_VARIANTS.get(m, ("full_support",)):
+            for s in seeds:
                 if (_checkpoint_dir(m, v, s) / "checkpoint.pt").exists():
                     pending.append((m, s, v))
-    print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(EVAL_GPUS)} workers parallel) ===")
+    mode = "full-diagnostics" if full_diagnostics else "fast"
+    print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(eval_gpus)} workers, "
+          f"{mode}) ===")
 
     results: list[dict[str, Any]] = []
-    gpu_pool = list(EVAL_GPUS)
-    with ProcessPoolExecutor(max_workers=len(EVAL_GPUS)) as pool:
+    gpu_pool = list(eval_gpus)
+    with ProcessPoolExecutor(max_workers=len(eval_gpus)) as pool:
         active: dict[Any, int] = {}
         job_iter = iter(pending)
 
@@ -237,11 +257,14 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
             except StopIteration:
                 return False
             gpu = gpu_pool.pop(0)
-            future = pool.submit(_run_eval_job, gpu, method, seed, variant)
+            future = pool.submit(
+                _run_eval_job, gpu, method, seed, variant,
+                episodes, full_diagnostics, timeout,
+            )
             active[future] = gpu
             return True
 
-        for _ in range(min(len(GPUS), len(pending))):
+        for _ in range(min(len(eval_gpus), len(pending))):
             _submit_next()
 
         while active:
@@ -255,11 +278,9 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
                 info = future.result()
                 results.append(info)
                 status = "OK" if info["ok"] else "FAIL"
-                print(
-                    f"  [{len(results):2d}/{len(pending)}] "
-                    f"{info['method']}/{info['variant']}/seed{info['seed']} "
-                    f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)"
-                )
+                print(f"  [{len(results):2d}/{len(pending)}] "
+                      f"{info['method']}/{info['variant']}/seed{info['seed']} "
+                      f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)")
                 if not info["ok"]:
                     print(f"    stderr: {info['stderr_tail']}")
                 _submit_next()
@@ -268,6 +289,8 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
     print(f"\nEvaluation complete: {ok}/{len(pending)} succeeded")
     return results
 
+
+# -------------------------------------------------------------------------- matrix
 
 def _extract_random_baseline_from_eval(seed: int) -> float | None:
     for method in METHODS:
@@ -290,7 +313,7 @@ def _extract_random_baseline_from_eval(seed: int) -> float | None:
     return None
 
 
-def build_matrix() -> dict[str, Any]:
+def build_matrix(seeds: tuple[int, ...]) -> dict[str, Any]:
     print("\n=== Phase 5: Evaluation Matrix ===")
     matrix: dict[str, dict[str, list[float]]] = {
         method: {variant: [] for variant in VARIANTS}
@@ -298,14 +321,13 @@ def build_matrix() -> dict[str, Any]:
     }
 
     for method in METHODS:
-        for seed in SEEDS:
+        for seed in seeds:
             if method == "random_policy":
                 ret = _extract_random_baseline_from_eval(seed)
                 if ret is not None:
                     matrix[method]["full_support"].append(ret)
                 continue
-            eval_variants = EVAL_VARIANTS.get(method, ("full_support",))
-            for ev in eval_variants:
+            for ev in EVAL_VARIANTS.get(method, ("full_support",)):
                 suffix = f"_{ev}" if ev != "full_support" else ""
                 eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}{suffix}.json"
                 if not eval_path.exists():
@@ -342,7 +364,7 @@ def build_matrix() -> dict[str, Any]:
     return summary
 
 
-def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def check_gates(summary: dict[str, Any], seeds: tuple[int, ...]) -> dict[str, dict[str, Any]]:
     print("\n=== Validation Gates ===")
     gates: dict[str, dict[str, Any]] = {}
 
@@ -354,7 +376,7 @@ def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
     bo_fs = _mean("base_only", "full_support")
     rp_vals = [
         ret
-        for seed in SEEDS
+        for seed in seeds
         if (ret := _extract_random_baseline_from_eval(seed)) is not None
     ]
     rp_fs = float(np.mean(rp_vals)) if rp_vals else None
@@ -387,37 +409,80 @@ def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return gates
 
 
-def main() -> None:
-    print(f"Step 4: Micro-Train & Evaluation Matrix")
+# ---------------------------------------------------------------------------- main
+
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--phase", choices=["train", "eval", "matrix", "all"], default="all")
+    p.add_argument("--seeds", default="0,1,2", help="comma-separated seeds")
+    p.add_argument("--gpus", default="0,0,0",
+                   help="comma-separated GPU ids = training worker slots")
+    p.add_argument("--eval-workers", type=int, default=6,
+                   help="number of parallel eval workers (CPU-bound)")
+    p.add_argument("--eval-gpu", type=int, default=0,
+                   help="GPU id all eval workers share (eval is CPU-bound)")
+    p.add_argument("--full-diagnostics", action="store_true",
+                   help="run eval WITHOUT --fast (G-TVOI/MI/belief-swap/factor-deletion)")
+    p.add_argument("--updates", type=int, default=5000,
+                   help="train_aris total_updates override")
+    p.add_argument("--eval-episodes", type=int, default=3)
+    p.add_argument("--train-timeout", type=int, default=3600)
+    p.add_argument("--eval-timeout", type=int, default=14400)
+    return p.parse_args(argv)
+
+
+def _write_json(name: str, payload: Any) -> Path:
+    out_path = REPO_ROOT / OUTPUT_DIR / name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    return out_path
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    seeds = tuple(int(x) for x in args.seeds.split(",") if x.strip() != "")
+    gpus = [int(x) for x in args.gpus.split(",") if x.strip() != ""]
+    eval_gpus = [int(args.eval_gpu)] * int(args.eval_workers)
+
+    print("Step 4: Micro-Train & Evaluation Matrix")
+    print(f"Phase: {args.phase}")
     print(f"Methods: {METHODS}")
     print(f"Variants: {VARIANTS}")
-    print(f"Seeds: {SEEDS}")
-    print(f"GPUs: {GPUS}")
-    print(f"Total jobs: {len(METHODS) * len(VARIANTS) * len(SEEDS)}")
+    print(f"Seeds: {seeds}")
+    print(f"Train GPU slots: {gpus} (updates={args.updates})")
+    print(f"Eval workers: {len(eval_gpus)} on GPU {args.eval_gpu} "
+          f"({'full-diagnostics' if args.full_diagnostics else 'fast'})")
     print()
 
-    train_results = run_training_phase()
-    eval_results = run_evaluation_phase()
-    summary = build_matrix()
-    gates = check_gates(summary)
+    if args.phase in ("train", "all"):
+        train_results = run_training_phase(gpus, seeds, args.updates, args.train_timeout)
+        _write_json("train_results.json", {"seeds": seeds, "updates": args.updates,
+                                           "results": train_results})
 
-    output = {
-        "matrix": summary,
-        "gates": gates,
-        "train_results": train_results,
-        "eval_results": eval_results,
-        "config": {
-            "methods": METHODS,
-            "variants": VARIANTS,
-            "seeds": SEEDS,
-            "gpus": GPUS,
-            "eval_episodes": EVAL_EPISODES,
-        },
-    }
-    out_path = REPO_ROOT / OUTPUT_DIR / "step4_matrix.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(output, indent=2, default=str), encoding="utf-8")
-    print(f"\nResults saved to: {out_path}")
+    if args.phase in ("eval", "all"):
+        eval_results = run_evaluation_phase(
+            eval_gpus, seeds, args.eval_episodes, args.full_diagnostics, args.eval_timeout
+        )
+        _write_json("eval_results.json", {"seeds": seeds,
+                                          "full_diagnostics": args.full_diagnostics,
+                                          "results": eval_results})
+
+    if args.phase in ("matrix", "all"):
+        summary = build_matrix(seeds)
+        gates = check_gates(summary, seeds)
+        out_path = _write_json("step4_matrix.json", {
+            "matrix": summary,
+            "gates": gates,
+            "config": {
+                "methods": METHODS,
+                "variants": VARIANTS,
+                "seeds": seeds,
+                "updates": args.updates,
+                "eval_episodes": args.eval_episodes,
+                "full_diagnostics": args.full_diagnostics,
+            },
+        })
+        print(f"\nResults saved to: {out_path}")
 
 
 if __name__ == "__main__":
