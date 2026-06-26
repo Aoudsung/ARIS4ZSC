@@ -17,7 +17,7 @@ layouts:
     min_options: 6
 
 graph:
-  ce_path: outputs/p0_verify/ce_refined.npy
+  ce_path: outputs/p1_verify/ce_refined.npy
   preflight_path: results/ocv2/preflight.json
   ce_eta: 0.05
   max_factors: 16
