@@ -8,17 +8,20 @@ import numpy as np
 from jaxmarl.environments.overcooked_v2.common import Actions, StaticObject
 
 from .state_utils import (
+    agent_facing_pos,
+    cell_is_delivery,
     get_agent_pos,
     get_dynamic_objects_grid,
     get_inventory,
-    has_ingredient_bits,
-    has_plate,
     is_empty_inventory,
+    is_plain_plate,
+    is_pot_full,
     is_pot_ready,
     is_plated_cooked_soup,
 )
 
 GridPos = tuple[int, int]
+EVENT_SEMANTICS_VERSION = 2
 
 _MOVE_ACTIONS = {
     int(Actions.right),
@@ -108,14 +111,20 @@ def extract_event(
         _blocked_move(ego_action, ego_pos_before, ego_pos_after)
         or _blocked_move(partner_action, partner_pos_before, partner_pos_after)
     )
-    delivery_event = _delivered_soup(
-        ego_inventory_before,
-        ego_inventory_after,
-        ego_interacted,
-    ) or _delivered_soup(
-        partner_inventory_before,
-        partner_inventory_after,
-        partner_interacted,
+    delivery_event = (
+        _delivered_soup(
+            ego_inventory_before,
+            ego_inventory_after,
+            ego_interacted,
+        )
+        and _delivery_target(prev_state, 0)
+    ) or (
+        _delivered_soup(
+            partner_inventory_before,
+            partner_inventory_after,
+            partner_interacted,
+        )
+        and _delivery_target(prev_state, 1)
     )
     object_pickup_or_drop = (
         ego_inventory_before != ego_inventory_after
@@ -210,6 +219,10 @@ def _delivered_soup(inv_before: int, inv_after: int, interacted: bool) -> bool:
     return interacted and is_plated_cooked_soup(inv_before) and is_empty_inventory(inv_after)
 
 
+def _delivery_target(state: Any, agent_id: int) -> bool:
+    return cell_is_delivery(state, agent_facing_pos(state, agent_id))
+
+
 def _changed_dynamic_cells(
     prev_dynamic: np.ndarray,
     next_dynamic: np.ndarray,
@@ -265,7 +278,7 @@ def _pot_became_full(
         before_values,
         after_values,
     ):
-        if not has_ingredient_bits(before) and has_ingredient_bits(after):
+        if not is_pot_full(before) and is_pot_full(after):
             return True
     return False
 
@@ -303,7 +316,10 @@ def _pot_became_ready(
 
 def _plate_picked(*inventories: int) -> bool:
     before_after_pairs = ((inventories[0], inventories[1]), (inventories[2], inventories[3]))
-    return any(not has_plate(before) and has_plate(after) for before, after in before_after_pairs)
+    return any(
+        not is_plain_plate(before) and is_plain_plate(after)
+        for before, after in before_after_pairs
+    )
 
 
 def _soup_picked(*inventories: int) -> bool:

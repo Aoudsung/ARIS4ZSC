@@ -41,6 +41,7 @@ from experiments.overcooked_v2.train_aris import (
     _build_belief_model,
     _build_env,
     _build_q_network,
+    _graph_objective_metadata_status,
     _graph_tensors,
     _obs_vector,
     _partner_id_tensor,
@@ -83,6 +84,10 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _load_context(_sibling_checkpoint(anchor, variant), variant)
         for variant in variants
     ]
+    reward_scale_status = {
+        ctx.graph_variant: _graph_objective_metadata_status(ctx.graph, ctx.config)
+        for ctx in contexts
+    }
     partner_names = _resolve_partner_names(contexts[0].option_lib, args.partners)
     seed = int(args.seed)
     max_episode_options = int(
@@ -108,6 +113,12 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 "graph_variant": ctx.graph_variant,
                 "partner": partner_name,
                 "checkpoint": str(ctx.checkpoint_path),
+                "reward_scale_verified": bool(
+                    reward_scale_status[ctx.graph_variant]["reward_scale_verified"]
+                ),
+                "event_semantics_version": reward_scale_status[ctx.graph_variant][
+                    "event_semantics_version"
+                ],
                 "aggregate": aggregate,
                 "episodes": episodes,
                 "factor_deletion_q_proxy": _factor_deletion_q_proxy_diagnostics(ctx),
@@ -159,6 +170,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "max_episode_options": max_episode_options,
         "diagnostic_granularity": "option",
         "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
+        "reward_scale_verified": all(
+            bool(item["reward_scale_verified"])
+            for item in reward_scale_status.values()
+        ),
+        "graph_event_semantics_versions": {
+            variant: status["event_semantics_version"]
+            for variant, status in reward_scale_status.items()
+        },
+        "graph_reward_scale_status": reward_scale_status,
         "reference_gap_semantics": _reference_semantics(external_references is not None),
         "results": results,
         "reference_baselines": baselines,

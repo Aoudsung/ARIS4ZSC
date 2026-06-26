@@ -25,7 +25,7 @@ from src.aris_bellman.specs import GraphSpec, OptionTransition
 from src.aris_bellman.td import aris_td_loss
 
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
-from experiments.overcooked_v2.event_extractor import extract_event
+from experiments.overcooked_v2.event_extractor import EVENT_SEMANTICS_VERSION, extract_event
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.graph_builder import build_graph_variant, validate_task_stage_coverage
 from experiments.overcooked_v2.layout_diagnostics import preflight_layout
@@ -241,6 +241,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     _write_json(output_dir / "preflight_gate.json", preflight_gate)
 
     graph = _build_graph(env, layout_graph, option_lib, config, args)
+    _enforce_graph_objective_metadata(graph, config)
     graph.metadata = {
         **(graph.metadata or {}),
         "preflight_gate": preflight_gate,
@@ -543,12 +544,111 @@ def _build_graph(
             "formal_experiment": True,
             "graph_source": graph_source,
         }
+    ce_meta_path = Path(ce_path).parent / (Path(ce_path).stem + ".meta.json")
+    if ce_meta_path.exists():
+        sidecar_meta = json.loads(ce_meta_path.read_text(encoding="utf-8"))
+        graph.metadata = {**(graph.metadata or {}), **sidecar_meta}
     if graph.num_factors == 0:
         raise RuntimeError(
             "Graph construction produced zero factors. Run layout_preflight or lower "
             "eta explicitly; empty graphs are invalid for ARIS training."
         )
     return graph
+
+
+def _expected_graph_objective_metadata(config: dict[str, Any]) -> dict[str, Any]:
+    training = config["training"]
+    return {
+        "layout": str(config["layout"]),
+        "cost_coef": float(training["cost_coef"]),
+        "cost_per_step": float(training["cost_per_step"]),
+        "shaped_reward_coef": float(training["shaped_reward_coef"]),
+        "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
+    }
+
+
+def _graph_objective_metadata_status(
+    graph: GraphSpec,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    metadata = graph.metadata or {}
+    try:
+        expected = _expected_graph_objective_metadata(config)
+    except KeyError as exc:
+        return {
+            "reward_scale_verified": False,
+            "expected": {},
+            "observed": {},
+            "missing": [],
+            "mismatches": {
+                "config": {
+                    "graph": None,
+                    "config": f"missing required config key {exc}",
+                }
+            },
+            "event_semantics_version": metadata.get("event_semantics_version"),
+        }
+    missing = [key for key in expected if key not in metadata]
+    mismatches: dict[str, dict[str, Any]] = {}
+
+    for key, expected_value in expected.items():
+        if key in missing:
+            continue
+        observed = metadata.get(key)
+        if key in {"cost_coef", "cost_per_step", "shaped_reward_coef"}:
+            try:
+                matches = math.isclose(
+                    float(observed),
+                    float(expected_value),
+                    rel_tol=1e-9,
+                    abs_tol=1e-12,
+                )
+            except (TypeError, ValueError):
+                matches = False
+        elif key == "event_semantics_version":
+            try:
+                matches = int(observed) == int(expected_value)
+            except (TypeError, ValueError):
+                matches = False
+        else:
+            matches = str(observed) == str(expected_value)
+        if not matches:
+            mismatches[key] = {
+                "graph": observed,
+                "config": expected_value,
+            }
+
+    if str(graph.layout_name) != str(expected["layout"]):
+        mismatches["layout_name"] = {
+            "graph": graph.layout_name,
+            "config": expected["layout"],
+        }
+
+    return {
+        "reward_scale_verified": not missing and not mismatches,
+        "expected": expected,
+        "observed": {key: metadata.get(key) for key in expected},
+        "missing": missing,
+        "mismatches": mismatches,
+        "event_semantics_version": metadata.get("event_semantics_version"),
+    }
+
+
+def _enforce_graph_objective_metadata(
+    graph: GraphSpec,
+    config: dict[str, Any],
+) -> None:
+    status = _graph_objective_metadata_status(graph, config)
+    if status["reward_scale_verified"]:
+        return
+    raise RuntimeError(
+        "Loaded CE graph metadata is missing or inconsistent with the training "
+        "objective. Regenerate CE with experiments/overcooked_v2/scripts/"
+        "run_ce_pipeline.py using the current config, then set graph.graph_path "
+        "to the regenerated graph.json before training. "
+        f"Missing: {status['missing']}; mismatches: "
+        f"{json.dumps(_jsonable(status['mismatches']), sort_keys=True)}"
+    )
 
 
 def _build_q_network(

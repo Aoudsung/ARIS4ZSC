@@ -168,7 +168,6 @@ class _EnvSlot:
     partner: Any
     done: bool
     needs_new_option: bool
-    episodes_remaining: int
     rng_seed_base: int
 
 
@@ -204,6 +203,19 @@ def collect_option_replay_batched(
     for partner_idx, partner_template in enumerate(partners):
         print(f"  partner {partner_idx+1}/{len(partners)}: {getattr(partner_template, 'name', '?')}", flush=True)
         episode_base = partner_idx * episodes
+        initial_active = min(batch_size, episodes)
+        next_episode_idx = initial_active
+        completed_episodes = 0
+        completed_episode_ids: set[int] = set()
+
+        def _assign_episode(slot: _EnvSlot, idx: int) -> None:
+            slot.episode_id = episode_base + int(idx)
+            slot.t_option = 0
+            slot.option_id = None
+            slot.option_runtime = None
+            slot.state_key = None
+            slot.needs_new_option = True
+
         slots = [
             _EnvSlot(
                 episode_id=episode_base + i,
@@ -219,9 +231,8 @@ def collect_option_replay_batched(
                 partner_options=[],
                 partner_confidences=[],
                 partner=copy.deepcopy(partner_template),
-                done=i >= episodes,
+                done=i >= initial_active,
                 needs_new_option=True,
-                episodes_remaining=max(0, episodes - i),
                 rng_seed_base=int(rng.integers(0, 2**31 - 1)),
             )
             for i in range(batch_size)
@@ -231,9 +242,9 @@ def collect_option_replay_batched(
             int(rng.integers(0, 2**31 - 1)) for _ in range(batch_size)
         ], dtype=np.int64)
         pool.reset(init_seeds)
-        for slot in slots:
+        for i, slot in enumerate(slots):
             if not slot.done and hasattr(slot.partner, "reset"):
-                slot.partner.reset(int(init_seeds[slots.index(slot)]))
+                slot.partner.reset(int(init_seeds[i]))
 
         active_count = sum(1 for s in slots if not s.done)
         ego_actions = np.zeros(batch_size, dtype=np.int32)
@@ -353,11 +364,16 @@ def collect_option_replay_batched(
                     slot.needs_new_option = True
 
                 if done_i or slot.t_option >= option_limit:
-                    slot.episodes_remaining -= 1
-                    if slot.episodes_remaining > 0:
-                        slot.episode_id = episode_base + (episodes - slot.episodes_remaining)
-                        slot.t_option = 0
-                        slot.needs_new_option = True
+                    completed_episodes += 1
+                    if int(slot.episode_id) in completed_episode_ids:
+                        raise RuntimeError(
+                            f"Batched CE produced duplicate episode_id "
+                            f"{slot.episode_id} for partner {partner_idx}."
+                        )
+                    completed_episode_ids.add(int(slot.episode_id))
+                    if next_episode_idx < episodes:
+                        _assign_episode(slot, next_episode_idx)
+                        next_episode_idx += 1
                         new_seed = int(rng.integers(0, 2**31 - 1))
                         reset_indices.append(i)
                         reset_seeds.append(new_seed)
@@ -374,8 +390,13 @@ def collect_option_replay_batched(
                 )
 
         _elapsed = _time.monotonic() - _t0
-        _ep_done = sum(episodes - s.episodes_remaining for s in slots)
-        print(f"    → {_ep_done}/{episodes} episodes done, {len(rows)} rows, {_elapsed:.1f}s elapsed", flush=True)
+        if completed_episodes != episodes or len(completed_episode_ids) != episodes:
+            raise RuntimeError(
+                f"Batched CE completed {completed_episodes} episodes with "
+                f"{len(completed_episode_ids)} unique episode_ids for partner "
+                f"{partner_idx}, expected {episodes}."
+            )
+        print(f"    → {completed_episodes}/{episodes} episodes done, {len(rows)} rows, {_elapsed:.1f}s elapsed", flush=True)
 
     compute_local_returns(
         rows, gamma=gamma, horizon=horizon_options,

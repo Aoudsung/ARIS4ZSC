@@ -54,6 +54,11 @@ def is_plated_cooked_soup(inv: int) -> bool:
     return has_plate(obj) and is_cooked(obj) and has_ingredient_bits(obj)
 
 
+def is_plain_plate(inv: int) -> bool:
+    obj = int(inv)
+    return has_plate(obj) and not has_ingredient_bits(obj) and not is_cooked(obj)
+
+
 def is_pot_ready(contents: int) -> bool:
     return is_cooked(contents) and has_ingredient_bits(contents) and not has_plate(contents)
 
@@ -104,6 +109,16 @@ def get_cell_extra(state: Any, pos: GridPos) -> int:
         return 0
     x, y = pos
     return _to_int(grid[y, x, 2])
+
+
+def cell_is_delivery(state: Any, pos: GridPos) -> bool:
+    grid = np.asarray(state.grid)
+    x, y = pos
+    if grid.ndim < 3 or grid.shape[2] <= 0:
+        return False
+    if 0 <= y < grid.shape[0] and 0 <= x < grid.shape[1]:
+        return int(grid[y, x, 0]) == int(StaticObject.GOAL)
+    return False
 
 
 def is_pot_cooking(state: Any, pos: GridPos) -> bool:
