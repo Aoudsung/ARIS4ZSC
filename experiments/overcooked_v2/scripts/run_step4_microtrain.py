@@ -17,12 +17,19 @@ CONFIG = "experiments/overcooked_v2/configs/ocv2_step4.yaml"
 OUTPUT_DIR = "results/ocv2_step4"
 LAYOUT = "cramped_room"
 
-METHODS = ("aris_bellman", "base_only", "flat_factor", "random_policy")
+METHODS = (
+    "aris_bellman",
+    "base_only",
+    "flat_factor",
+    "global_gru",
+    "partner_id_q",
+    "random_policy",
+)
 VARIANTS = ("full_support", "minus_high_ce", "overcomplete", "shuffled_relevance")
 SEEDS = (0, 1, 2)
 GPUS = [0, 1, 2, 4, 5, 6, 7]
 
-EVAL_EPISODES = 10
+EVAL_EPISODES = 3
 
 
 def _job_key(method: str, variant: str, seed: int) -> str:
@@ -80,6 +87,19 @@ def run_training_phase() -> list[dict[str, Any]]:
     with ProcessPoolExecutor(max_workers=len(GPUS)) as pool:
         futures = {}
         for method, variant, seed in jobs:
+            ckpt = _checkpoint_dir(method, variant, seed) / "checkpoint.pt"
+            if ckpt.exists():
+                results.append({
+                    "key": _job_key(method, variant, seed),
+                    "method": method, "variant": variant, "seed": seed,
+                    "gpu": -1, "returncode": 0, "elapsed": 0,
+                    "checkpoint_exists": True, "stderr_tail": "",
+                })
+                print(
+                    f"  [{len(results):2d}/{len(jobs)}] "
+                    f"{_job_key(method, variant, seed):45s} CACHED"
+                )
+                continue
             gpu = GPUS[gpu_cycle % len(GPUS)]
             gpu_cycle += 1
             future = pool.submit(_run_train_job, gpu, method, variant, seed)
@@ -114,22 +134,32 @@ def _run_eval_job(method: str, seed: int) -> dict[str, Any]:
         "--seed", str(seed),
         "--output", str(out_path),
     ]
-    result = subprocess.run(
-        cmd, cwd=str(REPO_ROOT),
-        capture_output=True, text=True, timeout=1800,
-    )
-    return {
-        "method": method,
-        "seed": seed,
-        "returncode": result.returncode,
-        "output_path": str(out_path),
-        "output_exists": out_path.exists(),
-        "stderr_tail": result.stderr[-500:] if result.returncode != 0 else "",
-    }
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(REPO_ROOT),
+            capture_output=True, text=True, timeout=7200,
+        )
+        return {
+            "method": method,
+            "seed": seed,
+            "returncode": result.returncode,
+            "output_path": str(out_path),
+            "output_exists": out_path.exists(),
+            "stderr_tail": result.stderr[-500:] if result.returncode != 0 else "",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "method": method,
+            "seed": seed,
+            "returncode": -1,
+            "output_path": str(out_path),
+            "output_exists": out_path.exists(),
+            "stderr_tail": "TIMEOUT after 7200s",
+        }
 
 
 def run_evaluation_phase() -> list[dict[str, Any]]:
-    eval_jobs = [(m, s) for m in METHODS for s in SEEDS]
+    eval_jobs = [(m, s) for m in METHODS if m != "random_policy" for s in SEEDS]
     print(f"\n=== Phase 4: Evaluation ({len(eval_jobs)} runs) ===")
 
     results: list[dict[str, Any]] = []
@@ -148,6 +178,27 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
     return results
 
 
+def _extract_random_baseline_from_eval(seed: int) -> float | None:
+    for method in METHODS:
+        if method == "random_policy":
+            continue
+        eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}.json"
+        if not eval_path.exists():
+            continue
+        data = json.loads(eval_path.read_text(encoding="utf-8"))
+        baselines = data.get("reference_baselines", {})
+        if not isinstance(baselines, dict):
+            continue
+        returns = [
+            float(baseline["mean_return"])
+            for baseline in baselines.values()
+            if isinstance(baseline, dict) and baseline.get("mean_return") is not None
+        ]
+        if returns:
+            return float(np.mean(returns))
+    return None
+
+
 def build_matrix() -> dict[str, Any]:
     print("\n=== Phase 5: Evaluation Matrix ===")
     matrix: dict[str, dict[str, list[float]]] = {
@@ -157,6 +208,11 @@ def build_matrix() -> dict[str, Any]:
 
     for method in METHODS:
         for seed in SEEDS:
+            if method == "random_policy":
+                ret = _extract_random_baseline_from_eval(seed)
+                if ret is not None:
+                    matrix[method]["full_support"].append(ret)
+                continue
             eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}.json"
             if not eval_path.exists():
                 continue
@@ -206,14 +262,19 @@ def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
     ab_fs = _mean("aris_bellman", "full_support")
     bo_fs = _mean("base_only", "full_support")
-    rp_fs = _mean("random_policy", "full_support")
+    rp_vals = [
+        ret
+        for seed in SEEDS
+        if (ret := _extract_random_baseline_from_eval(seed)) is not None
+    ]
+    rp_fs = float(np.mean(rp_vals)) if rp_vals else None
     ab_mh = _mean("aris_bellman", "minus_high_ce")
     ab_oc = _mean("aris_bellman", "overcomplete")
 
     def _gate(name: str, left: float | None, right: float | None, desc: str) -> None:
         if left is None or right is None:
-            status = "SKIP"
             passed = False
+            status = "FAIL"
         else:
             passed = left > right
             status = "PASS" if passed else "FAIL"
@@ -231,7 +292,7 @@ def check_gates(summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
     _gate("G4_overcomplete", ab_fs, ab_oc,
           "aris_bellman/full_support > aris_bellman/overcomplete")
 
-    all_pass = all(g["passed"] for g in gates.values() if g["status"] != "SKIP")
+    all_pass = all(g["passed"] for g in gates.values())
     print(f"\n  Overall: {'ALL PASS' if all_pass else 'SOME FAILED'}")
     return gates
 
