@@ -111,7 +111,7 @@ def extract_event(
         _blocked_move(ego_action, ego_pos_before, ego_pos_after)
         or _blocked_move(partner_action, partner_pos_before, partner_pos_after)
     )
-    delivery_event = (
+    heuristic_delivery = (
         _delivered_soup(
             ego_inventory_before,
             ego_inventory_after,
@@ -126,6 +126,9 @@ def extract_event(
         )
         and _delivery_target(prev_state, 1)
     )
+    correct_delivery = bool(np.asarray(next_state.new_correct_delivery).item())
+    delivery_event = bool(heuristic_delivery or correct_delivery)
+    wrong_delivery_event = bool(delivery_event and not correct_delivery)
     object_pickup_or_drop = (
         ego_inventory_before != ego_inventory_after
         or partner_inventory_before != partner_inventory_after
@@ -162,8 +165,6 @@ def extract_event(
         partner_inventory_before,
         partner_inventory_after,
     )
-    wrong_delivery_event = _explicit_wrong_delivery(info)
-    correct_delivery = bool(delivery_event and not wrong_delivery_event)
     recipe_indicator_event = _positive_shaped_reward(info) and not object_pickup_or_drop
     button_pressed = (ego_interacted or partner_interacted) and recipe_indicator_event
 
@@ -328,13 +329,6 @@ def _soup_picked(*inventories: int) -> bool:
         not is_plated_cooked_soup(before) and is_plated_cooked_soup(after)
         for before, after in before_after_pairs
     )
-
-
-def _explicit_wrong_delivery(info: dict[str, Any]) -> bool:
-    for key in ("wrong_delivery", "wrong_delivery_event"):
-        if key in info:
-            return bool(np.asarray(info[key]).item())
-    return False
 
 
 def _partner_option_confidence(

@@ -54,6 +54,7 @@ def _state(
     grid: np.ndarray | None = None,
     dir0: int | None = None,
     dir1: int | None = None,
+    new_correct_delivery: bool = False,
 ) -> SimpleNamespace:
     direction = _direction_for((1, 0))
     agents = SimpleNamespace(
@@ -71,6 +72,7 @@ def _state(
         agents=agents,
         grid=np.zeros((4, 4, 3), dtype=np.int32) if grid is None else grid,
         recipe=np.asarray(_ingredients(int(MAX_INGREDIENTS))),
+        new_correct_delivery=np.asarray(new_correct_delivery),
     )
 
 
@@ -137,6 +139,7 @@ def test_delivery_requires_facing_goal_cell() -> None:
         inventory0=0,
         grid=_grid(target_pos, StaticObject.GOAL),
         dir0=direction,
+        new_correct_delivery=True,
     )
 
     goal_event = extract_event(
@@ -150,7 +153,81 @@ def test_delivery_requires_facing_goal_cell() -> None:
     )
 
     assert counter_event.delivery_event is False
+    assert counter_event.correct_delivery is False
+    assert counter_event.wrong_delivery_event is False
     assert goal_event.delivery_event is True
+    assert goal_event.correct_delivery is True
+    assert goal_event.wrong_delivery_event is False
+
+
+def test_wrong_recipe_goal_drop_is_wrong_delivery() -> None:
+    agent_pos = (1, 1)
+    target_pos = (2, 1)
+    soup = _plated_cooked_soup()
+    direction = _direction_for((1, 0))
+
+    prev_state = _state(
+        agent0_pos=agent_pos,
+        inventory0=soup,
+        grid=_grid(target_pos, StaticObject.GOAL),
+        dir0=direction,
+    )
+    next_state = _state(
+        agent0_pos=agent_pos,
+        inventory0=0,
+        grid=_grid(target_pos, StaticObject.GOAL),
+        dir0=direction,
+        new_correct_delivery=False,
+    )
+
+    event = extract_event(
+        prev_state,
+        int(Actions.interact),
+        int(Actions.stay),
+        next_state,
+        {},
+        partner_option=None,
+        partner_option_dist=None,
+    )
+
+    assert event.delivery_event is True
+    assert event.correct_delivery is False
+    assert event.wrong_delivery_event is True
+
+
+def test_counter_drop_is_not_delivery() -> None:
+    agent_pos = (1, 1)
+    target_pos = (2, 1)
+    soup = _plated_cooked_soup()
+    direction = _direction_for((1, 0))
+
+    prev_state = _state(
+        agent0_pos=agent_pos,
+        inventory0=soup,
+        grid=_grid(target_pos, StaticObject.WALL),
+        dir0=direction,
+    )
+    next_state = _state(
+        agent0_pos=agent_pos,
+        inventory0=0,
+        grid=_grid(target_pos, StaticObject.WALL),
+        dir0=direction,
+        new_correct_delivery=False,
+    )
+
+    event = extract_event(
+        prev_state,
+        int(Actions.interact),
+        int(Actions.stay),
+        next_state,
+        {},
+        partner_option=None,
+        partner_option_dist=None,
+    )
+
+    assert event.delivery_event is False
+    assert event.correct_delivery is False
+    assert event.wrong_delivery_event is False
 
 
 def test_plate_pickup_excludes_plated_soup_pickup() -> None:

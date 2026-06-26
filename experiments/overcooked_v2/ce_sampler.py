@@ -10,12 +10,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
+import yaml
 
 if __package__ in {None, ""}:  # pragma: no cover - script execution path
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
-from experiments.overcooked_v2.event_extractor import OCV2Event, extract_event
+from experiments.overcooked_v2.event_extractor import (
+    EVENT_SEMANTICS_VERSION,
+    OCV2Event,
+    extract_event,
+)
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
@@ -959,6 +964,29 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         raise ValueError(
             "Phase 4 CE collection supports scripted_debug/train/all partner selectors."
         )
+    if args.config:
+        with open(args.config, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh)
+        tcfg = cfg["training"]
+        cost_coef = float(tcfg["cost_coef"])
+        shaped_reward_coef = float(tcfg["shaped_reward_coef"])
+        cost_per_step = float(tcfg["cost_per_step"])
+        reward_scale_source = "config.training"
+    else:
+        if (
+            args.cost_coef is None
+            or args.shaped_reward_coef is None
+            or args.cost_per_step is None
+        ):
+            raise ValueError(
+                "ce_sampler collect requires --config or all of "
+                "--cost_coef/--shaped_reward_coef/--cost_per_step "
+                "(no silent default reward scale)."
+            )
+        cost_coef = float(args.cost_coef)
+        shaped_reward_coef = float(args.shaped_reward_coef)
+        cost_per_step = float(args.cost_per_step)
+        reward_scale_source = "cli_explicit"
     partners = make_training_partners(option_lib)
     collect_fn = collect_option_replay_batched if args.batch_size > 1 else collect_option_replay
     collect_kwargs = dict(
@@ -968,9 +996,9 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         seed=args.seed,
         gamma=args.gamma,
         horizon_options=args.horizon_options,
-        cost_per_step=args.cost_per_step,
-        cost_coef=args.cost_coef,
-        shaped_reward_coef=args.shaped_reward_coef,
+        cost_per_step=cost_per_step,
+        cost_coef=cost_coef,
+        shaped_reward_coef=shaped_reward_coef,
     )
     if args.batch_size > 1:
         collect_kwargs["batch_size"] = args.batch_size
@@ -988,9 +1016,11 @@ def _cmd_collect(args: argparse.Namespace) -> None:
             "episodes_per_partner": args.episodes,
             "num_rows": len(rows),
             "partners": [partner.name for partner in partners],
-            "cost_coef": float(args.cost_coef),
-            "cost_per_step": float(args.cost_per_step),
-            "shaped_reward_coef": float(args.shaped_reward_coef),
+            "cost_coef": cost_coef,
+            "cost_per_step": cost_per_step,
+            "shaped_reward_coef": shaped_reward_coef,
+            "reward_scale_source": reward_scale_source,
+            "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
             "coverage": coverage,
             "coverage_gate": coverage_gate,
             "option_kind_stats": option_kind_stats(rows, option_lib.options),
@@ -1043,9 +1073,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     collect.add_argument("--partners", default="scripted_debug")
     collect.add_argument("--seed", type=int, default=0)
     collect.add_argument("--gamma", type=float, default=0.99)
-    collect.add_argument("--cost_per_step", type=float, default=1.0)
-    collect.add_argument("--cost_coef", type=float, default=1.0)
-    collect.add_argument("--shaped_reward_coef", type=float, default=0.0)
+    collect.add_argument("--config", default=None)
+    collect.add_argument("--cost_per_step", type=float, default=None)
+    collect.add_argument("--cost_coef", type=float, default=None)
+    collect.add_argument("--shaped_reward_coef", type=float, default=None)
     collect.add_argument("--max_steps", type=int, default=200)
     collect.add_argument("--max_option_steps", type=int, default=12)
     collect.add_argument("--max_options_per_episode", type=int, default=None)

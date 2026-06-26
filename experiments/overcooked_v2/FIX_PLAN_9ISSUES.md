@@ -425,6 +425,56 @@ Test (write only, execution-gated): unit test that a graph whose metadata is mer
 from a sidecar dict matching a config passes `_graph_objective_metadata_status[...
 reward_scale_verified] is True`, and a graph without it is False.
 
+## P2 / P6 FULL CLOSURE (remote-verified facts)
+
+Remote env verified at
+/apps/users/cxw/Document/CodeSpace/Selfs/TG-SSA/external/JaxMARL/jaxmarl/environments/overcooked_v2/overcooked.py:
+- `step_env` info dict = ONLY `{"shaped_reward": ...}` (overcooked.py:210). There is NO
+  `correct_delivery`/`successful_delivery` info key → the planned `_delivery_from_info()`
+  is not implementable, and the existing `_explicit_wrong_delivery(info)` (reads
+  `info["wrong_delivery"]`) NEVER fires → `correct_delivery` currently == `delivery_event`
+  (latent bug: wrong deliveries counted as correct).
+- The AUTHORITATIVE correct-delivery signal lives on STATE: `state.new_correct_delivery`
+  (set during step, overcooked.py:1181; consumed in obs at 640-649).
+
+### P2 fix (event_extractor.py)
+Reorder + use the authoritative state signal:
+1. heuristic_delivery = (ego `_delivered_soup` AND `_delivery_target(prev_state,0)`) OR
+   (partner `_delivered_soup` AND `_delivery_target(prev_state,1)`)  [already implemented]
+2. `correct_delivery = bool(np.asarray(next_state.new_correct_delivery).item())`  [authoritative]
+3. `delivery_event = bool(heuristic_delivery or correct_delivery)`  [superset; never misses a
+   correct delivery, still catches wrong-recipe drops on GOAL]
+4. `wrong_delivery_event = bool(delivery_event and not correct_delivery)`
+5. Remove the now-dead `_explicit_wrong_delivery` + its `info` usage (verify no other refs).
+Semantics: delivery_event = any dish delivered to GOAL; correct_delivery = reward-earning
+correct-recipe delivery (authoritative); wrong_delivery_event = delivered to GOAL but wrong.
+Tests (extend tests/test_event_extractor.py + its `_state` stub to carry
+`new_correct_delivery`): correct-recipe@GOAL → delivery_event True, correct_delivery True,
+wrong_delivery_event False; wrong-recipe@GOAL (new_correct_delivery False) → delivery_event
+True, correct_delivery False, wrong_delivery_event True; counter(WALL) drop → delivery_event
+False.
+
+### P6 fix (ce_sampler.py collect CLI)
+Verified: `collect` defaults `--cost_coef 1.0 --shaped_reward_coef 0.0` (ce_sampler.py:1047-1049);
+`_cmd_collect` passes them to the collector AND stamps them into the metadata sidecar; ce_sampler
+does NOT import yaml. run_ce_pipeline does not use this CLI (imports collect_option_replay
+directly), so changing the CLI is safe.
+1. `import yaml`; `from experiments.overcooked_v2.event_extractor import EVENT_SEMANTICS_VERSION`.
+2. Add `--config` to the collect subparser; change `--cost_coef/--shaped_reward_coef/--cost_per_step`
+   defaults to None.
+3. In `_cmd_collect`, resolve reward scale BEFORE collecting:
+   - if `args.config`: load yaml, read `training.{cost_coef,shaped_reward_coef,cost_per_step}`;
+     reward_scale_source = "config.training".
+   - else: if any of the three is None → raise ValueError("pass --config or all of
+     --cost_coef/--shaped_reward_coef/--cost_per_step for formal CE"); else use explicit values,
+     reward_scale_source = "cli_explicit".
+4. Use the resolved values in collect_kwargs and in the metadata sidecar, plus add
+   `reward_scale_source` and `event_semantics_version` to that metadata. No silent old-scale path.
+
+Guard rails: do NOT touch run_step4_microtrain.py / outputs/; do NOT run anything; no
+over-defensive fallbacks (direct `next_state.new_correct_delivery` access — it is confirmed
+present; a future env lacking it should error, not be masked).
+
 ## Anti-pattern self-check
 - No fix weakens a real signal (no regressive changes).
 - Problem 7 explicitly REMOVES over-defensive logging-only behavior.
