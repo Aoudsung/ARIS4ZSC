@@ -27,7 +27,11 @@ METHODS = (
 )
 VARIANTS = ("full_support", "minus_high_ce", "overcomplete", "shuffled_relevance")
 SEEDS = (0, 1, 2)
-GPUS = [0, 2, 4, 5, 6, 7]
+# Single-GPU Docker (1x L40, 144 CPU cores). Over-subscribe the one physical GPU:
+# training is light (hidden_dim=64, 1000 updates) so 3 share GPU 0 with XLA prealloc off;
+# eval runs PyTorch on CPU (GPU does only light JAX env steps) so it parallelizes on cores.
+GPUS = [0, 0, 0]
+EVAL_GPUS = [0, 0, 0, 0, 0, 0]
 
 EVAL_EPISODES = 3
 EVAL_VARIANTS: dict[str, tuple[str, ...]] = {
@@ -45,7 +49,11 @@ def _checkpoint_dir(method: str, variant: str, seed: int) -> Path:
 
 def _run_train_job(gpu: int, method: str, variant: str, seed: int) -> dict[str, Any]:
     key = _job_key(method, variant, seed)
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)}
+    env = {
+        **os.environ,
+        "CUDA_VISIBLE_DEVICES": str(gpu),
+        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+    }
     cmd = [
         sys.executable,
         str(REPO_ROOT / "experiments" / "overcooked_v2" / "train_aris.py"),
@@ -160,6 +168,7 @@ def _run_eval_job(gpu: int, method: str, seed: int, variant: str = "full_support
         "--episodes", str(EVAL_EPISODES),
         "--seed", str(seed),
         "--output", str(out_path),
+        "--fast",
     ]
     if out_path.exists():
         out_path.unlink()
@@ -212,11 +221,11 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
             for s in SEEDS:
                 if (_checkpoint_dir(m, v, s) / "checkpoint.pt").exists():
                     pending.append((m, s, v))
-    print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(GPUS)} GPUs parallel) ===")
+    print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(EVAL_GPUS)} workers parallel) ===")
 
     results: list[dict[str, Any]] = []
-    gpu_pool = list(GPUS)
-    with ProcessPoolExecutor(max_workers=len(GPUS)) as pool:
+    gpu_pool = list(EVAL_GPUS)
+    with ProcessPoolExecutor(max_workers=len(EVAL_GPUS)) as pool:
         active: dict[Any, int] = {}
         job_iter = iter(pending)
 

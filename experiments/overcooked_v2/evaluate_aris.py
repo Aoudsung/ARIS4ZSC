@@ -95,6 +95,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         or contexts[0].config["training"].get("max_episode_options", 20)
     )
 
+    fast = bool(getattr(args, "fast", False))
     results = []
     for ctx in contexts:
         for partner_name in partner_names:
@@ -106,7 +107,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 max_episode_options=max_episode_options,
                 graph_override=ctx.graph,
                 random_policy=False,
-                collect_diagnostics=True,
+                collect_diagnostics=not fast,
             )
             result = {
                 "method": ctx.method,
@@ -121,7 +122,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 ],
                 "aggregate": aggregate,
                 "episodes": episodes,
-                "factor_deletion_q_proxy": _factor_deletion_q_proxy_diagnostics(ctx),
+                "factor_deletion_q_proxy": (
+                    [] if fast else _factor_deletion_q_proxy_diagnostics(ctx)
+                ),
             }
             if int(args.factor_deletion_episodes) > 0:
                 result["factor_deletion_return_drop"] = (
@@ -1057,6 +1060,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_episode_options", type=int, default=0)
     parser.add_argument("--factor_deletion_episodes", type=int, default=0)
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Gate-only mode: skip per-option diagnostics and factor q-proxy "
+        "(mean_return unaffected). Used for fast verification matrices.",
+    )
     parser.add_argument("--reference_base_checkpoint", default=None)
     parser.add_argument("--reference_ref_checkpoint", default=None)
     return parser
