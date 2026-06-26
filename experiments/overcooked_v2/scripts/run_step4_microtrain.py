@@ -134,9 +134,10 @@ def _run_eval_job(method: str, seed: int) -> dict[str, Any]:
         "--seed", str(seed),
         "--output", str(out_path),
     ]
+    eval_env = {**os.environ, "CUDA_VISIBLE_DEVICES": ",".join(str(g) for g in GPUS)}
     try:
         result = subprocess.run(
-            cmd, cwd=str(REPO_ROOT),
+            cmd, env=eval_env, cwd=str(REPO_ROOT),
             capture_output=True, text=True, timeout=7200,
         )
         return {
