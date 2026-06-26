@@ -147,19 +147,15 @@ def run_training_phase() -> list[dict[str, Any]]:
     return results
 
 
-def _eval_variants_for(method: str) -> tuple[str, ...]:
-    return EVAL_VARIANTS.get(method, ("full_support",))
-
-
-def _run_eval_job(gpu: int, method: str, seed: int) -> dict[str, Any]:
-    variants = _eval_variants_for(method)
-    ckpt_dir = _checkpoint_dir(method, "full_support", seed)
-    out_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}.json"
+def _run_eval_job(gpu: int, method: str, seed: int, variant: str = "full_support") -> dict[str, Any]:
+    ckpt_dir = _checkpoint_dir(method, variant, seed)
+    suffix = f"_{variant}" if variant != "full_support" else ""
+    out_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}{suffix}.json"
     cmd = [
         sys.executable,
         str(REPO_ROOT / "experiments" / "overcooked_v2" / "evaluate_aris.py"),
         "--checkpoint", str(ckpt_dir),
-        "--graph_variants", ",".join(variants),
+        "--graph_variants", variant,
         "--partners", "all",
         "--episodes", str(EVAL_EPISODES),
         "--seed", str(seed),
@@ -184,7 +180,7 @@ def _run_eval_job(gpu: int, method: str, seed: int) -> dict[str, Any]:
             "method": method,
             "seed": seed,
             "gpu": gpu,
-            "variants": variants,
+            "variant": variant,
             "returncode": result.returncode,
             "elapsed": elapsed,
             "output_path": str(out_path),
@@ -197,7 +193,7 @@ def _run_eval_job(gpu: int, method: str, seed: int) -> dict[str, Any]:
             "method": method,
             "seed": seed,
             "gpu": gpu,
-            "variants": variants,
+            "variant": variant,
             "returncode": -1,
             "elapsed": elapsed,
             "output_path": str(out_path),
@@ -207,12 +203,15 @@ def _run_eval_job(gpu: int, method: str, seed: int) -> dict[str, Any]:
 
 
 def run_evaluation_phase() -> list[dict[str, Any]]:
-    pending = [
-        (m, s)
-        for m in METHODS if m != "random_policy"
-        for s in SEEDS
-        if (_checkpoint_dir(m, "full_support", s) / "checkpoint.pt").exists()
-    ]
+    pending: list[tuple[str, int, str]] = []
+    for m in METHODS:
+        if m == "random_policy":
+            continue
+        variants = EVAL_VARIANTS.get(m, ("full_support",))
+        for v in variants:
+            for s in SEEDS:
+                if (_checkpoint_dir(m, v, s) / "checkpoint.pt").exists():
+                    pending.append((m, s, v))
     print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(GPUS)} GPUs parallel) ===")
 
     results: list[dict[str, Any]] = []
@@ -225,11 +224,11 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
             if not gpu_pool:
                 return False
             try:
-                method, seed = next(job_iter)
+                method, seed, variant = next(job_iter)
             except StopIteration:
                 return False
             gpu = gpu_pool.pop(0)
-            future = pool.submit(_run_eval_job, gpu, method, seed)
+            future = pool.submit(_run_eval_job, gpu, method, seed, variant)
             active[future] = gpu
             return True
 
@@ -247,11 +246,10 @@ def run_evaluation_phase() -> list[dict[str, Any]]:
                 info = future.result()
                 results.append(info)
                 status = "OK" if info["ok"] else "FAIL"
-                vcount = len(info["variants"])
                 print(
                     f"  [{len(results):2d}/{len(pending)}] "
-                    f"{info['method']}/seed{info['seed']} "
-                    f"GPU:{info['gpu']} {vcount}v {status} ({info['elapsed']:.0f}s)"
+                    f"{info['method']}/{info['variant']}/seed{info['seed']} "
+                    f"GPU:{info['gpu']} {status} ({info['elapsed']:.0f}s)"
                 )
                 if not info["ok"]:
                     print(f"    stderr: {info['stderr_tail']}")
@@ -297,19 +295,18 @@ def build_matrix() -> dict[str, Any]:
                 if ret is not None:
                     matrix[method]["full_support"].append(ret)
                 continue
-            eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}.json"
-            if not eval_path.exists():
-                continue
-            data = json.loads(eval_path.read_text(encoding="utf-8"))
-            per_variant: dict[str, list[float]] = {}
-            for entry in data.get("results", []):
-                variant = entry.get("graph_variant", "")
-                ret = entry.get("aggregate", {}).get("mean_return")
-                if variant and ret is not None:
-                    per_variant.setdefault(variant, []).append(float(ret))
-            for variant in VARIANTS:
-                if variant in per_variant:
-                    matrix[method][variant].append(np.mean(per_variant[variant]))
+            eval_variants = EVAL_VARIANTS.get(method, ("full_support",))
+            for ev in eval_variants:
+                suffix = f"_{ev}" if ev != "full_support" else ""
+                eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}{suffix}.json"
+                if not eval_path.exists():
+                    continue
+                data = json.loads(eval_path.read_text(encoding="utf-8"))
+                for entry in data.get("results", []):
+                    variant = entry.get("graph_variant", "")
+                    ret = entry.get("aggregate", {}).get("mean_return")
+                    if variant in VARIANTS and ret is not None:
+                        matrix[method][variant].append(float(ret))
 
     print(f"\n{'Method':25s}", end="")
     for v in VARIANTS:

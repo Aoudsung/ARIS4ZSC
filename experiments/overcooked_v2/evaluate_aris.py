@@ -452,6 +452,14 @@ def _execute_eval_option(
     )
 
 
+_DIAG_SKIP = {
+    "delta_info": 0.0,
+    "mi": 0.0,
+    "diagnostic_cost": 0.0,
+    "belief_swap": {"status": "shape_mismatch"},
+}
+
+
 def _option_diagnostics(
     ctx: EvalContext,
     obs_next: dict[str, np.ndarray],
@@ -461,6 +469,9 @@ def _option_diagnostics(
     graph: GraphSpec,
 ) -> dict[str, Any]:
     graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
+    mode_mask = graph_batch["mode_mask"]
+    if belief_before.shape != mode_mask.shape:
+        return dict(_DIAG_SKIP)
     obs_tensor = _tensor(_obs_vector(obs_next, "agent_0")[None, ...], torch.device("cpu"))
     with torch.no_grad():
         delta = realized_delta_info(
@@ -471,7 +482,7 @@ def _option_diagnostics(
             graph_batch,
             gamma=float(ctx.config["training"]["gamma"]),
         )
-        mi = mutual_information_proxy(belief_before, belief_after, graph_batch["mode_mask"])
+        mi = mutual_information_proxy(belief_before, belief_after, mode_mask)
         q_base = _base_q_values(ctx, obs_tensor, graph_batch, belief_after)
         _, cost = diagnostic_cost(q_base, int(option_id), delta, tau=0.0)
         swap = belief_swap_top_pairs(ctx.q_net, obs_tensor, belief_after, graph_batch, graph)
