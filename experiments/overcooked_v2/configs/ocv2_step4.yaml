@@ -1,0 +1,57 @@
+layout: cramped_room
+
+env:
+  max_steps: 200
+  observation_type: default
+  negative_rewards: true
+  sample_recipe_on_delivery: true
+  random_reset: false
+  random_agent_positions: false
+  force_path_planning: false
+
+options:
+  max_option_steps: 6
+
+layouts:
+  filter:
+    min_options: 6
+
+graph:
+  ce_path: outputs/p0_verify/ce_refined.npy
+  preflight_path: results/ocv2/preflight.json
+  ce_eta: 0.05
+  max_factors: 16
+  full_max_factors: 16
+  overcomplete_extra_factors: 8
+  local_return_horizon_options: 3
+  modes:
+    bottleneck: 3
+    resource: 2
+    handoff: 3
+    serving: 2
+    pot_allocation: 2
+    recipe_indicator: 2
+    generic_option_pair: 3
+
+training:
+  require_preflight_accepted: true
+  total_updates: 1000
+  updates_per_transition: 8
+  batch_size: 8
+  warmup_transitions: 8
+  replay_size: 5000
+  gamma: 0.99
+  cost_coef: 0.02
+  cost_per_step: 1.0
+  shaped_reward_coef: 1.0
+  learning_rate: 0.0003
+  hidden_dim: 64
+  obs_encoder: auto
+  num_partners: 6
+  evidence_window: 4
+  target_update_interval: 50
+  grad_clip_norm: 5.0
+  epsilon_start: 0.35
+  epsilon_end: 0.05
+  max_episode_options: 20
+  log_interval: 100
