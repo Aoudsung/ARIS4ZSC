@@ -44,6 +44,7 @@ class FactorLocalQNetwork(nn.Module):
         max_modes: int | None = None,
         option_feature_dim: int = 0,
         factor_feature_dim: int = 0,
+        advantage_norm: str = "none",
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -60,6 +61,12 @@ class FactorLocalQNetwork(nn.Module):
         self.hidden_dim = hidden_dim
         self.option_feature_dim = int(option_feature_dim)
         self.factor_feature_dim = int(factor_feature_dim)
+        if advantage_norm not in {"none", "relevant_count", "sqrt_relevant"}:
+            raise ValueError(
+                "advantage_norm must be one of "
+                "{'none', 'relevant_count', 'sqrt_relevant'}."
+            )
+        self.advantage_norm = str(advantage_norm)
 
         self.base = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -251,7 +258,16 @@ class FactorLocalQNetwork(nn.Module):
         )
         adv = adv * rel.to(dtype=adv.dtype)
         adv = adv * factor_mask[:, :, None].to(dtype=adv.dtype)
-        q_values = q_base + adv.sum(dim=1)
+        adv_sum = adv.sum(dim=1)
+        if self.advantage_norm != "none":
+            relevant_count = (
+                rel & factor_mask[:, :, None].to(dtype=torch.bool)
+            ).sum(dim=1).clamp(min=1)
+            scale = relevant_count.to(dtype=adv_sum.dtype)
+            if self.advantage_norm == "sqrt_relevant":
+                scale = torch.sqrt(scale)
+            adv_sum = adv_sum / scale
+        q_values = q_base + adv_sum
         return _mask_options(q_values, option_mask)
 
     def _toy_mode_mask(

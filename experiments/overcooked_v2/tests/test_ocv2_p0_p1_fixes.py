@@ -9,7 +9,9 @@ import pytest
 import torch
 from jaxmarl.environments.overcooked_v2.common import Actions, DynamicObject, StaticObject
 
+from src.aris_bellman.factor_q import FactorLocalQNetwork
 from src.aris_bellman.specs import FactorSpec, GraphSpec, OptionSpec
+from src.aris_bellman.td import _td_criterion, aris_td_loss
 
 from experiments.overcooked_v2 import ce_sampler
 from experiments.overcooked_v2 import evaluate_aris, layout_diagnostics, train_aris
@@ -121,6 +123,194 @@ def _event(**overrides):
     }
     data.update(overrides)
     return SimpleNamespace(**data)
+
+
+class _TableQNet(torch.nn.Module):
+    def __init__(self, current_q, next_q):
+        super().__init__()
+        self.current_q = torch.as_tensor(current_q, dtype=torch.float32)
+        self.next_q = torch.as_tensor(next_q, dtype=torch.float32)
+
+    def forward(self, obs_feat, belief, **kwargs):
+        del belief, kwargs
+        is_next = obs_feat[:, 0].bool()
+        values = self._batch_values(
+            self.current_q.to(obs_feat.device),
+            obs_feat.shape[0],
+        )
+        next_values = self._batch_values(
+            self.next_q.to(obs_feat.device),
+            obs_feat.shape[0],
+        )
+        return torch.where(is_next[:, None], next_values, values)
+
+    @staticmethod
+    def _batch_values(values, batch_size):
+        if values.ndim == 1:
+            return values.unsqueeze(0).expand(batch_size, -1)
+        return values
+
+
+def _td_graph_batch(batch_size=2, num_options=3):
+    return {
+        "option_mask": torch.ones(batch_size, num_options, dtype=torch.bool),
+        "option_mask_next": torch.ones(batch_size, num_options, dtype=torch.bool),
+        "factor_mask": torch.ones(batch_size, 1, dtype=torch.bool),
+        "mode_mask": torch.ones(batch_size, 1, 1, dtype=torch.bool),
+        "relevance_mask": torch.ones(batch_size, 1, num_options, dtype=torch.bool),
+    }
+
+
+def test_td_criterion_supports_huber_and_mse_small_error_branch():
+    q_pred = torch.tensor([0.0, 0.2])
+    target = torch.tensor([0.1, 0.0])
+
+    mse = _td_criterion(q_pred, target, td_loss="mse", huber_delta=1.0)
+    huber_equiv = _td_criterion(q_pred, target, td_loss="huber", huber_delta=0.5)
+
+    assert torch.allclose(huber_equiv, mse)
+    with pytest.raises(ValueError, match="huber_delta"):
+        _td_criterion(q_pred, target, td_loss="huber", huber_delta=0.0)
+
+
+def test_double_q_target_selects_online_and_evaluates_target_values():
+    q_net = _TableQNet(
+        current_q=[0.0, 0.0, 0.0],
+        next_q=[
+            [1.0, 3.0, 2.0],
+            [5.0, 4.0, 0.0],
+        ],
+    )
+    target_q_net = _TableQNet(
+        current_q=[0.0, 0.0, 0.0],
+        next_q=[
+            [10.0, 20.0, 30.0],
+            [7.0, 9.0, 11.0],
+        ],
+    )
+
+    loss = aris_td_loss(
+        q_net,
+        target_q_net,
+        obs_feat_t=torch.zeros(2, 1),
+        belief_t=torch.zeros(2, 1),
+        option_id=torch.zeros(2, dtype=torch.long),
+        reward_sum=torch.zeros(2),
+        realized_cost=torch.zeros(2),
+        duration=torch.ones(2),
+        obs_feat_next=torch.ones(2, 1),
+        belief_next=torch.zeros(2, 1),
+        done=torch.zeros(2),
+        graph_batch=_td_graph_batch(),
+        gamma=1.0,
+        cost_coef=0.0,
+        td_loss="mse",
+        double_q=True,
+    )
+
+    expected_targets = torch.tensor([20.0, 7.0])
+    assert loss.ndim == 0
+    assert torch.allclose(loss, torch.mean(expected_targets.pow(2)))
+
+
+def test_advantage_norm_rescales_without_flattening_relevance_routing():
+    relevance = [
+        [True, False],
+        [True, True],
+        [False, True],
+    ]
+
+    def build(norm):
+        net = FactorLocalQNetwork(
+            obs_dim=2,
+            max_options=2,
+            max_factors=3,
+            max_modes=2,
+            hidden_dim=4,
+            relevance_mask=relevance,
+            advantage_norm=norm,
+        )
+        with torch.no_grad():
+            for param in net.base.parameters():
+                param.zero_()
+            for param in net.residual_weight.parameters():
+                param.zero_()
+            net.residual_weight[-1].bias.copy_(torch.tensor([1.0, -1.0]))
+        return net
+
+    obs = torch.zeros(1, 2)
+    belief = torch.tensor([[[0.75, 0.25], [0.65, 0.35], [0.45, 0.55]]])
+    option_mask = torch.ones(1, 2, dtype=torch.bool)
+    factor_mask = torch.ones(1, 3, dtype=torch.bool)
+    mode_mask = torch.ones(1, 3, 2, dtype=torch.bool)
+
+    q_none = build("none")(
+        obs,
+        belief,
+        option_mask=option_mask,
+        factor_mask=factor_mask,
+        mode_mask=mode_mask,
+    )
+    q_count = build("relevant_count")(
+        obs,
+        belief,
+        option_mask=option_mask,
+        factor_mask=factor_mask,
+        mode_mask=mode_mask,
+    )
+    q_sqrt = build("sqrt_relevant")(
+        obs,
+        belief,
+        option_mask=option_mask,
+        factor_mask=factor_mask,
+        mode_mask=mode_mask,
+    )
+
+    assert torch.allclose(q_count, q_none / 2.0)
+    assert torch.allclose(q_sqrt, q_none / torch.sqrt(torch.tensor(2.0)))
+    assert torch.equal(torch.argsort(q_none, dim=1), torch.argsort(q_count, dim=1))
+    assert torch.equal(torch.argsort(q_none, dim=1), torch.argsort(q_sqrt, dim=1))
+
+
+def test_training_stability_flags_are_cli_ablatable():
+    args = train_aris.build_arg_parser().parse_args(
+        [
+            "--config",
+            "dummy.yaml",
+            "--graph_variant",
+            "full_support",
+            "--method",
+            "aris_bellman",
+            "--seed",
+            "0",
+            "--td_loss",
+            "mse",
+            "--huber_delta",
+            "0.25",
+            "--no_double_q",
+            "--advantage_norm",
+            "sqrt_relevant",
+            "--checkpoint_every",
+            "250",
+            "--select_best_by",
+            "final",
+            "--checkpoint_eval_episodes",
+            "2",
+        ]
+    )
+    config = {"training": {}}
+
+    train_aris._apply_cli_overrides(config, args)
+    train_aris._normalize_training_stability_config(config)
+
+    assert config["training"]["td_loss"] == "mse"
+    assert config["training"]["huber_delta"] == 0.25
+    assert config["training"]["double_q"] is False
+    assert config["training"]["advantage_norm"] == "sqrt_relevant"
+    assert config["training"]["checkpoint_every"] == 250
+    assert config["training"]["select_best_by"] == "final"
+    assert config["training"]["checkpoint_eval_episodes"] == 2
+    assert train_aris._checkpoint_policy(config)["greedy_enabled"] is False
 
 
 def _state(

@@ -23,6 +23,9 @@ def aris_td_loss(
     cost_coef: float,
     q_extra_t: dict[str, Any] | None = None,
     q_extra_next: dict[str, Any] | None = None,
+    td_loss: str = "huber",
+    huber_delta: float = 1.0,
+    double_q: bool = True,
 ) -> torch.Tensor:
     q_all = q_net(
         obs_feat_t,
@@ -34,7 +37,7 @@ def aris_td_loss(
 
     with torch.no_grad():
         next_kwargs = _graph_kwargs(graph_batch, next_step=True)
-        q_next = target_q_net(
+        q_next_target = target_q_net(
             obs_feat_next,
             belief_next,
             **next_kwargs,
@@ -45,15 +48,49 @@ def aris_td_loss(
             next_kwargs.get("option_mask"),
         )
         if option_mask_next is not None:
-            q_next = q_next.masked_fill(~option_mask_next.bool(), -1e9)
-        max_next = q_next.max(dim=1).values
+            q_next_target = q_next_target.masked_fill(
+                ~option_mask_next.bool(),
+                -1e9,
+            )
+        if double_q:
+            q_next_online = q_net(
+                obs_feat_next,
+                belief_next,
+                **next_kwargs,
+                **(q_extra_next or {}),
+            )
+            if option_mask_next is not None:
+                q_next_online = q_next_online.masked_fill(
+                    ~option_mask_next.bool(),
+                    -1e9,
+                )
+            next_option = q_next_online.argmax(dim=1)
+            max_next = q_next_target.gather(1, next_option[:, None]).squeeze(1)
+        else:
+            max_next = q_next_target.max(dim=1).values
         target = (
             reward_sum
             - cost_coef * realized_cost
             + (gamma ** duration) * (1.0 - done.float()) * max_next
         )
 
-    return F.mse_loss(q_pred, target)
+    return _td_criterion(q_pred, target, td_loss=td_loss, huber_delta=huber_delta)
+
+
+def _td_criterion(
+    q_pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    td_loss: str,
+    huber_delta: float,
+) -> torch.Tensor:
+    if td_loss == "mse":
+        return F.mse_loss(q_pred, target)
+    if td_loss == "huber":
+        if huber_delta <= 0.0:
+            raise ValueError("huber_delta must be positive when td_loss='huber'.")
+        return F.smooth_l1_loss(q_pred, target, beta=float(huber_delta))
+    raise ValueError("td_loss must be one of {'huber', 'mse'}.")
 
 
 def _graph_kwargs(graph_batch: dict[str, Any], *, next_step: bool) -> dict[str, Any]:

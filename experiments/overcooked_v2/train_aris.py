@@ -63,6 +63,7 @@ class ArisBellmanQNetwork(nn.Module):
         hidden_dim: int,
         graph: GraphSpec,
         encoder_type: str = "auto",
+        advantage_norm: str = "none",
     ):
         super().__init__()
         self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
@@ -73,6 +74,7 @@ class ArisBellmanQNetwork(nn.Module):
             max_modes=max(1, graph.max_modes),
             hidden_dim=hidden_dim,
             relevance_mask=graph.relevance,
+            advantage_norm=advantage_norm,
         )
 
     def forward(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
@@ -233,6 +235,7 @@ class PartnerIDQNetwork(nn.Module):
 def train(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_config(args.config)
     _apply_cli_overrides(config, args)
+    _normalize_training_stability_config(config)
     _set_seeds(args.seed)
 
     layout_name = str(config["layout"])
@@ -306,6 +309,28 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     rng = np.random.default_rng(args.seed)
     metrics = _empty_metrics(args.method, graph, output_dir)
+    checkpoint_policy = _checkpoint_policy(config)
+    metrics["checkpoint_selection"] = {
+        "checkpoint_every": checkpoint_policy["checkpoint_every"],
+        "select_best_by": checkpoint_policy["select_best_by"],
+        "checkpoint_eval_episodes": checkpoint_policy["checkpoint_eval_episodes"],
+        "best_greedy_return": None,
+        "best_update": None,
+        "selected_checkpoint": None,
+    }
+    validation_env = None
+    validation_router = None
+    validation_partners: list[Any] = []
+    if checkpoint_policy["greedy_enabled"]:
+        validation_env = _build_env(layout_name, config)
+        validation_env.set_featurizer(NumpyFeaturizer(layout_graph))
+        validation_router = OCV2EvidenceRouter(
+            graph,
+            layout_graph.cell_to_entity,
+            layout_graph.region_cells,
+        )
+        validation_partners = make_training_partners(option_lib)
+    best_greedy_return = -float("inf")
     obs, _, current_partner = _reset_episode(
         env,
         evidence_buffer,
@@ -415,9 +440,80 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 target_q_net.load_state_dict(q_net.state_dict())
             if updates_done % int(config["training"]["log_interval"]) == 0:
                 _write_metrics(output_dir, metrics, updates_done, wall_start)
+            if (
+                checkpoint_policy["greedy_enabled"]
+                and updates_done % checkpoint_policy["checkpoint_every"] == 0
+            ):
+                if validation_env is None or validation_router is None:
+                    raise RuntimeError(
+                        "Greedy checkpoint validation was not initialized."
+                    )
+                validation = _run_greedy_validation(
+                    args.method,
+                    q_net,
+                    belief_model,
+                    validation_env,
+                    option_lib,
+                    validation_router,
+                    validation_partners,
+                    graph,
+                    config,
+                    seed=int(args.seed) + 1_000_003 + int(updates_done),
+                    episodes=checkpoint_policy["checkpoint_eval_episodes"],
+                    update_idx=updates_done,
+                    device=device,
+                )
+                metrics["greedy_validation"].append(validation)
+                if float(validation["mean_return"]) > best_greedy_return:
+                    best_greedy_return = float(validation["mean_return"])
+                    metrics["checkpoint_selection"].update(
+                        {
+                            "best_greedy_return": best_greedy_return,
+                            "best_update": int(updates_done),
+                            "selected_checkpoint": "checkpoint.pt",
+                            "selected_by": "greedy",
+                        }
+                    )
+                    _save_checkpoint(
+                        output_dir,
+                        args.method,
+                        config,
+                        graph,
+                        metrics,
+                        q_net,
+                        belief_model,
+                        optimizer,
+                        filename="checkpoint.pt",
+                    )
+                    _save_checkpoint(
+                        output_dir,
+                        args.method,
+                        config,
+                        graph,
+                        metrics,
+                        q_net,
+                        belief_model,
+                        optimizer,
+                        filename="checkpoint_best.pt",
+                    )
 
     if episode_options:
         metrics["episode_returns"].append(float(episode_return))
+    metrics["checkpoint_selection"]["final_checkpoint"] = "checkpoint_final.pt"
+    select_final = (
+        checkpoint_policy["select_best_by"] == "final"
+        or metrics["checkpoint_selection"].get("best_update") is None
+    )
+    if select_final:
+        selected_by = checkpoint_policy["select_best_by"]
+        if selected_by == "greedy":
+            selected_by = "final_no_greedy_validation"
+        metrics["checkpoint_selection"].update(
+            {
+                "selected_checkpoint": "checkpoint.pt",
+                "selected_by": selected_by,
+            }
+        )
     _write_metrics(output_dir, metrics, updates_done, wall_start, final=True)
     _save_checkpoint(
         output_dir,
@@ -428,7 +524,20 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         q_net,
         belief_model,
         optimizer,
+        filename="checkpoint_final.pt",
     )
+    if select_final:
+        _save_checkpoint(
+            output_dir,
+            args.method,
+            config,
+            graph,
+            metrics,
+            q_net,
+            belief_model,
+            optimizer,
+            filename="checkpoint.pt",
+        )
     metrics["checkpoint_load_ok"] = _checkpoint_loads(output_dir / "checkpoint.pt")
     _write_metrics(output_dir, metrics, updates_done, wall_start, final=True)
     return metrics
@@ -850,7 +959,13 @@ def _build_q_network(
     hidden_dim = int(config["training"]["hidden_dim"])
     encoder_type = str(config["training"].get("obs_encoder", "auto"))
     if method == "aris_bellman":
-        return ArisBellmanQNetwork(obs_dim, hidden_dim, graph, encoder_type)
+        return ArisBellmanQNetwork(
+            obs_dim,
+            hidden_dim,
+            graph,
+            encoder_type,
+            advantage_norm=str(config["training"].get("advantage_norm", "none")),
+        )
     if method == "base_only":
         return BaseOnlyQNetwork(obs_dim, hidden_dim, graph.num_options, encoder_type)
     if method == "flat_factor":
@@ -1118,6 +1233,9 @@ def _td_update(
         cost_coef=float(config["training"]["cost_coef"]),
         q_extra_t=_q_extra_kwargs(method, batch, device),
         q_extra_next=_q_extra_kwargs(method, batch, device),
+        td_loss=str(config["training"].get("td_loss", "huber")),
+        huber_delta=float(config["training"].get("huber_delta", 1.0)),
+        double_q=_as_bool(config["training"].get("double_q", True), "double_q"),
     )
     loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -1126,6 +1244,110 @@ def _td_update(
     )
     optimizer.step()
     return float(loss.detach().cpu().item())
+
+
+def _run_greedy_validation(
+    method: str,
+    q_net: nn.Module,
+    belief_model: FactorLocalBeliefModel,
+    env: OCV2Adapter,
+    option_lib: OCV2OptionLibrary,
+    router: OCV2EvidenceRouter,
+    partners: list[Any],
+    graph: GraphSpec,
+    config: dict[str, Any],
+    *,
+    seed: int,
+    episodes: int,
+    update_idx: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    greedy_config = copy.deepcopy(config)
+    greedy_config.setdefault("training", {})
+    greedy_config["training"]["epsilon_start"] = 0.0
+    greedy_config["training"]["epsilon_end"] = 0.0
+    rng = np.random.default_rng(seed)
+    returns: list[float] = []
+    option_counts: list[int] = []
+    q_was_training = q_net.training
+    belief_was_training = belief_model.training
+    q_net.eval()
+    belief_model.eval()
+    try:
+        with torch.no_grad():
+            for episode_idx in range(int(episodes)):
+                evidence_buffer = EvidenceBuffer(
+                    num_factors=graph.num_factors,
+                    window=int(config["training"]["evidence_window"]),
+                    evidence_dim=D_EVID,
+                )
+                obs, _, partner = _reset_episode(
+                    env,
+                    evidence_buffer,
+                    partners,
+                    rng,
+                    int(seed) + episode_idx,
+                    router,
+                )
+                episode_return = 0.0
+                option_count = 0
+                done = False
+                while (
+                    not done
+                    and option_count < int(config["training"]["max_episode_options"])
+                ):
+                    option_id = _select_option(
+                        method,
+                        q_net,
+                        belief_model,
+                        obs,
+                        env.state,
+                        evidence_buffer,
+                        option_lib,
+                        graph,
+                        greedy_config,
+                        update_idx,
+                        rng,
+                        device,
+                        partner_id=int(getattr(partner, "partner_id", 0)),
+                        selection_stats=None,
+                    )
+                    transition, done, obs = _execute_option(
+                        env,
+                        obs,
+                        partner,
+                        option_lib,
+                        router,
+                        evidence_buffer,
+                        option_id,
+                        graph,
+                        rng,
+                        greedy_config,
+                    )
+                    episode_return += _transition_training_return(
+                        transition,
+                        greedy_config,
+                    )
+                    option_count += 1
+                returns.append(float(episode_return))
+                option_counts.append(int(option_count))
+    finally:
+        q_net.train(q_was_training)
+        belief_model.train(belief_was_training)
+
+    mean_return = (
+        float(np.mean(np.asarray(returns, dtype=np.float64)))
+        if returns
+        else float("nan")
+    )
+    return {
+        "update": int(update_idx),
+        "seed": int(seed),
+        "episodes": int(episodes),
+        "returns": returns,
+        "mean_return": mean_return,
+        "option_counts": option_counts,
+    }
 
 
 def _state_repr(
@@ -1404,6 +1626,8 @@ def _empty_metrics(method: str, graph: GraphSpec, output_dir: Path) -> dict[str,
         "option_kind_stats": {},
         "task_progress_counts": {},
         "checkpoint_load_ok": False,
+        "greedy_validation": [],
+        "checkpoint_selection": {},
         "option_selection_count": 0,
         "no_valid_option_count": 0,
         "forced_noop_count": 0,
@@ -1437,6 +1661,7 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     selection_count = int(metrics.get("option_selection_count", 0))
     forced_noop_count = int(metrics.get("forced_noop_count", 0))
     no_valid_count = int(metrics.get("no_valid_option_count", 0))
+    checkpoint_selection = metrics.get("checkpoint_selection", {}) or {}
     return {
         "finite_td_loss": bool(losses.size == 0 or np.all(np.isfinite(losses))),
         "td_loss_first_window": first_mean,
@@ -1497,6 +1722,10 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
             metrics.get("task_progress_counts", {}).get("cleared_interaction_cell", 0)
         ),
         "task_progress_events": int(sum(int(value) for value in progress.values())),
+        "selected_checkpoint": checkpoint_selection.get("selected_checkpoint"),
+        "selected_checkpoint_by": checkpoint_selection.get("selected_by"),
+        "best_greedy_return": checkpoint_selection.get("best_greedy_return"),
+        "best_greedy_update": checkpoint_selection.get("best_update"),
     }
 
 
@@ -1523,6 +1752,8 @@ def _save_checkpoint(
     q_net: nn.Module | None,
     belief_model: nn.Module | None,
     optimizer: torch.optim.Optimizer | None,
+    *,
+    filename: str = "checkpoint.pt",
 ) -> None:
     payload: dict[str, Any] = {
         "method": method,
@@ -1536,7 +1767,7 @@ def _save_checkpoint(
         payload["belief_model"] = belief_model.state_dict()
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
-    torch.save(payload, output_dir / "checkpoint.pt")
+    torch.save(payload, output_dir / filename)
 
 
 def _checkpoint_loads(path: Path) -> bool:
@@ -1589,6 +1820,85 @@ def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> No
         config.setdefault("preflight", {})["path"] = str(args.preflight_path)
     if bool(getattr(args, "allow_shared_shaping", False)):
         config["training"]["allow_shared_shaping"] = True
+    for key in (
+        "td_loss",
+        "huber_delta",
+        "double_q",
+        "advantage_norm",
+        "checkpoint_every",
+        "select_best_by",
+        "checkpoint_eval_episodes",
+    ):
+        value = getattr(args, key, None)
+        if value is not None:
+            config["training"][key] = value
+
+
+def _normalize_training_stability_config(config: dict[str, Any]) -> None:
+    train_cfg = config.setdefault("training", {})
+
+    td_loss = str(train_cfg.get("td_loss", "huber")).lower()
+    if td_loss not in {"huber", "mse"}:
+        raise ValueError("training.td_loss must be one of {'huber', 'mse'}.")
+    train_cfg["td_loss"] = td_loss
+
+    huber_delta = float(train_cfg.get("huber_delta", 1.0))
+    if huber_delta <= 0.0:
+        raise ValueError("training.huber_delta must be positive.")
+    train_cfg["huber_delta"] = huber_delta
+
+    train_cfg["double_q"] = _as_bool(train_cfg.get("double_q", True), "double_q")
+
+    advantage_norm = str(train_cfg.get("advantage_norm", "none")).lower()
+    if advantage_norm not in {"none", "relevant_count", "sqrt_relevant"}:
+        raise ValueError(
+            "training.advantage_norm must be one of "
+            "{'none', 'relevant_count', 'sqrt_relevant'}."
+        )
+    train_cfg["advantage_norm"] = advantage_norm
+
+    checkpoint_every = int(train_cfg.get("checkpoint_every", 0))
+    if checkpoint_every < 0:
+        raise ValueError("training.checkpoint_every must be non-negative.")
+    train_cfg["checkpoint_every"] = checkpoint_every
+
+    select_best_by = str(train_cfg.get("select_best_by", "greedy")).lower()
+    if select_best_by not in {"greedy", "final"}:
+        raise ValueError("training.select_best_by must be one of {'greedy', 'final'}.")
+    train_cfg["select_best_by"] = select_best_by
+
+    checkpoint_eval_episodes = int(train_cfg.get("checkpoint_eval_episodes", 3))
+    if checkpoint_eval_episodes <= 0:
+        raise ValueError("training.checkpoint_eval_episodes must be positive.")
+    train_cfg["checkpoint_eval_episodes"] = checkpoint_eval_episodes
+
+
+def _checkpoint_policy(config: dict[str, Any]) -> dict[str, Any]:
+    train_cfg = config["training"]
+    checkpoint_every = int(train_cfg.get("checkpoint_every", 0))
+    select_best_by = str(train_cfg.get("select_best_by", "greedy")).lower()
+    return {
+        "checkpoint_every": checkpoint_every,
+        "select_best_by": select_best_by,
+        "checkpoint_eval_episodes": int(train_cfg.get("checkpoint_eval_episodes", 3)),
+        "greedy_enabled": bool(
+            checkpoint_every > 0 and select_best_by == "greedy"
+        ),
+    }
+
+
+def _as_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)) and int(value) in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "y"}:
+            return True
+        if lowered in {"false", "0", "no", "n"}:
+            return False
+    raise ValueError(f"training.{name} must be a boolean.")
 
 
 def _set_seeds(seed: int) -> None:
@@ -1805,6 +2115,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--preflight_path", default=None)
+    parser.add_argument("--td_loss", choices=("huber", "mse"), default=None)
+    parser.add_argument("--huber_delta", type=float, default=None)
+    double_q_group = parser.add_mutually_exclusive_group()
+    double_q_group.add_argument(
+        "--double_q",
+        dest="double_q",
+        action="store_true",
+        default=None,
+    )
+    double_q_group.add_argument("--no_double_q", dest="double_q", action="store_false")
+    parser.add_argument(
+        "--advantage_norm",
+        choices=("none", "relevant_count", "sqrt_relevant"),
+        default=None,
+    )
+    parser.add_argument("--checkpoint_every", type=int, default=None)
+    parser.add_argument("--select_best_by", choices=("greedy", "final"), default=None)
+    parser.add_argument("--checkpoint_eval_episodes", type=int, default=None)
     parser.add_argument(
         "--allow_shared_shaping",
         action="store_true",

@@ -45,6 +45,13 @@ training:
   cost_per_step: 1.0
   shaped_reward_coef: 1.0
   learning_rate: 0.0003
+  td_loss: huber
+  huber_delta: 1.0
+  double_q: true
+  advantage_norm: none
+  checkpoint_every: 500
+  select_best_by: greedy
+  checkpoint_eval_episodes: 3
   hidden_dim: 64
   obs_encoder: auto
   num_partners: 6
