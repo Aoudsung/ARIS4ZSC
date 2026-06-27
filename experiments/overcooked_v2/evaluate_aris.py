@@ -66,6 +66,12 @@ class EvalContext:
     layout_graph: LayoutGraph
     option_lib: OCV2OptionLibrary
     obs_dim: int
+    # Diagnostic-only hooks (default off → normal eval/selection unchanged). RC-1: when
+    # `qaudit` is a list, _select_option appends a read-only (q_total, q_base) decomposition
+    # per greedy decision. RC-2: when `scripted_priority` is a kind-priority list, selection
+    # follows that priority over valid options instead of argmax-Q (bypasses the network).
+    qaudit: list | None = None
+    scripted_priority: list[str] | None = None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -617,6 +623,11 @@ def _select_option(
     if random_policy:
         return int(rng.choice(valid_ids))
 
+    if getattr(ctx, "scripted_priority", None) is not None:
+        scripted = _scripted_priority_select(ctx, graph, valid_ids)
+        if scripted is not None:
+            return scripted
+
     with torch.no_grad():
         graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
         obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], torch.device("cpu"))
@@ -627,9 +638,56 @@ def _select_option(
             **_q_forward_kwargs(graph_batch),
             partner_id=_partner_id_tensor(partner_id, 1, torch.device("cpu")),
         ).squeeze(0)
+        if getattr(ctx, "qaudit", None) is not None:
+            _record_qaudit(ctx, obs_tensor, graph_batch, q_values, valid)
         valid_tensor = torch.as_tensor(valid, dtype=torch.bool)
         q_values = q_values.masked_fill(~valid_tensor, -1e9)
         return int(torch.argmax(q_values).item())
+
+
+def _scripted_priority_select(
+    ctx: EvalContext,
+    graph: GraphSpec,
+    valid_ids: np.ndarray,
+) -> int | None:
+    """RC-2 diagnostic: pick the valid option of the highest-priority kind, bypassing Q.
+
+    Used to confirm whether the full fetch->cook->plate->serve pipeline is reachable and
+    whether serve_soup success / ego delivery / completion ever fire under deliberate play.
+    Returns None if no valid option matches any listed kind (caller falls back to Q).
+    """
+    kinds = {int(i): str(graph.options[int(i)].kind) for i in valid_ids}
+    for target in ctx.scripted_priority:
+        for vid in valid_ids:
+            if kinds[int(vid)] == target:
+                return int(vid)
+    return None
+
+
+def _record_qaudit(
+    ctx: EvalContext,
+    obs_tensor: torch.Tensor,
+    graph_batch: dict[str, Any],
+    q_values: torch.Tensor,
+    valid: np.ndarray,
+) -> None:
+    """RC-1 diagnostic: log the (q_total, q_base) decomposition for the current decision.
+
+    Read-only: it does NOT change the returned argmax. adv_sum is recovered downstream as
+    q_total - q_base (the network defines q_values = q_base + sum_f A_f). Skips silently if
+    the wrapped net does not expose a factor-local base head.
+    """
+    if not (hasattr(ctx.q_net, "q_net") and hasattr(ctx.q_net.q_net, "q_base_values")):
+        return
+    encoded = ctx.q_net.encoder(obs_tensor)
+    q_base = ctx.q_net.q_net.q_base_values(encoded, graph_batch["option_mask"]).squeeze(0)
+    ctx.qaudit.append(
+        {
+            "q_full": [float(x) for x in q_values.detach().tolist()],
+            "q_base": [float(x) for x in q_base.detach().tolist()],
+            "valid": [bool(x) for x in valid.tolist()],
+        }
+    )
 
 
 def _factor_deletion_q_proxy_diagnostics(ctx: EvalContext) -> list[dict[str, Any]]:

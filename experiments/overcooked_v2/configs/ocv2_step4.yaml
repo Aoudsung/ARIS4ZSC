@@ -49,6 +49,17 @@ training:
   huber_delta: 1.0
   double_q: true
   advantage_norm: none
+  # RC-1 fix: bounded Bellman value range (hard cap |Q| <= base_bound + adv_bound = vmax).
+  # reward_scale normalizes the TD reward/cost to the return scale; vmax clamps the bootstrapped
+  # target. Defaults follow the plan (Vmax=20, 0.5/0.5 base/adv split). Disable (enabled: false)
+  # to recover the unbounded baseline for ablation.
+  value_bound:
+    enabled: true
+    vmax: 20.0
+    base_bound: 10.0
+    adv_bound: 10.0
+    adv_unit: 1.0
+    reward_scale: 1.0
   checkpoint_every: 500
   select_best_by: greedy
   checkpoint_eval_episodes: 3

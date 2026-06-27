@@ -45,6 +45,11 @@ class FactorLocalQNetwork(nn.Module):
         option_feature_dim: int = 0,
         factor_feature_dim: int = 0,
         advantage_norm: str = "none",
+        value_bound: bool = False,
+        vmax: float = 20.0,
+        base_bound: float | None = None,
+        adv_bound: float | None = None,
+        adv_unit: float = 1.0,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -67,6 +72,20 @@ class FactorLocalQNetwork(nn.Module):
                 "{'none', 'relevant_count', 'sqrt_relevant'}."
             )
         self.advantage_norm = str(advantage_norm)
+        # RC-1 fix: bounded factor-local value range. When value_bound is on, the base head and
+        # each per-factor advantage are squashed by tanh into an explicit physical scale, so
+        # Q = base_bound*tanh(.) + sum_{f in Rel} (adv_bound/rel_count)*tanh(.) is hard-bounded by
+        # base_bound + adv_bound (= Vmax with the recommended 0.5/0.5 split). Still Q_base + sum_f A_f
+        # with argmax control and a single TD loss — no selector, no auxiliary supervision.
+        self.value_bound = bool(value_bound)
+        self.vmax = float(vmax)
+        self.base_bound = float(base_bound) if base_bound is not None else 0.5 * self.vmax
+        self.adv_bound = float(adv_bound) if adv_bound is not None else 0.5 * self.vmax
+        self.adv_unit = float(adv_unit)
+        if self.adv_unit <= 0.0:
+            raise ValueError("adv_unit must be positive.")
+        if self.value_bound and (self.base_bound <= 0.0 or self.adv_bound <= 0.0):
+            raise ValueError("base_bound and adv_bound must be positive when value_bound is on.")
 
         self.base = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -102,6 +121,21 @@ class FactorLocalQNetwork(nn.Module):
         obs: torch.Tensor,
         option_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        q_base = self.base(obs)
+        if self.value_bound:
+            q_base = self.base_bound * torch.tanh(q_base / self.base_bound)
+        if option_mask is not None:
+            q_base = q_base[:, : option_mask.shape[1]]
+            return q_base.masked_fill(~option_mask.bool(), -1e9)
+        return q_base[:, : self.n_options]
+
+    def raw_base_values(
+        self,
+        obs: torch.Tensor,
+        option_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Unbounded base-head output. Audit-only: never used for selection/target. Lets the
+        q-stability gate track raw value growth even while bounded Q is hard-capped at Vmax."""
         q_base = self.base(obs)
         if option_mask is not None:
             q_base = q_base[:, : option_mask.shape[1]]
@@ -206,7 +240,12 @@ class FactorLocalQNetwork(nn.Module):
         if factor_mask.shape != (batch_size, num_factors):
             raise ValueError("factor_mask must have shape [B, F].")
 
-        q_base = self.base(obs_feat)[:, :num_options]
+        raw_base = self.base(obs_feat)[:, :num_options]
+        q_base = (
+            self.base_bound * torch.tanh(raw_base / self.base_bound)
+            if self.value_bound
+            else raw_base
+        )
         if num_factors == 0:
             return _mask_options(q_base, option_mask)
 
@@ -248,7 +287,7 @@ class FactorLocalQNetwork(nn.Module):
         weights = self.residual_weight(
             torch.cat([obs_term, factor_term, option_term], dim=-1)
         )[..., :max_modes]
-        adv = (weights * centered_belief[:, :, None, :]).sum(dim=-1)
+        raw_adv = (weights * centered_belief[:, :, None, :]).sum(dim=-1)
         rel = self._effective_relevance_mask(
             relevance_mask,
             batch_size,
@@ -256,17 +295,29 @@ class FactorLocalQNetwork(nn.Module):
             num_options,
             obs_feat.device,
         )
-        adv = adv * rel.to(dtype=adv.dtype)
-        adv = adv * factor_mask[:, :, None].to(dtype=adv.dtype)
-        adv_sum = adv.sum(dim=1)
-        if self.advantage_norm != "none":
+        route = rel.to(dtype=raw_adv.dtype) * factor_mask[:, :, None].to(dtype=raw_adv.dtype)
+        if self.value_bound:
+            # Each relevant factor contributes at most adv_bound/rel_count, so the routed sum is
+            # bounded by adv_bound. tanh is monotonic and the per-option rel_count scaling matches
+            # advantage_norm='relevant_count' — relevance routing (claim 4) is preserved, only the
+            # magnitude is capped.
             relevant_count = (
                 rel & factor_mask[:, :, None].to(dtype=torch.bool)
-            ).sum(dim=1).clamp(min=1)
-            scale = relevant_count.to(dtype=adv_sum.dtype)
-            if self.advantage_norm == "sqrt_relevant":
-                scale = torch.sqrt(scale)
-            adv_sum = adv_sum / scale
+            ).sum(dim=1).clamp(min=1).to(dtype=raw_adv.dtype)
+            per_factor_bound = self.adv_bound / relevant_count[:, None, :]
+            adv = per_factor_bound * torch.tanh(raw_adv / self.adv_unit) * route
+            adv_sum = adv.sum(dim=1)
+        else:
+            adv = raw_adv * route
+            adv_sum = adv.sum(dim=1)
+            if self.advantage_norm != "none":
+                relevant_count = (
+                    rel & factor_mask[:, :, None].to(dtype=torch.bool)
+                ).sum(dim=1).clamp(min=1)
+                scale = relevant_count.to(dtype=adv_sum.dtype)
+                if self.advantage_norm == "sqrt_relevant":
+                    scale = torch.sqrt(scale)
+                adv_sum = adv_sum / scale
         q_values = q_base + adv_sum
         return _mask_options(q_values, option_mask)
 

@@ -64,6 +64,11 @@ class ArisBellmanQNetwork(nn.Module):
         graph: GraphSpec,
         encoder_type: str = "auto",
         advantage_norm: str = "none",
+        value_bound: bool = False,
+        vmax: float = 20.0,
+        base_bound: float | None = None,
+        adv_bound: float | None = None,
+        adv_unit: float = 1.0,
     ):
         super().__init__()
         self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
@@ -75,6 +80,11 @@ class ArisBellmanQNetwork(nn.Module):
             hidden_dim=hidden_dim,
             relevance_mask=graph.relevance,
             advantage_norm=advantage_norm,
+            value_bound=value_bound,
+            vmax=vmax,
+            base_bound=base_bound,
+            adv_bound=adv_bound,
+            adv_unit=adv_unit,
         )
 
     def forward(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
@@ -464,6 +474,18 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                     device=device,
                 )
                 metrics["greedy_validation"].append(validation)
+                if getattr(args, "save_all_checkpoints", False):
+                    _save_checkpoint(
+                        output_dir,
+                        args.method,
+                        config,
+                        graph,
+                        metrics,
+                        q_net,
+                        belief_model,
+                        optimizer,
+                        filename=f"checkpoint_u{int(updates_done)}.pt",
+                    )
                 if float(validation["mean_return"]) > best_greedy_return:
                     best_greedy_return = float(validation["mean_return"])
                     metrics["checkpoint_selection"].update(
@@ -959,12 +981,18 @@ def _build_q_network(
     hidden_dim = int(config["training"]["hidden_dim"])
     encoder_type = str(config["training"].get("obs_encoder", "auto"))
     if method == "aris_bellman":
+        vb = config["training"].get("value_bound", {}) or {}
         return ArisBellmanQNetwork(
             obs_dim,
             hidden_dim,
             graph,
             encoder_type,
             advantage_norm=str(config["training"].get("advantage_norm", "none")),
+            value_bound=bool(vb.get("enabled", False)),
+            vmax=float(vb.get("vmax", 20.0)),
+            base_bound=(float(vb["base_bound"]) if vb.get("base_bound") is not None else None),
+            adv_bound=(float(vb["adv_bound"]) if vb.get("adv_bound") is not None else None),
+            adv_unit=float(vb.get("adv_unit", 1.0)),
         )
     if method == "base_only":
         return BaseOnlyQNetwork(obs_dim, hidden_dim, graph.num_options, encoder_type)
@@ -1216,6 +1244,7 @@ def _td_update(
     state_next = _state_repr(method, belief_model, evidence_next, graph_batch)
 
     optimizer.zero_grad(set_to_none=True)
+    _vb = config["training"].get("value_bound", {}) or {}
     loss = aris_td_loss(
         q_net,
         target_q_net,
@@ -1236,6 +1265,8 @@ def _td_update(
         td_loss=str(config["training"].get("td_loss", "huber")),
         huber_delta=float(config["training"].get("huber_delta", 1.0)),
         double_q=_as_bool(config["training"].get("double_q", True), "double_q"),
+        reward_scale=float(_vb.get("reward_scale", 1.0)),
+        vmax=(float(_vb["vmax"]) if _vb.get("enabled") and _vb.get("vmax") is not None else None),
     )
     loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -2131,6 +2162,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--checkpoint_every", type=int, default=None)
+    parser.add_argument(
+        "--save_all_checkpoints",
+        action="store_true",
+        help="RC-1 diagnostic: also persist checkpoint_u<update>.pt at every greedy-validation "
+        "interval (does not change training/selection; for per-checkpoint Q-decomposition audit).",
+    )
     parser.add_argument("--select_best_by", choices=("greedy", "final"), default=None)
     parser.add_argument("--checkpoint_eval_episodes", type=int, default=None)
     parser.add_argument(

@@ -26,6 +26,8 @@ def aris_td_loss(
     td_loss: str = "huber",
     huber_delta: float = 1.0,
     double_q: bool = True,
+    reward_scale: float = 1.0,
+    vmax: float | None = None,
 ) -> torch.Tensor:
     q_all = q_net(
         obs_feat_t,
@@ -69,10 +71,15 @@ def aris_td_loss(
         else:
             max_next = q_next_target.max(dim=1).values
         target = (
-            reward_sum
-            - cost_coef * realized_cost
+            reward_sum / reward_scale
+            - (cost_coef * realized_cost) / reward_scale
             + (gamma ** duration) * (1.0 - done.float()) * max_next
         )
+        # RC-1 fix: hard-clamp the bootstrapped target to the return scale so it cannot run away
+        # (the bounded q_net already caps max_next; this bounds the reward+bootstrap sum too). A
+        # persistently high clamp fraction means reward_scale/vmax are misset, not that it "works".
+        if vmax is not None:
+            target = target.clamp(min=-float(vmax), max=float(vmax))
 
     return _td_criterion(q_pred, target, td_loss=td_loss, huber_delta=huber_delta)
 
