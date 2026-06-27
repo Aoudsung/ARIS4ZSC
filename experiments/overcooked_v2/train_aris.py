@@ -4,9 +4,11 @@ import argparse
 import copy
 import json
 import math
+import pickle
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,13 @@ from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.provenance import (
+    GRAPH_HASH_FIELD,
+    PROVENANCE_SCHEMA_VERSION,
+    graph_hash_from_spec,
+    runtime_provenance,
+    stamp_graph_hash,
+)
 from experiments.overcooked_v2.state_utils import get_agent_pos
 
 METHODS = (
@@ -240,17 +249,32 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     preflight_gate = _enforce_preflight_gate(layout_name, config, args)
     _write_json(output_dir / "preflight_gate.json", preflight_gate)
 
+    partners = make_training_partners(option_lib)
     graph = _build_graph(env, layout_graph, option_lib, config, args)
-    _enforce_graph_objective_metadata(graph, config)
+    _enforce_graph_objective_metadata(
+        graph,
+        config,
+        layout_graph=layout_graph,
+        option_lib=option_lib,
+        partners=partners,
+    )
     graph.metadata = {
         **(graph.metadata or {}),
         "preflight_gate": preflight_gate,
     }
+    _stamp_runtime_provenance(
+        graph,
+        config,
+        layout_graph,
+        option_lib,
+        partners,
+        fill_missing_hashes=True,
+    )
     router = OCV2EvidenceRouter(graph, layout_graph.cell_to_entity, layout_graph.region_cells)
     obs_dim = infer_obs_dim(env, obs)
 
     _write_json(output_dir / "resolved_config.json", config)
-    _write_json(output_dir / "graph.json", graph.to_json_dict())
+    _write_graph_json(output_dir / "graph.json", graph)
     _capture_git_metadata(output_dir)
 
     if args.method == "random_policy":
@@ -280,7 +304,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         window=int(config["training"]["evidence_window"]),
         evidence_dim=D_EVID,
     )
-    partners = make_training_partners(option_lib)
     rng = np.random.default_rng(args.seed)
     metrics = _empty_metrics(args.method, graph, output_dir)
     obs, _, current_partner = _reset_episode(
@@ -324,6 +347,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             rng,
             device,
             partner_id=int(getattr(current_partner, "partner_id", 0)),
+            selection_stats=metrics,
         )
         transition, done, obs = _execute_option(
             env,
@@ -544,16 +568,79 @@ def _build_graph(
             "formal_experiment": True,
             "graph_source": graph_source,
         }
-    ce_meta_path = Path(ce_path).parent / (Path(ce_path).stem + ".meta.json")
-    if ce_meta_path.exists():
+    ce_meta_path = _metadata_sidecar_path(Path(ce_path))
+    if ce_meta_path is not None:
         sidecar_meta = json.loads(ce_meta_path.read_text(encoding="utf-8"))
-        graph.metadata = {**(graph.metadata or {}), **sidecar_meta}
+        graph.metadata = _merge_metadata(graph.metadata or {}, sidecar_meta)
     if graph.num_factors == 0:
         raise RuntimeError(
             "Graph construction produced zero factors. Run layout_preflight or lower "
             "eta explicitly; empty graphs are invalid for ARIS training."
         )
     return graph
+
+
+def _merge_metadata(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    merged = {**base, **extra}
+    merged["provenance"] = {
+        **(base.get("provenance", {}) or {}),
+        **(extra.get("provenance", {}) or {}),
+    }
+    return merged
+
+
+def _stamp_runtime_provenance(
+    graph: GraphSpec,
+    config: dict[str, Any],
+    layout_graph: LayoutGraph,
+    option_lib: OCV2OptionLibrary,
+    partners: list[Any],
+    *,
+    fill_missing_hashes: bool,
+) -> None:
+    existing = dict((graph.metadata or {}).get("provenance", {}) or {})
+    generated = runtime_provenance(
+        config=config,
+        layout_graph=layout_graph,
+        option_lib=option_lib,
+        partners=partners,
+        ce_path=config.get("graph", {}).get("ce_path"),
+        replay_path=config.get("graph", {}).get("replay_path"),
+        graph_path=config.get("graph", {}).get("graph_path"),
+    )
+    generated[GRAPH_HASH_FIELD] = graph_hash_from_spec(graph)
+    if not fill_missing_hashes:
+        generated = {
+            key: value
+            for key, value in generated.items()
+            if key in existing or key in {"schema_version", "git_commit"}
+        }
+    provenance = {
+        "schema_version": PROVENANCE_SCHEMA_VERSION,
+        **existing,
+        **generated,
+    }
+    graph.metadata = {
+        **(graph.metadata or {}),
+        "provenance": provenance,
+    }
+
+
+def _metadata_sidecar_path(path: Path) -> Path | None:
+    candidates = (
+        Path(f"{path}.metadata.json"),
+        path.parent / f"{path.stem}.meta.json",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _write_graph_json(path: Path, graph: GraphSpec) -> None:
+    graph_json = stamp_graph_hash(graph.to_json_dict())
+    graph.metadata = graph_json["metadata"]
+    _write_json(path, graph_json)
 
 
 def _expected_graph_objective_metadata(config: dict[str, Any]) -> dict[str, Any]:
@@ -570,6 +657,10 @@ def _expected_graph_objective_metadata(config: dict[str, Any]) -> dict[str, Any]
 def _graph_objective_metadata_status(
     graph: GraphSpec,
     config: dict[str, Any],
+    *,
+    layout_graph: LayoutGraph | None = None,
+    option_lib: OCV2OptionLibrary | None = None,
+    partners: list[Any] | None = None,
 ) -> dict[str, Any]:
     metadata = graph.metadata or {}
     try:
@@ -624,21 +715,51 @@ def _graph_objective_metadata_status(
             "config": expected["layout"],
         }
 
+    provenance_status = _graph_provenance_status(
+        graph,
+        config,
+        layout_graph=layout_graph,
+        option_lib=option_lib,
+        partners=partners,
+    )
+
     return {
-        "reward_scale_verified": not missing and not mismatches,
+        "reward_scale_verified": (
+            not missing
+            and not mismatches
+            and not provenance_status["mismatches"]
+        ),
         "expected": expected,
         "observed": {key: metadata.get(key) for key in expected},
         "missing": missing,
         "mismatches": mismatches,
         "event_semantics_version": metadata.get("event_semantics_version"),
+        "provenance": provenance_status,
     }
 
 
 def _enforce_graph_objective_metadata(
     graph: GraphSpec,
     config: dict[str, Any],
+    *,
+    layout_graph: LayoutGraph | None = None,
+    option_lib: OCV2OptionLibrary | None = None,
+    partners: list[Any] | None = None,
 ) -> None:
-    status = _graph_objective_metadata_status(graph, config)
+    status = _graph_objective_metadata_status(
+        graph,
+        config,
+        layout_graph=layout_graph,
+        option_lib=option_lib,
+        partners=partners,
+    )
+    provenance = status.get("provenance", {})
+    if provenance.get("missing"):
+        warnings.warn(
+            "Loaded CE graph metadata has no provenance hashes for "
+            f"{provenance['missing']}; treating as legacy graph metadata.",
+            RuntimeWarning,
+        )
     if status["reward_scale_verified"]:
         return
     raise RuntimeError(
@@ -647,8 +768,77 @@ def _enforce_graph_objective_metadata(
         "run_ce_pipeline.py using the current config, then set graph.graph_path "
         "to the regenerated graph.json before training. "
         f"Missing: {status['missing']}; mismatches: "
-        f"{json.dumps(_jsonable(status['mismatches']), sort_keys=True)}"
+        f"{json.dumps(_jsonable(status['mismatches']), sort_keys=True)}; "
+        "provenance mismatches: "
+        f"{json.dumps(_jsonable(provenance.get('mismatches', {})), sort_keys=True)}"
     )
+
+
+def _graph_provenance_status(
+    graph: GraphSpec,
+    config: dict[str, Any],
+    *,
+    layout_graph: LayoutGraph | None = None,
+    option_lib: OCV2OptionLibrary | None = None,
+    partners: list[Any] | None = None,
+) -> dict[str, Any]:
+    observed = dict((graph.metadata or {}).get("provenance", {}) or {})
+    expected = _expected_provenance_hashes(
+        graph,
+        config,
+        layout_graph=layout_graph,
+        option_lib=option_lib,
+        partners=partners,
+    )
+    missing = sorted(key for key in expected if key not in observed)
+    mismatches = {}
+    for key, expected_value in expected.items():
+        if key not in observed:
+            continue
+        if observed.get(key) != expected_value:
+            mismatches[key] = {
+                "graph": observed.get(key),
+                "config": expected_value,
+            }
+    return {
+        "expected": expected,
+        "observed": {key: observed.get(key) for key in expected},
+        "missing": missing,
+        "mismatches": mismatches,
+    }
+
+
+def _expected_provenance_hashes(
+    graph: GraphSpec,
+    config: dict[str, Any],
+    *,
+    layout_graph: LayoutGraph | None = None,
+    option_lib: OCV2OptionLibrary | None = None,
+    partners: list[Any] | None = None,
+) -> dict[str, Any]:
+    graph_cfg = config.get("graph", {})
+    provenance = runtime_provenance(
+        config=config,
+        layout_graph=layout_graph,
+        option_lib=option_lib,
+        partners=partners or [],
+        ce_path=graph_cfg.get("ce_path"),
+        replay_path=graph_cfg.get("replay_path"),
+        graph_path=graph_cfg.get("graph_path"),
+    )
+    if layout_graph is None:
+        provenance.pop("layout_parse_sha256", None)
+    if option_lib is None:
+        provenance.pop("option_library_sha256", None)
+    if partners is None:
+        provenance.pop("partner_pool_sha256", None)
+    if not graph_cfg.get("graph_path") and hasattr(graph, "to_json_dict"):
+        provenance[GRAPH_HASH_FIELD] = graph_hash_from_spec(graph)
+    return {
+        key: value
+        for key, value in provenance.items()
+        if key.endswith("_sha256") and value is not None
+    }
 
 
 def _build_q_network(
@@ -745,7 +935,13 @@ def _run_random_policy(
             episode_return = 0.0
             episode_options = 0
 
-        option_id = _sample_valid_option(option_lib, env.state, 0, rng)
+        option_id = _sample_valid_option(
+            option_lib,
+            env.state,
+            0,
+            rng,
+            selection_stats=metrics,
+        )
         transition, done, obs = _execute_option(
             env,
             obs,
@@ -968,10 +1164,13 @@ def _select_option(
     rng: np.random.Generator,
     device: torch.device,
     partner_id: int | None = None,
+    selection_stats: dict[str, Any] | None = None,
 ) -> int:
+    _record_selection_attempt(selection_stats)
     valid = option_lib.valid_options(state, 0)
     valid_ids = np.flatnonzero(valid)
     if valid_ids.size == 0:
+        _record_forced_noop(selection_stats)
         return _noop_option_id(option_lib)
     if method == "random_policy" or rng.random() < _epsilon(config, update_idx):
         return int(rng.choice(valid_ids))
@@ -1083,6 +1282,12 @@ def _empty_event_summary() -> dict[str, int]:
     return {
         "delivery_event": 0,
         "wrong_delivery_event": 0,
+        "ego_delivery_event": 0,
+        "partner_delivery_event": 0,
+        "ego_correct_delivery": 0,
+        "partner_correct_delivery": 0,
+        "ego_wrong_delivery_event": 0,
+        "partner_wrong_delivery_event": 0,
         "pot_changed": 0,
         "object_pickup_or_drop": 0,
         "recipe_indicator_event": 0,
@@ -1113,8 +1318,10 @@ def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTra
         counts["ingredient_delivered_to_pot"] = int(counts.get("ingredient_delivered_to_pot", 0)) + 1
     if transition.termination_reason == "plated_soup":
         counts["plated_soup"] = int(counts.get("plated_soup", 0)) + 1
-    if transition.termination_reason == "served_soup":
-        counts["served_soup"] = int(counts.get("served_soup", 0)) + 1
+    delivered = int(summary.get("delivery_event", 0))
+    if delivered <= 0 and transition.termination_reason == "served_soup":
+        delivered = 1
+    counts["served_soup"] = int(counts.get("served_soup", 0)) + delivered
     if transition.termination_reason == "dropped_item_to_counter":
         counts["drop_item_to_counter"] = int(counts.get("drop_item_to_counter", 0)) + 1
     if transition.termination_reason == "cleared_interaction_cell":
@@ -1125,6 +1332,12 @@ def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTra
         "soup_picked",
         "correct_delivery",
         "wrong_delivery_event",
+        "ego_delivery_event",
+        "partner_delivery_event",
+        "ego_correct_delivery",
+        "partner_correct_delivery",
+        "ego_wrong_delivery_event",
+        "partner_wrong_delivery_event",
         "collision_or_block",
         "recipe_indicator_event",
         "button_pressed",
@@ -1138,7 +1351,11 @@ def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTra
 def _training_reward(step: Any, config: dict[str, Any], agent_key: str) -> float:
     sparse = float(step.rewards.get(agent_key, 0.0))
     shaped_coef = float(config["training"].get("shaped_reward_coef", 0.0))
-    return sparse + shaped_coef * _shaped_reward_for_agent(step.info, agent_key)
+    return sparse + shaped_coef * _shaped_reward_for_agent(
+        step.info,
+        agent_key,
+        allow_shared=bool(config["training"].get("allow_shared_shaping", False)),
+    )
 
 
 def _transition_training_return(
@@ -1149,11 +1366,21 @@ def _transition_training_return(
     return float(transition.reward_sum - cost_coef * transition.realized_cost)
 
 
-def _shaped_reward_for_agent(info: dict[str, Any], agent_key: str) -> float:
+def _shaped_reward_for_agent(
+    info: dict[str, Any],
+    agent_key: str,
+    *,
+    allow_shared: bool = False,
+) -> float:
     shaped = info.get("shaped_reward", 0.0)
     if isinstance(shaped, dict):
         if agent_key in shaped:
             return _as_float(shaped[agent_key])
+        if not allow_shared:
+            raise KeyError(
+                f"shaped_reward is a dict but has no {agent_key!r} entry; pass "
+                "--allow_shared_shaping only for legacy shared-shaping smoke runs."
+            )
         return float(sum(_as_float(value) for value in shaped.values()))
     return _as_float(shaped)
 
@@ -1177,6 +1404,9 @@ def _empty_metrics(method: str, graph: GraphSpec, output_dir: Path) -> dict[str,
         "option_kind_stats": {},
         "task_progress_counts": {},
         "checkpoint_load_ok": False,
+        "option_selection_count": 0,
+        "no_valid_option_count": 0,
+        "forced_noop_count": 0,
     }
 
 
@@ -1204,6 +1434,9 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     total_terminations = max(1, sum(int(v) for v in terminations.values()))
     noop_count = int(terminations.get("noop", 0))
     max_steps_count = int(terminations.get("max_steps", 0))
+    selection_count = int(metrics.get("option_selection_count", 0))
+    forced_noop_count = int(metrics.get("forced_noop_count", 0))
+    no_valid_count = int(metrics.get("no_valid_option_count", 0))
     return {
         "finite_td_loss": bool(losses.size == 0 or np.all(np.isfinite(losses))),
         "td_loss_first_window": first_mean,
@@ -1217,13 +1450,46 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "env_max_steps_count": int(
             metrics.get("termination_counts", {}).get("env_max_steps", 0)
         ),
+        "option_selection_count": selection_count,
+        "forced_noop_count": forced_noop_count,
+        "no_valid_option_count": no_valid_count,
+        "forced_noop_fraction": float(
+            forced_noop_count / max(1, selection_count)
+        ),
+        "no_valid_option_fraction": float(
+            no_valid_count / max(1, selection_count)
+        ),
         "option_kind_stats": metrics.get("option_kind_stats", {}),
         "delivery_event_count": int(metrics.get("task_progress_counts", {}).get("delivery_event", 0)),
+        "ego_delivery_event_count": int(
+            metrics.get("task_progress_counts", {}).get("ego_delivery_event", 0)
+        ),
+        "partner_delivery_event_count": int(
+            metrics.get("task_progress_counts", {}).get("partner_delivery_event", 0)
+        ),
         "pot_changed_count": int(metrics.get("task_progress_counts", {}).get("pot_changed", 0)),
         "plate_picked_count": int(metrics.get("task_progress_counts", {}).get("plate_picked", 0)),
         "soup_picked_count": int(metrics.get("task_progress_counts", {}).get("soup_picked", 0)),
         "plated_soup_count": int(metrics.get("task_progress_counts", {}).get("plated_soup", 0)),
         "served_soup_count": int(metrics.get("task_progress_counts", {}).get("served_soup", 0)),
+        "correct_delivery_count": int(
+            metrics.get("task_progress_counts", {}).get("correct_delivery", 0)
+        ),
+        "wrong_delivery_event_count": int(
+            metrics.get("task_progress_counts", {}).get("wrong_delivery_event", 0)
+        ),
+        "ego_correct_delivery_count": int(
+            metrics.get("task_progress_counts", {}).get("ego_correct_delivery", 0)
+        ),
+        "partner_correct_delivery_count": int(
+            metrics.get("task_progress_counts", {}).get("partner_correct_delivery", 0)
+        ),
+        "ego_wrong_delivery_event_count": int(
+            metrics.get("task_progress_counts", {}).get("ego_wrong_delivery_event", 0)
+        ),
+        "partner_wrong_delivery_event_count": int(
+            metrics.get("task_progress_counts", {}).get("partner_wrong_delivery_event", 0)
+        ),
         "drop_item_to_counter_count": int(
             metrics.get("task_progress_counts", {}).get("drop_item_to_counter", 0)
         ),
@@ -1276,7 +1542,11 @@ def _save_checkpoint(
 def _checkpoint_loads(path: Path) -> bool:
     try:
         torch.load(path, map_location="cpu")
-    except Exception:
+    except (OSError, RuntimeError, EOFError, ValueError, pickle.UnpicklingError) as exc:
+        warnings.warn(
+            f"Checkpoint load validation failed with {type(exc).__name__}: {exc}",
+            RuntimeWarning,
+        )
         return False
     return True
 
@@ -1317,6 +1587,8 @@ def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> No
         config["output_dir"] = str(args.output_dir)
     if getattr(args, "preflight_path", None) is not None:
         config.setdefault("preflight", {})["path"] = str(args.preflight_path)
+    if bool(getattr(args, "allow_shared_shaping", False)):
+        config["training"]["allow_shared_shaping"] = True
 
 
 def _set_seeds(seed: int) -> None:
@@ -1340,11 +1612,33 @@ def _sample_valid_option(
     state: Any,
     agent_id: int,
     rng: np.random.Generator,
+    selection_stats: dict[str, Any] | None = None,
 ) -> int:
+    _record_selection_attempt(selection_stats)
     valid_ids = np.flatnonzero(option_lib.valid_options(state, agent_id))
     if valid_ids.size:
         return int(rng.choice(valid_ids))
+    _record_forced_noop(selection_stats)
     return _noop_option_id(option_lib)
+
+
+def _record_selection_attempt(selection_stats: dict[str, Any] | None) -> None:
+    if selection_stats is None:
+        return
+    selection_stats["option_selection_count"] = int(
+        selection_stats.get("option_selection_count", 0)
+    ) + 1
+
+
+def _record_forced_noop(selection_stats: dict[str, Any] | None) -> None:
+    if selection_stats is None:
+        return
+    selection_stats["no_valid_option_count"] = int(
+        selection_stats.get("no_valid_option_count", 0)
+    ) + 1
+    selection_stats["forced_noop_count"] = int(
+        selection_stats.get("forced_noop_count", 0)
+    ) + 1
 
 
 def _noop_option_id(option_lib: OCV2OptionLibrary) -> int:
@@ -1432,6 +1726,12 @@ def _empty_progress_summary() -> dict[str, int]:
         "delivery_event": 0,
         "pot_changed": 0,
         "wrong_delivery_event": 0,
+        "ego_delivery_event": 0,
+        "partner_delivery_event": 0,
+        "ego_correct_delivery": 0,
+        "partner_correct_delivery": 0,
+        "ego_wrong_delivery_event": 0,
+        "partner_wrong_delivery_event": 0,
         "collision_or_block": 0,
         "recipe_indicator_event": 0,
         "button_pressed": 0,
@@ -1446,8 +1746,15 @@ def _accumulate_progress_summary(summary: dict[str, int], event: Any) -> None:
     summary["pot_became_ready"] += int(bool(getattr(event, "pot_became_ready", False)))
     summary["plate_picked"] += int(bool(getattr(event, "plate_picked", False)))
     summary["soup_picked"] += int(bool(getattr(event, "soup_picked", False)))
+    summary["delivery_event"] += int(bool(getattr(event, "delivery_event", False)))
     summary["correct_delivery"] += int(bool(getattr(event, "correct_delivery", False)))
     summary["wrong_delivery_event"] += int(bool(getattr(event, "wrong_delivery_event", False)))
+    summary["ego_delivery_event"] += int(bool(getattr(event, "ego_delivery_event", False)))
+    summary["partner_delivery_event"] += int(bool(getattr(event, "partner_delivery_event", False)))
+    summary["ego_correct_delivery"] += int(bool(getattr(event, "ego_correct_delivery", False)))
+    summary["partner_correct_delivery"] += int(bool(getattr(event, "partner_correct_delivery", False)))
+    summary["ego_wrong_delivery_event"] += int(bool(getattr(event, "ego_wrong_delivery_event", False)))
+    summary["partner_wrong_delivery_event"] += int(bool(getattr(event, "partner_wrong_delivery_event", False)))
     summary["collision_or_block"] += int(bool(getattr(event, "collision_or_block", False)))
     summary["recipe_indicator_event"] += int(bool(getattr(event, "recipe_indicator_event", False)))
     summary["button_pressed"] += int(bool(getattr(event, "button_pressed", False)))
@@ -1498,6 +1805,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--preflight_path", default=None)
+    parser.add_argument(
+        "--allow_shared_shaping",
+        action="store_true",
+        help="Legacy smoke escape hatch: sum shared shaped_reward dicts when agent_0 is absent.",
+    )
     return parser
 
 

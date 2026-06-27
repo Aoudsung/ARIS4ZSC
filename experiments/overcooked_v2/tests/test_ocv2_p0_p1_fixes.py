@@ -30,6 +30,7 @@ from experiments.overcooked_v2.option_termination import OptionRuntime, option_t
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_option_classifier import PartnerOptionClassifier
 from experiments.overcooked_v2.partner_pool import ProtocolSpec, ScriptedProtocolPartner
+from experiments.overcooked_v2.scripts import run_step4_microtrain
 
 
 def _option(option_id: int, entity_ids=(), region_ids=(), kind="fetch_ingredient"):
@@ -96,6 +97,12 @@ def _event(**overrides):
         "collision_or_block": False,
         "delivery_event": False,
         "wrong_delivery_event": False,
+        "ego_delivery_event": False,
+        "partner_delivery_event": False,
+        "ego_correct_delivery": False,
+        "partner_correct_delivery": False,
+        "ego_wrong_delivery_event": False,
+        "partner_wrong_delivery_event": False,
         "pot_changed": False,
         "object_pickup_or_drop": False,
         "recipe_indicator_event": False,
@@ -803,11 +810,113 @@ def test_full_support_and_derived_variants_honor_full_max_factors():
 
 def test_factor_deletion_rollout_and_q_proxy_are_separate_outputs():
     source = inspect.getsource(evaluate_aris.evaluate)
-    assert "factor_deletion_q_proxy" in source
-    assert "factor_deletion_return_drop" in source
+    assert "q_proxy_factor_mask" in source
+    assert "rollout_factor_mask" in source
     assert "\"factor_deletion_return_drop\"" not in inspect.getsource(
         evaluate_aris._factor_deletion_q_proxy_diagnostics
     )
+
+
+def test_eval_diagnostic_shape_mismatch_fails_loud_unless_allowed():
+    graph = _graph([_option(0), _option(1)], [_factor(0, 0, 1)])
+    belief = torch.zeros(1, 2, 2)
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        evaluate_aris._option_diagnostics(
+            SimpleNamespace(),
+            {"agent_0": np.zeros(4, dtype=np.float32)},
+            0,
+            belief,
+            belief,
+            graph,
+        )
+
+    skipped = evaluate_aris._option_diagnostics(
+        SimpleNamespace(),
+        {"agent_0": np.zeros(4, dtype=np.float32)},
+        0,
+        belief,
+        belief,
+        graph,
+        allow_diag_skip=True,
+    )
+    assert skipped["status"] == "shape_mismatch"
+    assert np.isnan(skipped["delta_info"])
+
+
+def test_serve_soup_termination_uses_canonical_delivery_event():
+    soup = _recipe(0, 0, 0) | int(DynamicObject.COOKED) | int(DynamicObject.PLATE)
+    opt = OptionSpec(
+        id=0,
+        name="serve",
+        kind="serve_soup",
+        target_id="delivery:2:1",
+        target_pos=(2, 1),
+        entity_ids=("delivery:2:1",),
+        region_ids=(),
+        max_steps=5,
+        metadata={},
+    )
+    runtime = OptionRuntime(option_id=0, start_pos=(1, 1))
+
+    terminated, reason = option_terminated(
+        opt,
+        _state((1, 1), inventory0=soup),
+        _state((1, 1), inventory0=0),
+        _event(delivery_event=True, ego_delivery_event=True, correct_delivery=True),
+        agent_id=0,
+        elapsed=1,
+        runtime=runtime,
+    )
+    assert (terminated, reason) == (True, "served_soup")
+
+    terminated, reason = option_terminated(
+        opt,
+        _state((1, 1), inventory0=soup),
+        _state((1, 1), inventory0=0),
+        _event(delivery_event=False, ego_delivery_event=False, correct_delivery=False),
+        agent_id=0,
+        elapsed=1,
+        runtime=runtime,
+    )
+    assert (terminated, reason) == (False, "running")
+
+
+def test_step4_matrix_reads_eval_manifest_provenance(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_step4_microtrain, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(run_step4_microtrain, "OUTPUT_DIR", "out")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    (out_dir / "eval_results.json").write_text(
+        json.dumps(
+            {
+                "seeds": [0],
+                "eval_episodes": 7,
+                "full_diagnostics": False,
+                "results": [
+                    {
+                        "output_path": str(out_dir / "eval_aris_bellman_seed0.json"),
+                        "command": ["python", "evaluate_aris.py", "--fast"],
+                        "eval_args": {"full_diagnostics": False},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = run_step4_microtrain._load_eval_manifest_for_matrix((0,))
+    cfg = run_step4_microtrain._matrix_eval_config(
+        SimpleNamespace(updates=5, eval_episodes=3, full_diagnostics=True),
+        (0,),
+        manifest,
+    )
+
+    assert cfg["full_diagnostics"] is False
+    assert cfg["eval_episodes"] == 7
+    assert cfg["eval_commands"] == [["python", "evaluate_aris.py", "--fast"]]
+    with pytest.raises(RuntimeError, match="seed manifest"):
+        run_step4_microtrain._load_eval_manifest_for_matrix((1,))
 
 
 def test_partner_id_q_consumes_partner_id():

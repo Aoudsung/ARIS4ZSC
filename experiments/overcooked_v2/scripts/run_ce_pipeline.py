@@ -29,6 +29,12 @@ from experiments.overcooked_v2.graph_builder import (
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.provenance import (
+    PROVENANCE_SCHEMA_VERSION,
+    runtime_provenance,
+    sha256_file,
+    stamp_graph_hash,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "ocv2_step4.yaml"
@@ -122,6 +128,7 @@ def main(argv: list[str] | None = None) -> None:
         "option_kind_stats": option_kind_stats(rows, lib.options),
     }
     save_replay_npz(replay_path, rows, replay_metadata)
+    replay_sha256 = sha256_file(replay_path)
     if gate.get("status") != "passed":
         sys.exit(1)
 
@@ -140,6 +147,7 @@ def main(argv: list[str] | None = None) -> None:
     ce = estimate_empirical_ce(rows, lib.num_options, min_weight=20.0)
     ce_path = output_dir / "ce_matrix.npy"
     np.save(ce_path, ce)
+    ce_sha256 = sha256_file(ce_path)
 
     print("CE matrix (non-zero entries):")
     for i in range(ce.shape[0]):
@@ -153,8 +161,25 @@ def main(argv: list[str] | None = None) -> None:
     refined, refine_meta = refine_empirical_ce(ce, rows, lib.num_options, top_k=32, min_weight=20.0)
     refined_path = output_dir / "ce_refined.npy"
     np.save(refined_path, refined)
+    refined_sha256 = sha256_file(refined_path)
     sidecar_path = output_dir / "ce_refined.meta.json"
-    sidecar_path.write_text(json.dumps(reward_metadata, indent=2, sort_keys=True), encoding="utf-8")
+    sidecar_path.write_text(
+        json.dumps(
+            {
+                **reward_metadata,
+                **refine_meta,
+                "provenance": {
+                    "schema_version": PROVENANCE_SCHEMA_VERSION,
+                    "replay_sha256": replay_sha256,
+                    "ce_matrix_input_sha256": ce_sha256,
+                    "ce_matrix_sha256": refined_sha256,
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     print(f"Saved CE metadata sidecar to {sidecar_path}")
 
     print("\n=== Phase 4: Graph Build ===")
@@ -170,6 +195,18 @@ def main(argv: list[str] | None = None) -> None:
         **reward_metadata,
         "coverage_gate": "pending",
         "formal_graph": True,
+        "provenance": {
+            **((graph.metadata or {}).get("provenance", {})),
+            **runtime_provenance(
+                config=config,
+                layout_graph=lg,
+                option_lib=lib,
+                partners=partners,
+                repo_root=REPO_ROOT,
+                ce_path=refined_path,
+                replay_path=replay_path,
+            ),
+        },
     }
     print(f"Graph: {len(graph.factors)} factors")
     factor_kinds_in_graph = set()
@@ -222,7 +259,9 @@ def main(argv: list[str] | None = None) -> None:
 
     # Save graph
     graph_path = output_dir / "graph.json"
-    graph_path.write_text(json.dumps(graph.to_json_dict(), indent=2), encoding="utf-8")
+    graph_json = stamp_graph_hash(graph.to_json_dict())
+    graph.metadata = graph_json["metadata"]
+    graph_path.write_text(json.dumps(graph_json, indent=2), encoding="utf-8")
 
     print("\n=== SUMMARY ===")
     print(f"Replay rows: {len(rows)}")

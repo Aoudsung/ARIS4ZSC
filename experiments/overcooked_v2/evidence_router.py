@@ -88,10 +88,26 @@ class OCV2EvidenceRouter:
         self.option_by_id = {int(opt.id): opt for opt in graph.options}
         self._factor_active = np.asarray(graph.factor_mask, dtype=bool)
         self._previous_partner_option: int | None = None
+        self._partner_option_evidence_counts = {
+            "observed_dist_count": 0,
+            "inferred_option_count": 0,
+            "missing_count": 0,
+            "total_count": 0,
+        }
         self._validate_factor_refs()
 
     def reset(self) -> None:
         self._previous_partner_option = None
+
+    def partner_option_evidence_summary(self) -> dict[str, Any]:
+        counts = dict(self._partner_option_evidence_counts)
+        total = max(1, int(counts["total_count"]))
+        return {
+            **counts,
+            "observed_dist_rate": float(counts["observed_dist_count"] / total),
+            "inferred_option_rate": float(counts["inferred_option_count"] / total),
+            "missing_rate": float(counts["missing_count"] / total),
+        }
 
     def route(
         self,
@@ -102,6 +118,10 @@ class OCV2EvidenceRouter:
     ) -> np.ndarray:
         routed = np.zeros((self.graph.num_factors, D_EVID), dtype=np.float32)
         current_partner_option = _as_optional_int(getattr(event, "partner_option", None))
+        self._record_partner_option_evidence(
+            getattr(event, "partner_option_dist", None),
+            current_partner_option,
+        )
         partner_switched = (
             current_partner_option is not None
             and self._previous_partner_option is not None
@@ -180,6 +200,19 @@ class OCV2EvidenceRouter:
         if current_partner_option is not None:
             self._previous_partner_option = current_partner_option
         return routed
+
+    def _record_partner_option_evidence(
+        self,
+        partner_option_dist: Any,
+        current_partner_option: int | None,
+    ) -> None:
+        self._partner_option_evidence_counts["total_count"] += 1
+        if partner_option_dist is not None:
+            self._partner_option_evidence_counts["observed_dist_count"] += 1
+        elif current_partner_option is not None:
+            self._partner_option_evidence_counts["inferred_option_count"] += 1
+        else:
+            self._partner_option_evidence_counts["missing_count"] += 1
 
     def _validate_factor_refs(self) -> None:
         for factor_idx, factor in enumerate(self.graph.factors):

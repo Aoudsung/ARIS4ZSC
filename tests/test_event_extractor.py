@@ -156,7 +156,10 @@ def test_delivery_requires_facing_goal_cell() -> None:
     assert counter_event.correct_delivery is False
     assert counter_event.wrong_delivery_event is False
     assert goal_event.delivery_event is True
+    assert goal_event.ego_delivery_event is True
+    assert goal_event.partner_delivery_event is False
     assert goal_event.correct_delivery is True
+    assert goal_event.ego_correct_delivery is True
     assert goal_event.wrong_delivery_event is False
 
 
@@ -191,8 +194,10 @@ def test_wrong_recipe_goal_drop_is_wrong_delivery() -> None:
     )
 
     assert event.delivery_event is True
+    assert event.ego_delivery_event is True
     assert event.correct_delivery is False
     assert event.wrong_delivery_event is True
+    assert event.ego_wrong_delivery_event is True
 
 
 def test_counter_drop_is_not_delivery() -> None:

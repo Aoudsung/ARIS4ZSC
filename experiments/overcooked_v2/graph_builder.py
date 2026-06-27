@@ -17,6 +17,10 @@ from src.aris_bellman.specs import FactorSpec, GraphSpec, OptionSpec
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.options import OCV2OptionLibrary
+from experiments.overcooked_v2.provenance import (
+    PROVENANCE_SCHEMA_VERSION,
+    sha256_numpy,
+)
 
 
 DEFAULT_FACTOR_MODES = {
@@ -95,6 +99,10 @@ def build_support_graph(
             "eta": float(eta),
             "max_factors": int(max_factors),
             "full_max_factors": int(max_factors),
+            "provenance": {
+                "schema_version": PROVENANCE_SCHEMA_VERSION,
+                "ce_matrix_array_sha256": sha256_numpy(ce_matrix),
+            },
         },
     )
 
@@ -245,7 +253,20 @@ def build_graph_variant(
 
     if require_task_stage_coverage:
         validate_task_stage_coverage(graph)
+    graph.metadata = _metadata_with_ce_hash(graph.metadata, ce_matrix)
     return graph
+
+
+def _metadata_with_ce_hash(
+    metadata: dict[str, Any] | None,
+    ce_matrix: np.ndarray,
+) -> dict[str, Any]:
+    updated = dict(metadata or {})
+    provenance = dict(updated.get("provenance", {}))
+    provenance.setdefault("schema_version", PROVENANCE_SCHEMA_VERSION)
+    provenance["ce_matrix_array_sha256"] = sha256_numpy(ce_matrix)
+    updated["provenance"] = provenance
+    return updated
 
 
 def full_support_graph(

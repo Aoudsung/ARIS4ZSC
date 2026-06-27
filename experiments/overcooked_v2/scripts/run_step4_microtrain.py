@@ -181,7 +181,9 @@ def _run_eval_job(
     gpu: int, method: str, seed: int, variant: str,
     episodes: int, full_diagnostics: bool, timeout: int,
 ) -> dict[str, Any]:
-    ckpt_dir = _checkpoint_dir(method, variant, seed)
+    context_method = "aris_bellman" if method == "random_policy" else method
+    context_variant = "full_support" if method == "random_policy" else variant
+    ckpt_dir = _checkpoint_dir(context_method, context_variant, seed)
     suffix = f"_{variant}" if variant != "full_support" else ""
     out_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}{suffix}.json"
     cmd = [
@@ -194,6 +196,8 @@ def _run_eval_job(
         "--seed", str(seed),
         "--output", str(out_path),
     ]
+    if method == "random_policy":
+        cmd.append("--random_policy_only")
     if not full_diagnostics:
         cmd.append("--fast")
     if out_path.exists():
@@ -222,6 +226,17 @@ def _run_eval_job(
         "returncode": rc,
         "elapsed": elapsed,
         "output_path": str(out_path),
+        "command": cmd,
+        "eval_args": {
+            "method": method,
+            "context_method": context_method,
+            "variant": variant,
+            "context_variant": context_variant,
+            "seed": seed,
+            "episodes": episodes,
+            "full_diagnostics": full_diagnostics,
+            "timeout": timeout,
+        },
         "ok": ok,
         "stderr_tail": stderr_tail if rc != 0 else "",
     }
@@ -233,11 +248,11 @@ def run_evaluation_phase(
 ) -> list[dict[str, Any]]:
     pending: list[tuple[str, int, str]] = []
     for m in METHODS:
-        if m == "random_policy":
-            continue
         for v in EVAL_VARIANTS.get(m, ("full_support",)):
             for s in seeds:
-                if (_checkpoint_dir(m, v, s) / "checkpoint.pt").exists():
+                ckpt_method = "aris_bellman" if m == "random_policy" else m
+                ckpt_variant = "full_support" if m == "random_policy" else v
+                if (_checkpoint_dir(ckpt_method, ckpt_variant, s) / "checkpoint.pt").exists():
                     pending.append((m, s, v))
     mode = "full-diagnostics" if full_diagnostics else "fast"
     print(f"\n=== Phase 4: Evaluation ({len(pending)} runs, {len(eval_gpus)} workers, "
@@ -292,13 +307,38 @@ def run_evaluation_phase(
 
 # -------------------------------------------------------------------------- matrix
 
-def _extract_random_baseline_from_eval(seed: int) -> float | None:
+def _manifest_output_paths(eval_manifest: dict[str, Any] | None) -> set[Path]:
+    if not eval_manifest:
+        return set()
+    return {
+        Path(str(result["output_path"])).resolve()
+        for result in eval_manifest.get("results", [])
+        if isinstance(result, dict) and result.get("output_path")
+    }
+
+
+def _assert_eval_path_manifested(
+    eval_path: Path,
+    eval_manifest: dict[str, Any] | None,
+) -> None:
+    manifested = _manifest_output_paths(eval_manifest)
+    if manifested and eval_path.resolve() not in manifested:
+        raise RuntimeError(
+            f"Matrix wants {eval_path}, but it is absent from eval_results.json."
+        )
+
+
+def _extract_random_baseline_from_eval(
+    seed: int,
+    eval_manifest: dict[str, Any] | None = None,
+) -> float | None:
     for method in METHODS:
         if method == "random_policy":
             continue
         eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}.json"
         if not eval_path.exists():
             continue
+        _assert_eval_path_manifested(eval_path, eval_manifest)
         data = json.loads(eval_path.read_text(encoding="utf-8"))
         baselines = data.get("reference_baselines", {})
         if not isinstance(baselines, dict):
@@ -313,7 +353,28 @@ def _extract_random_baseline_from_eval(seed: int) -> float | None:
     return None
 
 
-def build_matrix(seeds: tuple[int, ...]) -> dict[str, Any]:
+def _extract_direct_random_policy_eval(
+    seed: int,
+    eval_manifest: dict[str, Any] | None = None,
+) -> float | None:
+    eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_random_policy_seed{seed}.json"
+    if not eval_path.exists():
+        return None
+    _assert_eval_path_manifested(eval_path, eval_manifest)
+    data = json.loads(eval_path.read_text(encoding="utf-8"))
+    returns = [
+        float(entry.get("aggregate", {}).get("mean_return"))
+        for entry in data.get("results", [])
+        if entry.get("method") == "random_policy"
+        and entry.get("aggregate", {}).get("mean_return") is not None
+    ]
+    return float(np.mean(returns)) if returns else None
+
+
+def build_matrix(
+    seeds: tuple[int, ...],
+    eval_manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     print("\n=== Phase 5: Evaluation Matrix ===")
     matrix: dict[str, dict[str, list[float]]] = {
         method: {variant: [] for variant in VARIANTS}
@@ -323,7 +384,9 @@ def build_matrix(seeds: tuple[int, ...]) -> dict[str, Any]:
     for method in METHODS:
         for seed in seeds:
             if method == "random_policy":
-                ret = _extract_random_baseline_from_eval(seed)
+                ret = _extract_direct_random_policy_eval(seed, eval_manifest)
+                if ret is None:
+                    ret = _extract_random_baseline_from_eval(seed, eval_manifest)
                 if ret is not None:
                     matrix[method]["full_support"].append(ret)
                 continue
@@ -332,6 +395,7 @@ def build_matrix(seeds: tuple[int, ...]) -> dict[str, Any]:
                 eval_path = REPO_ROOT / OUTPUT_DIR / f"eval_{method}_seed{seed}{suffix}.json"
                 if not eval_path.exists():
                     continue
+                _assert_eval_path_manifested(eval_path, eval_manifest)
                 data = json.loads(eval_path.read_text(encoding="utf-8"))
                 for entry in data.get("results", []):
                     variant = entry.get("graph_variant", "")
@@ -364,7 +428,11 @@ def build_matrix(seeds: tuple[int, ...]) -> dict[str, Any]:
     return summary
 
 
-def check_gates(summary: dict[str, Any], seeds: tuple[int, ...]) -> dict[str, dict[str, Any]]:
+def check_gates(
+    summary: dict[str, Any],
+    seeds: tuple[int, ...],
+    eval_manifest: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
     print("\n=== Validation Gates ===")
     gates: dict[str, dict[str, Any]] = {}
 
@@ -374,11 +442,13 @@ def check_gates(summary: dict[str, Any], seeds: tuple[int, ...]) -> dict[str, di
 
     ab_fs = _mean("aris_bellman", "full_support")
     bo_fs = _mean("base_only", "full_support")
-    rp_vals = [
-        ret
-        for seed in seeds
-        if (ret := _extract_random_baseline_from_eval(seed)) is not None
-    ]
+    rp_vals = []
+    for seed in seeds:
+        ret = _extract_direct_random_policy_eval(seed, eval_manifest)
+        if ret is None:
+            ret = _extract_random_baseline_from_eval(seed, eval_manifest)
+        if ret is not None:
+            rp_vals.append(ret)
     rp_fs = float(np.mean(rp_vals)) if rp_vals else None
     ab_mh = _mean("aris_bellman", "minus_high_ce")
     ab_oc = _mean("aris_bellman", "overcomplete")
@@ -438,6 +508,53 @@ def _write_json(name: str, payload: Any) -> Path:
     return out_path
 
 
+def _load_eval_manifest_for_matrix(seeds: tuple[int, ...]) -> dict[str, Any] | None:
+    path = REPO_ROOT / OUTPUT_DIR / "eval_results.json"
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    manifest_seeds = tuple(int(seed) for seed in data.get("seeds", ()))
+    if manifest_seeds != tuple(seeds):
+        raise RuntimeError(
+            "eval_results.json seed manifest does not match matrix seeds: "
+            f"manifest={manifest_seeds}, matrix={tuple(seeds)}"
+        )
+    data["manifest_path"] = str(path)
+    return data
+
+
+def _matrix_eval_config(
+    args: argparse.Namespace,
+    seeds: tuple[int, ...],
+    eval_manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    config = {
+        "methods": METHODS,
+        "variants": VARIANTS,
+        "seeds": seeds,
+        "updates": args.updates,
+    }
+    if eval_manifest is not None:
+        config.update(
+            {
+                "eval_results_manifest": eval_manifest.get("manifest_path"),
+                "eval_episodes": eval_manifest.get("eval_episodes"),
+                "full_diagnostics": eval_manifest.get("full_diagnostics"),
+                "eval_commands": [
+                    result.get("command")
+                    for result in eval_manifest.get("results", [])
+                    if isinstance(result, dict) and result.get("command")
+                ],
+                "eval_args": [
+                    result.get("eval_args")
+                    for result in eval_manifest.get("results", [])
+                    if isinstance(result, dict) and result.get("eval_args")
+                ],
+            }
+        )
+    return config
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     seeds = tuple(int(x) for x in args.seeds.split(",") if x.strip() != "")
@@ -464,23 +581,18 @@ def main(argv: list[str] | None = None) -> None:
             eval_gpus, seeds, args.eval_episodes, args.full_diagnostics, args.eval_timeout
         )
         _write_json("eval_results.json", {"seeds": seeds,
+                                          "eval_episodes": args.eval_episodes,
                                           "full_diagnostics": args.full_diagnostics,
                                           "results": eval_results})
 
     if args.phase in ("matrix", "all"):
-        summary = build_matrix(seeds)
-        gates = check_gates(summary, seeds)
+        eval_manifest = _load_eval_manifest_for_matrix(seeds)
+        summary = build_matrix(seeds, eval_manifest)
+        gates = check_gates(summary, seeds, eval_manifest)
         out_path = _write_json("step4_matrix.json", {
             "matrix": summary,
             "gates": gates,
-            "config": {
-                "methods": METHODS,
-                "variants": VARIANTS,
-                "seeds": seeds,
-                "updates": args.updates,
-                "eval_episodes": args.eval_episodes,
-                "full_diagnostics": args.full_diagnostics,
-            },
+            "config": _matrix_eval_config(args, seeds, eval_manifest),
         })
         print(f"\nResults saved to: {out_path}")
 

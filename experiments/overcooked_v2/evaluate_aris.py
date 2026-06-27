@@ -36,6 +36,7 @@ from experiments.overcooked_v2.obs_encoder import infer_obs_dim
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.provenance import runtime_provenance
 from experiments.overcooked_v2.state_utils import get_agent_pos
 from experiments.overcooked_v2.train_aris import (
     _build_belief_model,
@@ -84,11 +85,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _load_context(_sibling_checkpoint(anchor, variant), variant)
         for variant in variants
     ]
+    partner_names = _resolve_partner_names(contexts[0].option_lib, args.partners)
     reward_scale_status = {
-        ctx.graph_variant: _graph_objective_metadata_status(ctx.graph, ctx.config)
+        ctx.graph_variant: _graph_objective_metadata_status(
+            ctx.graph,
+            ctx.config,
+            layout_graph=ctx.layout_graph,
+            option_lib=ctx.option_lib,
+            partners=make_training_partners(ctx.option_lib),
+        )
         for ctx in contexts
     }
-    partner_names = _resolve_partner_names(contexts[0].option_lib, args.partners)
     seed = int(args.seed)
     max_episode_options = int(
         args.max_episode_options
@@ -96,6 +103,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     fast = bool(getattr(args, "fast", False))
+    allow_diag_skip = bool(getattr(args, "allow_diag_skip", False))
+    random_policy_only = bool(getattr(args, "random_policy_only", False))
+    factor_deletion_episodes = _factor_deletion_episode_count(args, fast)
     results = []
     for ctx in contexts:
         for partner_name in partner_names:
@@ -106,11 +116,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 seed=seed,
                 max_episode_options=max_episode_options,
                 graph_override=ctx.graph,
-                random_policy=False,
+                random_policy=random_policy_only,
                 collect_diagnostics=not fast,
+                allow_diag_skip=allow_diag_skip,
             )
+            q_proxy_factor_mask = [] if fast else _factor_deletion_q_proxy_diagnostics(ctx)
             result = {
-                "method": ctx.method,
+                "method": "random_policy" if random_policy_only else ctx.method,
                 "graph_variant": ctx.graph_variant,
                 "partner": partner_name,
                 "checkpoint": str(ctx.checkpoint_path),
@@ -122,21 +134,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 ],
                 "aggregate": aggregate,
                 "episodes": episodes,
-                "factor_deletion_q_proxy": (
-                    [] if fast else _factor_deletion_q_proxy_diagnostics(ctx)
-                ),
+                "q_proxy_factor_mask": q_proxy_factor_mask,
+                "rollout_factor_mask": [],
+                "factor_deletion_q_proxy": q_proxy_factor_mask,
             }
-            if int(args.factor_deletion_episodes) > 0:
-                result["factor_deletion_return_drop"] = (
-                    _factor_deletion_rollout_diagnostics(
-                        ctx,
-                        partner_name,
-                        float(aggregate["mean_return"]),
-                        episodes=int(args.factor_deletion_episodes),
-                        seed=seed + 400_000,
-                        max_episode_options=max_episode_options,
-                    )
+            if factor_deletion_episodes > 0 and not random_policy_only:
+                result["rollout_factor_mask"] = _factor_deletion_rollout_diagnostics(
+                    ctx,
+                    partner_name,
+                    float(aggregate["mean_return"]),
+                    episodes=factor_deletion_episodes,
+                    seed=seed + 400_000,
+                    max_episode_options=max_episode_options,
+                    allow_diag_skip=allow_diag_skip,
                 )
+                result["factor_deletion_return_drop"] = result["rollout_factor_mask"]
             results.append(result)
 
     baselines = _random_baselines(
@@ -172,6 +184,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "episodes_per_partner": int(args.episodes),
         "max_episode_options": max_episode_options,
         "diagnostic_granularity": "option",
+        "allow_diag_skip": allow_diag_skip,
+        "factor_deletion_episodes": factor_deletion_episodes,
         "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
         "reward_scale_verified": all(
             bool(item["reward_scale_verified"])
@@ -182,6 +196,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             for variant, status in reward_scale_status.items()
         },
         "graph_reward_scale_status": reward_scale_status,
+        "graph_provenance": {
+            ctx.graph_variant: (ctx.graph.metadata or {}).get("provenance", {})
+            for ctx in contexts
+        },
+        "eval_provenance": {
+            ctx.graph_variant: _eval_provenance(ctx)
+            for ctx in contexts
+        },
         "reference_gap_semantics": _reference_semantics(external_references is not None),
         "results": results,
         "reference_baselines": baselines,
@@ -240,6 +262,7 @@ def _evaluate_partner(
     graph_override: GraphSpec,
     random_policy: bool,
     collect_diagnostics: bool,
+    allow_diag_skip: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     rng = np.random.default_rng(seed)
     env = _build_env(graph_override.layout_name, ctx.config)
@@ -267,11 +290,19 @@ def _evaluate_partner(
             max_episode_options,
             random_policy=random_policy,
             collect_diagnostics=collect_diagnostics,
+            allow_diag_skip=allow_diag_skip,
         )
         row["episode_id"] = int(episode_idx)
         episode_rows.append(row)
 
-    return _aggregate_episodes(episode_rows), episode_rows
+    aggregate = _aggregate_episodes(episode_rows)
+    aggregate["partner_option_evidence"] = router.partner_option_evidence_summary()
+    _validate_eval_integrity(
+        aggregate,
+        collect_diagnostics=collect_diagnostics,
+        allow_diag_skip=allow_diag_skip,
+    )
+    return aggregate, episode_rows
 
 
 def _run_episode(
@@ -286,6 +317,7 @@ def _run_episode(
     *,
     random_policy: bool,
     collect_diagnostics: bool,
+    allow_diag_skip: bool,
 ) -> dict[str, Any]:
     evidence_buffer = EvidenceBuffer(
         num_factors=graph.num_factors,
@@ -308,6 +340,13 @@ def _run_episode(
     swap_values: list[dict[str, Any]] = []
     termination_counts: dict[str, int] = {}
     option_kind_stats: dict[str, dict[str, Any]] = {}
+    diagnostic_status_counts: dict[str, int] = {}
+    selection_stats: dict[str, int] = {
+        "option_selection_count": 0,
+        "forced_noop_count": 0,
+        "no_valid_option_count": 0,
+    }
+    delivery_counts = _empty_delivery_counts()
     done = False
 
     while not done and option_count < max_episode_options:
@@ -320,6 +359,7 @@ def _run_episode(
             rng,
             random_policy,
             partner_id=int(getattr(partner, "partner_id", 0)),
+            selection_stats=selection_stats,
         )
         option_return, done, obs, info = _execute_eval_option(
             ctx,
@@ -331,6 +371,7 @@ def _run_episode(
             evidence_buffer,
             option_id,
             collect_diagnostics,
+            allow_diag_skip,
             rng,
         )
         episode_return += option_return
@@ -338,6 +379,8 @@ def _run_episode(
         primitive_steps += int(info["primitive_steps"])
         blocking_events += int(info["blocking_events"])
         delivery_seen = bool(delivery_seen or info["delivery_seen"])
+        _merge_counts(delivery_counts, info["delivery_counts"])
+        _merge_counts(diagnostic_status_counts, info["diagnostic_status_counts"])
         delta_values.extend(info["delta_info"])
         mi_values.extend(info["mi"])
         diagnostic_cost_values.extend(info["diagnostic_cost"])
@@ -352,14 +395,25 @@ def _run_episode(
     return {
         "return": float(episode_return),
         "completed": bool(delivery_seen),
+        "delivery_counts": delivery_counts,
         "primitive_steps": int(primitive_steps),
         "option_count": int(option_count),
         "blocking_events": int(blocking_events),
         "blocking_rate": float(blocking_events / max(1, primitive_steps)),
-        "delta_info_mean": _mean_or_zero(delta_values),
-        "mi_mean": _mean_or_zero(mi_values),
-        "diagnostic_cost_mean": _mean_or_zero(diagnostic_cost_values),
+        "delta_info_mean": _mean_or_nan(delta_values),
+        "mi_mean": _mean_or_nan(mi_values),
+        "diagnostic_cost_mean": _mean_or_nan(diagnostic_cost_values),
         "diagnostic_count": len(delta_values),
+        "diagnostic_status_counts": diagnostic_status_counts,
+        **selection_stats,
+        "forced_noop_fraction": float(
+            selection_stats["forced_noop_count"]
+            / max(1, selection_stats["option_selection_count"])
+        ),
+        "no_valid_option_fraction": float(
+            selection_stats["no_valid_option_count"]
+            / max(1, selection_stats["option_selection_count"])
+        ),
         "belief_swap": _aggregate_swap(swap_values),
         "termination_counts": termination_counts,
         "option_kind_stats": option_kind_stats,
@@ -376,6 +430,7 @@ def _execute_eval_option(
     evidence_buffer: EvidenceBuffer,
     option_id: int,
     collect_diagnostics: bool,
+    allow_diag_skip: bool,
     rng: np.random.Generator,
 ) -> tuple[float, bool, dict[str, np.ndarray], dict[str, Any]]:
     opt = ctx.option_lib.options[int(option_id)]
@@ -393,6 +448,8 @@ def _execute_eval_option(
     mi_values: list[float] = []
     diagnostic_cost_values: list[float] = []
     swap_values: list[dict[str, Any]] = []
+    diagnostic_status_counts: dict[str, int] = {}
+    delivery_counts = _empty_delivery_counts()
     done = False
     belief_before_option = _current_belief(ctx, evidence_buffer, graph)
 
@@ -421,11 +478,8 @@ def _execute_eval_option(
         )
         evidence_buffer.append(x_f)
         blocking_events += int(bool(event.collision_or_block))
-        delivery_seen = bool(
-            delivery_seen
-            or event.delivery_event
-            or float(step.rewards.get("agent_0", 0.0)) > 0.0
-        )
+        _accumulate_delivery_counts(delivery_counts, event)
+        delivery_seen = bool(delivery_seen or event.delivery_event)
         done = bool(step.dones.get("__all__", False))
         terminated, termination_reason = ctx.option_lib.option_terminated(
             opt,
@@ -451,11 +505,14 @@ def _execute_eval_option(
             belief_before_option,
             belief_after_option,
             graph,
+            allow_diag_skip=allow_diag_skip,
         )
-        delta_values.append(diag["delta_info"])
-        mi_values.append(diag["mi"])
-        diagnostic_cost_values.append(diag["diagnostic_cost"])
-        swap_values.append(diag["belief_swap"])
+        _increment(diagnostic_status_counts, str(diag.get("status", "unknown")))
+        if diag.get("status") == "ok":
+            delta_values.append(diag["delta_info"])
+            mi_values.append(diag["mi"])
+            diagnostic_cost_values.append(diag["diagnostic_cost"])
+            swap_values.append(diag["belief_swap"])
 
     option_return = reward_sum - float(ctx.config["training"]["cost_coef"]) * realized_cost
     return (
@@ -466,19 +523,22 @@ def _execute_eval_option(
             "primitive_steps": int(duration),
             "blocking_events": int(blocking_events),
             "delivery_seen": bool(delivery_seen),
+            "delivery_counts": delivery_counts,
             "termination_reason": termination_reason,
             "delta_info": delta_values,
             "mi": mi_values,
             "diagnostic_cost": diagnostic_cost_values,
             "belief_swap": swap_values,
+            "diagnostic_status_counts": diagnostic_status_counts,
         },
     )
 
 
 _DIAG_SKIP = {
-    "delta_info": 0.0,
-    "mi": 0.0,
-    "diagnostic_cost": 0.0,
+    "status": "shape_mismatch",
+    "delta_info": float("nan"),
+    "mi": float("nan"),
+    "diagnostic_cost": float("nan"),
     "belief_swap": {"status": "shape_mismatch"},
 }
 
@@ -490,10 +550,18 @@ def _option_diagnostics(
     belief_before: torch.Tensor,
     belief_after: torch.Tensor,
     graph: GraphSpec,
+    *,
+    allow_diag_skip: bool = False,
 ) -> dict[str, Any]:
     graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
     mode_mask = graph_batch["mode_mask"]
     if belief_before.shape != mode_mask.shape:
+        if not allow_diag_skip:
+            raise RuntimeError(
+                "Diagnostic belief/mode-mask shape mismatch: "
+                f"belief={tuple(belief_before.shape)} mode_mask={tuple(mode_mask.shape)}. "
+                "Pass --allow_diag_skip only for non-formal smoke runs."
+            )
         return dict(_DIAG_SKIP)
     obs_tensor = _tensor(_obs_vector(obs_next, "agent_0")[None, ...], torch.device("cpu"))
     with torch.no_grad():
@@ -510,6 +578,7 @@ def _option_diagnostics(
         _, cost = diagnostic_cost(q_base, int(option_id), delta, tau=0.0)
         swap = belief_swap_top_pairs(ctx.q_net, obs_tensor, belief_after, graph_batch, graph)
         return {
+            "status": "ok",
             "delta_info": float(delta.mean().item()),
             "mi": float(mi.mean().item()),
             "diagnostic_cost": float(cost.mean().item()),
@@ -537,10 +606,13 @@ def _select_option(
     rng: np.random.Generator,
     random_policy: bool,
     partner_id: int | None = None,
+    selection_stats: dict[str, int] | None = None,
 ) -> int:
+    _record_selection_attempt(selection_stats)
     valid = ctx.option_lib.valid_options(state, 0)
     valid_ids = np.flatnonzero(valid)
     if valid_ids.size == 0:
+        _record_forced_noop(selection_stats)
         return _noop_option_id(ctx.option_lib)
     if random_policy:
         return int(rng.choice(valid_ids))
@@ -591,6 +663,7 @@ def _factor_deletion_rollout_diagnostics(
     episodes: int,
     seed: int,
     max_episode_options: int,
+    allow_diag_skip: bool = False,
 ) -> list[dict[str, Any]]:
     deleted_returns: dict[int, float] = {}
     for factor in ctx.graph.factors:
@@ -604,6 +677,7 @@ def _factor_deletion_rollout_diagnostics(
             graph_override=deleted_graph,
             random_policy=False,
             collect_diagnostics=False,
+            allow_diag_skip=allow_diag_skip,
         )
         deleted_returns[int(factor.id)] = float(aggregate["mean_return"])
 
@@ -756,11 +830,15 @@ def _attach_within_run_relative_returns(
         r_base = float(baselines[partner]["mean_return"])
         r_ref = max(float(row["aggregate"]["mean_return"]) for row in rows)
         for row in rows:
-            row["aggregate"]["within_run_relative_return"] = reference_gap_closure(
+            metric = reference_gap_closure(
                 float(row["aggregate"]["mean_return"]),
                 r_base,
                 r_ref,
             )
+            if metric.get("status") == "ok" and float(row["aggregate"]["mean_return"]) == r_ref:
+                metric.pop("raw_value", None)
+                metric["status"] = "within_run_reference_variant"
+            row["aggregate"]["within_run_relative_return"] = metric
 
 
 def _reference_semantics(has_external_references: bool) -> dict[str, str]:
@@ -783,7 +861,17 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     blocking_events = sum(int(row["blocking_events"]) for row in episodes)
     term_counts: dict[str, int] = {}
     option_kind_stats: dict[str, dict[str, Any]] = {}
+    diagnostic_status_counts: dict[str, int] = {}
+    delivery_counts = _empty_delivery_counts()
+    option_selection_count = 0
+    forced_noop_count = 0
+    no_valid_option_count = 0
     for row in episodes:
+        _merge_counts(delivery_counts, row.get("delivery_counts", {}))
+        _merge_counts(diagnostic_status_counts, row.get("diagnostic_status_counts", {}))
+        option_selection_count += int(row.get("option_selection_count", 0))
+        forced_noop_count += int(row.get("forced_noop_count", 0))
+        no_valid_option_count += int(row.get("no_valid_option_count", 0))
         for key, value in row["termination_counts"].items():
             term_counts[key] = term_counts.get(key, 0) + int(value)
         for kind, item in row.get("option_kind_stats", {}).items():
@@ -814,12 +902,27 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
             int(item["success_count"]) / max(1, int(item["attempt_count"]))
         )
     return {
-        "mean_return": _mean_or_zero(returns),
-        "return_std": float(np.std(returns)) if returns else 0.0,
-        "completion_rate": _mean_or_zero([float(row["completed"]) for row in episodes]),
+        "mean_return": _mean_or_nan(returns),
+        "return_std": float(np.std(returns)) if returns else float("nan"),
+        "completion_rate": _mean_or_nan([float(row["completed"]) for row in episodes]),
+        "delivery_counts": delivery_counts,
+        "ego_delivery_count": int(delivery_counts["ego_delivery_event"]),
+        "partner_delivery_count": int(delivery_counts["partner_delivery_event"]),
+        "correct_delivery_count": int(delivery_counts["correct_delivery"]),
+        "wrong_delivery_count": int(delivery_counts["wrong_delivery_event"]),
+        "ego_correct_delivery_count": int(delivery_counts["ego_correct_delivery"]),
+        "partner_correct_delivery_count": int(delivery_counts["partner_correct_delivery"]),
+        "ego_wrong_delivery_count": int(delivery_counts["ego_wrong_delivery_event"]),
+        "partner_wrong_delivery_count": int(delivery_counts["partner_wrong_delivery_event"]),
         "blocking_rate": float(blocking_events / max(1, primitive_steps)),
-        "mean_duration": _mean_or_zero([float(row["primitive_steps"]) for row in episodes]),
+        "mean_duration": _mean_or_nan([float(row["primitive_steps"]) for row in episodes]),
         "primitive_steps": int(primitive_steps),
+        "option_selection_count": int(option_selection_count),
+        "forced_noop_count": int(forced_noop_count),
+        "no_valid_option_count": int(no_valid_option_count),
+        "forced_noop_fraction": float(forced_noop_count / max(1, option_selection_count)),
+        "no_valid_option_fraction": float(no_valid_option_count / max(1, option_selection_count)),
+        "diagnostic_status_counts": diagnostic_status_counts,
         "termination_counts": term_counts,
         "option_kind_stats": option_kind_stats,
         "delta_info": _weighted_episode_summary(episodes, "delta_info_mean"),
@@ -885,28 +988,28 @@ def _summary(
     summary = {
         "num_results": len(results),
         "partners": sorted(baselines),
-        "mean_return": _mean_or_zero(
+        "mean_return": _mean_or_nan(
             [float(row["aggregate"]["mean_return"]) for row in results]
         ),
-        "mean_completion_rate": _mean_or_zero(
+        "mean_completion_rate": _mean_or_nan(
             [float(row["aggregate"]["completion_rate"]) for row in results]
         ),
-        "mean_blocking_rate": _mean_or_zero(
+        "mean_blocking_rate": _mean_or_nan(
             [float(row["aggregate"]["blocking_rate"]) for row in results]
         ),
         "wall_time_sec": float(wall),
     }
     if closures:
-        summary["mean_reference_gap_closure"] = _mean_or_zero(closures)
+        summary["mean_reference_gap_closure"] = _mean_or_nan(closures)
     if raw_closures:
-        summary["mean_reference_gap_closure_raw"] = _mean_or_zero(raw_closures)
+        summary["mean_reference_gap_closure_raw"] = _mean_or_nan(raw_closures)
         summary["num_negative_raw_reference_gaps"] = int(
             sum(1 for value in raw_closures if float(value) < 0.0)
         )
     if within_run:
-        summary["mean_within_run_relative_return"] = _mean_or_zero(within_run)
+        summary["mean_within_run_relative_return"] = _mean_or_nan(within_run)
     if raw_within_run:
-        summary["mean_within_run_relative_return_raw"] = _mean_or_zero(raw_within_run)
+        summary["mean_within_run_relative_return_raw"] = _mean_or_nan(raw_within_run)
     return summary
 
 
@@ -929,7 +1032,7 @@ def _relative_values(
 def _finite_summary(values: list[float]) -> dict[str, Any]:
     finite = [float(value) for value in values if np.isfinite(float(value))]
     return {
-        "mean": _mean_or_zero(finite),
+        "mean": _mean_or_nan(finite),
         "count": len(finite),
         "status": "ok" if finite else "no_values",
     }
@@ -951,13 +1054,13 @@ def _aggregate_swap(values: list[dict[str, Any]]) -> dict[str, Any]:
         "num_option_diagnostics": len(ok),
         "num_pair_rows": len(pair_rows),
         "pairs": pair_rows,
-        "mean_abs_maxq_delta": _mean_or_zero(
+        "mean_abs_maxq_delta": _mean_or_nan(
             [float(value["mean_abs_maxq_delta"]) for value in ok]
         ),
-        "mean_abs_q_delta": _mean_or_zero(
+        "mean_abs_q_delta": _mean_or_nan(
             [float(value["mean_abs_q_delta"]) for value in ok]
         ),
-        "action_flip_rate": _mean_or_zero(
+        "action_flip_rate": _mean_or_nan(
             [float(value["action_flip_rate"]) for value in ok]
         ),
     }
@@ -977,16 +1080,115 @@ def _weighted_episode_summary(
         total += value * row_count
         count += row_count
     return {
-        "mean": float(total / count) if count else 0.0,
+        "mean": float(total / count) if count else float("nan"),
         "count": count,
         "status": "ok" if count else "no_values",
     }
 
 
-def _mean_or_zero(values: list[float]) -> float:
+def _mean_or_nan(values: list[float]) -> float:
     if not values:
-        return 0.0
+        return float("nan")
     return float(np.mean(np.asarray(values, dtype=np.float64)))
+
+
+def _empty_delivery_counts() -> dict[str, int]:
+    return {
+        "delivery_event": 0,
+        "ego_delivery_event": 0,
+        "partner_delivery_event": 0,
+        "correct_delivery": 0,
+        "wrong_delivery_event": 0,
+        "ego_correct_delivery": 0,
+        "partner_correct_delivery": 0,
+        "ego_wrong_delivery_event": 0,
+        "partner_wrong_delivery_event": 0,
+    }
+
+
+def _accumulate_delivery_counts(counts: dict[str, int], event: Any) -> None:
+    for key in counts:
+        counts[key] = int(counts.get(key, 0)) + int(bool(getattr(event, key, False)))
+
+
+def _merge_counts(target: dict[str, int], source: dict[str, Any]) -> None:
+    for key, value in source.items():
+        target[str(key)] = int(target.get(str(key), 0)) + int(value)
+
+
+def _record_selection_attempt(selection_stats: dict[str, int] | None) -> None:
+    if selection_stats is None:
+        return
+    selection_stats["option_selection_count"] = int(
+        selection_stats.get("option_selection_count", 0)
+    ) + 1
+
+
+def _record_forced_noop(selection_stats: dict[str, int] | None) -> None:
+    if selection_stats is None:
+        return
+    selection_stats["no_valid_option_count"] = int(
+        selection_stats.get("no_valid_option_count", 0)
+    ) + 1
+    selection_stats["forced_noop_count"] = int(
+        selection_stats.get("forced_noop_count", 0)
+    ) + 1
+
+
+def _validate_eval_integrity(
+    aggregate: dict[str, Any],
+    *,
+    collect_diagnostics: bool,
+    allow_diag_skip: bool,
+) -> None:
+    if allow_diag_skip:
+        return
+    if int(aggregate.get("forced_noop_count", 0)) > 0:
+        raise RuntimeError(
+            "Formal eval encountered no-valid-option forced noop events: "
+            f"{aggregate['forced_noop_count']}. Pass --allow_diag_skip only for smoke runs."
+        )
+    evidence = aggregate.get("partner_option_evidence", {})
+    if int(evidence.get("missing_count", 0)) > 0:
+        raise RuntimeError(
+            "Formal eval observed missing partner-option evidence: "
+            f"{evidence['missing_count']} events."
+        )
+    if collect_diagnostics:
+        bad = {
+            key: value
+            for key, value in (
+                ("delta_info", aggregate.get("delta_info", {})),
+                ("mi", aggregate.get("mi", {})),
+                ("diagnostic_cost", aggregate.get("diagnostic_cost", {})),
+            )
+            if isinstance(value, dict) and value.get("status") != "ok"
+        }
+        if bad:
+            raise RuntimeError(
+                "Formal eval diagnostics produced no valid values: "
+                f"{json.dumps(_jsonable(bad), sort_keys=True)}. "
+                "Pass --allow_diag_skip only for smoke runs."
+            )
+
+
+def _factor_deletion_episode_count(args: argparse.Namespace, fast: bool) -> int:
+    requested = getattr(args, "factor_deletion_episodes", None)
+    if requested is not None:
+        return int(requested)
+    return 0 if fast else 3
+
+
+def _eval_provenance(ctx: EvalContext) -> dict[str, Any]:
+    return runtime_provenance(
+        config=ctx.config,
+        layout_graph=ctx.layout_graph,
+        option_lib=ctx.option_lib,
+        partners=make_training_partners(ctx.option_lib),
+        ce_path=ctx.config.get("graph", {}).get("ce_path"),
+        replay_path=ctx.config.get("graph", {}).get("replay_path"),
+        graph_path=ctx.config.get("graph", {}).get("graph_path"),
+    )
 
 
 def _noop_option_id(option_lib: OCV2OptionLibrary) -> int:
@@ -1059,7 +1261,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_episode_options", type=int, default=0)
-    parser.add_argument("--factor_deletion_episodes", type=int, default=0)
+    parser.add_argument("--factor_deletion_episodes", type=int, default=None)
+    parser.add_argument(
+        "--allow_diag_skip",
+        action="store_true",
+        help="Smoke/debug escape hatch: record diagnostic skips instead of failing formal eval.",
+    )
+    parser.add_argument(
+        "--random_policy_only",
+        action="store_true",
+        help="Use the checkpoint only to load env/graph context and evaluate random valid options.",
+    )
     parser.add_argument(
         "--fast",
         action="store_true",

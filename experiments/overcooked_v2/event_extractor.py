@@ -53,6 +53,12 @@ class OCV2Event:
     collision_or_block: bool
     delivery_event: bool
     wrong_delivery_event: bool
+    ego_delivery_event: bool
+    partner_delivery_event: bool
+    ego_correct_delivery: bool
+    partner_correct_delivery: bool
+    ego_wrong_delivery_event: bool
+    partner_wrong_delivery_event: bool
     pot_changed: bool
     object_pickup_or_drop: bool
     recipe_indicator_event: bool
@@ -111,24 +117,27 @@ def extract_event(
         _blocked_move(ego_action, ego_pos_before, ego_pos_after)
         or _blocked_move(partner_action, partner_pos_before, partner_pos_after)
     )
-    heuristic_delivery = (
-        _delivered_soup(
-            ego_inventory_before,
-            ego_inventory_after,
-            ego_interacted,
-        )
-        and _delivery_target(prev_state, 0)
-    ) or (
-        _delivered_soup(
-            partner_inventory_before,
-            partner_inventory_after,
-            partner_interacted,
-        )
-        and _delivery_target(prev_state, 1)
+    ego_delivery_event = _canonical_agent_delivery(
+        prev_state,
+        agent_id=0,
+        inventory_before=ego_inventory_before,
+        inventory_after=ego_inventory_after,
+        interacted=ego_interacted,
+    )
+    partner_delivery_event = _canonical_agent_delivery(
+        prev_state,
+        agent_id=1,
+        inventory_before=partner_inventory_before,
+        inventory_after=partner_inventory_after,
+        interacted=partner_interacted,
     )
     correct_delivery = bool(np.asarray(next_state.new_correct_delivery).item())
-    delivery_event = bool(heuristic_delivery or correct_delivery)
+    delivery_event = bool(ego_delivery_event or partner_delivery_event or correct_delivery)
     wrong_delivery_event = bool(delivery_event and not correct_delivery)
+    ego_correct_delivery = bool(ego_delivery_event and correct_delivery)
+    partner_correct_delivery = bool(partner_delivery_event and correct_delivery)
+    ego_wrong_delivery_event = bool(ego_delivery_event and not correct_delivery)
+    partner_wrong_delivery_event = bool(partner_delivery_event and not correct_delivery)
     object_pickup_or_drop = (
         ego_inventory_before != ego_inventory_after
         or partner_inventory_before != partner_inventory_after
@@ -194,6 +203,12 @@ def extract_event(
         collision_or_block=collision_or_block,
         delivery_event=delivery_event,
         wrong_delivery_event=wrong_delivery_event,
+        ego_delivery_event=ego_delivery_event,
+        partner_delivery_event=partner_delivery_event,
+        ego_correct_delivery=ego_correct_delivery,
+        partner_correct_delivery=partner_correct_delivery,
+        ego_wrong_delivery_event=ego_wrong_delivery_event,
+        partner_wrong_delivery_event=partner_wrong_delivery_event,
         pot_changed=pot_changed,
         object_pickup_or_drop=object_pickup_or_drop,
         recipe_indicator_event=recipe_indicator_event,
@@ -218,6 +233,20 @@ def _blocked_move(action: int, before: GridPos, after: GridPos) -> bool:
 
 def _delivered_soup(inv_before: int, inv_after: int, interacted: bool) -> bool:
     return interacted and is_plated_cooked_soup(inv_before) and is_empty_inventory(inv_after)
+
+
+def _canonical_agent_delivery(
+    state: Any,
+    *,
+    agent_id: int,
+    inventory_before: int,
+    inventory_after: int,
+    interacted: bool,
+) -> bool:
+    return bool(
+        _delivered_soup(inventory_before, inventory_after, interacted)
+        and _delivery_target(state, agent_id)
+    )
 
 
 def _delivery_target(state: Any, agent_id: int) -> bool:

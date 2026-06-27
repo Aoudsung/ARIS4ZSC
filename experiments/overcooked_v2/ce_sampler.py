@@ -25,6 +25,15 @@ from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.provenance import (
+    PROVENANCE_SCHEMA_VERSION,
+    layout_parse_hash,
+    option_library_hash,
+    partner_pool_hash,
+    reward_config_payload,
+    sha256_file,
+    sha256_json,
+)
 from experiments.overcooked_v2.state_utils import (
     get_agent_pos,
     get_dynamic_objects_grid,
@@ -454,6 +463,14 @@ def replay_coverage(
         "plate_picked": 0,
         "plated_soup": 0,
         "served_soup": 0,
+        "ego_delivery_event": 0,
+        "partner_delivery_event": 0,
+        "correct_delivery": 0,
+        "wrong_delivery_event": 0,
+        "ego_correct_delivery": 0,
+        "partner_correct_delivery": 0,
+        "ego_wrong_delivery_event": 0,
+        "partner_wrong_delivery_event": 0,
         "drop_item_to_counter": 0,
         "cleared_interaction_cell": 0,
     }
@@ -474,6 +491,14 @@ def replay_coverage(
             int(reason == "served_soup"),
             int(summary.get("delivery_event", 0)),
         )
+        coverage["ego_delivery_event"] += int(summary.get("ego_delivery_event", 0))
+        coverage["partner_delivery_event"] += int(summary.get("partner_delivery_event", 0))
+        coverage["correct_delivery"] += int(summary.get("correct_delivery", 0))
+        coverage["wrong_delivery_event"] += int(summary.get("wrong_delivery_event", 0))
+        coverage["ego_correct_delivery"] += int(summary.get("ego_correct_delivery", 0))
+        coverage["partner_correct_delivery"] += int(summary.get("partner_correct_delivery", 0))
+        coverage["ego_wrong_delivery_event"] += int(summary.get("ego_wrong_delivery_event", 0))
+        coverage["partner_wrong_delivery_event"] += int(summary.get("partner_wrong_delivery_event", 0))
         coverage["drop_item_to_counter"] += int(reason == "dropped_item_to_counter")
         coverage["cleared_interaction_cell"] += int(reason == "cleared_interaction_cell")
     return {key: int(value) for key, value in coverage.items()}
@@ -829,6 +854,12 @@ def _empty_event_summary() -> dict[str, Any]:
     return {
         "delivery_event": 0,
         "wrong_delivery_event": 0,
+        "ego_delivery_event": 0,
+        "partner_delivery_event": 0,
+        "ego_correct_delivery": 0,
+        "partner_correct_delivery": 0,
+        "ego_wrong_delivery_event": 0,
+        "partner_wrong_delivery_event": 0,
         "pot_changed": 0,
         "object_pickup_or_drop": 0,
         "recipe_indicator_event": 0,
@@ -851,6 +882,12 @@ def _accumulate_event_summary(summary: dict[str, Any], event: OCV2Event) -> None
     for key in (
         "delivery_event",
         "wrong_delivery_event",
+        "ego_delivery_event",
+        "partner_delivery_event",
+        "ego_correct_delivery",
+        "partner_correct_delivery",
+        "ego_wrong_delivery_event",
+        "partner_wrong_delivery_event",
         "pot_changed",
         "object_pickup_or_drop",
         "recipe_indicator_event",
@@ -946,7 +983,9 @@ def _top_pairs(ce_matrix: np.ndarray, top_k: int) -> list[tuple[float, int, int]
     return pairs[: max(0, int(top_k))]
 
 
-def _build_default_stack(args: argparse.Namespace) -> tuple[OCV2Adapter, OCV2OptionLibrary]:
+def _build_default_stack(
+    args: argparse.Namespace,
+) -> tuple[OCV2Adapter, OCV2OptionLibrary, Any]:
     env = OCV2Adapter(
         args.layout,
         max_steps=args.max_steps,
@@ -955,11 +994,11 @@ def _build_default_stack(args: argparse.Namespace) -> tuple[OCV2Adapter, OCV2Opt
     )
     layout_graph = parse_layout(env, args.layout)
     option_lib = OCV2OptionLibrary(layout_graph, max_option_steps=args.max_option_steps)
-    return env, option_lib
+    return env, option_lib, layout_graph
 
 
 def _cmd_collect(args: argparse.Namespace) -> None:
-    env, option_lib = _build_default_stack(args)
+    env, option_lib, layout_graph = _build_default_stack(args)
     if args.partners not in {"scripted_debug", "train", "all"}:
         raise ValueError(
             "Phase 4 CE collection supports scripted_debug/train/all partner selectors."
@@ -1008,22 +1047,44 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         coverage,
         require_full_task_coverage=bool(args.require_full_task_coverage),
     )
+    reward_config = {
+        "layout": args.layout,
+        "cost_coef": cost_coef,
+        "cost_per_step": cost_per_step,
+        "shaped_reward_coef": shaped_reward_coef,
+        "reward_scale_source": reward_scale_source,
+        "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
+    }
     save_replay_npz(
         args.output,
         rows,
         metadata={
+            **reward_config,
             "layout": args.layout,
             "episodes_per_partner": args.episodes,
             "num_rows": len(rows),
             "partners": [partner.name for partner in partners],
-            "cost_coef": cost_coef,
-            "cost_per_step": cost_per_step,
-            "shaped_reward_coef": shaped_reward_coef,
-            "reward_scale_source": reward_scale_source,
-            "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
             "coverage": coverage,
             "coverage_gate": coverage_gate,
             "option_kind_stats": option_kind_stats(rows, option_lib.options),
+            "provenance": {
+                "schema_version": PROVENANCE_SCHEMA_VERSION,
+                "layout_parse_sha256": layout_parse_hash(layout_graph),
+                "option_library_sha256": option_library_hash(option_lib),
+                "partner_pool_sha256": partner_pool_hash(partners),
+                "reward_config_sha256": sha256_json(
+                    reward_config_payload(
+                        {
+                            "layout": args.layout,
+                            "training": {
+                                "cost_coef": cost_coef,
+                                "cost_per_step": cost_per_step,
+                                "shaped_reward_coef": shaped_reward_coef,
+                            },
+                        }
+                    )
+                ),
+            },
         },
     )
 
@@ -1035,7 +1096,11 @@ def _cmd_estimate(args: argparse.Namespace) -> None:
     np.save(args.output, ce)
     _write_metadata_sidecar(
         args.output,
-        {**metadata, "min_weight": args.min_weight, "num_options": args.num_options},
+        _metadata_with_artifact_hashes(
+            {**metadata, "min_weight": args.min_weight, "num_options": args.num_options},
+            replay_path=args.replay,
+            ce_path=args.output,
+        ),
     )
 
 
@@ -1053,12 +1118,38 @@ def _cmd_refine(args: argparse.Namespace) -> None:
     )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output, refined)
-    _write_metadata_sidecar(args.output, {**metadata, **refine_metadata})
+    _write_metadata_sidecar(
+        args.output,
+        _metadata_with_artifact_hashes(
+            {
+                **metadata,
+                **refine_metadata,
+                "input_ce_matrix_sha256": sha256_file(args.ce),
+            },
+            replay_path=args.replay,
+            ce_path=args.output,
+        ),
+    )
 
 
 def _write_metadata_sidecar(path: str | Path, metadata: dict[str, Any]) -> None:
     sidecar = Path(f"{path}.metadata.json")
     sidecar.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _metadata_with_artifact_hashes(
+    metadata: dict[str, Any],
+    *,
+    replay_path: str | Path,
+    ce_path: str | Path,
+) -> dict[str, Any]:
+    updated = dict(metadata)
+    provenance = dict(updated.get("provenance", {}))
+    provenance.setdefault("schema_version", PROVENANCE_SCHEMA_VERSION)
+    provenance["replay_sha256"] = sha256_file(replay_path)
+    provenance["ce_matrix_sha256"] = sha256_file(ce_path)
+    updated["provenance"] = provenance
+    return updated
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
