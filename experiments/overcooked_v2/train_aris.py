@@ -1156,7 +1156,8 @@ def _execute_option(
     termination_reason = "running"
     event_summary = _empty_event_summary()
 
-    while duration < opt.max_steps:
+    _budget = option_lib.option_budget(env.state, 0, int(option_id))
+    while duration < _budget:
         _ostep = option_primitive_step(env, option_lib, int(option_id), partner, obs, rng)
         ego_action = _ostep.ego_action
         partner_action = _ostep.partner_action

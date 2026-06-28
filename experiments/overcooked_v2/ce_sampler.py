@@ -749,7 +749,8 @@ def _rollout_option(
     partner_confidences: list[float] = []
     summary = _empty_event_summary()
 
-    while duration < opt.max_steps:
+    _budget = option_lib.option_budget(env.state, 0, option_id)
+    while duration < _budget:
         _ostep = option_primitive_step(env, option_lib, option_id, partner, obs, rng)
         ego_action = _ostep.ego_action
         partner_action = _ostep.partner_action

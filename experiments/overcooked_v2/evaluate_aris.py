@@ -492,7 +492,8 @@ def _execute_eval_option(
     _stuck = 0
     _pot_positions = [e.pos for e in ctx.layout_graph.entities.values() if e.kind == "pot"]
 
-    while duration < opt.max_steps:
+    _budget = ctx.option_lib.option_budget(env.state, 0, int(option_id))
+    while duration < _budget:
         _ostep = option_primitive_step(env, ctx.option_lib, int(option_id), partner, obs, rng)
         ego_action = _ostep.ego_action
         partner_action = _ostep.partner_action

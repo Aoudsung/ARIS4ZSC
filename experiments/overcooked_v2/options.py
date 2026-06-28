@@ -46,9 +46,17 @@ _ACTION_BY_DELTA = {
 }
 
 class OCV2OptionLibrary:
-    def __init__(self, layout_graph: LayoutGraph, max_option_steps: int = 20):
+    def __init__(self, layout_graph: LayoutGraph, max_option_steps: int = 20,
+                 strict_preconditions: bool = False, dynamic_budget: bool = False):
         self.layout_graph = layout_graph
         self.max_option_steps = max_option_steps
+        # RC-2b D4' (default off -> no behavior change): task-stage-aware preconditions that close the
+        # pre-fetch sequencing trap (don't stage a fresh ingredient while a soup must be finished) and
+        # stop premature pick_plate (require genuinely full/cooking/ready, not >=2 ingredients).
+        self.strict_preconditions = bool(strict_preconditions)
+        # RC-2b D5' (default off): path-dependent option budget via option_budget(), replacing a fixed
+        # max_option_steps that was too small (deliver 5/165, pick_plate 0/155 at 6 steps).
+        self.dynamic_budget = bool(dynamic_budget)
         self.options = self._build_options()
 
     @property
@@ -117,6 +125,28 @@ class OCV2OptionLibrary:
         )
         interaction_steps = 1 if opt.kind in _OBJECT_INTERACTION_KINDS else 0
         return float(min_dist + interaction_steps)
+
+    def option_budget(self, state: Any, agent_id: int, option_id: int) -> int:
+        """Primitive-step budget for one option execution. Static (`max_option_steps`) unless
+        dynamic_budget is on, in which case it is path-dependent: shortest path to the nearest stand
+        cell + turn + interact + contention/recovery slack, clamped to [4, 16]."""
+        opt = self.options[option_id]
+        if not self.dynamic_budget:
+            return opt.max_steps
+        targets = self._target_cells(opt)
+        if not targets:
+            return opt.max_steps
+        current = get_agent_pos(state, agent_id)
+        dists = [
+            d for d in (
+                self.layout_graph.shortest_path_dist.get((current, t)) for t in targets
+            )
+            if d is not None
+        ]
+        if not dists:
+            return opt.max_steps
+        budget = min(dists) + 1 + 1 + 4 + 4  # path + turn + interact + contention + recovery
+        return int(max(4, min(16, budget)))
 
     def option_terminated(
         self,
@@ -444,6 +474,11 @@ class OCV2OptionLibrary:
                 require_recipe_useful=True,
             ):
                 return True
+        if self.strict_preconditions and self._soup_in_progress(state):
+            # Do not stage/pre-fetch a fresh ingredient on a counter while a soup is cooking/ready and
+            # no pot needs ingredients: it occupies the hands and blocks pick_plate (empty-hands), the
+            # pre-fetch sequencing trap. Counter-staging stays valid otherwise (e.g. multi-pot throughput).
+            return False
         return self._has_empty_reachable_counter(state, agent_id)
 
     def _counter_empty(self, state: Any, opt: OptionSpec) -> bool:
@@ -469,6 +504,15 @@ class OCV2OptionLibrary:
                     return True
         return False
 
+    def _soup_in_progress(self, state: Any) -> bool:
+        for entity_id in self._entity_ids_by_kind("pot"):
+            pot_pos = self.layout_graph.entities[entity_id].pos
+            if is_pot_cooking(state, pot_pos) or is_pot_ready_for_plate(
+                state, pot_pos, require_correct_recipe=False
+            ):
+                return True
+        return False
+
     def _there_is_pot_to_plate_or_soon(self, state: Any) -> bool:
         for entity_id in self._entity_ids_by_kind("pot"):
             pot_pos = self.layout_graph.entities[entity_id].pos
@@ -479,7 +523,11 @@ class OCV2OptionLibrary:
                 return True
             if is_pot_full(contents) and has_ingredient_bits(contents):
                 return True
-            if ingredient_count_py(contents) >= 2 and has_ingredient_bits(contents):
+            if (
+                not self.strict_preconditions
+                and ingredient_count_py(contents) >= 2
+                and has_ingredient_bits(contents)
+            ):
                 return True
         return False
 
