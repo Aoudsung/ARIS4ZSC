@@ -34,6 +34,7 @@ from experiments.overcooked_v2.layout_diagnostics import preflight_layout
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
+from experiments.overcooked_v2.option_executor import option_primitive_step
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
@@ -1156,20 +1157,12 @@ def _execute_option(
     event_summary = _empty_event_summary()
 
     while duration < opt.max_steps:
-        ego_action = option_lib.primitive_action(env.state, 0, int(option_id))
-        partner_obs = obs.get("agent_1") if isinstance(obs, dict) else None
-        partner_action = partner.act(partner_obs, env.state, rng)
-        prev_state = env.state
-        step = env.step(ego_action, partner_action.primitive_action)
-        event = extract_event(
-            prev_state,
-            ego_action,
-            partner_action.primitive_action,
-            step.state,
-            step.info,
-            partner_action.option_id,
-            partner_action.option_dist,
-        )
+        _ostep = option_primitive_step(env, option_lib, int(option_id), partner, obs, rng)
+        ego_action = _ostep.ego_action
+        partner_action = _ostep.partner_action
+        prev_state = _ostep.prev_state
+        step = _ostep.step
+        event = _ostep.event
         _accumulate_event_summary(event_summary, event)
         reward_sum += _training_reward(step, config, "agent_0")
         realized_cost += float(config["training"].get("cost_per_step", 1.0))

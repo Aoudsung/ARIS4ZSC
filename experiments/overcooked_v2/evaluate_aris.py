@@ -34,10 +34,15 @@ from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import infer_obs_dim
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
+from experiments.overcooked_v2.option_executor import option_primitive_step
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.provenance import runtime_provenance
-from experiments.overcooked_v2.state_utils import get_agent_pos
+from experiments.overcooked_v2.state_utils import (
+    agent_facing_pos, get_agent_pos, get_inventory,
+    get_pot_contents, is_pot_cooking, is_pot_ready_for_plate,
+)
+from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
 from experiments.overcooked_v2.train_aris import (
     _build_belief_model,
     _build_env,
@@ -72,6 +77,14 @@ class EvalContext:
     # follows that priority over valid options instead of argmax-Q (bypasses the network).
     qaudit: list | None = None
     scripted_priority: list[str] | None = None
+    # RC-2b per-step option-execution trace (diagnostic; default off). When trace_steps is a
+    # list, _execute_eval_option appends one record per primitive step for options whose kind
+    # equals trace_kind (or all kinds if trace_kind is None).
+    trace_steps: list | None = None
+    trace_kind: str | None = None
+    # RC-2b state-aware scripted oracle: callable(ctx, state, valid_ids) -> option_id, used by the
+    # reachability probe to drive the full pipeline with stage/inventory awareness (bypasses Q).
+    scripted_fsm: object | None = None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -459,20 +472,33 @@ def _execute_eval_option(
     done = False
     belief_before_option = _current_belief(ctx, evidence_buffer, graph)
 
+    # F2 (RC-2b): executor patience. When the agent makes no progress toward the option's target
+    # interaction cell for `block_patience` steps (livelock / partner camping the only stand cell),
+    # terminate the option as blocked so the policy can re-decide, instead of thrashing/colliding
+    # for the whole budget. Default 0 = off (current behavior).
+    _patience = int((ctx.config.get("options") or {}).get("block_patience", 0))
+    _spd = ctx.option_lib.layout_graph.shortest_path_dist
+    _opt_targets = tuple(ctx.option_lib._target_cells(opt))
+
+    def _dist_to_target(_st: Any) -> int | None:
+        if not _opt_targets:
+            return None
+        _a = get_agent_pos(_st, 0)
+        _ds = [_spd.get((_a, _t)) for _t in _opt_targets]
+        _ds = [d for d in _ds if d is not None]
+        return min(_ds) if _ds else None
+
+    _best_dist = _dist_to_target(env.state)
+    _stuck = 0
+    _pot_positions = [e.pos for e in ctx.layout_graph.entities.values() if e.kind == "pot"]
+
     while duration < opt.max_steps:
-        ego_action = ctx.option_lib.primitive_action(env.state, 0, int(option_id))
-        partner_action = partner.act(obs.get("agent_1"), env.state, rng)
-        prev_state = env.state
-        step = env.step(ego_action, partner_action.primitive_action)
-        event = extract_event(
-            prev_state,
-            ego_action,
-            partner_action.primitive_action,
-            step.state,
-            step.info,
-            partner_action.option_id,
-            partner_action.option_dist,
-        )
+        _ostep = option_primitive_step(env, ctx.option_lib, int(option_id), partner, obs, rng)
+        ego_action = _ostep.ego_action
+        partner_action = _ostep.partner_action
+        prev_state = _ostep.prev_state
+        step = _ostep.step
+        event = _ostep.event
         reward_sum += _training_reward(step, ctx.config, "agent_0")
         realized_cost += float(ctx.config["training"].get("cost_per_step", 1.0))
         duration += 1
@@ -484,9 +510,42 @@ def _execute_eval_option(
         )
         evidence_buffer.append(x_f)
         blocking_events += int(bool(event.collision_or_block))
+        if getattr(ctx, "trace_steps", None) is not None and (
+            ctx.trace_kind is None or opt.kind == ctx.trace_kind
+        ):
+            ctx.trace_steps.append({
+                "kind": opt.kind,
+                "step": int(duration),
+                "agent": list(get_agent_pos(prev_state, 0)),
+                "partner": list(get_agent_pos(prev_state, 1)),
+                "target_pos": list(opt.target_pos) if opt.target_pos is not None else None,
+                "facing": list(agent_facing_pos(prev_state, 0)),
+                "action": int(ego_action),
+                "is_interact": bool(int(ego_action) == int(_OCActions.interact)),
+                "inv_before": int(get_inventory(prev_state, 0)),
+                "inv_after": int(get_inventory(step.state, 0)),
+                "blocked": bool(event.collision_or_block),
+                "pots": [
+                    [list(p), int(get_pot_contents(step.state, p)),
+                     bool(is_pot_cooking(step.state, p)),
+                     bool(is_pot_ready_for_plate(step.state, p, require_correct_recipe=False))]
+                    for p in _pot_positions
+                ],
+            })
         _accumulate_delivery_counts(delivery_counts, event)
         delivery_seen = bool(delivery_seen or event.delivery_event)
         done = bool(step.dones.get("__all__", False))
+        if _patience and _best_dist is not None and not done:
+            _cur = _dist_to_target(step.state)
+            if _cur is not None and _cur < _best_dist:
+                _best_dist = _cur
+                _stuck = 0
+            elif _cur is not None and _cur > 0:
+                _stuck += 1
+            if _stuck >= _patience:
+                obs = step.obs
+                termination_reason = "blocked_no_progress"
+                break
         terminated, termination_reason = ctx.option_lib.option_terminated(
             opt,
             prev_state,
@@ -622,6 +681,11 @@ def _select_option(
         return _noop_option_id(ctx.option_lib)
     if random_policy:
         return int(rng.choice(valid_ids))
+
+    if getattr(ctx, "scripted_fsm", None) is not None:
+        chosen = ctx.scripted_fsm(ctx, state, valid_ids)
+        if chosen is not None:
+            return int(chosen)
 
     if getattr(ctx, "scripted_priority", None) is not None:
         scripted = _scripted_priority_select(ctx, graph, valid_ids)

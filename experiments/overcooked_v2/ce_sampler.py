@@ -24,6 +24,7 @@ from experiments.overcooked_v2.event_extractor import (
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
+from experiments.overcooked_v2.option_executor import option_primitive_step
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.provenance import (
     PROVENANCE_SCHEMA_VERSION,
@@ -749,26 +750,17 @@ def _rollout_option(
     summary = _empty_event_summary()
 
     while duration < opt.max_steps:
-        ego_action = option_lib.primitive_action(env.state, 0, option_id)
-        partner_obs = obs.get("agent_1") if isinstance(obs, dict) else None
-        partner_action = partner.act(partner_obs, env.state, rng)
+        _ostep = option_primitive_step(env, option_lib, option_id, partner, obs, rng)
+        ego_action = _ostep.ego_action
+        partner_action = _ostep.partner_action
+        prev_state = _ostep.prev_state
+        step = _ostep.step
+        event = _ostep.event
         if partner_action.option_dist is not None:
             partner_dists.append(np.asarray(partner_action.option_dist, dtype=np.float32))
         if partner_action.option_id is not None:
             partner_options.append(int(partner_action.option_id))
         partner_confidences.append(float(partner_action.option_confidence))
-
-        prev_state = env.state
-        step = env.step(ego_action, partner_action.primitive_action)
-        event = extract_event(
-            prev_state,
-            ego_action,
-            partner_action.primitive_action,
-            step.state,
-            step.info,
-            partner_option=partner_action.option_id,
-            partner_option_dist=partner_action.option_dist,
-        )
         _accumulate_event_summary(summary, event)
 
         reward_sum += float(step.rewards.get("agent_0", 0.0))
