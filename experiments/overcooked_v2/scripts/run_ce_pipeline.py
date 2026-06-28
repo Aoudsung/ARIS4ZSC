@@ -75,9 +75,12 @@ def main(argv: list[str] | None = None) -> None:
         force_path_planning=bool(env_cfg.get("force_path_planning", False)),
     )
     lg = parse_layout(env.env, layout)
+    _opt_cfg = config.get("options", {}) or {}
     lib = OCV2OptionLibrary(
         lg,
-        max_option_steps=int(config.get("options", {}).get("max_option_steps", 6)),
+        max_option_steps=int(_opt_cfg.get("max_option_steps", 6)),
+        strict_preconditions=bool(_opt_cfg.get("strict_preconditions", False)),
+        dynamic_budget=bool(_opt_cfg.get("dynamic_budget", False)),
     )
     partners = make_training_partners(lib)
 

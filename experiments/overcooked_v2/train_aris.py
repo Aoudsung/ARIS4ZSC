@@ -260,7 +260,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     preflight_gate = _enforce_preflight_gate(layout_name, config, args)
     _write_json(output_dir / "preflight_gate.json", preflight_gate)
 
-    partners = make_training_partners(option_lib)
+    partners = _select_train_partners(option_lib, config)
     graph = _build_graph(env, layout_graph, option_lib, config, args)
     _enforce_graph_objective_metadata(
         graph,
@@ -337,7 +337,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             layout_graph.cell_to_entity,
             layout_graph.region_cells,
         )
-        validation_partners = make_training_partners(option_lib)
+        validation_partners = _select_train_partners(option_lib, config)
     best_greedy_return = -float("inf")
     obs, _, current_partner = _reset_episode(
         env,
@@ -651,6 +651,25 @@ def _build_option_lib(layout_graph: Any, config: dict[str, Any]) -> OCV2OptionLi
         strict_preconditions=bool(opt_cfg.get("strict_preconditions", False)),
         dynamic_budget=bool(opt_cfg.get("dynamic_budget", False)),
     )
+
+
+def _select_train_partners(option_lib: OCV2OptionLibrary, config: dict[str, Any]) -> list[Any]:
+    """Training + greedy-validation partner pool, optionally restricted to config
+    training.train_partners (held-out partners are then never seen during training/validation).
+    RC-2b held-out ZSC: train on TRAIN partners, evaluate on the held-out hard partners."""
+    partners = make_training_partners(option_lib)
+    names = (config.get("training", {}) or {}).get("train_partners")
+    if not names:
+        return partners
+    name_set = set(names)
+    available = {p.name for p in partners}
+    missing = name_set - available
+    if missing:
+        raise ValueError(f"train_partners not found: {sorted(missing)}; available={sorted(available)}")
+    selected = [p for p in partners if p.name in name_set]
+    if not selected:
+        raise ValueError("train_partners selected zero partners.")
+    return selected
 
 
 def _build_graph(

@@ -1,0 +1,87 @@
+# RC-2b held-out ZSC config: asymm_advantages family, corrected executor (P1/RC-1).
+# Train on TRAIN partners; evaluate on the held-out hard partners {bottleneck-yield, flexible-balanced}
+# via `evaluate_aris --partners bottleneck-yield,flexible-balanced`.
+layout: asymm_advantages
+
+env:
+  max_steps: 400
+  observation_type: default
+  negative_rewards: true
+  sample_recipe_on_delivery: true
+  random_reset: false
+  random_agent_positions: false
+  # Certified substrate condition (rc2b_layout_scan ran fpp=true). fpp is a real OvercookedV2 param
+  # but inert for the option-level executor; kept explicit so the executor_semantics_hash matches the cert.
+  force_path_planning: true
+
+options:
+  # Corrected executor semantics (RC-2b P1 + Phase-2 fix), matching the per-partner pre-check substrate.
+  max_option_steps: 16
+  strict_preconditions: true
+  dynamic_budget: true
+
+layouts:
+  filter:
+    min_options: 6
+
+graph:
+  ce_path: outputs/asymm_ce/ce_refined.npy
+  preflight_path: results/ocv2_asymm/preflight.json
+  ce_eta: 0.05
+  max_factors: 16
+  full_max_factors: 16
+  overcomplete_extra_factors: 8
+  local_return_horizon_options: 3
+  modes:
+    bottleneck: 3
+    resource: 2
+    handoff: 3
+    serving: 2
+    pot_allocation: 2
+    recipe_indicator: 2
+    generic_option_pair: 3
+
+training:
+  require_preflight_accepted: true
+  total_updates: 1000
+  updates_per_transition: 8
+  batch_size: 8
+  warmup_transitions: 8
+  replay_size: 5000
+  gamma: 0.99
+  cost_coef: 0.02
+  cost_per_step: 1.0
+  shaped_reward_coef: 1.0
+  learning_rate: 0.0003
+  td_loss: huber
+  huber_delta: 1.0
+  double_q: true
+  advantage_norm: none
+  # RC-1 fix: bounded Bellman value range (hard cap |Q| <= vmax).
+  value_bound:
+    enabled: true
+    vmax: 20.0
+    base_bound: 10.0
+    adv_bound: 10.0
+    adv_unit: 1.0
+    reward_scale: 1.0
+  # RC-2b held-out split: train + greedy-validation see ONLY these 4 partners; the 2 hard partners
+  # (bottleneck-yield, flexible-balanced) are held out for evaluation only.
+  train_partners:
+    - ingredient-near
+    - ingredient-far
+    - dish-server
+    - server-left
+  checkpoint_every: 500
+  select_best_by: greedy
+  checkpoint_eval_episodes: 3
+  hidden_dim: 64
+  obs_encoder: auto
+  num_partners: 6
+  evidence_window: 4
+  target_update_interval: 50
+  grad_clip_norm: 5.0
+  epsilon_start: 0.35
+  epsilon_end: 0.05
+  max_episode_options: 20
+  log_interval: 100
