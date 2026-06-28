@@ -83,12 +83,17 @@ def main(argv: list[str] | None = None) -> None:
         dynamic_budget=bool(_opt_cfg.get("dynamic_budget", False)),
     )
     partners = make_training_partners(lib)
+    _train_names = (config.get("training", {}) or {}).get("train_partners")
+    if _train_names:
+        _ns = set(_train_names)
+        partners = [p for p in partners if p.name in _ns]
+        print(f"CE collected on TRAIN partners only (held-out excluded): {[p.name for p in partners]}")
 
     print(f"Options: {lib.num_options}")
     for opt in lib.options:
         print(f"  {opt.id}: {opt.kind}")
 
-    ep_per_partner = 100
+    ep_per_partner = int(args.episodes_per_partner)
     print(f"\n=== Phase 2: CE Collect ({ep_per_partner} episodes × {len(partners)} partners, sequential) ===")
     rows = collect_option_replay(
         env,
@@ -281,6 +286,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--output_dir", default="outputs/p1_verify")
     parser.add_argument("--allow_incomplete_graph", action="store_true")
+    parser.add_argument("--episodes-per-partner", dest="episodes_per_partner", type=int, default=100)
     parser.add_argument(
         "--require_task_stage_coverage",
         dest="require_task_stage_coverage",
