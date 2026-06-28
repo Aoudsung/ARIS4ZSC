@@ -99,7 +99,8 @@ def run_episode(env, option_lib, partner, seed, max_options, patience, spd):
         stuck = 0
         done = False
         reason = "max_steps"
-        for step_i in range(opt.max_steps):
+        _budget = option_lib.option_budget(state, 0, int(oid))
+        for step_i in range(_budget):
             ego_a = option_lib.primitive_action(env.state, 0, int(oid))
             pa = partner.act(obs.get("agent_1"), env.state, rng)
             prev = env.state
@@ -137,6 +138,8 @@ def main() -> None:
     ap.add_argument("--max-option-steps", type=int, default=16)
     ap.add_argument("--max-options", type=int, default=60)
     ap.add_argument("--patience", type=int, default=3)
+    ap.add_argument("--strict-preconditions", action="store_true")
+    ap.add_argument("--dynamic-budget", action="store_true")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -153,7 +156,10 @@ def main() -> None:
             env = E._build_env(lay, config)
             layout_graph = parse_layout(env, lay)
             env.set_featurizer(NumpyFeaturizer(layout_graph))
-            option_lib = OCV2OptionLibrary(layout_graph, max_option_steps=int(args.max_option_steps))
+            option_lib = OCV2OptionLibrary(
+                layout_graph, max_option_steps=int(args.max_option_steps),
+                strict_preconditions=args.strict_preconditions, dynamic_budget=args.dynamic_budget,
+            )
             spd = layout_graph.shortest_path_dist
             partners = make_training_partners(option_lib)[: args.partners]
             n_pass = layout_graph.passable_count if hasattr(layout_graph, "passable_count") else None
