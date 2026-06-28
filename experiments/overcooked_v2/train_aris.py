@@ -254,10 +254,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     layout_graph = parse_layout(env, layout_name)
     env.set_featurizer(NumpyFeaturizer(layout_graph))
     obs, _ = env.reset(args.seed)
-    option_lib = OCV2OptionLibrary(
-        layout_graph,
-        max_option_steps=int(config["options"]["max_option_steps"]),
-    )
+    option_lib = _build_option_lib(layout_graph, config)
     output_dir = _result_dir(config, args, layout_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     preflight_gate = _enforce_preflight_gate(layout_name, config, args)
@@ -627,7 +624,9 @@ def _enforce_preflight_gate(
 def _build_env(layout_name: str, config: dict[str, Any]) -> OCV2Adapter:
     env_cfg = config.setdefault("env", {})
     env_cfg["observation_type"] = "default"
-    env_cfg["force_path_planning"] = False
+    # RC-2b P1: respect the configured force_path_planning (was hard-coded False, silently overriding
+    # config and mislabeling experiment conditions in logs). OCV2Adapter's own default is True.
+    fpp = bool(env_cfg.get("force_path_planning", False))
     return OCV2Adapter(
         layout=layout_name,
         max_steps=int(env_cfg.get("max_steps", 200)),
@@ -637,7 +636,20 @@ def _build_env(layout_name: str, config: dict[str, Any]) -> OCV2Adapter:
         sample_recipe_on_delivery=bool(env_cfg.get("sample_recipe_on_delivery", True)),
         random_reset=bool(env_cfg.get("random_reset", False)),
         random_agent_positions=bool(env_cfg.get("random_agent_positions", False)),
-        force_path_planning=False,
+        force_path_planning=fpp,
+    )
+
+
+def _build_option_lib(layout_graph: Any, config: dict[str, Any]) -> OCV2OptionLibrary:
+    """Single factory so train/eval/CE construct the option library identically and the executor
+    semantics flags actually reach it. RC-2b P1: train/eval previously passed only max_option_steps,
+    so strict_preconditions / dynamic_budget never took effect on the main path."""
+    opt_cfg = config.get("options", {}) or {}
+    return OCV2OptionLibrary(
+        layout_graph,
+        max_option_steps=int(opt_cfg.get("max_option_steps", 20)),
+        strict_preconditions=bool(opt_cfg.get("strict_preconditions", False)),
+        dynamic_budget=bool(opt_cfg.get("dynamic_budget", False)),
     )
 
 

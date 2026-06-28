@@ -11,6 +11,10 @@ env:
 
 options:
   max_option_steps: 6
+  # RC-2b P1: executor semantics flags now actually reach the option library via _build_option_lib.
+  # Defaults preserve prior behavior; the component ablation / fix runs toggle these (and env.force_path_planning).
+  strict_preconditions: false
+  dynamic_budget: false
 
 layouts:
   filter:

@@ -46,6 +46,7 @@ from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
 from experiments.overcooked_v2.train_aris import (
     _build_belief_model,
     _build_env,
+    _build_option_lib,
     _build_q_network,
     _graph_objective_metadata_status,
     _graph_tensors,
@@ -245,10 +246,7 @@ def _load_context(checkpoint_path: Path, variant: str) -> EvalContext:
     layout_graph = parse_layout(env, graph.layout_name)
     env.set_featurizer(NumpyFeaturizer(layout_graph))
     obs, _ = env.reset(0)
-    option_lib = OCV2OptionLibrary(
-        layout_graph,
-        max_option_steps=int(config["options"]["max_option_steps"]),
-    )
+    option_lib = _build_option_lib(layout_graph, config)
     obs_dim = infer_obs_dim(env, obs)
     q_net = _build_q_network(method, obs_dim, graph, config).to(torch.device("cpu"))
     q_net.load_state_dict(checkpoint["q_net"])
