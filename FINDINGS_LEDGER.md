@@ -226,3 +226,61 @@ repair commit: unmasked CE `.npy` use in training, CE support params not enforce
 detached P4 belief filter, and stale `checkpoint.pt` survivability. The follow-up
 diff fixes all four and records the rerun in
 `provenance/CURRENT_TREE_ROOTCAUSE_REPAIR_VALIDATION_20260702.md`.
+
+---
+
+## 静态验收 PASS（2026-07-02 深夜，3 路深度复核 d1633ae+033fd1c）
+
+三个独立复核 agent 对全部必修项做了对抗性验证（含反模式搜查：oracle 搬家/直通推断器/
+未来泄漏/只加门不修机制/config 静默重开）。**结论：全部 ACCEPTED，零拒绝级 blocker。**
+
+| 复核域 | verdict | 关键确认 |
+|---|---|---|
+| P1 去oracle | **ACCEPTED** | `act()`不发射真值；executor 剥离+行为推断重标注；confidence 语义修正；eval 硬门(oracle_source_count>0→fail，不可被 allow_diag_skip 绕过)；无搬家路径；partner_id 只进声明的 partner_id_q 基线 |
+| P4/S1/S2/S3 | **ACCEPTED** | 隐状态仅 episode 边界重置；无未来泄漏（transition 字段选项开始前快照）；梯度流正确（**033fd1c 承重**：d1633ae 单独存在 GRU-对-TD 不可训练 + eval 窗口双计，由它修复）；train/eval 共用实现；CE 无信念路径；`"max_steps"`入失败集、`option_invalid`已删、S3 boundary-row 替代重复路由、S2 掩码生效 |
+| P5 | **ACCEPTED** | 守卫覆盖全部4个config可达oracle机制(无flag即raise)；`_select_option`签名已无`partner_terminal_policy`；reward 三层剥离(train:3000/sparse_credit:155/ce_sampler:415,984)；唯一残留 protocol 读取是 curriculum_group 采样分组(数据分布设计，非证据/奖励) |
+| P3 生产者+消费者 | **ACCEPTED** | min_weight/γ/horizon 全部 config 化并入元数据；`weight_sum/estimable_mask/skipped_mask/measured_zero_mask` sidecar；masked npy 正式消费 + unmasked 审计；train 侧再掩码+目标门 fail-closed，**无 legacy 逃逸路径** |
+| S16/S17/S18/S20 | **ACCEPTED** | gru 诊断 unsupported_method 优雅记录；硬门清单明确(forced_noop/evidence_policy/observed_dist/missing/oracle_source)；provenance 哈希口径端到端对齐(train子集)；completion headline=ego_sole_correct |
+| NEW-1/NEW-2/S23 | **ACCEPTED** | preflight 伙伴子集+credit 修复；checkpoint 资格前置到保存之前+陈旧产物清理+启动接线检查；train_partners 强制显式(无split声明豁免需显式flag) |
+
+**跟进项（非阻塞，登记为 F 系列）**：
+F1 批处理CE推断器按选项重置vs顺序按episode(语义不一致) · F2 CE不读`evidence.partner_option_inference`config ·
+F3 死代码`build_/attach_behavior_option_inferencer`+未用import · F4 `partner_option_known`通道退化恒1.0 ·
+F5 router对oracle-like只计数不阻断(训练侧无运行时门，eval有硬门——纵深防御备注) ·
+F6 failure-boundary行presence位与snapshot-mask语义小失配 · F7 bootstrap用在线信念模型(无target网络，标准做法备注) ·
+F8 refine正值-only幸存偏置仍未文档化(ce_sampler.py:812) · F9 train侧greedy`completion_rate`仍team语义(建议改名或ego-sole重导出) ·
+F10 gap-proxy回退缺credit_params(layout_diagnostics.py:132-144) · F12 fidelity gate**工具**未实现I10-I17机械检查(仅文档声明) ·
+F13 evidence_window 4vs8消融值得列入实验链 · F14 W3±1500伙伴行为重设计随de-oracle捆绑(已被benchmark-v2 candidate框架覆盖，仍需certificate)
+
+**待用户决策（进入正式实验前）**：
+D-A `require_ego_delivery_selection` 在 role_v1/role_v1_novb 两个正式候选 config 中为 **false**
+（asymm/armA/armB 为 true）——要么论证 contrib_team 已使 free-rider 无利可图故不需要，要么翻开。
+D-B **§5.1 治理决策现在成熟**（用户原话"等我修订完代码再决定"——代码修订已完成并验收）：
+role_conditioned_v2 candidate 能否作为 benchmark-v2 使用（须先过 partner-differentiation certificate）。
+
+**状态推进**：P1/P3/P4/P5/S1/S2/S3/S16/S17/S18/S20/S23/NEW-1/NEW-2 → `已验证(静态)`；
+远程 I10-I18 验证 = 实验链 Phase 1（见 [EXPERIMENT_CHAIN_PLAN.md](EXPERIMENT_CHAIN_PLAN.md)）。
+
+---
+
+## Phase 0 执行记录（2026-07-02，静态验收 PASS 之后）
+
+用户裁决 + 执行完成（全部静态，无实验运行）：
+
+| 项 | 裁决/动作 | 状态 |
+|---|---|---|
+| **D-B (G0.1)** | `role_conditioned_v2` **有条件允许**：仅作受控机制诊断基底（benchmark-v2-diagnostic），须过 R2.1 certificate；headline ZSC 主张走 FCP/MEP 群体，其投资以 E1 信号为门。全文 METHOD_LOCK sec18.1 | **已裁决** |
+| **D-A (G0.2)** | `require_ego_delivery_selection` → **true**（role_v1 + novb，带语义注释）；书面豁免路线被否决（contrib_team 对 prep-only 在 claim 伙伴送餐上仍付费，mean-return 无法证明能过滤 always-prep 塌缩）。METHOD_LOCK sec18.2 | **已裁决+已改** |
+| F8 | refine 正值-only 幸存偏置：代码注释 + metadata 标志 `bootstrap_positive_only_survivorship_bias: true` | 已修 |
+| F9 | greedy validation 指标拆分：`team_delivery_episode_rate` + `ego_correct_completion_rate` 取代裸 completion_rate；checkpoint_selection/metrics 两处消费者同步；eval 侧读取方（rc2*_reachability 读 eval 聚合）不受影响 | 已修 |
+| F10 | `estimate_reference_base_gap_proxy` 补 `credit_params/terminal_progress/cost_per_step/exclude_terminal_progress` 线程，caller 从 config 取值（与 CE fallback 同模式） | 已修 |
+| F3 | 删除死代码 `build_/attach_behavior_option_inferencer` + evaluate_aris 未用 import（eval 实际用 `make_behavior_option_inferencer`，已验证） | 已修 |
+| F12 | fidelity gate 工具实现 **I10–I17 机械检查**（同 I1–I9 风格：静态 token/AST 绊线，歧义倾向 WARN）；当前树 **17/17 PASS，exit 0**；`FIDELITY_GATE.{md,json}` 自此由工具生成；I18 为过程级，由 EXPERIMENT_CHAIN_PLAN Phase 3–5 + METHOD_LOCK 追踪（sec18.3） | 已修+已验证 |
+| G0.4 | 预注册入档：R2.1/R2.2/E1/E2/E3 全部"结果→结论"分支表 → METHOD_LOCK sec18.4–18.7 | 已入档 |
+| G0.5 | `EXPERIMENT_LOG.md` 骨架创建（记录模板 + 引用预注册义务 + NEW-4 排除） | 已建 |
+
+未在本批处理（保持原状态）：F1/F2（批处理 CE 一致性——正式路径为顺序，非阻塞）、
+F4（vacuous 通道）、F5（router 纵深防御备注）、F6（presence-bit 失配备注）、F7（无 target 信念网络备注）、
+F13（窗口消融→已列入 E3）、F14（→由 R2.1 certificate 覆盖）、W8（下轮 codex 复核）。
+
+**Phase 0 完成。下一步 = Phase 1（远程基础设施验证 R1.1–R1.3），需用户授权远程执行。**

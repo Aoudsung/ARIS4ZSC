@@ -423,3 +423,107 @@ Forbidden post-lock interpretations:
 - Do not treat team delivery or partner delivery as ego-owned success.
 
 Next valid claim transition requires: remote gated verification of I10-I18, the registered four-arm de-oracled rerun, CE support probe, belief-persistence ablation, partner-differentiation certificate if benchmark-v2 is used, and Type-B human decision.
+
+---
+
+## sec18. Phase-0 decisions + preregistration (2026-07-02, pre-Phase-1 lock)
+
+Append-only. Records the two governance decisions closing Phase 0 of
+[EXPERIMENT_CHAIN_PLAN.md](EXPERIMENT_CHAIN_PLAN.md), and PREREGISTERS the
+decision rules for R2.1/R2.2/E1/E2/E3. Per plan §8: results are read out by
+these tables verbatim; post-hoc reinterpretation is forbidden.
+
+### 18.1 G0.1 — partner-substrate governance (D-B, decided)
+
+`role_conditioned_v2` is admitted **only as a controlled mechanism-diagnostic
+substrate** ("benchmark-v2-diagnostic"), conditional on passing the R2.1
+partner-differentiation certificate. Constraints:
+
+1. The paper's headline ZSC generalization claim may NOT rest solely on
+   scripted role_conditioned_v2 partners.
+2. Claim-level ZSC evidence comes from an FCP/MEP trained-partner population
+   (EXPERIMENT_PLAN original design). Sequencing: the FCP/MEP investment
+   (~400-800 GPU-h) is GATED on E1 — any preregistered ARIS signal in E1
+   unlocks it; a clean four-arm null after artifact checks defers it.
+3. Framing rule: scripted v2 = controlled mechanism analysis (E1-E6);
+   FCP population = ZSC benchmark evidence (E7 / final tables). Both labeled
+   as such in any write-up. This respects the 7/1 synthetic-data directive's
+   intent: no headline claim rests on self-designed partners.
+
+### 18.2 G0.2 — free-rider guard in role_v1 formal configs (D-A, decided)
+
+`require_ego_delivery_selection` flipped to **true** in
+`ocv2_step4_asymm_role_v1.yaml` and `ocv2_step4_asymm_role_v1_novb.yaml`.
+Rationale: train partners include yield-family → a correct adaptive policy
+necessarily has ego-sole deliveries in mixed-partner greedy validation, so the
+guard cannot reject good policies; it rejects exactly the historically observed
+always-prep collapse (sec11 seed1). The written-waiver alternative was
+rejected: contrib_team pays prep-only policies on claim-partner deliveries, so
+mean-return selection alone cannot be proven to filter the collapse.
+General rule (ledger): any config whose train set contains ≥1 partner mode
+where the ego should serve keeps this guard ON.
+
+### 18.3 Fidelity-gate note
+
+The mechanical gate now implements I1–I17 (17/17 PASS on this tree;
+`FIDELITY_GATE.{md,json}` are tool-generated from now on). I18 (decisive-rerun
+archive + Type-B human checkpoint) is process-level, not statically checkable:
+it is tracked by EXPERIMENT_CHAIN_PLAN Phases 3–5 and this file's dated
+entries, not by the gate.
+
+### 18.4 PREREGISTRATION — R2.1 partner-differentiation certificate
+
+Procedure: per candidate layout × partner set: fixed seeds + randomized
+starts; 60–100 primitive-step open-loop traces AND full episodes with a
+competent scripted ego (NOT noop-ego); pairwise trajectory/action/return
+divergence on value-critical phases; scripted-oracle completability; verify
+partner-only play does not saturate the task.
+
+| Outcome | Preregistered conclusion |
+|---|---|
+| ≥2 distinguishable behavior modes on each of ≥2 value-critical factors | PASS — substrate admitted for E1-E6 |
+| Distinguishable on a factor subset only | Narrow: re-cut train/held-out along the distinguishable subset; record the narrowing |
+| Collapse (indistinguishable) | FAIL — STOP; no ARIS-vs-baseline claim on this substrate; escalate to FCP/MEP line |
+
+### 18.5 PREREGISTRATION — R2.2 asymm CE support probe
+
+500–1000 episodes/train-partner; artifact must carry per-pair weight_sum +
+all masks + CI. Citation rule: a zero is interpretable only with
+`estimable_mask=true`.
+
+| Outcome | Preregistered conclusion |
+|---|---|
+| serve CE measured-nonzero with support ≥ min_weight | sec11's "asymm has no terminal externality" is REFUTED; asymm re-admitted as discriminative-layout candidate |
+| serve CE measured-zero with support ≥ min_weight | geometry explanation SUPPORTED; asymm remains Table-1 sanity only |
+| support still < min_weight | inconclusive — report support, raise collection budget or targeted starts; NO conclusion |
+
+### 18.6 PREREGISTRATION — E1 de-oracled four-arm rerun (decisive)
+
+Arms: aris_bellman / flat_factor / global_gru / base_only (+partner_id_q as
+oracle upper reference, excluded from claims). 5 seeds × 50–100 eval
+episodes/partner; train on train split, eval dev-heldout; ALL hard integrity
+flags true or the run is inadmissible. Headline: ego_correct_completion_rate +
+throughput; secondary: time-to-complete, ego/partner split, wrong-delivery,
+first-diagnostic-action timing.
+
+| Outcome (CI-separated) | Preregistered conclusion |
+|---|---|
+| ARIS > flat > base | factor-local relevance routing SUPPORTED (Claims 2/4 discriminative evidence) |
+| ARIS ≈ flat > base | beliefs useful, routing adds nothing → narrow to weak Claim 2 |
+| all four ≈ | run artifact-suspect checklist; if clean → record "no ARIS-specific advantage on this substrate" (honest null); do NOT retro-blame P1 |
+| only ARIS collapses | treat as de-oracling regression; fix, rerun; no scientific conclusion |
+| partner_id_q >> ARIS | quantify the inference gap as upper-bound distance; analysis only |
+
+FCP/MEP gate: any of rows 1-2 → unlock the population line (18.1). Row 3 after
+clean artifact checks → defer FCP/MEP, reassess method.
+
+### 18.7 PREREGISTRATION — E2 oracle-channel ablation + E3 belief-persistence ablation
+
+E2: same checkpoints, eval twice (behavior-inferred channels vs zeroed).
+| Both arms drop hard when zeroed | evidence channels carry the load (expected) |
+| ARIS retains separation when zeroed | ARIS advantage does NOT come from partner-option inference — report honestly, revisit mechanism claim |
+
+E3: window-4 / window-8 / persistent-hidden (main), 3 seeds each.
+| Only persistent improves repeat-failure held-out cases | P4 mechanism claim SUPPORTED |
+| No difference | held-out failure was substrate/distribution — mechanism claim stays unproven; do not claim accumulation |
+
