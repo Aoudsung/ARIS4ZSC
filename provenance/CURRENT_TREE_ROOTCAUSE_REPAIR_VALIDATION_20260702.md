@@ -68,6 +68,39 @@ Result:
 
 Only warning: `jaxopt` package deprecation warning from the remote environment.
 
+## Reviewer Follow-Up
+
+Reviewer subagent `Sartre` found four blockers after commit `d1633ae`; the
+follow-up diff addresses them before final acceptance:
+
+- P3 support masking now closes both producer and consumer sides. `run_ce_pipeline.py`
+  writes support-masked `ce_refined.npy` for formal graph/training consumption and
+  keeps `ce_refined_unmasked.npy` for audit. `train_aris.py` also reads
+  `ce_refined.meta.json` before graph construction and masks `ce_path` again from
+  `estimable_mask`, so stale unmasked `.npy` files cannot influence factor selection
+  when a support sidecar is present.
+- P3 support parameters are enforced, not only recorded. The graph objective gate
+  compares config-derived CE `gamma`, `horizon_options`, `min_weight`,
+  `reward_objective`, and `support_objective` against both top-level metadata and
+  the nested CE support audit.
+- P4 persistence remains trainable. Replay stores the hidden state at the start of
+  the visible evidence window; TD state construction re-encodes the evidence window
+  from that detached base, so the recurrent filter receives TD gradients while
+  preserving cross-window history.
+- NEW-2 stale deployment artifacts are removed. If the run does not select a
+  deployable `checkpoint.pt`, old `checkpoint.pt` / `checkpoint_best.pt` files in a
+  reused output directory are unlinked and the removal is recorded in metrics.
+
+After these changes the same remote parse and pytest commands above were rerun with
+the same results:
+
+```text
+AST_PARSE_OK 72 python files
+YAML_PARSE_OK 7 yaml files
+JSON_PARSE_OK 6 json files
+54 passed
+```
+
 ## Interpretation Boundary
 
 This validation supports a Type-A implementation-fidelity handoff for P1/P3/P4/P5,

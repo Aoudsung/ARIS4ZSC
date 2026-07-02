@@ -29,6 +29,8 @@ class EvidenceBuffer:
         self._count = 0
         self._start = 0
         self._belief_hidden: np.ndarray | None = None
+        self._belief_window_bases: np.ndarray | None = None
+        self._last_write_idx: int | None = None
 
     def append(self, x_f: np.ndarray) -> None:
         evidence = np.asarray(x_f, dtype=self.dtype)
@@ -43,6 +45,7 @@ class EvidenceBuffer:
             write_idx = self._start
             self._start = (self._start + 1) % self.window
         self._buffer[:, write_idx, :] = evidence
+        self._last_write_idx = int(write_idx)
 
     def snapshot(self) -> np.ndarray:
         out = np.zeros_like(self._buffer)
@@ -104,11 +107,48 @@ class EvidenceBuffer:
             return None
         return self._belief_hidden.copy()
 
+    def record_belief_window_base(self, hidden: np.ndarray) -> None:
+        """Record the hidden state that preceded the most recently appended row."""
+        if self._last_write_idx is None:
+            raise RuntimeError("record_belief_window_base() requires a prior append().")
+        arr = np.asarray(hidden, dtype=self.dtype)
+        if arr.ndim != 2 or arr.shape[0] != self.num_factors:
+            raise ValueError(
+                "belief window base must have shape [num_factors, hidden_dim]; "
+                f"got {arr.shape}."
+            )
+        hidden_dim = int(arr.shape[1])
+        if (
+            self._belief_window_bases is None
+            or self._belief_window_bases.shape != (self.num_factors, self.window, hidden_dim)
+        ):
+            self._belief_window_bases = np.zeros(
+                (self.num_factors, self.window, hidden_dim),
+                dtype=self.dtype,
+            )
+        self._belief_window_bases[:, int(self._last_write_idx), :] = arr
+
+    def belief_window_base_snapshot(self) -> np.ndarray | None:
+        """Hidden state immediately before the first row in ``snapshot()``.
+
+        TD replay re-encodes the visible evidence window from this detached base,
+        so the recurrent filter remains trainable on the current window while still
+        carrying history that preceded the window.
+        """
+        if self._belief_hidden is None:
+            return None
+        if self._count <= 0 or self._belief_window_bases is None:
+            return self._belief_hidden.copy()
+        base_idx = 0 if self._count < self.window else int(self._start)
+        return self._belief_window_bases[:, base_idx, :].copy()
+
     def reset(self) -> None:
         self._buffer.fill(0)
         self._count = 0
         self._start = 0
         self._belief_hidden = None
+        self._belief_window_bases = None
+        self._last_write_idx = None
 
     @property
     def count(self) -> int:

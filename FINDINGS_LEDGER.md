@@ -220,3 +220,9 @@ Type-B 裁决已经完成。
 
 剩余边界：P2/W/D 伙伴基底治理仍待 Type-B 人类裁决；`role_conditioned_v2_candidate`
 最多是 benchmark-v2 candidate，须先有 partner-differentiation certificate 后才可用于正式主张。
+
+Reviewer follow-up: subagent `Sartre` flagged four repair blockers after the first
+repair commit: unmasked CE `.npy` use in training, CE support params not enforced,
+detached P4 belief filter, and stale `checkpoint.pt` survivability. The follow-up
+diff fixes all four and records the rerun in
+`provenance/CURRENT_TREE_ROOTCAUSE_REPAIR_VALIDATION_20260702.md`.

@@ -291,8 +291,24 @@ def main(argv: list[str] | None = None) -> None:
     refined, refine_meta = refine_empirical_ce(
         ce, rows, lib.num_options, top_k=ce_refine_top_k, min_weight=ce_min_weight
     )
+    estimable_mask = np.asarray(ce_support_audit.get("estimable_mask", []), dtype=bool)
+    if estimable_mask.shape != refined.shape:
+        raise ValueError(
+            f"CE support audit shape mismatch: mask={estimable_mask.shape} refined={refined.shape}"
+        )
+    measured_zero_mask = np.asarray(ce_support_audit.get("measured_zero_mask", []), dtype=bool)
+    skipped_mask = np.asarray(ce_support_audit.get("skipped_mask", []), dtype=bool)
+    weight_sum = np.asarray(ce_support_audit.get("weight_sum", []), dtype=float)
+    refined_for_graph = np.asarray(refined, dtype=np.float32).copy()
+    # Unsupported/skipped cells are not zero-effect evidence.  The formal ce_refined
+    # artifact consumed by train_aris is support-masked; the raw refined scores are
+    # kept separately for audit only.
+    refined_for_graph[~estimable_mask] = 0.0
+    refined_unmasked_path = output_dir / "ce_refined_unmasked.npy"
+    np.save(refined_unmasked_path, refined)
+    refined_unmasked_sha256 = sha256_file(refined_unmasked_path)
     refined_path = output_dir / "ce_refined.npy"
-    np.save(refined_path, refined)
+    np.save(refined_path, refined_for_graph)
     refined_sha256 = sha256_file(refined_path)
     support_sidecar_path = output_dir / "ce_support_audit.json"
     support_sidecar_path.write_text(
@@ -310,6 +326,9 @@ def main(argv: list[str] | None = None) -> None:
                 "ce_support_audit": ce_support_audit,
                 "ce_support_sidecar": str(support_sidecar_path),
                 "ce_support_sidecar_sha256": support_sidecar_sha256,
+                "ce_refined_unmasked": str(refined_unmasked_path),
+                "ce_refined_unmasked_sha256": refined_unmasked_sha256,
+                "ce_unsupported_cells_masked": True,
                 "provenance": {
                     "schema_version": PROVENANCE_SCHEMA_VERSION,
                     "replay_sha256": replay_sha256,
@@ -324,19 +343,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Saved CE metadata sidecar to {sidecar_path}")
     print(f"Saved CE support sidecar to {support_sidecar_path}")
-
-    estimable_mask = np.asarray(ce_support_audit.get("estimable_mask", []), dtype=bool)
-    if estimable_mask.shape != refined.shape:
-        raise ValueError(
-            f"CE support audit shape mismatch: mask={estimable_mask.shape} refined={refined.shape}"
-        )
-    measured_zero_mask = np.asarray(ce_support_audit.get("measured_zero_mask", []), dtype=bool)
-    skipped_mask = np.asarray(ce_support_audit.get("skipped_mask", []), dtype=bool)
-    weight_sum = np.asarray(ce_support_audit.get("weight_sum", []), dtype=float)
-    refined_for_graph = np.asarray(refined, dtype=np.float32).copy()
-    # Unsupported/skipped cells are not zero-effect evidence.  They are excluded from
-    # factor selection; graph metadata below records that this masking occurred.
-    refined_for_graph[~estimable_mask] = 0.0
 
     print("\n=== Phase 4: Graph Build ===")
     # Coverage-constrained selection: graph_cfg may carry selection / required_option_*_coverage

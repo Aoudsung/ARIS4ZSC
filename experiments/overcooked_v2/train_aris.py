@@ -672,6 +672,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         metrics["checkpoint_selection"]["free_rider_diagnosis"] = _free_rider_diagnosis(
             metrics["checkpoint_selection"]
         )
+    if metrics["checkpoint_selection"].get("deployable_checkpoint") != "checkpoint.pt":
+        _remove_stale_deployable_checkpoints(
+            output_dir,
+            metrics,
+            reason=str(
+                metrics["checkpoint_selection"].get(
+                    "selected_by",
+                    "no_deployable_checkpoint_selected",
+                )
+            ),
+        )
     _write_metrics(output_dir, metrics, updates_done, wall_start, final=True)
     _save_checkpoint(
         output_dir,
@@ -883,7 +894,17 @@ def _build_graph(
             "Run ce_sampler.py and graph_builder.py before train_aris.py; "
             "online CE construction inside training is disabled."
         )
-    ce_matrix = np.load(Path(ce_path))
+    ce_path_obj = Path(ce_path)
+    ce_matrix = np.load(ce_path_obj)
+    ce_meta_path = _metadata_sidecar_path(ce_path_obj)
+    sidecar_meta: dict[str, Any] = {}
+    ce_support_mask_applied = False
+    if ce_meta_path is not None:
+        sidecar_meta = json.loads(ce_meta_path.read_text(encoding="utf-8"))
+        ce_matrix, ce_support_mask_applied = _mask_ce_matrix_with_support_audit(
+            ce_matrix,
+            sidecar_meta,
+        )
 
     max_factors = int(graph_cfg.get("max_factors", 16))
     relevance_semantics = str(graph_cfg.get("relevance_semantics", "legacy_id_pair"))
@@ -926,16 +947,37 @@ def _build_graph(
             "formal_experiment": True,
             "graph_source": graph_source,
         }
-    ce_meta_path = _metadata_sidecar_path(Path(ce_path))
     if ce_meta_path is not None:
-        sidecar_meta = json.loads(ce_meta_path.read_text(encoding="utf-8"))
         graph.metadata = _merge_metadata(graph.metadata or {}, sidecar_meta)
+        if ce_support_mask_applied:
+            graph.metadata["ce_unsupported_cells_masked"] = True
     if graph.num_factors == 0:
         raise RuntimeError(
             "Graph construction produced zero factors. Run layout_preflight or lower "
             "eta explicitly; empty graphs are invalid for ARIS training."
         )
     return graph
+
+
+def _mask_ce_matrix_with_support_audit(
+    ce_matrix: np.ndarray,
+    metadata: dict[str, Any],
+) -> tuple[np.ndarray, bool]:
+    ce_support = metadata.get("ce_support_audit")
+    if not isinstance(ce_support, dict):
+        return ce_matrix, False
+    estimable_raw = ce_support.get("estimable_mask")
+    if estimable_raw is None:
+        return ce_matrix, False
+    estimable = np.asarray(estimable_raw, dtype=bool)
+    if estimable.shape != ce_matrix.shape:
+        raise RuntimeError(
+            "CE support audit estimable_mask shape does not match ce_path matrix: "
+            f"mask={estimable.shape}, ce={ce_matrix.shape}."
+        )
+    masked = np.asarray(ce_matrix, dtype=np.float32).copy()
+    masked[~estimable] = 0.0
+    return masked, True
 
 
 def _merge_metadata(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
@@ -1024,6 +1066,8 @@ def _expected_graph_objective_metadata(config: dict[str, Any]) -> dict[str, Any]
             (config.get("graph") or {}).get("relevance_semantics", "legacy_id_pair")
         ),
     }
+    if config.get("graph"):
+        expected["ce_support_objective"] = _expected_ce_support_objective(config)
     # ego_correct_delivery's reward magnitude comes from explicit constants; enforce
     # them so a graph built with different constants is rejected. team / ego_delivery
     # do not use constants, so they are not part of their objective signature.
@@ -1043,6 +1087,41 @@ def _expected_graph_objective_metadata(config: dict[str, Any]) -> dict[str, Any]
             ),
         }
     return expected
+
+
+def _expected_ce_support_objective(config: dict[str, Any]) -> dict[str, Any]:
+    training = config["training"]
+    graph_cfg = config.get("graph", {}) or {}
+    sparse_ce_support = bool(graph_cfg.get("sparse_ce_support", False))
+    support_objective_cfg = graph_cfg.get("support_objective", graph_cfg.get("ce_support_objective"))
+    if isinstance(support_objective_cfg, dict):
+        support_objective = str(
+            support_objective_cfg.get(
+                "support_objective",
+                "sparse_excluding_terminal_progress" if sparse_ce_support else "training_reward_sum",
+            )
+        )
+    else:
+        support_objective = str(
+            support_objective_cfg
+            or ("sparse_excluding_terminal_progress" if sparse_ce_support else "training_reward_sum")
+        )
+    return {
+        "gamma": float(graph_cfg.get("ce_gamma", training.get("gamma", 0.99))),
+        "horizon_options": int(
+            graph_cfg.get(
+                "local_return_horizon_options",
+                graph_cfg.get(
+                    "horizon_options",
+                    training.get("local_return_horizon_options", 5),
+                ),
+            )
+        ),
+        "min_weight": float(graph_cfg.get("ce_min_weight", 20.0)),
+        "min_actor_delivery_support": int(graph_cfg.get("min_actor_delivery_support", 1)),
+        "support_objective": support_objective,
+        "sparse_ce_support": sparse_ce_support,
+    }
 
 
 def _graph_objective_metadata_status(
@@ -1128,6 +1207,10 @@ def _graph_objective_metadata_status(
             matches = json.dumps(observed, sort_keys=True) == json.dumps(
                 expected_value, sort_keys=True
             )
+        elif key == "ce_support_objective":
+            matches = json.dumps(observed, sort_keys=True) == json.dumps(
+                expected_value, sort_keys=True
+            )
         elif key == "relevance_semantics":
             observed = metadata.get(key, "legacy_id_pair")
             matches = str(observed) == str(expected_value)
@@ -1159,6 +1242,50 @@ def _graph_objective_metadata_status(
                     "graph": sorted(ce_support),
                     "config": f"missing CE support keys {absent_ce_keys}",
                 }
+            expected_ce = expected.get("ce_support_objective")
+            if isinstance(expected_ce, dict):
+                nested_mismatches: dict[str, dict[str, Any]] = {}
+                for field in ("min_weight", "gamma"):
+                    try:
+                        if not math.isclose(
+                            float(ce_support.get(field)),
+                            float(expected_ce[field]),
+                            rel_tol=1e-9,
+                            abs_tol=1e-12,
+                        ):
+                            nested_mismatches[field] = {
+                                "graph": ce_support.get(field),
+                                "config": expected_ce[field],
+                            }
+                    except (TypeError, ValueError):
+                        nested_mismatches[field] = {
+                            "graph": ce_support.get(field),
+                            "config": expected_ce[field],
+                        }
+                try:
+                    if int(ce_support.get("horizon_options")) != int(expected_ce["horizon_options"]):
+                        nested_mismatches["horizon_options"] = {
+                            "graph": ce_support.get("horizon_options"),
+                            "config": expected_ce["horizon_options"],
+                        }
+                except (TypeError, ValueError):
+                    nested_mismatches["horizon_options"] = {
+                        "graph": ce_support.get("horizon_options"),
+                        "config": expected_ce["horizon_options"],
+                    }
+                expected_reward_objective = str(expected.get("sparse_credit", "team"))
+                if str(ce_support.get("reward_objective")) != expected_reward_objective:
+                    nested_mismatches["reward_objective"] = {
+                        "graph": ce_support.get("reward_objective"),
+                        "config": expected_reward_objective,
+                    }
+                if str(ce_support.get("support_objective")) != str(expected_ce["support_objective"]):
+                    nested_mismatches["support_objective"] = {
+                        "graph": ce_support.get("support_objective"),
+                        "config": expected_ce["support_objective"],
+                    }
+                if nested_mismatches:
+                    mismatches["ce_support_audit_params"] = nested_mismatches
         if not bool(metadata.get("ce_unsupported_cells_masked", False)):
             mismatches["ce_unsupported_cells_masked"] = {
                 "graph": metadata.get("ce_unsupported_cells_masked"),
@@ -1501,7 +1628,7 @@ def _execute_option(
     evidence_t = evidence_buffer.snapshot()
     evidence_mask_t = evidence_buffer.snapshot_mask()
     evidence_len_t = evidence_buffer.length()
-    belief_hidden_t = evidence_buffer.belief_hidden_snapshot()
+    belief_hidden_t = evidence_buffer.belief_window_base_snapshot()
     obs_feat_t = _obs_vector(obs, "agent_0")
     expected_cost = option_lib.expected_cost(env.state, 0, int(option_id))
     reward_sum = 0.0
@@ -1622,7 +1749,7 @@ def _execute_option(
             evidence_next=evidence_buffer.snapshot(),
             evidence_mask_next=evidence_buffer.snapshot_mask(),
             evidence_len_next=int(evidence_buffer.length()),
-            belief_hidden_next=evidence_buffer.belief_hidden_snapshot(),
+            belief_hidden_next=evidence_buffer.belief_window_base_snapshot(),
             done=bool(done),
             termination_reason=termination_reason,
             graph_id=f"{graph.layout_name}:{graph.metadata.get('graph_variant', 'graph')}",
@@ -1987,20 +2114,19 @@ def _state_repr(
     if method == "global_gru":
         return evidence
     if method in {"aris_bellman", "flat_factor"}:
-        if belief_hidden is not None:
-            return belief_model.belief_from_hidden(
-                belief_hidden,
-                factor_features=graph_batch.get("factor_features"),
-                factor_mask=graph_batch["factor_mask"],
-                mode_mask=graph_batch["mode_mask"],
-            )
-        return belief_model(
+        hidden = belief_model.encode_history(
             evidence,
             graph_batch.get("factor_features"),
-            graph_batch["factor_mask"],
-            graph_batch["mode_mask"],
+            factor_mask=graph_batch["factor_mask"],
             evidence_lengths=evidence_lengths,
             evidence_mask=evidence_mask,
+            initial_hidden=belief_hidden,
+        )
+        return belief_model.belief_from_hidden(
+            hidden,
+            factor_features=graph_batch.get("factor_features"),
+            factor_mask=graph_batch["factor_mask"],
+            mode_mask=graph_batch["mode_mask"],
         )
     return evidence.new_zeros(
         evidence.shape[0],
@@ -2052,7 +2178,7 @@ def _select_option(
             [evidence_buffer.length()], dtype=torch.float32, device=device
         )
         graph_batch = _graph_tensors(graph, 1, device)
-        belief_hidden_np = evidence_buffer.belief_hidden_snapshot()
+        belief_hidden_np = evidence_buffer.belief_window_base_snapshot()
         belief_hidden = (
             _tensor(belief_hidden_np[None, ...], device)
             if belief_hidden_np is not None
@@ -2768,6 +2894,7 @@ def _advance_persistent_belief(
             )
         active_np = row_np[:, EVIDENCE_INDEX["evidence_present"]] > 0.0
         active = torch.as_tensor(active_np[None, ...], dtype=torch.bool, device=device)
+        evidence_buffer.record_belief_window_base(hidden_np)
         next_hidden = belief_model.step_history(
             evidence_t,
             hidden,
@@ -3093,6 +3220,27 @@ def _save_checkpoint(
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
     torch.save(payload, output_dir / filename)
+
+
+def _remove_stale_deployable_checkpoints(
+    output_dir: Path,
+    metrics: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    removed: list[str] = []
+    for filename in ("checkpoint.pt", "checkpoint_best.pt"):
+        path = output_dir / filename
+        if path.exists():
+            path.unlink()
+            removed.append(filename)
+    if removed:
+        metrics.setdefault("checkpoint_selection", {})[
+            "removed_stale_deployable_checkpoints"
+        ] = removed
+        metrics.setdefault("checkpoint_selection", {})[
+            "stale_deployable_removal_reason"
+        ] = reason
 
 
 def _checkpoint_loads(path: Path) -> bool:

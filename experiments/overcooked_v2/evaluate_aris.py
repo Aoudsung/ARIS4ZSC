@@ -855,7 +855,7 @@ def _current_belief(
         evidence_buffer.snapshot_mask()[None, ...], dtype=torch.bool, device=torch.device("cpu")
     )
     evidence_lengths = torch.as_tensor([evidence_buffer.length()], dtype=torch.float32)
-    hidden_np = evidence_buffer.belief_hidden_snapshot()
+    hidden_np = evidence_buffer.belief_window_base_snapshot()
     belief_hidden = _tensor(hidden_np[None, ...], torch.device("cpu")) if hidden_np is not None else None
     with torch.no_grad():
         return _state_repr(
