@@ -600,8 +600,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                             ),
                             "selected_ego_sole_correct_delivery_count": _val_ego_sole,
                             "selected_partner_correct_delivery_count": _val_partner,
-                            "selected_completion_rate": float(
-                                validation.get("completion_rate", 0.0)
+                            "selected_team_delivery_episode_rate": float(
+                                validation.get("team_delivery_episode_rate", 0.0)
+                            ),
+                            "selected_ego_correct_completion_rate": float(
+                                validation.get("ego_correct_completion_rate", 0.0)
                             ),
                         }
                     )
@@ -1990,7 +1993,8 @@ def _run_greedy_validation(
     ego_correct_deliveries = 0
     ego_sole_correct_deliveries = 0
     partner_correct_deliveries = 0
-    completed_episodes = 0
+    team_delivery_episodes = 0
+    ego_sole_completed_episodes = 0
     q_was_training = q_net.training
     belief_was_training = belief_model.training
     q_net.eval()
@@ -2021,6 +2025,7 @@ def _run_greedy_validation(
                 episode_return = 0.0
                 option_count = 0
                 episode_delivered = 0
+                episode_ego_sole = 0
                 done = False
                 while (
                     not done
@@ -2072,10 +2077,12 @@ def _run_greedy_validation(
                         _esummary.get("partner_correct_delivery", 0)
                     )
                     episode_delivered += int(_esummary.get("delivery_event", 0))
+                    episode_ego_sole += int(_esummary.get("ego_sole_correct_delivery", 0))
                     option_count += 1
                 returns.append(float(episode_return))
                 option_counts.append(int(option_count))
-                completed_episodes += int(episode_delivered > 0)
+                team_delivery_episodes += int(episode_delivered > 0)
+                ego_sole_completed_episodes += int(episode_ego_sole > 0)
     finally:
         q_net.train(q_was_training)
         belief_model.train(belief_was_training)
@@ -2095,8 +2102,17 @@ def _run_greedy_validation(
         "ego_correct_delivery_count": int(ego_correct_deliveries),
         "ego_sole_correct_delivery_count": int(ego_sole_correct_deliveries),
         "partner_correct_delivery_count": int(partner_correct_deliveries),
-        "completion_rate": (
-            float(completed_episodes) / float(episodes) if int(episodes) > 0 else 0.0
+        # F9 (FINDINGS_LEDGER): the former completion-rate key here carried TEAM
+        # semantics (any delivery incl. partner's). Renamed so a team rate is
+        # never quoted under a completion name; the ego-sole rate matches the
+        # formal eval headline metric.
+        "team_delivery_episode_rate": (
+            float(team_delivery_episodes) / float(episodes) if int(episodes) > 0 else 0.0
+        ),
+        "ego_correct_completion_rate": (
+            float(ego_sole_completed_episodes) / float(episodes)
+            if int(episodes) > 0
+            else 0.0
         ),
     }
 
@@ -3172,7 +3188,12 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "selected_partner_correct_delivery_count": checkpoint_selection.get(
             "selected_partner_correct_delivery_count"
         ),
-        "selected_completion_rate": checkpoint_selection.get("selected_completion_rate"),
+        "selected_team_delivery_episode_rate": checkpoint_selection.get(
+            "selected_team_delivery_episode_rate"
+        ),
+        "selected_ego_correct_completion_rate": checkpoint_selection.get(
+            "selected_ego_correct_completion_rate"
+        ),
         "max_partner_correct_delivery_seen": checkpoint_selection.get(
             "max_partner_correct_delivery_seen"
         ),
