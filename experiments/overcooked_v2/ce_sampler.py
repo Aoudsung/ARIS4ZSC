@@ -808,6 +808,11 @@ def refine_empirical_ce(
         for _, i, j in top_pairs:
             estimates[(i, j)].append(float(sample_ce[i, j]))
 
+    # F8 (FINDINGS_LEDGER): positive-only bootstrap mean — sentinel zeros from
+    # below-support resamples are dropped, so weakly-supported cells are biased
+    # UPWARD (survivorship). Scope: magnitudes of already-estimable top-k cells
+    # only; support/estimability decisions come from the unrefined support audit,
+    # and the base + unmasked matrices are persisted for audit alongside.
     for _, i, j in top_pairs:
         values = [value for value in estimates[(i, j)] if value > 0.0]
         if values:
@@ -820,6 +825,7 @@ def refine_empirical_ce(
         "min_weight": float(min_weight),
         "relaxed_min_weight": relaxed_min_weight,
         "forced_intervention": False,
+        "bootstrap_positive_only_survivorship_bias": True,
     }
     return refined, metadata
 
