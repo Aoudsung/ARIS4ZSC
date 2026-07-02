@@ -1,0 +1,205 @@
+# role_conditioned_v1 benchmark on asymm_advantages: symmetric yield/claim terminal
+# policies. Train partners = 6, held-out = {heldout-yield-terminal-claim,
+# heldout-push-terminal-yield}. Evaluate via
+# `evaluate_aris --partners heldout-yield-terminal-claim,heldout-push-terminal-yield`.
+layout: asymm_advantages
+
+env:
+  max_steps: 400
+  observation_type: default
+  negative_rewards: true
+  sample_recipe_on_delivery: true
+  random_reset: false
+  random_agent_positions: false
+  # Certified substrate condition (rc2b_layout_scan ran fpp=true). fpp is a real OvercookedV2 param
+  # but inert for the option-level executor; kept explicit so the executor_semantics_hash matches the cert.
+  force_path_planning: true
+
+options:
+  # Corrected executor semantics (RC-2b P1 + Phase-2 fix), matching the per-partner pre-check substrate.
+  max_option_steps: 16
+  strict_preconditions: true
+  dynamic_budget: true
+
+layouts:
+  filter:
+    min_options: 6
+
+graph:
+  # RC root-cause fix: these point at the NEW ego-credit CE artifacts. Regenerate via
+  #   python experiments/overcooked_v2/scripts/run_ce_pipeline.py \
+  #     --config experiments/overcooked_v2/configs/ocv2_step4_asymm.yaml \
+  #     --output_dir outputs/asymm_ce_egocredit_progression_seed
+  # The objective gate REJECTS the old outputs/asymm_ce (team-credit) graph under
+  # sparse_credit: ego_delivery, so do not repoint these back to it without regenerating.
+  ce_path: outputs/asymm_ce_role_v1_v3/ce_refined.npy
+  replay_path: outputs/asymm_ce_role_v1_v3/replay.npz
+  preflight_path: results/ocv2_asymm/preflight.json
+  relevance_semantics: ego_complement_projection
+  ce_eta: 0.05
+  max_factors: 16
+  full_max_factors: 16
+  # Coverage-constrained CE graph selection: raw top-K shaped CE crowded serve_soup
+  # (CE 0.73) out of the top-16 (cutoff ~0.80). Task-critical options are reserved a
+  # relevant factor BEFORE CE fill, with diversity caps; the task-stage gate then holds
+  # by construction. Operates on the SAME CE matrix (no re-collection) — train rebuilds
+  # the variant from ce_refined.npy with this selection.
+  selection: coverage_constrained_ce
+  required_option_kind_coverage:
+    pick_plate: {min_factors: 1}
+    plate_soup: {min_factors: 1}
+    serve_soup: {min_factors: 1}
+    clear_interaction_cell: {min_factors: 1}
+  required_option_id_coverage:
+    pick_plate:                {min_per_valid_option: 1}
+    plate_soup:                {min_per_valid_option: 1}
+    serve_soup:                {min_per_valid_option: 1}
+    clear_interaction_cell:    {min_per_valid_option: 1}
+    deliver_ingredient_to_pot: {min_per_valid_option: 1}
+  diversity:
+    max_factors_per_option_kind_pair: 3
+    max_factors_per_option_id: 4
+  overcomplete_extra_factors: 8
+  local_return_horizon_options: 3
+  modes:
+    bottleneck: 3
+    resource: 2
+    handoff: 3
+    serving: 2
+    pot_allocation: 2
+    recipe_indicator: 2
+    generic_option_pair: 3
+
+diagnostics:
+  # Preflight reference-gap proxy is a coarse layout-accept check (not a measured experiment result);
+  # keep its sampling small for speed. CE/replay are loaded from graph.ce_path / graph.replay_path.
+  proxy_episodes: 10
+
+training:
+  partner_set: role_conditioned_v1
+
+  train_partners:
+    - ingredient-near-yield
+    - ingredient-far-yield
+    - server-left-claim
+    - server-right-claim
+    - bottleneck-yield-terminal-yield
+    - bottleneck-push-terminal-claim
+
+  partner_groups:
+    ingredient-near-yield: terminal_yield
+    ingredient-far-yield: terminal_yield
+    bottleneck-yield-terminal-yield: terminal_yield
+    server-left-claim: terminal_claim
+    server-right-claim: terminal_claim
+    bottleneck-push-terminal-claim: terminal_claim
+
+  partner_sampling: {}
+
+  sparse_credit: role_contrib_team
+
+  contrib_team:
+    contrib_scale: 1.0
+
+  role_contrib_team:
+    ego_terminal_penalty_under_claim: 0.3
+
+  terminal_progress_shaping:
+    enabled: false
+    ego_plate_pick_bonus: 0.0
+    ego_plate_soup_bonus: 0.0
+    ego_serve_bonus: 0.0
+    max_bonus_per_step: null
+
+  role_exploration:
+    enabled: true
+    yield:
+      bias_start: 0.90
+      bias_end: 0.35
+      anneal_updates: 2500
+      preferred_kinds:
+        - serve_soup
+        - plate_soup
+        - pick_plate
+    claim:
+      bias_start: 0.90
+      bias_end: 0.35
+      anneal_updates: 2500
+      preferred_kinds:
+        - deliver_ingredient_to_pot
+        - fetch_ingredient
+        - clear_interaction_cell
+        - wait_at_bottleneck
+        - drop_item_to_counter
+
+  terminal_exploration:
+    enabled: false
+
+  terminal_replay_seed:
+    enabled: false
+
+  role_replay_seed:
+    enabled: true
+    chains:
+      - name: ego_terminal_against_yield
+        partner: ingredient-near-yield
+        target_actor: ego
+        target_deliveries: 32
+        ego_priority_kinds:
+          - serve_soup
+          - plate_soup
+          - pick_plate
+          - deliver_ingredient_to_pot
+          - fetch_ingredient
+          - clear_interaction_cell
+          - wait_at_bottleneck
+      - name: support_partner_terminal_claim
+        partner: server-left-claim
+        target_actor: partner
+        target_deliveries: 32
+        ego_priority_kinds:
+          - deliver_ingredient_to_pot
+          - fetch_ingredient
+          - clear_interaction_cell
+          - wait_at_bottleneck
+          - drop_item_to_counter
+    seed_updates: 600
+    seed_batch_size: 8
+
+  require_ego_delivery_selection: false
+  require_preflight_accepted: true
+  total_updates: 5000
+  updates_per_transition: 8
+  batch_size: 8
+  warmup_transitions: 8
+  replay_size: 5000
+  gamma: 0.99
+  cost_coef: 0.02
+  cost_per_step: 1.0
+  shaped_reward_coef: 1.0
+  learning_rate: 0.0003
+  td_loss: huber
+  huber_delta: 1.0
+  double_q: true
+  advantage_norm: none
+  value_bound:
+    enabled: true
+    apply_to_all_methods: true
+    vmax: 30.0
+    base_bound: 15.0
+    adv_bound: 15.0
+    adv_unit: 1.0
+    reward_scale: 1.0
+  checkpoint_every: 500
+  select_best_by: greedy
+  checkpoint_eval_episodes: 5
+  hidden_dim: 64
+  obs_encoder: auto
+  num_partners: 8
+  evidence_window: 4
+  target_update_interval: 50
+  grad_clip_norm: 5.0
+  epsilon_start: 0.50
+  epsilon_end: 0.10
+  max_episode_options: 20
+  log_interval: 100

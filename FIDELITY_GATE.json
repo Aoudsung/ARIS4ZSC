@@ -1,0 +1,62 @@
+{
+  "gate": "aris_bellman_fidelity_gate",
+  "register": "invariant/method-fidelity",
+  "overall": "PASS",
+  "green": true,
+  "findings": [
+    {
+      "id": "I1",
+      "title": "no G-TVOI/MI/probe selector in deploy path",
+      "state": "PASS",
+      "evidence": "deploy/select/train path free of selector symbols (\u0394_info/MI stay post-hoc in diagnostics.py)"
+    },
+    {
+      "id": "I2",
+      "title": "single TD loss, no auxiliary losses",
+      "state": "PASS",
+      "evidence": "src/aris_bellman/td.py returns one F.mse_loss; experiments/overcooked_v2/train_aris.py backprops aris_td_loss with no aux terms"
+    },
+    {
+      "id": "I3",
+      "title": "action selection is pure Bellman argmax",
+      "state": "PASS",
+      "evidence": "experiments/overcooked_v2/train_aris.py:_select_option selects via argmax with no info-gain/selector branch"
+    },
+    {
+      "id": "I4",
+      "title": "CE is preprocessing, not in training loop",
+      "state": "PASS",
+      "evidence": "experiments/overcooked_v2/train_aris.py does not call CE estimation; CE lives in ce_sampler.py (preprocessing)"
+    },
+    {
+      "id": "I5",
+      "title": "reward-scale single-source (structural)",
+      "state": "PASS",
+      "evidence": "cost/shaped coefs flow from training.* into CE, preflight, eval, and td target (numeric equivalence is semantic \u2192 out of scope, jury/human)"
+    },
+    {
+      "id": "I6",
+      "title": "articulation-point bottlenecks, not degree<=2",
+      "state": "PASS",
+      "evidence": "experiments/overcooked_v2/layout_parser.py uses Tarjan articulation points + region-size filter; no degree<=2 heuristic"
+    },
+    {
+      "id": "I7",
+      "title": "preflight hard gate + acceptance, no smoke bypass",
+      "state": "PASS",
+      "evidence": "experiments/overcooked_v2/train_aris.py:_enforce_preflight_gate requires an accepted report; no smoke bypass"
+    },
+    {
+      "id": "I8",
+      "title": "no factor-accuracy as a primary metric",
+      "state": "PASS",
+      "evidence": "evaluation is return / reference-gap grounded; no factor-label-accuracy metric"
+    },
+    {
+      "id": "I9",
+      "title": "factor deletion removes latent+route+relevance",
+      "state": "PASS",
+      "evidence": "experiments/overcooked_v2/graph_builder.py:make_graph_spec derives relevance+route_map+mode_mask from `factors`; deleting a factor structurally removes all three"
+    }
+  ]
+}

@@ -20,6 +20,16 @@ from .state_utils import (
     is_plated_cooked_soup,
 )
 
+# Actor-specific sparse-credit helpers live in a dependency-light module so they
+# can be unit-tested without the JaxMARL env stack; re-exported here for the
+# existing `from .event_extractor import actor_sparse_reward` call sites.
+from .sparse_credit import (  # noqa: F401
+    DEFAULT_SPARSE_CREDIT_MODE,
+    SPARSE_CREDIT_MODES,
+    actor_sparse_reward,
+    sparse_credit_params,
+)
+
 GridPos = tuple[int, int]
 EVENT_SEMANTICS_VERSION = 2
 
@@ -59,6 +69,11 @@ class OCV2Event:
     partner_correct_delivery: bool
     ego_wrong_delivery_event: bool
     partner_wrong_delivery_event: bool
+    # Actor-LOCAL correct delivery: the ego delivered correctly AND was the sole
+    # deliverer this step. correct_delivery below is the env's SHARED bool, so on a
+    # coincident ego-wrong + partner-correct step `ego_correct_delivery` is spuriously
+    # True; this field is the leak-proof signal the free-rider guard/metrics use.
+    ego_sole_correct_delivery: bool
     pot_changed: bool
     object_pickup_or_drop: bool
     recipe_indicator_event: bool
@@ -138,6 +153,11 @@ def extract_event(
     partner_correct_delivery = bool(partner_delivery_event and correct_delivery)
     ego_wrong_delivery_event = bool(ego_delivery_event and not correct_delivery)
     partner_wrong_delivery_event = bool(partner_delivery_event and not correct_delivery)
+    # Leak-proof actor-local correct delivery: ego delivered correctly AND no partner
+    # delivery this step (so the shared correct_delivery bool is unambiguously the ego's).
+    ego_sole_correct_delivery = bool(
+        ego_delivery_event and not partner_delivery_event and correct_delivery
+    )
     object_pickup_or_drop = (
         ego_inventory_before != ego_inventory_after
         or partner_inventory_before != partner_inventory_after
@@ -209,6 +229,7 @@ def extract_event(
         partner_correct_delivery=partner_correct_delivery,
         ego_wrong_delivery_event=ego_wrong_delivery_event,
         partner_wrong_delivery_event=partner_wrong_delivery_event,
+        ego_sole_correct_delivery=ego_sole_correct_delivery,
         pot_changed=pot_changed,
         object_pickup_or_drop=object_pickup_or_drop,
         recipe_indicator_event=recipe_indicator_event,

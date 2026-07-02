@@ -1,6 +1,9 @@
-# RC-2b held-out ZSC config: asymm_advantages family, corrected executor (P1/RC-1).
-# Train on TRAIN partners; evaluate on the held-out hard partners {bottleneck-yield, flexible-balanced}
-# via `evaluate_aris --partners bottleneck-yield,flexible-balanced`.
+# RC re-verify ARM B — under-training/exploration + cause-#2 shaping re-tune.
+# = ARM A with ONE additional change: shaped_reward_coef 1.0 -> 0.5 (rely less on dense
+#   ingredient shaping, weight the terminal ego-serve sparse reward relatively more).
+# Because the reward scale changed, this needs its OWN CE regen at the new scale:
+#   run_ce_pipeline.py --config <this> --output_dir outputs/asymm_ce_egocredit_progression_seed_armB
+# Compared against ARM A, this isolates the shaping effect (single-variable).
 layout: asymm_advantages
 
 env:
@@ -10,12 +13,9 @@ env:
   sample_recipe_on_delivery: true
   random_reset: false
   random_agent_positions: false
-  # Certified substrate condition (rc2b_layout_scan ran fpp=true). fpp is a real OvercookedV2 param
-  # but inert for the option-level executor; kept explicit so the executor_semantics_hash matches the cert.
   force_path_planning: true
 
 options:
-  # Corrected executor semantics (RC-2b P1 + Phase-2 fix), matching the per-partner pre-check substrate.
   max_option_steps: 16
   strict_preconditions: true
   dynamic_budget: true
@@ -25,23 +25,13 @@ layouts:
     min_options: 6
 
 graph:
-  # RC root-cause fix: these point at the NEW ego-credit CE artifacts. Regenerate via
-  #   python experiments/overcooked_v2/scripts/run_ce_pipeline.py \
-  #     --config experiments/overcooked_v2/configs/ocv2_step4_asymm.yaml \
-  #     --output_dir outputs/asymm_ce_egocredit_progression_seed
-  # The objective gate REJECTS the old outputs/asymm_ce (team-credit) graph under
-  # sparse_credit: ego_delivery, so do not repoint these back to it without regenerating.
-  ce_path: outputs/asymm_ce_egocredit_progression_seed/ce_refined.npy
-  replay_path: outputs/asymm_ce_egocredit_progression_seed/replay.npz
+  # ARM B reward scale differs (shaped_reward_coef=0.5) -> dedicated CE regen path.
+  ce_path: outputs/asymm_ce_egocredit_progression_seed_armB/ce_refined.npy
+  replay_path: outputs/asymm_ce_egocredit_progression_seed_armB/replay.npz
   preflight_path: results/ocv2_asymm/preflight.json
   ce_eta: 0.05
   max_factors: 16
   full_max_factors: 16
-  # Coverage-constrained CE graph selection: raw top-K shaped CE crowded serve_soup
-  # (CE 0.73) out of the top-16 (cutoff ~0.80). Task-critical options are reserved a
-  # relevant factor BEFORE CE fill, with diversity caps; the task-stage gate then holds
-  # by construction. Operates on the SAME CE matrix (no re-collection) — train rebuilds
-  # the variant from ce_refined.npy with this selection.
   selection: coverage_constrained_ce
   required_option_kind_coverage:
     pick_plate: {min_factors: 1}
@@ -64,8 +54,6 @@ graph:
     generic_option_pair: 3
 
 diagnostics:
-  # Preflight reference-gap proxy is a coarse layout-accept check (not a measured experiment result);
-  # keep its sampling small for speed. CE/replay are loaded from graph.ce_path / graph.replay_path.
   proxy_episodes: 10
 
 training:
@@ -76,20 +64,9 @@ training:
   warmup_transitions: 8
   replay_size: 5000
   gamma: 0.99
-  cost_coef: 0.02
+  cost_coef: 0.02              # kept = ARM A (single-variable: only shaping changes)
   cost_per_step: 1.0
-  shaped_reward_coef: 1.0
-  # RC root-cause fix: actor-specific sparse credit. OvercookedV2's +delivery
-  # reward is SHARED, so crediting step.rewards["agent_0"] to the ego paid it
-  # the delivery reward when the PARTNER served — a free-riding optimum on this
-  # train/held-out split. "ego_delivery" credits the env's own delivery reward
-  # to the ego ONLY on steps where the ego itself delivers (correct -> +reward,
-  # wrong -> -penalty under env.negative_rewards above); a partner delivery
-  # contributes 0. No inferred constant, stays on the value_bound.vmax scale.
-  # Alternatives: "ego_correct_delivery" (explicit ego_delivery_reward: 20.0 /
-  # ego_wrong_delivery_penalty: -20.0 constants) or legacy "team" (pre-fix bug).
-  # NOTE: this is part of the CE objective — regenerate CE via run_ce_pipeline so
-  # the graph metadata records sparse_credit; train_aris rejects a stale team graph.
+  shaped_reward_coef: 0.5      # ARM B cause-#2 re-tune: 1.0 -> 0.5
   sparse_credit: ego_delivery
   # Higher-risk terminal-stage intervention: actor-local progression shaping.
   # This is not team reward and does not pay the ego for partner plate/serve.
@@ -139,7 +116,6 @@ training:
   huber_delta: 1.0
   double_q: true
   advantage_norm: none
-  # RC-1 fix: bounded Bellman value range (hard cap |Q| <= vmax).
   value_bound:
     enabled: true
     vmax: 30.0
@@ -147,8 +123,6 @@ training:
     adv_bound: 15.0
     adv_unit: 1.0
     reward_scale: 1.0
-  # RC-2b held-out split: train + greedy-validation see ONLY the listed train partners; the 2 hard partners
-  # (bottleneck-yield, flexible-balanced) remain held out for evaluation only.
   train_partners:
     - ingredient-near
     - ingredient-far
@@ -162,9 +136,6 @@ training:
     terminal-yield: 3.0
   checkpoint_every: 500
   select_best_by: greedy
-  # RC free-rider guard: refuse to select a greedy checkpoint with positive return
-  # but zero ego correct deliveries (the free-riding signature). Safe under the
-  # sparse_credit fix above; catches any regression that re-credits partner serves.
   require_ego_delivery_selection: true
   checkpoint_eval_episodes: 5
   hidden_dim: 64
@@ -173,7 +144,7 @@ training:
   evidence_window: 4
   target_update_interval: 50
   grad_clip_norm: 5.0
-  epsilon_start: 0.50
+  epsilon_start: 0.5
   epsilon_end: 0.10
   max_episode_options: 20
   log_interval: 100

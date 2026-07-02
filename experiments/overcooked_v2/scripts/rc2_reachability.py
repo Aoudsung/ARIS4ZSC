@@ -30,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
 from experiments.overcooked_v2 import evaluate_aris as E  # noqa: E402
+from experiments.overcooked_v2.options import OCV2OptionLibrary  # noqa: E402
 
 VARIANT = "full_support"
 KNOWN_ORDER = [
@@ -53,6 +54,10 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, help="seed0 dir or a checkpoint .pt")
     ap.add_argument("--episodes", type=int, default=5)
     ap.add_argument("--max-episode-options", type=int, default=40)
+    ap.add_argument("--max-option-steps", type=int, default=None,
+                    help="RC-2b executor test: override per-option primitive-step budget.")
+    ap.add_argument("--force-path-planning", choices=("true", "false"), default=None,
+                    help="RC-2b executor test: override env force_path_planning.")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -63,9 +68,17 @@ def main() -> None:
                 ckpt = ckpt / name
                 break
     ctx = E._load_context(ckpt, VARIANT)
+    # RC-2b executor overrides (diagnostic): test whether step budget / path planning is the wall.
+    if args.force_path_planning is not None:
+        ctx.config.setdefault("env", {})["force_path_planning"] = (args.force_path_planning == "true")
+    if args.max_option_steps:
+        ctx.config["options"]["max_option_steps"] = int(args.max_option_steps)
+        ctx.option_lib = OCV2OptionLibrary(ctx.layout_graph, max_option_steps=int(args.max_option_steps))
     priority = _build_priority(ctx)
     print(f"=== RC-2 reachability probe (scripted pipeline) ===")
     print(f"checkpoint: {ckpt}")
+    print(f"overrides: max_option_steps={ctx.config['options']['max_option_steps']} "
+          f"force_path_planning={ctx.config.get('env', {}).get('force_path_planning')}")
     print(f"priority: {priority}\n")
 
     partners = E._resolve_partner_names(ctx.option_lib, "all")

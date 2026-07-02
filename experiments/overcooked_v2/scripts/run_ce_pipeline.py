@@ -21,7 +21,10 @@ from experiments.overcooked_v2.ce_sampler import (
     save_replay_npz,
 )
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
-from experiments.overcooked_v2.event_extractor import EVENT_SEMANTICS_VERSION
+from experiments.overcooked_v2.event_extractor import (
+    EVENT_SEMANTICS_VERSION,
+    sparse_credit_params,
+)
 from experiments.overcooked_v2.graph_builder import (
     build_support_graph,
     validate_task_stage_coverage,
@@ -29,6 +32,7 @@ from experiments.overcooked_v2.graph_builder import (
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.reward_design import terminal_progress_params
 from experiments.overcooked_v2.provenance import (
     PROVENANCE_SCHEMA_VERSION,
     runtime_provenance,
@@ -49,14 +53,43 @@ def main(argv: list[str] | None = None) -> None:
     cost_coef = float(train_cfg["cost_coef"])
     shaped_reward_coef = float(train_cfg["shaped_reward_coef"])
     cost_per_step = float(train_cfg["cost_per_step"])
+    # RC root-cause fix: the actor-specific sparse-credit mode is part of the CE
+    # objective. Recorded into the graph metadata so train_aris rejects a graph
+    # built under a different credit objective (see _enforce_graph_objective_metadata).
+    credit_params = sparse_credit_params(train_cfg)
+    terminal_progress_cfg = terminal_progress_params(train_cfg)
     reward_metadata = {
         "layout": layout,
         "cost_coef": cost_coef,
         "cost_per_step": cost_per_step,
         "shaped_reward_coef": shaped_reward_coef,
+        "sparse_credit": credit_params["mode"],
+        "partner_set": str(train_cfg.get("partner_set", "standard7")),
+        "contribution_credit": {
+            "contrib_scale": float(
+                (train_cfg.get("contrib_team") or {}).get("contrib_scale", 1.0)
+            ),
+        },
         "reward_scale_source": "config.training",
         "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
+        "terminal_progress_shaping": terminal_progress_cfg,
     }
+    # The ego_correct_delivery mode's reward magnitude depends on explicit constants;
+    # record them so the objective gate rejects a graph built with different constants.
+    # team / ego_delivery do not use them, so they are omitted to keep the gate clean.
+    if credit_params["mode"] == "ego_correct_delivery":
+        reward_metadata["ego_delivery_reward"] = float(credit_params["ego_delivery_reward"])
+        reward_metadata["ego_wrong_delivery_penalty"] = float(
+            credit_params["ego_wrong_delivery_penalty"]
+        )
+    if credit_params["mode"] == "role_contrib_team":
+        reward_metadata["role_contrib_team"] = {
+            "ego_terminal_penalty_under_claim": float(
+                (train_cfg.get("role_contrib_team") or {}).get(
+                    "ego_terminal_penalty_under_claim", 0.3
+                )
+            ),
+        }
 
     output_dir = Path(args.output_dir)
     if output_dir.resolve() == LEGACY_P0_OUTPUT.resolve():
@@ -82,12 +115,31 @@ def main(argv: list[str] | None = None) -> None:
         strict_preconditions=bool(_opt_cfg.get("strict_preconditions", False)),
         dynamic_budget=bool(_opt_cfg.get("dynamic_budget", False)),
     )
-    partners = make_training_partners(lib)
+    partners_all = make_training_partners(
+        lib,
+        partner_set=str(train_cfg.get("partner_set", "standard7")),
+    )
     _train_names = (config.get("training", {}) or {}).get("train_partners")
     if _train_names:
-        _ns = set(_train_names)
-        partners = [p for p in partners if p.name in _ns]
+        by_name = {p.name: p for p in partners_all}
+        missing = sorted(set(_train_names) - set(by_name))
+        if missing:
+            raise ValueError(
+                f"train_partners not found for CE collection: {missing}; "
+                f"available={sorted(by_name)}"
+            )
+        # Preserve config order but collapse duplicates for CE graph construction; partner_sampling
+        # affects online training distribution, not the CE support estimate.
+        seen = set()
+        partners = []
+        for name in _train_names:
+            if name in seen:
+                continue
+            seen.add(name)
+            partners.append(by_name[str(name)])
         print(f"CE collected on TRAIN partners only (held-out excluded): {[p.name for p in partners]}")
+    else:
+        partners = partners_all
 
     print(f"Options: {lib.num_options}")
     for opt in lib.options:
@@ -102,12 +154,15 @@ def main(argv: list[str] | None = None) -> None:
         layout_name=layout,
         episodes=ep_per_partner,
         max_options_per_episode=200,
-        seed=42,
+        seed=int(args.seed),
         gamma=0.99,
         horizon_options=5,
         cost_per_step=cost_per_step,
         cost_coef=cost_coef,
         shaped_reward_coef=shaped_reward_coef,
+        credit_params=credit_params,
+        terminal_progress=terminal_progress_cfg,
+        exclude_terminal_progress_from_reward_sum=bool(args.sparse_ce_support),
     )
     print(f"Collected {len(rows)} option replay rows")
 
@@ -191,12 +246,17 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Saved CE metadata sidecar to {sidecar_path}")
 
     print("\n=== Phase 4: Graph Build ===")
+    graph_cfg = config.get("graph", {}) or {}
+    # Coverage-constrained selection: graph_cfg may carry selection / required_option_*_coverage
+    # / diversity. With selection="coverage_constrained_ce" task-critical options (serve_soup, …)
+    # are reserved before CE fill, so the task-stage gate is a postcondition, not a late surprise.
     graph = build_support_graph(
         layout,
         lib.options,
         refined,
-        eta=0.05,
-        max_factors=16,
+        eta=float(graph_cfg.get("ce_eta", 0.05)),
+        max_factors=int(graph_cfg.get("max_factors", 16)),
+        selection_cfg=graph_cfg,
     )
     graph.metadata = {
         **(graph.metadata or {}),
@@ -285,6 +345,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--output_dir", default="outputs/p1_verify")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed for CE collection rollouts; vary to separate CE stochasticity from "
+        "training stochasticity (default 42 reproduces the original collection).",
+    )
+    parser.add_argument(
+        "--sparse_ce_support",
+        action="store_true",
+        help="Exclude the dense terminal_progress_bonus from the CE return used for graph "
+        "support selection (G3). TD-time progression shaping is unaffected; this only "
+        "changes which factors the support graph is selected on.",
+    )
     parser.add_argument("--allow_incomplete_graph", action="store_true")
     parser.add_argument("--episodes-per-partner", dest="episodes_per_partner", type=int, default=100)
     parser.add_argument(

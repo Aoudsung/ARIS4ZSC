@@ -1,0 +1,399 @@
+# METHOD_LOCK — ARIS-Bellman OvercookedV2 ZSC (asymm_advantages)
+
+Status: **method-locking + validation phase** (no further method interventions).
+Frozen candidate: `aris_bellman_g2_coverage_constrained_progression_seed_v1`
+(immutable at `frozen/…_v1/` on the remote). All comparisons are against it.
+
+Dev-heldout partners (now USED for debugging, no longer pristine):
+`bottleneck-yield`, `flexible-balanced`. A fresh **blind** split is created only
+after the final method is locked (see §7). Do not tune on the blind split.
+
+---
+
+## 1. Frozen causal story
+
+```
+actor-specific reward credit fixed free-riding
+  → terminal-yield curriculum created ego-owned terminal-stage data
+  → raw top-K CE support failed: not value-sufficient (serve_soup excluded)
+  → coverage-constrained CE restored serve_soup belief access
+  → ARIS learned ego-owned serving (held-out completion 1.0)
+  → removing serve_soup support destroys ego serving
+```
+
+**Specific claim (do NOT weaken to "a larger graph helps" — A2 refutes that):**
+> CE support selection must be **value-sufficient and task-stage complete**;
+> raw top-K by CE magnitude is insufficient.
+
+## 2. The dissociation (the load-bearing result)
+
+| Variant | Graph | Outcome (train-proxy + held-out) |
+|---|---|---|
+| **G2 / A3 / A4 / A6** | coverage-constrained, serve present | **succeed** — 5/5 (G2) + A3/A4/A6 3/3, held-out **1.0**, ego=20/partner=0 |
+| **A1** raw top-16 | serve crowded out | **build-gate FAIL** (`lacks serve_soup`), 3/3 |
+| **A2** raw top-24 | serve present but no coverage structure | **free-rides**, `ego_sole=0`, partner>ego, 3/3 |
+| **A7** minus-serve | coverage-constrained, serve factor deleted | **free-rides**, `ego_sole=0`, partner>ego, 3/3 |
+
+A1 (selection too small) + A2 (capacity ≠ coverage) + A7 (factor deletion) together
+establish the coverage-constrained support graph + serve_soup factor as causally
+load-bearing — not decorative.
+
+## 3. Necessary vs removable (this layout/split)
+
+```
+NECESSARY / load-bearing:
+  actor-specific sparse credit (ego_delivery)
+  coverage-constrained CE support graph
+  serve_soup per-option / per-kind coverage
+  dynamic next-option TD mask
+  terminal-yield TRAIN PARTNER            (A9 pending: tests the partner itself)
+
+REMOVABLE (each dropped, held-out stayed 1.0):
+  Bellman seed replay            (A3 ✓)
+  directed exploration           (A4 ✓)
+  3× terminal-yield upweight     (A6 ✓ — only the upweight, not the partner)
+
+RESOLVING (train-proxy pass; held-out eval queued to confirm):
+  progression shaping            (A5 PASS 3/3 -> REMOVABLE; ego 24-26 >> partner 5-14)
+  shaped-CE vs sparse/task-CE    (G3 PASS 3/3 -> sparse-CE support WORKS; cleaner)
+  CE-collection stochasticity    (§9.2 regen-CE PASS -> selector robust to CE seed)
+
+UNRESOLVED:
+  baseline parity                (§9.8 trains pass guard on TRAIN; held-out eval is decisive)
+  terminal-yield PARTNER         (A9 — trains running)
+  blind held-out                 (§7 — after lock)
+```
+
+Implied simplified final method (pending held-out confirmation of A5/G3/A9):
+`actor-credit + coverage-constrained SPARSE/task-CE graph + serve coverage +
+dynamic next-option TD mask + terminal-yield partner` — NO progression shaping,
+NO seed replay, NO directed exploration, NO yield-upweight.
+
+## 4. G2-lite (locked simplified candidate)
+
+`ocv2_step4_asymm_G2lite.yaml` = G2 minus seed-replay, minus directed-exploration,
+yield-upweight → 1×. Keeps everything in "NECESSARY" above + progression shaping
+(pending A5). This is the combined-removal test and the basis for the final rerun.
+
+## 5. Branch-by-decision-rule (after pending jobs)
+
+```
+A5 passes  → drop progression shaping from main method (major simplification)
+A5 fails   → keep it, report as terminal-stage learning stabilizer; rely on G3 to
+             keep graph support independent of shaping
+G3 passes  → make sparse/task-CE the default support builder (cleanest)
+G3 fails   → keep shaped-CE support, report support-score sensitivity (A7 still
+             shows the selected serve factor is load-bearing)
+A9 passes  → terminal-yield partner also removable (cleaner still)
+A9 fails   → terminal-yield is a necessary train-only terminal-ownership curriculum
+baselines match G2 → narrow the claim (curriculum/reward/option engineering, not
+             ARIS-specific). baselines fail → strong ARIS claim holds.
+regen-CE passes → selector robust to CE stochasticity.
+regen-CE fails  → support-estimation reliability problem (more CE episodes /
+             reserved coverage), NOT a Bellman-control failure; do not touch policy.
+```
+
+## 6. Final clean rerun (after A5/G3/A9 decide)
+
+```
+final method: 5 seeds × (≥2 CE seeds) × 50–100 eval episodes/partner, CIs reported.
+  no seed replay (A3), no directed exploration (A4), yield 1× (A6),
+  progression per A5, support-CE per G3, terminal-yield per A9.
+20 ep/partner was a rapid robustness read — NOT the final table.
+```
+
+## 7. Blind split (create AFTER lock; do not tune)
+
+```
+blind_1: terminal-yield-like, different bottleneck protocol
+blind_2: flexible-balanced variant, changed resource priority
+blind_3: dish/serve timing variant
+blind_4: stochastic/adaptive local-mode variant (if available)
+report: dev-heldout {bottleneck-yield, flexible-balanced} vs blind-heldout {new}
+If blind fails: label current as dev success, start v2 — do not patch silently.
+```
+
+## 8. SPLIT RECLASSIFICATION (2026-07-01) — parity failure = split too easy
+
+Held-out batch: **base_only + flat_factor reach dev-heldout completion 1.0
+(ego=20/partner=0) = ARIS.** The dev-heldout partners leave ALL serving to the ego,
+so the task collapses to single-agent terminal competence — a no-factor controller
+solves it. The completion result is curriculum/layout-driven, **NOT ARIS-specific.**
+(`global_gru` eval crashed on a diagnostics shape bug — unknown, needs `--allow_diag_skip`.)
+**A9** (no terminal-yield partner) fails hard (ego=0/partner=32-46) → terminal-yield is
+a **necessary train-only terminal-ownership curriculum**.
+
+Reclassify, do NOT discard:
+- **Table 1 (dev sanity split):** ARIS = baselines = 1.0. Validates the reward-credit
+  fix, terminal competence, coverage-constrained graph repair, serve gate, no
+  free-riding. NOT the main ZSC benchmark.
+- **Table 2 (discriminative split — TO BUILD):** must require factor-local inference;
+  ARIS should beat base_only/global_gru/flat_factor. Tests the core claim.
+
+The A1/A2/A7 dissociation still shows the graph is causal *for the ARIS controller* —
+but base_only needs no graph and still completes, so task-level ARIS superiority is
+**unproven on this split**. Next work is BENCHMARK CONSTRUCTION, not ARIS changes.
+
+## 8b. G2-lite FINAL (frozen engineering candidate — no more method changes)
+
+```
+keep:    actor-specific sparse credit; coverage-constrained CE graph (+ serve/plate/
+         pick coverage); dynamic next-option TD mask; terminal-yield TRAIN partner (A9)
+remove:  seed replay (A3); directed exploration (A4); 3x yield upweight (A6);
+         progression shaping (A5 pass)
+support: task/sparse CE. The A5 no-progression CE == sparse support (no shaping bonus
+         in the return), and it carries progression=disabled metadata, so it also
+         matches a progression-off training config — avoiding the objective-gate
+         mismatch that a shaped-CE(metadata=on) + progression-off config would hit.
+```
+
+## 9. Correlation-reversal discriminative benchmark (queue §12.4-8)
+
+Factors: **F_bottleneck {yield, push} × F_serving {ego_serves, partner_serves}.**
+Partners added to `partner_pool.py` (`terminal_policy="serve"` = partner owns terminal):
+```
+TRAIN diagonal (factors correlated):   cr-yield-egoserve, cr-push-partnerserve
+HELD-OUT off-diagonal (reversed):      cr-yield-partnerserve, cr-push-egoserve
+```
+
+**DISCRIMINABILITY PREFLIGHT (scripted oracle vs fixed ego; diagnose_split.py) — RESULT:**
+```
+Completion SATURATES (every ego gets >=1 delivery) -> use THROUGHPUT, not completion
+  (matches sec7). Off-diagonal throughput (deliveries):
+    cr-yield-partnerserve: oracle=7.9  fixed=1.0   gap 6.9x   (serving axis discriminates)
+    cr-push-egoserve     : oracle=4.8  fixed=5.0   ~0         (bottleneck axis inert for
+                                                               throughput; still a valid
+                                                               observable spurious CUE for
+                                                               serving, correlated on the
+                                                               train diagonal)
+VERDICT: split IS solvable by adaptation and a fixed convention fails on serve-partners
+  -> PROCEED with THROUGHPUT as the eval metric. Note: base_only sees the partner in its
+  obs, so it MAY react without belief; the training experiment tests belief vs reactivity.
+```
+
+CR CAMPAIGN (in flight): sparse CE regen on the 2 diagonal partners -> train
+{aris_bellman, base_only, global_gru, flat_factor} x3 on the diagonal -> eval off-diagonal
+throughput. Guard `require_ego_delivery_selection` OFF (ego must be free to prep when the
+partner serves; checkpoint chosen by greedy return).
+
+If the preflight passes:
+```
+regen sparse/task CE on the DIAGONAL train partners (coverage: serve + bottleneck);
+train {base_only, global_gru, flat_factor, ARIS-G2lite, oracle} on diagonal;
+eval off-diagonal with metrics BEYOND completion: time-to-complete, collisions,
+  wrong-role stalls, ego/partner split, first diagnostic action, belief-entropy drop,
+  Delta_info, Q-rank of the convention-dependent option;
+factor deletion (serve, bottleneck separately) + shuffled relevance.
+```
+
+Decision rule (queue §13):
+```
+base==flat==ARIS on Table 2   -> split still not testing ARIS, or relevance adds nothing
+ARIS>base but not >flat        -> factor beliefs matter, relevance routing does not
+ARIS>flat under reversal       -> factor-local relevance routing SUPPORTED (the claim)
+ARIS>global_gru under recomb   -> compositional local factors > monolithic modeling
+only oracle wins               -> belief/evidence routing insufficient
+```
+
+## 10. §10 gate status
+```
+[x] G2-lite >=4/5 seeds, dev completion >=0.8, ego dominates   (Table 1 sanity)
+[x] A1 raw top-16 fails; A2 no match; A7 minus-serve degrades  (graph causal FOR ARIS)
+[!] matched baselines do NOT match under same curriculum        FAILED on Table 1
+                                                                (split non-discriminative)
+[ ] discriminative Table 2 built + passes preflight
+[ ] ARIS > baselines on Table 2
+[ ] blind-heldout above baselines
+```
+Verdict: **system validity established; the CORE ARIS CLAIM is UNTESTED until Table 2.**
+
+## 11. LAYOUT-ARTIFACT finding + contested-layout pivot (2026-07-01)
+
+The CR benchmark on asymm_advantages could not build: **serve_soup CE = 0.000** (and
+plate_soup = 0.000). In asymm_advantages roles are **spatially fixed** (the ego is the
+natural server by layout access), so "who serves" is geometry, not negotiated coordination
+— NOT an interaction externality ARIS can capture. The only CE-detectable factors are
+bottleneck-spatial (max 0.599) and those are throughput-navigable (auto-pathing). => The
+persistent baseline parity is a **layout artifact**, not a method failure. ARIS's factor
+mechanism captures interaction externalities; asymm_advantages has none at the terminal
+stage.
+
+PROBE on the CONTESTED **cramped_room** (symmetric, both agents contest pot/serve):
+```
+                 asymm_advantages   cramped_room
+serve_soup CE         0.000            8.98      (top factor serve_soup<->clear_cell 8.4)
+plate_soup CE         0.000            0.64
+deliver_to_pot CE     0.305            8.98
+```
+=> On cramped_room, "who serves" IS a value-sufficient interaction factor. This is the
+layout ARIS should be tested on. (forced_coord is a stronger fallback — mandatory handoff.)
+
+CRAMPED BENCHMARK RESULT (3 seeds, 20ep, per-partner adaptation) — FIRST POSITIVE ARIS SIGNAL:
+```
+method        yield-partner(ego serves)  serve-partner(ego preps)  mean throughput
+aris_bellman  ego=13.3 prt=0  (serves)   ego=0 prt=6.7  (preps)    10.0   <-- ADAPTS
+flat_factor   ego=6.7  prt=0             ego=0 prt=3.3             5.0
+global_gru    ego=0    prt=0             ego=0 prt=1.3            0.67
+base_only     ego=0    prt=0             ego=0 prt=0              0.0    <-- fails both
+```
+ARIS >> base_only/global_gru => partner-belief adaptation HELPS (core claim supported on a
+contested layout). ARIS >> flat_factor (2x) => factor-local RELEVANCE ROUTING matters.
+Retroactively explains asymm parity: that layout's coordination wasn't a CE factor.
+
+CAVEATS (do not overclaim): IN-DISTRIBUTION (train==eval partners) -> shows ARIS LEARNS to
+adapt, not yet that it GENERALIZES; need a HELD-OUT novel-partner test for the ZSC claim.
+3 seeds/20ep, aris seed1 collapsed to always-prep (2/3 adapt) -> need more seeds+episodes.
+Single layout -> confirm on forced_coord/coord_ring.
+
+## 12. Next tier (contested-layout validation)
+```
+1. Robustness: cramped_room, aris seeds 0-4 (+more), 50-100 ep; explain/repair seed1.
+2. HELD-OUT novel partners (the ZSC test): design serving sub-protocols (S0-S3, sec6),
+   train on a subset, eval on held-out compositions. ARIS should transfer; base/gru fail.
+3. 2nd contested layout: forced_coord (mandatory handoff) and/or coord_ring, same suite.
+4. Diagnostics (sec6) NOW meaningful (ARIS uses the serve factor): diagnose_traces.py ->
+   serve Q-rank when valid, factor-advantage decomposition, belief-swap ΔQ on the serve
+   factor, Δ_info vs MI. Contrast ARIS-adapt vs base_only-fail vs flat_factor-partial.
+5. sec10 gate on the contested layout; then the honest write-up (asymm = Table 1 sanity;
+   cramped = Table 2 discriminative where ARIS wins).
+```
+
+## sec13. HELD-OUT novel-partner test (2026-07-01) — narrow-training failure, not mechanism failure
+
+Evaluated cramped checkpoints on 4 ORIGINAL-library partners (`ingredient-near/far`,
+`dish-server`, `server-left`) never in cramped training. Result: ALL methods 0-1.7
+throughput. IDENTICAL deterministic behavior across all 20 episodes/partner (greedy +
+same env seed).
+
+DIAGNOSIS from option_kind_stats on ARIS/novel `ingredient-near`:
+```
+option              attempts  success   |  in-dist(cr-yield-egoserve)
+fetch_ingredient      100      100      |    106  106     (identical)
+deliver_to_pot        100       80      |     80   60
+pick_plate             40       40      |     40   40     (identical)
+plate_soup             20       20      |     20   20     (identical)
+serve_soup             20        0      |     34   20   <<-- BLOCKED
+```
+ARIS ATTEMPTS serve 20x but 0 succeed — the novel partner physically blocks the serve
+station. On the in-dist partner (which has terminal_policy="yield" -> partner explicitly
+avoids serve), 20/34 serve attempts succeed. So ARIS learned "serve when the partner
+yields at terminal" — a policy that WORKS but doesn't cover the "partner neither yields
+nor serves" mode that ingredient-near/dish-server represent.
+
+=> The mechanism IS working (serve factor active in-dist). The failure is TRAINING
+DISTRIBUTION NARROWNESS: 2 training partners can't teach 3+ behavioral modes. Standard
+ZSC narrow-train pathology, not an ARIS-specific failure.
+
+BUT: the in-distribution win alone is not a ZSC claim. To salvage the ZSC claim, either:
+(a) BROADEN training — cramped train on 4+ diverse partners (yield/serve/neither/switch),
+    eval on held-out modes. Standard ZSC recipe.
+(b) NARROW claim — "value-sufficient CE support selection + factor-local relevance
+    routing generate correct terminal-role adaptation for the partner modes seen in
+    training, but the specific 2-partner curriculum here does not transfer to novel
+    behavioral modes. Broader curricula are needed for full ZSC."
+
+Option (a) is one training cycle away (~10 min per method x 3 seeds); (b) is defensible
+and honest today.
+
+## sec14. Compliance action: synthetic-partner ban (2026-07-01)
+
+User directive: prohibit testing on synthetic/non-standard datasets. Actions:
+- Reverted all `cr-*` scripted partners + `terminal_policy="serve"` + switch_ys/sy
+  logic from `partner_pool.py`. Back to 7 STANDARD library partners.
+- Killed the broad-training run mid-flight (was using synthetic partners).
+- Kept the `ego_option_terminated_failed` evidence channel — general improvement,
+  no synthetic-data dependency; fires on any option timeout against any partner.
+- Rebuilt the ZSC experiment using ONLY standard partners on standard cramped_room.
+  Train: {terminal-yield, dish-server, bottleneck-yield, ingredient-near}
+  Held-out: {ingredient-far, server-left, flexible-balanced}
+  Methods: aris_bellman + base_only + global_gru + flat_factor, 3 seeds.
+
+## sec15. Identical-eval finding — NOT an eval bug, a partner-scoring artifact
+
+Standard-partner held-out eval on cramped_room produced BYTE-IDENTICAL per-partner
+results. Root cause found empirically:
+```
+Init state on cramped_room, score for each valid option:
+  ingredient-near : clear_interaction_cell=98.8, fetch_ingredient=5.9, ...
+  ingredient-far  : clear_interaction_cell=98.8, fetch_ingredient=5.9, ...
+  dish-server     : clear_interaction_cell=98.8, fetch_ingredient=0.9, ...
+  server-left     : clear_interaction_cell=98.8, fetch_ingredient=0.9, ...
+  bottleneck-yield: clear_interaction_cell=99.8, fetch_ingredient=1.9, ...
+  flexible-balanced: clear_interaction_cell=99.8, fetch_ingredient=1.9, ...
+  terminal-yield  : clear_interaction_cell=106.8, fetch_ingredient=5.9, ...
+```
+Every library partner picks `clear_interaction_cell` because the +100 bonus from
+`_blocking_critical_cell()` (partner_pool.py) swamps the +/-1 role bonuses. In
+cramped_room's tight 6-cell space the partner starts blocking a critical cell so
+this fires immediately for all 7 partners.
+
+=> On cramped_room, library partners are BEHAVIORALLY IDENTICAL from the ego's
+perspective. cramped_room + library partners is NOT a valid ZSC discriminator.
+The prior "aris_bellman 10.0 vs baselines 0-5" cramped_room result used synthetic
+cr-* partners (invalidated by the user's synthetic-data ban), and library partners
+there give the same trajectory for everyone. The whole cramped-room ARIS-vs-
+baselines narrative should be discarded.
+
+On asymm_advantages, library partners DO differ (larger layout, partner not stuck
+blocking): the G2 result had ARIS + baselines all reach ~1.0 completion under the
+same curriculum. That's the honest finding for asymm_advantages: no discriminative
+gap for ARIS-specific mechanism on this layout/split with only standard partners.
+
+Path forward with ONLY standard partners + standard layouts:
+- Try `forced_coord` (mandatory handoff — likely differentiates partners more)
+- Try `coord_ring` (larger, forces partner interaction)
+- On asymm_advantages, try a HARDER train/held-out split (smaller train subset)
+
+## sec16. Partner-differentiation probe across standard layouts (2026-07-01)
+
+Ran 60-step primitive-action trace per standard library partner, on 5 standard
+layouts. Count of unique partner behaviors (out of 6 tested):
+```
+asymm_advantages    4/6  (ing-near/far/dish/server collapse; yield-family differ)
+cramped_room        1/6  (all identical — +100 clear_interaction_cell bonus fires)
+forced_coord        1/6  (all identical)
+coord_ring          1/6  (all identical)
+two_rooms           1/6  (all identical)
+```
+Cause: `_protocol_score` gives +/-1 role bonuses but +100 for clear_critical_cell,
++3 for bottleneck yield, +/-100 for terminal yield. On tight layouts the +100 cell-
+clearing bonus fires for every partner from the initial state → identical
+trajectories. Only asymm_advantages gives partners room to act; even there, only
+the YIELD-family partners (terminal-yield, bottleneck-yield, flexible-balanced)
+differentiate via the +3 bottleneck bonus. Role bonuses (+/-1) are too small to
+matter anywhere.
+
+**Consequence: with ONLY standard partners + ONLY standard layouts, there is no
+path to a discriminative ARIS-specific ZSC test on OvercookedV2.** The 4 role-
+based partners are behaviorally indistinguishable on every standard layout, and
+the 3 yield-based partners only differ on asymm_advantages, where baselines
+already match ARIS at 1.0 completion under matched curriculum (G2 §9.8 result).
+
+## HONEST SCIENTIFIC CONCLUSION (standard-data only)
+
+Validated on standard data:
+- Actor-specific sparse credit fix (removes free-riding on shared delivery reward)
+- Value-sufficient CE support selection (A1 raw top-K fails, A2 capacity insufficient,
+  A7 minus-serve collapses)
+- System-level: ARIS + baselines reach 1.0 completion on the standard
+  asymm_advantages dev-heldout under the same curriculum
+
+NOT demonstrated on standard data:
+- ARIS-specific ZSC generalization gap vs base_only/global_gru/flat_factor on any
+  standard OvercookedV2 layout with standard library partners
+
+To test ARIS's ZSC claim requires either:
+(a) A different environment with partners that intrinsically differentiate on
+    value-critical dimensions (not role bonuses swamped by geometry bonuses)
+(b) A revision of the scripted-partner scoring so role bonuses can dominate
+    geometry — but that's a partner-library redesign, likely outside "standard".
+
+## sec10 gate status (contested layout)
+```
+[x] ARIS learns the task on a contested layout (throughput 10 vs baselines <=5)
+[x] matched baselines do NOT match under same curriculum (base 0, gru 0.67, flat 5 vs ARIS 10)
+[x] ARIS > flat_factor => relevance routing matters
+[ ] HELD-OUT novel-partner generalization (ZSC) — NOT yet tested (in-distribution so far)
+[ ] robustness (>=4/5 seeds; seed1 collapsed) + 2nd layout + 50-100 ep
+[ ] diagnostics mechanism evidence
+```

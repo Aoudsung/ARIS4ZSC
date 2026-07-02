@@ -38,6 +38,7 @@ from experiments.overcooked_v2.option_executor import option_primitive_step
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.provenance import runtime_provenance
+from experiments.overcooked_v2.reward_design import ContributionLedger
 from experiments.overcooked_v2.state_utils import (
     agent_facing_pos, get_agent_pos, get_inventory,
     get_pot_contents, is_pot_cooking, is_pot_ready_for_plate,
@@ -105,14 +106,21 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _load_context(_sibling_checkpoint(anchor, variant), variant)
         for variant in variants
     ]
-    partner_names = _resolve_partner_names(contexts[0].option_lib, args.partners)
+    partner_names = _resolve_partner_names(
+        contexts[0].option_lib,
+        args.partners,
+        partner_set=str(contexts[0].config.get("training", {}).get("partner_set", "standard7")),
+    )
     reward_scale_status = {
         ctx.graph_variant: _graph_objective_metadata_status(
             ctx.graph,
             ctx.config,
             layout_graph=ctx.layout_graph,
             option_lib=ctx.option_lib,
-            partners=make_training_partners(ctx.option_lib),
+            partners=make_training_partners(
+                ctx.option_lib,
+                partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
+            ),
         )
         for ctx in contexts
     }
@@ -140,6 +148,37 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 collect_diagnostics=not fast,
                 allow_diag_skip=allow_diag_skip,
             )
+            partner_protocol = None
+            try:
+                partners_map = {p.name: p for p in make_training_partners(
+                    ctx.option_lib,
+                    partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
+                )}
+                p_obj = partners_map.get(partner_name)
+                proto_obj = getattr(p_obj, "protocol", None) if p_obj is not None else None
+                if proto_obj is not None:
+                    partner_protocol = {
+                        "role": getattr(proto_obj, "role", None),
+                        "bottleneck_policy": getattr(proto_obj, "bottleneck_policy", None),
+                        "terminal_policy": getattr(proto_obj, "terminal_policy", None),
+                        "curriculum_group": getattr(proto_obj, "curriculum_group", None),
+                    }
+            except Exception:
+                partner_protocol = None
+            aggregate["partner_protocol"] = partner_protocol
+
+            terminal_policy = (partner_protocol or {}).get("terminal_policy")
+            ego_deliv = int(aggregate.get("ego_correct_delivery_count", 0) or 0)
+            prt_deliv = int(aggregate.get("partner_correct_delivery_count", 0) or 0)
+            total_deliv = int(aggregate.get("correct_delivery_count", ego_deliv + prt_deliv) or 0)
+            if terminal_policy == "yield":
+                role_match = ego_deliv
+            elif terminal_policy == "claim":
+                role_match = prt_deliv
+            else:
+                role_match = total_deliv
+            aggregate["role_match_delivery_count"] = int(role_match)
+            aggregate["role_match_rate"] = float(role_match / max(1, int(args.episodes)))
             q_proxy_factor_mask = [] if fast else _factor_deletion_q_proxy_diagnostics(ctx)
             result = {
                 "method": "random_policy" if random_policy_only else ctx.method,
@@ -289,7 +328,10 @@ def _evaluate_partner(
         ctx.layout_graph.cell_to_entity,
         ctx.layout_graph.region_cells,
     )
-    partners = {partner.name: partner for partner in make_training_partners(ctx.option_lib)}
+    partners = {partner.name: partner for partner in make_training_partners(
+        ctx.option_lib,
+        partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
+    )}
     if partner_name not in partners:
         raise KeyError(f"Unknown partner {partner_name!r}; choices={sorted(partners)}")
     partner = partners[partner_name]
@@ -345,6 +387,9 @@ def _run_episode(
     router.reset()
     obs, _ = env.reset(seed)
     partner.reset(seed)
+    contribution_ledger = ContributionLedger.from_config(
+        ctx.config.get("training", {})
+    )
 
     episode_return = 0.0
     primitive_steps = 0
@@ -355,6 +400,7 @@ def _run_episode(
     mi_values: list[float] = []
     diagnostic_cost_values: list[float] = []
     swap_values: list[dict[str, Any]] = []
+    belief_influence_values: list[dict[str, float]] = []
     termination_counts: dict[str, int] = {}
     option_kind_stats: dict[str, dict[str, Any]] = {}
     diagnostic_status_counts: dict[str, int] = {}
@@ -390,6 +436,7 @@ def _run_episode(
             collect_diagnostics,
             allow_diag_skip,
             rng,
+            contribution_ledger=contribution_ledger,
         )
         episode_return += option_return
         option_count += 1
@@ -402,6 +449,7 @@ def _run_episode(
         mi_values.extend(info["mi"])
         diagnostic_cost_values.extend(info["diagnostic_cost"])
         swap_values.extend(info["belief_swap"])
+        belief_influence_values.extend(info["belief_influence"])
         _increment(termination_counts, str(info["termination_reason"]))
         _update_option_kind_stats(
             option_kind_stats,
@@ -432,6 +480,8 @@ def _run_episode(
             / max(1, selection_stats["option_selection_count"])
         ),
         "belief_swap": _aggregate_swap(swap_values),
+        "belief_influence": _aggregate_belief_influence(belief_influence_values),
+        "belief_influence_count": len(belief_influence_values),
         "termination_counts": termination_counts,
         "option_kind_stats": option_kind_stats,
     }
@@ -449,8 +499,13 @@ def _execute_eval_option(
     collect_diagnostics: bool,
     allow_diag_skip: bool,
     rng: np.random.Generator,
+    *,
+    contribution_ledger: ContributionLedger | None = None,
 ) -> tuple[float, bool, dict[str, np.ndarray], dict[str, Any]]:
     opt = ctx.option_lib.options[int(option_id)]
+    partner_terminal_policy = getattr(
+        getattr(partner, "protocol", None), "terminal_policy", None
+    )
     runtime = OptionRuntime(
         option_id=int(option_id),
         start_pos=get_agent_pos(env.state, 0),
@@ -465,6 +520,7 @@ def _execute_eval_option(
     mi_values: list[float] = []
     diagnostic_cost_values: list[float] = []
     swap_values: list[dict[str, Any]] = []
+    belief_influence_values: list[dict[str, float]] = []
     diagnostic_status_counts: dict[str, int] = {}
     delivery_counts = _empty_delivery_counts()
     done = False
@@ -498,7 +554,19 @@ def _execute_eval_option(
         prev_state = _ostep.prev_state
         step = _ostep.step
         event = _ostep.event
-        reward_sum += _training_reward(step, ctx.config, "agent_0")
+        if contribution_ledger is not None:
+            contribution_ledger.update(event, ego_option_kind=str(opt.kind))
+        ego_contributed = False
+        if contribution_ledger is not None:
+            ego_contributed = contribution_ledger.query_and_reset_on_delivery(event)
+        reward_sum += _training_reward(
+            step,
+            ctx.config,
+            "agent_0",
+            event,
+            ego_contributed=ego_contributed,
+            partner_terminal_policy=partner_terminal_policy,
+        )
         realized_cost += float(ctx.config["training"].get("cost_per_step", 1.0))
         duration += 1
         x_f = router.route(
@@ -560,6 +628,26 @@ def _execute_eval_option(
         if done or terminated:
             break
 
+    # Diagnostic label fix (mirrors train_aris._execute_option): relabel a budget
+    # exhaustion so option stats don't record "running" as a terminal reason.
+    if not done and termination_reason == "running":
+        termination_reason = "budget_exhausted"
+
+    # Push option-level FAILURE signal to evidence when the option did not succeed
+    # (mirrors train_aris). Belief must see failure events at inference too.
+    _failed = termination_reason in {"budget_exhausted", "env_max_steps", "option_invalid", "blocked_no_progress"}
+    if _failed and 'event' in locals():
+        evidence_buffer.append(
+            router.route(
+                event,
+                ego_option_id=int(option_id),
+                ego_option_elapsed=duration,
+                ego_option_max_steps=opt.max_steps,
+                ego_option_terminated_failed=True,
+                failed_option_id=int(option_id),
+            )
+        )
+
     if collect_diagnostics:
         belief_after_option = _current_belief(ctx, evidence_buffer, graph)
         diag = _option_diagnostics(
@@ -577,6 +665,7 @@ def _execute_eval_option(
             mi_values.append(diag["mi"])
             diagnostic_cost_values.append(diag["diagnostic_cost"])
             swap_values.append(diag["belief_swap"])
+            belief_influence_values.append(diag["belief_influence"])
 
     option_return = reward_sum - float(ctx.config["training"]["cost_coef"]) * realized_cost
     return (
@@ -593,6 +682,7 @@ def _execute_eval_option(
             "mi": mi_values,
             "diagnostic_cost": diagnostic_cost_values,
             "belief_swap": swap_values,
+            "belief_influence": belief_influence_values,
             "diagnostic_status_counts": diagnostic_status_counts,
         },
     )
@@ -604,6 +694,11 @@ _DIAG_SKIP = {
     "mi": float("nan"),
     "diagnostic_cost": float("nan"),
     "belief_swap": {"status": "shape_mismatch"},
+    "belief_influence": {
+        "belief_zero_delta": 0.0,
+        "belief_uniform_delta": 0.0,
+        "relevance_zero_delta": 0.0,
+    },
 }
 
 
@@ -641,13 +736,76 @@ def _option_diagnostics(
         q_base = _base_q_values(ctx, obs_tensor, graph_batch, belief_after)
         _, cost = diagnostic_cost(q_base, int(option_id), delta, tau=0.0)
         swap = belief_swap_top_pairs(ctx.q_net, obs_tensor, belief_after, graph_batch, graph)
+        q_actual = ctx.q_net(
+            obs_tensor,
+            belief_after,
+            **_q_forward_kwargs(graph_batch),
+        ).squeeze(0)
+        belief_influence = _belief_influence_decomposition(
+            ctx,
+            obs_tensor,
+            belief_after,
+            _q_forward_kwargs(graph_batch),
+            q_actual,
+        )
         return {
             "status": "ok",
             "delta_info": float(delta.mean().item()),
             "mi": float(mi.mean().item()),
             "diagnostic_cost": float(cost.mean().item()),
             "belief_swap": swap,
+            "belief_influence": belief_influence,
         }
+
+
+def _belief_influence_decomposition(
+    ctx: EvalContext,
+    obs_tensor: torch.Tensor,
+    belief_actual: torch.Tensor,
+    graph_kwargs: dict[str, Any],
+    q_actual: torch.Tensor,
+) -> dict[str, float]:
+    if not hasattr(ctx.q_net, "forward_with_belief_override"):
+        return {
+            "belief_zero_delta": 0.0,
+            "belief_uniform_delta": 0.0,
+            "relevance_zero_delta": 0.0,
+        }
+    with torch.no_grad():
+        belief_zero = torch.zeros_like(belief_actual)
+        q_zero = ctx.q_net.forward_with_belief_override(
+            obs_tensor,
+            belief_zero,
+            graph_kwargs=graph_kwargs,
+        ).squeeze(0)
+
+        mode_mask = graph_kwargs.get("mode_mask")
+        if mode_mask is not None:
+            mm = mode_mask.to(dtype=belief_actual.dtype)
+            n_valid = mm.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            belief_unif = mm / n_valid
+        else:
+            belief_unif = torch.ones_like(belief_actual) / max(1, belief_actual.shape[-1])
+        q_unif = ctx.q_net.forward_with_belief_override(
+            obs_tensor,
+            belief_unif,
+            graph_kwargs=graph_kwargs,
+        ).squeeze(0)
+
+        graph_kwargs_no_rel = dict(graph_kwargs)
+        rm = graph_kwargs_no_rel.get("relevance_mask")
+        if rm is not None:
+            graph_kwargs_no_rel["relevance_mask"] = torch.zeros_like(rm)
+        q_no_rel = ctx.q_net.forward_with_belief_override(
+            obs_tensor,
+            belief_actual,
+            graph_kwargs=graph_kwargs_no_rel,
+        ).squeeze(0)
+    return {
+        "belief_zero_delta": float((q_actual - q_zero).abs().max().item()),
+        "belief_uniform_delta": float((q_actual - q_unif).abs().max().item()),
+        "relevance_zero_delta": float((q_actual - q_no_rel).abs().max().item()),
+    }
 
 
 def _current_belief(
@@ -1050,6 +1208,7 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "mi": _weighted_episode_summary(episodes, "mi_mean"),
         "diagnostic_cost": _weighted_episode_summary(episodes, "diagnostic_cost_mean"),
         "belief_swap_delta": _aggregate_swap([row["belief_swap"] for row in episodes]),
+        "belief_influence": _weighted_belief_influence_summary(episodes),
     }
 
 
@@ -1065,8 +1224,16 @@ def _base_q_values(
     return ctx.q_net(obs_tensor, belief, **_q_forward_kwargs(graph_batch))
 
 
-def _resolve_partner_names(option_lib: OCV2OptionLibrary, selector: str) -> list[str]:
-    partners = [partner.name for partner in make_training_partners(option_lib)]
+def _resolve_partner_names(
+    option_lib: OCV2OptionLibrary,
+    selector: str,
+    *,
+    partner_set: str = "standard7",
+) -> list[str]:
+    partners = [
+        partner.name
+        for partner in make_training_partners(option_lib, partner_set=partner_set)
+    ]
     if selector == "all":
         return partners
     requested = _parse_csv(selector)
@@ -1102,6 +1269,9 @@ def _summary(
     baselines: dict[str, Any],
     wall: float,
 ) -> dict[str, Any]:
+    def _mean_or_zero(vals: list[float]) -> float:
+        return float(np.mean(vals)) if vals else 0.0
+
     closures = _relative_values(results, "reference_gap_closure", "value")
     raw_closures = _relative_values(results, "reference_gap_closure", "raw_value")
     within_run = _relative_values(results, "within_run_relative_return", "value")
@@ -1131,6 +1301,15 @@ def _summary(
         summary["mean_within_run_relative_return"] = _mean_or_nan(within_run)
     if raw_within_run:
         summary["mean_within_run_relative_return_raw"] = _mean_or_nan(raw_within_run)
+    summary["mean_role_match_rate"] = _mean_or_zero([
+        float(r["aggregate"].get("role_match_rate", 0.0)) for r in results
+    ])
+    summary["mean_ego_delivery_count"] = _mean_or_zero([
+        float(r["aggregate"].get("ego_correct_delivery_count", 0.0)) for r in results
+    ])
+    summary["mean_partner_delivery_count"] = _mean_or_zero([
+        float(r["aggregate"].get("partner_correct_delivery_count", 0.0)) for r in results
+    ])
     return summary
 
 
@@ -1184,6 +1363,68 @@ def _aggregate_swap(values: list[dict[str, Any]]) -> dict[str, Any]:
         "action_flip_rate": _mean_or_nan(
             [float(value["action_flip_rate"]) for value in ok]
         ),
+    }
+
+
+def _aggregate_belief_influence(values: list[dict[str, float]]) -> dict[str, Any]:
+    keys = ("belief_zero_delta", "belief_uniform_delta", "relevance_zero_delta")
+    finite_by_key: dict[str, list[float]] = {key: [] for key in keys}
+    for row in values:
+        for key in keys:
+            value = float(row.get(key, 0.0))
+            if np.isfinite(value):
+                finite_by_key[key].append(value)
+    return {
+        "mean_belief_zero_delta": _mean_or_nan(finite_by_key["belief_zero_delta"]),
+        "mean_belief_uniform_delta": _mean_or_nan(finite_by_key["belief_uniform_delta"]),
+        "mean_relevance_zero_delta": _mean_or_nan(finite_by_key["relevance_zero_delta"]),
+        "count": max((len(v) for v in finite_by_key.values()), default=0),
+        "status": "ok" if any(finite_by_key.values()) else "no_values",
+    }
+
+
+def _weighted_belief_influence_summary(episodes: list[dict[str, Any]]) -> dict[str, Any]:
+    keys = (
+        ("mean_belief_zero_delta", "belief_zero_delta"),
+        ("mean_belief_uniform_delta", "belief_uniform_delta"),
+        ("mean_relevance_zero_delta", "relevance_zero_delta"),
+    )
+    totals = {out_key: 0.0 for out_key, _ in keys}
+    count = 0
+    for row in episodes:
+        influence = row.get("belief_influence", {})
+        if not isinstance(influence, dict):
+            continue
+        row_count = int(row.get("belief_influence_count", row.get("diagnostic_count", 0)))
+        if row_count <= 0:
+            continue
+        row_values: dict[str, float] = {}
+        valid = True
+        for out_key, _raw_key in keys:
+            value = float(influence.get(out_key, float("nan")))
+            if not np.isfinite(value):
+                valid = False
+                break
+            row_values[out_key] = value
+        if not valid:
+            continue
+        for out_key in totals:
+            totals[out_key] += row_values[out_key] * row_count
+        count += row_count
+    if count <= 0:
+        return {
+            "mean_belief_zero_delta": 0.0,
+            "mean_belief_uniform_delta": 0.0,
+            "mean_relevance_zero_delta": 0.0,
+            "count": 0,
+            "status": "no_values",
+        }
+    return {
+        "mean_belief_zero_delta": float(totals["mean_belief_zero_delta"] / count),
+        "mean_belief_uniform_delta": float(totals["mean_belief_uniform_delta"] / count),
+        "mean_relevance_zero_delta": float(totals["mean_relevance_zero_delta"] / count),
+        "count": int(count),
+        "status": "ok",
     }
 
 
@@ -1305,7 +1546,10 @@ def _eval_provenance(ctx: EvalContext) -> dict[str, Any]:
         config=ctx.config,
         layout_graph=ctx.layout_graph,
         option_lib=ctx.option_lib,
-        partners=make_training_partners(ctx.option_lib),
+        partners=make_training_partners(
+            ctx.option_lib,
+            partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
+        ),
         ce_path=ctx.config.get("graph", {}).get("ce_path"),
         replay_path=ctx.config.get("graph", {}).get("replay_path"),
         graph_path=ctx.config.get("graph", {}).get("graph_path"),

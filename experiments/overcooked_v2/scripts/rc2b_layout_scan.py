@@ -77,11 +77,13 @@ def _dist(option_lib, state, opt, spd):
     return min(ds) if ds else None
 
 
-def run_episode(env, option_lib, partner, seed, max_options, patience, spd):
+def run_episode(env, option_lib, partner, seed, max_options, patience, spd, policy="fsm"):
     obs, _ = env.reset(seed)
     partner.reset(seed)
     rng = np.random.default_rng(seed)
     completed = False
+    ego_deliv = 0
+    partner_deliv = 0
     reasons = defaultdict(int)
     kind_attempt = defaultdict(int)
     noop_id = _noop_id(option_lib)
@@ -89,7 +91,12 @@ def run_episode(env, option_lib, partner, seed, max_options, patience, spd):
         state = env.state
         valid = option_lib.valid_options(state, 0)
         valid_ids = np.flatnonzero(valid)
-        oid = noop_id if valid_ids.size == 0 else fsm(option_lib, state, valid_ids)
+        if valid_ids.size == 0 or policy == "partner_only":
+            oid = noop_id  # partner_only: ego always idles -> isolates the partner's solo contribution
+        elif policy == "random":
+            oid = int(rng.choice(valid_ids))
+        else:
+            oid = fsm(option_lib, state, valid_ids)
         if oid is None:
             oid = noop_id
         opt = option_lib.options[int(oid)]
@@ -111,6 +118,10 @@ def run_episode(env, option_lib, partner, seed, max_options, patience, spd):
             done = bool(step.dones.get("__all__", False))
             if getattr(event, "delivery_event", False):
                 completed = True
+            if getattr(event, "ego_delivery_event", False):
+                ego_deliv += 1
+            if getattr(event, "partner_delivery_event", False):
+                partner_deliv += 1
             cur = _dist(option_lib, step.state, opt, spd)
             if cur is not None and best is not None and cur < best:
                 best = cur
@@ -127,7 +138,7 @@ def run_episode(env, option_lib, partner, seed, max_options, patience, spd):
         reasons[reason] += 1
         if done:
             break
-    return completed, dict(reasons), dict(kind_attempt)
+    return completed, dict(reasons), dict(kind_attempt), ego_deliv, partner_deliv
 
 
 def main() -> None:
@@ -149,8 +160,8 @@ def main() -> None:
 
     layouts = [s.strip() for s in args.layouts.split(",") if s.strip()]
     results = {}
-    print(f"=== RC-2b layout reachability scan ({len(layouts)} layouts) ===")
-    print(f"{'layout':28s} {'admit':>6} {'best_compl':>10} {'#options':>9}  top_reasons")
+    print(f"=== RC-2b layout admissibility scan ({len(layouts)} layouts) — D10 ego+skill filter ===")
+    print(f"{'layout':30s} {'admit':>6} {'oracle':>7} {'rand':>6} {'randmin':>7} {'ponly':>6} {'ego_dlv':>8} {'part_dlv':>9}")
     for lay in layouts:
         try:
             env = E._build_env(lay, config)
@@ -164,21 +175,59 @@ def main() -> None:
             partners = make_training_partners(option_lib)[: args.partners]
             n_pass = layout_graph.passable_count if hasattr(layout_graph, "passable_count") else None
             best_compl = 0.0
+            ego_total = 0
+            partner_total = 0
             agg_reasons = defaultdict(int)
             for partner in partners:
                 comps = []
                 for ep in range(args.episodes):
-                    done_compl, reasons, _ = run_episode(env, option_lib, partner, ep,
-                                                         args.max_options, args.patience, spd)
+                    done_compl, reasons, _, ego_d, part_d = run_episode(
+                        env, option_lib, partner, ep, args.max_options, args.patience, spd, policy="fsm")
                     comps.append(1.0 if done_compl else 0.0)
+                    ego_total += ego_d
+                    partner_total += part_d
                     for r, c in reasons.items():
                         agg_reasons[r] += c
                 best_compl = max(best_compl, sum(comps) / len(comps))
-            admit = best_compl > 0.0
-            top = sorted(agg_reasons.items(), key=lambda kv: -kv[1])[:3]
-            results[lay] = {"admit": admit, "best_completion": best_compl,
-                            "n_options": len(option_lib.options), "reasons": dict(agg_reasons)}
-            print(f"{lay:28s} {str(admit):>6} {best_compl:>10.2f} {len(option_lib.options):>9}  {top}")
+            # random-policy baseline: B6/D10 skill / coordination-difficulty check
+            rand_compl = 0.0
+            rand_min = 1.0
+            rand_per_partner = []
+            for partner in partners:
+                rc = []
+                for ep in range(args.episodes):
+                    dc, _, _, _, _ = run_episode(
+                        env, option_lib, partner, 1000 + ep, args.max_options, args.patience, spd,
+                        policy="random")
+                    rc.append(1.0 if dc else 0.0)
+                _pc = sum(rc) / len(rc)
+                rand_per_partner.append(round(_pc, 2))
+                rand_compl = max(rand_compl, _pc)
+                rand_min = min(rand_min, _pc)
+            # partner-only baseline (ego idles): isolates the partner's solo contribution (review P6)
+            po_compl = 0.0
+            for partner in partners:
+                pc = []
+                for ep in range(args.episodes):
+                    dc, _, _, _, _ = run_episode(
+                        env, option_lib, partner, 2000 + ep, args.max_options, args.patience, spd,
+                        policy="partner_only")
+                    pc.append(1.0 if dc else 0.0)
+                po_compl = max(po_compl, sum(pc) / len(pc))
+            ego_participates = ego_total > 0
+            skill_matters = best_compl >= rand_compl + 0.34
+            partner_carries = po_compl >= best_compl - 0.34
+            admit = (best_compl >= 0.8) and ego_participates and skill_matters and not partner_carries
+            results[lay] = {
+                "admit": admit, "oracle_completion": best_compl, "random_completion": rand_compl,
+                "random_completion_min": rand_min, "random_per_partner": rand_per_partner,
+                "partner_only_completion": po_compl, "partner_carries": partner_carries,
+                "ego_deliv": ego_total, "partner_deliv": partner_total,
+                "ego_participates": ego_participates, "skill_matters": skill_matters,
+                "n_options": len(option_lib.options), "reasons": dict(agg_reasons),
+            }
+            print(f"{lay:30s} {str(admit):>6} {best_compl:>7.2f} {rand_compl:>6.2f} {rand_min:>7.2f} "
+                  f"{po_compl:>6.2f} {ego_total:>8} {partner_total:>9}  rand_pp={rand_per_partner}")
         except Exception as ex:
             results[lay] = {"error": f"{type(ex).__name__}: {ex}"}
             print(f"{lay:28s} ERROR {type(ex).__name__}: {ex}")

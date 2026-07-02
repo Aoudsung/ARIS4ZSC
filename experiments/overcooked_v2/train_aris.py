@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import logging
 import math
 import pickle
 import subprocess
@@ -27,9 +28,18 @@ from src.aris_bellman.specs import GraphSpec, OptionTransition
 from src.aris_bellman.td import aris_td_loss
 
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
-from experiments.overcooked_v2.event_extractor import EVENT_SEMANTICS_VERSION, extract_event
+from experiments.overcooked_v2.event_extractor import (
+    EVENT_SEMANTICS_VERSION,
+    actor_sparse_reward,
+    extract_event,
+    sparse_credit_params,
+)
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
-from experiments.overcooked_v2.graph_builder import build_graph_variant, validate_task_stage_coverage
+from experiments.overcooked_v2.graph_builder import (
+    _load_ego_selectable_from_replay,
+    build_graph_variant,
+    validate_task_stage_coverage,
+)
 from experiments.overcooked_v2.layout_diagnostics import preflight_layout
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
@@ -37,7 +47,12 @@ from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
 from experiments.overcooked_v2.option_executor import option_primitive_step
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
-from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.partner_pool import PARTNER_REGISTRIES, make_training_partners
+from experiments.overcooked_v2.reward_design import (
+    ContributionLedger,
+    terminal_progress_bonus,
+    terminal_progress_params,
+)
 from experiments.overcooked_v2.provenance import (
     GRAPH_HASH_FIELD,
     PROVENANCE_SCHEMA_VERSION,
@@ -55,6 +70,8 @@ METHODS = (
     "partner_id_q",
     "random_policy",
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ArisBellmanQNetwork(nn.Module):
@@ -93,6 +110,26 @@ class ArisBellmanQNetwork(nn.Module):
         encoded = self.encoder(obs_feat)
         return self.q_net(encoded, belief, **graph_kwargs)
 
+    def forward_with_belief_override(
+        self,
+        obs: torch.Tensor,
+        belief_override: torch.Tensor,
+        *,
+        graph_kwargs: dict[str, Any] | None = None,
+        bypass_evidence_recompute: bool = True,
+    ) -> torch.Tensor:
+        graph_kwargs = dict(graph_kwargs or {})
+        graph_kwargs.pop("partner_id", None)
+        encoded = self.encoder(obs)
+        if hasattr(self.q_net, "forward_with_belief_override"):
+            return self.q_net.forward_with_belief_override(
+                encoded,
+                belief_override,
+                graph_kwargs=graph_kwargs,
+                bypass_evidence_recompute=bypass_evidence_recompute,
+            )
+        return self.q_net(encoded, belief_override, **graph_kwargs)
+
 
 class BaseOnlyQNetwork(nn.Module):
     def __init__(
@@ -101,8 +138,10 @@ class BaseOnlyQNetwork(nn.Module):
         hidden_dim: int,
         num_options: int,
         encoder_type: str = "auto",
+        q_bound_vmax: float | None = None,
     ):
         super().__init__()
+        self.q_bound_vmax = _validated_q_bound_vmax(q_bound_vmax)
         self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -119,6 +158,7 @@ class BaseOnlyQNetwork(nn.Module):
     ) -> torch.Tensor:
         del belief
         q_values = self.head(self.encoder(obs_feat))
+        q_values = _apply_final_q_value_bound(q_values, self.q_bound_vmax)
         return _mask_q_values(q_values, option_mask)
 
 
@@ -131,8 +171,10 @@ class FlatFactorQNetwork(nn.Module):
         num_factors: int,
         max_modes: int,
         encoder_type: str = "auto",
+        q_bound_vmax: float | None = None,
     ):
         super().__init__()
+        self.q_bound_vmax = _validated_q_bound_vmax(q_bound_vmax)
         self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.flat_dim = max(0, int(num_factors) * int(max_modes))
         self.head = nn.Sequential(
@@ -151,6 +193,7 @@ class FlatFactorQNetwork(nn.Module):
         encoded = self.encoder(obs_feat)
         flat = belief.reshape(belief.shape[0], -1)
         q_values = self.head(torch.cat([encoded, flat], dim=-1))
+        q_values = _apply_final_q_value_bound(q_values, self.q_bound_vmax)
         return _mask_q_values(q_values, option_mask)
 
 
@@ -163,8 +206,10 @@ class GlobalGRUQNetwork(nn.Module):
         num_factors: int,
         evidence_dim: int,
         encoder_type: str = "auto",
+        q_bound_vmax: float | None = None,
     ):
         super().__init__()
+        self.q_bound_vmax = _validated_q_bound_vmax(q_bound_vmax)
         self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.history_input_dim = max(1, int(num_factors) * int(evidence_dim))
         self.history = nn.GRU(
@@ -200,6 +245,7 @@ class GlobalGRUQNetwork(nn.Module):
             )
         _, hidden = self.history(history_in)
         q_values = self.head(torch.cat([encoded, hidden[-1]], dim=-1))
+        q_values = _apply_final_q_value_bound(q_values, self.q_bound_vmax)
         return _mask_q_values(q_values, option_mask)
 
 
@@ -211,8 +257,10 @@ class PartnerIDQNetwork(nn.Module):
         num_options: int,
         num_partners: int,
         encoder_type: str = "auto",
+        q_bound_vmax: float | None = None,
     ):
         super().__init__()
+        self.q_bound_vmax = _validated_q_bound_vmax(q_bound_vmax)
         self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
         self.partner_embedding = nn.Embedding(max(1, int(num_partners)), hidden_dim)
         self.head = nn.Sequential(
@@ -240,6 +288,7 @@ class PartnerIDQNetwork(nn.Module):
         partner_id = partner_id.long().clamp(min=0, max=self.partner_embedding.num_embeddings - 1)
         partner_context = self.partner_embedding(partner_id.reshape(-1))
         q_values = self.head(torch.cat([encoded, partner_context], dim=-1))
+        q_values = _apply_final_q_value_bound(q_values, self.q_bound_vmax)
         return _mask_q_values(q_values, option_mask)
 
 
@@ -317,6 +366,24 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     rng = np.random.default_rng(args.seed)
     metrics = _empty_metrics(args.method, graph, output_dir)
+    seed_summary = _maybe_seed_terminal_replay(
+        env,
+        partners,
+        option_lib,
+        router,
+        graph,
+        config,
+        args.seed,
+        replay,
+        args.method,
+        q_net,
+        target_q_net,
+        belief_model,
+        optimizer,
+        device,
+    )
+    if seed_summary:
+        metrics["terminal_replay_seed"] = seed_summary
     checkpoint_policy = _checkpoint_policy(config)
     metrics["checkpoint_selection"] = {
         "checkpoint_every": checkpoint_policy["checkpoint_every"],
@@ -347,6 +414,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         args.seed,
         router,
     )
+    contribution_ledger = ContributionLedger.from_config(config.get("training"))
     episode_return = 0.0
     episode_options = 0
     updates_done = 0
@@ -363,6 +431,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.seed,
                 router,
             )
+            contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
 
@@ -380,6 +449,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             rng,
             device,
             partner_id=int(getattr(current_partner, "partner_id", 0)),
+            partner_terminal_policy=getattr(
+                getattr(current_partner, "protocol", None), "terminal_policy", None
+            ),
             selection_stats=metrics,
         )
         transition, done, obs = _execute_option(
@@ -393,6 +465,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             graph,
             rng,
             config,
+            contribution_ledger=contribution_ledger,
         )
         replay.add(transition)
         episode_return += _transition_training_return(transition, config)
@@ -416,6 +489,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.seed,
                 router,
             )
+            contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
 
@@ -484,14 +558,30 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         optimizer,
                         filename=f"checkpoint_u{int(updates_done)}.pt",
                     )
-                if float(validation["mean_return"]) > best_greedy_return:
-                    best_greedy_return = float(validation["mean_return"])
-                    metrics["checkpoint_selection"].update(
+                _cs = metrics["checkpoint_selection"]
+                _val_mean = float(validation["mean_return"])
+                _val_ego_sole = int(validation.get("ego_sole_correct_delivery_count", 0))
+                _val_partner = int(validation.get("partner_correct_delivery_count", 0))
+                _cs["max_partner_correct_delivery_seen"] = max(
+                    int(_cs.get("max_partner_correct_delivery_seen", 0)), _val_partner
+                )
+                if _val_mean > best_greedy_return:
+                    best_greedy_return = _val_mean
+                    _cs.update(
                         {
                             "best_greedy_return": best_greedy_return,
                             "best_update": int(updates_done),
                             "selected_checkpoint": "checkpoint.pt",
                             "selected_by": "greedy",
+                            "deployable_checkpoint": "checkpoint.pt",
+                            "selected_ego_correct_delivery_count": int(
+                                validation.get("ego_correct_delivery_count", 0)
+                            ),
+                            "selected_ego_sole_correct_delivery_count": _val_ego_sole,
+                            "selected_partner_correct_delivery_count": _val_partner,
+                            "selected_completion_rate": float(
+                                validation.get("completion_rate", 0.0)
+                            ),
                         }
                     )
                     _save_checkpoint(
@@ -532,7 +622,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "selected_checkpoint": "checkpoint.pt",
                 "selected_by": selected_by,
+                "deployable_checkpoint": "checkpoint.pt",
             }
+        )
+    # RC free-rider guard verdict. Under ego-terminal-aware selection a checkpoint
+    # is selectable only if it actually serves, so a "fail" means greedy validation
+    # never produced a serving checkpoint. Recorded as a machine-checkable Type-A
+    # field in metrics.json. If it fails, the final checkpoint remains available as
+    # a diagnostic artifact but is not published as checkpoint.pt.
+    _greedy_ran = bool(metrics.get("greedy_validation"))
+    metrics["checkpoint_selection"]["free_rider_guard"] = _free_rider_guard_verdict(
+        metrics["checkpoint_selection"], config, greedy_ran=_greedy_ran
+    )
+    if metrics["checkpoint_selection"]["free_rider_guard"] == "fail":
+        metrics["checkpoint_selection"]["free_rider_diagnosis"] = _free_rider_diagnosis(
+            metrics["checkpoint_selection"]
         )
     _write_metrics(output_dir, metrics, updates_done, wall_start, final=True)
     _save_checkpoint(
@@ -558,7 +662,11 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             optimizer,
             filename="checkpoint.pt",
         )
-    metrics["checkpoint_load_ok"] = _checkpoint_loads(output_dir / "checkpoint.pt")
+    checkpoint_path = output_dir / "checkpoint.pt"
+    metrics["checkpoint_load_ok"] = (
+        _checkpoint_loads(checkpoint_path) if checkpoint_path.exists() else False
+    )
+    metrics["run_status"] = "ok"
     _write_metrics(output_dir, metrics, updates_done, wall_start, final=True)
     return metrics
 
@@ -654,23 +762,43 @@ def _build_option_lib(layout_graph: Any, config: dict[str, Any]) -> OCV2OptionLi
 
 
 def _select_train_partners(option_lib: OCV2OptionLibrary, config: dict[str, Any]) -> list[Any]:
-    """Training + greedy-validation partner pool, optionally restricted to config
-    training.train_partners (held-out partners are then never seen during training/validation).
-    RC-2b held-out ZSC: train on TRAIN partners, evaluate on the held-out hard partners."""
-    partners = make_training_partners(option_lib)
-    names = (config.get("training", {}) or {}).get("train_partners")
+    """Training + greedy-validation partner pool.
+
+    The order in training.train_partners is preserved and duplicates are allowed.
+    This is intentional: the terminal-stage curriculum can be expressed as data
+    distribution, not as a fallback controller or an auxiliary loss. Optional
+    training.partner_sampling weights are attached to the selected partner objects
+    and consumed by _reset_episode().
+    """
+    train_cfg = config.get("training", {}) or {}
+    partners = make_training_partners(
+        option_lib,
+        partner_set=str(train_cfg.get("partner_set", "standard7")),
+    )
+    names = train_cfg.get("train_partners")
+    weights_cfg = train_cfg.get("partner_sampling", {}) or {}
+    groups_cfg = train_cfg.get("partner_groups", {}) or {}
+    by_name = {p.name: p for p in partners}
     if not names:
-        return partners
-    name_set = set(names)
-    available = {p.name for p in partners}
-    missing = name_set - available
-    if missing:
-        raise ValueError(f"train_partners not found: {sorted(missing)}; available={sorted(available)}")
-    selected = [p for p in partners if p.name in name_set]
+        selected = list(partners)
+    else:
+        missing = sorted(set(names) - set(by_name))
+        if missing:
+            raise ValueError(
+                f"train_partners not found: {missing}; available={sorted(by_name)}"
+            )
+        selected = [by_name[str(name)] for name in names]
     if not selected:
         raise ValueError("train_partners selected zero partners.")
+    for partner in selected:
+        setattr(partner, "sampling_weight", float(weights_cfg.get(partner.name, 1.0)))
+        default_group = getattr(getattr(partner, "protocol", None), "curriculum_group", None)
+        setattr(
+            partner,
+            "sampling_group",
+            str(groups_cfg.get(partner.name, default_group or partner.name)),
+        )
     return selected
-
 
 def _build_graph(
     env: OCV2Adapter,
@@ -706,6 +834,18 @@ def _build_graph(
     ce_matrix = np.load(Path(ce_path))
 
     max_factors = int(graph_cfg.get("max_factors", 16))
+    relevance_semantics = str(graph_cfg.get("relevance_semantics", "legacy_id_pair"))
+    ego_selectable_v3: frozenset[int] | None = None
+    if relevance_semantics in {"ego_kind_projection", "ego_complement_projection"}:
+        ego_selectable_v3 = _load_ego_selectable_from_replay(graph_cfg.get("replay_path"))
+        if ego_selectable_v3 is None:
+            raise RuntimeError(
+                f"graph.relevance_semantics={relevance_semantics!r} requires "
+                "replay rows with ego_option field. Loaded replay_path="
+                f"{graph_cfg.get('replay_path')!r} does not provide any. Either "
+                "regenerate the CE replay (which stores per-row ego_option) or "
+                "switch relevance_semantics back to 'legacy_id_pair'."
+            )
     graph = build_graph_variant(
         args.graph_variant,
         layout_graph.layout_name,
@@ -717,7 +857,10 @@ def _build_graph(
         overcomplete_extra_factors=int(graph_cfg.get("overcomplete_extra_factors", 0)),
         mode_config=graph_cfg.get("modes"),
         seed=args.seed,
-        require_task_stage_coverage=True,
+        require_task_stage_coverage=bool(graph_cfg.get("require_task_stage_coverage", True)),
+        selection_cfg=graph_cfg,
+        ego_selectable=ego_selectable_v3,
+        relevance_semantics=relevance_semantics,
     )
     if graph_source == "online_debug_ce":
         graph.metadata = {
@@ -808,13 +951,46 @@ def _write_graph_json(path: Path, graph: GraphSpec) -> None:
 
 def _expected_graph_objective_metadata(config: dict[str, Any]) -> dict[str, Any]:
     training = config["training"]
-    return {
+    params = sparse_credit_params(training)
+    expected = {
         "layout": str(config["layout"]),
         "cost_coef": float(training["cost_coef"]),
         "cost_per_step": float(training["cost_per_step"]),
         "shaped_reward_coef": float(training["shaped_reward_coef"]),
+        # RC root-cause fix: the actor-specific sparse-credit mode is part of the
+        # CE objective. A graph built under a different credit mode is objective-
+        # inconsistent. Absent graph metadata is treated as legacy "team" in
+        # _graph_objective_metadata_status so pre-fix graphs still load for team runs.
+        "sparse_credit": str(params["mode"]),
+        "partner_set": str(training.get("partner_set", "standard7")),
         "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
+        # Research reward intervention: if terminal progression shaping is enabled,
+        # the CE graph must be regenerated under the same objective. Record the
+        # full actor-local shaping signature so stale pre-intervention graphs reject.
+        "terminal_progress_shaping": terminal_progress_params(training),
+        "relevance_semantics": str(
+            (config.get("graph") or {}).get("relevance_semantics", "legacy_id_pair")
+        ),
     }
+    # ego_correct_delivery's reward magnitude comes from explicit constants; enforce
+    # them so a graph built with different constants is rejected. team / ego_delivery
+    # do not use constants, so they are not part of their objective signature.
+    if params["mode"] == "ego_correct_delivery":
+        expected["ego_delivery_reward"] = float(params["ego_delivery_reward"])
+        expected["ego_wrong_delivery_penalty"] = float(params["ego_wrong_delivery_penalty"])
+    if str(params.get("mode", "")) in {"contrib_team", "role_contrib_team"}:
+        expected["contribution_credit"] = {
+            "contrib_scale": float(
+                (training.get("contrib_team") or {}).get("contrib_scale", 1.0)
+            ),
+        }
+    if str(params.get("mode", "")) == "role_contrib_team":
+        expected["role_contrib_team"] = {
+            "ego_terminal_penalty_under_claim": float(
+                params["ego_terminal_penalty_under_claim"]
+            ),
+        }
+    return expected
 
 
 def _graph_objective_metadata_status(
@@ -842,14 +1018,27 @@ def _graph_objective_metadata_status(
             },
             "event_semantics_version": metadata.get("event_semantics_version"),
         }
-    missing = [key for key in expected if key not in metadata]
+    # sparse_credit is back-compatible: a legacy graph with no sparse_credit key
+    # is treated as "team" (the historical objective), so it is NOT a hard-miss.
+    # It only mismatches when the config asks for a non-team mode the graph lacks.
+    missing = [
+        key for key in expected
+        if key not in metadata
+        and key not in {"sparse_credit", "partner_set", "relevance_semantics"}
+    ]
     mismatches: dict[str, dict[str, Any]] = {}
 
     for key, expected_value in expected.items():
         if key in missing:
             continue
         observed = metadata.get(key)
-        if key in {"cost_coef", "cost_per_step", "shaped_reward_coef"}:
+        if key in {
+            "cost_coef",
+            "cost_per_step",
+            "shaped_reward_coef",
+            "ego_delivery_reward",
+            "ego_wrong_delivery_penalty",
+        }:
             try:
                 matches = math.isclose(
                     float(observed),
@@ -864,6 +1053,27 @@ def _graph_objective_metadata_status(
                 matches = int(observed) == int(expected_value)
             except (TypeError, ValueError):
                 matches = False
+        elif key == "sparse_credit":
+            observed = metadata.get(key, "team")
+            matches = str(observed) == str(expected_value)
+        elif key == "partner_set":
+            observed = metadata.get(key, "standard7")
+            matches = str(observed) == str(expected_value)
+        elif key == "terminal_progress_shaping":
+            matches = json.dumps(observed, sort_keys=True) == json.dumps(
+                expected_value, sort_keys=True
+            )
+        elif key == "contribution_credit":
+            matches = json.dumps(observed, sort_keys=True) == json.dumps(
+                expected_value, sort_keys=True
+            )
+        elif key == "role_contrib_team":
+            matches = json.dumps(observed, sort_keys=True) == json.dumps(
+                expected_value, sort_keys=True
+            )
+        elif key == "relevance_semantics":
+            observed = metadata.get(key, "legacy_id_pair")
+            matches = str(observed) == str(expected_value)
         else:
             matches = str(observed) == str(expected_value)
         if not matches:
@@ -1012,8 +1222,13 @@ def _build_q_network(
 ) -> nn.Module:
     hidden_dim = int(config["training"]["hidden_dim"])
     encoder_type = str(config["training"].get("obs_encoder", "auto"))
+    vb = config["training"].get("value_bound", {}) or {}
+    non_aris_q_bound_vmax = (
+        float(vb.get("vmax", 20.0))
+        if bool(vb.get("enabled", False)) and bool(vb.get("apply_to_all_methods", False))
+        else None
+    )
     if method == "aris_bellman":
-        vb = config["training"].get("value_bound", {}) or {}
         return ArisBellmanQNetwork(
             obs_dim,
             hidden_dim,
@@ -1027,7 +1242,13 @@ def _build_q_network(
             adv_unit=float(vb.get("adv_unit", 1.0)),
         )
     if method == "base_only":
-        return BaseOnlyQNetwork(obs_dim, hidden_dim, graph.num_options, encoder_type)
+        return BaseOnlyQNetwork(
+            obs_dim,
+            hidden_dim,
+            graph.num_options,
+            encoder_type,
+            q_bound_vmax=non_aris_q_bound_vmax,
+        )
     if method == "flat_factor":
         return FlatFactorQNetwork(
             obs_dim,
@@ -1036,6 +1257,7 @@ def _build_q_network(
             graph.num_factors,
             graph.max_modes,
             encoder_type,
+            q_bound_vmax=non_aris_q_bound_vmax,
         )
     if method == "global_gru":
         return GlobalGRUQNetwork(
@@ -1045,6 +1267,7 @@ def _build_q_network(
             graph.num_factors,
             D_EVID,
             encoder_type,
+            q_bound_vmax=non_aris_q_bound_vmax,
         )
     if method == "partner_id_q":
         return PartnerIDQNetwork(
@@ -1053,6 +1276,7 @@ def _build_q_network(
             graph.num_options,
             int(config["training"].get("num_partners", 6)),
             encoder_type,
+            q_bound_vmax=non_aris_q_bound_vmax,
         )
     raise ValueError(f"Unsupported trainable method {method!r}.")
 
@@ -1077,7 +1301,10 @@ def _run_random_policy(
 ) -> dict[str, Any]:
     del obs
     rng = np.random.default_rng(args.seed)
-    partners = make_training_partners(option_lib)
+    partners = make_training_partners(
+        option_lib,
+        partner_set=str(config.get("training", {}).get("partner_set", "standard7")),
+    )
     evidence_buffer = EvidenceBuffer(
         num_factors=router.graph.num_factors,
         window=int(config["training"]["evidence_window"]),
@@ -1091,6 +1318,7 @@ def _run_random_policy(
         args.seed,
         router,
     )
+    contribution_ledger = ContributionLedger.from_config(config.get("training"))
     metrics = _empty_metrics(args.method, router.graph, output_dir)
     episode_return = 0.0
     episode_options = 0
@@ -1107,6 +1335,7 @@ def _run_random_policy(
                 args.seed,
                 router,
             )
+            contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
 
@@ -1128,6 +1357,7 @@ def _run_random_policy(
             router.graph,
             rng,
             config,
+            contribution_ledger=contribution_ledger,
         )
         episode_return += _transition_training_return(transition, config)
         episode_options += 1
@@ -1149,6 +1379,7 @@ def _run_random_policy(
                 args.seed,
                 router,
             )
+            contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
         if update_idx % int(config["training"]["log_interval"]) == 0:
@@ -1171,8 +1402,13 @@ def _execute_option(
     graph: GraphSpec,
     rng: np.random.Generator,
     config: dict[str, Any],
+    *,
+    contribution_ledger: ContributionLedger | None = None,
 ) -> tuple[OptionTransition, bool, dict[str, np.ndarray]]:
     opt = option_lib.options[int(option_id)]
+    partner_terminal_policy = getattr(
+        getattr(partner, "protocol", None), "terminal_policy", None
+    )
     runtime = OptionRuntime(
         option_id=int(option_id),
         start_pos=get_agent_pos(env.state, 0),
@@ -1196,7 +1432,16 @@ def _execute_option(
         step = _ostep.step
         event = _ostep.event
         _accumulate_event_summary(event_summary, event)
-        reward_sum += _training_reward(step, config, "agent_0")
+        if contribution_ledger is not None:
+            contribution_ledger.update(event, ego_option_kind=str(opt.kind))
+        ego_contributed = False
+        if contribution_ledger is not None:
+            ego_contributed = contribution_ledger.query_and_reset_on_delivery(event)
+        reward_sum += _training_reward(
+            step, config, "agent_0", event,
+            ego_contributed=ego_contributed,
+            partner_terminal_policy=partner_terminal_policy,
+        )
         realized_cost += float(config["training"].get("cost_per_step", 1.0))
         duration += 1
         evidence_buffer.append(
@@ -1222,6 +1467,38 @@ def _execute_option(
         obs = step.obs
         if done or terminated:
             break
+
+    # Diagnostic label fix: with dynamic option budgets the loop can exit because
+    # `duration` reached `_budget` without a natural termination, leaving the last
+    # option_terminated() verdict "running" as the recorded terminal reason. Relabel
+    # it so option stats show a real terminal cause (does not change control flow).
+    if not done and termination_reason == "running":
+        termination_reason = "budget_exhausted"
+
+    # Push the option-level FAILURE signal to evidence when the option did not succeed.
+    # Value-sufficient belief update: repeated failure of an option should shift the
+    # posterior on the factors touching that option, allowing the model to route away
+    # from it without a probe/selector.
+    _failed = termination_reason in {"budget_exhausted", "env_max_steps", "option_invalid"}
+    if _failed and 'event' in locals():
+        evidence_buffer.append(
+            router.route(
+                event,
+                ego_option_id=int(option_id),
+                ego_option_elapsed=duration,
+                ego_option_max_steps=opt.max_steps,
+                ego_option_terminated_failed=True,
+                failed_option_id=int(option_id),
+            )
+        )
+
+    # Bellman target hygiene: action selection masks invalid options dynamically, so
+    # the TD bootstrap must do the same for s_{t+1}. Store the next-state validity
+    # inside the transition summary to avoid changing the public OptionTransition
+    # schema; _td_update consumes it when the replay buffer exposes event_summary.
+    event_summary["valid_options_next"] = [
+        bool(x) for x in option_lib.valid_options(env.state, 0).tolist()
+    ]
 
     return (
         OptionTransition(
@@ -1265,6 +1542,9 @@ def _td_update(
     evidence_t = _tensor(batch["evidence_t"], device)
     evidence_next = _tensor(batch["evidence_next"], device)
     graph_batch = _graph_tensors(graph, obs_t.shape[0], device)
+    dynamic_next_mask = _option_mask_next_from_batch(batch, graph, device)
+    if dynamic_next_mask is not None:
+        graph_batch["option_mask_next"] = dynamic_next_mask
     state_t = _state_repr(method, belief_model, evidence_t, graph_batch)
     state_next = _state_repr(method, belief_model, evidence_next, graph_batch)
 
@@ -1302,6 +1582,78 @@ def _td_update(
     return float(loss.detach().cpu().item())
 
 
+def _option_mask_next_from_batch(
+    batch: dict[str, Any],
+    graph: GraphSpec,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return the dynamic valid-option mask for bootstrap states when available.
+
+    This keeps the Bellman target aligned with deployment action selection:
+    _select_option() masks invalid options using option_lib.valid_options(state, 0),
+    so the TD target must not bootstrap through options that are only present in
+    the static graph support. The transition stores this as event_summary because
+    the shared OptionTransition schema may be used by older experiments.
+    """
+    raw = batch.get("valid_options_next")
+    if raw is None:
+        summaries = batch.get("event_summary")
+        if summaries is not None:
+            values = []
+            for summary in summaries:
+                if isinstance(summary, dict):
+                    values.append(summary.get("valid_options_next"))
+                else:
+                    values.append(None)
+            if values and all(v is not None for v in values):
+                raw = values
+    if raw is None:
+        return None
+    arr = np.asarray(raw, dtype=bool)
+    if arr.ndim != 2 or arr.shape[1] != graph.num_options:
+        warnings.warn(
+            "Ignoring malformed valid_options_next mask in replay batch: "
+            f"shape={arr.shape}, expected=(*,{graph.num_options}).",
+            RuntimeWarning,
+        )
+        return None
+    return torch.as_tensor(arr, dtype=torch.bool, device=device)
+
+
+def _free_rider_guard_verdict(
+    checkpoint_selection: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    greedy_ran: bool,
+) -> str:
+    """RC free-rider guard verdict (Type-A).
+
+    Under ego-terminal-aware selection a checkpoint can only be selected if it
+    actually serves (ego_sole_correct_delivery_count > 0), so:
+      * "not_required" — run did not opt in.
+      * "not_evaluated" — no greedy validation ran (cannot judge).
+      * "pass" — a serving checkpoint was selected.
+      * "fail" — greedy ran but NO serving checkpoint was ever found (the run did
+                 not learn to take the terminal stage). The accompanying
+                 free_rider_diagnosis distinguishes free-riding from shaped-farming.
+    """
+    if not bool(config["training"].get("require_ego_delivery_selection", False)):
+        return "not_required"
+    if not greedy_ran:
+        return "not_evaluated"
+    sel_ego_sole = checkpoint_selection.get("selected_ego_sole_correct_delivery_count")
+    if sel_ego_sole is not None and int(sel_ego_sole) > 0:
+        return "pass"
+    return "fail"
+
+
+def _free_rider_diagnosis(checkpoint_selection: dict[str, Any]) -> str:
+    """Why the free-rider guard failed: partner-serving (free-riding) vs no serve."""
+    if int(checkpoint_selection.get("max_partner_correct_delivery_seen", 0)) > 0:
+        return "free_riding_partner_serves_while_ego_idle"
+    return "no_terminal_stage_shaped_farming_or_stall"
+
+
 def _run_greedy_validation(
     method: str,
     q_net: nn.Module,
@@ -1325,6 +1677,15 @@ def _run_greedy_validation(
     rng = np.random.default_rng(seed)
     returns: list[float] = []
     option_counts: list[int] = []
+    # RC free-rider guard instrumentation: a high greedy return with zero EGO
+    # deliveries is the free-riding signature (the partner finishes for the ego).
+    # Aggregate the actor-specific terminal-stage counts so checkpoint selection
+    # can refuse such a checkpoint. These are read off transition.event_summary,
+    # which already carries ego/partner correct-delivery flags.
+    ego_correct_deliveries = 0
+    ego_sole_correct_deliveries = 0
+    partner_correct_deliveries = 0
+    completed_episodes = 0
     q_was_training = q_net.training
     belief_was_training = belief_model.training
     q_net.eval()
@@ -1337,6 +1698,7 @@ def _run_greedy_validation(
                     window=int(config["training"]["evidence_window"]),
                     evidence_dim=D_EVID,
                 )
+                validation_partner = partners[int(episode_idx) % len(partners)]
                 obs, _, partner = _reset_episode(
                     env,
                     evidence_buffer,
@@ -1344,9 +1706,14 @@ def _run_greedy_validation(
                     rng,
                     int(seed) + episode_idx,
                     router,
+                    partner_override=validation_partner,
+                )
+                contribution_ledger = ContributionLedger.from_config(
+                    greedy_config.get("training")
                 )
                 episode_return = 0.0
                 option_count = 0
+                episode_delivered = 0
                 done = False
                 while (
                     not done
@@ -1366,6 +1733,9 @@ def _run_greedy_validation(
                         rng,
                         device,
                         partner_id=int(getattr(partner, "partner_id", 0)),
+                        partner_terminal_policy=getattr(
+                            getattr(partner, "protocol", None), "terminal_policy", None
+                        ),
                         selection_stats=None,
                     )
                     transition, done, obs = _execute_option(
@@ -1379,14 +1749,25 @@ def _run_greedy_validation(
                         graph,
                         rng,
                         greedy_config,
+                        contribution_ledger=contribution_ledger,
                     )
                     episode_return += _transition_training_return(
                         transition,
                         greedy_config,
                     )
+                    _esummary = transition.event_summary or {}
+                    ego_correct_deliveries += int(_esummary.get("ego_correct_delivery", 0))
+                    ego_sole_correct_deliveries += int(
+                        _esummary.get("ego_sole_correct_delivery", 0)
+                    )
+                    partner_correct_deliveries += int(
+                        _esummary.get("partner_correct_delivery", 0)
+                    )
+                    episode_delivered += int(_esummary.get("delivery_event", 0))
                     option_count += 1
                 returns.append(float(episode_return))
                 option_counts.append(int(option_count))
+                completed_episodes += int(episode_delivered > 0)
     finally:
         q_net.train(q_was_training)
         belief_model.train(belief_was_training)
@@ -1403,6 +1784,12 @@ def _run_greedy_validation(
         "returns": returns,
         "mean_return": mean_return,
         "option_counts": option_counts,
+        "ego_correct_delivery_count": int(ego_correct_deliveries),
+        "ego_sole_correct_delivery_count": int(ego_sole_correct_deliveries),
+        "partner_correct_delivery_count": int(partner_correct_deliveries),
+        "completion_rate": (
+            float(completed_episodes) / float(episodes) if int(episodes) > 0 else 0.0
+        ),
     }
 
 
@@ -1442,6 +1829,7 @@ def _select_option(
     rng: np.random.Generator,
     device: torch.device,
     partner_id: int | None = None,
+    partner_terminal_policy: str | None = None,
     selection_stats: dict[str, Any] | None = None,
 ) -> int:
     _record_selection_attempt(selection_stats)
@@ -1451,7 +1839,16 @@ def _select_option(
         _record_forced_noop(selection_stats)
         return _noop_option_id(option_lib)
     if method == "random_policy" or rng.random() < _epsilon(config, update_idx):
-        return int(rng.choice(valid_ids))
+        return _sample_exploration_option(
+            option_lib,
+            valid_ids,
+            graph,
+            config,
+            update_idx,
+            rng,
+            selection_stats,
+            partner_terminal_policy=partner_terminal_policy,
+        )
 
     with torch.no_grad():
         obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], device)
@@ -1467,6 +1864,80 @@ def _select_option(
         valid_tensor = torch.as_tensor(valid, dtype=torch.bool, device=device)
         q_values = q_values.masked_fill(~valid_tensor, -1e9)
         return int(torch.argmax(q_values).item())
+
+
+def _sample_exploration_option(
+    option_lib: OCV2OptionLibrary,
+    valid_ids: np.ndarray,
+    graph: GraphSpec,
+    config: dict[str, Any],
+    update_idx: int,
+    rng: np.random.Generator,
+    selection_stats: dict[str, Any] | None = None,
+    *,
+    partner_terminal_policy: str | None = None,
+) -> int:
+    """Training-only directed exploration over valid terminal-stage options.
+
+    This changes only epsilon exploration, not greedy/deployment argmax. It is a
+    data-distribution intervention for the terminal-stage stall: when serve/plate
+    options are already valid, do not waste almost all exploratory samples on
+    bottleneck/wait/fetch options.
+    """
+    training_cfg = config.get("training", {}) or {}
+    role_cfg = training_cfg.get("role_exploration")
+    if role_cfg is None:
+        cfg = training_cfg.get("terminal_exploration") or {}
+        enabled = bool(cfg.get("enabled", False))
+    else:
+        role_exploration = role_cfg or {}
+        if not bool(role_exploration.get("enabled", False)):
+            return int(rng.choice(valid_ids))
+        selected_cfg = role_exploration.get(str(partner_terminal_policy))
+        if selected_cfg is None:
+            selected_cfg = role_exploration.get("default")
+        cfg = selected_cfg or {}
+        enabled = True
+    if not enabled:
+        return int(rng.choice(valid_ids))
+    preferred_kinds = tuple(
+        str(kind)
+        for kind in cfg.get(
+            "preferred_kinds",
+            ("serve_soup", "plate_soup", "pick_plate"),
+        )
+    )
+    preferred = [
+        int(idx)
+        for idx in valid_ids
+        if graph.options[int(idx)].kind in preferred_kinds
+    ]
+    if preferred and rng.random() < _terminal_exploration_bias(cfg, update_idx):
+        _record_terminal_exploration_pick(selection_stats)
+        # Ordered preference matters at the terminal stage: if serve is valid,
+        # sampling pick_plate instead is usually a regression. Among equally ranked
+        # valid options, remain stochastic to preserve exploration.
+        rank = {kind: pos for pos, kind in enumerate(preferred_kinds)}
+        best_rank = min(rank.get(graph.options[int(idx)].kind, 10_000) for idx in preferred)
+        best = [idx for idx in preferred if rank.get(graph.options[int(idx)].kind, 10_000) == best_rank]
+        return int(rng.choice(np.asarray(best, dtype=np.int64)))
+    return int(rng.choice(valid_ids))
+
+
+def _terminal_exploration_bias(cfg: dict[str, Any], update_idx: int) -> float:
+    start = float(cfg.get("bias_start", 0.9))
+    end = float(cfg.get("bias_end", 0.35))
+    horizon = max(1, int(cfg.get("anneal_updates", 2_500)))
+    frac = min(1.0, max(0.0, float(update_idx) / float(horizon)))
+    return float(start + frac * (end - start))
+
+
+def _record_terminal_exploration_pick(selection_stats: dict[str, Any] | None) -> None:
+    if selection_stats is None:
+        return
+    selection_stats["terminal_exploration_pick_count"] = int(
+        selection_stats.get("terminal_exploration_pick_count", 0)
+    ) + 1
 
 
 def _q_forward_kwargs(graph_batch: dict[str, Any]) -> dict[str, Any]:
@@ -1535,6 +2006,460 @@ def _optional_feature_tensor(
     return tensor.unsqueeze(0).expand(batch_size, -1, -1)
 
 
+
+def _maybe_seed_terminal_replay(
+    env: OCV2Adapter,
+    partners: list[Any],
+    option_lib: OCV2OptionLibrary,
+    router: OCV2EvidenceRouter,
+    graph: GraphSpec,
+    config: dict[str, Any],
+    base_seed: int,
+    replay: OptionReplayBuffer,
+    method: str,
+    q_net: nn.Module,
+    target_q_net: nn.Module,
+    belief_model: FactorLocalBeliefModel,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Seed Bellman replay with scripted ego-owned terminal-stage chains.
+
+    This is a higher-risk curriculum/data intervention for the observed stall:
+    online exploration never generates ego plate→serve transitions. It does not
+    add imitation loss, supervised labels, or a deployment fallback. The seeded
+    data are converted into normal OptionTransition rows and trained with the same
+    TD loss as online experience.
+    """
+    train_cfg = config.get("training", {}) or {}
+    role_cfg = train_cfg.get("role_replay_seed") or {}
+    cfg = train_cfg.get("terminal_replay_seed") or {}
+    if bool(role_cfg.get("enabled", False)):
+        if bool(cfg.get("enabled", False)):
+            logger.warning(
+                "Both terminal_replay_seed.enabled=True and role_replay_seed.enabled=True; "
+                "using role_replay_seed."
+            )
+        return _seed_role_replay(
+            env,
+            partners,
+            option_lib,
+            router,
+            graph,
+            config,
+            train_cfg,
+            role_cfg,
+            base_seed,
+            replay,
+            method,
+            q_net,
+            target_q_net,
+            belief_model,
+            optimizer,
+            device,
+        )
+    if not bool(cfg.get("enabled", False)):
+        return {}
+    if not partners:
+        raise ValueError("terminal_replay_seed requires at least one training partner")
+
+    rng = np.random.default_rng(int(base_seed) + int(cfg.get("seed_offset", 7_131_917)))
+    target_serves = max(0, int(cfg.get("target_ego_serves", 64)))
+    max_episodes = max(1, int(cfg.get("max_episodes", 120)))
+    max_options = max(1, int(cfg.get("max_episode_options", train_cfg.get("max_episode_options", 20))))
+    store_all_chain = bool(cfg.get("store_all_chain", True))
+    store_kinds = set(
+        str(k)
+        for k in cfg.get(
+            "store_option_kinds",
+            ("pick_plate", "plate_soup", "serve_soup"),
+        )
+    )
+    priority_kinds = tuple(
+        str(k)
+        for k in cfg.get(
+            "priority_kinds",
+            (
+                "serve_soup",
+                "plate_soup",
+                "pick_plate",
+                "deliver_ingredient_to_pot",
+                "fetch_ingredient",
+                "clear_interaction_cell",
+                "wait_at_bottleneck",
+            ),
+        )
+    )
+    partner = _partner_by_name(partners, cfg.get("partner"))
+
+    rows_added = 0
+    ego_serves = 0
+    episodes_used = 0
+    option_counts_by_kind: dict[str, int] = {}
+    terminal_rows_added = 0
+
+    for episode_idx in range(max_episodes):
+        if target_serves > 0 and ego_serves >= target_serves:
+            break
+        evidence_buffer = EvidenceBuffer(
+            num_factors=graph.num_factors,
+            window=int(train_cfg["evidence_window"]),
+            evidence_dim=D_EVID,
+        )
+        obs, _, active_partner = _reset_episode(
+            env,
+            evidence_buffer,
+            [partner],
+            rng,
+            int(base_seed) + 90_000_000 + episode_idx,
+            router,
+            partner_override=partner,
+        )
+        contribution_ledger = ContributionLedger.from_config(train_cfg)
+        done = False
+        episodes_used += 1
+        for _ in range(max_options):
+            if done:
+                break
+            option_id = _scripted_terminal_option(
+                option_lib, graph, env.state, priority_kinds, rng
+            )
+            transition, done, obs = _execute_option(
+                env,
+                obs,
+                active_partner,
+                option_lib,
+                router,
+                evidence_buffer,
+                option_id,
+                graph,
+                rng,
+                config,
+                contribution_ledger=contribution_ledger,
+            )
+            kind = graph.options[int(transition.option_id)].kind
+            option_counts_by_kind[kind] = int(option_counts_by_kind.get(kind, 0)) + 1
+            summary = transition.event_summary or {}
+            terminal_event = bool(
+                int(summary.get("ego_sole_correct_delivery", 0))
+                or kind in {"pick_plate", "plate_soup", "serve_soup"}
+            )
+            if store_all_chain or kind in store_kinds or terminal_event:
+                replay.add(transition)
+                rows_added += 1
+                terminal_rows_added += int(terminal_event)
+            ego_serves += int(summary.get("ego_sole_correct_delivery", 0))
+            if target_serves > 0 and ego_serves >= target_serves:
+                break
+
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "partner": getattr(partner, "name", None),
+        "target_ego_serves": int(target_serves),
+        "episodes_used": int(episodes_used),
+        "rows_added": int(rows_added),
+        "terminal_rows_added": int(terminal_rows_added),
+        "ego_sole_correct_delivery_count": int(ego_serves),
+        "option_kind_counts": option_counts_by_kind,
+    }
+
+    seed_updates = max(0, int(cfg.get("seed_updates", 0)))
+    if seed_updates > 0 and rows_added > 0:
+        pretrain = _pretrain_from_seed_replay(
+            replay,
+            seed_updates,
+            int(cfg.get("seed_batch_size", train_cfg.get("batch_size", 8))),
+            method,
+            q_net,
+            target_q_net,
+            belief_model,
+            optimizer,
+            graph,
+            config,
+            device,
+        )
+        summary.update(pretrain)
+    return summary
+
+
+def _seed_role_replay(
+    env: OCV2Adapter,
+    partners: list[Any],
+    option_lib: OCV2OptionLibrary,
+    router: OCV2EvidenceRouter,
+    graph: GraphSpec,
+    config: dict[str, Any],
+    train_cfg: dict[str, Any],
+    cfg: dict[str, Any],
+    base_seed: int,
+    replay: OptionReplayBuffer,
+    method: str,
+    q_net: nn.Module,
+    target_q_net: nn.Module,
+    belief_model: FactorLocalBeliefModel,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> dict[str, Any]:
+    if not partners:
+        raise ValueError("role_replay_seed requires at least one training partner")
+    chains = list(cfg.get("chains") or [])
+    if not chains:
+        raise ValueError("role_replay_seed.enabled=true requires at least one chain")
+
+    rng = np.random.default_rng(int(base_seed) + int(cfg.get("seed_offset", 7_131_917)))
+    max_options = max(1, int(cfg.get("max_episode_options", train_cfg.get("max_episode_options", 20))))
+    rows_added = 0
+    terminal_rows_added = 0
+    chain_summaries: list[dict[str, Any]] = []
+
+    for chain_idx, chain_raw in enumerate(chains):
+        chain = chain_raw or {}
+        name = str(chain.get("name", f"chain_{chain_idx}"))
+        partner = _partner_by_name(partners, chain.get("partner"))
+        target_actor = str(chain.get("target_actor", "ego"))
+        if target_actor not in {"ego", "partner"}:
+            raise ValueError(
+                f"role_replay_seed chain {name!r} target_actor={target_actor!r}; "
+                "expected 'ego' or 'partner'."
+            )
+        target_deliveries = max(0, int(chain.get("target_deliveries", 0)))
+        max_episodes = max(1, int(chain.get("max_episodes", cfg.get("max_episodes", 120))))
+        priority_kinds = tuple(
+            str(k)
+            for k in chain.get(
+                "ego_priority_kinds",
+                (
+                    "serve_soup",
+                    "plate_soup",
+                    "pick_plate",
+                    "deliver_ingredient_to_pot",
+                    "fetch_ingredient",
+                    "clear_interaction_cell",
+                    "wait_at_bottleneck",
+                ),
+            )
+        )
+        chain_rows = 0
+        chain_terminal_rows = 0
+        chain_ego_deliveries = 0
+        chain_partner_deliveries = 0
+        chain_target_deliveries = 0
+        episodes_used = 0
+        option_counts_by_kind: dict[str, int] = {}
+
+        for episode_idx in range(max_episodes):
+            if target_deliveries > 0 and chain_target_deliveries >= target_deliveries:
+                break
+            evidence_buffer = EvidenceBuffer(
+                num_factors=graph.num_factors,
+                window=int(train_cfg["evidence_window"]),
+                evidence_dim=D_EVID,
+            )
+            obs, _, active_partner = _reset_episode(
+                env,
+                evidence_buffer,
+                [partner],
+                rng,
+                int(base_seed) + 91_000_000 + chain_idx * 1_000_000 + episode_idx,
+                router,
+                partner_override=partner,
+            )
+            contribution_ledger = ContributionLedger.from_config(train_cfg)
+            done = False
+            episodes_used += 1
+            for _ in range(max_options):
+                if done:
+                    break
+                option_id = _scripted_terminal_option(
+                    option_lib, graph, env.state, priority_kinds, rng
+                )
+                transition, done, obs = _execute_option(
+                    env,
+                    obs,
+                    active_partner,
+                    option_lib,
+                    router,
+                    evidence_buffer,
+                    option_id,
+                    graph,
+                    rng,
+                    config,
+                    contribution_ledger=contribution_ledger,
+                )
+                kind = graph.options[int(transition.option_id)].kind
+                option_counts_by_kind[kind] = int(option_counts_by_kind.get(kind, 0)) + 1
+                summary = transition.event_summary or {}
+                replay.add(transition)
+                rows_added += 1
+                chain_rows += 1
+                ego_count = int(summary.get("ego_sole_correct_delivery", 0))
+                partner_count = int(summary.get("partner_correct_delivery", 0))
+                chain_ego_deliveries += ego_count
+                chain_partner_deliveries += partner_count
+                if target_actor == "ego":
+                    chain_target_deliveries += ego_count
+                else:
+                    chain_target_deliveries += partner_count
+                terminal_event = bool(
+                    int(summary.get("delivery_event", 0))
+                    or kind in {"pick_plate", "plate_soup", "serve_soup"}
+                )
+                terminal_rows_added += int(terminal_event)
+                chain_terminal_rows += int(terminal_event)
+                if target_deliveries > 0 and chain_target_deliveries >= target_deliveries:
+                    break
+
+        chain_summaries.append(
+            {
+                "name": name,
+                "partner": getattr(partner, "name", None),
+                "target_actor": target_actor,
+                "target_deliveries": int(target_deliveries),
+                "episodes_used": int(episodes_used),
+                "rows_added": int(chain_rows),
+                "terminal_rows_added": int(chain_terminal_rows),
+                "ego_sole_correct_delivery_count": int(chain_ego_deliveries),
+                "partner_correct_delivery_count": int(chain_partner_deliveries),
+                "target_delivery_count": int(chain_target_deliveries),
+                "option_kind_counts": option_counts_by_kind,
+            }
+        )
+
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "mode": "role_replay_seed",
+        "rows_added": int(rows_added),
+        "terminal_rows_added": int(terminal_rows_added),
+        "chains": chain_summaries,
+    }
+
+    seed_updates = max(0, int(cfg.get("seed_updates", 0)))
+    if seed_updates > 0 and rows_added > 0:
+        pretrain = _pretrain_from_seed_replay(
+            replay,
+            seed_updates,
+            int(cfg.get("seed_batch_size", train_cfg.get("batch_size", 8))),
+            method,
+            q_net,
+            target_q_net,
+            belief_model,
+            optimizer,
+            graph,
+            config,
+            device,
+        )
+        summary.update(pretrain)
+    return summary
+
+
+def _pretrain_from_seed_replay(
+    replay: OptionReplayBuffer,
+    seed_updates: int,
+    batch_size: int,
+    method: str,
+    q_net: nn.Module,
+    target_q_net: nn.Module,
+    belief_model: FactorLocalBeliefModel,
+    optimizer: torch.optim.Optimizer,
+    graph: GraphSpec,
+    config: dict[str, Any],
+    device: torch.device,
+) -> dict[str, Any]:
+    if len(replay) < max(1, int(batch_size)):
+        return {
+            "seed_updates_requested": int(seed_updates),
+            "seed_updates_done": 0,
+            "seed_update_skip_reason": "insufficient_seed_replay",
+        }
+    losses: list[float] = []
+    target_interval = max(1, int(config["training"].get("target_update_interval", 50)))
+    for update_idx in range(int(seed_updates)):
+        batch = replay.sample(int(batch_size))
+        loss = _td_update(
+            method,
+            q_net,
+            target_q_net,
+            belief_model,
+            optimizer,
+            batch,
+            graph,
+            config,
+            device,
+        )
+        if not math.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite terminal seed TD loss at seed update {update_idx}: {loss}"
+            )
+        losses.append(float(loss))
+        if (update_idx + 1) % target_interval == 0:
+            target_q_net.load_state_dict(q_net.state_dict())
+    if losses:
+        target_q_net.load_state_dict(q_net.state_dict())
+    return {
+        "seed_updates_requested": int(seed_updates),
+        "seed_updates_done": int(len(losses)),
+        "seed_td_loss_start": float(losses[0]) if losses else None,
+        "seed_td_loss_end": float(losses[-1]) if losses else None,
+        "seed_td_loss_mean": float(np.mean(np.asarray(losses, dtype=np.float64))) if losses else None,
+    }
+
+
+def _partner_by_name(partners: list[Any], name: Any | None) -> Any:
+    if name is None:
+        return partners[0]
+    for partner in partners:
+        if getattr(partner, "name", None) == str(name):
+            return partner
+    raise ValueError(
+        f"terminal_replay_seed.partner={name!r} not found; "
+        f"available={[getattr(p, 'name', '?') for p in partners]}"
+    )
+
+
+def _scripted_terminal_option(
+    option_lib: OCV2OptionLibrary,
+    graph: GraphSpec,
+    state: Any,
+    priority_kinds: tuple[str, ...],
+    rng: np.random.Generator,
+) -> int:
+    valid = option_lib.valid_options(state, 0)
+    valid_ids = np.flatnonzero(valid)
+    if valid_ids.size == 0:
+        return _noop_option_id(option_lib)
+    for kind in priority_kinds:
+        candidates = [int(idx) for idx in valid_ids if graph.options[int(idx)].kind == kind]
+        if candidates:
+            return int(rng.choice(np.asarray(candidates, dtype=np.int64)))
+    return int(rng.choice(valid_ids))
+
+
+def _sample_partner(partners: list[Any], rng: np.random.Generator) -> Any:
+    grouped: dict[str, list[Any]] = {}
+    for partner in partners:
+        group = str(getattr(partner, "sampling_group", getattr(partner, "name", "default")))
+        grouped.setdefault(group, []).append(partner)
+
+    if len(grouped) < len(partners):
+        # Multiple groups -> sample group uniformly, then partner by weight within group.
+        group_names = sorted(grouped)
+        group = group_names[int(rng.integers(0, len(group_names)))]
+        candidates = grouped[group]
+    else:
+        candidates = partners
+
+    weights = np.asarray(
+        [max(0.0, float(getattr(p, "sampling_weight", 1.0))) for p in candidates],
+        dtype=np.float64,
+    )
+    total = float(weights.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("partner_sampling weights must be finite and have positive sum.")
+    probs = weights / total
+    idx = int(rng.choice(np.arange(len(candidates)), p=probs))
+    return candidates[idx]
+
+
 def _reset_episode(
     env: OCV2Adapter,
     evidence_buffer: EvidenceBuffer,
@@ -1542,6 +2467,7 @@ def _reset_episode(
     rng: np.random.Generator,
     base_seed: int,
     router: OCV2EvidenceRouter | None = None,
+    partner_override: Any | None = None,
 ) -> tuple[dict[str, np.ndarray], Any, Any]:
     evidence_buffer.reset()
     if router is not None:
@@ -1550,13 +2476,13 @@ def _reset_episode(
     obs, state = env.reset(seed)
     if not partners:
         raise ValueError("_reset_episode() requires at least one partner.")
-    partner = partners[int(rng.integers(0, len(partners)))]
+    partner = partner_override if partner_override is not None else _sample_partner(partners, rng)
     partner.reset(seed)
     return obs, state, partner
 
 
 
-def _empty_event_summary() -> dict[str, int]:
+def _empty_event_summary() -> dict[str, Any]:
     return {
         "delivery_event": 0,
         "wrong_delivery_event": 0,
@@ -1564,6 +2490,7 @@ def _empty_event_summary() -> dict[str, int]:
         "partner_delivery_event": 0,
         "ego_correct_delivery": 0,
         "partner_correct_delivery": 0,
+        "ego_sole_correct_delivery": 0,
         "ego_wrong_delivery_event": 0,
         "partner_wrong_delivery_event": 0,
         "pot_changed": 0,
@@ -1614,6 +2541,7 @@ def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTra
         "partner_delivery_event",
         "ego_correct_delivery",
         "partner_correct_delivery",
+        "ego_sole_correct_delivery",
         "ego_wrong_delivery_event",
         "partner_wrong_delivery_event",
         "collision_or_block",
@@ -1626,13 +2554,43 @@ def _update_task_progress_metrics(metrics: dict[str, Any], transition: OptionTra
             counts[key] = int(counts.get(key, 0)) + int(summary.get(key, 0))
 
 
-def _training_reward(step: Any, config: dict[str, Any], agent_key: str) -> float:
-    sparse = float(step.rewards.get(agent_key, 0.0))
+def _training_reward(
+    step: Any,
+    config: dict[str, Any],
+    agent_key: str,
+    event: Any,
+    *,
+    ego_contributed: bool = False,
+    partner_terminal_policy: str | None = None,
+) -> float:
+    # RC root-cause fix: the sparse term is the ego's actor-specific delivery
+    # credit, not the shared team reward. With sparse_credit="team" (legacy
+    # default) this reproduces the old `step.rewards[agent_key]` behaviour
+    # exactly; with "ego_delivery"/"ego_correct_delivery" the partner's
+    # deliveries no longer leak into the ego option's return. `event` is the
+    # OCV2Event for this primitive step (always available at both call sites).
+    team_sparse = float(step.rewards.get(agent_key, 0.0))
+    sparse_params = sparse_credit_params(config.get("training"))
+    sparse = actor_sparse_reward(
+        team_sparse,
+        event,
+        ego_contributed=ego_contributed,
+        partner_terminal_policy=partner_terminal_policy,
+        **{k: v for k, v in sparse_params.items() if k != "partner_terminal_policy"},
+    )
     shaped_coef = float(config["training"].get("shaped_reward_coef", 0.0))
-    return sparse + shaped_coef * _shaped_reward_for_agent(
-        step.info,
-        agent_key,
-        allow_shared=bool(config["training"].get("allow_shared_shaping", False)),
+    terminal_bonus = terminal_progress_bonus(
+        event, params=terminal_progress_params(config.get("training"))
+    )
+    return (
+        sparse
+        + terminal_bonus
+        + shaped_coef
+        * _shaped_reward_for_agent(
+            step.info,
+            agent_key,
+            allow_shared=bool(config["training"].get("allow_shared_shaping", False)),
+        )
     )
 
 
@@ -1782,6 +2740,21 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "selected_checkpoint_by": checkpoint_selection.get("selected_by"),
         "best_greedy_return": checkpoint_selection.get("best_greedy_return"),
         "best_greedy_update": checkpoint_selection.get("best_update"),
+        "selected_ego_correct_delivery_count": checkpoint_selection.get(
+            "selected_ego_correct_delivery_count"
+        ),
+        "selected_ego_sole_correct_delivery_count": checkpoint_selection.get(
+            "selected_ego_sole_correct_delivery_count"
+        ),
+        "selected_partner_correct_delivery_count": checkpoint_selection.get(
+            "selected_partner_correct_delivery_count"
+        ),
+        "selected_completion_rate": checkpoint_selection.get("selected_completion_rate"),
+        "max_partner_correct_delivery_seen": checkpoint_selection.get(
+            "max_partner_correct_delivery_seen"
+        ),
+        "free_rider_guard": checkpoint_selection.get("free_rider_guard"),
+        "free_rider_diagnosis": checkpoint_selection.get("free_rider_diagnosis"),
     }
 
 
@@ -1928,6 +2901,24 @@ def _normalize_training_stability_config(config: dict[str, Any]) -> None:
         raise ValueError("training.checkpoint_eval_episodes must be positive.")
     train_cfg["checkpoint_eval_episodes"] = checkpoint_eval_episodes
 
+    # RC free-rider guard wiring check: the guard is only enforceable when greedy
+    # validation actually runs (it reads the selected checkpoint's ego deliveries).
+    # Fail fast instead of letting an opted-in hard gate silently no-op. Reads the
+    # EFFECTIVE (normalized) select_best_by / checkpoint_every, not logged intent.
+    require_ego_delivery_selection = _as_bool(
+        train_cfg.get("require_ego_delivery_selection", False),
+        "require_ego_delivery_selection",
+    )
+    train_cfg["require_ego_delivery_selection"] = require_ego_delivery_selection
+    if require_ego_delivery_selection and not (
+        checkpoint_every > 0 and select_best_by == "greedy"
+    ):
+        raise ValueError(
+            "training.require_ego_delivery_selection=true requires greedy validation "
+            "(select_best_by='greedy' and checkpoint_every>0); otherwise the free-rider "
+            "guard has no greedy-validation deliveries to check and would silently no-op."
+        )
+
 
 def _checkpoint_policy(config: dict[str, Any]) -> dict[str, Any]:
     train_cfg = config["training"]
@@ -2042,6 +3033,25 @@ def _mask_q_values(
     return q_values.masked_fill(~option_mask.bool(), -1e9)
 
 
+def _validated_q_bound_vmax(q_bound_vmax: float | None) -> float | None:
+    if q_bound_vmax is None:
+        return None
+    vmax = float(q_bound_vmax)
+    if vmax <= 0.0:
+        raise ValueError("value_bound.vmax must be positive when apply_to_all_methods is enabled.")
+    return vmax
+
+
+def _apply_final_q_value_bound(
+    q_values: torch.Tensor,
+    q_bound_vmax: float | None,
+) -> torch.Tensor:
+    if q_bound_vmax is None:
+        return q_values
+    vmax = float(q_bound_vmax)
+    return vmax * torch.tanh(q_values / vmax)
+
+
 def _increment_count(counts: dict[str, int], key: str) -> None:
     counts[key] = int(counts.get(key, 0)) + 1
 
@@ -2096,6 +3106,7 @@ def _empty_progress_summary() -> dict[str, int]:
         "partner_delivery_event": 0,
         "ego_correct_delivery": 0,
         "partner_correct_delivery": 0,
+        "ego_sole_correct_delivery": 0,
         "ego_wrong_delivery_event": 0,
         "partner_wrong_delivery_event": 0,
         "collision_or_block": 0,

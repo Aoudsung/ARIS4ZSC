@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Sequence
+from typing import Any, Sequence
 
 import torch
 import torch.nn as nn
@@ -174,6 +174,18 @@ class FactorLocalQNetwork(nn.Module):
             option_features,
             factor_features,
         )
+
+    def forward_with_belief_override(
+        self,
+        obs: torch.Tensor,
+        belief_override: torch.Tensor,
+        *,
+        graph_kwargs: dict[str, Any] | None = None,
+        bypass_evidence_recompute: bool = True,
+    ) -> torch.Tensor:
+        """Diagnostic forward using the provided belief tensor verbatim."""
+        del bypass_evidence_recompute
+        return self.forward(obs, belief_override, **(graph_kwargs or {}))
 
     def _forward_toy(
         self,

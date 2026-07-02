@@ -6,6 +6,12 @@ import numpy as np
 
 from src.aris_bellman.specs import FactorSpec, GraphSpec
 
+from experiments.overcooked_v2.partner_pool import (
+    PREP_KINDS,
+    SUPPORT_KINDS,
+    TERMINAL_KINDS,
+)
+
 GridPos = tuple[int, int]
 
 D_EVID = 64
@@ -59,6 +65,20 @@ EVIDENCE_INDEX = {
     "correct_delivery": 45,
     "pot_changed_near_entity": 46,
     "pot_changed_near_region": 47,
+    # OPTION-LEVEL FAILURE SIGNAL. Set at the boundary when the ego's just-completed
+    # option terminated without success (budget_exhausted / env_max_steps / invalid).
+    # Per-factor: fires only for factors whose option_i or option_j equals the failed
+    # option's id, so the belief for THAT factor accumulates a per-mode failure trace.
+    # Motivates the value-sufficient belief update the paper claims: repeated failure
+    # of a serve attempt against a blocking partner should shift the serve factor's
+    # posterior, allowing routing away from serve without needing a probe/selector.
+    "ego_option_terminated_failed": 48,
+    "ego_terminal_option": 49,
+    "partner_terminal_option": 50,
+    "partner_prep_option": 51,
+    "partner_support_option": 52,
+    "partner_bottleneck_wait": 53,
+    "partner_bottleneck_cross": 54,
 }
 
 
@@ -115,6 +135,8 @@ class OCV2EvidenceRouter:
         ego_option_id: int | None = None,
         ego_option_elapsed: int | None = None,
         ego_option_max_steps: int | None = None,
+        ego_option_terminated_failed: bool = False,
+        failed_option_id: int | None = None,
     ) -> np.ndarray:
         routed = np.zeros((self.graph.num_factors, D_EVID), dtype=np.float32)
         current_partner_option = _as_optional_int(getattr(event, "partner_option", None))
@@ -197,6 +219,42 @@ class OCV2EvidenceRouter:
                 ego_option_elapsed,
                 ego_option_max_steps,
             )
+            # Option-level failure signal: fires ONLY for factors whose option pair
+            # touches the just-failed option, so the belief for THAT factor accumulates
+            # a per-mode failure trace. Preserves factor-locality.
+            if ego_option_terminated_failed and failed_option_id is not None:
+                if int(factor.option_i) == int(failed_option_id) or int(factor.option_j) == int(failed_option_id):
+                    routed[factor_idx, EVIDENCE_INDEX["ego_option_terminated_failed"]] = 1.0
+
+            # Factor-local semantic evidence: each kind-tagged channel fires ONLY
+            # for factors whose option pair touches an option of that kind.
+            options_seq = self.graph.options
+            i_kind = str(options_seq[int(factor.option_i)].kind)
+            j_kind = str(options_seq[int(factor.option_j)].kind)
+            factor_touches_terminal = i_kind in TERMINAL_KINDS or j_kind in TERMINAL_KINDS
+            factor_touches_prep = i_kind in PREP_KINDS or j_kind in PREP_KINDS
+            factor_touches_support = i_kind in SUPPORT_KINDS or j_kind in SUPPORT_KINDS
+            factor_touches_bottleneck = "bottleneck" in i_kind or "bottleneck" in j_kind
+
+            ego_kind = None
+            if ego_option_id is not None and 0 <= int(ego_option_id) < len(options_seq):
+                ego_kind = str(options_seq[int(ego_option_id)].kind)
+            partner_kind = None
+            if current_partner_option is not None and 0 <= int(current_partner_option) < len(options_seq):
+                partner_kind = str(options_seq[int(current_partner_option)].kind)
+
+            if factor_touches_terminal and ego_kind in TERMINAL_KINDS:
+                routed[factor_idx, EVIDENCE_INDEX["ego_terminal_option"]] = 1.0
+            if factor_touches_terminal and partner_kind in TERMINAL_KINDS:
+                routed[factor_idx, EVIDENCE_INDEX["partner_terminal_option"]] = 1.0
+            if factor_touches_prep and partner_kind in PREP_KINDS:
+                routed[factor_idx, EVIDENCE_INDEX["partner_prep_option"]] = 1.0
+            if factor_touches_support and partner_kind in SUPPORT_KINDS:
+                routed[factor_idx, EVIDENCE_INDEX["partner_support_option"]] = 1.0
+            if factor_touches_bottleneck and partner_kind == "wait_at_bottleneck":
+                routed[factor_idx, EVIDENCE_INDEX["partner_bottleneck_wait"]] = 1.0
+            if factor_touches_bottleneck and partner_kind == "cross_bottleneck":
+                routed[factor_idx, EVIDENCE_INDEX["partner_bottleneck_cross"]] = 1.0
         if current_partner_option is not None:
             self._previous_partner_option = current_partner_option
         return routed

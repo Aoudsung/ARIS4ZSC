@@ -1,0 +1,185 @@
+ROLE
+You are an adversarial cross-model code+claim reviewer. Your job is not to rubber-stamp the existing
+root-cause review. Your job is to independently audit the clean code package, verify whether the
+review findings are reproducible from code, and produce an actionable feedback plan that can be
+mechanically integrated into the project plan and implementation.
+
+PACKAGE
+Review this zip as the authoritative review bundle:
+
+  aris4zsc_clean_rootcause_20260702.zip
+
+Unpack it into a temporary directory and treat the unpacked package as the source of truth. The package
+contains:
+  code/        clean ARIS + OvercookedV2 implementation code
+  review/      root-cause review materials and active governance docs
+  provenance/  manifest, git status, git diff, checksums
+
+IMPORTANT SCOPE
+- Static review only.
+- Do NOT run tests, training, eval, experiments, LaTeX compilation, or remote commands.
+- Do NOT judge the ARIS method as scientifically sound or unsound.
+- You may judge code-vs-claim fidelity, artifact-safety of past conclusions, and whether the proposed
+  feedback/repair process is sufficient.
+- Treat science acceptance/rejection as Type-B: reviewer evidence + human decision.
+
+READ ORDER
+Follow this order to avoid anchoring:
+
+1. Read:
+   - provenance/MANIFEST.md
+   - provenance/git_status_short.txt
+   - provenance/git_diff.patch
+   - provenance/SHA256SUMS.txt
+
+2. Inspect package completeness:
+   - Confirm the expected code and review files are present.
+   - Confirm excluded artifacts are indeed absent: results, logs, tests, checkpoints, numpy arrays,
+     historical review snapshots, generated eval/result JSONs.
+   - Note any package-completeness limitation that affects review confidence.
+
+3. Read the review brief before reading the prior reviewer verdict:
+   - review/review_bundles/rootcause_review_20260702/REVIEW_BRIEF.md
+   - review/METHOD_LOCK.md
+   - review/FINDINGS_LEDGER.md
+   - review/ROOTCAUSE_REVIEW_PLAN.md
+   - review/FIDELITY_GATE.md
+   - review/PROJECT_DASHBOARD.md
+   - review/RC_REWARD_CREDIT_FIX.md
+   - review/idea-stage/refine-logs/FINAL_PROPOSAL.md
+   - review/artifacts/OvercookedV2_plan.md
+
+4. Independently verify the major findings from code in code/:
+   - P1 oracle partner-option evidence leak
+   - P2 partner substrate degeneracy / working-tree refinement
+   - P3 CE sentinel-zero and support blindness
+   - P4 memory-less belief / missing persistent failure trace
+   - P5 reward/exploration/replay/eval-return conditioning on true partner terminal policy
+   - S/W/D/NEW findings that materially affect fix order or claim safety
+
+5. Only after writing your own per-finding notes, read:
+   - review/review_bundles/rootcause_review_20260702/CODEX_OUTPUT.md
+
+6. Compare your independent verdict against CODEX_OUTPUT.md:
+   - Confirm, refute, or refine each major pillar.
+   - Identify overstatements, missing issues, and under-ranked risks.
+   - Explicitly address the Q-B issue: P1 does not mathematically force parity if ARIS and flat_factor
+     transform the same oracle evidence differently. Decide whether this changes the top-level verdict.
+
+PRIMARY QUESTIONS
+Answer these directly:
+
+Q1. Is the clean zip sufficient for a deep static review?
+- What can be verified from the package?
+- What cannot be verified because results/logs/tests were intentionally excluded?
+- Does the package contain enough provenance to trust that it reflects the dirty working tree?
+
+Q2. Is the top-level verdict still correct?
+Current verdict under review:
+  The core ZSC claim has never been cleanly tested. Past headline negative/neutral results are artifact-
+  contaminated by P1/P2/P3/P4/P5 and related secondary issues. The method is neither validated nor refuted.
+
+You must actively try to refute this. If you find the verdict wrong, say so plainly.
+
+Q3. Which findings should be fed back into the code plan?
+For every confirmed/refined actionable issue, map it to:
+  - existing ID if present: P/S/W/D/E/NEW
+  - new ID if missing
+  - category: implementation error / substrate design defect / estimator limitation / method-design limitation / governance
+  - severity
+  - blocking status: blocks all experiments / blocks decisive eval / blocks claim wording / cleanup only
+  - target fix step
+  - verification method
+
+Q4. How should review results flow back into the project?
+Evaluate whether the current loop is sufficient:
+  FINDINGS_LEDGER.md -> human裁决 -> static handoff doc -> code diff -> codex diff review ->
+  remote gated verification -> METHOD_LOCK append-only update -> PROJECT_DASHBOARD claim status.
+
+If insufficient, propose exact changes.
+
+Q5. How should future revisions avoid drifting again?
+Evaluate the proposed guardrails:
+  - pre-registered result-to-claim decision rules
+  - artifact-suspect checklist before negative/null claims
+  - FIDELITY_GATE I10-I14
+  - concern separation: estimator/substrate/eval/method fixes not mixed
+  - append-only METHOD_LOCK
+  - Type-B human checkpoints
+
+If insufficient, propose stronger rules.
+
+OUTPUT
+Write a Markdown review with exactly these sections:
+
+## 1. Package Integrity
+- package sufficiency verdict: PASS / WARN / FAIL
+- missing or intentionally excluded evidence
+- whether exclusions limit scientific adjudication
+- checksum/provenance observations
+
+## 2. Root-Cause Verdict
+- overall verdict: CONFIRMED / REFUTED / REFINED
+- concise reasoning
+- strongest counterargument you considered
+- confidence
+
+## 3. Finding Adjudication
+Table:
+ID | verdict(CONFIRMED/REFUTED/REFINED/NEW) | evidence(file:line) | correction | severity | blocks | target fix step
+
+Rules:
+- Use existing IDs where possible.
+- Add NEW-x only for genuinely missing issues.
+- Do not mark CONFIRMED unless behavior is reproduced from code.
+- If evidence is absent because the clean package excluded logs/results, mark REVIEW-LIMITED, not confirmed.
+
+## 4. Feedback Into Plan And Code
+Provide concrete edits to the project coordination layer:
+- FINDINGS_LEDGER.md rows to add/update
+- ROOTCAUSE_REVIEW_PLAN.md fix-order changes
+- METHOD_LOCK.md append-only entry that should be written after human acceptance
+- PROJECT_DASHBOARD claim-status changes
+- FIDELITY_GATE invariants to add/update
+- handoff documents that should be created before code changes
+
+For each proposed change, include:
+document | exact change summary | dependent finding IDs | human decision needed? yes/no
+
+## 5. Revised Fix Order
+Give a dependency-ordered fix list. Each item must include:
+step | target IDs | layer(method/eval/estimator/substrate/governance) | why now | must-not-do | verification
+
+Respect these constraints:
+- De-oracle train/eval/CE before any decisive ARIS-vs-baseline claim.
+- Belief persistence or explicit finite-window claim must be resolved before testing accumulated failure traces.
+- CE support sidecar and skipped-mask are estimator fixes; do not change policy/method in that step.
+- Eval integrity gates must pass before any formal result is cited.
+- Partner-library redesign requires human governance decision before becoming a benchmark.
+
+## 6. Anti-Drift Protocol
+Write a concrete protocol for future changes:
+- pre-registration template
+- artifact-suspect checklist
+- required provenance checks
+- minimum acceptance criteria for decisive reruns
+- forbidden interpretation patterns
+- Type-B human checkpoints
+
+## 7. Implementation-Ready Handoff Queue
+List the next handoff docs to create, in order:
+handoff title | IDs covered | exact implementation boundary | required static review | required remote verification
+
+## 8. Final Advisory
+- What is safe to claim now?
+- What is explicitly not safe to claim?
+- What must happen before the method can be considered tested?
+- Any unresolved human decision.
+
+STYLE
+Be adversarial but constructive.
+Use file:line anchors.
+Do not give vague advice.
+Do not propose running local tests or experiments.
+Do not collapse scientific judgment and implementation hygiene.
+Every actionable recommendation must map to a ledger ID or create a new one.

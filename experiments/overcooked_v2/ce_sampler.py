@@ -19,13 +19,20 @@ from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import (
     EVENT_SEMANTICS_VERSION,
     OCV2Event,
+    actor_sparse_reward,
     extract_event,
+    sparse_credit_params,
 )
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.option_executor import option_primitive_step
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.reward_design import (
+    ContributionLedger,
+    terminal_progress_bonus,
+    terminal_progress_params,
+)
 from experiments.overcooked_v2.provenance import (
     PROVENANCE_SCHEMA_VERSION,
     layout_parse_hash,
@@ -77,6 +84,9 @@ def collect_option_replay(
     cost_per_step: float = 1.0,
     cost_coef: float = 1.0,
     shaped_reward_coef: float = 0.0,
+    credit_params: dict[str, Any] | None = None,
+    terminal_progress: dict[str, Any] | None = None,
+    exclude_terminal_progress_from_reward_sum: bool = False,
 ) -> list[OptionReplayRow]:
     import time as _time
     rng = np.random.default_rng(seed)
@@ -97,6 +107,7 @@ def collect_option_replay(
             if hasattr(partner, "reset"):
                 partner.reset(reset_seed)
 
+            ledger = ContributionLedger()
             t_option = 0
             done = False
             option_limit = max_options_per_episode or getattr(env, "max_steps", 400)
@@ -114,6 +125,10 @@ def collect_option_replay(
                     option_id,
                     rng,
                     cost_per_step,
+                    credit_params=credit_params,
+                    terminal_progress=terminal_progress,
+                    exclude_terminal_progress_from_reward_sum=exclude_terminal_progress_from_reward_sum,
+                    contribution_ledger=ledger,
                 )
                 rows.append(row)
                 obs = env.obs or obs
@@ -184,6 +199,10 @@ class _EnvSlot:
     done: bool
     needs_new_option: bool
     rng_seed_base: int
+    # Dynamic option budget for THIS option (set at sample time); the batched loop
+    # caps option duration here just like the sequential _rollout_option's
+    # `while duration < _budget`, so dynamic_budget semantics match across paths.
+    option_budget: int = 0
 
 
 def collect_option_replay_batched(
@@ -201,9 +220,14 @@ def collect_option_replay_batched(
     cost_coef: float = 1.0,
     shaped_reward_coef: float = 0.0,
     batch_size: int = 64,
+    credit_params: dict[str, Any] | None = None,
+    terminal_progress: dict[str, Any] | None = None,
+    exclude_terminal_progress_from_reward_sum: bool = False,
 ) -> list[OptionReplayRow]:
     from experiments.overcooked_v2.batched_rollout import BatchedEnvPool
 
+    _credit = credit_params or {}
+    _terminal_progress = terminal_progress or terminal_progress_params(None)
     rng = np.random.default_rng(seed)
     layout = layout_name or getattr(env, "layout_name", "unknown_layout")
     rows: list[OptionReplayRow] = []
@@ -252,6 +276,9 @@ def collect_option_replay_batched(
             )
             for i in range(batch_size)
         ]
+        slot_ledgers: list[ContributionLedger] = [
+            ContributionLedger() for _ in range(batch_size)
+        ]
 
         init_seeds = np.array([
             int(rng.integers(0, 2**31 - 1)) for _ in range(batch_size)
@@ -283,6 +310,9 @@ def collect_option_replay_batched(
                     slot.option_runtime = OptionRuntime(
                         option_id=int(slot.option_id),
                         start_pos=get_agent_pos(state_i, 0),
+                    )
+                    slot.option_budget = int(
+                        option_lib.option_budget(state_i, 0, int(slot.option_id))
                     )
                     slot.state_key = _state_key(state_i)
                     slot.reward_sum = 0.0
@@ -336,7 +366,22 @@ def collect_option_replay_batched(
                     partner_option_dist=slot.partner_dists[-1] if slot.partner_dists else None,
                 )
                 _accumulate_event_summary(slot.summary, event)
-                slot.reward_sum += reward_i
+                slot_ledgers[i].update(event, ego_option_kind=str(opt.kind))
+                partner_terminal_policy_i = getattr(
+                    getattr(slot.partner, "protocol", None), "terminal_policy", None
+                )
+                slot_credit = {
+                    k: v for k, v in _credit.items() if k != "partner_terminal_policy"
+                }
+                slot.reward_sum += actor_sparse_reward(
+                    reward_i,
+                    event,
+                    ego_contributed=slot_ledgers[i].query_and_reset_on_delivery(event),
+                    partner_terminal_policy=partner_terminal_policy_i,
+                    **slot_credit,
+                )
+                if not exclude_terminal_progress_from_reward_sum:
+                    slot.reward_sum += terminal_progress_bonus(event, params=_terminal_progress)
                 slot.shaped_reward_sum += shaped_i
                 slot.duration += 1
 
@@ -346,6 +391,14 @@ def collect_option_replay_batched(
                 )
                 if done_i and not terminated:
                     reason = "env_max_steps"
+                    terminated = True
+                # Dynamic-budget cap: match the sequential path's `while duration < _budget`.
+                if (
+                    not terminated
+                    and int(slot.option_budget) > 0
+                    and slot.duration >= int(slot.option_budget)
+                ):
+                    reason = "budget_exhausted"
                     terminated = True
 
                 if terminated:
@@ -388,6 +441,7 @@ def collect_option_replay_batched(
                     completed_episode_ids.add(int(slot.episode_id))
                     if next_episode_idx < episodes:
                         _assign_episode(slot, next_episode_idx)
+                        slot_ledgers[i].reset()
                         next_episode_idx += 1
                         new_seed = int(rng.integers(0, 2**31 - 1))
                         reset_indices.append(i)
@@ -734,8 +788,18 @@ def _rollout_option(
     option_id: int,
     rng: np.random.Generator,
     cost_per_step: float,
+    credit_params: dict[str, Any] | None = None,
+    terminal_progress: dict[str, Any] | None = None,
+    exclude_terminal_progress_from_reward_sum: bool = False,
+    *,
+    contribution_ledger: ContributionLedger | None = None,
 ) -> tuple[OptionReplayRow, bool]:
+    _credit = credit_params or {}
+    _terminal_progress = terminal_progress or terminal_progress_params(None)
     opt = option_lib.options[option_id]
+    partner_terminal_policy = getattr(
+        getattr(partner, "protocol", None), "terminal_policy", None
+    )
     start_state = env.state
     runtime = OptionRuntime(option_id=int(option_id), start_pos=get_agent_pos(start_state, 0))
     state_key = _state_key(start_state)
@@ -748,6 +812,7 @@ def _rollout_option(
     partner_options: list[int] = []
     partner_confidences: list[float] = []
     summary = _empty_event_summary()
+    ledger = contribution_ledger if contribution_ledger is not None else ContributionLedger()
 
     _budget = option_lib.option_budget(env.state, 0, option_id)
     while duration < _budget:
@@ -764,7 +829,17 @@ def _rollout_option(
         partner_confidences.append(float(partner_action.option_confidence))
         _accumulate_event_summary(summary, event)
 
-        reward_sum += float(step.rewards.get("agent_0", 0.0))
+        ledger.update(event, ego_option_kind=str(opt.kind))
+        credit = {k: v for k, v in _credit.items() if k != "partner_terminal_policy"}
+        reward_sum += actor_sparse_reward(
+            float(step.rewards.get("agent_0", 0.0)),
+            event,
+            ego_contributed=ledger.query_and_reset_on_delivery(event),
+            partner_terminal_policy=partner_terminal_policy,
+            **credit,
+        )
+        if not exclude_terminal_progress_from_reward_sum:
+            reward_sum += terminal_progress_bonus(event, params=_terminal_progress)
         shaped_reward_sum += _shaped_reward_for_agent(step.info, "agent_0")
         duration += 1
         done = bool(step.dones.get("__all__", False))
@@ -782,6 +857,11 @@ def _rollout_option(
         obs = step.obs
         if done or terminated:
             break
+
+    # Diagnostic label fix (mirrors train_aris._execute_option): a dynamic-budget
+    # exhaustion should not record "running" as the option's terminal reason.
+    if not done and termination_reason == "running":
+        termination_reason = "budget_exhausted"
 
     partner_dist = _average_partner_dist(partner_dists)
     partner_option = _partner_option_from_trace(partner_dist, partner_options)
@@ -851,6 +931,7 @@ def _empty_event_summary() -> dict[str, Any]:
         "partner_delivery_event": 0,
         "ego_correct_delivery": 0,
         "partner_correct_delivery": 0,
+        "ego_sole_correct_delivery": 0,
         "ego_wrong_delivery_event": 0,
         "partner_wrong_delivery_event": 0,
         "pot_changed": 0,
@@ -879,6 +960,7 @@ def _accumulate_event_summary(summary: dict[str, Any], event: OCV2Event) -> None
         "partner_delivery_event",
         "ego_correct_delivery",
         "partner_correct_delivery",
+        "ego_sole_correct_delivery",
         "ego_wrong_delivery_event",
         "partner_wrong_delivery_event",
         "pot_changed",
@@ -1004,6 +1086,9 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         shaped_reward_coef = float(tcfg["shaped_reward_coef"])
         cost_per_step = float(tcfg["cost_per_step"])
         reward_scale_source = "config.training"
+        credit_params = sparse_credit_params(tcfg)
+        terminal_progress_cfg = terminal_progress_params(tcfg)
+        partner_set = str(tcfg.get("partner_set", "standard7"))
     else:
         if (
             args.cost_coef is None
@@ -1019,7 +1104,11 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         shaped_reward_coef = float(args.shaped_reward_coef)
         cost_per_step = float(args.cost_per_step)
         reward_scale_source = "cli_explicit"
-    partners = make_training_partners(option_lib)
+        # CLI smoke path has no config; legacy team credit (no silent ego switch).
+        credit_params = sparse_credit_params(None)
+        terminal_progress_cfg = terminal_progress_params(None)
+        partner_set = "standard7"
+    partners = make_training_partners(option_lib, partner_set=partner_set)
     collect_fn = collect_option_replay_batched if args.batch_size > 1 else collect_option_replay
     collect_kwargs = dict(
         layout_name=args.layout,
@@ -1031,6 +1120,8 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         cost_per_step=cost_per_step,
         cost_coef=cost_coef,
         shaped_reward_coef=shaped_reward_coef,
+        credit_params=credit_params,
+        terminal_progress=terminal_progress_cfg,
     )
     if args.batch_size > 1:
         collect_kwargs["batch_size"] = args.batch_size
@@ -1045,9 +1136,22 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         "cost_coef": cost_coef,
         "cost_per_step": cost_per_step,
         "shaped_reward_coef": shaped_reward_coef,
+        "sparse_credit": credit_params["mode"],
+        "partner_set": partner_set,
+        "contribution_credit": {
+            "contrib_scale": float(
+                (tcfg.get("contrib_team") or {}).get("contrib_scale", 1.0)
+            ) if args.config else 1.0,
+        },
         "reward_scale_source": reward_scale_source,
         "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
+        "terminal_progress_shaping": terminal_progress_cfg,
     }
+    if credit_params["mode"] == "ego_correct_delivery":
+        reward_config["ego_delivery_reward"] = float(credit_params["ego_delivery_reward"])
+        reward_config["ego_wrong_delivery_penalty"] = float(
+            credit_params["ego_wrong_delivery_penalty"]
+        )
     save_replay_npz(
         args.output,
         rows,
@@ -1073,6 +1177,7 @@ def _cmd_collect(args: argparse.Namespace) -> None:
                                 "cost_coef": cost_coef,
                                 "cost_per_step": cost_per_step,
                                 "shaped_reward_coef": shaped_reward_coef,
+                                "terminal_progress_shaping": terminal_progress_cfg,
                             },
                         }
                     )

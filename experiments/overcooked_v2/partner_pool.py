@@ -19,6 +19,15 @@ from .state_utils import (
 
 GridPos = tuple[int, int]
 
+TERMINAL_KINDS = frozenset({"pick_plate", "plate_soup", "serve_soup"})
+PREP_KINDS = frozenset({"fetch_ingredient", "deliver_ingredient_to_pot"})
+SUPPORT_KINDS = frozenset({
+    "drop_item_to_counter",
+    "clear_interaction_cell",
+    "wait_at_bottleneck",
+    "cross_bottleneck",
+})
+
 
 class PartnerPolicy(Protocol):
     name: str
@@ -35,11 +44,13 @@ class ProtocolSpec:
     pot_preference: str | None = None
     delivery_preference: str | None = None
     serving_style: str | None = None
+    terminal_policy: str | None = None
     button_policy: str | None = None
     counter_preference: str | None = None
+    curriculum_group: str | None = None
 
 
-TRAINING_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
+STANDARD7_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
     (
         "ingredient-near",
         ProtocolSpec(role="ingredient_person", pot_preference="near"),
@@ -64,7 +75,98 @@ TRAINING_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
         "flexible-balanced",
         ProtocolSpec(role="flexible", bottleneck_policy="alternate"),
     ),
+    (
+        "terminal-yield",
+        ProtocolSpec(
+            role="prep_partner",
+            pot_preference="near",
+            bottleneck_policy="yield",
+            terminal_policy="yield",
+        ),
+    ),
 )
+
+TRAINING_PROTOCOLS = STANDARD7_PROTOCOLS  # backward-compat alias
+
+ROLE_CONDITIONED_V1_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
+    (
+        "ingredient-near-yield",
+        ProtocolSpec(
+            role="ingredient_person",
+            pot_preference="near",
+            terminal_policy="yield",
+            curriculum_group="terminal_yield",
+        ),
+    ),
+    (
+        "ingredient-far-yield",
+        ProtocolSpec(
+            role="ingredient_person",
+            pot_preference="far",
+            terminal_policy="yield",
+            curriculum_group="terminal_yield",
+        ),
+    ),
+    (
+        "server-left-claim",
+        ProtocolSpec(
+            role="server",
+            delivery_preference="left",
+            terminal_policy="claim",
+            curriculum_group="terminal_claim",
+        ),
+    ),
+    (
+        "server-right-claim",
+        ProtocolSpec(
+            role="server",
+            delivery_preference="right",
+            terminal_policy="claim",
+            curriculum_group="terminal_claim",
+        ),
+    ),
+    (
+        "bottleneck-yield-terminal-yield",
+        ProtocolSpec(
+            role="flexible",
+            bottleneck_policy="yield",
+            terminal_policy="yield",
+            curriculum_group="terminal_yield",
+        ),
+    ),
+    (
+        "bottleneck-push-terminal-claim",
+        ProtocolSpec(
+            role="flexible",
+            bottleneck_policy="push",
+            terminal_policy="claim",
+            curriculum_group="terminal_claim",
+        ),
+    ),
+    (
+        "heldout-yield-terminal-claim",
+        ProtocolSpec(
+            role="flexible",
+            bottleneck_policy="yield",
+            terminal_policy="claim",
+            curriculum_group="terminal_claim",
+        ),
+    ),
+    (
+        "heldout-push-terminal-yield",
+        ProtocolSpec(
+            role="flexible",
+            bottleneck_policy="push",
+            terminal_policy="yield",
+            curriculum_group="terminal_yield",
+        ),
+    ),
+)
+
+PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec], ...]] = {
+    "standard7": STANDARD7_PROTOCOLS,
+    "role_conditioned_v1": ROLE_CONDITIONED_V1_PROTOCOLS,
+}
 
 
 @dataclass
@@ -139,6 +241,20 @@ class ScriptedProtocolPartner:
             )
         elif self.protocol.role == "server":
             score += _role_bonus(opt.kind == "serve_soup")
+        elif self.protocol.role == "prep_partner":
+            # Train-only curriculum partner: create ego-owned terminal-stage data
+            # distribution without adding a fallback controller or supervised loss.
+            score += _role_bonus(
+                opt.kind in {
+                    "fetch_ingredient",
+                    "deliver_ingredient_to_pot",
+                    "drop_item_to_counter",
+                    "clear_interaction_cell",
+                    "wait_at_bottleneck",
+                }
+            )
+
+        score += _terminal_policy_bonus(opt, self.protocol.terminal_policy)
 
         if opt.kind == "deliver_ingredient_to_pot":
             score += _positional_preference_bonus(
@@ -224,7 +340,17 @@ class ScriptedProtocolPartner:
             )
 
 
-def make_training_partners(option_library: Any) -> list[ScriptedProtocolPartner]:
+def make_training_partners(
+    option_library: Any,
+    partner_set: str = "standard7",
+) -> list[ScriptedProtocolPartner]:
+    try:
+        protocols = PARTNER_REGISTRIES[str(partner_set)]
+    except KeyError as exc:
+        choices = ", ".join(sorted(PARTNER_REGISTRIES))
+        raise ValueError(
+            f"unknown partner_set {partner_set!r}; expected one of {choices}"
+        ) from exc
     return [
         ScriptedProtocolPartner(
             name=name,
@@ -232,7 +358,7 @@ def make_training_partners(option_library: Any) -> list[ScriptedProtocolPartner]
             protocol=protocol,
             partner_id=partner_id,
         )
-        for partner_id, (name, protocol) in enumerate(TRAINING_PROTOCOLS)
+        for partner_id, (name, protocol) in enumerate(protocols)
     ]
 
 
@@ -294,7 +420,8 @@ def _task_progress_score(opt: OptionSpec, state: Any) -> float:
 
 
 def _role_bonus(condition: bool) -> float:
-    return 4.0 if condition else -1.0
+    """Lexicographic role-identity tier (magnitude 10^3)."""
+    return 4000.0 if condition else -1000.0
 
 
 def _positional_preference_bonus(
@@ -334,6 +461,25 @@ def _bottleneck_bonus(
             return 1.5
         if not prefer_cross and opt.kind == "wait_at_bottleneck":
             return 1.5
+    return 0.0
+
+
+def _terminal_policy_bonus(opt: OptionSpec, policy: str | None) -> float:
+    """Lexicographic role-identity tier (magnitude 10^3 - 10^4)."""
+    if policy == "yield":
+        if opt.kind in TERMINAL_KINDS:
+            return -30000.0
+        if opt.kind in PREP_KINDS or opt.kind in SUPPORT_KINDS:
+            return 5000.0
+        return 0.0
+    if policy == "claim":
+        if opt.kind in TERMINAL_KINDS:
+            return 8000.0
+        if opt.kind in PREP_KINDS:
+            return 1000.0
+        if opt.kind == "wait_at_bottleneck":
+            return -2000.0
+        return 0.0
     return 0.0
 
 
