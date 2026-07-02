@@ -189,39 +189,3 @@ def make_behavior_option_inferencer(
         classifier_checkpoint=cfg.get("classifier_checkpoint"),
         allow_heuristic=bool(cfg.get("allow_heuristic", True)),
     )
-
-
-
-def build_behavior_option_inferencer(
-    option_library: Any,
-    config: dict[str, Any] | None = None,
-) -> PartnerOptionInferencer | None:
-    """Construct the main-path partner-option evidence source.
-
-    P1: this inferencer may consume primitive partner actions, state deltas, and
-    event booleans only. It must not consume partner name/id/protocol/role or
-    terminal_policy. The heuristic path is enabled by default so de-oracling does
-    not silently make the method untestable.
-    """
-    cfg = ((config or {}).get("partner_option_inference") or {})
-    if not bool(cfg.get("enabled", True)):
-        return None
-    return PartnerOptionInferencer(
-        option_library,
-        temperature=float(cfg.get("temperature", 1.0)),
-        classifier_checkpoint=cfg.get("classifier_checkpoint"),
-        allow_heuristic=bool(cfg.get("allow_heuristic", True)),
-    )
-
-
-def attach_behavior_option_inferencer(
-    partner: Any,
-    option_library: Any,
-    state: Any,
-    config: dict[str, Any] | None = None,
-) -> PartnerOptionInferencer | None:
-    inferencer = build_behavior_option_inferencer(option_library, config)
-    if inferencer is not None:
-        inferencer.reset(state)
-    setattr(partner, "_behavior_option_inferencer", inferencer)
-    return inferencer

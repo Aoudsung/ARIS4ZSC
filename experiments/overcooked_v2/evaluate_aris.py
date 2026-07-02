@@ -56,7 +56,6 @@ from experiments.overcooked_v2.train_aris import (
     _graph_objective_metadata_status,
     _graph_tensors,
     _initialise_persistent_belief,
-    _new_partner_option_inferencer,
     _obs_vector,
     _partner_id_tensor,
     _q_forward_kwargs,
