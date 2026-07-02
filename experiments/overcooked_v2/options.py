@@ -428,7 +428,7 @@ class OCV2OptionLibrary:
                 and is_pot_ready_for_plate(
                     state,
                     opt.target_pos,
-                    require_correct_recipe=True,
+                    require_correct_recipe=False,
                 )
             )
         if opt.kind == "serve_soup":

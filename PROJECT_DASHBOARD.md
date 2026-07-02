@@ -128,3 +128,22 @@ find these. Decide: move, or symlink, or pin the path in `.aris/config.json`.
 - Agent coordination / Codex scope → [AGENTS.md](AGENTS.md)
 - Remote contract → [CUSTOMER.md](CUSTOMER.md)
 - Project posture (machine-readable) → [`.aris/config.json`](.aris/config.json)
+
+---
+
+## 8. Root-Cause Repair Status — 2026-07-02
+
+Claim status: **static-repaired / remote-pending / science-not-adjudicated**. Historical OvercookedV2 results remain diagnostic only under `FINDINGS_LEDGER` P1/P2/P3/P4/P5/S17/S20/NEW-2/NEW-3/NEW-4. The core claim is not validated or refuted. The next permissible formal result must be generated under the repaired protocol and reviewed against `FIDELITY_GATE.md` I10-I18.
+
+| Claim / artifact | current status | blocking / dependency IDs | allowed interpretation |
+|---|---|---|---|
+| Core ZSC ARIS-vs-baseline claim | testable only after remote gates | P1, P3, P4, P5, S17, S20, NEW-2 | no scientific conclusion yet |
+| Historical headline OvercookedV2 results | QUARANTINED | P1/P2/P3/P4/P5, NEW-3, NEW-4 | diagnostic only; neither validation nor refutation |
+| Oracle-free factor evidence | static repair complete, remote pending | P1, NEW-G3, I10 | clean-test candidate after diff review |
+| Accumulated belief / failure traces | static repair complete, ablation pending | P4, S1-S3, I11 | mechanism claim pending ablation |
+| CE support graph claims | static repair complete, CE probe pending | P3, S8-S11, D4-D5, I12 | support-relative only until CE probe |
+| Black-box main-method objective | static repair complete, objective gate pending | P5, I13 | no role/terminal-policy main-claim evidence |
+| Formal eval / checkpoint path | static repair complete, gated rerun pending | S17, S20, NEW-2, I14-I18 | may be used for preregistered rerun after diff review |
+| `role_conditioned_v2_candidate` | BENCHMARK-CANDIDATE | P2, W1-W7, D1-D5 | inspect/certify only; not approved benchmark |
+
+Dashboard rule: no result may move a claim from pending to supported/refuted until the relevant ledger IDs above are either closed by remote verification or explicitly waived by Type-B human decision with reason.

@@ -163,9 +163,37 @@ ROLE_CONDITIONED_V1_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
     ),
 )
 
+ROLE_CONDITIONED_V2_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
+    *ROLE_CONDITIONED_V1_PROTOCOLS[:6],
+    (
+        "heldout-handoff-alternate-yield",
+        ProtocolSpec(
+            role="flexible",
+            pot_preference="far",
+            bottleneck_policy="alternate",
+            terminal_policy="yield",
+            counter_preference="handoff",
+            curriculum_group="heldout_terminal_yield",
+        ),
+    ),
+    (
+        "heldout-resource-server-claim",
+        ProtocolSpec(
+            role="ingredient_person",
+            pot_preference="far",
+            delivery_preference="right",
+            bottleneck_policy="push",
+            terminal_policy="claim",
+            counter_preference="clear",
+            curriculum_group="heldout_terminal_claim",
+        ),
+    ),
+)
+
 PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec], ...]] = {
     "standard7": STANDARD7_PROTOCOLS,
     "role_conditioned_v1": ROLE_CONDITIONED_V1_PROTOCOLS,
+    "role_conditioned_v2": ROLE_CONDITIONED_V2_PROTOCOLS,
 }
 
 
@@ -180,6 +208,7 @@ class ScriptedProtocolPartner:
     last_primitive_action: int | None = None
     option_runtime: OptionRuntime | None = None
     elapsed: int = 0
+    bottleneck_alternate_phase: int = 0
 
     def reset(self, seed: int) -> None:
         self.current_option = None
@@ -187,6 +216,9 @@ class ScriptedProtocolPartner:
         self.last_primitive_action = None
         self.option_runtime = None
         self.elapsed = 0
+        self.bottleneck_alternate_phase = 0
+        if hasattr(self, "_behavior_option_inferencer"):
+            setattr(self, "_behavior_option_inferencer", None)
 
     def act(self, obs_partner: Any, state: Any, rng: np.random.Generator) -> PartnerAction:
         del obs_partner
@@ -205,12 +237,15 @@ class ScriptedProtocolPartner:
         self.last_state = state
         self.last_primitive_action = int(primitive)
         self.elapsed += 1
+        # P1: scripted true option labels are diagnostic truth and must not enter
+        # the main train/eval/CE evidence path. The shared executor infers partner
+        # options from primitive action and state deltas instead.
         return PartnerAction(
             primitive_action=int(primitive),
-            option_id=int(self.current_option),
-            option_confidence=1.0,
-            option_dist=_one_hot(self.current_option, self.option_library.num_options),
-            source="scripted",
+            option_id=None,
+            option_confidence=0.0,
+            option_dist=None,
+            source="scripted_primitive_only",
         )
 
     def _choose_option(
@@ -221,14 +256,21 @@ class ScriptedProtocolPartner:
     ) -> int:
         valid_ids = np.flatnonzero(valid)
         if valid_ids.size == 0:
-            return 0
+            return _noop_option_id(self.option_library)
 
         scores = np.asarray(
             [self._protocol_score(self.option_library.options[idx], state) for idx in valid_ids],
             dtype=float,
         )
         best = np.flatnonzero(scores == np.max(scores))
-        return int(rng.choice(valid_ids[best]))
+        choice = int(rng.choice(valid_ids[best]))
+        chosen_kind = str(self.option_library.options[choice].kind)
+        if self.protocol.bottleneck_policy == "alternate" and chosen_kind in {
+            "cross_bottleneck",
+            "wait_at_bottleneck",
+        }:
+            self.bottleneck_alternate_phase = 1 - int(self.bottleneck_alternate_phase)
+        return choice
 
     def _protocol_score(self, opt: OptionSpec, state: Any) -> float:
         score = _task_progress_score(opt, state)
@@ -282,7 +324,13 @@ class ScriptedProtocolPartner:
         ):
             score += 100.0
         if opt.kind in {"cross_bottleneck", "wait_at_bottleneck"}:
-            score += _bottleneck_bonus(opt, self.protocol.bottleneck_policy, self.elapsed)
+            score += _bottleneck_bonus(
+                opt,
+                self.protocol.bottleneck_policy,
+                self.elapsed,
+                self.bottleneck_alternate_phase,
+            )
+        score += _counter_preference_bonus(opt, self.protocol.counter_preference)
         if opt.kind == "serve_soup":
             score += _positional_preference_bonus(
                 opt.target_pos,
@@ -362,10 +410,13 @@ def make_training_partners(
     ]
 
 
-def _one_hot(option_id: int, num_options: int) -> np.ndarray:
-    dist = np.zeros((num_options,), dtype=np.float32)
-    dist[int(option_id)] = 1.0
-    return dist
+
+def _noop_option_id(option_library: Any) -> int:
+    for opt in option_library.options:
+        if str(opt.kind) == "noop":
+            return int(opt.id)
+    return 0
+
 
 
 def _fetch_has_current_pot_sink(option_library: Any, opt: OptionSpec, state: Any) -> bool:
@@ -450,17 +501,35 @@ def _bottleneck_bonus(
     opt: OptionSpec,
     policy: str | None,
     elapsed: int,
+    alternate_phase: int = 0,
 ) -> float:
     if policy == "yield":
-        return 3.0 if opt.kind == "wait_at_bottleneck" else -1.0
+        # W3: bottleneck policy must be behaviorally visible within the support/
+        # terminal tier, but still below the lexicographic role/terminal tier.
+        return 1500.0 if opt.kind == "wait_at_bottleneck" else -500.0
     if policy == "push":
-        return 3.0 if opt.kind == "cross_bottleneck" else -1.0
+        return 1500.0 if opt.kind == "cross_bottleneck" else -500.0
     if policy == "alternate":
-        prefer_cross = elapsed % 2 == 0
+        # W4: alternate must alternate across option choices, not within-option
+        # elapsed ticks that reset whenever a new option is selected.
+        del elapsed
+        prefer_cross = int(alternate_phase) % 2 == 0
         if prefer_cross and opt.kind == "cross_bottleneck":
-            return 1.5
+            return 1500.0
         if not prefer_cross and opt.kind == "wait_at_bottleneck":
-            return 1.5
+            return 1500.0
+        if opt.kind in {"cross_bottleneck", "wait_at_bottleneck"}:
+            return -500.0
+    return 0.0
+
+
+def _counter_preference_bonus(opt: OptionSpec, preference: str | None) -> float:
+    if preference == "handoff" and opt.kind in {"handoff_counter", "drop_item_to_counter"}:
+        return 3.0
+    if preference == "clear" and opt.kind == "clear_interaction_cell":
+        return 3.0
+    if preference == "drop" and opt.kind == "drop_item_to_counter":
+        return 3.0
     return 0.0
 
 
@@ -500,7 +569,14 @@ def _congestion_penalty(opt: OptionSpec, state: Any) -> float:
         return 0.0
     ego_pos = get_agent_pos(state, 0)
     partner_pos = get_agent_pos(state, 1)
-    return 1.0 if _manhattan(ego_pos, opt.target_pos) <= 1 and partner_pos != ego_pos else 0.0
+    target = opt.target_pos
+    # W5: penalize true target/corridor contention, not the nearly-always-true
+    # condition that the partner is simply not on the ego's cell.
+    if partner_pos == target:
+        return 1.0
+    if _manhattan(ego_pos, target) <= 1 and _manhattan(partner_pos, target) <= 1:
+        return 0.5
+    return 0.0
 
 
 def _region_cells(opt: OptionSpec) -> tuple[GridPos, ...]:

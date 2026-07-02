@@ -112,8 +112,16 @@ def run_episode(env, option_lib, partner, seed, max_options, patience, spd, poli
             pa = partner.act(obs.get("agent_1"), env.state, rng)
             prev = env.state
             step = env.step(ego_a, pa.primitive_action)
-            event = extract_event(prev, ego_a, pa.primitive_action, step.state, step.info,
-                                  pa.option_id, pa.option_dist)
+            event = extract_event(
+                prev,
+                ego_a,
+                pa.primitive_action,
+                step.state,
+                step.info,
+                partner_option=None,
+                partner_option_dist=None,
+                partner_option_source="diagnostic_behavior_only",
+            )
             obs = step.obs
             done = bool(step.dones.get("__all__", False))
             if getattr(event, "delivery_event", False):

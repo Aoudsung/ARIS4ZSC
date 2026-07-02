@@ -105,6 +105,8 @@ class FactorLocalBeliefModel(nn.Module):
         evidence_seq: torch.Tensor,
         factor_features: torch.Tensor | None = None,
         factor_mask: torch.Tensor | None = None,
+        evidence_lengths: torch.Tensor | None = None,
+        evidence_mask: torch.Tensor | None = None,
         initial_hidden: torch.Tensor | None = None,
         return_sequence: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -117,11 +119,34 @@ class FactorLocalBeliefModel(nn.Module):
 
         hidden_after_steps = []
         for timestep in range(max_time):
+            active_mask = None
+            if evidence_mask is not None:
+                mask = evidence_mask.to(evidence_seq.device)
+                if mask.dim() != 3:
+                    raise ValueError("evidence_mask must have shape [B, F, T].")
+                active_mask = mask[:, :, timestep]
+            elif evidence_lengths is not None:
+                lengths = evidence_lengths.to(evidence_seq.device)
+                if lengths.dim() == 1:
+                    active_mask = (timestep < lengths)[:, None].expand(-1, num_factors)
+                elif lengths.dim() == 2:
+                    active_mask = timestep < lengths
+                else:
+                    raise ValueError(
+                        "evidence_lengths must have shape [B] or [B, F]."
+                    )
+            elif evidence_seq.shape[-1] > 0:
+                # P4/S2: OvercookedV2 reserves the final evidence channel as an
+                # explicit presence bit. Zero-padded history rows no longer update
+                # recurrent belief state. Non-OCV2 callers without that bit should
+                # pass evidence_mask or evidence_lengths.
+                active_mask = evidence_seq[:, :, timestep, -1] > 0
             hidden = self.step_history(
                 evidence_seq[:, :, timestep],
                 hidden,
                 factor_features=factor_features,
                 factor_mask=factor_mask,
+                active_mask=active_mask,
             )
             if return_sequence:
                 hidden_after_steps.append(hidden)
@@ -159,12 +184,32 @@ class FactorLocalBeliefModel(nn.Module):
         factor_features: torch.Tensor | None,
         factor_mask: torch.Tensor,
         mode_mask: torch.Tensor,
+        evidence_lengths: torch.Tensor | None = None,
+        evidence_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden = self.encode_history(
             evidence_seq,
             factor_features=factor_features,
             factor_mask=factor_mask,
+            evidence_lengths=evidence_lengths,
+            evidence_mask=evidence_mask,
         )
+        return self.belief_from_hidden(
+            hidden,
+            factor_features=factor_features,
+            factor_mask=factor_mask,
+            mode_mask=mode_mask,
+        )
+
+    def belief_from_hidden(
+        self,
+        hidden: torch.Tensor,
+        *,
+        factor_features: torch.Tensor | None,
+        factor_mask: torch.Tensor,
+        mode_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode a persistent factor hidden state into local mode beliefs (P4)."""
         logits = self.logits_from_hidden(hidden, factor_features=factor_features)
         return masked_softmax(logits[:, :, : mode_mask.shape[-1]], mode_mask, factor_mask)
 

@@ -51,6 +51,16 @@ training:
   learning_rate: 0.0003
   hidden_dim: 64
   obs_encoder: auto
+  partner_set: standard7
+  train_partners:
+  - ingredient-near
+  - ingredient-far
+  - dish-server
+  - server-left
+  - bottleneck-yield
+  - flexible-balanced
+  - terminal-yield
+  oracle_role_conditioned_ablation: false
   num_partners: 6
   evidence_window: 4
   target_update_interval: 50

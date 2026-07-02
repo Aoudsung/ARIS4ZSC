@@ -101,8 +101,9 @@ def main() -> None:
                         pa.primitive_action,
                         step_result.state,
                         step_result.info,
-                        partner_option=pa.option_id,
-                        partner_option_dist=pa.option_dist,
+                        partner_option=None,
+                        partner_option_dist=None,
+                        partner_option_source="diagnostic_behavior_only",
                     )
                     state = step_result.state
                     obs = step_result.obs

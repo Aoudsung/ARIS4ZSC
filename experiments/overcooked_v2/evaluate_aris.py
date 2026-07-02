@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -28,13 +28,16 @@ from experiments.overcooked_v2.diagnostics import (
     reference_gap_closure,
 )
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
-from experiments.overcooked_v2.event_extractor import extract_event
 from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import infer_obs_dim
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.option_executor import option_primitive_step
+from experiments.overcooked_v2.option_inferencer import (
+    PartnerOptionInferencer,
+    make_behavior_option_inferencer,
+)
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.provenance import runtime_provenance
@@ -45,15 +48,19 @@ from experiments.overcooked_v2.state_utils import (
 )
 from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
 from experiments.overcooked_v2.train_aris import (
+    _advance_persistent_belief,
     _build_belief_model,
     _build_env,
     _build_option_lib,
     _build_q_network,
     _graph_objective_metadata_status,
     _graph_tensors,
+    _initialise_persistent_belief,
+    _new_partner_option_inferencer,
     _obs_vector,
     _partner_id_tensor,
     _q_forward_kwargs,
+    _select_train_partners,
     _state_repr,
     _tensor,
     _training_reward,
@@ -117,10 +124,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             ctx.config,
             layout_graph=ctx.layout_graph,
             option_lib=ctx.option_lib,
-            partners=make_training_partners(
-                ctx.option_lib,
-                partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
-            ),
+            partners=_select_train_partners(ctx.option_lib, ctx.config),
         )
         for ctx in contexts
     }
@@ -148,37 +152,11 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 collect_diagnostics=not fast,
                 allow_diag_skip=allow_diag_skip,
             )
-            partner_protocol = None
-            try:
-                partners_map = {p.name: p for p in make_training_partners(
-                    ctx.option_lib,
-                    partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
-                )}
-                p_obj = partners_map.get(partner_name)
-                proto_obj = getattr(p_obj, "protocol", None) if p_obj is not None else None
-                if proto_obj is not None:
-                    partner_protocol = {
-                        "role": getattr(proto_obj, "role", None),
-                        "bottleneck_policy": getattr(proto_obj, "bottleneck_policy", None),
-                        "terminal_policy": getattr(proto_obj, "terminal_policy", None),
-                        "curriculum_group": getattr(proto_obj, "curriculum_group", None),
-                    }
-            except Exception:
-                partner_protocol = None
-            aggregate["partner_protocol"] = partner_protocol
-
-            terminal_policy = (partner_protocol or {}).get("terminal_policy")
-            ego_deliv = int(aggregate.get("ego_correct_delivery_count", 0) or 0)
-            prt_deliv = int(aggregate.get("partner_correct_delivery_count", 0) or 0)
-            total_deliv = int(aggregate.get("correct_delivery_count", ego_deliv + prt_deliv) or 0)
-            if terminal_policy == "yield":
-                role_match = ego_deliv
-            elif terminal_policy == "claim":
-                role_match = prt_deliv
-            else:
-                role_match = total_deliv
-            aggregate["role_match_delivery_count"] = int(role_match)
-            aggregate["role_match_rate"] = float(role_match / max(1, int(args.episodes)))
+            # P5: formal evaluation metadata must not inspect true partner
+            # terminal_policy/role/protocol and derive role-match returns. Partner
+            # names select the requested evaluation partner only; they are not routed
+            # into decision evidence or return conditioning.
+            aggregate["partner_protocol"] = "not_recorded_on_formal_main_path"
             q_proxy_factor_mask = [] if fast else _factor_deletion_q_proxy_diagnostics(ctx)
             result = {
                 "method": "random_policy" if random_policy_only else ctx.method,
@@ -385,8 +363,13 @@ def _run_episode(
     )
     evidence_buffer.reset()
     router.reset()
-    obs, _ = env.reset(seed)
+    obs, state0 = env.reset(seed)
     partner.reset(seed)
+    partner_option_inferencer = make_behavior_option_inferencer(ctx.option_lib, ctx.config)
+    partner_option_inferencer.reset(state0)
+    _initialise_persistent_belief(
+        evidence_buffer, ctx.method, ctx.belief_model, graph, torch.device("cpu")
+    )
     contribution_ledger = ContributionLedger.from_config(
         ctx.config.get("training", {})
     )
@@ -396,6 +379,9 @@ def _run_episode(
     option_count = 0
     blocking_events = 0
     delivery_seen = False
+    ego_completion_seen = False
+    partner_delivery_seen = False
+    wrong_delivery_seen = False
     delta_values: list[float] = []
     mi_values: list[float] = []
     diagnostic_cost_values: list[float] = []
@@ -437,6 +423,7 @@ def _run_episode(
             allow_diag_skip,
             rng,
             contribution_ledger=contribution_ledger,
+            partner_option_inferencer=partner_option_inferencer,
         )
         episode_return += option_return
         option_count += 1
@@ -444,6 +431,15 @@ def _run_episode(
         blocking_events += int(info["blocking_events"])
         delivery_seen = bool(delivery_seen or info["delivery_seen"])
         _merge_counts(delivery_counts, info["delivery_counts"])
+        ego_completion_seen = bool(
+            ego_completion_seen or int(info["delivery_counts"].get("ego_sole_correct_delivery", 0)) > 0
+        )
+        partner_delivery_seen = bool(
+            partner_delivery_seen or int(info["delivery_counts"].get("partner_delivery_event", 0)) > 0
+        )
+        wrong_delivery_seen = bool(
+            wrong_delivery_seen or int(info["delivery_counts"].get("wrong_delivery_event", 0)) > 0
+        )
         _merge_counts(diagnostic_status_counts, info["diagnostic_status_counts"])
         delta_values.extend(info["delta_info"])
         mi_values.extend(info["mi"])
@@ -459,7 +455,14 @@ def _run_episode(
 
     return {
         "return": float(episode_return),
-        "completed": bool(delivery_seen),
+        # S20: headline completion is ego-owned success; team delivery is separate.
+        "completed": bool(ego_completion_seen),
+        "team_completed": bool(delivery_seen),
+        "partner_delivery_episode": bool(partner_delivery_seen),
+        "wrong_delivery_episode": bool(wrong_delivery_seen),
+        "ego_correct_completed": bool(ego_completion_seen),
+        "partner_correct_completed": bool(delivery_counts.get("partner_correct_delivery", 0) > 0),
+        "wrong_delivery_completed": bool(wrong_delivery_seen),
         "delivery_counts": delivery_counts,
         "primitive_steps": int(primitive_steps),
         "option_count": int(option_count),
@@ -501,11 +504,9 @@ def _execute_eval_option(
     rng: np.random.Generator,
     *,
     contribution_ledger: ContributionLedger | None = None,
+    partner_option_inferencer: PartnerOptionInferencer | None = None,
 ) -> tuple[float, bool, dict[str, np.ndarray], dict[str, Any]]:
     opt = ctx.option_lib.options[int(option_id)]
-    partner_terminal_policy = getattr(
-        getattr(partner, "protocol", None), "terminal_policy", None
-    )
     runtime = OptionRuntime(
         option_id=int(option_id),
         start_pos=get_agent_pos(env.state, 0),
@@ -548,7 +549,15 @@ def _execute_eval_option(
 
     _budget = ctx.option_lib.option_budget(env.state, 0, int(option_id))
     while duration < _budget:
-        _ostep = option_primitive_step(env, ctx.option_lib, int(option_id), partner, obs, rng)
+        _ostep = option_primitive_step(
+            env,
+            ctx.option_lib,
+            int(option_id),
+            partner,
+            obs,
+            rng,
+            partner_option_inferencer=partner_option_inferencer,
+        )
         ego_action = _ostep.ego_action
         partner_action = _ostep.partner_action
         prev_state = _ostep.prev_state
@@ -565,7 +574,6 @@ def _execute_eval_option(
             "agent_0",
             event,
             ego_contributed=ego_contributed,
-            partner_terminal_policy=partner_terminal_policy,
         )
         realized_cost += float(ctx.config["training"].get("cost_per_step", 1.0))
         duration += 1
@@ -576,6 +584,14 @@ def _execute_eval_option(
             ego_option_max_steps=opt.max_steps,
         )
         evidence_buffer.append(x_f)
+        _advance_persistent_belief(
+            evidence_buffer,
+            ctx.method,
+            ctx.belief_model,
+            graph,
+            torch.device("cpu"),
+            x_f,
+        )
         blocking_events += int(bool(event.collision_or_block))
         if getattr(ctx, "trace_steps", None) is not None and (
             ctx.trace_kind is None or opt.kind == ctx.trace_kind
@@ -635,17 +651,21 @@ def _execute_eval_option(
 
     # Push option-level FAILURE signal to evidence when the option did not succeed
     # (mirrors train_aris). Belief must see failure events at inference too.
-    _failed = termination_reason in {"budget_exhausted", "env_max_steps", "option_invalid", "blocked_no_progress"}
-    if _failed and 'event' in locals():
-        evidence_buffer.append(
-            router.route(
-                event,
-                ego_option_id=int(option_id),
-                ego_option_elapsed=duration,
-                ego_option_max_steps=opt.max_steps,
-                ego_option_terminated_failed=True,
-                failed_option_id=int(option_id),
-            )
+    _failed = termination_reason in {"budget_exhausted", "max_steps", "env_max_steps", "blocked_no_progress"}
+    if _failed and duration > 0:
+        x_fail = router.route_failure_boundary(
+            ego_option_id=int(option_id),
+            ego_option_elapsed=duration,
+            ego_option_max_steps=opt.max_steps,
+        )
+        evidence_buffer.append(x_fail)
+        _advance_persistent_belief(
+            evidence_buffer,
+            ctx.method,
+            ctx.belief_model,
+            graph,
+            torch.device("cpu"),
+            x_fail,
         )
 
     if collect_diagnostics:
@@ -701,6 +721,19 @@ _DIAG_SKIP = {
     },
 }
 
+_DIAG_UNSUPPORTED = {
+    "status": "unsupported_method",
+    "delta_info": float("nan"),
+    "mi": float("nan"),
+    "diagnostic_cost": float("nan"),
+    "belief_swap": {"status": "unsupported_method"},
+    "belief_influence": {
+        "belief_zero_delta": 0.0,
+        "belief_uniform_delta": 0.0,
+        "relevance_zero_delta": 0.0,
+    },
+}
+
 
 def _option_diagnostics(
     ctx: EvalContext,
@@ -712,6 +745,9 @@ def _option_diagnostics(
     *,
     allow_diag_skip: bool = False,
 ) -> dict[str, Any]:
+    method = getattr(ctx, "method", "aris_bellman")
+    if method not in {"aris_bellman", "flat_factor"}:
+        return dict(_DIAG_UNSUPPORTED)
     graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
     mode_mask = graph_batch["mode_mask"]
     if belief_before.shape != mode_mask.shape:
@@ -815,8 +851,22 @@ def _current_belief(
 ) -> torch.Tensor:
     graph_batch = _graph_tensors(graph, 1, torch.device("cpu"))
     evidence = _tensor(evidence_buffer.snapshot()[None, ...], torch.device("cpu"))
+    evidence_mask = torch.as_tensor(
+        evidence_buffer.snapshot_mask()[None, ...], dtype=torch.bool, device=torch.device("cpu")
+    )
+    evidence_lengths = torch.as_tensor([evidence_buffer.length()], dtype=torch.float32)
+    hidden_np = evidence_buffer.belief_hidden_snapshot()
+    belief_hidden = _tensor(hidden_np[None, ...], torch.device("cpu")) if hidden_np is not None else None
     with torch.no_grad():
-        return _state_repr(ctx.method, ctx.belief_model, evidence, graph_batch)
+        return _state_repr(
+            ctx.method,
+            ctx.belief_model,
+            evidence,
+            graph_batch,
+            evidence_lengths=evidence_lengths,
+            evidence_mask=evidence_mask,
+            belief_hidden=belief_hidden,
+        )
 
 
 def _select_option(
@@ -1184,12 +1234,20 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "mean_return": _mean_or_nan(returns),
         "return_std": float(np.std(returns)) if returns else float("nan"),
         "completion_rate": _mean_or_nan([float(row["completed"]) for row in episodes]),
+        "headline_success_metric": "ego_correct_completion_rate",
+        "ego_correct_completion_rate": _mean_or_nan([float(row.get("ego_correct_completed", False)) for row in episodes]),
+        "team_completion_rate": _mean_or_nan([float(row.get("team_completed", False)) for row in episodes]),
+        "partner_correct_completion_rate": _mean_or_nan([float(row.get("partner_correct_completed", False)) for row in episodes]),
+        "wrong_delivery_rate": _mean_or_nan([float(row.get("wrong_delivery_completed", False)) for row in episodes]),
+        "partner_delivery_episode_rate": _mean_or_nan([float(row.get("partner_delivery_episode", False)) for row in episodes]),
+        "wrong_delivery_episode_rate": _mean_or_nan([float(row.get("wrong_delivery_episode", False)) for row in episodes]),
         "delivery_counts": delivery_counts,
         "ego_delivery_count": int(delivery_counts["ego_delivery_event"]),
         "partner_delivery_count": int(delivery_counts["partner_delivery_event"]),
         "correct_delivery_count": int(delivery_counts["correct_delivery"]),
         "wrong_delivery_count": int(delivery_counts["wrong_delivery_event"]),
         "ego_correct_delivery_count": int(delivery_counts["ego_correct_delivery"]),
+        "ego_sole_correct_delivery_count": int(delivery_counts.get("ego_sole_correct_delivery", 0)),
         "partner_correct_delivery_count": int(delivery_counts["partner_correct_delivery"]),
         "ego_wrong_delivery_count": int(delivery_counts["ego_wrong_delivery_event"]),
         "partner_wrong_delivery_count": int(delivery_counts["partner_wrong_delivery_event"]),
@@ -1301,8 +1359,16 @@ def _summary(
         summary["mean_within_run_relative_return"] = _mean_or_nan(within_run)
     if raw_within_run:
         summary["mean_within_run_relative_return_raw"] = _mean_or_nan(raw_within_run)
-    summary["mean_role_match_rate"] = _mean_or_zero([
-        float(r["aggregate"].get("role_match_rate", 0.0)) for r in results
+    summary["mean_role_match_rate"] = None
+    summary["role_match_status"] = "removed_from_formal_main_path_p5"
+    summary["mean_ego_correct_completion_rate"] = _mean_or_zero([
+        float(r["aggregate"].get("ego_correct_completion_rate", 0.0)) for r in results
+    ])
+    summary["mean_partner_correct_completion_rate"] = _mean_or_zero([
+        float(r["aggregate"].get("partner_correct_completion_rate", 0.0)) for r in results
+    ])
+    summary["mean_wrong_delivery_rate"] = _mean_or_zero([
+        float(r["aggregate"].get("wrong_delivery_rate", 0.0)) for r in results
     ])
     summary["mean_ego_delivery_count"] = _mean_or_zero([
         float(r["aggregate"].get("ego_correct_delivery_count", 0.0)) for r in results
@@ -1462,6 +1528,7 @@ def _empty_delivery_counts() -> dict[str, int]:
         "correct_delivery": 0,
         "wrong_delivery_event": 0,
         "ego_correct_delivery": 0,
+        "ego_sole_correct_delivery": 0,
         "partner_correct_delivery": 0,
         "ego_wrong_delivery_event": 0,
         "partner_wrong_delivery_event": 0,
@@ -1503,18 +1570,29 @@ def _validate_eval_integrity(
     collect_diagnostics: bool,
     allow_diag_skip: bool,
 ) -> None:
-    if allow_diag_skip:
-        return
     if int(aggregate.get("forced_noop_count", 0)) > 0:
         raise RuntimeError(
             "Formal eval encountered no-valid-option forced noop events: "
-            f"{aggregate['forced_noop_count']}. Pass --allow_diag_skip only for smoke runs."
+            f"{aggregate['forced_noop_count']}. This hard integrity check is not "
+            "bypassed by --allow_diag_skip."
         )
     evidence = aggregate.get("partner_option_evidence", {})
+    if str(evidence.get("evidence_policy")) != "behavior_inferred_v1":
+        raise RuntimeError(f"Formal eval has wrong partner-option evidence policy: {evidence!r}")
+    if int(evidence.get("observed_dist_count", 0)) > 0:
+        raise RuntimeError(
+            "Formal eval observed non-behavior partner-option distributions: "
+            f"{evidence['observed_dist_count']} events."
+        )
     if int(evidence.get("missing_count", 0)) > 0:
         raise RuntimeError(
             "Formal eval observed missing partner-option evidence: "
             f"{evidence['missing_count']} events."
+        )
+    if int(evidence.get("oracle_source_count", 0)) > 0:
+        raise RuntimeError(
+            "Formal eval observed oracle partner-option evidence source: "
+            f"{evidence['oracle_source_count']} events."
         )
     if collect_diagnostics:
         bad = {
@@ -1524,9 +1602,9 @@ def _validate_eval_integrity(
                 ("mi", aggregate.get("mi", {})),
                 ("diagnostic_cost", aggregate.get("diagnostic_cost", {})),
             )
-            if isinstance(value, dict) and value.get("status") != "ok"
+            if isinstance(value, dict) and value.get("status") not in {"ok", "unsupported_method"}
         }
-        if bad:
+        if bad and not allow_diag_skip:
             raise RuntimeError(
                 "Formal eval diagnostics produced no valid values: "
                 f"{json.dumps(_jsonable(bad), sort_keys=True)}. "
@@ -1546,10 +1624,7 @@ def _eval_provenance(ctx: EvalContext) -> dict[str, Any]:
         config=ctx.config,
         layout_graph=ctx.layout_graph,
         option_lib=ctx.option_lib,
-        partners=make_training_partners(
-            ctx.option_lib,
-            partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
-        ),
+        partners=_select_train_partners(ctx.option_lib, ctx.config),
         ce_path=ctx.config.get("graph", {}).get("ce_path"),
         replay_path=ctx.config.get("graph", {}).get("replay_path"),
         graph_path=ctx.config.get("graph", {}).get("graph_path"),

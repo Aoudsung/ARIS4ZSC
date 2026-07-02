@@ -18,9 +18,11 @@ from experiments.overcooked_v2.ce_sampler import (
     load_replay_npz,
 )
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
+from experiments.overcooked_v2.event_extractor import sparse_credit_params
 from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
+from experiments.overcooked_v2.reward_design import terminal_progress_params
 
 
 def preflight_layout(
@@ -172,7 +174,7 @@ def _ce_matrix_and_replay(
         replay_rows, _ = load_replay_npz(replay_path)
 
     if ce_matrix is None:
-        partners = make_training_partners(option_lib)
+        partners = _partners_for_config(option_lib, config, context="preflight CE fallback")
         episodes = int(_cfg(config, "graph.ce_episodes", 100))
         max_options_per_episode = int(_cfg(config, "graph.ce_max_options_per_episode", 20))
         replay_rows = collect_option_replay(
@@ -188,6 +190,11 @@ def _ce_matrix_and_replay(
             cost_per_step=float(_cfg(config, "training.cost_per_step", 1.0)),
             cost_coef=cost_coef,
             shaped_reward_coef=shaped_reward_coef,
+            credit_params=sparse_credit_params(config.get("training")),
+            terminal_progress=terminal_progress_params(config.get("training")),
+            exclude_terminal_progress_from_reward_sum=bool(
+                _cfg(config, "graph.sparse_ce_support", False)
+            ),
         )
         ce_matrix = estimate_empirical_ce(
             replay_rows,
@@ -217,7 +224,7 @@ def _partner_return_proxy_stats(
             shaped_reward_coef=shaped_reward_coef,
         )
 
-    partners = make_training_partners(option_lib)
+    partners = _partners_for_config(option_lib, config, context="preflight partner-return fallback")
     episodes = int(_cfg(config, "diagnostics.proxy_episodes", 100))
     max_options_per_episode = int(_cfg(config, "graph.ce_max_options_per_episode", 20))
     return estimate_reference_base_gap_proxy(
@@ -234,6 +241,46 @@ def _partner_return_proxy_stats(
         shaped_reward_coef=shaped_reward_coef,
     )
 
+
+
+def _partners_for_config(
+    option_lib: OCV2OptionLibrary,
+    config: dict[str, Any],
+    *,
+    context: str,
+) -> list[Any]:
+    """Resolve the partner subset used by preflight fallback paths.
+
+    S12/S23: fallback CE/proxy collection must not silently switch back to the
+    default partner library, default team-credit semantics, or all-partner split.
+    Formal split claims require ``training.train_partners``; all-partner fallback
+    is allowed only when explicitly marked as no-split smoke/diagnostic work.
+    """
+    train_cfg = config.get("training", {}) or {}
+    partner_set = str(train_cfg.get("partner_set", "standard7"))
+    partners_all = make_training_partners(option_lib, partner_set=partner_set)
+    names = train_cfg.get("train_partners")
+    if names:
+        by_name = {partner.name: partner for partner in partners_all}
+        missing = sorted(set(names) - set(by_name))
+        if missing:
+            raise ValueError(f"{context}: unknown train_partners {missing}; available={sorted(by_name)}")
+        seen: set[str] = set()
+        out = []
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(str(name))
+            out.append(by_name[str(name)])
+        return out
+    is_lightweight_fixture = not isinstance(option_lib, OCV2OptionLibrary)
+    if not bool(train_cfg.get("allow_all_partners_for_no_split", False)) and not is_lightweight_fixture:
+        raise ValueError(
+            f"{context}: formal split claims require training.train_partners. "
+            "Set training.allow_all_partners_for_no_split=true only for explicitly "
+            "labeled no-split smoke/diagnostic use."
+        )
+    return partners_all
 
 def _partner_return_stats(
     rows: list[OptionReplayRow],

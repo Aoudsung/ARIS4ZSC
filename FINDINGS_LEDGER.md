@@ -198,3 +198,25 @@
 
 处置指向：修订要求见本次会话交付（步1–5+NEW-2 逐项验收判据）；先落基线提交再修
 （2478 行未提交 diff 违反增量可归因纪律）。
+
+---
+
+## 修复执行记录（2026-07-02，当前分支 baseline 之后）
+
+Source commit boundary: `wip: pre-fix baseline` 之后的独立修复 diff。状态 `STATIC-PATCHED`
+表示源码/文档已修订并可进入静态/远程非实验验证；不表示训练、eval、CE 生成、远程实验或科学
+Type-B 裁决已经完成。
+
+| ID | 当前处置 | 静态修复状态 | 验收边界 |
+|---|---|---|---|
+| P1 | must-fix | STATIC-PATCHED | `option_executor.py` 在 `extract_event` 前剥离 scripted `option_id/option_dist/confidence`；train/eval/CE 使用 behavior-inferred partner-option 语义。 |
+| P4/S2 | must-fix | STATIC-PATCHED | `EvidenceBuffer` 持久化 factor-belief hidden state；replay 存 masks/lengths；belief encoder 使用 mask，零填充不再当证据。 |
+| P3/S9/S10/S11 | must-fix | STATIC-PATCHED | CE 估计输出 `weight_sum/estimable_mask/skipped_mask/measured_zero_mask` sidecar；`min_weight/gamma/horizon` 来自 config/metadata；unsupported zero 不再可解释为无外部性。 |
+| P5 | must-fix | STATIC-PATCHED | 主方法 reward/exploration/replay/eval/checkpoint path 不消费 true `terminal_policy`；`role_contrib_team`、role exploration、role replay、terminal replay seed、`ego_terminal_penalty_under_claim` 只允许显式 oracle ablation/curriculum baseline。 |
+| S17 | must-fix | STATIC-PATCHED | `allow_diag_skip` 不再跳过 forced-noop、evidence policy、oracle-source、missing-evidence 等 hard integrity checks。 |
+| S20 | must-fix | STATIC-PATCHED | completion 拆分 ego/team/partner/wrong，headline 使用 ego-owned correct completion。 |
+| NEW-2 | must-fix | STATIC-PATCHED | `checkpoint.pt/checkpoint_best.pt` 发布前先检查 ego-owned delivery eligibility；guard 不再只是事后标 fail。 |
+| NEW-4 | governance | QUARANTINED | CODEX_IMPL_SPEC v1-v4 与其远程数字仅 diagnostic-only；不得进入支持/反驳主张证据链。 |
+
+剩余边界：P2/W/D 伙伴基底治理仍待 Type-B 人类裁决；`role_conditioned_v2_candidate`
+最多是 benchmark-v2 candidate，须先有 partner-differentiation certificate 后才可用于正式主张。

@@ -23,6 +23,9 @@ HARD CONSTRAINTS
 5. Every conclusion must cite FINDINGS_LEDGER / CODEX_OUTPUT IDs. Register missing issues as NEW-x.
 6. Proposal language may be narrowed or clarified, but wording changes must not replace required
    implementation fixes.
+7. NEW-4 isolation is mandatory: CODEX_IMPL_SPEC v1-v4 method-layer changes and all remote
+   numbers cited there are diagnostic-only because they predate the root-cause repair, were not
+   preregistered, used unresolved role-v1 governance, and ran through P1/P5-contaminated paths.
 
 PRIMARY OBJECTIVE
 Move the current state from "core claim has never been cleanly tested" to "core claim can now be
@@ -70,6 +73,9 @@ IMPLEMENTATION ORDER
 5. Fix P5: remove true terminal_policy conditioning from the main method
    - Main-method training reward, exploration, seeded replay, and eval return must not branch on true
      partner_terminal_policy.
+   - The expanded P5 surface also includes `role_contrib_team`, role exploration, replay seeding,
+     `ego_terminal_penalty_under_claim`, and any option-selection call that passes or branches on
+     `partner_terminal_policy`.
    - Role-conditioned curriculum may remain only as a separate ablation or curriculum-only baseline, not as main-method evidence.
    - Proposal must state that the main method learns behavior-inferable factors, not a policy shaped by artificial terminal-role labels.
 
@@ -105,6 +111,7 @@ Static acceptance must show:
   - Metrics distinguish ego/partner/correct/wrong delivery.
   - Checkpoint selection cannot publish a free-riding checkpoint.
   - Proposal claims match implementation state and do not present unrun experiments as results.
+  - NEW-4 material remains diagnostic-only and is not used as validation/refutation evidence.
   - Every fix handoff/commit references FINDINGS_LEDGER IDs.
 
 DELIVERABLES

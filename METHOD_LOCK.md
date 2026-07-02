@@ -397,3 +397,29 @@ To test ARIS's ZSC claim requires either:
 [ ] robustness (>=4/5 seeds; seed1 collapsed) + 2nd layout + 50-100 ep
 [ ] diagnostics mechanism evidence
 ```
+
+---
+
+## sec17. Root-cause repair implementation lock entry (2026-07-02, static-only)
+
+Status: **implementation repaired statically; remote verification and scientific adjudication pending**.
+
+This entry is append-only. It does not rewrite or erase earlier contaminated conclusions. It records the repair boundary accepted for the next clean test pass.
+
+1. P1 / NEW-G3 are repaired in the main path: scripted partners no longer emit true `option_id`, `option_dist`, or confidence into decision evidence. Train/eval/CE share a behavior-inferred partner-option semantic. Any true scripted label, if reintroduced later, must be diagnostic-only and must not enter factor evidence.
+2. P4 / S1 / S2 / S3 are repaired in the main ARIS/flat path: belief hidden state persists across option decisions, replay stores evidence masks/lengths, zero padding is masked, and option failure evidence uses a boundary annotation rather than duplicating the last primitive event.
+3. P3 / S8 / S9 / S10 / S11 / D4 are repaired in the estimator path: CE artifacts carry support sidecars with `weight_sum`, `estimable_mask`, `skipped_mask`, and `measured_zero_mask`; gamma/horizon/min_weight/support objective are metadata; unsupported CE cells are not interpretable as zero externality.
+4. P5 is repaired in the main method path: true partner terminal policy is not consumed by reward, exploration, seeded replay, or eval-return conditioning. Role/terminal-conditioned curricula may exist only as explicitly marked oracle-ablation or benchmark-v2 diagnostic paths.
+5. S17 / S20 / NEW-2 are repaired in eval/checkpoint infrastructure: `allow_diag_skip` cannot bypass formal hard integrity checks, headline completion is ego-owned correct delivery, and a free-riding checkpoint cannot be published as deployable `checkpoint.pt` before ego-delivery eligibility passes.
+6. P2 / W / D substrate issues remain under human governance. `role_conditioned_v1` is not locked as a standard benchmark by this repair. `role_conditioned_v2_candidate` is at most a candidate benchmark-v2 substrate pending a partner-differentiation certificate and Type-B human approval.
+7. Historical results remain artifact-suspect. The repaired code makes the core claim eligible for clean testing; it does not validate or refute ARIS-Bellman. NEW-4 is explicitly quarantined here: CODEX_IMPL_SPEC v1-v4 method-layer iterations and the remote numbers cited there were produced before this repair, without preregistration, under unresolved role-v1 governance and contaminated P1/P5 paths. They are diagnostic-only and cannot support or refute any main claim.
+
+Forbidden post-lock interpretations:
+- Do not cite pre-repair results as validation/refutation of the core ZSC claim.
+- Do not cite CODEX_IMPL_SPEC v1-v4 remote numbers, ego/prt flips, RMR comparisons, or role-v1 reruns as anything stronger than diagnostic-only NEW-4 material.
+- Do not say P1 mathematically forced ARIS/flat parity; the correct interpretation is oracle-evidence contamination of the black-box inference claim.
+- Do not infer “no externality” from CE=0 without `estimable_mask=true`, `skipped_mask=false`, and sufficient support.
+- Do not treat role/terminal-policy-conditioned curriculum as the main black-box method.
+- Do not treat team delivery or partner delivery as ego-owned success.
+
+Next valid claim transition requires: remote gated verification of I10-I18, the registered four-arm de-oracled rerun, CE support probe, belief-persistence ablation, partner-differentiation certificate if benchmark-v2 is used, and Type-B human decision.

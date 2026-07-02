@@ -79,6 +79,8 @@ EVIDENCE_INDEX = {
     "partner_support_option": 52,
     "partner_bottleneck_wait": 53,
     "partner_bottleneck_cross": 54,
+    # P4/S2: explicit presence bit lets belief models mask zero-padded history rows.
+    "evidence_present": 63,
 }
 
 
@@ -111,7 +113,11 @@ class OCV2EvidenceRouter:
         self._partner_option_evidence_counts = {
             "observed_dist_count": 0,
             "inferred_option_count": 0,
+            "heuristic_count": 0,
+            "classifier_count": 0,
             "missing_count": 0,
+            "boundary_annotation_count": 0,
+            "oracle_source_count": 0,
             "total_count": 0,
         }
         self._validate_factor_refs()
@@ -124,9 +130,12 @@ class OCV2EvidenceRouter:
         total = max(1, int(counts["total_count"]))
         return {
             **counts,
+            "evidence_policy": "behavior_inferred_v1",
+            "oracle_stripped": True,
             "observed_dist_rate": float(counts["observed_dist_count"] / total),
             "inferred_option_rate": float(counts["inferred_option_count"] / total),
             "missing_rate": float(counts["missing_count"] / total),
+            "oracle_source_rate": float(counts["oracle_source_count"] / total),
         }
 
     def route(
@@ -139,6 +148,7 @@ class OCV2EvidenceRouter:
         failed_option_id: int | None = None,
     ) -> np.ndarray:
         routed = np.zeros((self.graph.num_factors, D_EVID), dtype=np.float32)
+        self._current_event = event
         current_partner_option = _as_optional_int(getattr(event, "partner_option", None))
         self._record_partner_option_evidence(
             getattr(event, "partner_option_dist", None),
@@ -152,6 +162,7 @@ class OCV2EvidenceRouter:
         for factor_idx, factor in enumerate(self.graph.factors):
             if factor_idx < self._factor_active.size and not bool(self._factor_active[factor_idx]):
                 continue
+            routed[factor_idx, EVIDENCE_INDEX["evidence_present"]] = 1.0
             entity_ids, region_ids = self._route_entities_regions(factor_idx, factor)
             entity_cells = self._entity_cells(entity_ids)
             region = self._region_cells(region_ids)
@@ -259,16 +270,95 @@ class OCV2EvidenceRouter:
             self._previous_partner_option = current_partner_option
         return routed
 
+    def route_failure_boundary(
+        self,
+        *,
+        ego_option_id: int,
+        ego_option_elapsed: int | None = None,
+        ego_option_max_steps: int | None = None,
+    ) -> np.ndarray:
+        """Route a boundary-only option failure signal.
+
+        P4/S3: do not duplicate the last full primitive event on failure. This
+        emits only the factor-local failure channel and elapsed fraction for the
+        failed ego option.
+        """
+        routed = np.zeros((self.graph.num_factors, D_EVID), dtype=np.float32)
+        failed_option_id = int(ego_option_id)
+        options_seq = self.graph.options
+        failed_kind = (
+            str(options_seq[failed_option_id].kind)
+            if 0 <= failed_option_id < len(options_seq)
+            else None
+        )
+        for factor_idx, factor in enumerate(self.graph.factors):
+            if factor_idx < self._factor_active.size and not bool(self._factor_active[factor_idx]):
+                continue
+            touches_failed = (
+                int(factor.option_i) == failed_option_id
+                or int(factor.option_j) == failed_option_id
+            )
+            if not touches_failed:
+                continue
+            routed[factor_idx, EVIDENCE_INDEX["evidence_present"]] = 1.0
+            routed[factor_idx, EVIDENCE_INDEX["ego_option_is_i"]] = float(
+                failed_option_id == int(factor.option_i)
+            )
+            routed[factor_idx, EVIDENCE_INDEX["ego_option_is_j"]] = float(
+                failed_option_id == int(factor.option_j)
+            )
+            routed[factor_idx, EVIDENCE_INDEX["ego_option_elapsed_fraction"]] = _elapsed_fraction(
+                ego_option_elapsed,
+                ego_option_max_steps,
+            )
+            routed[factor_idx, EVIDENCE_INDEX["ego_option_terminated_failed"]] = 1.0
+            if failed_kind in TERMINAL_KINDS:
+                routed[factor_idx, EVIDENCE_INDEX["ego_terminal_option"]] = 1.0
+        return routed
+
     def _record_partner_option_evidence(
         self,
         partner_option_dist: Any,
         current_partner_option: int | None,
     ) -> None:
         self._partner_option_evidence_counts["total_count"] += 1
-        if partner_option_dist is not None:
-            self._partner_option_evidence_counts["observed_dist_count"] += 1
-        elif current_partner_option is not None:
-            self._partner_option_evidence_counts["inferred_option_count"] += 1
+        source_raw = str(
+            getattr(getattr(self, "_current_event", None), "partner_option_source", "none")
+        )
+        source = source_raw.lower()
+        if source == "boundary_failure_annotation":
+            self._partner_option_evidence_counts["boundary_annotation_count"] += 1
+            return
+        oracle_like = (
+            "oracle" in source
+            or "scripted" in source
+            or "terminal_policy" in source
+            or "protocol" in source
+            or "partner_action" in source
+        )
+        has_option_evidence = partner_option_dist is not None or current_partner_option is not None
+        if oracle_like:
+            self._partner_option_evidence_counts["oracle_source_count"] += 1
+            if partner_option_dist is not None:
+                self._partner_option_evidence_counts["observed_dist_count"] += 1
+            return
+        if has_option_evidence:
+            behavior_like = (
+                "classifier" in source
+                or "inferred" in source
+                or "heuristic" in source
+                or source.startswith("behavior_")
+            )
+            if behavior_like:
+                self._partner_option_evidence_counts["inferred_option_count"] += 1
+                if "classifier" in source:
+                    self._partner_option_evidence_counts["classifier_count"] += 1
+                else:
+                    self._partner_option_evidence_counts["heuristic_count"] += 1
+            else:
+                self._partner_option_evidence_counts["observed_dist_count"] += int(
+                    partner_option_dist is not None
+                )
         else:
             self._partner_option_evidence_counts["missing_count"] += 1
 

@@ -160,6 +160,9 @@ class PartnerAction:
 class OptionTransition:
     obs_feat_t: np.ndarray
     evidence_t: np.ndarray
+    evidence_mask_t: np.ndarray | None
+    evidence_len_t: int
+    belief_hidden_t: np.ndarray | None
     option_id: int
     reward_sum: float
     expected_cost: float
@@ -167,11 +170,13 @@ class OptionTransition:
     duration: int
     obs_feat_next: np.ndarray
     evidence_next: np.ndarray
+    evidence_mask_next: np.ndarray | None
+    evidence_len_next: int
+    belief_hidden_next: np.ndarray | None
     done: bool
     termination_reason: str
     graph_id: str | None = None
     partner_id: int | None = None
-    event_summary: dict[str, Any] | None = None
     event_summary: dict[str, Any] | None = None
 
 

@@ -5,7 +5,7 @@ import copy
 import hashlib
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -22,11 +22,16 @@ from experiments.overcooked_v2.event_extractor import (
     actor_sparse_reward,
     extract_event,
     sparse_credit_params,
+    with_partner_option_evidence,
 )
 from experiments.overcooked_v2.layout_parser import parse_layout
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.option_executor import option_primitive_step
+from experiments.overcooked_v2.option_inferencer import (
+    PartnerOptionInferencer,
+    make_behavior_option_inferencer,
+)
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.reward_design import (
     ContributionLedger,
@@ -68,6 +73,7 @@ class OptionReplayRow:
     event_summary: dict[str, Any]
     partner_name: str
     partner_id: int
+    partner_option_source: str = "none"
 
 
 def collect_option_replay(
@@ -103,9 +109,11 @@ def collect_option_replay(
                 print(f"    ep {episode_idx}/{episodes}, {len(rows)} rows, {_elapsed:.1f}s", flush=True)
             episode_id = partner_idx * episodes + episode_idx
             reset_seed = int(rng.integers(0, 2**31 - 1))
-            obs, _ = env.reset(reset_seed)
+            obs, state = env.reset(reset_seed)
             if hasattr(partner, "reset"):
                 partner.reset(reset_seed)
+            partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+            partner_option_inferencer.reset(state)
 
             ledger = ContributionLedger()
             t_option = 0
@@ -129,6 +137,7 @@ def collect_option_replay(
                     terminal_progress=terminal_progress,
                     exclude_terminal_progress_from_reward_sum=exclude_terminal_progress_from_reward_sum,
                     contribution_ledger=ledger,
+                    partner_option_inferencer=partner_option_inferencer,
                 )
                 rows.append(row)
                 obs = env.obs or obs
@@ -152,20 +161,26 @@ def compute_local_returns(
     cost_coef: float = 1.0,
     shaped_reward_coef: float = 0.0,
 ) -> list[OptionReplayRow]:
-    for idx, row in enumerate(option_rows):
-        ret = 0.0
-        discount = 1.0
-        for jdx in range(idx, min(idx + horizon, len(option_rows))):
-            next_row = option_rows[jdx]
-            if next_row.episode_id != row.episode_id:
-                break
-            ret += discount * (
-                next_row.reward_sum
-                + float(shaped_reward_coef) * next_row.shaped_reward_sum
-                - float(cost_coef) * next_row.realized_cost
-            )
-            discount *= gamma ** max(1, next_row.duration)
-        row.local_return_h = float(ret)
+    # S7: batched CE collection can interleave episode rows. Local h-step
+    # returns must be computed over each episode's own option sequence rather
+    # than over the global append order. Preserve the caller's row order while
+    # grouping the return calculation by episode_id/t_option.
+    rows_by_episode: dict[int, list[OptionReplayRow]] = {}
+    for row in option_rows:
+        rows_by_episode.setdefault(int(row.episode_id), []).append(row)
+    for rows in rows_by_episode.values():
+        rows.sort(key=lambda item: int(item.t_option))
+        for idx, row in enumerate(rows):
+            ret = 0.0
+            discount = 1.0
+            for next_row in rows[idx : idx + max(1, int(horizon))]:
+                ret += discount * (
+                    next_row.reward_sum
+                    + float(shaped_reward_coef) * next_row.shaped_reward_sum
+                    - float(cost_coef) * next_row.realized_cost
+                )
+                discount *= gamma ** max(1, next_row.duration)
+            row.local_return_h = float(ret)
     return option_rows
 
 
@@ -173,11 +188,14 @@ def compute_reward_to_go(
     option_rows: list[OptionReplayRow],
     gamma: float,
 ) -> list[OptionReplayRow]:
-    running_by_episode: dict[int, float] = {}
-    for row in reversed(option_rows):
-        running = running_by_episode.get(row.episode_id, 0.0)
-        row.reward_to_go = float(row.reward_sum + (gamma ** max(1, row.duration)) * running)
-        running_by_episode[row.episode_id] = row.reward_to_go
+    rows_by_episode: dict[int, list[OptionReplayRow]] = {}
+    for row in option_rows:
+        rows_by_episode.setdefault(int(row.episode_id), []).append(row)
+    for rows in rows_by_episode.values():
+        running = 0.0
+        for row in reversed(sorted(rows, key=lambda item: int(item.t_option))):
+            row.reward_to_go = float(row.reward_sum + (gamma ** max(1, row.duration)) * running)
+            running = row.reward_to_go
     return option_rows
 
 
@@ -195,6 +213,8 @@ class _EnvSlot:
     partner_dists: list[np.ndarray]
     partner_options: list[int]
     partner_confidences: list[float]
+    partner_sources: list[str]
+    partner_option_inferencer: PartnerOptionInferencer
     partner: Any
     done: bool
     needs_new_option: bool
@@ -254,6 +274,7 @@ def collect_option_replay_batched(
             slot.option_runtime = None
             slot.state_key = None
             slot.needs_new_option = True
+            slot.partner_option_inferencer = None
 
         slots = [
             _EnvSlot(
@@ -269,6 +290,8 @@ def collect_option_replay_batched(
                 partner_dists=[],
                 partner_options=[],
                 partner_confidences=[],
+                partner_sources=[],
+                partner_option_inferencer=make_behavior_option_inferencer(option_lib),
                 partner=copy.deepcopy(partner_template),
                 done=i >= initial_active,
                 needs_new_option=True,
@@ -284,9 +307,13 @@ def collect_option_replay_batched(
             int(rng.integers(0, 2**31 - 1)) for _ in range(batch_size)
         ], dtype=np.int64)
         pool.reset(init_seeds)
+        init_states = pool.snapshot()
         for i, slot in enumerate(slots):
             if not slot.done and hasattr(slot.partner, "reset"):
                 slot.partner.reset(int(init_seeds[i]))
+            if not slot.done:
+                slot.partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+                slot.partner_option_inferencer.reset(init_states[i])
 
         active_count = sum(1 for s in slots if not s.done)
         ego_actions = np.zeros(batch_size, dtype=np.int32)
@@ -304,6 +331,9 @@ def collect_option_replay_batched(
                     continue
 
                 state_i = pre_snap[i]
+                if slot.partner_option_inferencer is None:
+                    slot.partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+                    slot.partner_option_inferencer.reset(state_i)
 
                 if slot.needs_new_option:
                     slot.option_id = _sample_valid_option(option_lib, state_i, 0, rng)
@@ -311,9 +341,13 @@ def collect_option_replay_batched(
                         option_id=int(slot.option_id),
                         start_pos=get_agent_pos(state_i, 0),
                     )
-                    slot.option_budget = int(
-                        option_lib.option_budget(state_i, 0, int(slot.option_id))
-                    )
+                    budget_fn = getattr(option_lib, "option_budget", None)
+                    if callable(budget_fn):
+                        slot.option_budget = int(budget_fn(state_i, 0, int(slot.option_id)))
+                    else:
+                        slot.option_budget = int(
+                            getattr(option_lib.options[int(slot.option_id)], "max_steps", 1)
+                        )
                     slot.state_key = _state_key(state_i)
                     slot.reward_sum = 0.0
                     slot.shaped_reward_sum = 0.0
@@ -322,6 +356,7 @@ def collect_option_replay_batched(
                     slot.partner_dists = []
                     slot.partner_options = []
                     slot.partner_confidences = []
+                    slot.partner_sources = []
                     slot.needs_new_option = False
 
                 ego_actions[i] = option_lib.primitive_action(state_i, 0, slot.option_id)
@@ -329,11 +364,6 @@ def collect_option_replay_batched(
                 partner_obs_i = partner_obs[i] if partner_obs is not None else None
                 pa = slot.partner.act(partner_obs_i, state_i, rng)
                 partner_actions[i] = int(pa.primitive_action)
-                if pa.option_dist is not None:
-                    slot.partner_dists.append(np.asarray(pa.option_dist, dtype=np.float32))
-                if pa.option_id is not None:
-                    slot.partner_options.append(int(pa.option_id))
-                slot.partner_confidences.append(float(pa.option_confidence))
                 prev_states[i] = state_i
 
             _, _, rewards, dones, info = pool.step(ego_actions, partner_actions)
@@ -362,14 +392,25 @@ def collect_option_replay_batched(
                     int(partner_actions[i]),
                     state_i,
                     info_i,
-                    partner_option=slot.partner_options[-1] if slot.partner_options else None,
-                    partner_option_dist=slot.partner_dists[-1] if slot.partner_dists else None,
+                    partner_option=None,
+                    partner_option_dist=None,
+                    partner_option_source="none",
                 )
+                inferred = slot.partner_option_inferencer.update(
+                    prev_states[i],
+                    int(partner_actions[i]),
+                    state_i,
+                    event,
+                )
+                event = with_partner_option_evidence(event, inferred)
+                if getattr(event, "partner_option_dist", None) is not None:
+                    slot.partner_dists.append(np.asarray(event.partner_option_dist, dtype=np.float32))
+                if getattr(event, "partner_option", None) is not None:
+                    slot.partner_options.append(int(event.partner_option))
+                slot.partner_confidences.append(float(getattr(event, "partner_option_confidence", 0.0)))
+                slot.partner_sources.append(str(getattr(event, "partner_option_source", "none")))
                 _accumulate_event_summary(slot.summary, event)
                 slot_ledgers[i].update(event, ego_option_kind=str(opt.kind))
-                partner_terminal_policy_i = getattr(
-                    getattr(slot.partner, "protocol", None), "terminal_policy", None
-                )
                 slot_credit = {
                     k: v for k, v in _credit.items() if k != "partner_terminal_policy"
                 }
@@ -377,7 +418,6 @@ def collect_option_replay_batched(
                     reward_i,
                     event,
                     ego_contributed=slot_ledgers[i].query_and_reset_on_delivery(event),
-                    partner_terminal_policy=partner_terminal_policy_i,
                     **slot_credit,
                 )
                 if not exclude_terminal_progress_from_reward_sum:
@@ -427,9 +467,11 @@ def collect_option_replay_batched(
                         event_summary=slot.summary,
                         partner_name=str(getattr(slot.partner, "name", "partner")),
                         partner_id=int(getattr(slot.partner, "partner_id", -1)),
+                        partner_option_source=_partner_option_source_from_trace(slot.partner_sources),
                     ))
                     slot.t_option += 1
                     slot.needs_new_option = True
+                    slot.partner_option_inferencer = None
 
                 if done_i or slot.t_option >= option_limit:
                     completed_episodes += 1
@@ -457,7 +499,10 @@ def collect_option_replay_batched(
                     np.array(reset_indices, dtype=np.int32),
                     np.array(reset_seeds, dtype=np.int64),
                 )
-
+                post_reset = pool.snapshot()
+                for reset_i in reset_indices:
+                    slots[int(reset_i)].partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+                    slots[int(reset_i)].partner_option_inferencer.reset(post_reset[int(reset_i)])
         _elapsed = _time.monotonic() - _t0
         if completed_episodes != episodes or len(completed_episode_ids) != episodes:
             raise RuntimeError(
@@ -507,6 +552,31 @@ def option_kind_stats(
     return stats
 
 
+def _partner_option_source_from_trace(sources: Iterable[str]) -> str:
+    values = [str(source) for source in sources if source]
+    if not values:
+        return "none"
+    if "oracle" in values or "scripted" in values:
+        return "oracle_diagnostic_only"
+    if "classifier" in values:
+        return "classifier"
+    if "heuristic" in values:
+        return "heuristic"
+    return values[-1]
+
+
+def _ce_audit_jsonable(audit: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in audit.items():
+        if isinstance(value, np.ndarray):
+            out[key] = value.tolist()
+        elif isinstance(value, (np.floating, np.integer)):
+            out[key] = value.item()
+        else:
+            out[key] = value
+    return out
+
+
 def replay_coverage(
     rows: list[OptionReplayRow],
     options: list[Any],
@@ -523,6 +593,7 @@ def replay_coverage(
         "correct_delivery": 0,
         "wrong_delivery_event": 0,
         "ego_correct_delivery": 0,
+        "ego_sole_correct_delivery": 0,
         "partner_correct_delivery": 0,
         "ego_wrong_delivery_event": 0,
         "partner_wrong_delivery_event": 0,
@@ -551,6 +622,7 @@ def replay_coverage(
         coverage["correct_delivery"] += int(summary.get("correct_delivery", 0))
         coverage["wrong_delivery_event"] += int(summary.get("wrong_delivery_event", 0))
         coverage["ego_correct_delivery"] += int(summary.get("ego_correct_delivery", 0))
+        coverage["ego_sole_correct_delivery"] += int(summary.get("ego_sole_correct_delivery", 0))
         coverage["partner_correct_delivery"] += int(summary.get("partner_correct_delivery", 0))
         coverage["ego_wrong_delivery_event"] += int(summary.get("ego_wrong_delivery_event", 0))
         coverage["partner_wrong_delivery_event"] += int(summary.get("partner_wrong_delivery_event", 0))
@@ -563,18 +635,29 @@ def replay_coverage_gate(
     coverage: dict[str, int],
     *,
     require_full_task_coverage: bool,
+    min_actor_delivery_support: int = 1,
 ) -> dict[str, Any]:
-    required = ("plated_soup", "served_soup")
-    missing = [key for key in required if int(coverage.get(key, 0)) <= 0]
+    # P3/S8: broad team delivery is not sufficient. Formal CE coverage must
+    # expose actor-local ego support so one partner/team delivery cannot certify
+    # a cell as estimable for ego return claims.
+    required = ("plated_soup", "ego_sole_correct_delivery")
+    missing = [
+        key
+        for key in required
+        if int(coverage.get(key, 0)) < int(min_actor_delivery_support if key == "ego_sole_correct_delivery" else 1)
+    ]
     result = {
         "require_full_task_coverage": bool(require_full_task_coverage),
+        "min_actor_delivery_support": int(min_actor_delivery_support),
         "missing_required_coverage": missing,
+        "ego_sole_correct_delivery": int(coverage.get("ego_sole_correct_delivery", 0)),
+        "team_delivery_event": int(coverage.get("delivery_event", 0)),
+        "partner_delivery_event": int(coverage.get("partner_delivery_event", 0)),
         "status": "passed" if not missing else "missing_required_coverage",
     }
     if require_full_task_coverage and missing:
-        raise RuntimeError(f"CE replay lacks required task coverage: {missing}")
+        raise RuntimeError(f"CE replay lacks required actor-local task coverage: {missing}")
     return result
-
 
 def _option_kind_for_row(row: OptionReplayRow, options: list[Any]) -> str:
     if 0 <= int(row.ego_option) < len(options):
@@ -582,15 +665,27 @@ def _option_kind_for_row(row: OptionReplayRow, options: list[Any]) -> str:
     return str((row.event_summary or {}).get("option_kind", "unknown"))
 
 
-def estimate_empirical_ce(
+def estimate_empirical_ce_with_support(
     replay: list[OptionReplayRow],
     num_options: int,
     min_weight: float = 20.0,
-) -> np.ndarray:
+    *,
+    gamma: float | None = None,
+    horizon_options: int | None = None,
+    reward_objective: str | None = None,
+    support_objective: str | None = None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Estimate CE and return an audit sidecar distinguishing skipped/measured zeros.
+
+    P3/S8/S9/D4: CE=0 is ambiguous unless accompanied by support metadata.
+    ``skipped_mask[i,j]`` means the zero in ``ce[i,j]`` is a sentinel for
+    insufficient support, not evidence of no interaction.
+    """
     if not replay:
         raise ValueError("estimate_empirical_ce() requires at least one replay row.")
 
     ce = np.zeros((num_options, num_options), dtype=np.float32)
+    weight_sum = np.zeros((num_options, num_options), dtype=np.float32)
     returns = np.asarray([row.local_return_h for row in replay], dtype=np.float32)
     global_mean = float(returns.mean())
 
@@ -598,12 +693,16 @@ def estimate_empirical_ce(
     partner_w = np.zeros((len(replay), num_options), dtype=np.float32)
 
     for idx, row in enumerate(replay):
-        ego_w[idx, row.ego_option] = 1.0
+        ego_option = int(row.ego_option)
+        if 0 <= ego_option < num_options:
+            ego_w[idx, ego_option] = 1.0
         if row.partner_option_dist is not None:
             dist = np.asarray(row.partner_option_dist, dtype=np.float32)
             partner_w[idx, : min(num_options, dist.size)] = dist[:num_options]
         elif row.partner_option is not None:
-            partner_w[idx, row.partner_option] = float(row.partner_option_confidence)
+            partner_option = int(row.partner_option)
+            if 0 <= partner_option < num_options:
+                partner_w[idx, partner_option] = float(row.partner_option_confidence)
 
     ego_mean = weighted_means(returns, ego_w, default=global_mean)
     partner_mean = weighted_means(returns, partner_w, default=global_mean)
@@ -611,16 +710,60 @@ def estimate_empirical_ce(
     for ego_option in range(num_options):
         for partner_option in range(num_options):
             weight = ego_w[:, ego_option] * partner_w[:, partner_option]
-            weight_sum = float(weight.sum())
-            if weight_sum < min_weight:
+            total = float(weight.sum())
+            weight_sum[ego_option, partner_option] = total
+            if total < min_weight:
                 continue
-            joint = float((weight * returns).sum() / weight_sum)
+            joint = float((weight * returns).sum() / total)
             ce[ego_option, partner_option] = abs(
                 joint - ego_mean[ego_option] - partner_mean[partner_option] + global_mean
             )
 
-    return ce
+    estimable_mask = weight_sum >= float(min_weight)
+    skipped_mask = ~estimable_mask
+    measured_zero_mask = estimable_mask & np.isclose(ce, 0.0)
+    audit = {
+        "schema_version": "ce_support_audit_v1",
+        "min_weight": float(min_weight),
+        "gamma": None if gamma is None else float(gamma),
+        "horizon_options": None if horizon_options is None else int(horizon_options),
+        "reward_objective": reward_objective,
+        "support_objective": support_objective or "behavior_inferred_partner_option_x_ego_option",
+        "global_mean_local_return": global_mean,
+        "num_options": int(num_options),
+        "num_rows": int(len(replay)),
+        "ego_support": ego_w.sum(axis=0).astype(np.float32).tolist(),
+        "partner_support": partner_w.sum(axis=0).astype(np.float32).tolist(),
+        "num_estimable_pairs": int(np.asarray(estimable_mask).sum()),
+        "num_skipped_pairs": int(np.asarray(skipped_mask).sum()),
+        "num_measured_zero_pairs": int(np.asarray(measured_zero_mask).sum()),
+        "weight_sum": weight_sum.tolist(),
+        "estimable_mask": estimable_mask.astype(bool).tolist(),
+        "skipped_mask": skipped_mask.astype(bool).tolist(),
+        "measured_zero_mask": measured_zero_mask.astype(bool).tolist(),
+    }
+    return ce, audit
 
+
+def estimate_empirical_ce(
+    replay: list[OptionReplayRow],
+    num_options: int,
+    min_weight: float = 20.0,
+    *,
+    return_audit: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
+    ce, audit = estimate_empirical_ce_with_support(
+        replay,
+        num_options,
+        min_weight=min_weight,
+        support_objective="behavior_inferred_partner_option_x_ego_option",
+    )
+    # Backward-compatible alias for consumers that expect explicit support_weight_sum.
+    if "weight_sum" in audit and "support_weight_sum" not in audit:
+        audit["support_weight_sum"] = audit["weight_sum"]
+    if return_audit:
+        return ce, audit
+    return ce
 
 def weighted_means(
     values: np.ndarray,
@@ -793,13 +936,11 @@ def _rollout_option(
     exclude_terminal_progress_from_reward_sum: bool = False,
     *,
     contribution_ledger: ContributionLedger | None = None,
+    partner_option_inferencer: PartnerOptionInferencer | None = None,
 ) -> tuple[OptionReplayRow, bool]:
     _credit = credit_params or {}
     _terminal_progress = terminal_progress or terminal_progress_params(None)
     opt = option_lib.options[option_id]
-    partner_terminal_policy = getattr(
-        getattr(partner, "protocol", None), "terminal_policy", None
-    )
     start_state = env.state
     runtime = OptionRuntime(option_id=int(option_id), start_pos=get_agent_pos(start_state, 0))
     state_key = _state_key(start_state)
@@ -811,22 +952,32 @@ def _rollout_option(
     partner_dists: list[np.ndarray] = []
     partner_options: list[int] = []
     partner_confidences: list[float] = []
+    partner_sources: list[str] = []
     summary = _empty_event_summary()
     ledger = contribution_ledger if contribution_ledger is not None else ContributionLedger()
 
     _budget = option_lib.option_budget(env.state, 0, option_id)
     while duration < _budget:
-        _ostep = option_primitive_step(env, option_lib, option_id, partner, obs, rng)
+        _ostep = option_primitive_step(
+            env,
+            option_lib,
+            option_id,
+            partner,
+            obs,
+            rng,
+            partner_option_inferencer=partner_option_inferencer,
+        )
         ego_action = _ostep.ego_action
         partner_action = _ostep.partner_action
         prev_state = _ostep.prev_state
         step = _ostep.step
         event = _ostep.event
-        if partner_action.option_dist is not None:
-            partner_dists.append(np.asarray(partner_action.option_dist, dtype=np.float32))
-        if partner_action.option_id is not None:
-            partner_options.append(int(partner_action.option_id))
-        partner_confidences.append(float(partner_action.option_confidence))
+        if getattr(event, "partner_option_dist", None) is not None:
+            partner_dists.append(np.asarray(event.partner_option_dist, dtype=np.float32))
+        if getattr(event, "partner_option", None) is not None:
+            partner_options.append(int(event.partner_option))
+        partner_confidences.append(float(getattr(event, "partner_option_confidence", 0.0)))
+        partner_sources.append(str(getattr(event, "partner_option_source", "none")))
         _accumulate_event_summary(summary, event)
 
         ledger.update(event, ego_option_kind=str(opt.kind))
@@ -835,7 +986,6 @@ def _rollout_option(
             float(step.rewards.get("agent_0", 0.0)),
             event,
             ego_contributed=ledger.query_and_reset_on_delivery(event),
-            partner_terminal_policy=partner_terminal_policy,
             **credit,
         )
         if not exclude_terminal_progress_from_reward_sum:
@@ -889,6 +1039,7 @@ def _rollout_option(
         event_summary=summary,
         partner_name=str(getattr(partner, "name", "partner")),
         partner_id=int(getattr(partner, "partner_id", -1)),
+        partner_option_source=_partner_option_source_from_trace(partner_sources),
     )
     return row, done
 
@@ -1043,6 +1194,7 @@ def _row_from_json_dict(data: dict[str, Any]) -> OptionReplayRow:
     dist = data.get("partner_option_dist")
     data["partner_option_dist"] = None if dist is None else np.asarray(dist, dtype=np.float32)
     data.setdefault("partner_id", -1)
+    data.setdefault("partner_option_source", "legacy_missing")
     return OptionReplayRow(**data)
 
 
@@ -1078,6 +1230,8 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         raise ValueError(
             "Phase 4 CE collection supports scripted_debug/train/all partner selectors."
         )
+    cfg: dict[str, Any] | None = None
+    tcfg: dict[str, Any] | None = None
     if args.config:
         with open(args.config, encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh)
@@ -1087,6 +1241,15 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         cost_per_step = float(tcfg["cost_per_step"])
         reward_scale_source = "config.training"
         credit_params = sparse_credit_params(tcfg)
+        if (
+            credit_params["mode"] == "role_contrib_team"
+            and not bool(tcfg.get("oracle_role_conditioned_ablation", False))
+        ):
+            raise ValueError(
+                "P5: CE replay collection with sparse_credit='role_contrib_team' "
+                "is oracle role-conditioned and is allowed only for explicitly labeled "
+                "oracle ablations, not the main black-box method path."
+            )
         terminal_progress_cfg = terminal_progress_params(tcfg)
         partner_set = str(tcfg.get("partner_set", "standard7"))
     else:
@@ -1108,7 +1271,55 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         credit_params = sparse_credit_params(None)
         terminal_progress_cfg = terminal_progress_params(None)
         partner_set = "standard7"
-    partners = make_training_partners(option_lib, partner_set=partner_set)
+    all_partners = make_training_partners(option_lib, partner_set=partner_set)
+    train_names = list((tcfg or {}).get("train_partners") or [])
+    heldout_names = list((tcfg or {}).get("heldout_partners") or [])
+    allow_all = bool((tcfg or {}).get("allow_all_partners_for_no_split", False))
+
+    def _filter_by_names(names: list[str]) -> list[Any]:
+        by_name = {partner.name: partner for partner in all_partners}
+        missing = [name for name in names if name not in by_name]
+        if missing:
+            raise ValueError(
+                f"ce_sampler collect train_partners not found: {missing}; "
+                f"available={sorted(by_name)}"
+            )
+        selected = [by_name[name] for name in names]
+        if not selected:
+            raise ValueError("ce_sampler collect selected zero train partners.")
+        return selected
+
+    if args.partners == "train":
+        if not train_names:
+            raise ValueError(
+                "ce_sampler collect --partners=train requires explicit "
+                "training.train_partners in --config; silent all-partner fallback "
+                "is forbidden for split claims (S6/S23)."
+            )
+        partners = _filter_by_names(train_names)
+        partner_selector_effective = "train_partners"
+    elif args.partners == "all":
+        if heldout_names and not allow_all:
+            raise ValueError(
+                "ce_sampler collect --partners=all would include held-out partners. "
+                "Set training.allow_all_partners_for_no_split=true only for "
+                "explicit no-split diagnostic artifacts (S6/S23)."
+            )
+        partners = all_partners
+        partner_selector_effective = "all_partners_explicit"
+    else:  # scripted_debug
+        if train_names:
+            partners = _filter_by_names(train_names)
+            partner_selector_effective = "scripted_debug_train_partners"
+        elif heldout_names and not allow_all:
+            raise ValueError(
+                "ce_sampler collect --partners=scripted_debug with a split config "
+                "requires training.train_partners; silent all-partner fallback is "
+                "forbidden for split claims (S6/S23)."
+            )
+        else:
+            partners = all_partners
+            partner_selector_effective = "scripted_debug_all_partners_no_split"
     collect_fn = collect_option_replay_batched if args.batch_size > 1 else collect_option_replay
     collect_kwargs = dict(
         layout_name=args.layout,
@@ -1138,6 +1349,10 @@ def _cmd_collect(args: argparse.Namespace) -> None:
         "shaped_reward_coef": shaped_reward_coef,
         "sparse_credit": credit_params["mode"],
         "partner_set": partner_set,
+        "partner_selector_requested": str(args.partners),
+        "partner_selector_effective": partner_selector_effective,
+        "train_partners": train_names,
+        "heldout_partners": heldout_names,
         "contribution_credit": {
             "contrib_scale": float(
                 (tcfg.get("contrib_team") or {}).get("contrib_scale", 1.0)
@@ -1160,7 +1375,13 @@ def _cmd_collect(args: argparse.Namespace) -> None:
             "layout": args.layout,
             "episodes_per_partner": args.episodes,
             "num_rows": len(rows),
+            "gamma": float(args.gamma),
+            "horizon_options": int(args.horizon_options),
+            "ce_support_objective": "behavior_inferred_partner_option_x_ego_option",
+            "partner_option_evidence_policy": "behavior_inferred_v1",
             "partners": [partner.name for partner in partners],
+            "partner_selector_requested": str(args.partners),
+            "partner_selector_effective": partner_selector_effective,
             "coverage": coverage,
             "coverage_gate": coverage_gate,
             "option_kind_stats": option_kind_stats(rows, option_lib.options),
@@ -1189,13 +1410,31 @@ def _cmd_collect(args: argparse.Namespace) -> None:
 
 def _cmd_estimate(args: argparse.Namespace) -> None:
     rows, metadata = load_replay_npz(args.replay)
-    ce = estimate_empirical_ce(rows, args.num_options, min_weight=args.min_weight)
+    ce, support_audit = estimate_empirical_ce_with_support(
+        rows,
+        args.num_options,
+        min_weight=args.min_weight,
+        gamma=metadata.get("gamma"),
+        horizon_options=metadata.get("horizon_options"),
+        reward_objective=str(metadata.get("sparse_credit", "unknown")),
+        support_objective=str(
+            metadata.get(
+                "ce_support_objective",
+                "behavior_inferred_partner_option_x_ego_option",
+            )
+        ),
+    )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output, ce)
     _write_metadata_sidecar(
         args.output,
         _metadata_with_artifact_hashes(
-            {**metadata, "min_weight": args.min_weight, "num_options": args.num_options},
+            {
+                **metadata,
+                "min_weight": args.min_weight,
+                "num_options": args.num_options,
+                "ce_support_audit": support_audit,
+            },
             replay_path=args.replay,
             ce_path=args.output,
         ),
@@ -1214,6 +1453,20 @@ def _cmd_refine(args: argparse.Namespace) -> None:
         bootstrap_iterations=args.bootstrap_iterations,
         seed=args.seed,
     )
+    support_meta = metadata.get("ce_support_objective")
+    if isinstance(support_meta, dict):
+        support_objective = str(support_meta.get("support_objective", "unknown"))
+    else:
+        support_objective = str(support_meta or "behavior_inferred_partner_option_x_ego_option")
+    _, ce_support_audit = estimate_empirical_ce_with_support(
+        rows,
+        args.num_options,
+        min_weight=args.min_weight,
+        gamma=metadata.get("gamma"),
+        horizon_options=metadata.get("horizon_options"),
+        reward_objective=str(metadata.get("sparse_credit", "unknown")),
+        support_objective=support_objective,
+    )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     np.save(args.output, refined)
     _write_metadata_sidecar(
@@ -1222,6 +1475,7 @@ def _cmd_refine(args: argparse.Namespace) -> None:
             {
                 **metadata,
                 **refine_metadata,
+                "ce_support_audit": ce_support_audit,
                 "input_ce_matrix_sha256": sha256_file(args.ce),
             },
             replay_path=args.replay,

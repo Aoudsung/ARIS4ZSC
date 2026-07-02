@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from experiments.overcooked_v2.ce_sampler import (
     collect_option_replay,
-    estimate_empirical_ce,
+    estimate_empirical_ce_with_support,
     option_kind_stats,
     refine_empirical_ce,
     replay_coverage,
@@ -23,6 +24,7 @@ from experiments.overcooked_v2.ce_sampler import (
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import (
     EVENT_SEMANTICS_VERSION,
+    PARTNER_OPTION_EVIDENCE_POLICY,
     sparse_credit_params,
 )
 from experiments.overcooked_v2.graph_builder import (
@@ -50,6 +52,7 @@ def main(argv: list[str] | None = None) -> None:
     config = _load_config(args.config)
     layout = str(config["layout"])
     train_cfg = config.get("training", {})
+    graph_cfg = config.get("graph", {}) or {}
     cost_coef = float(train_cfg["cost_coef"])
     shaped_reward_coef = float(train_cfg["shaped_reward_coef"])
     cost_per_step = float(train_cfg["cost_per_step"])
@@ -57,7 +60,40 @@ def main(argv: list[str] | None = None) -> None:
     # objective. Recorded into the graph metadata so train_aris rejects a graph
     # built under a different credit objective (see _enforce_graph_objective_metadata).
     credit_params = sparse_credit_params(train_cfg)
+    if (
+        credit_params["mode"] == "role_contrib_team"
+        and not bool(train_cfg.get("oracle_role_conditioned_ablation", False))
+    ):
+        raise ValueError(
+            "P5: CE graph construction with sparse_credit='role_contrib_team' "
+            "is oracle role-conditioned and is allowed only for explicitly labeled "
+            "oracle ablations, not the main black-box method path."
+        )
     terminal_progress_cfg = terminal_progress_params(train_cfg)
+    ce_gamma = float(graph_cfg.get("ce_gamma", train_cfg.get("gamma", 0.99)))
+    ce_horizon = int(
+        graph_cfg.get(
+            "local_return_horizon_options",
+            graph_cfg.get(
+                "horizon_options",
+                train_cfg.get("local_return_horizon_options", 5),
+            ),
+        )
+    )
+    ce_min_weight = float(graph_cfg.get("ce_min_weight", 20.0))
+    ce_refine_top_k = int(graph_cfg.get("ce_refine_top_k", 32))
+    ce_max_options_per_episode = int(
+        graph_cfg.get(
+            "ce_max_options_per_episode",
+            train_cfg.get("max_options_per_episode", train_cfg.get("max_episode_options", 200)),
+        )
+    )
+    min_actor_delivery_support = int(graph_cfg.get("min_actor_delivery_support", 1))
+    support_objective = (
+        "sparse_excluding_terminal_progress"
+        if bool(args.sparse_ce_support)
+        else "training_reward_sum"
+    )
     reward_metadata = {
         "layout": layout,
         "cost_coef": cost_coef,
@@ -73,6 +109,14 @@ def main(argv: list[str] | None = None) -> None:
         "reward_scale_source": "config.training",
         "event_semantics_version": int(EVENT_SEMANTICS_VERSION),
         "terminal_progress_shaping": terminal_progress_cfg,
+        "ce_support_objective": {
+            "gamma": ce_gamma,
+            "horizon_options": ce_horizon,
+            "min_weight": ce_min_weight,
+            "min_actor_delivery_support": min_actor_delivery_support,
+            "support_objective": support_objective,
+            "sparse_ce_support": bool(args.sparse_ce_support),
+        },
     }
     # The ego_correct_delivery mode's reward magnitude depends on explicit constants;
     # record them so the objective gate rejects a graph built with different constants.
@@ -139,6 +183,12 @@ def main(argv: list[str] | None = None) -> None:
             partners.append(by_name[str(name)])
         print(f"CE collected on TRAIN partners only (held-out excluded): {[p.name for p in partners]}")
     else:
+        if not bool(train_cfg.get("allow_all_partners_for_no_split", False)):
+            raise ValueError(
+                "S23/P3: CE graph construction for formal split claims requires "
+                "training.train_partners. Set training.allow_all_partners_for_no_split=true "
+                "only for explicitly labeled no-split smoke runs."
+            )
         partners = partners_all
 
     print(f"Options: {lib.num_options}")
@@ -153,10 +203,10 @@ def main(argv: list[str] | None = None) -> None:
         lib,
         layout_name=layout,
         episodes=ep_per_partner,
-        max_options_per_episode=200,
+        max_options_per_episode=ce_max_options_per_episode,
         seed=int(args.seed),
-        gamma=0.99,
-        horizon_options=5,
+        gamma=ce_gamma,
+        horizon_options=ce_horizon,
         cost_per_step=cost_per_step,
         cost_coef=cost_coef,
         shaped_reward_coef=shaped_reward_coef,
@@ -174,7 +224,11 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  {key}: {value} [{marker}]")
 
     try:
-        gate = replay_coverage_gate(coverage, require_full_task_coverage=True)
+        gate = replay_coverage_gate(
+            coverage,
+            require_full_task_coverage=True,
+            min_actor_delivery_support=min_actor_delivery_support,
+        )
         print(f"Coverage gate: {gate['status']}")
     except RuntimeError as exc:
         print(f"Coverage gate FAILED: {exc}")
@@ -189,6 +243,11 @@ def main(argv: list[str] | None = None) -> None:
         "coverage": coverage,
         "coverage_gate": gate,
         "option_kind_stats": option_kind_stats(rows, lib.options),
+        "gamma": ce_gamma,
+        "horizon_options": ce_horizon,
+        "ce_min_weight": ce_min_weight,
+        "ce_max_options_per_episode": ce_max_options_per_episode,
+        "partner_option_evidence_policy": PARTNER_OPTION_EVIDENCE_POLICY,
     }
     save_replay_npz(replay_path, rows, replay_metadata)
     replay_sha256 = sha256_file(replay_path)
@@ -207,7 +266,15 @@ def main(argv: list[str] | None = None) -> None:
         )
 
     print("\n=== Phase 3: CE Estimate ===")
-    ce = estimate_empirical_ce(rows, lib.num_options, min_weight=20.0)
+    ce, ce_support_audit = estimate_empirical_ce_with_support(
+        rows,
+        lib.num_options,
+        min_weight=ce_min_weight,
+        gamma=ce_gamma,
+        horizon_options=ce_horizon,
+        reward_objective=str(credit_params["mode"]),
+        support_objective=support_objective,
+    )
     ce_path = output_dir / "ce_matrix.npy"
     np.save(ce_path, ce)
     ce_sha256 = sha256_file(ce_path)
@@ -221,16 +288,28 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"  CE({i}:{oi}, {j}:{oj}) = {ce[i, j]:.4f}")
 
     # Refine
-    refined, refine_meta = refine_empirical_ce(ce, rows, lib.num_options, top_k=32, min_weight=20.0)
+    refined, refine_meta = refine_empirical_ce(
+        ce, rows, lib.num_options, top_k=ce_refine_top_k, min_weight=ce_min_weight
+    )
     refined_path = output_dir / "ce_refined.npy"
     np.save(refined_path, refined)
     refined_sha256 = sha256_file(refined_path)
+    support_sidecar_path = output_dir / "ce_support_audit.json"
+    support_sidecar_path.write_text(
+        json.dumps(ce_support_audit, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    support_sidecar_sha256 = sha256_file(support_sidecar_path)
+
     sidecar_path = output_dir / "ce_refined.meta.json"
     sidecar_path.write_text(
         json.dumps(
             {
                 **reward_metadata,
                 **refine_meta,
+                "ce_support_audit": ce_support_audit,
+                "ce_support_sidecar": str(support_sidecar_path),
+                "ce_support_sidecar_sha256": support_sidecar_sha256,
                 "provenance": {
                     "schema_version": PROVENANCE_SCHEMA_VERSION,
                     "replay_sha256": replay_sha256,
@@ -244,25 +323,58 @@ def main(argv: list[str] | None = None) -> None:
         encoding="utf-8",
     )
     print(f"Saved CE metadata sidecar to {sidecar_path}")
+    print(f"Saved CE support sidecar to {support_sidecar_path}")
+
+    estimable_mask = np.asarray(ce_support_audit.get("estimable_mask", []), dtype=bool)
+    if estimable_mask.shape != refined.shape:
+        raise ValueError(
+            f"CE support audit shape mismatch: mask={estimable_mask.shape} refined={refined.shape}"
+        )
+    measured_zero_mask = np.asarray(ce_support_audit.get("measured_zero_mask", []), dtype=bool)
+    skipped_mask = np.asarray(ce_support_audit.get("skipped_mask", []), dtype=bool)
+    weight_sum = np.asarray(ce_support_audit.get("weight_sum", []), dtype=float)
+    refined_for_graph = np.asarray(refined, dtype=np.float32).copy()
+    # Unsupported/skipped cells are not zero-effect evidence.  They are excluded from
+    # factor selection; graph metadata below records that this masking occurred.
+    refined_for_graph[~estimable_mask] = 0.0
 
     print("\n=== Phase 4: Graph Build ===")
-    graph_cfg = config.get("graph", {}) or {}
     # Coverage-constrained selection: graph_cfg may carry selection / required_option_*_coverage
     # / diversity. With selection="coverage_constrained_ce" task-critical options (serve_soup, …)
     # are reserved before CE fill, so the task-stage gate is a postcondition, not a late surprise.
     graph = build_support_graph(
         layout,
         lib.options,
-        refined,
+        refined_for_graph,
         eta=float(graph_cfg.get("ce_eta", 0.05)),
         max_factors=int(graph_cfg.get("max_factors", 16)),
         selection_cfg=graph_cfg,
     )
+    graph.factors = [
+        replace(
+            factor,
+            metadata={
+                **(factor.metadata or {}),
+                "ce_weight_sum": float(weight_sum[factor.option_i, factor.option_j]),
+                "ce_estimable": bool(estimable_mask[factor.option_i, factor.option_j]),
+                "ce_skipped": bool(skipped_mask[factor.option_i, factor.option_j]),
+                "ce_measured_zero": bool(measured_zero_mask[factor.option_i, factor.option_j]),
+                "ce_support_min_weight": ce_min_weight,
+            },
+        )
+        for factor in graph.factors
+    ]
     graph.metadata = {
         **(graph.metadata or {}),
         **reward_metadata,
         "coverage_gate": "pending",
         "formal_graph": True,
+        "ce_support_audit": ce_support_audit,
+        "ce_support_sidecar": str(support_sidecar_path),
+        "ce_support_sidecar_sha256": support_sidecar_sha256,
+        "ce_unsupported_cells_masked": True,
+        "ce_refine_top_k": ce_refine_top_k,
+        "ce_max_options_per_episode": ce_max_options_per_episode,
         "provenance": {
             **((graph.metadata or {}).get("provenance", {})),
             **runtime_provenance(

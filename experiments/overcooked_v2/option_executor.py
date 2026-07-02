@@ -16,10 +16,12 @@ never choose high-level options, and must never silently override a black-box pa
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from experiments.overcooked_v2.event_extractor import extract_event
+from experiments.overcooked_v2.option_inferencer import PartnerOptionInferencer
+from src.aris_bellman.specs import PartnerAction
 
 
 @dataclass
@@ -27,7 +29,8 @@ class OptionStep:
     """Outcome of one primitive tick of an option."""
 
     ego_action: int
-    partner_action: Any  # PartnerAction: .primitive_action, .option_id, .option_dist, .option_confidence
+    partner_action: Any  # Sanitized PartnerAction: primitive only; no true option labels.
+    diagnostic_partner_action: Any  # Raw partner action. Diagnostic-only, never routed to evidence.
     prev_state: Any
     step: Any  # OCV2Step
     event: Any  # OCV2Event
@@ -42,6 +45,7 @@ def option_primitive_step(
     rng: Any,
     *,
     agent_id: int = 0,
+    partner_option_inferencer: PartnerOptionInferencer | None = None,
 ) -> OptionStep:
     """Advance the ego's current option by one primitive step against the live partner.
 
@@ -51,21 +55,53 @@ def option_primitive_step(
     """
     ego_action = option_lib.primitive_action(env.state, agent_id, int(option_id))
     partner_obs = obs.get("agent_1") if isinstance(obs, dict) else None
-    partner_action = partner.act(partner_obs, env.state, rng)
+    raw_partner_action = partner.act(partner_obs, env.state, rng)
+    partner_action = PartnerAction(
+        primitive_action=int(raw_partner_action.primitive_action),
+        option_id=None,
+        option_confidence=0.0,
+        option_dist=None,
+        source="behavior_observed:oracle_stripped",
+    )
     prev_state = env.state
     step = env.step(ego_action, partner_action.primitive_action)
+    # P1: the main event/evidence path must not receive ScriptedProtocolPartner's
+    # true option_id / option_dist / confidence. The event is first extracted with
+    # no partner-option labels, then optionally annotated by a behavior-only
+    # inferencer that consumes primitive actions and state/event deltas.
     event = extract_event(
         prev_state,
         ego_action,
         partner_action.primitive_action,
         step.state,
         step.info,
-        partner_action.option_id,
-        partner_action.option_dist,
+        partner_option=None,
+        partner_option_dist=None,
+        partner_option_source="none",
+    )
+    if partner_option_inferencer is None:
+        partner_option_inferencer = getattr(partner, "_behavior_option_inferencer", None)
+    if partner_option_inferencer is None:
+        partner_option_inferencer = PartnerOptionInferencer(option_lib, allow_heuristic=True)
+        partner_option_inferencer.reset(prev_state)
+        setattr(partner, "_behavior_option_inferencer", partner_option_inferencer)
+    inferred = partner_option_inferencer.update(
+        prev_state,
+        int(partner_action.primitive_action),
+        step.state,
+        event,
+    )
+    event = replace(
+        event,
+        partner_option=inferred.option_id,
+        partner_option_dist=inferred.option_dist,
+        partner_option_confidence=float(inferred.option_confidence),
+        partner_option_source=str(inferred.source),
     )
     return OptionStep(
         ego_action=ego_action,
         partner_action=partner_action,
+        diagnostic_partner_action=raw_partner_action,
         prev_state=prev_state,
         step=step,
         event=event,

@@ -148,7 +148,7 @@ ID | 来源(audit-N/codex/NEW) | 断言 | 锚点 | 分类 | codex verdict | 人�
 | 1 | **去 oracle 证据**：接入 `option_inferencer`（或 config 开关置零 `partner_option_*` 通道），train/eval/CE 三处一致 | P1 | 无——**一切比较实验的前提** |
 | 2 | **信念持久化**：跨选项决策保留隐状态，或窗口≥数个选项跨度 + 修零填充掩码(S2) | P4, S2 | 步1 |
 | 3 | **CE 支持度 sidecar**（per-pair weight_sum + skipped mask）+ min_weight 可配 + **重测 asymm** | P3, S9, S10, S11 | 可与步1–2并行（不碰 policy） |
-| 4 | **课程去 oracle**：`role_contrib_team`/角色探索/播种移出主方法臂，或主张明确降级为「课程条件化」 | P5 | 步1（**原步5，2026-07-02提前**） |
+| 4 | **课程去 oracle**：`role_contrib_team`、角色探索、回放播种、`ego_terminal_penalty_under_claim`、选项选择调用里的 `partner_terminal_policy` 真值分支全部移出主方法臂；保留时只能是独立 oracle/curriculum 消融，或主张明确降级为「课程条件化」 | P5, NEW-4 | 步1（**原步5，2026-07-02提前**） |
 | 5 | **评估完整性**：`--allow_diag_skip` 只跳诊断不跳完整性门(S17)、provenance 口径(S18)、gru 诊断形状(S16)、completion 指标拆分(S20)、diagnose_traces.py(S19) | S16, S17, S18, S19, S20 | 任何决定性 eval/重跑之前（**原步6，2026-07-02提前**） |
 | 6 | **伙伴库修复**：换掉近重复 held-out claim 伙伴(W2)、yield 层内排序(W3)、其余 W4-W6 小修；**W1 已被 codex 证伪不再是阻塞项**（活锁论证在当前树不成立，仅剩 tier 内平局微小偏置，可选打磨） | W2–W6 | **§5.1 治理裁决**（2026-07-02 用户裁定「等修订完代码再决定」，当前延后） |
 | 7 | **preflight/selection 治理门**（新增）：把伙伴差异性代理指标的粒度不足(D1已更正/D2)、preflight 回退口径(S12)、split 静默回退(S23)、preflight 伙伴池/信用目标(NEW-1)、**checkpoint 可在 guard 判定前被保存**(NEW-2) 打包为「新主张提出前必须先过」的门 | D1(已更正), D2, S12, S23, NEW-1, NEW-2 | 步1–6完成后，任何「支持/否定主张」声明前 |
@@ -162,7 +162,8 @@ message 引用台账 ID；多机制修复必须带组件消融。
 - 步2：持久化**不得**引入未来信息泄漏（隐状态只沿时间正向传播）。
 - 步3：估计量修复**不碰** policy/method 任何一行。
 - 步4：课程去 oracle **不得**只改文档措辞掩盖问题——若保留角色条件化课程，必须明确降级为
-  独立消融/课程专用基线，不得继续作为主方法证据。
+  独立消融/课程专用基线，不得继续作为主方法证据；不得用 `ego_terminal_penalty_under_claim`
+  或 option-selection 的 `partner_terminal_policy` 传参换通道保留 oracle。
 - 步5：评估完整性修复**不得**新增门却不修数据流本身（如：光收窄 `--allow_diag_skip` 范围但
   不修 provenance 口径不一致的根因）；`ROOTCAUSE_FIX_EXECUTOR_PROMPT.txt` 的反模式清单同样适用。
 - 步6（若治理放行）：伙伴库修复**不得**顺手把「谁 serve」变成几何可解（保留协商性）。
@@ -173,6 +174,8 @@ message 引用台账 ID；多机制修复必须带组件消融。
 ### 2.5 再验证（远程、执行门控、Type-B 接受）
 
 - 全部按 [CUSTOMER.md](CUSTOMER.md) 远程执行；每次代码更新出显式 git diff。
+- NEW-4 隔离：CODEX_IMPL_SPEC v1-v4 及其远程数字只能作为 diagnostic-only 记录；不得进入
+  `EXPERIMENT_LOG.md` 的支持/反驳结论，也不得作为 METHOD_LOCK 新 claim 的依据。
 - **决定性重跑**（去 oracle 后：ARIS 是否仍适应？四臂是否分离？asymm serve CE 是否转正？）
   = Type-B → 结果须 codex + 用户接受后才可写任何主张；结论按 §3.1 预注册规则读出，
   **不允许事后重解释**。

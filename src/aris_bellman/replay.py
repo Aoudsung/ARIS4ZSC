@@ -28,6 +28,7 @@ class EvidenceBuffer:
         )
         self._count = 0
         self._start = 0
+        self._belief_hidden: np.ndarray | None = None
 
     def append(self, x_f: np.ndarray) -> None:
         evidence = np.asarray(x_f, dtype=self.dtype)
@@ -55,10 +56,59 @@ class EvidenceBuffer:
         out[:, :, :] = self._buffer[:, indices, :]
         return out.copy()
 
+    def snapshot_mask(self) -> np.ndarray:
+        """Boolean [F,T] mask identifying real evidence rows.
+
+        P4/S2: zero padding in early windows is not evidence. The mask is
+        stored with each transition and consumed by the belief encoder.
+        """
+        mask = np.zeros((self.num_factors, self.window), dtype=bool)
+        if self._count <= 0:
+            return mask.copy()
+        active = min(self._count, self.window)
+        mask[:, :active] = True
+        return mask.copy()
+
+    def snapshot_with_mask(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.snapshot(), self.snapshot_mask()
+
+    def length(self) -> int:
+        """Number of real rows represented in ``snapshot()``.
+
+        ``snapshot()`` is zero-padded until the evidence window is full. This
+        length is the mask source used by the belief model so early padding is
+        not treated as observed evidence (P4/S2).
+        """
+        return int(self._count)
+
+    def mask_snapshot(self) -> np.ndarray:
+        mask = np.zeros((self.window,), dtype=bool)
+        mask[: min(self._count, self.window)] = True
+        return mask.copy()
+
+    def set_belief_hidden(self, hidden: np.ndarray | None) -> None:
+        """Persist factor-belief hidden state across option decisions (P4)."""
+        if hidden is None:
+            self._belief_hidden = None
+            return
+        arr = np.asarray(hidden, dtype=self.dtype)
+        if arr.ndim != 2 or arr.shape[0] != self.num_factors:
+            raise ValueError(
+                "belief hidden must have shape [num_factors, hidden_dim]; "
+                f"got {arr.shape}."
+            )
+        self._belief_hidden = arr.copy()
+
+    def belief_hidden_snapshot(self) -> np.ndarray | None:
+        if self._belief_hidden is None:
+            return None
+        return self._belief_hidden.copy()
+
     def reset(self) -> None:
         self._buffer.fill(0)
         self._count = 0
         self._start = 0
+        self._belief_hidden = None
 
     @property
     def count(self) -> int:

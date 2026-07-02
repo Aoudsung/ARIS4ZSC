@@ -59,12 +59,21 @@ class PartnerOptionInferencer:
                 source="classifier",
             )
 
-        if self.belief is None or self.belief.shape[0] != self.option_library.num_options:
+        num_options = int(
+            getattr(self.option_library, "num_options", len(self.option_library.options))
+        )
+        if self.belief is None or self.belief.shape[0] != num_options:
             self.reset(prev_state)
 
         likelihood = np.zeros_like(self.belief)
+        valid_mask = self.option_library.valid_options(prev_state, agent_id=1)
         for opt in self.option_library.options:
-            if not self.option_library.is_valid_for_state(prev_state, 1, opt.id):
+            is_valid_fn = getattr(self.option_library, "is_valid_for_state", None)
+            if callable(is_valid_fn):
+                is_valid = bool(is_valid_fn(prev_state, 1, opt.id))
+            else:
+                is_valid = bool(valid_mask[int(opt.id)])
+            if not is_valid:
                 likelihood[opt.id] = 0.0
                 continue
 
@@ -84,6 +93,7 @@ class PartnerOptionInferencer:
                 event,
                 agent_id=1,
                 elapsed=1,
+                runtime=None,
             )[0]
             likelihood[opt.id] = (
                 0.65 * match + 0.25 * progress + 0.10 * float(terminated) + 1e-4
@@ -97,7 +107,7 @@ class PartnerOptionInferencer:
             option_id=option_id,
             option_confidence=float(np.max(self.belief)),
             option_dist=self.belief.copy(),
-            source="inferred",
+            source="heuristic",
         )
 
 
@@ -124,12 +134,12 @@ def _option_progress_score(
 
 
 def _target_cells(opt: OptionSpec) -> tuple[GridPos, ...]:
-    metadata = opt.metadata or {}
+    metadata = getattr(opt, "metadata", None) or {}
     if "interaction_cells" in metadata:
         return tuple(metadata["interaction_cells"])
     if "region_cells" in metadata:
         return tuple(metadata["region_cells"])
-    if opt.target_pos is not None:
+    if getattr(opt, "target_pos", None) is not None:
         return (opt.target_pos,)
     return ()
 
@@ -160,3 +170,58 @@ def _normalize(values: np.ndarray) -> np.ndarray:
             return values.astype(np.float32)
         return np.full_like(values, 1.0 / values.size, dtype=np.float32)
     return (values / total).astype(np.float32)
+
+def make_behavior_option_inferencer(
+    option_library: Any,
+    config: dict[str, Any] | None = None,
+) -> PartnerOptionInferencer:
+    """Construct the single train/eval/CE partner-option evidence source.
+
+    P1 boundary: this helper never receives a partner name, id, protocol, role,
+    terminal policy, or scripted true option label. The default heuristic consumes
+    only primitive partner action, state deltas, validity, and extracted event
+    features inside :meth:`PartnerOptionInferencer.update`.
+    """
+    cfg = ((config or {}).get("evidence", {}) or {}).get("partner_option_inference", {}) or {}
+    return PartnerOptionInferencer(
+        option_library,
+        temperature=float(cfg.get("temperature", 1.0)),
+        classifier_checkpoint=cfg.get("classifier_checkpoint"),
+        allow_heuristic=bool(cfg.get("allow_heuristic", True)),
+    )
+
+
+
+def build_behavior_option_inferencer(
+    option_library: Any,
+    config: dict[str, Any] | None = None,
+) -> PartnerOptionInferencer | None:
+    """Construct the main-path partner-option evidence source.
+
+    P1: this inferencer may consume primitive partner actions, state deltas, and
+    event booleans only. It must not consume partner name/id/protocol/role or
+    terminal_policy. The heuristic path is enabled by default so de-oracling does
+    not silently make the method untestable.
+    """
+    cfg = ((config or {}).get("partner_option_inference") or {})
+    if not bool(cfg.get("enabled", True)):
+        return None
+    return PartnerOptionInferencer(
+        option_library,
+        temperature=float(cfg.get("temperature", 1.0)),
+        classifier_checkpoint=cfg.get("classifier_checkpoint"),
+        allow_heuristic=bool(cfg.get("allow_heuristic", True)),
+    )
+
+
+def attach_behavior_option_inferencer(
+    partner: Any,
+    option_library: Any,
+    state: Any,
+    config: dict[str, Any] | None = None,
+) -> PartnerOptionInferencer | None:
+    inferencer = build_behavior_option_inferencer(option_library, config)
+    if inferencer is not None:
+        inferencer.reset(state)
+    setattr(partner, "_behavior_option_inferencer", inferencer)
+    return inferencer

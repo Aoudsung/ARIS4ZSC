@@ -34,6 +34,10 @@ class PartnerOptionClassifier(nn.Module):
 
 
 def event_feature_vector(event: Any) -> np.ndarray:
+    # P1: this vector is allowed to use behavior-observable fields only. Keep the
+    # historical dimensionality for checkpoint compatibility, but reserve the old
+    # partner_option_confidence slot as a constant 0.0 so no true scripted option
+    # confidence can re-enter through a classifier feature.
     values = np.asarray(
         [
             float(getattr(event, "partner_action", 0)),
@@ -41,7 +45,7 @@ def event_feature_vector(event: Any) -> np.ndarray:
             float(bool(getattr(event, "partner_interacted", False))),
             float(bool(getattr(event, "collision_or_block", False))),
             float(bool(getattr(event, "partner_inventory_before", 0) != getattr(event, "partner_inventory_after", 0))),
-            float(getattr(event, "partner_option_confidence", 0.0)),
+            0.0,
             float(bool(getattr(event, "pot_changed", False))),
             float(bool(getattr(event, "pot_became_ready", False))),
             float(bool(getattr(event, "plate_picked", False))),

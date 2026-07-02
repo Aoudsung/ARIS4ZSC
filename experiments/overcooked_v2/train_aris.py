@@ -30,11 +30,12 @@ from src.aris_bellman.td import aris_td_loss
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.event_extractor import (
     EVENT_SEMANTICS_VERSION,
+    PARTNER_OPTION_EVIDENCE_POLICY,
     actor_sparse_reward,
     extract_event,
     sparse_credit_params,
 )
-from experiments.overcooked_v2.evidence_router import D_EVID, OCV2EvidenceRouter
+from experiments.overcooked_v2.evidence_router import D_EVID, EVIDENCE_INDEX, OCV2EvidenceRouter
 from experiments.overcooked_v2.graph_builder import (
     _load_ego_selectable_from_replay,
     build_graph_variant,
@@ -45,6 +46,10 @@ from experiments.overcooked_v2.layout_parser import LayoutGraph, parse_layout
 from experiments.overcooked_v2.obs_featurizer import NumpyFeaturizer
 from experiments.overcooked_v2.obs_encoder import OCV2ObsEncoder, infer_obs_dim
 from experiments.overcooked_v2.option_executor import option_primitive_step
+from experiments.overcooked_v2.option_inferencer import (
+    PartnerOptionInferencer,
+    make_behavior_option_inferencer,
+)
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import PARTNER_REGISTRIES, make_training_partners
@@ -406,7 +411,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         validation_partners = _select_train_partners(option_lib, config)
     best_greedy_return = -float("inf")
-    obs, _, current_partner = _reset_episode(
+    obs, state, current_partner = _reset_episode(
         env,
         evidence_buffer,
         partners,
@@ -414,6 +419,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         args.seed,
         router,
     )
+    partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
+    _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device)
     contribution_ledger = ContributionLedger.from_config(config.get("training"))
     episode_return = 0.0
     episode_options = 0
@@ -423,7 +430,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     while updates_done < int(config["training"]["total_updates"]):
         if episode_options >= int(config["training"]["max_episode_options"]):
             metrics["episode_returns"].append(float(episode_return))
-            obs, _, current_partner = _reset_episode(
+            obs, state, current_partner = _reset_episode(
                 env,
                 evidence_buffer,
                 partners,
@@ -431,6 +438,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.seed,
                 router,
             )
+            partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
+            _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device)
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
@@ -449,9 +458,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             rng,
             device,
             partner_id=int(getattr(current_partner, "partner_id", 0)),
-            partner_terminal_policy=getattr(
-                getattr(current_partner, "protocol", None), "terminal_policy", None
-            ),
             selection_stats=metrics,
         )
         transition, done, obs = _execute_option(
@@ -466,6 +472,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             rng,
             config,
             contribution_ledger=contribution_ledger,
+            partner_option_inferencer=partner_option_inferencer,
+            method=args.method,
+            belief_model=belief_model,
+            device=device,
         )
         replay.add(transition)
         episode_return += _transition_training_return(transition, config)
@@ -481,7 +491,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
         if done:
             metrics["episode_returns"].append(float(episode_return))
-            obs, _, current_partner = _reset_episode(
+            obs, state, current_partner = _reset_episode(
                 env,
                 evidence_buffer,
                 partners,
@@ -489,6 +499,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.seed,
                 router,
             )
+            partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
+            _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device)
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
@@ -565,7 +577,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 _cs["max_partner_correct_delivery_seen"] = max(
                     int(_cs.get("max_partner_correct_delivery_seen", 0)), _val_partner
                 )
+                requires_ego_selection = bool(
+                    config["training"].get("require_ego_delivery_selection", False)
+                )
+                eligible_for_deploy = (not requires_ego_selection) or _val_ego_sole > 0
                 if _val_mean > best_greedy_return:
+                    _cs["best_greedy_return_seen"] = _val_mean
+                    _cs["best_update_seen"] = int(updates_done)
+                    _cs["best_seen_ego_sole_correct_delivery_count"] = _val_ego_sole
+                    _cs["best_seen_partner_correct_delivery_count"] = _val_partner
+                if eligible_for_deploy and _val_mean > best_greedy_return:
                     best_greedy_return = _val_mean
                     _cs.update(
                         {
@@ -606,6 +627,8 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                         optimizer,
                         filename="checkpoint_best.pt",
                     )
+                elif not eligible_for_deploy:
+                    _cs["last_ineligible_checkpoint_reason"] = "no_ego_sole_correct_delivery"
 
     if episode_options:
         metrics["episode_returns"].append(float(episode_return))
@@ -614,17 +637,28 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         checkpoint_policy["select_best_by"] == "final"
         or metrics["checkpoint_selection"].get("best_update") is None
     )
+    final_publish_allowed = not bool(config["training"].get("require_ego_delivery_selection", False))
     if select_final:
         selected_by = checkpoint_policy["select_best_by"]
         if selected_by == "greedy":
             selected_by = "final_no_greedy_validation"
-        metrics["checkpoint_selection"].update(
-            {
-                "selected_checkpoint": "checkpoint.pt",
-                "selected_by": selected_by,
-                "deployable_checkpoint": "checkpoint.pt",
-            }
-        )
+        if final_publish_allowed:
+            metrics["checkpoint_selection"].update(
+                {
+                    "selected_checkpoint": "checkpoint.pt",
+                    "selected_by": selected_by,
+                    "deployable_checkpoint": "checkpoint.pt",
+                }
+            )
+        else:
+            metrics["checkpoint_selection"].update(
+                {
+                    "selected_checkpoint": None,
+                    "selected_by": f"{selected_by}_not_publishable_without_ego_delivery_validation",
+                    "deployable_checkpoint": None,
+                    "final_checkpoint_publish_blocked": True,
+                }
+            )
     # RC free-rider guard verdict. Under ego-terminal-aware selection a checkpoint
     # is selectable only if it actually serves, so a "fail" means greedy validation
     # never produced a serving checkpoint. Recorded as a machine-checkable Type-A
@@ -650,7 +684,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         optimizer,
         filename="checkpoint_final.pt",
     )
-    if select_final:
+    if select_final and final_publish_allowed:
         _save_checkpoint(
             output_dir,
             args.method,
@@ -733,7 +767,8 @@ def _build_env(layout_name: str, config: dict[str, Any]) -> OCV2Adapter:
     env_cfg = config.setdefault("env", {})
     env_cfg["observation_type"] = "default"
     # RC-2b P1: respect the configured force_path_planning (was hard-coded False, silently overriding
-    # config and mislabeling experiment conditions in logs). OCV2Adapter's own default is True.
+    # config and mislabeling experiment conditions in logs). OCV2Adapter's own default is True;
+    # this wrapper keeps the explicit default force_path_planning=False unless config opts in.
     fpp = bool(env_cfg.get("force_path_planning", False))
     return OCV2Adapter(
         layout=layout_name,
@@ -779,7 +814,24 @@ def _select_train_partners(option_lib: OCV2OptionLibrary, config: dict[str, Any]
     weights_cfg = train_cfg.get("partner_sampling", {}) or {}
     groups_cfg = train_cfg.get("partner_groups", {}) or {}
     by_name = {p.name: p for p in partners}
+    heldout_names = [str(name) for name in (train_cfg.get("heldout_partners") or [])]
+    missing_heldout = sorted(set(heldout_names) - set(by_name))
+    if missing_heldout:
+        raise ValueError(
+            f"heldout_partners not found: {missing_heldout}; available={sorted(by_name)}"
+        )
+    overlap = sorted(set(str(name) for name in (names or [])) & set(heldout_names))
+    if overlap:
+        raise ValueError(f"S23: train_partners overlap heldout_partners: {overlap}")
     if not names:
+        if train_cfg.get("heldout_partners") and not bool(
+            train_cfg.get("allow_all_partners_for_no_split", False)
+        ):
+            raise ValueError(
+                "S23: formal held-out split claims require explicit "
+                "training.train_partners. Set allow_all_partners_for_no_split=true "
+                "only for labeled no-split smoke runs."
+            )
         selected = list(partners)
     else:
         missing = sorted(set(names) - set(by_name))
@@ -1021,15 +1073,20 @@ def _graph_objective_metadata_status(
     # sparse_credit is back-compatible: a legacy graph with no sparse_credit key
     # is treated as "team" (the historical objective), so it is NOT a hard-miss.
     # It only mismatches when the config asks for a non-team mode the graph lacks.
+    optional_legacy_keys = {"sparse_credit", "partner_set", "relevance_semantics"}
+    if not bool((expected.get("terminal_progress_shaping") or {}).get("enabled", False)):
+        optional_legacy_keys.add("terminal_progress_shaping")
     missing = [
         key for key in expected
         if key not in metadata
-        and key not in {"sparse_credit", "partner_set", "relevance_semantics"}
+        and key not in optional_legacy_keys
     ]
     mismatches: dict[str, dict[str, Any]] = {}
 
     for key, expected_value in expected.items():
         if key in missing:
+            continue
+        if key in optional_legacy_keys and key not in metadata:
             continue
         observed = metadata.get(key)
         if key in {
@@ -1087,6 +1144,26 @@ def _graph_objective_metadata_status(
             "graph": graph.layout_name,
             "config": expected["layout"],
         }
+
+    require_ce_support = bool(config.get("graph"))
+    if require_ce_support:
+        ce_support = metadata.get("ce_support_audit")
+        if not isinstance(ce_support, dict) or ce_support.get("schema_version") != "ce_support_audit_v1":
+            if "ce_support_audit" not in missing:
+                missing.append("ce_support_audit")
+        else:
+            required_ce_keys = {"weight_sum", "estimable_mask", "skipped_mask", "measured_zero_mask", "min_weight"}
+            absent_ce_keys = sorted(key for key in required_ce_keys if key not in ce_support)
+            if absent_ce_keys:
+                mismatches["ce_support_audit"] = {
+                    "graph": sorted(ce_support),
+                    "config": f"missing CE support keys {absent_ce_keys}",
+                }
+        if not bool(metadata.get("ce_unsupported_cells_masked", False)):
+            mismatches["ce_unsupported_cells_masked"] = {
+                "graph": metadata.get("ce_unsupported_cells_masked"),
+                "config": True,
+            }
 
     provenance_status = _graph_provenance_status(
         graph,
@@ -1310,7 +1387,7 @@ def _run_random_policy(
         window=int(config["training"]["evidence_window"]),
         evidence_dim=D_EVID,
     )
-    obs, _, current_partner = _reset_episode(
+    obs, state, current_partner = _reset_episode(
         env,
         evidence_buffer,
         partners,
@@ -1318,6 +1395,7 @@ def _run_random_policy(
         args.seed,
         router,
     )
+    partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
     contribution_ledger = ContributionLedger.from_config(config.get("training"))
     metrics = _empty_metrics(args.method, router.graph, output_dir)
     episode_return = 0.0
@@ -1327,7 +1405,7 @@ def _run_random_policy(
     for update_idx in range(int(config["training"]["total_updates"])):
         if episode_options >= int(config["training"]["max_episode_options"]):
             metrics["episode_returns"].append(float(episode_return))
-            obs, _, current_partner = _reset_episode(
+            obs, state, current_partner = _reset_episode(
                 env,
                 evidence_buffer,
                 partners,
@@ -1335,6 +1413,7 @@ def _run_random_policy(
                 args.seed,
                 router,
             )
+            partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
@@ -1358,6 +1437,10 @@ def _run_random_policy(
             rng,
             config,
             contribution_ledger=contribution_ledger,
+            partner_option_inferencer=partner_option_inferencer,
+            method=args.method,
+            belief_model=None,
+            device=None,
         )
         episode_return += _transition_training_return(transition, config)
         episode_options += 1
@@ -1371,7 +1454,7 @@ def _run_random_policy(
         _update_task_progress_metrics(metrics, transition)
         if done:
             metrics["episode_returns"].append(float(episode_return))
-            obs, _, current_partner = _reset_episode(
+            obs, state, current_partner = _reset_episode(
                 env,
                 evidence_buffer,
                 partners,
@@ -1379,6 +1462,7 @@ def _run_random_policy(
                 args.seed,
                 router,
             )
+            partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
@@ -1404,16 +1488,20 @@ def _execute_option(
     config: dict[str, Any],
     *,
     contribution_ledger: ContributionLedger | None = None,
+    partner_option_inferencer: PartnerOptionInferencer | None = None,
+    method: str | None = None,
+    belief_model: FactorLocalBeliefModel | None = None,
+    device: torch.device | None = None,
 ) -> tuple[OptionTransition, bool, dict[str, np.ndarray]]:
     opt = option_lib.options[int(option_id)]
-    partner_terminal_policy = getattr(
-        getattr(partner, "protocol", None), "terminal_policy", None
-    )
     runtime = OptionRuntime(
         option_id=int(option_id),
         start_pos=get_agent_pos(env.state, 0),
     )
     evidence_t = evidence_buffer.snapshot()
+    evidence_mask_t = evidence_buffer.snapshot_mask()
+    evidence_len_t = evidence_buffer.length()
+    belief_hidden_t = evidence_buffer.belief_hidden_snapshot()
     obs_feat_t = _obs_vector(obs, "agent_0")
     expected_cost = option_lib.expected_cost(env.state, 0, int(option_id))
     reward_sum = 0.0
@@ -1425,7 +1513,15 @@ def _execute_option(
 
     _budget = option_lib.option_budget(env.state, 0, int(option_id))
     while duration < _budget:
-        _ostep = option_primitive_step(env, option_lib, int(option_id), partner, obs, rng)
+        _ostep = option_primitive_step(
+            env,
+            option_lib,
+            int(option_id),
+            partner,
+            obs,
+            rng,
+            partner_option_inferencer=partner_option_inferencer,
+        )
         ego_action = _ostep.ego_action
         partner_action = _ostep.partner_action
         prev_state = _ostep.prev_state
@@ -1440,17 +1536,23 @@ def _execute_option(
         reward_sum += _training_reward(
             step, config, "agent_0", event,
             ego_contributed=ego_contributed,
-            partner_terminal_policy=partner_terminal_policy,
         )
         realized_cost += float(config["training"].get("cost_per_step", 1.0))
         duration += 1
-        evidence_buffer.append(
-            router.route(
-                event,
-                ego_option_id=int(option_id),
-                ego_option_elapsed=duration,
-                ego_option_max_steps=opt.max_steps,
-            )
+        x_f = router.route(
+            event,
+            ego_option_id=int(option_id),
+            ego_option_elapsed=duration,
+            ego_option_max_steps=opt.max_steps,
+        )
+        evidence_buffer.append(x_f)
+        _advance_persistent_belief(
+            evidence_buffer,
+            method,
+            belief_model,
+            graph,
+            device,
+            x_f,
         )
         done = bool(step.dones.get("__all__", False))
         terminated, termination_reason = option_lib.option_terminated(
@@ -1479,17 +1581,21 @@ def _execute_option(
     # Value-sufficient belief update: repeated failure of an option should shift the
     # posterior on the factors touching that option, allowing the model to route away
     # from it without a probe/selector.
-    _failed = termination_reason in {"budget_exhausted", "env_max_steps", "option_invalid"}
-    if _failed and 'event' in locals():
-        evidence_buffer.append(
-            router.route(
-                event,
-                ego_option_id=int(option_id),
-                ego_option_elapsed=duration,
-                ego_option_max_steps=opt.max_steps,
-                ego_option_terminated_failed=True,
-                failed_option_id=int(option_id),
-            )
+    _failed = termination_reason in {"budget_exhausted", "max_steps", "env_max_steps"}
+    if _failed and duration > 0:
+        x_fail = router.route_failure_boundary(
+            ego_option_id=int(option_id),
+            ego_option_elapsed=duration,
+            ego_option_max_steps=opt.max_steps,
+        )
+        evidence_buffer.append(x_fail)
+        _advance_persistent_belief(
+            evidence_buffer,
+            method,
+            belief_model,
+            graph,
+            device,
+            x_fail,
         )
 
     # Bellman target hygiene: action selection masks invalid options dynamically, so
@@ -1504,6 +1610,9 @@ def _execute_option(
         OptionTransition(
             obs_feat_t=obs_feat_t,
             evidence_t=evidence_t,
+            evidence_mask_t=evidence_mask_t,
+            evidence_len_t=int(evidence_len_t),
+            belief_hidden_t=belief_hidden_t,
             option_id=int(option_id),
             reward_sum=float(reward_sum),
             expected_cost=float(expected_cost),
@@ -1511,6 +1620,9 @@ def _execute_option(
             duration=max(1, int(duration)),
             obs_feat_next=_obs_vector(obs, "agent_0"),
             evidence_next=evidence_buffer.snapshot(),
+            evidence_mask_next=evidence_buffer.snapshot_mask(),
+            evidence_len_next=int(evidence_buffer.length()),
+            belief_hidden_next=evidence_buffer.belief_hidden_snapshot(),
             done=bool(done),
             termination_reason=termination_reason,
             graph_id=f"{graph.layout_name}:{graph.metadata.get('graph_variant', 'graph')}",
@@ -1545,8 +1657,30 @@ def _td_update(
     dynamic_next_mask = _option_mask_next_from_batch(batch, graph, device)
     if dynamic_next_mask is not None:
         graph_batch["option_mask_next"] = dynamic_next_mask
-    state_t = _state_repr(method, belief_model, evidence_t, graph_batch)
-    state_next = _state_repr(method, belief_model, evidence_next, graph_batch)
+    evidence_len_t = _tensor(batch.get("evidence_len_t"), device) if batch.get("evidence_len_t") is not None else None
+    evidence_len_next = _tensor(batch.get("evidence_len_next"), device) if batch.get("evidence_len_next") is not None else None
+    evidence_mask_t = _batch_evidence_mask(batch.get("evidence_mask_t"), evidence_t, device)
+    evidence_mask_next = _batch_evidence_mask(batch.get("evidence_mask_next"), evidence_next, device)
+    belief_hidden_t = _optional_tensor(batch.get("belief_hidden_t"), device)
+    belief_hidden_next = _optional_tensor(batch.get("belief_hidden_next"), device)
+    state_t = _state_repr(
+        method,
+        belief_model,
+        evidence_t,
+        graph_batch,
+        evidence_lengths=evidence_len_t,
+        evidence_mask=evidence_mask_t,
+        belief_hidden=belief_hidden_t,
+    )
+    state_next = _state_repr(
+        method,
+        belief_model,
+        evidence_next,
+        graph_batch,
+        evidence_lengths=evidence_len_next,
+        evidence_mask=evidence_mask_next,
+        belief_hidden=belief_hidden_next,
+    )
 
     optimizer.zero_grad(set_to_none=True)
     _vb = config["training"].get("value_bound", {}) or {}
@@ -1580,6 +1714,34 @@ def _td_update(
     )
     optimizer.step()
     return float(loss.detach().cpu().item())
+
+
+def _batch_evidence_mask(
+    raw: Any,
+    evidence: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return a boolean evidence mask for replay batches when available.
+
+    P4/S2: replay evidence windows are left-padded with zeros early in an
+    episode. Without this mask the GRU treats padding as real zero-valued
+    behavioral evidence. Legacy replay without mask remains loadable but is
+    explicitly weaker and should not support formal post-repair claims.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)) and all(item is None for item in raw):
+        return None
+    arr = np.asarray(raw, dtype=bool)
+    expected_shape = tuple(evidence.shape[:-1])
+    if arr.shape != expected_shape:
+        warnings.warn(
+            "Ignoring malformed evidence mask in replay batch: "
+            f"shape={arr.shape}, expected={expected_shape}.",
+            RuntimeWarning,
+        )
+        return None
+    return torch.as_tensor(arr, dtype=torch.bool, device=device)
 
 
 def _option_mask_next_from_batch(
@@ -1618,6 +1780,22 @@ def _option_mask_next_from_batch(
         )
         return None
     return torch.as_tensor(arr, dtype=torch.bool, device=device)
+
+
+def _checkpoint_candidate_eligible(
+    validation: dict[str, Any],
+    config: dict[str, Any],
+) -> bool:
+    """Return whether a greedy checkpoint may be published as deployable.
+
+    NEW-2/S20: when ego-delivery selection is required, a high-return
+    free-riding checkpoint must not be saved as ``checkpoint.pt`` and then merely
+    marked failed after the fact. Eligibility is enforced before publication.
+    """
+    if not bool(config["training"].get("require_ego_delivery_selection", False)):
+        return True
+    return int(validation.get("ego_sole_correct_delivery_count", 0)) > 0
+
 
 
 def _free_rider_guard_verdict(
@@ -1699,7 +1877,7 @@ def _run_greedy_validation(
                     evidence_dim=D_EVID,
                 )
                 validation_partner = partners[int(episode_idx) % len(partners)]
-                obs, _, partner = _reset_episode(
+                obs, state, partner = _reset_episode(
                     env,
                     evidence_buffer,
                     partners,
@@ -1708,6 +1886,8 @@ def _run_greedy_validation(
                     router,
                     partner_override=validation_partner,
                 )
+                partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, greedy_config)
+                _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
                 contribution_ledger = ContributionLedger.from_config(
                     greedy_config.get("training")
                 )
@@ -1733,9 +1913,6 @@ def _run_greedy_validation(
                         rng,
                         device,
                         partner_id=int(getattr(partner, "partner_id", 0)),
-                        partner_terminal_policy=getattr(
-                            getattr(partner, "protocol", None), "terminal_policy", None
-                        ),
                         selection_stats=None,
                     )
                     transition, done, obs = _execute_option(
@@ -1750,6 +1927,10 @@ def _run_greedy_validation(
                         rng,
                         greedy_config,
                         contribution_ledger=contribution_ledger,
+                        partner_option_inferencer=partner_option_inferencer,
+                        method=method,
+                        belief_model=belief_model,
+                        device=device,
                     )
                     episode_return += _transition_training_return(
                         transition,
@@ -1798,15 +1979,28 @@ def _state_repr(
     belief_model: FactorLocalBeliefModel,
     evidence: torch.Tensor,
     graph_batch: dict[str, Any],
+    *,
+    evidence_lengths: torch.Tensor | None = None,
+    evidence_mask: torch.Tensor | None = None,
+    belief_hidden: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if method == "global_gru":
         return evidence
     if method in {"aris_bellman", "flat_factor"}:
+        if belief_hidden is not None:
+            return belief_model.belief_from_hidden(
+                belief_hidden,
+                factor_features=graph_batch.get("factor_features"),
+                factor_mask=graph_batch["factor_mask"],
+                mode_mask=graph_batch["mode_mask"],
+            )
         return belief_model(
             evidence,
             graph_batch.get("factor_features"),
             graph_batch["factor_mask"],
             graph_batch["mode_mask"],
+            evidence_lengths=evidence_lengths,
+            evidence_mask=evidence_mask,
         )
     return evidence.new_zeros(
         evidence.shape[0],
@@ -1829,7 +2023,6 @@ def _select_option(
     rng: np.random.Generator,
     device: torch.device,
     partner_id: int | None = None,
-    partner_terminal_policy: str | None = None,
     selection_stats: dict[str, Any] | None = None,
 ) -> int:
     _record_selection_attempt(selection_stats)
@@ -1847,14 +2040,33 @@ def _select_option(
             update_idx,
             rng,
             selection_stats,
-            partner_terminal_policy=partner_terminal_policy,
         )
 
     with torch.no_grad():
         obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], device)
         evidence = _tensor(evidence_buffer.snapshot()[None, ...], device)
+        evidence_mask = torch.as_tensor(
+            evidence_buffer.snapshot_mask()[None, ...], dtype=torch.bool, device=device
+        )
+        evidence_lengths = torch.as_tensor(
+            [evidence_buffer.length()], dtype=torch.float32, device=device
+        )
         graph_batch = _graph_tensors(graph, 1, device)
-        state_repr = _state_repr(method, belief_model, evidence, graph_batch)
+        belief_hidden_np = evidence_buffer.belief_hidden_snapshot()
+        belief_hidden = (
+            _tensor(belief_hidden_np[None, ...], device)
+            if belief_hidden_np is not None
+            else None
+        )
+        state_repr = _state_repr(
+            method,
+            belief_model,
+            evidence,
+            graph_batch,
+            evidence_lengths=evidence_lengths,
+            evidence_mask=evidence_mask,
+            belief_hidden=belief_hidden,
+        )
         q_values = q_net(
             obs_tensor,
             state_repr,
@@ -1874,8 +2086,6 @@ def _sample_exploration_option(
     update_idx: int,
     rng: np.random.Generator,
     selection_stats: dict[str, Any] | None = None,
-    *,
-    partner_terminal_policy: str | None = None,
 ) -> int:
     """Training-only directed exploration over valid terminal-stage options.
 
@@ -1885,19 +2095,18 @@ def _sample_exploration_option(
     bottleneck/wait/fetch options.
     """
     training_cfg = config.get("training", {}) or {}
-    role_cfg = training_cfg.get("role_exploration")
-    if role_cfg is None:
+    role_cfg = training_cfg.get("role_exploration") or {}
+    if bool(role_cfg.get("enabled", False)):
+        # P5: main-method exploration may use only behavior-observable state. It
+        # must not branch on partner terminal_policy. A role_exploration.default
+        # block is accepted as an oracle-free curriculum; keyed yield/claim blocks
+        # are ignored unless run as a separately labeled ablation outside the main
+        # method path.
+        cfg = role_cfg.get("default") or training_cfg.get("terminal_exploration") or {}
+        enabled = bool(cfg)
+    else:
         cfg = training_cfg.get("terminal_exploration") or {}
         enabled = bool(cfg.get("enabled", False))
-    else:
-        role_exploration = role_cfg or {}
-        if not bool(role_exploration.get("enabled", False)):
-            return int(rng.choice(valid_ids))
-        selected_cfg = role_exploration.get(str(partner_terminal_policy))
-        if selected_cfg is None:
-            selected_cfg = role_exploration.get("default")
-        cfg = selected_cfg or {}
-        enabled = True
     if not enabled:
         return int(rng.choice(valid_ids))
     preferred_kinds = tuple(
@@ -2106,7 +2315,7 @@ def _maybe_seed_terminal_replay(
             window=int(train_cfg["evidence_window"]),
             evidence_dim=D_EVID,
         )
-        obs, _, active_partner = _reset_episode(
+        obs, state, active_partner = _reset_episode(
             env,
             evidence_buffer,
             [partner],
@@ -2115,6 +2324,8 @@ def _maybe_seed_terminal_replay(
             router,
             partner_override=partner,
         )
+        partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
+        _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
         contribution_ledger = ContributionLedger.from_config(train_cfg)
         done = False
         episodes_used += 1
@@ -2136,6 +2347,10 @@ def _maybe_seed_terminal_replay(
                 rng,
                 config,
                 contribution_ledger=contribution_ledger,
+                partner_option_inferencer=partner_option_inferencer,
+                method=method,
+                belief_model=belief_model,
+                device=device,
             )
             kind = graph.options[int(transition.option_id)].kind
             option_counts_by_kind[kind] = int(option_counts_by_kind.get(kind, 0)) + 1
@@ -2255,7 +2470,7 @@ def _seed_role_replay(
                 window=int(train_cfg["evidence_window"]),
                 evidence_dim=D_EVID,
             )
-            obs, _, active_partner = _reset_episode(
+            obs, state, active_partner = _reset_episode(
                 env,
                 evidence_buffer,
                 [partner],
@@ -2264,6 +2479,8 @@ def _seed_role_replay(
                 router,
                 partner_override=partner,
             )
+            partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
+            _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
             contribution_ledger = ContributionLedger.from_config(train_cfg)
             done = False
             episodes_used += 1
@@ -2285,6 +2502,10 @@ def _seed_role_replay(
                     rng,
                     config,
                     contribution_ledger=contribution_ledger,
+                    partner_option_inferencer=partner_option_inferencer,
+                    method=method,
+                    belief_model=belief_model,
+                    device=device,
                 )
                 kind = graph.options[int(transition.option_id)].kind
                 option_counts_by_kind[kind] = int(option_counts_by_kind.get(kind, 0)) + 1
@@ -2481,6 +2702,81 @@ def _reset_episode(
     return obs, state, partner
 
 
+def _new_partner_option_inferencer(
+    option_lib: OCV2OptionLibrary,
+    state: Any,
+    config: dict[str, Any] | None = None,
+) -> PartnerOptionInferencer:
+    """Behavior-only partner option inferencer for P1 de-oracled evidence.
+
+    The inferencer consumes primitive partner actions plus state/event deltas via
+    ``option_executor.option_primitive_step``. It never receives partner name,
+    protocol, role, terminal_policy, or the scripted true option labels.
+    """
+    inferencer = make_behavior_option_inferencer(option_lib, config)
+    inferencer.reset(state)
+    return inferencer
+
+
+
+
+def _initialise_persistent_belief(
+    evidence_buffer: EvidenceBuffer,
+    method: str | None,
+    belief_model: FactorLocalBeliefModel | None,
+    graph: GraphSpec,
+    device: torch.device | None,
+) -> None:
+    """Initialise cross-option factor belief state at episode start (P4)."""
+    if method not in {"aris_bellman", "flat_factor"}:
+        evidence_buffer.set_belief_hidden(None)
+        return
+    if belief_model is None or device is None:
+        raise ValueError("persistent belief requires belief_model and device for ARIS/flat methods")
+    with torch.no_grad():
+        hidden = belief_model.initial_hidden(1, graph.num_factors, device).squeeze(0)
+    evidence_buffer.set_belief_hidden(hidden.detach().cpu().numpy())
+
+
+def _advance_persistent_belief(
+    evidence_buffer: EvidenceBuffer,
+    method: str | None,
+    belief_model: FactorLocalBeliefModel | None,
+    graph: GraphSpec,
+    device: torch.device | None,
+    evidence_row: np.ndarray,
+) -> None:
+    """Transfer factor-belief hidden state after each primitive evidence row (P4)."""
+    if method not in {"aris_bellman", "flat_factor"}:
+        return
+    if belief_model is None or device is None:
+        raise ValueError("persistent belief update requires belief_model and device")
+    hidden_np = evidence_buffer.belief_hidden_snapshot()
+    if hidden_np is None:
+        _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
+        hidden_np = evidence_buffer.belief_hidden_snapshot()
+    if hidden_np is None:
+        raise ValueError("persistent belief initialisation failed")
+    with torch.no_grad():
+        graph_batch = _graph_tensors(graph, 1, device)
+        hidden = _tensor(hidden_np[None, ...], device)
+        row_np = np.asarray(evidence_row, dtype=np.float32)
+        evidence_t = _tensor(row_np[None, ...], device)
+        if row_np.ndim != 2 or row_np.shape[0] != graph.num_factors:
+            raise ValueError(
+                f"evidence_row must have shape [num_factors, {D_EVID}], got {row_np.shape}."
+            )
+        active_np = row_np[:, EVIDENCE_INDEX["evidence_present"]] > 0.0
+        active = torch.as_tensor(active_np[None, ...], dtype=torch.bool, device=device)
+        next_hidden = belief_model.step_history(
+            evidence_t,
+            hidden,
+            factor_features=graph_batch.get("factor_features"),
+            factor_mask=graph_batch["factor_mask"],
+            active_mask=active,
+        ).squeeze(0)
+    evidence_buffer.set_belief_hidden(next_hidden.detach().cpu().numpy())
+
 
 def _empty_event_summary() -> dict[str, Any]:
     return {
@@ -2561,7 +2857,6 @@ def _training_reward(
     event: Any,
     *,
     ego_contributed: bool = False,
-    partner_terminal_policy: str | None = None,
 ) -> float:
     # RC root-cause fix: the sparse term is the ego's actor-specific delivery
     # credit, not the shared team reward. With sparse_credit="team" (legacy
@@ -2575,7 +2870,6 @@ def _training_reward(
         team_sparse,
         event,
         ego_contributed=ego_contributed,
-        partner_terminal_policy=partner_terminal_policy,
         **{k: v for k, v in sparse_params.items() if k != "partner_terminal_policy"},
     )
     shaped_coef = float(config["training"].get("shaped_reward_coef", 0.0))
@@ -2645,6 +2939,8 @@ def _empty_metrics(method: str, graph: GraphSpec, output_dir: Path) -> dict[str,
         "option_selection_count": 0,
         "no_valid_option_count": 0,
         "forced_noop_count": 0,
+        "partner_option_evidence_policy": PARTNER_OPTION_EVIDENCE_POLICY,
+        "oracle_truth_main_path": False,
     }
 
 
@@ -2919,6 +3215,43 @@ def _normalize_training_stability_config(config: dict[str, Any]) -> None:
             "guard has no greedy-validation deliveries to check and would silently no-op."
         )
 
+    oracle_role_ablation = _as_bool(
+        train_cfg.get("oracle_role_conditioned_ablation", False),
+        "oracle_role_conditioned_ablation",
+    )
+    train_cfg["oracle_role_conditioned_ablation"] = oracle_role_ablation
+    if not oracle_role_ablation:
+        sparse_credit = str(train_cfg.get("sparse_credit", "team"))
+        if sparse_credit == "role_contrib_team":
+            raise ValueError(
+                "P5: sparse_credit='role_contrib_team' branches on true "
+                "partner terminal_policy and is allowed only under "
+                "training.oracle_role_conditioned_ablation=true, not in the "
+                "main black-box method path."
+            )
+        role_exploration = train_cfg.get("role_exploration") or {}
+        if bool(role_exploration.get("enabled", False)):
+            raise ValueError(
+                "P5: training.role_exploration.enabled=true is a true-role "
+                "curriculum and is allowed only under "
+                "training.oracle_role_conditioned_ablation=true."
+            )
+        role_replay_seed = train_cfg.get("role_replay_seed") or {}
+        if bool(role_replay_seed.get("enabled", False)):
+            raise ValueError(
+                "P5: training.role_replay_seed.enabled=true is a true-role "
+                "seeded-replay ablation and is allowed only under "
+                "training.oracle_role_conditioned_ablation=true."
+            )
+        terminal_replay_seed = train_cfg.get("terminal_replay_seed") or {}
+        if bool(terminal_replay_seed.get("enabled", False)):
+            raise ValueError(
+                "P5: training.terminal_replay_seed.enabled=true seeds replay by a "
+                "named terminal-policy partner and is allowed only under "
+                "training.oracle_role_conditioned_ablation=true, not in the main "
+                "black-box method path."
+            )
+
 
 def _checkpoint_policy(config: dict[str, Any]) -> dict[str, Any]:
     train_cfg = config["training"]
@@ -3007,6 +3340,14 @@ def _noop_option_id(option_lib: OCV2OptionLibrary) -> int:
 
 def _obs_vector(obs: dict[str, np.ndarray], agent_key: str) -> np.ndarray:
     return np.asarray(obs[agent_key], dtype=np.float32)
+
+
+def _optional_tensor(value: Any, device: torch.device) -> torch.Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, list) and all(item is None for item in value):
+        return None
+    return _tensor(value, device)
 
 
 def _tensor(value: Any, device: torch.device) -> torch.Tensor:

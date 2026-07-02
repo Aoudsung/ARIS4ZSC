@@ -95,7 +95,7 @@ training:
   # the replay distribution, not the loss: seeded rows are ordinary OptionTransition
   # samples trained with the same TD objective as online experience.
   terminal_replay_seed:
-    enabled: true
+    enabled: false  # P5: main path must not seed replay by named terminal-policy partner
     partner: terminal-yield
     target_ego_serves: 64
     max_episodes: 100

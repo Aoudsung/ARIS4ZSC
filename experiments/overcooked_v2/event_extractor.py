@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -31,7 +31,8 @@ from .sparse_credit import (  # noqa: F401
 )
 
 GridPos = tuple[int, int]
-EVENT_SEMANTICS_VERSION = 2
+EVENT_SEMANTICS_VERSION = 3
+PARTNER_OPTION_EVIDENCE_POLICY = "behavior_inferred_v1"
 
 _MOVE_ACTIONS = {
     int(Actions.right),
@@ -53,9 +54,14 @@ class OCV2Event:
     partner_inventory_after: int
     ego_action: int
     partner_action: int
+    # Behavior-observable partner-option evidence. The scripted partner's true
+    # option label/dist must never be passed here on the formal train/eval/CE
+    # path (P1). Sources allowed on the main path are heuristic/classifier
+    # inferencers that consume only primitive actions and state/event deltas.
     partner_option: int | None
     partner_option_dist: np.ndarray | None
     partner_option_confidence: float
+    partner_option_source: str
     ego_waited: bool
     partner_waited: bool
     ego_interacted: bool
@@ -99,6 +105,8 @@ def extract_event(
     info: dict[str, Any],
     partner_option: int | None,
     partner_option_dist: np.ndarray | None,
+    partner_option_confidence: float | None = None,
+    partner_option_source: str = "none",
 ) -> OCV2Event:
     ego_action = int(ego_action)
     partner_action = int(partner_action)
@@ -146,7 +154,9 @@ def extract_event(
         inventory_after=partner_inventory_after,
         interacted=partner_interacted,
     )
-    correct_delivery = bool(np.asarray(next_state.new_correct_delivery).item())
+    correct_delivery = bool(
+        np.asarray(getattr(next_state, "new_correct_delivery", False)).item()
+    )
     delivery_event = bool(ego_delivery_event or partner_delivery_event or correct_delivery)
     wrong_delivery_event = bool(delivery_event and not correct_delivery)
     ego_correct_delivery = bool(ego_delivery_event and correct_delivery)
@@ -212,10 +222,12 @@ def extract_event(
         partner_option_dist=(
             None if partner_option_dist is None else np.asarray(partner_option_dist)
         ),
-        partner_option_confidence=_partner_option_confidence(
-            partner_option,
-            partner_option_dist,
+        partner_option_confidence=(
+            float(partner_option_confidence)
+            if partner_option_confidence is not None
+            else _partner_option_confidence(partner_option, partner_option_dist)
         ),
+        partner_option_source=str(partner_option_source),
         ego_waited=ego_waited,
         partner_waited=partner_waited,
         ego_interacted=ego_interacted,
@@ -245,6 +257,45 @@ def extract_event(
         plate_picked=plate_picked,
         soup_picked=soup_picked,
         correct_delivery=correct_delivery,
+    )
+
+
+def with_partner_option_evidence(event: OCV2Event, partner_action: Any) -> OCV2Event:
+    """Return ``event`` with behavior-inferred partner-option evidence attached.
+
+    P1/NEW-G3 repair boundary: this helper accepts inferred/classifier/
+    heuristic evidence only. If a caller accidentally passes scripted, oracle,
+    protocol, terminal-policy, or otherwise true-label-derived evidence, the
+    partner-option fields are blocked rather than moved into the main evidence
+    channel.
+    """
+    source = str(getattr(partner_action, "source", "inferred"))
+    lowered = source.lower()
+    blocked_tokens = (
+        "oracle",
+        "scripted",
+        "protocol",
+        "terminal_policy",
+        "partner_action",
+        "true",
+    )
+    if any(token in lowered for token in blocked_tokens):
+        return replace(
+            event,
+            partner_option=None,
+            partner_option_dist=None,
+            partner_option_confidence=0.0,
+            partner_option_source="blocked_oracle_like",
+        )
+
+    dist = getattr(partner_action, "option_dist", None)
+    option_id = getattr(partner_action, "option_id", None)
+    return replace(
+        event,
+        partner_option=None if option_id is None else int(option_id),
+        partner_option_dist=None if dist is None else np.asarray(dist, dtype=np.float32),
+        partner_option_confidence=float(getattr(partner_action, "option_confidence", 0.0)),
+        partner_option_source=source,
     )
 
 
@@ -389,8 +440,11 @@ def _partner_option_confidence(
         dist = np.asarray(partner_option_dist, dtype=float)
         if dist.size:
             return float(np.max(dist))
+    # A bare option id without an explicit distribution/confidence is not treated
+    # as a certain observation. Formal paths provide an inferred distribution or
+    # confidence; diagnostic true labels must not call this helper as evidence.
     if partner_option is not None:
-        return 1.0
+        return 0.0
     return 0.0
 
 
