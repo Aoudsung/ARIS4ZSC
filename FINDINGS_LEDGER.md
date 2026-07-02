@@ -284,3 +284,27 @@ F4（vacuous 通道）、F5（router 纵深防御备注）、F6（presence-bit �
 F13（窗口消融→已列入 E3）、F14（→由 R2.1 certificate 覆盖）、W8（下轮 codex 复核）。
 
 **Phase 0 完成。下一步 = Phase 1（远程基础设施验证 R1.1–R1.3），需用户授权远程执行。**
+
+---
+
+## Phase 1 执行记录（2026-07-03 凌晨，远程已授权）
+
+**R1.1 ✅ R1.2 ✅ R1.3 ✅ — Phase 1 GREEN**（细节见 EXPERIMENT_LOG.md Phase 1 段）。
+
+要点：六项完整性旗全绿（`reward_scale_verified=true` 首次真实验证通过——S18 死旗复活）；
+P3 sidecar 与覆盖门在真实运行中按设计工作（覆盖门两次正确 fail-closed）；NEW-2 历史审计
+155 个 metrics 扫描 → 3 个 guard-fail 幸存 checkpoint（全部 6/29 results_rcfix 时代，无结论
+污染，已就地 QUARANTINE 标记）。
+
+**Phase 1 新发现（登记）**：
+- **R1-A（正式链路口径，重要）**：train 的 `graph_path` 分支在 train_aris:884 **无条件**跑覆盖
+  门（对正式跑是正确行为）；`ce_path` 分支才受 `graph.require_task_stage_coverage` 控制，且
+  走 sidecar 合并元数据（无 5 个 provenance 哈希 → S24 legacy 警告路径）。**规定：正式跑一律
+  用 pipeline 产出的 graph.json（graph_path 分支）+ 覆盖完整图；ce_path+覆盖关 仅限冒烟。**
+  已写入 CHAIN_PLAN §10 执行卡。
+- **R1-B（可行性）**：CPU-JAX 下 eval 是墙钟大头（≈163s/ep 含参照基线摊销），E1 评估需两段式
+  + 并行化（CHAIN_PLAN §9）。
+- **R1-C（管线增强候选，非必需）**：run_ce_pipeline 无 replay 复用开关，重估计必重采集；
+  R2.2 大样本探针按此计入预算，或加 `--replay_path` 复用（小改，待定 wontfix/defer）。
+- **E2/E3 前置小实现（已在 §10 执行卡登记）**：E2 需 eval 侧"推断通道置零"模式开关；
+  E3 需 `training.belief_persistence` 开关（window 臂只改 config 即可）。

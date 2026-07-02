@@ -527,3 +527,18 @@ E3: window-4 / window-8 / persistent-hidden (main), 3 seeds each.
 | Only persistent improves repeat-failure held-out cases | P4 mechanism claim SUPPORTED |
 | No difference | held-out failure was substrate/distribution — mechanism claim stays unproven; do not claim accumulation |
 
+
+### 18.8 Amendments (2026-07-03, post-Phase-1 feasibility calibration; append-only)
+
+1. **sec18.6 power precheck (amends the "all four ≈" row):** with 5 seeds only large
+   effects (d≳1.8 @ 80% power) are detectable. Before reading "all four ≈" as a null,
+   apply: **CI overlap with consistent ordering across seeds → run +5 seeds once and
+   re-adjudicate; only a second overlap permits the null reading.** CI
+   operationalization: seed-level bootstrap 95% (10k resamples) or Mann-Whitney U.
+2. **sec18.7 E2 zeroed-mode integrity note:** the zeroed-channel ablation eval must
+   record `evidence_policy=behavior_inferred_v1_zeroed_ablation` (explicit mode) so
+   the S17 hard gate can admit it without weakening the formal-path check.
+3. **Formal-path rule (Phase-1 finding R1-A):** formal runs consume the pipeline
+   `graph.json` via the `graph_path` branch (unconditional coverage gate + stamped
+   provenance). The `ce_path` branch with `require_task_stage_coverage=false` is
+   smoke-only and must never appear in a formal config.
