@@ -126,8 +126,12 @@ def estimate_reference_base_gap_proxy(
     seed: int = 0,
     gamma: float = 0.99,
     horizon_options: int = 5,
+    cost_per_step: float = 1.0,
     cost_coef: float = 1.0,
     shaped_reward_coef: float = 0.0,
+    credit_params: dict[str, Any] | None = None,
+    terminal_progress: dict[str, Any] | None = None,
+    exclude_terminal_progress_from_reward_sum: bool = False,
 ) -> dict[str, Any]:
     rows = collect_option_replay(
         env,
@@ -139,8 +143,12 @@ def estimate_reference_base_gap_proxy(
         seed=seed,
         gamma=gamma,
         horizon_options=horizon_options,
+        cost_per_step=cost_per_step,
         cost_coef=cost_coef,
         shaped_reward_coef=shaped_reward_coef,
+        credit_params=credit_params,
+        terminal_progress=terminal_progress,
+        exclude_terminal_progress_from_reward_sum=exclude_terminal_progress_from_reward_sum,
     )
     return _partner_return_stats(rows)
 
@@ -237,8 +245,14 @@ def _partner_return_proxy_stats(
         seed=int(_cfg(config, "diagnostics.seed", 0)),
         gamma=gamma,
         horizon_options=horizon_options,
+        cost_per_step=float(_cfg(config, "training.cost_per_step", 1.0)),
         cost_coef=cost_coef,
         shaped_reward_coef=shaped_reward_coef,
+        credit_params=sparse_credit_params(config.get("training")),
+        terminal_progress=terminal_progress_params(config.get("training")),
+        exclude_terminal_progress_from_reward_sum=bool(
+            _cfg(config, "graph.sparse_ce_support", False)
+        ),
     )
 
 
