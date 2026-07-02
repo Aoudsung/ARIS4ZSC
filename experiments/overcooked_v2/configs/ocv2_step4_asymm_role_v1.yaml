@@ -143,7 +143,13 @@ training:
       - drop_item_to_counter
     seed_updates: 600
     seed_batch_size: 8
-  require_ego_delivery_selection: false
+  # G0.2 (FINDINGS_LEDGER D-A, 2026-07-02): guard checks that terminal COMPETENCE
+  # exists (>=1 ego-sole correct delivery across mixed-partner greedy validation,
+  # which yield-partners guarantee for a correct adaptive policy). It does NOT
+  # require the ego to serve against every partner, so it never rejects correct
+  # role-adaptive behavior; it only rejects the observed always-prep collapse.
+  # Do not flip back to false without a recorded ledger decision.
+  require_ego_delivery_selection: true
   require_preflight_accepted: true
   total_updates: 5000
   updates_per_transition: 8
