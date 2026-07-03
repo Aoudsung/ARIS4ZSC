@@ -52,6 +52,17 @@
 - **伪影自检**：max-opt=40 探针曾误报 bottleneck/held-out compl=0（伪影，80 opt 下 fsm=1.0 全部完成）→ 已修正解读。ingredient-far-yield fsm=0.0 但 rand=1.0 = FSM-ego 确定性盲点（探针质量注记，非基底问题）。
 - **sec18.4 分支命中**："Distinguishable on a factor subset only → Narrow: re-cut train/held-out along the distinguishable subset"（差异化真、但可容许判别子集需重划 split）。**非干净 PASS→E1；需用户裁决 split/layout**（fork 决策，Type-B）。R2.2（serving CE 是否真非零）将决定 asymm 能否测推断 vs 仅导航。
 
+### 2026-07-03 R2.1b — 吞吐口径 4 布局横扫 + sanity（sec18.9）
+- 脚本: `scripts/rc2b_throughput_certificate.py`（新）· config: `ocv2_step4_asymm_role_v1.yaml`（正扫）+ `_tmp_sanity_v2.yaml`（sanity, 已清）
+- 产物: `review_bundles/phase2_R2.1_certificate_20260703/{throughput_certificate.json, throughput_sanity_cramped_debug.json, *.log}`
+- **正扫结果（4 布局 × 8 伙伴 × 3 seeds × 5 ep × 3 policies = 1440 ep）：0 admit**——但数据反常：
+  - `rand_tp > fsm_tp` 广泛出现（asymm/server-*: rand=9.07 vs fsm=1.0）——物理上 FSM 必赢或平手，倒挂说明 FSM 在**争抢终端**
+  - forced_coord/coord_ring 几乎全 0 → sec18.9.4 判读表兜底命中："probe budget too small → escalate, do NOT flip verdict"（先怀疑参数）
+- **Sanity（cramped_room × v2 × debug executor: `force_path_planning=false`, `max_option_steps=6`, 2 seeds × 3 ep）：** 8 伙伴 **fsm_tp 全 0**，rand_tp 0.17–1.00，ponly_tp 全 0。**这排除了 executor 参数假说**。
+- **核心诊断（重要发现）**：R2.1 探针的"FSM 是称职 ego"假设**不适配 v2**。FSM 是刚性 inventory-based pipeline，对 partner role/位置无感；v2 partners 是 role-aware（yield/claim/handoff），需要 role-aware ego 才能协调。FSM 与 partner 争抢终端 → 拖累吞吐 → 探针拒绝任何 substrate。**这是探针失败，非 substrate 失败**。
+- **同时收获的正面信号**：cramped × v2 上 **ponly_tp 全 0 across all partners**（v2 partners 不能 solo，与 asymm 完全不同），但 rand ego 存在时能促成送餐——说明 cramped × v2 上 **ego 是必要的**，只是 FSM 太笨。这个信号 asymm 上没有（asymm/server-*: ponly=1.0 solo）。
+- **R2.1 探针框架结论**：sec18.4/18.9 的"FSM-oracle admissibility"路径**无法通过 v2**——不因 substrate，因探针方法论。差异化 PASS 是稳固信号（v2 有真实行为多样性），但 admissibility 需换探针（role-aware oracle）或换判据（训练本身作为 admissibility test，即 E1 本身）。
+
 ## Phase 3 — 决定性实验（E1 四臂去 oracle 重跑 · E2 通道消融 · E3 持久化消融）
 
 *(待运行)*

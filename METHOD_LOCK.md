@@ -611,3 +611,61 @@ supplement. Whether to replace it (v2.1) or drop it stays a governance decision
   archival-obligation for P3 sentinel and CE estimand discipline. If asymm is
   demoted, R2.2 collapses in scope but should still be run on whichever layout E1
   chooses, since CE support underlies P3 for ALL bases.
+
+## sec18.10 R2.1 probe methodology revision — E1 as decisive admissibility test (2026-07-03)
+
+Append-only. sec18.9 preregistered a throughput lens on top of the completion
+lens; the 2026-07-03 sweep showed both lenses fail on v2 partners for a subtler
+reason: `rand_throughput > fsm_throughput` on multiple (asymm/cramped) cells,
+which is physically impossible for a competent oracle ego. Root cause: the
+FSM ego (state-based inventory pipeline) is not role-aware; v2 partners are
+role-aware (yield/claim/handoff); FSM contests the terminal with partners
+whose role expects them to serve, dropping throughput below random-ego (which
+sometimes stays out of the way).
+
+The failure is METHODOLOGICAL, not substrate: the R2.1 differentiation probe
+PASSED cleanly (2/2 axes, 27/28 pairs distinguishable), and the cramped×v2
+sanity showed `ponly_throughput=0` across all partners (v2 partners are NOT
+partner-solo on cramped, unlike asymm/server-*). The substrate has both
+diversity AND ego-necessity signals; only the FSM-based admissibility gate
+cannot register them.
+
+### 18.10.1 Decision (user-approved, 2026-07-03)
+- ABANDON the FSM-oracle admissibility gate for v2 partners. Do NOT design a
+  role-aware oracle probe — it would need to read `partner.protocol.terminal_policy`
+  and thereby violate P5 in spirit even if isolated to the probe.
+- USE E1 ITSELF as the decisive admissibility test. This is admitted because
+  Phase-1 fixed the eval-integrity gates (I10-I17) that previously masked
+  substrate quality, and the four arms + partner_id_q reference now form a
+  self-diagnostic instrument.
+- The R2.1 differentiation certificate (already PASSED) remains the ONLY R2.1
+  precondition for E1.
+
+### 18.10.2 E1 admissibility read (preregistered, added to sec18.6)
+E1 outputs a substrate admissibility verdict as a BY-PRODUCT of its own
+readings, using the arms and the partner_id_q reference already in the
+preregistered design:
+
+| E1 signal | Substrate admissibility conclusion |
+|---|---|
+| base_only reaches `ego_correct_completion_rate >= 0.9` on held-out | Substrate is NOT ZSC-discriminative (base solves without any belief/routing). Record as diagnostic; do not claim ARIS advantage regardless of relative ordering. |
+| partner_id_q strongly separates from ARIS/flat/base | An oracle information gap exists → belief-inference is genuinely required → substrate is admissible for ARIS-claim reading. |
+| partner_id_q ≈ ARIS ≈ flat ≈ base | Substrate provides no information gap → not admissible for the inference-claim reading, but sec18.6 rows still apply to routing/simplicity claims. |
+| Any arm exhibits `oracle_source_count > 0` or `reward_scale_verified=false` | ineligible; do not read (I10-I17 gate enforces this). |
+
+The four-arm read replaces the FSM-oracle admissibility read of sec18.4/18.9.
+Both prior R2.1 certificates stay archived as historical context; they do NOT
+gate E1.
+
+### 18.10.3 R2.2 scope collapse
+sec18.5 asymm CE support probe is REDUCED to an archival P3-sentinel run
+(≤300 ep/partner, one seed, ≈45 min) executed AFTER E1 to close the "is
+serve_soup CE below-support-sentinel vs measured-zero" question permanently.
+It is NOT a fork gate anymore. If E1 renders a verdict, the fork is
+already resolved.
+
+### 18.10.4 What did not change
+- The R2.1 differentiation gate must still PASS before E1 (it did).
+- All E1 integrity flags (I10-I17) still hard-block reading. Nothing in this
+  revision weakens those.
+- sec18.9 stays on file as a completed but methodologically superseded gate.
