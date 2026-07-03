@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from experiments.overcooked_v2.ce_sampler import (
     collect_option_replay,
     estimate_empirical_ce_with_support,
+    load_replay_npz,
     option_kind_stats,
     refine_empirical_ce,
     replay_coverage,
@@ -196,25 +197,48 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  {opt.id}: {opt.kind}")
 
     ep_per_partner = int(args.episodes_per_partner)
-    print(f"\n=== Phase 2: CE Collect ({ep_per_partner} episodes × {len(partners)} partners, sequential) ===")
-    rows = collect_option_replay(
-        env,
-        partners,
-        lib,
-        layout_name=layout,
-        episodes=ep_per_partner,
-        max_options_per_episode=ce_max_options_per_episode,
-        seed=int(args.seed),
-        gamma=ce_gamma,
-        horizon_options=ce_horizon,
-        cost_per_step=cost_per_step,
-        cost_coef=cost_coef,
-        shaped_reward_coef=shaped_reward_coef,
-        credit_params=credit_params,
-        terminal_progress=terminal_progress_cfg,
-        exclude_terminal_progress_from_reward_sum=bool(args.sparse_ce_support),
-    )
-    print(f"Collected {len(rows)} option replay rows")
+    if args.reuse_replay:
+        reuse_path = Path(args.reuse_replay)
+        print(f"\n=== Phase 2: REUSE Replay ({reuse_path}) ===")
+        rows, prior_meta = load_replay_npz(reuse_path)
+        # Compatibility guard: reward objective + partners must match the current
+        # config, otherwise we would silently be running eta/min_weight tests
+        # against a replay from a different substrate. Fail loudly instead.
+        prior_partners = tuple(prior_meta.get("partners", ()) or ())
+        current_partners = tuple(p.name for p in partners)
+        if prior_partners and prior_partners != current_partners:
+            raise SystemExit(
+                f"reuse_replay partners {prior_partners} do not match config partners "
+                f"{current_partners}. Rerun collection or align the config."
+            )
+        prior_credit = str(prior_meta.get("sparse_credit", "team"))
+        current_credit = str((reward_metadata or {}).get("sparse_credit", "team"))
+        if prior_credit != current_credit:
+            raise SystemExit(
+                f"reuse_replay sparse_credit {prior_credit!r} != config {current_credit!r}. "
+                "CE reward objective mismatch; rerun collection."
+            )
+        print(f"Reused {len(rows)} option replay rows (from {reuse_path.parent.name})")
+    else:
+        print(f"\n=== Phase 2: CE Collect ({ep_per_partner} episodes × {len(partners)} partners, sequential) ===")
+        rows = collect_option_replay(
+            env,
+            partners,
+            lib,
+            layout_name=layout,
+            episodes=ep_per_partner,
+            max_options_per_episode=ce_max_options_per_episode,
+            seed=int(args.seed),
+            gamma=ce_gamma,
+            horizon_options=ce_horizon,
+            cost_per_step=cost_per_step,
+            cost_coef=cost_coef,
+            shaped_reward_coef=shaped_reward_coef,
+            credit_params=credit_params,
+            terminal_progress=terminal_progress_cfg,
+            exclude_terminal_progress_from_reward_sum=bool(args.sparse_ce_support),
+        )
+        print(f"Collected {len(rows)} option replay rows")
 
     # Coverage check
     coverage = replay_coverage(rows, lib.options)
@@ -479,6 +503,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--allow_incomplete_graph", action="store_true")
     parser.add_argument("--episodes-per-partner", dest="episodes_per_partner", type=int, default=100)
+    parser.add_argument(
+        "--reuse_replay",
+        default=None,
+        help="Reuse an existing replay.npz (from a prior pipeline run) instead of "
+        "re-collecting. Skips Phase 2 collection and reads the saved rows. Use to "
+        "cheaply re-run estimation/graph-build with different eta/min_weight/config "
+        "flags. Ledger: R1-C follow-up (was 'wontfix/defer' — enabled by demand).",
+    )
     parser.add_argument(
         "--require_task_stage_coverage",
         dest="require_task_stage_coverage",
