@@ -90,8 +90,14 @@ class OCV2EvidenceRouter:
         graph: GraphSpec,
         cell_to_entity: dict[GridPos, str],
         region_cells: dict[str, list[GridPos]],
+        evidence_policy: str = "behavior_inferred_v1",
     ):
         self.graph = graph
+        # E2 ablation: the policy string the eval integrity gate keys on. Default is
+        # the formal-path value; the zeroed-channel ablation sets
+        # "behavior_inferred_v1_zeroed_ablation" (METHOD_LOCK sec18.8) so the gate can
+        # admit it without weakening the real-path checks.
+        self._evidence_policy = str(evidence_policy)
         self.cell_to_entity = dict(cell_to_entity)
         self.region_cells = {
             region_id: [tuple(cell) for cell in cells]
@@ -118,6 +124,7 @@ class OCV2EvidenceRouter:
             "missing_count": 0,
             "boundary_annotation_count": 0,
             "oracle_source_count": 0,
+            "zeroed_count": 0,
             "total_count": 0,
         }
         self._validate_factor_refs()
@@ -130,12 +137,13 @@ class OCV2EvidenceRouter:
         total = max(1, int(counts["total_count"]))
         return {
             **counts,
-            "evidence_policy": "behavior_inferred_v1",
+            "evidence_policy": self._evidence_policy,
             "oracle_stripped": True,
             "observed_dist_rate": float(counts["observed_dist_count"] / total),
             "inferred_option_rate": float(counts["inferred_option_count"] / total),
             "missing_rate": float(counts["missing_count"] / total),
             "oracle_source_rate": float(counts["oracle_source_count"] / total),
+            "zeroed_rate": float(counts["zeroed_count"] / total),
         }
 
     def route(
@@ -328,6 +336,17 @@ class OCV2EvidenceRouter:
         source = source_raw.lower()
         if source == "boundary_failure_annotation":
             self._partner_option_evidence_counts["boundary_annotation_count"] += 1
+            return
+        if source == "zeroed_partner_option" and (
+            current_partner_option is None and partner_option_dist is None
+        ):
+            # E2 ablation: intentionally-withheld option intent. Count it distinctly so
+            # the eval gate does NOT read it as `missing_count` (which is a hard fail).
+            # Guard (review fix): only trust the zeroed label when the payload really is
+            # empty. A "zeroed" event that still carries an option id/dist is an
+            # inconsistency — fall through so it lands in observed_dist_count and the
+            # hard gate catches it, rather than being silently excused.
+            self._partner_option_evidence_counts["zeroed_count"] += 1
             return
         oracle_like = (
             "oracle" in source

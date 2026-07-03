@@ -23,12 +23,26 @@ class PartnerOptionInferencer:
         temperature: float = 1.0,
         classifier_checkpoint: str | None = None,
         allow_heuristic: bool = False,
+        mode: str = "inferred",
     ):
         self.option_library = option_library
         self.temperature = temperature
         self.belief: np.ndarray | None = None
         self.classifier: PartnerOptionClassifier | None = None
         self.allow_heuristic = bool(allow_heuristic)
+        # E2 ablation (EXPERIMENT_CHAIN_PLAN §10.4, METHOD_LOCK sec18.7): "zeroed"
+        # emits no option-level intent, only the observable primitive action, so the
+        # partner_option_* evidence channels go neutral. Default "inferred" is the
+        # normal behavior-inference path. This is an EVAL-ONLY ablation knob.
+        self.mode = str(mode)
+        if self.mode not in {"inferred", "zeroed"}:
+            raise ValueError(
+                f"PartnerOptionInferencer.mode must be 'inferred' or 'zeroed', got {mode!r}."
+            )
+        if self.mode == "zeroed":
+            # A zeroed inferencer never consults a classifier/heuristic, so skip the
+            # (potentially checkpoint-requiring) construction path entirely.
+            return
         if classifier_checkpoint is not None:
             self.classifier = load_partner_option_classifier(classifier_checkpoint)
         elif not self.allow_heuristic:
@@ -48,6 +62,18 @@ class PartnerOptionInferencer:
         next_state: Any,
         event: Any,
     ) -> PartnerAction:
+        if self.mode == "zeroed":
+            # E2: keep the observable primitive action; withhold all option-level
+            # intent. option_id=None / option_dist=None make the router's
+            # partner_option_* channels resolve to 0.0 (same neutral state as the
+            # oracle-stripped path), and `source` tags it for the eval integrity gate.
+            return PartnerAction(
+                primitive_action=int(primitive_action),
+                option_id=None,
+                option_confidence=0.0,
+                option_dist=None,
+                source="zeroed_partner_option",
+            )
         if self.classifier is not None:
             option_id, confidence, dist = classifier_action(self.classifier, event)
             self.belief = dist.copy()
@@ -174,6 +200,8 @@ def _normalize(values: np.ndarray) -> np.ndarray:
 def make_behavior_option_inferencer(
     option_library: Any,
     config: dict[str, Any] | None = None,
+    *,
+    require_inferred: bool = False,
 ) -> PartnerOptionInferencer:
     """Construct the single train/eval/CE partner-option evidence source.
 
@@ -181,11 +209,23 @@ def make_behavior_option_inferencer(
     terminal policy, or scripted true option label. The default heuristic consumes
     only primitive partner action, state deltas, validity, and extracted event
     features inside :meth:`PartnerOptionInferencer.update`.
+
+    E2 (review BLOCK fix): the ``zeroed`` ablation is EVAL-ONLY. Callers on the
+    training/CE path pass ``require_inferred=True`` so that a config which sets
+    ``mode: zeroed`` FAILS LOUDLY here rather than silently zeroing the partner-option
+    channels during training (a silent experiment-condition override).
     """
     cfg = ((config or {}).get("evidence", {}) or {}).get("partner_option_inference", {}) or {}
+    mode = str(cfg.get("mode", "inferred"))
+    if require_inferred and mode != "inferred":
+        raise ValueError(
+            "partner_option_inference.mode must be 'inferred' on the training/CE path; "
+            f"the {mode!r} ablation is eval-only (E2, METHOD_LOCK sec18.7)."
+        )
     return PartnerOptionInferencer(
         option_library,
         temperature=float(cfg.get("temperature", 1.0)),
         classifier_checkpoint=cfg.get("classifier_checkpoint"),
         allow_heuristic=bool(cfg.get("allow_heuristic", True)),
+        mode=mode,
     )

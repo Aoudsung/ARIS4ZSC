@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, replace
@@ -40,7 +41,12 @@ from experiments.overcooked_v2.option_inferencer import (
 )
 from experiments.overcooked_v2.options import OCV2OptionLibrary
 from experiments.overcooked_v2.partner_pool import make_training_partners
-from experiments.overcooked_v2.provenance import runtime_provenance
+from experiments.overcooked_v2.provenance import (
+    reward_config_payload,
+    runtime_provenance,
+    sha256_file,
+    sha256_json,
+)
 from experiments.overcooked_v2.reward_design import ContributionLedger
 from experiments.overcooked_v2.state_utils import (
     agent_facing_pos, get_agent_pos, get_inventory,
@@ -49,6 +55,7 @@ from experiments.overcooked_v2.state_utils import (
 from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
 from experiments.overcooked_v2.train_aris import (
     _advance_persistent_belief,
+    _belief_persistence_enabled,
     _build_belief_model,
     _build_env,
     _build_option_lib,
@@ -187,12 +194,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 result["factor_deletion_return_drop"] = result["rollout_factor_mask"]
             results.append(result)
 
+    baseline_cache_dir = _resolve_baseline_cache_dir(args)
     baselines = _random_baselines(
         contexts[0],
         partner_names,
         episodes=int(args.episodes),
         seed=seed + 200_000,
         max_episode_options=max_episode_options,
+        cache_dir=baseline_cache_dir,
     )
     external_references = None
     if args.reference_base_checkpoint or args.reference_ref_checkpoint:
@@ -207,6 +216,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             episodes=int(args.episodes),
             seed=seed + 600_000,
             max_episode_options=max_episode_options,
+            cache_dir=baseline_cache_dir,
         )
         _attach_external_reference_gaps(results, external_references)
     else:
@@ -285,6 +295,26 @@ def _load_context(checkpoint_path: Path, variant: str) -> EvalContext:
     )
 
 
+def _evidence_policy_for_config(config: dict[str, Any]) -> str:
+    """E2: derive the evidence-policy string the router stamps and the gate checks.
+
+    `evidence.partner_option_inference.mode == "zeroed"` ⇒ the zeroed-channel ablation
+    policy (METHOD_LOCK sec18.8); anything else ⇒ the formal behavior-inferred policy.
+    Kept in one place so the router-stamped string and the gate's admitted set cannot
+    drift apart.
+    """
+    mode = str(
+        ((config or {}).get("evidence", {}) or {})
+        .get("partner_option_inference", {})
+        .get("mode", "inferred")
+    )
+    return (
+        "behavior_inferred_v1_zeroed_ablation"
+        if mode == "zeroed"
+        else "behavior_inferred_v1"
+    )
+
+
 def _evaluate_partner(
     ctx: EvalContext,
     partner_name: str,
@@ -304,6 +334,7 @@ def _evaluate_partner(
         graph_override,
         ctx.layout_graph.cell_to_entity,
         ctx.layout_graph.region_cells,
+        evidence_policy=_evidence_policy_for_config(ctx.config),
     )
     partners = {partner.name: partner for partner in make_training_partners(
         ctx.option_lib,
@@ -367,7 +398,8 @@ def _run_episode(
     partner_option_inferencer = make_behavior_option_inferencer(ctx.option_lib, ctx.config)
     partner_option_inferencer.reset(state0)
     _initialise_persistent_belief(
-        evidence_buffer, ctx.method, ctx.belief_model, graph, torch.device("cpu")
+        evidence_buffer, ctx.method, ctx.belief_model, graph, torch.device("cpu"),
+        _belief_persistence_enabled(ctx.config),
     )
     contribution_ledger = ContributionLedger.from_config(
         ctx.config.get("training", {})
@@ -590,6 +622,7 @@ def _execute_eval_option(
             graph,
             torch.device("cpu"),
             x_f,
+            _belief_persistence_enabled(ctx.config),
         )
         blocking_events += int(bool(event.collision_or_block))
         if getattr(ctx, "trace_steps", None) is not None and (
@@ -665,6 +698,7 @@ def _execute_eval_option(
             graph,
             torch.device("cpu"),
             x_fail,
+            _belief_persistence_enabled(ctx.config),
         )
 
     if collect_diagnostics:
@@ -1055,6 +1089,133 @@ def _factor_deletion_q_proxy(ctx: EvalContext) -> dict[int, float]:
     return drops
 
 
+_ENV_CACHE_KEYS = (
+    "max_steps",
+    "agent_view_size",
+    "negative_rewards",
+    "sample_recipe_on_delivery",
+    "random_reset",
+    "random_agent_positions",
+    "force_path_planning",
+)
+
+
+# Option-runtime config that changes valid options / budgets / termination and
+# therefore rollout returns (review BLOCK fix — was missing from the key).
+_OPTIONS_CACHE_KEYS = (
+    "max_option_steps",
+    "strict_preconditions",
+    "dynamic_budget",
+    "block_patience",
+)
+# Bump when the key scheme or entry shape changes so stale valid-JSON entries from
+# an older code version are rejected rather than trusted (review MEDIUM fix).
+_BASELINE_CACHE_SCHEMA = 2
+
+
+def _baseline_env_payload(config: dict[str, Any]) -> dict[str, Any]:
+    """The subset of config that changes a reference/random rollout's outcome."""
+    env_cfg = (config or {}).get("env", {}) or {}
+    opt_cfg = (config or {}).get("options", {}) or {}
+    return {
+        "env": {k: env_cfg.get(k) for k in _ENV_CACHE_KEYS},
+        "options": {k: opt_cfg.get(k) for k in _OPTIONS_CACHE_KEYS},
+        "reward_config": reward_config_payload(config or {}),
+        "partner_set": str(
+            ((config or {}).get("training", {}) or {}).get("partner_set", "standard7")
+        ),
+    }
+
+
+def _baseline_cache_target(
+    cache_dir: Path | None,
+    *,
+    kind: str,
+    layout: str,
+    config: dict[str, Any],
+    partner: str,
+    episodes: int,
+    seed: int,
+    max_episode_options: int,
+    extra: Any = None,
+) -> tuple[Path | None, str | None]:
+    """(path, key) for a checkpoint-independent baseline rollout.
+
+    Key covers everything that determines the result: kind, layout, the env/options/
+    reward config subset, partner_set, partner, episodes, max_episode_options, seed.
+    `extra` carries reference-checkpoint hashes for the external variant (which IS
+    checkpoint-dependent). Returns (None, None) when caching is disabled.
+    """
+    if cache_dir is None:
+        return None, None
+    key = sha256_json(
+        {
+            "schema": _BASELINE_CACHE_SCHEMA,
+            "kind": kind,
+            "layout": layout,
+            "config": _baseline_env_payload(config),
+            "partner": partner,
+            "episodes": int(episodes),
+            "max_episode_options": int(max_episode_options),
+            "seed": int(seed),
+            "extra": extra,
+        }
+    )
+    return cache_dir / f"{kind}_{key}.json", key
+
+
+def _resolve_baseline_cache_dir(args: argparse.Namespace) -> Path | None:
+    """Cache dir for baseline rollouts: explicit --baseline_cache_dir, 'none' to
+    disable, or default <output_dir>/.baseline_cache."""
+    raw = getattr(args, "baseline_cache_dir", None)
+    if raw is not None and str(raw).lower() == "none":
+        return None
+    cache_dir = Path(raw) if raw else (Path(args.output).parent / ".baseline_cache")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _read_baseline_cache(path: Path | None, expected_key: str | None) -> dict[str, Any] | None:
+    """Return the cached value only if the file parses, matches the current schema,
+    and its embedded key equals the expected key (defends against corrupt/partial
+    files and stale entries from an older key scheme)."""
+    if path is None or expected_key is None or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None  # corrupted/partial → recompute
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("_cache_schema") != _BASELINE_CACHE_SCHEMA:
+        return None
+    if raw.get("_cache_key") != expected_key:
+        return None
+    value = raw.get("value")
+    return value if isinstance(value, dict) else None
+
+
+def _write_baseline_cache(
+    path: Path | None, expected_key: str | None, value: dict[str, Any]
+) -> None:
+    if path is None or expected_key is None:
+        return
+    payload = {
+        "_cache_schema": _BASELINE_CACHE_SCHEMA,
+        "_cache_key": expected_key,
+        "value": value,
+    }
+    # Atomic on POSIX: write a pid-tagged temp then rename. Parallel eval runs as
+    # independent subprocesses; the key now covers every result-affecting input, so a
+    # same-path collision means identical inputs and last-writer-wins is harmless.
+    tmp = path.parent / f"{path.name}.tmp.{os.getpid()}"
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+
+
 def _random_baselines(
     ctx: EvalContext,
     partner_names: list[str],
@@ -1062,9 +1223,24 @@ def _random_baselines(
     episodes: int,
     seed: int,
     max_episode_options: int,
+    cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     baselines = {}
     for idx, partner_name in enumerate(partner_names):
+        cache_path, cache_key = _baseline_cache_target(
+            cache_dir,
+            kind="random_policy",
+            layout=ctx.graph.layout_name,
+            config=ctx.config,
+            partner=partner_name,
+            episodes=episodes,
+            seed=seed + idx,
+            max_episode_options=max_episode_options,
+        )
+        cached = _read_baseline_cache(cache_path, cache_key)
+        if cached is not None:
+            baselines[partner_name] = cached
+            continue
         aggregate, _ = _evaluate_partner(
             ctx,
             partner_name,
@@ -1075,12 +1251,14 @@ def _random_baselines(
             random_policy=True,
             collect_diagnostics=False,
         )
-        baselines[partner_name] = {
+        entry = {
             "base_kind": "random_policy",
             "mean_return": aggregate["mean_return"],
             "completion_rate": aggregate["completion_rate"],
             "blocking_rate": aggregate["blocking_rate"],
         }
+        _write_baseline_cache(cache_path, cache_key, entry)
+        baselines[partner_name] = entry
     return baselines
 
 
@@ -1091,6 +1269,7 @@ def _external_reference_baselines(
     episodes: int,
     seed: int,
     max_episode_options: int,
+    cache_dir: Path | None = None,
 ) -> dict[str, Any]:
     base_ctx = _load_context(
         _resolve_checkpoint_path(Path(args.reference_base_checkpoint)),
@@ -1100,8 +1279,29 @@ def _external_reference_baselines(
         _resolve_checkpoint_path(Path(args.reference_ref_checkpoint)),
         "reference_ref",
     )
+    # These baselines DO depend on the two reference checkpoints, so the cache key
+    # includes their content hashes (guards against a checkpoint being swapped).
+    ref_extra = {
+        "base_ckpt_sha256": sha256_file(base_ctx.checkpoint_path),
+        "ref_ckpt_sha256": sha256_file(ref_ctx.checkpoint_path),
+    }
     baselines: dict[str, Any] = {}
     for idx, partner_name in enumerate(partner_names):
+        cache_path, cache_key = _baseline_cache_target(
+            cache_dir,
+            kind="external_reference",
+            layout=base_ctx.graph.layout_name,
+            config=base_ctx.config,
+            partner=partner_name,
+            episodes=episodes,
+            seed=seed + idx,
+            max_episode_options=max_episode_options,
+            extra=ref_extra,
+        )
+        cached = _read_baseline_cache(cache_path, cache_key)
+        if cached is not None:
+            baselines[partner_name] = cached
+            continue
         base_aggregate, _ = _evaluate_partner(
             base_ctx,
             partner_name,
@@ -1122,7 +1322,7 @@ def _external_reference_baselines(
             random_policy=False,
             collect_diagnostics=False,
         )
-        baselines[partner_name] = {
+        entry = {
             "base_checkpoint": str(base_ctx.checkpoint_path),
             "ref_checkpoint": str(ref_ctx.checkpoint_path),
             "base_method": base_ctx.method,
@@ -1131,6 +1331,8 @@ def _external_reference_baselines(
             "ref_mean_return": ref_aggregate["mean_return"],
             "episodes": int(episodes),
         }
+        _write_baseline_cache(cache_path, cache_key, entry)
+        baselines[partner_name] = entry
     return baselines
 
 
@@ -1576,7 +1778,16 @@ def _validate_eval_integrity(
             "bypassed by --allow_diag_skip."
         )
     evidence = aggregate.get("partner_option_evidence", {})
-    if str(evidence.get("evidence_policy")) != "behavior_inferred_v1":
+    # E2 (METHOD_LOCK sec18.8): admit the explicit zeroed-channel ablation policy
+    # alongside the formal one. The oracle_source/observed_dist/missing hard checks
+    # below still run unconditionally, so admitting this string does NOT weaken the
+    # real-path guarantees — a zeroed run routes withheld steps to `zeroed_count`, so
+    # missing_count stays 0, while any true oracle leak would still hard-fail.
+    _allowed_evidence_policies = {
+        "behavior_inferred_v1",
+        "behavior_inferred_v1_zeroed_ablation",
+    }
+    if str(evidence.get("evidence_policy")) not in _allowed_evidence_policies:
         raise RuntimeError(f"Formal eval has wrong partner-option evidence policy: {evidence!r}")
     if int(evidence.get("observed_dist_count", 0)) > 0:
         raise RuntimeError(
@@ -1719,6 +1930,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--reference_base_checkpoint", default=None)
     parser.add_argument("--reference_ref_checkpoint", default=None)
+    parser.add_argument(
+        "--baseline_cache_dir",
+        default=None,
+        help="Directory to cache checkpoint-independent reference/random baseline "
+        "rollouts across eval invocations (E1 speedup). Defaults to "
+        "<output_dir>/.baseline_cache. Pass 'none' to disable.",
+    )
     return parser
 
 

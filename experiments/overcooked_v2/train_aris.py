@@ -420,7 +420,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         router,
     )
     partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
-    _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device)
+    _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device, _belief_persistence_enabled(config))
     contribution_ledger = ContributionLedger.from_config(config.get("training"))
     episode_return = 0.0
     episode_options = 0
@@ -439,7 +439,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 router,
             )
             partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
-            _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device)
+            _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device, _belief_persistence_enabled(config))
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
@@ -500,7 +500,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 router,
             )
             partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
-            _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device)
+            _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device, _belief_persistence_enabled(config))
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
@@ -1683,6 +1683,7 @@ def _execute_option(
             graph,
             device,
             x_f,
+            _belief_persistence_enabled(config),
         )
         done = bool(step.dones.get("__all__", False))
         terminated, termination_reason = option_lib.option_terminated(
@@ -1726,6 +1727,7 @@ def _execute_option(
             graph,
             device,
             x_fail,
+            _belief_persistence_enabled(config),
         )
 
     # Bellman target hygiene: action selection masks invalid options dynamically, so
@@ -2018,7 +2020,7 @@ def _run_greedy_validation(
                     partner_override=validation_partner,
                 )
                 partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, greedy_config)
-                _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
+                _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device, _belief_persistence_enabled(greedy_config))
                 contribution_ledger = ContributionLedger.from_config(
                     greedy_config.get("training")
                 )
@@ -2467,7 +2469,7 @@ def _maybe_seed_terminal_replay(
             partner_override=partner,
         )
         partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
-        _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
+        _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device, _belief_persistence_enabled(config))
         contribution_ledger = ContributionLedger.from_config(train_cfg)
         done = False
         episodes_used += 1
@@ -2622,7 +2624,7 @@ def _seed_role_replay(
                 partner_override=partner,
             )
             partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
-            _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
+            _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device, _belief_persistence_enabled(config))
             contribution_ledger = ContributionLedger.from_config(train_cfg)
             done = False
             episodes_used += 1
@@ -2855,11 +2857,21 @@ def _new_partner_option_inferencer(
     ``option_executor.option_primitive_step``. It never receives partner name,
     protocol, role, terminal_policy, or the scripted true option labels.
     """
-    inferencer = make_behavior_option_inferencer(option_lib, config)
+    # E2 (review BLOCK fix): the zeroed ablation is eval-only. Fail loudly if a
+    # training/CE config ever sets mode=zeroed instead of silently zeroing evidence.
+    inferencer = make_behavior_option_inferencer(option_lib, config, require_inferred=True)
     inferencer.reset(state)
     return inferencer
 
 
+
+
+def _belief_persistence_enabled(config: dict[str, Any] | None) -> bool:
+    """E3 switch: read ``training.belief_persistence`` (default True = current P4 behavior)."""
+    return _as_bool(
+        ((config or {}).get("training", {}) or {}).get("belief_persistence", True),
+        "belief_persistence",  # _as_bool already prefixes "training."
+    )
 
 
 def _initialise_persistent_belief(
@@ -2868,9 +2880,16 @@ def _initialise_persistent_belief(
     belief_model: FactorLocalBeliefModel | None,
     graph: GraphSpec,
     device: torch.device | None,
+    persistent: bool = True,
 ) -> None:
-    """Initialise cross-option factor belief state at episode start (P4)."""
-    if method not in {"aris_bellman", "flat_factor"}:
+    """Initialise cross-option factor belief state at episode start (P4).
+
+    E3 ablation (EXPERIMENT_CHAIN_PLAN §10.4): ``persistent=False`` takes the same
+    no-carry path as a non-belief method, so the belief re-encodes its window from a
+    zero hidden at every option decision — i.e. the pre-P4 behavior. Default (True)
+    is bit-identical to the current persistent behavior.
+    """
+    if method not in {"aris_bellman", "flat_factor"} or not persistent:
         evidence_buffer.set_belief_hidden(None)
         return
     if belief_model is None or device is None:
@@ -2887,15 +2906,21 @@ def _advance_persistent_belief(
     graph: GraphSpec,
     device: torch.device | None,
     evidence_row: np.ndarray,
+    persistent: bool = True,
 ) -> None:
-    """Transfer factor-belief hidden state after each primitive evidence row (P4)."""
-    if method not in {"aris_bellman", "flat_factor"}:
+    """Transfer factor-belief hidden state after each primitive evidence row (P4).
+
+    E3 ablation: ``persistent=False`` skips the carry entirely — no window-base is
+    recorded, so ``belief_window_base_snapshot()`` stays None and the belief re-encodes
+    from zeros each decision (pre-P4 behavior). Default (True) is unchanged.
+    """
+    if method not in {"aris_bellman", "flat_factor"} or not persistent:
         return
     if belief_model is None or device is None:
         raise ValueError("persistent belief update requires belief_model and device")
     hidden_np = evidence_buffer.belief_hidden_snapshot()
     if hidden_np is None:
-        _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device)
+        _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device, persistent)
         hidden_np = evidence_buffer.belief_hidden_snapshot()
     if hidden_np is None:
         raise ValueError("persistent belief initialisation failed")
