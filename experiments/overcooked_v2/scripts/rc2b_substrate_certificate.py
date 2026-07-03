@@ -92,7 +92,9 @@ def main() -> None:
             env.set_featurizer(NumpyFeaturizer(lg))
             ol = _build_option_lib(lg, config)
             spd = lg.shortest_path_dist
-            partners = make_training_partners(ol)
+            partners = make_training_partners(
+                ol, partner_set=str((config.get("training", {}) or {}).get("partner_set", "standard7"))
+            )
             if not option_kinds:
                 option_kinds = sorted({o.kind for o in ol.options})
             rows = {}

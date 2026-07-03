@@ -35,7 +35,22 @@
 
 ## Phase 2 — 基底证书（R2.1 伙伴可区分性 · R2.2 asymm CE 支持度）
 
-*(待运行)*
+### 2026-07-03 R2.1 — 差异化 PASS，但可容许判别条件仅限 bottleneck-导航（非 serving-推断）
+- 脚本: `scripts/rc2b_partner_differentiation.py`（新，checkpoint-free FSM-ego 探针）+ `rc2b_substrate_certificate.py`（修 partner_set bug）· config: `ocv2_step4_asymm_role_v1.yaml`（partner_set=role_conditioned_v2）· GPU-free（JAX-CPU）
+- 产物: `review_bundles/phase2_R2.1_certificate_20260703/{partner_differentiation_v2.json, substrate_cert_v2.json, *.log}`
+- **差异化探针（8ep, max-opt 40）：VERDICT=PASS（2/2 因子）**——serving 轴 spread=1.0、bottleneck 轴 spread=1.0、可区分对 27/28。**伙伴库有真实行为多样性**（不同于 sec16 标准伙伴的塌缩）。
+- **可容许性证书（5ep, max-opt 80，fsm/random/partner-only）揭示关键分层**：
+  ```
+  ingredient-near/far-yield : fsm1.0 rand1.0 ponly0.0  → random 也解 = 太易，技能无关
+  server-left/right-claim   : fsm1.0 rand1.0 ponly1.0  → partner 独解 = ego 无关
+  bottleneck-yield-term-yield: fsm1.0 rand0.0 ponly0.0 → 可容许判别 ✓（train）
+  bottleneck-push-term-claim : fsm1.0 rand0.4 ponly0.0 → 可容许判别 ✓（train）
+  heldout-handoff-alt-yield  : fsm1.0 rand0.0 ponly0.0 → 唯一被ADMIT的held-out ✓
+  heldout-resource-server-claim: fsm1.0 rand1.0 ponly1.0 → partner独解 = 退化 ✗
+  ```
+- **深层发现（与 METHOD_LOCK sec11 一致）**：asymm 上"谁 serve"因子**行为可区分**，但两模式都不给可容许判别条件（ego-serve 太易 / partner-serve ego 无关）。**唯一可容许判别条件 = bottleneck 导航伙伴**，而 bottleneck 是 throughput-navigable 空间因子（导航技能，非因子推断）。当前 6 训练+2 held-out split 里**只有 1/2 held-out 可容许**（heldout-handoff-admit；heldout-resource 退化）。
+- **伪影自检**：max-opt=40 探针曾误报 bottleneck/held-out compl=0（伪影，80 opt 下 fsm=1.0 全部完成）→ 已修正解读。ingredient-far-yield fsm=0.0 但 rand=1.0 = FSM-ego 确定性盲点（探针质量注记，非基底问题）。
+- **sec18.4 分支命中**："Distinguishable on a factor subset only → Narrow: re-cut train/held-out along the distinguishable subset"（差异化真、但可容许判别子集需重划 split）。**非干净 PASS→E1；需用户裁决 split/layout**（fork 决策，Type-B）。R2.2（serving CE 是否真非零）将决定 asymm 能否测推断 vs 仅导航。
 
 ## Phase 3 — 决定性实验（E1 四臂去 oracle 重跑 · E2 通道消融 · E3 持久化消融）
 

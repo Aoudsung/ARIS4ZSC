@@ -542,3 +542,72 @@ E3: window-4 / window-8 / persistent-hidden (main), 3 seeds each.
    `graph.json` via the `graph_path` branch (unconditional coverage gate + stamped
    provenance). The `ce_path` branch with `require_task_stage_coverage=false` is
    smoke-only and must never appear in a formal config.
+
+## sec18.9 R2.1 supplemental preregistration — throughput lens + layout sweep (2026-07-03)
+
+Append-only. Extends the R2.1 preregistration (sec18.4) after the 2026-07-03 result
+revealed that the completion-rate lens saturates on asymm_advantages: three of the
+six admissibility cells were rejected purely because a random ego eventually
+completed (rand=1.0) or a partner completed alone (ponly=1.0). This DOES NOT flip
+sec18.4 — it operationalizes the throughput lens that sec9 already established as
+the discriminative metric, so we do not "shop" for the friendlier reading.
+
+### 18.9.1 Justification (why throughput, why now)
+- Preregistered lens history: sec9 CR preflight already switched from completion
+  to throughput ("Completion SATURATES → use THROUGHPUT"); the R2.1 completion
+  thresholds are the legacy substrate-certificate defaults, not the sec9 lens.
+- Behavioral vs value cleavage: the R2.1 differentiation probe PASSED (27/28 pairs
+  distinguishable, 2/2 axes). What the completion certificate rejected is a value
+  cleavage, which throughput can register while completion cannot.
+- Non-shopping guard: this throughput lens is applied UNIFORMLY across all
+  candidate layouts before E1 base is chosen — it is not tightened for a layout
+  after it fails.
+
+### 18.9.2 Throughput admissibility metrics (per (layout, partner))
+Compute over N seeds × E episodes:
+- `fsm_throughput`   : mean(ego_deliv + partner_deliv) under competent ego, all seeds
+- `rand_throughput`  : same, random ego
+- `ponly_throughput` : same, ego = noop
+- `ego_serve_share`  : mean(ego_deliv / (ego_deliv + partner_deliv)) when denom > 0
+- `fsm_ttfs`         : time-to-first-serve under fsm (option-steps; +inf if none)
+
+### 18.9.3 Admissibility predicate (preregistered, no per-layout override)
+A (layout, partner) cell is ADMITTED iff ALL hold:
+- `fsm_throughput  >= --fsm-tp-min`   (default 0.8 — a skilled ego actually serves)
+- `rand_throughput <= --rand-tp-max`  (default 0.4 — random ego does not)
+- `ponly_throughput <= --ponly-tp-max`(default 0.4 — partner does not solo)
+- `fsm_throughput - rand_throughput >= --gap-min` (default 0.5 — skill gap exists)
+
+Partners whose completion-lens admission was rejected only via ceiling saturation
+(ingredient-*: rand_completion=1.0 with rand_throughput low; server-*:
+ponly_completion=1.0 with ponly_throughput low) become admissible under this
+predicate when the throughput reading really does show a gap.
+
+### 18.9.4 Layout sweep decision table (preregistered)
+Sweep `{asymm_advantages, cramped_room, forced_coord, coord_ring}` × role_conditioned_v2.
+
+| Sweep outcome (throughput lens) | Preregistered E1 base decision |
+|---|---|
+| cramped_room dominates both axes (serving-CE precondition from sec11 + admissible held-out) | cramped_room = E1 base; asymm → Table-1 sanity |
+| only forced_coord / coord_ring admissible (bottleneck/handoff as protocol, not path) | move E1 to that layout; document as "coordination-protocol not navigation" |
+| asymm throughput-admits ≥ 2 held-out on the serving axis | asymm stays; replace or drop heldout-resource-server-claim (which stays degenerate) |
+| any layout: fsm_throughput < 0.8 AND rand_throughput < 0.4 on all partners | probe budget too small → escalate max-options / episodes, do NOT flip verdict |
+| all layouts admit 0–1 held-out cells under throughput | scripted-v2 substrate exhausted → G0.1 pre-decided exit: FCP/MEP population line |
+
+### 18.9.5 FSM-ego probe hygiene (mandatory)
+Certificates must average over ≥ 3 seeds per (layout, partner, policy). Single-seed
+deterministic-FSM zeros (e.g., R2.1's ingredient-far-yield fsm=0.0 vs rand=1.0) are
+geometry-lock artifacts, not real failures. Report `n_seeds` in every artifact.
+
+### 18.9.6 Held-out membership: not decided by the sweep
+`heldout-resource-server-claim` was ponly=1.0 on asymm; it is not "solved" by this
+supplement. Whether to replace it (v2.1) or drop it stays a governance decision
+(G0.1 benchmark-v2-diagnostic scope). This sec only decides the layout base of E1.
+
+### 18.9.7 Non-goals
+- Does not override sec18.4 completion admissibility for narrower purposes
+  (curriculum sanity, Table-1); those still use completion.
+- Does not change the R2.2 CE support probe (sec18.5) — R2.2 remains
+  archival-obligation for P3 sentinel and CE estimand discipline. If asymm is
+  demoted, R2.2 collapses in scope but should still be run on whichever layout E1
+  chooses, since CE support underlies P3 for ALL bases.
