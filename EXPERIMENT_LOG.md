@@ -65,7 +65,18 @@
 
 ## Phase 3 — 决定性实验（E1 四臂去 oracle 重跑 · E2 通道消融 · E3 持久化消融）
 
-*(待运行)*
+### 2026-07-03 E1 前置 CE（asymm×v2）— 两次 GraphCoverageError → 根因 S27（推断器支撑集冻结）
+- 采集: 100ep×6伙伴=12000 rows（3h50m, GPU6/JAX-CPU）· 覆盖门 passed · sidecar 四掩码齐全
+- 建图两次失败: `plate_soup/serve_soup 无 above-eta CE 候选`（min_weight 20→10、eta 0.05→0.02 复用 replay 重试无效——`--reuse_replay` 功能顺手落地, commit 9dfb258）
+- **支持度审计决定性读数**: 终端选项作为伙伴列联合质量**精确 0.0**；73.9% 伙伴占用在 noop；
+  ego-terminal 行全部质量落 (terminal, noop) cell → 被 kernel noop 排除 → CoverageError
+- **现场实验（铁证）**: server-left-claim 单 ep 送餐 9 次（plate+serve 全程执行），行为推断器
+  终端选项质量恒 0.00000000, 每次送餐 argmax=noop → **S27 支撑集冻结确证**
+  （reset 冻结初始有效集为 belief 支撑, 乘性更新 0×x=0 永久锁死）
+- 台账: S27(实现bug,高) + D6(互斥估计量盲区, D4精化) + D7(noop排除×yield签名冲突)
+- **裁定**: 主导=实现 bug（P1 修复激活死代码中的潜伏缺陷）; 设计放大器 ×2; proposal 层非主因
+- 下一步（待批）: S27 修复（支撑注入/遗忘因子, codex diff 评审）→ **重采 CE**（现 replay 的
+  partner dist 已污染）→ 建图 → E1
 
 ## Phase 4 — 主张级实验（E4–E7）
 

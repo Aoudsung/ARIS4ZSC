@@ -308,3 +308,32 @@ P3 sidecar 与覆盖门在真实运行中按设计工作（覆盖门两次正确
   R2.2 大样本探针按此计入预算，或加 `--replay_path` 复用（小改，待定 wontfix/defer）。
 - **E2/E3 前置小实现（已在 §10 执行卡登记）**：E2 需 eval 侧"推断通道置零"模式开关；
   E3 需 `training.belief_persistence` 开关（window 臂只改 config 即可）。
+
+---
+
+## E1-CE 阻塞根因裁定（2026-07-03 深夜）——新实现 bug S27 + 两个设计放大器
+
+**触发**：E1 前置 CE 管线（asymm×v2, 100ep×6伙伴, 12000 rows）两次 GraphCoverageError：
+`plate_soup/serve_soup 无 above-eta CE 候选`。支持度审计显示终端选项作为**伙伴列**的
+联合质量**精确为 0.0**（非低于阈值），73.9% 伙伴占用质量堆在 noop 列。
+
+| ID | 断言 | 锚点/证据 | 分类 | 严重度 |
+|---|---|---|---|---|
+| **S27** | **行为推断器支撑集冻结**：`reset()` 把 belief 初始化为 `normalize(初始状态的有效选项)`；初始时终端选项无效 → belief=0；`update()` 是乘性 Bayes（`belief=normalize(belief×adjusted)`），0×任何=0 **永久锁死**。episode 中途变有效的选项永远无法进入支撑集 | `option_inferencer.py:40-42`(reset), `:103`(乘性更新)。**现场证据**：server-left-claim 一个 ep 送餐 9 次，推断终端质量恒 0.00000000，每次送餐 argmax=noop（远程实测 2026-07-03） | **实现 BUG**（P1 修复激活了死代码中的潜伏缺陷；P1 验收审"不耗 oracle/只用行为"，支撑集动力学不在验收单上——验收盲区） | **高**（阻塞 E1；污染 12000-row replay 的 partner dist——修复后须重采集） |
+| **D6** | 互斥型协调外部性（who-serves）的反相关结构自我压制 (ego-terminal × partner-terminal) 联合占用质量——占用加权二阶 CE 对互斥类因子存在结构性盲区（D4 的机制精化） | 随机 ego 终端行 52/12000；对角 cell 结构性低质量 | 估计量设计局限（D4 精化） | 中（S27 修复后 (ego-prep × partner-serve) 列应恢复——claim 伙伴 9 次/ep 送餐占用充足；对角 cell 仍薄，interventional CE / targeted-starts 为既有逃生通道） |
+| **D7** | `EXCLUDED_FACTOR_OPTION_KINDS={noop}` 把"伙伴闲置"排除出因子空间，但 partner-idle 恰是 yield 终端模式的行为签名；与 S27 叠加：推断器把一切压到 noop → (terminal,noop) 成唯一有支持 cell → 又被排除 → GraphCoverageError | `graph_builder.py:58`；retry1 audit: row opt3 全部 52.0 质量在 noop 列 | kernel 设计选择（本身有理，与现象冲突） | 中（S27 修复后可能自然缓解；若仍需 partner-idle 模式，需设计决策） |
+
+**自然实验闭环**：G2 时代（oracle 伙伴标签、P1 修复前）同布局建图成功、serve CE=0.73；
+现在（行为推断权重）终端列精确 0.0——差异被 S27 完全解释。
+
+**归属裁定**：主导=**实现 bug（S27，新引入）**；放大器=两个设计选择（D6/D7）；proposal 层
+仅 A8 假设（"CE 可由群体 rollout 估计"）未分析行为推断权重的支撑集/样本效率——非本次主因。
+
+**S27 修复方案（待实施，走 codex diff 评审）**：标准 Bayes 滤波支撑注入——update 时
+`belief = normalize((belief + ε·valid_now_mask) × adjusted)` 或与 uniform(valid_now) 做
+λ-混合（遗忘因子）；只使用公共信息 valid_options(state)，不触碰 oracle 边界。修复后
+**必须重采集 CE replay**（现有 12000 rows 的 partner dist 已被烙入冻结 bug）。
+
+**仪器化投资兑现备注**：本次能把故障从"CE=0"精确定位到"支撑集冻结的乘性更新"，依赖的
+正是 P3 修复的 per-pair support sidecar（精确区分 skipped/measured/exact-zero）+ P1 修复的
+行为推断路径可实测性。裁定→修复→验证循环按设计工作。
