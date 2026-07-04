@@ -189,3 +189,38 @@
   train-partner 指标与 held-out ZSC 泛化是两回事——一切结论等两段式 held-out eval。
 - **下一步**：stage-1 held-out eval（25ep × 2 held-out × ~24 deployable ckpts，基线缓存
   schema v3 + 固定 eval seed），按 §14.2 执行卡（待授权）。
+
+### 2026-07-05 stage-1 held-out eval 完成（24/24）· sec18.13 诊断链闭合 · 机制定式
+- **stage-1 决定性表**（25ep×2 held-out，bootstrap 95% CI，产物 results_phase3_eval/stage1_decisive_table.*）：
+
+  | arm | egoCCR [95% CI] | team tp/ep | ego tp/ep | serve share |
+  |---|---|---|---|---|
+  | aris_bellman | **0.125** [0.000, 0.375] | 1.000 | 0.125 | 0.250 |
+  | base_only | 0.900 [0.700, 1.000] | 1.200 | 0.900 | 0.817 |
+  | flat_factor | 0.800 [0.600, 1.000] | 0.900 | 0.800 | 0.950 |
+  | global_gru | 1.000 [1.000, 1.000] | 1.100 | 1.000 | 0.950 |
+  | partner_id_q | 0.800 [0.600, 1.000] | 0.800 | 0.800 | 1.000 |
+
+- **三表读出**：sec18.10.2 行 1 触发（base 0.900 ≥ 0.9 ⇒ **基底非 ZSC-判别**，任何相对排序
+  不得读作 ARIS 优势/劣势的主张证据）；sec18.6 落「仅 ARIS 崩」行（按预注册=可疑回归待查）。
+  次级并读：resource-server-claim 上 aris 角色互补（partner 吞吐 2-3/ep、团队回报 59>base 38.7）；
+  handoff-alternate-yield 上全臂唯 aris 死锁（partner_id_q 亦 2/5 死锁——该伙伴对 ID-oracle 也难）。
+- **sec18.13.1 判决：POLICY-DEFAULT-WAIT**——zeroed 重评 4/4 seeds 行为与 inferred 逐 seed
+  一致（塌缩不变）⇒ 信念通道非瓶颈。E2 表（sec18.7）zeroed 行同时完成。
+- **trace（非 fast, 3ep）**：belief_zero_delta≈20.5（信念显著平移 Q）但不翻转 wait→act 排序。
+- **训练伙伴探针矩阵（关键补充）**：
+  | seed × 训练 yield 伙伴 | ingredient-near-yield | bottleneck-yield-terminal-yield |
+  |---|---|---|
+  | s0 | 0.32 | 0.16 |
+  | s2 | **1.00**（52 送餐） | **0.00** |
+  接管行为**分布内即呈斑驳状**（同 seed 对某 yield 伙伴满分、对另一 yield 伙伴零分）；
+  bottleneck-中介的 yield 变体是系统性薄弱轴；held-out alternate-yield 位于最难角。
+- **机制定式（三证据闭合）**：ARIS 策略**默认让位**（zeroed=wait），信念仅对**识别出的
+  分布内伙伴**解锁接管（s2×near-yield=1.0 证明解锁存在且可完美）；OOD 伙伴 → 回落默认 →
+  对 yielder 死锁。方法的伙伴条件化能力把训练分布的让位偏置学到最彻底——base/gru 学不会
+  条件化反而获得 ZSC-鲁棒的无差别单干。诚实结论：**条件化解锁 vs 鲁棒默认的张力**是本轮
+  最重要的科学发现，独立于后续修复成败均可入文。
+- 附：诊断链工程记录——LDS-A1/B3 修复（`9e4d2f1`，codex APPROVE）解锁受控 zeroed 跑；
+  探针首launch 因嵌套引号本地展开失败（编排器事故同族），改脚本文件后成功（教训入档）。
+- **下一步**：群体压力干预新预注册（草案见
+  review_bundles/latent_defect_sweep_20260704/E1REV2_POPULATION_PREREG_DRAFT.md）待用户 Type-B。
