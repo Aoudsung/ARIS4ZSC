@@ -384,6 +384,11 @@ ego_correct_completion_rate）：
 ### 14.0 家务（wave 完成前）
 - ✅ e1.yaml `relevance_semantics: legacy_id_pair` 修正补提交（`ee24ccd`；远端启动时已生效，
   本地补齐 provenance）。
+- **codex 潜伏缺陷扫荡**（与 wave 并行，纯静态）：三 pass 全库深检，按事故驱动缺陷类
+  C1–C12 锚定扫描 + 下一步链路事前验尸。bundle：
+  `review_bundles/latent_defect_sweep_20260704/`（REVIEW_BRIEF + PASS_A/B/C_PROMPT）。
+  修复窗口纪律见 brief §6：eval 前只修 eval 路径 [A] 级测量污染；其余判读后处理；
+  训练路径 [A] 若成立 → 用户 Type-B 裁决（可能触发重跑），不得静默修复后沿用旧结果。
 - **方法层冻结**：E1-rev 判读完成前不动任何方法代码（sec18.11 禁令：不得以决定性 run
   的结果调 U1/U2 设计）。
 - （可选，10 分钟）K7 JAX-GPU 冒烟——若 ptxas 已修则 eval 全线提速，排在 eval 启动前验。
