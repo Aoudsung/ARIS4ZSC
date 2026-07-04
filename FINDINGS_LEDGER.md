@@ -337,3 +337,17 @@ P3 sidecar 与覆盖门在真实运行中按设计工作（覆盖门两次正确
 **仪器化投资兑现备注**：本次能把故障从"CE=0"精确定位到"支撑集冻结的乘性更新"，依赖的
 正是 P3 修复的 per-pair support sidecar（精确区分 skipped/measured/exact-zero）+ P1 修复的
 行为推断路径可实测性。裁定→修复→验证循环按设计工作。
+
+---
+
+## 创新升级登记（2026-07-04，用户指令：正确性前提下提升创新性至 ICLR 水准）
+
+| ID | 内容 | 源头 | 状态 |
+|---|---|---|---|
+| U1 | 干预式因子发现：targeted-start 采集 + interventional CE 接线 + 因子支持度证书；配套 C1 命题（互斥因子被动估计不可能性）形式化 | D6（互斥盲区，12000 行精确零支持实测） | 设计中（ICLR_UPGRADE_PLAN §2-C1；预注册 sec18.11） |
+| U2 | 持久协议模式信念 FactorModeFilter：推断潜变量从瞬时选项改为 episode-持久因子模式；瞬时推断器降级为诊断/消融臂 | S27（支撑集冻结暴露"瞬时选项是错误潜变量"） | 设计中（ICLR_UPGRADE_PLAN §2-C2；预注册 sec18.11） |
+| S27-fix | 支撑注入修复（belief ← (1-λ)·belief + λ·uniform(valid_now)，λ=0.05 config 化；mix=0 保留冻结行为供消融）+ 回归测试 ×4（含冻结复现锚点） | S27 | **代码落地、静态绿（compile+gate I1-I17）；远程验证排队（SSH 待用户预热）**；验证后重采 CE |
+| T3.1 | FCP/MEP spike 提前（改判 sec18.1 的 E1-信号门控：spike 不再等待，全量投资仍待 spike 结论+用户批准） | ICLR 评审必问 scripted partners（K2 提前退役） | 待启动 |
+
+**纪律注记**：以上全部在 E1 出数之前预注册（sec18.11），读出规则先于运行写死；
+mode-filter 不敌 option-infer 时如实降级 C2（预注册的诚实降级路径）。

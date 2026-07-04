@@ -669,3 +669,35 @@ already resolved.
 - All E1 integrity flags (I10-I17) still hard-block reading. Nothing in this
   revision weakens those.
 - sec18.9 stays on file as a completed but methodologically superseded gate.
+
+## sec18.11 Pre-E1 innovation preregistration (2026-07-04, user-directed)
+
+Append-only. User directive: correctness as precondition, innovation as goal,
+ICLR as the bar. Recorded BEFORE any E1 data exists — this is the only honest
+window for method-layer changes; once E1 produces numbers, the method layer
+freezes until read-out completes.
+
+Direction (full plan: ICLR_UPGRADE_PLAN.md; ledger IDs U1/U2):
+1. U1 (from D6): interventional/active factor discovery — targeted-start
+   collection + forced-option interventional CE (refine_interventional_ce is
+   in-tree, unwired) with per-factor support certificates. Motivated by the
+   measured impossibility: mutual-exclusion coordination factors carry
+   exactly-zero passive joint support (12000-row evidence).
+2. U2 (from S27): persistent protocol-mode belief (FactorModeFilter) — the
+   inference latent moves from transient partner options to episode-persistent
+   factor modes, aligning the implementation with the proposal's own §5.2
+   theory and eliminating the support-freeze bug class by construction. The
+   transient-option inferencer (S27-fixed) remains as a diagnostic + ablation
+   arm.
+3. E1 gains preregistered arms: aris(option-infer) vs aris(mode-filter), and
+   passive-CE graph vs interventional-CE graph. Read-out additions are in
+   ICLR_UPGRADE_PLAN §5; sec18.6/18.10.2 readings stay authoritative.
+4. FCP/MEP spike starts EARLY (no longer gated on E1 signal) — amends the
+   sec18.1 gating: the K2 feasibility spike (1-2 days) is ungated; the full
+   population investment still awaits the spike verdict + user approval.
+5. Obligations before the story is committed: /novelty-check on U1 and U2;
+   formalization attempt of the U1 exclusion-support proposition; honest
+   demotion paths are preregistered in ICLR_UPGRADE_PLAN §7.
+
+Forbidden: reading any E1/E2/E3 result against a rule not written down before
+the run; tuning U1/U2 designs on decisive-run outcomes.
