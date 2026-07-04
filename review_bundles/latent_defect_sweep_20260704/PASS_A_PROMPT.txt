@@ -1,0 +1,110 @@
+LATENT-DEFECT SWEEP — PASS A: evidence / inference / belief subsystem
+Repo: /Users/aoudsung/Documents/ARIS4ZSC (branch codex/rootcause-current-repair-20260702)
+Mode: READ-ONLY static review. Do NOT run anything, do NOT edit anything.
+
+== MISSION ==
+This project just went through an incident chain where ego delivery collapsed to ~0. Post-mortem
+showed the failures came from a small set of DEFECT CLASSES, not one-off bugs. Your job in this
+pass: hunt the entire evidence/inference/belief subsystem for REMAINING instances of three classes
+(C1, C7, C8 below), anchored on the real, already-fixed incidents. You are the adversarial reviewer
+whose job is to find what the authors missed. Assume more instances exist until coverage proves
+otherwise. A finding that survives is worth more than ten speculations: quote exact code, reason a
+concrete failure scenario, and say which upcoming pipeline step it would corrupt.
+
+== MANDATORY CONTEXT READING (skim, ~15 min budget) ==
+1. FINDINGS_LEDGER.md — the adjudicated defect ledger (S/P/D/W/F/NEW namespaces). Do NOT re-report
+   adjudicated items (S1-S27, P1-P5, D1-D7, F8-F13, NEW-*, S7 batched-collector deferral). DO report
+   if a past FIX is incomplete or introduced a new defect.
+2. METHOD_LOCK.md sec17 + sec18.12 (what is frozen; what E1-rev enables).
+3. EXPERIMENT_CHAIN_PLAN.md 补充 C §14 (the upcoming steps your findings protect).
+
+== ANCHOR INCIDENTS (your search templates) ==
+[C1 absorbing states] S27: experiments/overcooked_v2/option_inferencer.py — the behavior
+inferencer's multiplicative Bayes update `belief = normalize(belief * likelihood)` could never
+resurrect exact-zero mass, and reset() froze the t=0 valid-option set as the support forever.
+Mid-episode-valid options (plate/serve) were permanently uninferable; CE graph coverage then failed.
+Fixed by support injection (support_mix). GENERALIZE: any iterative state update where a component,
+once it hits 0 / saturation / an extreme, has NO recovery path; any mask/support/eligibility set
+computed once (at reset/init/t=0) and applied for the whole episode while the underlying validity is
+time-varying; any EMA/decay/counter that bottoms out irreversibly; any normalize() that silently
+turns all-zero vectors into uniform or NaN.
+[C7 information leakage] P1 (fixed): oracle partner-option truth leaked into the ego evidence path.
+P5 (fixed): oracle-conditioned curriculum. GENERALIZE: ANY channel through which partner-privileged
+information (partner's true option/goal/protocol/role, partner Q-net internals, partner policy
+parameters) can reach the ego's decision path: observation featurization, evidence channels, reward
+shaping terms, exploration bias, option termination conditions, event extraction, guard feedback
+into training, graph metadata consumed at decision time, or the partner_id_q reference arm sharing
+code paths with non-oracle arms. Note: E1-rev newly re-enabled terminal_progress_shaping +
+terminal_exploration — they were P5-audited as ego-local; ADVERSARIALLY re-verify that audit by
+reading the actual code paths (train_aris.py shaping/exploration sections): confirm they condition
+ONLY on ego option kinds / ego inventory / ego events, never on partner state or partner events.
+[C8 state residue] Near-miss class behind S27: objects that MUST be reconstructed or fully reset per
+episode (inferencer, router, buffers, belief windows). GENERALIZE: any stateful object reused across
+episodes / seeds / partners / eval-arms without complete reset; persistent-belief machinery leaking
+across episode boundaries (belief_hidden carried where it must not be); accumulators that survive a
+partner switch; RNG state shared across arms in a way that couples conditions.
+
+== FILE SCOPE (exclusive to this pass; read ALL of each) ==
+experiments/overcooked_v2/: option_inferencer.py, evidence_router.py, option_executor.py,
+  partner_option_classifier.py, event_extractor.py, option_termination.py, options.py,
+  obs_featurizer.py, obs_encoder.py, state_utils.py
+src/aris_bellman/: factor_belief.py, specs.py, replay.py
+tests/: test_s27_support_injection.py, test_ce_inferencer_provenance.py, test_event_extractor.py
+PLUS these LENSES on the two big files (read only these aspects):
+  train_aris.py — persistent-belief helpers (_initialise_persistent_belief /
+    _advance_persistent_belief and their ~11 call sites), evidence buffer usage, belief window
+    logic, shaping/exploration sections (for the C7 re-audit), episode/seed reset boundaries.
+  evaluate_aris.py — per-episode inferencer/router construction and reset, evidence threading,
+    E2 zeroed-mode path, E3 persistence-off path, partner switch boundaries.
+
+== HUNTING PROCEDURE (do all; report coverage per class) ==
+1. C1: grep for multiplicative/self-referential updates (`*=`, `belief *`, `normalize(`, `clip(`,
+   `mask`, `valid_`, `support`), for reset()/init methods that precompute sets later treated as
+   fixed, and for divisions by sums that can be zero. For each candidate: can the quantity reach an
+   absorbing value under legal inputs? Is there an injection/floor/recovery mechanism? Check the
+   S27 fix itself for completeness: does support_mix cover ALL paths (update(), reset(), classifier
+   fallback, heuristic path)? Does mode="zeroed" interact correctly with support injection?
+2. C7: build the ego-observable information inventory (what obs_featurizer/obs_encoder actually
+   encode; what events event_extractor emits and from whose state). Then trace every consumer in
+   the ego decision path and flag anything partner-privileged. Explicitly check: does any feature
+   encode the partner's held object/position in a way the proposal forbids (vs legitimately
+   observable)? Do guard/diagnostic computations feed back into training signals? Does
+   partner_id_q's oracle input flow through code shared with other arms (flag any shared mutable
+   state or default that changes behavior when the arm differs)?
+3. C8: enumerate every stateful class in scope (fields mutated after __init__). For each: where is
+   it constructed, where reset, what is its intended lifetime (step/episode/run)? Flag every field
+   not restored by reset. Cross-check eval loop in evaluate_aris.py: per-episode construction
+   claimed — verify no object outlives its episode; verify partner switch resets everything
+   evidence-related; verify E3 off leaves NO persistent hidden state (bit-faithful pre-P4:
+   belief_window_base_snapshot() must be None throughout).
+4. Free hunt (C12): anything else in scope that would corrupt the held-out eval or later phases.
+
+== PRE-MORTEM (mandatory; these paths run NEXT, within days) ==
+PM-1 stage-1 held-out eval: mode=inferred + require_inferred=True path end-to-end (construction →
+  per-step update → router channels → summary fields). Verdict: CERTIFIED-CLEAN or findings.
+PM-2 E2 zeroed-mode eval: zeroed inferencer output → executor event annotation → router zeroed_count
+  accounting → integrity gate admits policy string while STILL enforcing oracle_source_count==0.
+  Confirm zeroing cannot partially apply (e.g., option_dist zeroed but confidence nonzero, or
+  events still carrying inferred option ids).
+PM-3 E3 persistence-off eval/train: off ⇒ zero-hidden re-encode per decision, no residue.
+
+== OUTPUT CONTRACT (exact format) ==
+For each finding:
+[LDS-A<n>] [A|B|C] [C1|C7|C8|C12] <file>:<line>
+  CODE: <exact quoted snippet>
+  DEFECT: <mechanism in 1-3 sentences>
+  FAILURE SCENARIO: <concrete state/input → wrong behavior → which chain step it corrupts>
+  BLAST RADIUS: <which arms/metrics/completed results affected; does it invalidate the running wave?>
+  TEST GAP: <which existing test should have caught it and why it didn't>
+  FIX SKETCH: <minimal fix direction; do NOT implement>
+Severity: [A] corrupts the decisive held-out read or silently invalidates completed wave results;
+[B] corrupts later planned steps (E2/E3/R2.2/U1/U2, multi-arm E1); [C] latent, off the planned path.
+Order findings by severity. After findings, per class: COVERAGE: <files/functions read, grep
+patterns run, candidates examined and ruled out>. A class with no findings gets explicit
+"C<k>: NONE-FOUND" plus its coverage block. End with PRE-MORTEM verdicts for PM-1..PM-3.
+
+== HARD RULES ==
+Read-only; no execution; no method redesign (method layer is frozen until E1-rev read-out).
+Distinguish adjudicated design decisions (D-series, METHOD_LOCK) from defects — check the ledger
+before flagging. Quote real code (no paraphrased "code"). If uncertain whether something is a
+defect, report it with severity [C] and say what evidence would settle it.

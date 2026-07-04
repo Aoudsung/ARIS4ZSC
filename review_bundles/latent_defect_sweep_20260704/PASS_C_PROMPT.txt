@@ -1,0 +1,134 @@
+LATENT-DEFECT SWEEP — PASS C: metrics / numerics / CE estimation / artifacts & orchestration
+Repo: /Users/aoudsung/Documents/ARIS4ZSC (branch codex/rootcause-current-repair-20260702)
+Mode: READ-ONLY static review. Do NOT run anything, do NOT edit anything.
+
+== MISSION ==
+Three of this project's worst incidents lived in this pass's territory. (1) CE cells with zero
+support were recorded as 0.0, indistinguishable from measured-zero — an entire layout conclusion
+nearly rested on sentinel zeros (P3, fixed via support sidecar). (2) A train-side "completion"
+metric counted TEAM deliveries, so a free-riding ego looked competent until a dedicated guard was
+built (F9). (3) A wave orchestrator lost ~5 hours of experiment data because a single-statement
+bash `local method=$1 seed=$2 out=...` left vars empty, collapsing all runs into one directory
+that each run rm -rf'ed (fixed, but the class remains). The decisive held-out eval + 25-run
+aggregation + baseline-cache machinery run NEXT — sweep this territory for remaining instances of
+C4, C5, C9, C10. You are the adversarial reviewer; a plausible-but-unverified metric or a silently
+wrong aggregate here would poison the project's decisive read.
+
+== MANDATORY CONTEXT READING (skim, ~15 min budget) ==
+1. FINDINGS_LEDGER.md — do not re-report adjudicated items (S1-S27, P1-P5, D1-D7, F8-F13, NEW-*).
+   S7 (batched CE collector interleaving) is KNOWN and deferred with a red line "formal CE must use
+   the sequential path" — your job on S7 is only to verify the quarantine is airtight (see C9).
+2. METHOD_LOCK.md sec18.6/18.10.2/18.12.3 (what will be READ from eval outputs — the fields those
+   preregistered tables consume are the crown jewels this pass protects).
+3. EXPERIMENT_CHAIN_PLAN.md 补充 C §13-§14 (current wave state; §14.2 eval card).
+
+== DEFECT CLASSES (anchored) ==
+[C4 sentinel aliasing] Anchor: P3 CE sentinel zeros. GENERALIZE: any place a sentinel/default
+(0, 0.0, -1, None, NaN, empty list) can be confused with a legitimate measurement downstream:
+CE estimation cells, support/weight accounting, metrics fields absent-vs-zero (e.g., a run with no
+episodes vs a run with zero deliveries), None→0 coercions in aggregation, NaN silently absorbed by
+max/mean/clip, JSON round-trips turning NaN into null, missing keys defaulting inside .get()
+chains, division-by-zero guards that substitute a value indistinguishable from data.
+[C5 metric semantics] Anchor: F9 team-vs-ego conflation masking free-riding. GENERALIZE: for EVERY
+metric that feeds the preregistered tables (headline: held-out ego_correct_completion_rate;
+co-primary: terminal competence rate; secondary: throughput, time-to-complete, ego/partner splits,
+wrong-delivery, sole vs assisted counts, team_delivery_episode_rate): verify (i) the right agent is
+credited (ego vs partner attribution at the event level — trace event_extractor→metrics); (ii) the
+denominator is what the table assumes (episodes? attempts? only-successful-episodes? do guard-fail
+or crashed runs silently vanish from means instead of being counted per the preregistration?);
+(iii) rates cannot exceed bounds or double-count (delivery counted per event vs per soup);
+(iv) train-partner greedy_validation fields cannot be mistaken for held-out fields downstream
+(naming/labeling in metrics.json and eval outputs); (v) checkpoint_selection: "best" selected by
+greedy return — confirm selection criteria can't pick a checkpoint whose eligibility gates failed,
+and selection metadata records what the tables need.
+[C9 artifact/orchestration integrity] Anchor: the orchestrator local-bug data loss. GENERALIZE
+(local-repo scope): output-path construction anywhere (collision risk when params empty/equal),
+rm -rf / shutil.rmtree / overwrite without ownership checks, non-atomic writes of json/npz
+artifacts (torn files on interrupt), resume/--reuse_replay logic reading stale or
+partition-mismatched artifacts, baseline cache correctness (evaluate_aris: key must include EVERY
+input that affects the cached value — env subset, reward payload, partner identity, episode count,
+seed, external checkpoint hashes; verify schema-version + atomic write + corrupted-read fallback
+actually cover concurrent writers and torn reads; verify a cache hit cannot cross eval-arm
+conditions e.g. zeroed vs inferred if baselines could differ), replay.npz partition safety, tar/
+sync manifest completeness (provenance.py), and the S7 quarantine: verify no formal-path caller
+can reach collect_option_replay_batched (grep all callers; the red line must be structural, not
+just documentation).
+[C10 numerics/units] Anchor: reward-scale drift history (reward_scale_verified gate) + two
+gate-caught graph/config objective mismatches. GENERALIZE: env-step vs option-step confusion
+(durations, horizons, discounting: gamma applied per what unit? horizon_options=3 vs env steps);
+window off-by-ones (4-step belief window boundaries, first/last window in td_loss_first_window/
+last_window); normalization denominators (per-episode vs per-step vs per-option); float equality
+comparisons; accumulation order sensitivity; clip ranges that hide divergence; count metrics
+derived from different sources that should be consistent (e.g., delivery_event_count vs
+correct_delivery_count vs served_soup_count — are the invariants between them checked anywhere?).
+
+== FILE SCOPE (exclusive to this pass) ==
+experiments/overcooked_v2/: ce_sampler.py (1567 lines — estimation, support sidecar, replay IO,
+  batched collector quarantine), graph_builder.py (numeric/coverage/selection paths; metadata
+  sections belong to Pass B), batched_rollout.py, env_adapter.py, layout_parser.py,
+  diagnostics.py, diagnose_traces.py, layout_diagnostics.py
+src/aris_bellman/: metrics.py, td.py, factor_q.py
+experiments/overcooked_v2/scripts/: executor_golden_trace.py, run_stability_probe.py,
+  run_trace_diagnostic.py, parse_role_v1_v4.py, rc1_qaudit.py, rc2_reachability.py, rc2b_*.py,
+  rc_qstability_gate.py
+  (the rc*/parse* scripts are artifact producers/consumers for certificates and reports — check
+  them at [C] priority unless they feed preregistered tables)
+tests/: test_actor_sparse_credit.py, test_ce_sampler_batched.py, test_symbolic_sanity_phase3.py,
+  test_toy_factor_game_fixes.py
+PLUS these LENSES on the two big files:
+  evaluate_aris.py — ALL metric computation/aggregation, per-partner/per-episode accounting,
+    baseline cache (_baseline_cache_target, _baseline_env_payload, key construction, atomic write,
+    hit path), random/external reference baselines, output json schema (what field names the
+    preregistered tables will read).
+  train_aris.py — metrics assembly (the metrics.json fields), greedy_validation rollouts,
+    checkpoint_selection, free_rider_guard computation (as a measurement — is what it measures
+    what sec18.12 assumes?), episode_returns bookkeeping, td-loss windows.
+
+== HUNTING PROCEDURE (do all; report coverage per class) ==
+1. Field census (C5): list every field in metrics.json (train) and the eval output json that the
+   preregistered tables consume; for each give source expression, denominator, agent attribution,
+   and absent-vs-zero behavior. This census is a required deliverable even with zero findings.
+2. Sentinel audit (C4): grep `.get(`, `or 0`, `if not`, `nan`, `fillna`-like patterns, default
+   args in numeric functions; for each candidate decide aliasing risk.
+3. Cache adversarial review (C9): try to construct (on paper) two eval invocations that SHOULD
+   differ but hit the same cache key, and one that SHOULD hit but misses (perf-only). Check the
+   key includes evidence/arm-independent inputs only if baselines truly arm-independent.
+4. Path/write audit (C9): grep makedirs/rmtree/rm -rf/open(...,'w')/np.save/json.dump in scope;
+   verify unique paths, atomic patterns, and no unguarded destructive ops.
+5. Unit trace (C10): pick the three quantities gamma touches (TD target, CE support objective,
+   any discounted return) and verify unit consistency across modules; audit window boundary
+   arithmetic; list cross-field invariants and whether anything enforces them.
+6. Free hunt (C12) within scope.
+
+== PRE-MORTEM (mandatory; these run NEXT) ==
+PM-6 stage-1 eval at 25ep × 2 held-out partners × ~20 checkpoints with baseline cache ON and a
+  FIXED eval seed: walk the full path (checkpoint load → episodes → per-partner metrics → baseline
+  merge → output json). Verdict per stage: CERTIFIED-CLEAN or findings. Explicitly: does episode
+  count 25 vs 50 change any normalization subtly? Does the fixed seed create partner-order or
+  env-reset coupling across checkpoints that biases comparisons?
+PM-7 25-run aggregation for the preregistered tables: guard-fail runs (e.g., aris s3) must be
+  EXCLUDED from performance tables but COUNTED in terminal-competence-rate denominators
+  (sec18.12.3). Does any existing aggregation/parse script (parse_role_v1_v4.py or similar) do
+  this correctly, or will a fresh script be needed? State what the aggregation must and must not do.
+PM-8 two-stage protocol: stage-2 re-runs decisive arms at 50-100ep — confirm nothing caches or
+  reuses stage-1 25ep results in a way that would contaminate stage-2 numbers (episode-count in
+  cache keys, output overwrite vs new dir).
+
+== OUTPUT CONTRACT (exact format) ==
+For each finding:
+[LDS-C<n>] [A|B|C] [C4|C5|C9|C10|C12] <file>:<line>
+  CODE: <exact quoted snippet>
+  DEFECT: <mechanism>
+  FAILURE SCENARIO: <concrete input/state → wrong number/artifact → which preregistered reading it corrupts>
+  BLAST RADIUS: <arms/metrics/completed results affected; does it invalidate the running wave?>
+  TEST GAP: <which existing test should have caught it and why it didn't>
+  FIX SKETCH: <minimal direction; do NOT implement>
+Severity: [A] corrupts the decisive held-out read or silently invalidates completed wave results;
+[B] corrupts later planned steps (E2/E3/R2.2/U1/U2, multi-arm E1); [C] latent, off the planned
+path. Order by severity. Per class: COVERAGE block. Empty class ⇒ explicit "C<k>: NONE-FOUND" +
+coverage. End with the field census (deliverable), PM-6..PM-8 verdicts.
+
+== HARD RULES ==
+Read-only; no execution; no method redesign (frozen until E1-rev read-out). Check FINDINGS_LEDGER
+and METHOD_LOCK before flagging — adjudicated items and preregistered design choices are not
+defects. Quote real code. Uncertain ⇒ [C] plus the evidence that would settle it.
