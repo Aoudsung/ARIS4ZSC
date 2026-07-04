@@ -1,7 +1,9 @@
 # EXPERIMENT_CHAIN_PLAN.md — 从当前状态到论文级结果的完整实验链路
 
-**Status:** READY（静态验收全绿，待 Phase 0 两项决策后启动）· **Date:** 2026-07-02
+**Status:** EXECUTING — Phase 0–2 完成；Phase 3 E1-rev wave 运行中（9/25 final，决定性判读待
+held-out eval）· **Updated:** 2026-07-04，见 **补充 C**（§11–§16，执行对账 + 剩余链路调整版）
 **前提**：[FINDINGS_LEDGER.md](FINDINGS_LEDGER.md)「静态验收 PASS」段；METHOD_LOCK sec17 修复锁定条目。
+**阅读指引**：§0–§10 为原计划（保留存档）；与 补充 C 冲突处以 补充 C 为准（每处变更均引预注册段）。
 **边界**：所有实验按 [CUSTOMER.md](CUSTOMER.md) 远程执行（`zsc-customer`，8 GPU），逐次授权；
 本文档本身不触发任何执行。结果解读一律走预注册规则 + 伪影自检清单 + Type-B 双签。
 
@@ -302,3 +304,153 @@ E3 运行: {window4+off, window8+off, persistent(主)} × 3 seeds, 同 E1 基底
 3. (可选, R1-C) run_ce_pipeline --replay_path 复用开关
 4. E2/E3 前置开关(10.4) — 必需项
 ```
+
+---
+
+# 补充 C（2026-07-04）：执行对账 + E1-rev 运行态下的剩余链路调整
+
+> 本补充在 E1-rev wave 运行中写成。**训练期数字只用于调度决策，不用于主张判读**——
+> 判读一律等 held-out eval，按 METHOD_LOCK sec18.6 / 18.10.2 / 18.12.3 三表逐条读出。
+
+## 11. 执行对账（原计划 → 实际，截至 2026-07-04）
+
+| 计划项 | 状态 | 实际结果与证据 |
+|---|---|---|
+| Phase 0（G0.1–G0.5） | ✅ | `4d680ab`；G0.1 允许 v2 基底、G0.2 翻 true；sec18.1–18.7 预注册入档 |
+| Phase 1（R1.1–R1.3） | ✅ GREEN | `a2f813f`；pytest 全绿 + fidelity gate I1–I17 exit 0 + 冒烟产物全字段合规 |
+| R2.1 证书 | ✅ PASS（方法学修订） | 差异化证书 PASS；sec18.9 throughput 三布局扫描完成；sec18.10 裁决：FSM-oracle 探针**废弃**，E1 本身承担 admissibility 判读（`2f5e356`） |
+| R2.2 支持度探针 | ⤵ 塌缩为归档哨兵 | sec18.10.3：≤300ep×1seed，E1 后执行；其分叉功能由 E1 承担 |
+| §10.5 顺手工程 | ✅ 全部落地 | E2/E3 开关 + 参照基线缓存 `0e42573`；`--reuse_replay` `9dfb258`；仅 K7（JAX-GPU 冒烟）未做 |
+| E1 前置 CE | ✅（经 S27 修复重采） | 图 `0d0beba`；S27 修复 `930c37b`/`c1e112b`；audit：estimable 45→80、noop 占用 73.9%→13.8%；16 因子含全部终端 kind |
+| E1 四臂决定性跑 | ⤵ 被 **E1-rev** 替换 | 见 §12.3；sec18.12 已签收（`b9dea6f`），pilot 决定性（`2ba8a1c`），全 wave 运行中 |
+
+## 12. 链路结构变更（四项；均已预注册/留痕，无事后重释）
+
+### 12.1 Phase 2 分叉点重构（sec18.10）
+原「R2.1-oracle-admissibility + R2.2-CE 分叉」被 **E1-as-admissibility** 取代：
+base_only 在 held-out 上 CCR ≥0.9 ⇒ 基底非判别；partner_id_q 与其余臂的分离度 ⇒ 推断
+信息缺口是否存在。R2.1 差异化证书（已 PASS）仍是唯一硬前置。原 §3 的 R2.2 分叉描述作废。
+
+### 12.2 S27 插入（计划外根因修复，台账 S27/D6/D7）
+E1 前置 CE 两次 GraphCoverageError → 根因 = 行为推断器**支撑集冻结**（乘性 Bayes 更新
+0×x=0 永久锁死 t=0 无效选项；实现 bug）。修复（支撑注入 `support_mix`）+ 现场复验
+（claim 伙伴 9/9 次送餐 argmax=serve、终端质量 0.0→0.92）+ **CE 全量重采**。连带实测：
+opt7/opt9 被动访问 weight_sum=0 —— 这是 U1（干预式 CE）的直接实证动机，非推测。
+
+### 12.3 E1 → E1-rev（sec18.12，用户已签收）
+- **E1(no-scaffold) 实测**：全部完成 run ego_correct ∈ {0,1}（partner 6–12），guard 判
+  free-riding，无可部署 checkpoint。根因：P5 清理在 role_v1 config 里连带关掉了两个
+  **ego-kind-only（P5-clean）脚手架**，E1 测的是这个真空，不是方法本身。
+- **编排器事故（诚实记录 `19b653d`，我方 bug）**：单 `local` 语句吞位置参数 → 全部 run
+  共享同一输出目录并互相 `rm -rf`；no-scaffold wave 仅存 aris 5 seeds + base 1 seed 的
+  训练指标。编排器已重写（唯一目录 + 禁 cross-wipe）并用于 E1-rev。完整 no-scaffold
+  消融补跑列为可选项（§16 K10）。
+- **E1-rev pilot 决定性**：同 seed 同图，仅加回 P5-clean 脚手架 → ego 0→18、guard
+  fail→pass（`2ba8a1c`）⇒ 全 wave 授权启动。
+- E1(no-scaffold) 存活数据 = **脚手架消融基线**（sec18.12.4）：量化终端能力中脚手架
+  贡献 vs 方法贡献，入论文诚实报告节。
+
+### 12.4 创新轨道插入（sec18.11 / ICLR_UPGRADE_PLAN，`d17fedc`→`bb90b4e`）
+用户指令：正确性为前提、创新性为目标、ICLR 为标尺。U1（targeted-start + 干预式 CE +
+支持度证书）与 U2（FactorModeFilter，情节持久因子模式信念）设计规格已过 codex 评审
+（rev1 全采纳）。终态 E1 加臂为**六臂**（+aris(mode-filter)、+干预图 vs 被动图对比）；
+FCP/MEP spike 解除 E1 门控提前启动。**定位声明：当前 E1-rev 是 tier-1 诊断跑；8 月的
+多臂跑才是论文主表**——这缓和了 E1-rev 单次结果的叙事压力，但不豁免其预注册判读。
+
+## 13. 运行态快照（2026-07-04，wave 进行中；PID 1815648，修复版编排器）
+
+**进度**：9/25 final（aris_bellman 5/5、base_only 4/5）；3 in flight（base s4、gru s0/s1）；
+13 排队（gru s2–4、flat_factor 0–4、partner_id_q 0–4）。3 GPU 槽（{4,5,6}），~50–90min/run
+⇒ 预计再 **~5–7h** 完成。
+
+训练期指标（**仅调度用**；selCCR = 选中 checkpoint 在 train-partner greedy 验证上的
+ego_correct_completion_rate）：
+
+| arm | guard | selCCR（seed 序） | ego 送餐（训练期区间） |
+|---|---|---|---|
+| aris_bellman | 4/5 pass（s3 fail） | 0.4 / 0.6 / 0.8 / – / 0.8 | 6–18 |
+| base_only（s0–3） | 4/4 pass | 1.0 / 1.0 / 0.4 / 1.0 | 23–33 |
+
+两条纪律读数（现在就能定的只有这两条）：
+1. **sec18.12.3 第一行已触发**：≥2 臂各 ≥3/5 seeds 出现终端能力（guard 过、可部署
+   checkpoint 存在）⇒ **E1-rev 即决定性 run**，判读走 sec18.6 + 18.10.2 全表。
+2. base_only 训练期强势**在预期分支内**（对训练伙伴过拟合恰是 ZSC 论点的对照面）。若
+   held-out 上 base CCR ≥0.9 → 触发 18.10.2 第一行（基底非判别）→ 走 §14.3 分支映射；
+   在那之前不做任何方向性解读。aris s3（guard fail）按 I 门纪律不入表，但计入
+   sec18.12.3 co-primary「terminal competence rate」分母。
+
+## 14. 调整后的剩余链路（本补充的核心输出）
+
+### 14.0 家务（wave 完成前）
+- ✅ e1.yaml `relevance_semantics: legacy_id_pair` 修正补提交（`ee24ccd`；远端启动时已生效，
+  本地补齐 provenance）。
+- **方法层冻结**：E1-rev 判读完成前不动任何方法代码（sec18.11 禁令：不得以决定性 run
+  的结果调 U1/U2 设计）。
+- （可选，10 分钟）K7 JAX-GPU 冒烟——若 ptxas 已修则 eval 全线提速，排在 eval 启动前验。
+
+### 14.1 wave 完成 → 归档（Type-A，自判可过）
+- 全 25 run 的 metrics.json / free_rider_guard / checkpoint_selection / 训练日志
+  tar 回 `review_bundles/phase3_E1rev_<date>/`；EXPERIMENT_LOG 填 wave 汇总行。
+- 汇总表按臂给出：guard 通过率（= competence rate co-primary）、可部署 checkpoint 数。
+
+### 14.2 两段式 held-out eval（决定性判读；本节取代 §10.3 评估段）
+```
+对象:   全部 deployable checkpoints（当前预计 ~20）
+第一段: 25ep × 2 held-out（heldout-handoff-alternate-yield, heldout-resource-server-claim）
+        × 全部 ckpt；--baseline_cache_dir 共享缓存；全部 ckpt 固定同一 eval --seed
+        （缓存 key 含 seed，同臂跨 ckpt 复用参照基线）；3–4 槽并行
+        墙钟估计: 20 ckpt × ~68min(25ep×2伙伴, 按 §9.1 实测 163s/ep 折算) ÷ 3.5 槽
+        − 基线缓存摊销 ⇒ ~6–8h
+硬门:   evidence_policy=behavior_inferred_v1（require_inferred 强制）; oracle_source_count=0;
+        missing 率阈内; reward_scale_verified=true; I10–I17 全绿 —— 任一 false 不入表
+注:     脚手架是训练期 reward shaping，eval 的 headline（held-out ego_correct_completion_rate）
+        不含 shaping 项 —— E1-rev 与 E1 的 eval 口径天然同一
+初判:   sec18.6 五分支 + sec18.10.2 admissibility 四行 + sec18.12.3 → 定决胜臂
+第二段: 仅决胜臂补 50–100ep（终表口径）
+签收:   三表逐条 + 伪影自检清单（ROOTCAUSE_REVIEW_PLAN §3.2）→ codex 复核 → 用户 Type-B
+```
+
+### 14.3 判读后分支映射（预注册表 → 链路走向；不新增判读规则，只映射后续动作）
+| 判读结果（按 18.10.2 / 18.6） | 链路走向 |
+|---|---|
+| 基底判别 且 ARIS > flat > base（CI 分离） | 主线确认：E2/E3 → U1/U2 实现 → 8 月多臂正式跑 → Phase 4/5 |
+| 基底判别 且 ARIS ≈ flat（或 ≈ base） | 按预注册收窄主张、如实入档；U1/U2 成为方法改进主战场（其动机独立成立，见 §12.2/§12.4）；FCP spike 提前 |
+| base held-out CCR ≥ 0.9（基底非判别） | asymm×v2 降为机制分析布局；headline 转 FCP/MEP 群体线（T3.2）；E1-rev 全部结果作 diagnostic 入档 |
+| partner_id_q ≈ 各臂（无信息缺口） | 推断主张在该基底不可读；routing/简化主张仍按 sec18.6 读；用 sec18.9 已有扫描数据选替代布局 |
+| CI 重叠但方向一致 | +5 seeds 复跑一次再裁（§9.2 预注册行；先于任何"无差异"结论） |
+
+### 14.4 E1-rev 判读后的执行序列（顺序，各自门控）
+1. **E2 + E3 消融**：开关已落地（`0e42573`）；决胜 checkpoint × zeroed/inferred 两模式、
+   {win4-off, win8-off, persistent} × 3 seeds → sec18.7 两表。
+2. **R2.2 归档哨兵**（≤300ep × 1 seed，过夜档；关闭 serve-CE"哨兵零 vs 测量零"问题）。
+3. **U1 实现**（T2.1，~2–4 天）+ **U2 实现**（T2.2，~4–6 天）+ C1 命题形式化 +
+   /novelty-check ×2（并行，~2 天）。
+4. **FCP/MEP spike**（1–2 天，与 3 并行；K2 退役；全量群体训练仍待 spike 判读 + 用户批准）。
+5. **8 月多臂 E1 正式跑**（六臂，ICLR_UPGRADE_PLAN §5 读出）→ Phase 4（E4–E7）→
+   Phase 5（终表 + 盲测）。原 §4–§6 的实验定义与纪律不变，锚点从"E1"移到"多臂 E1"。
+
+## 15. 时间线 v2（对 §9.6 的校准；ICLR ~9 月下旬）
+
+```
+07-04        wave 完成 + 归档（14.1）
+07-05        stage-1 held-out eval（6–8h）+ 三表初判 + codex/用户 Type-B 双签
+07-06        stage-2 决胜臂补 ep + E2/E3 消融启动 + R2.2 哨兵过夜
+07-07..07-18 U1/U2 实现与远程验证 + FCP spike + C1 形式化/查新（ICLR_UPGRADE_PLAN tier-2/3）
+08 月        多臂 E1 正式跑（scripted v2 机制线 + FCP headline 线）+ E4–E7
+09 月上旬    终表（5 seeds × 2 CE seeds × 50–100ep, CI 全报）+ 盲测 split + 写作
+09 月下旬    提交（先过 /paper-claim-audit + /citation-audit + kill-argument）
+```
+
+## 16. 风险登记更新（对 §9.5）
+
+| # | 状态 | 说明 |
+|---|---|---|
+| K1 | 关闭（重构） | R2.1-FAIL 分叉被 sec18.10 E1-as-admissibility 取代 |
+| K2 | 缓解中 | FCP spike 解除门控（sec18.11(4)），排入 14.4(4)；全量投入仍待批 |
+| K3 | 已缓解 | 两段式 + 并行 eval + 基线缓存全部落地（`0e42573`） |
+| K4 | 关闭（降级） | R2.2 → 归档哨兵；支持度问题的真正解法 = U1 targeted-starts |
+| K5/K6 | 维持 | 红线不变：正式 CE 只许顺序采集；正式跑只许 graph_path 分支 |
+| K7 | 未验 | JAX-GPU 10 分钟冒烟排在 eval 前（14.0） |
+| **K8 新** | open | guard-fail 种子折损（aris s3，1/5）→ 功效下降。缓解：§9.2 预注册 +5 seeds 行；guard-fail 计入 competence-rate co-primary 而非静默丢弃 |
+| **K9 新** | open | base_only 训练期强势 ⇒ held-out 可能落「无 ARIS 特异优势」或「基底非判别」分支。**处置已预注册**（14.3 全表）；ICLR 主线（U1/U2 + FCP）的动机独立于该结果，不依赖其为正 |
+| **K10 新** | open（已量化） | 脚手架依赖批评（G2 旧账）：E1 vs E1-rev = 实测脚手架消融，但 no-scaffold 侧因编排器事故仅存 aris 5 seeds + base 1 seed；若审稿需完整对照，补跑 no-scaffold wave（~10 GPU·h，可选，用修复版编排器） |
