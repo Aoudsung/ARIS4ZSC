@@ -138,3 +138,30 @@
 - **Fix**: orchestrator rewritten with per-(method,seed) unique output dirs + no cross-wipe; used for E1-rev.
 - **Guard/eval note**: no deployable checkpoints existed (guard fail across arms), so nothing was
   read against sec18.6 — no claim contaminated. Loss is of the ablation record, not of a decisive read.
+
+### 2026-07-04 E1-rev pilot (scaffolds ON) — DECISIVE: scaffolds unlock terminal competence
+- config: `ocv2_step4_asymm_role_v2_e1rev.yaml` (contrib_team + ego-kind terminal_progress_shaping
+  + terminal_exploration, both P5-audited ego-local) · graph: `outputs/asymm_ce_role_v2_e1rev/`
+  (sparse-CE rebuild, reused replay) · commit b9dea6f→(config final)
+- **objective gate resolution (2 iterations, gate working as designed — S11/T1)**:
+  (1) shaping-on config vs shaping-off graph metadata rejected → rebuilt graph with
+  `--sparse_ce_support` (excludes terminal bonus from CE support selection, G3/S11 path);
+  (2) graph metadata `sparse_ce_support:true` vs config-unset rejected → set
+  `graph.sparse_ce_support: true` in config. Both are the anti-stale-graph gate correctly
+  enforcing CE-objective ↔ training-objective consistency. NOT failures.
+- **RESULT (aris_bellman s0, 5000 updates, 1280s)**:
+
+  | metric | E1(no-scaffold) s0 | **E1-rev(scaffold) s0** |
+  |---|---|---|
+  | ego_correct_delivery | 0 | **18** |
+  | ego_sole_correct_delivery | 0 | **2** |
+  | served_soup_count | 0 | **29** |
+  | free_rider_guard | fail | **pass** |
+  | deployable_checkpoint | None | **checkpoint.pt** |
+  | best_greedy_return | None | **46.15** |
+
+- **sec18.12.1 trigger CONFIRMED**: ego≈0 was the P5-clean-scaffold vacuum, not a method failure.
+  This is the FIRST genuinely-usable training result in the project — under honest (de-oracled) +
+  fair (oracle-free scaffolds) conditions the ego LEARNS to serve (18 correct, 2 ego-sole, guard pass).
+- **Full E1-rev wave launched** (fixed orchestrator, 4 arms × 5 seeds, unique dirs). Read per
+  sec18.6 + sec18.10.2 + sec18.12.3 once all 20 runs + partner_id_q reference land.

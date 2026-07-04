@@ -15,8 +15,8 @@ layouts:
   filter:
     min_options: 6
 graph:
-  ce_path: outputs/asymm_ce_role_v2_e1_s27fixed_retry2/ce_refined.npy
-  replay_path: outputs/asymm_ce_role_v2_e1_s27fixed_retry2/replay.npz
+  ce_path: outputs/asymm_ce_role_v2_e1rev/ce_refined.npy
+  replay_path: outputs/asymm_ce_role_v2_e1rev/replay.npz
   preflight_path: results_phase2/E1_preflight.json
   relevance_semantics: legacy_id_pair
   ce_eta: 0.02
@@ -45,8 +45,9 @@ graph:
     pot_allocation: 2
     recipe_indicator: 2
     generic_option_pair: 3
-  graph_path: outputs/asymm_ce_role_v2_e1_s27fixed_retry2/graph.json
+  graph_path: outputs/asymm_ce_role_v2_e1rev/graph.json
   ce_min_weight: 5.0
+  sparse_ce_support: true
 diagnostics:
   proxy_episodes: 10
 benchmark_variant: role_conditioned_v2_candidate
