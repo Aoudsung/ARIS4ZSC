@@ -701,3 +701,53 @@ Direction (full plan: ICLR_UPGRADE_PLAN.md; ledger IDs U1/U2):
 
 Forbidden: reading any E1/E2/E3 result against a rule not written down before
 the run; tuning U1/U2 designs on decisive-run outcomes.
+
+## sec18.12 E1-rev preregistration — oracle-FREE terminal-competence scaffolds (2026-07-04, SIGNED-OFF by user same day)
+
+Append-only. Drafted while the E1 (no-scaffold) wave is still running; readings
+below are preregistered BEFORE any E1 eval is read.
+
+### 18.12.1 Trigger (measured, not speculative)
+All completed E1 training runs (aris_bellman seeds 0-4, base_only seed 0) show
+ego_correct_delivery ∈ {0,1} vs partner 6-12; pilot guard verdict
+`free_riding_partner_serves_while_ego_idle`; no deployable checkpoint. Root
+cause analysis (EXPERIMENT_LOG 2026-07-04): (1) contrib_team pays prep against
+the 3/6 claim partners → free-riding optimum; (2) terminal chain
+pick_plate→plate_soup→serve is exploration-starved (measured 52/16 rows per
+12000 under random play); (3) dense prep shaping (coef 1.0) is a broad local
+optimum. Historical continuity: identical to RC-era "ego never serves once in
+5000 updates" (RC_REWARD_CREDIT_FIX §4b); G2 solved it with scaffolds; P5
+correctly removed the oracle-conditioned ones, but role_v1 config ALSO disabled
+the two ego-kind-only (P5-clean) scaffolds. E1(no-scaffold) is measuring that
+vacuum.
+
+### 18.12.2 E1-rev change set (option (c) — P5-clean, no partner-truth access)
+1. `terminal_progress_shaping.enabled: true` with ego-kind-only bonuses
+   (pick_plate / plate_soup / serve): conditions ONLY on the ego's own option
+   kinds and ego inventory (P5-audited ego-local; precedent: enabled in
+   ocv2_step4_asymm.yaml formal config).
+2. `terminal_exploration.enabled: true` (ego-kind exploration bias; P5-audited:
+   `_sample_exploration_option` has no partner-policy parameter).
+3. `sparse_credit: contrib_team` UNCHANGED (keeps role semantics: prepping for
+   a serving partner remains rewardable).
+4. Everything else identical to E1 (same graph, same partners, same seeds
+   0-4, same budget 5000 updates).
+Bonus values: copy the asymm.yaml formal-config values verbatim (no tuning
+against E1 outcomes — they predate E1).
+
+### 18.12.3 Preregistered readings (E1-rev)
+| Outcome | Reading |
+|---|---|
+| ego terminal competence appears (guard passes, deployable checkpoints exist) for ≥3/5 seeds in ≥2 arms | E1-rev becomes the decisive run; apply sec18.6 + sec18.10.2 tables to E1-rev eval |
+| competence appears in some arms but not others (e.g. aris yes, base no or vice versa) | THIS IS ITSELF a discriminative signal — read per sec18.6 rows with "terminal competence rate" as a co-primary metric alongside ego_correct_completion_rate |
+| still no arm reaches competence | scaffolds insufficient at this budget → escalate budget (10k updates) once; if still zero, record "asymm×v2 terminal chain unlearnable under P5-clean training at this scale" as an honest negative and shift the discriminative question to non-terminal factors (bottleneck axis) |
+| E1(no-scaffold) vs E1-rev comparison | archived as the SCAFFOLD ABLATION — quantifies how much of terminal competence is scaffold-driven vs method-driven; feeds the paper's honest-reporting section (curriculum-dependence was a G2-era criticism; now measured) |
+
+### 18.12.4 Guards
+- E1(no-scaffold) wave runs to completion and is archived as baseline record;
+  its eval is NOT read against sec18.6 (no deployable checkpoints ⇒ nothing to
+  read); its training metrics ARE the scaffold-ablation baseline.
+- No further reward/exploration tuning after E1-rev results are seen (one
+  budget escalation preregistered above is the only allowed knob).
+- All integrity gates unchanged (I10-I17); scaffolds are ego-local by
+  construction and do not touch the evidence path.
