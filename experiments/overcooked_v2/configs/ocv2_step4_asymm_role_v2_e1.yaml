@@ -18,7 +18,7 @@ graph:
   ce_path: outputs/asymm_ce_role_v2_e1_s27fixed_retry2/ce_refined.npy
   replay_path: outputs/asymm_ce_role_v2_e1_s27fixed_retry2/replay.npz
   preflight_path: results_phase2/E1_preflight.json
-  relevance_semantics: ego_complement_projection
+  relevance_semantics: legacy_id_pair
   ce_eta: 0.02
   max_factors: 16
   full_max_factors: 16
