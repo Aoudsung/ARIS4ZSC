@@ -119,3 +119,22 @@
 ## Phase 5 — 锁定 → 盲测 → 终表
 
 *(待运行)*
+
+### 2026-07-04 E1(no-scaffold) wave — ORCHESTRATOR BUG (data loss), partial result retained
+- **Bug (mine)**: `logs_phase3/E1_wave_orch.sh` used `local method=$1 ... out=results_phase3/E1_${method}_s${seed}`
+  in a SINGLE `local` declaration → `${method}`/`${seed}` empty when `out` computed (bash gotcha) →
+  every run's `out=results_phase3/E1__s` + `rm -rf $out` at run start **wiped all prior runs' outputs**.
+  CLI `--method`/`--seed` (separate refs, post-declaration) expanded fine → correct subpath but shared
+  parent dir. Only the last-completing run survived on disk.
+- **Captured before wipe (live reads, training-phase ego/partner delivery counts)**:
+  - aris_bellman: s0=0/8, s1=1/12, s2=0/10, s3=0/11, s4=0/6 (all 5 seeds — ego≈0)
+  - base_only: s0=0/7 (ego=0)
+  - partner_id_q: s4=1/9 (survived on disk; ego≈1)
+  - global_gru, flat_factor: NOT captured before wipe → lost
+- **Scientific status**: the no-scaffold "ego≈0 vacuum" headline (sec18.12.1 trigger) is established
+  qualitatively from aris×5 + base×1 + partner_id_q×1. The FULL 4-arm×5-seed ablation table is LOST.
+  Per sec18.12.4 this table is the scaffold-ablation baseline — **deferred re-run** (cheap, ~5h overnight,
+  only needed if the paper requires the complete no-scaffold ablation vs E1-rev).
+- **Fix**: orchestrator rewritten with per-(method,seed) unique output dirs + no cross-wipe; used for E1-rev.
+- **Guard/eval note**: no deployable checkpoints existed (guard fail across arms), so nothing was
+  read against sec18.6 — no claim contaminated. Loss is of the ablation record, not of a decisive read.
