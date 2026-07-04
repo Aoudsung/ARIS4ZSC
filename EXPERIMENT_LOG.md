@@ -165,3 +165,27 @@
   fair (oracle-free scaffolds) conditions the ego LEARNS to serve (18 correct, 2 ego-sole, guard pass).
 - **Full E1-rev wave launched** (fixed orchestrator, 4 arms × 5 seeds, unique dirs). Read per
   sec18.6 + sec18.10.2 + sec18.12.3 once all 20 runs + partner_id_q reference land.
+
+### 2026-07-04 E1-rev 全 wave 完成（25/25）· 潜伏缺陷扫荡 · 窗口一修复验证 PASS
+- **wave**: 5 臂 × 5 seeds 全部 exit=0；产物审计全干净（`final=True/run_status=ok/updates=5000`
+  ×25，含 LDS-C1 直接核验——skip-on-existence bug 存在但本 wave 无 resume 未触发）。
+- **codex 潜伏缺陷扫荡**（3-pass xhigh，`b11af06`）：12 发现（3A/7B/2C），**无一作废已完成
+  wave**；窗口一修复 F1–F5 落库（`98fe149` eval 层 + `6ece080` 汇总脚本），codex diff 复评
+  BLOCK→4 阻塞项修复→APPROVE-WITH-NITS；远程验证：定向回归 **33 passed**、gate I1–I17
+  exit 0（archive 缺 `.aris/`（untracked）致首次 exit=2 误报，copied tool 复跑 = 0）。
+- **train 期表**（aggregate_e1rev v1，**非决定性**——决定性 = held-out eval）：
+
+  | arm | seeds | guard pass | competence rate | selCCR (pass) | ego_sole (pass) | best_ret (pass) |
+  |---|---|---|---|---|---|---|
+  | aris_bellman | 5 | 4 | 0.80 | 0.65 | 5.0 | 42.4 |
+  | base_only | 5 | 5 | 1.00 | 0.80 | 7.2 | 64.2 |
+  | flat_factor | 5 | 5 | 1.00 | 0.88 | 7.2 | 53.8 |
+  | global_gru | 5 | 5 | 1.00 | 0.84 | 6.0 | 54.0 |
+  | partner_id_q | 5 | 5 | 1.00 | 0.88 | 7.6 | 56.3 |
+
+- **sec18.12.3 第一行触发（远超阈值）**：全部 5 臂 ≥4/5 seeds 达成终端能力 ⇒
+  **E1-rev 即决定性 run**，判读走 sec18.6 五分支 + sec18.10.2 admissibility 四行。
+- 观察记录（不解读）：aris_bellman 是唯一有 guard fail 的臂（s3）且 train selCCR 最低；
+  train-partner 指标与 held-out ZSC 泛化是两回事——一切结论等两段式 held-out eval。
+- **下一步**：stage-1 held-out eval（25ep × 2 held-out × ~24 deployable ckpts，基线缓存
+  schema v3 + 固定 eval seed），按 §14.2 执行卡（待授权）。

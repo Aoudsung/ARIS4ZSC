@@ -351,3 +351,29 @@ P3 sidecar 与覆盖门在真实运行中按设计工作（覆盖门两次正确
 
 **纪律注记**：以上全部在 E1 出数之前预注册（sec18.11），读出规则先于运行写死；
 mode-filter 不敌 option-infer 时如实降级 C2（预注册的诚实降级路径）。
+
+## 潜伏缺陷扫荡（LDS，2026-07-04，codex 三 pass xhigh；bundle: review_bundles/latent_defect_sweep_20260704/）
+
+裁决基线：**无一发现作废已完成的 E1-rev wave**（LDS-C1 逐产物核验、LDS-B1 不触 headline、
+LDS-B2 属门严格性）。修复窗口纪律见 bundle/SWEEP_SUMMARY.md §6。
+
+| ID | 级 | 类 | 一句话 | 状态 |
+|---|---|---|---|---|
+| LDS-B1 | A | C6 | terminal shaping 经 `_training_reward` 漏入 eval 回报口径 | **FIXED** `98fe149`（include_terminal_shaping；train 逐位不变） |
+| LDS-B2 | A | C11 | eval reward-scale 门只记录不硬拦 | **FIXED** `98fe149`（`_enforce_reward_scale` fail-closed + smoke 逃生口） |
+| LDS-C1 | A | C9 | 编排器 metrics.json 存在即视为完成（非终态可被 skip） | **PARTIAL**：消费端防御 FIXED `6ece080`（aggregate 硬校验 final/run_status/updates + 去重）；生产端 success-marker 待写入下一个编排器模板；本 wave 已核验未触发 |
+| LDS-C2 | B | C9 | 基线缓存 key 漏 sparse-credit/terminal-shaping/allow_shared_shaping | **FIXED** `98fe149`（schema v3，旧条目全失效） |
+| LDS-C3 | B | C5 | eval 无 canonical throughput 字段（分母口径可漂） | **FIXED** `98fe149`（`_throughput_fields`，sec18.9.2 口径，None≠0） |
+| PM-7 | — | — | 25-run 表无合规汇总工具 | **FIXED** `6ece080`（aggregate_e1rev.py，已对真实 25 run 出表） |
+| LDS-A1 | B | C7 | E2 zeroed 门漏 confidence/半置零 | OPEN，窗口二（E2 前修） |
+| LDS-B3 | B | C6 | E2 无 CLI 消融开关（需篡改 ckpt config） | OPEN，窗口二（E2 前修） |
+| LDS-B4 | B | C3 | `graph.sparse_ce_support` config 被 CE 脚本忽略（认 CLI flag） | OPEN，窗口二（CE 重建前修） |
+| LDS-B5 | B | C11 | `--reuse_replay` 门盲于 support_mix/reward/shaping 等 | OPEN，窗口二（CE 复用前修） |
+| LDS-B6 | B | C2 | `belief_persistence` 未在任何正式 config 显式钉 | OPEN，窗口二（E3 前钉 config） |
+| LDS-B7 | C | C11 | eval 完整性门可被零证据 vacuous 通过 | OPEN，窗口二 |
+| LDS-C4 | C | C4 | summary 均值把缺失字段静默当 0.0 | OPEN，窗口二（新字段已用 fail-closed 索引，旧字段待改） |
+
+修复验证记录：codex diff 复评 BLOCK（4 阻塞：cache key 漏 allow_shared_shaping、competence
+判据字段、eval 漏 serve_share、eval 缺去重）→ 全部修复 → **APPROVE-WITH-NITS**（nit 已修，
+thread 019f2d46）。远程（全新 archive 目录 ARIS4ZSC-w1fix-6ece080）：定向回归 33 passed、
+gate I1–I17 exit 0、aggregate_e1rev 对真实 25 run 出表成功（表见 EXPERIMENT_LOG 2026-07-04）。
