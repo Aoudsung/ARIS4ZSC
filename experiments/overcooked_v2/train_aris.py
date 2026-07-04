@@ -3025,6 +3025,7 @@ def _training_reward(
     event: Any,
     *,
     ego_contributed: bool = False,
+    include_terminal_shaping: bool = True,
 ) -> float:
     # RC root-cause fix: the sparse term is the ego's actor-specific delivery
     # credit, not the shared team reward. With sparse_credit="team" (legacy
@@ -3041,9 +3042,15 @@ def _training_reward(
         **{k: v for k, v in sparse_params.items() if k != "partner_terminal_policy"},
     )
     shaped_coef = float(config["training"].get("shaped_reward_coef", 0.0))
-    terminal_bonus = terminal_progress_bonus(
-        event, params=terminal_progress_params(config.get("training"))
-    )
+    # LDS-B1 (latent-defect sweep): terminal-progress shaping is a TRAINING
+    # scaffold. Eval-side return accounting passes include_terminal_shaping=False
+    # so shaped (E1-rev) and unshaped (E1) checkpoints report returns on the same
+    # scale. Training call sites keep the default True — behaviour unchanged.
+    terminal_bonus = 0.0
+    if include_terminal_shaping:
+        terminal_bonus = terminal_progress_bonus(
+            event, params=terminal_progress_params(config.get("training"))
+        )
     return (
         sparse
         + terminal_bonus

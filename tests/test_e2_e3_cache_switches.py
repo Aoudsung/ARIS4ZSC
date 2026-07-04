@@ -214,6 +214,48 @@ def test_cache_key_deterministic_and_sensitive(tmp_path: Path):
 
 
 @pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
+def test_cache_key_sensitive_to_reward_variant(tmp_path: Path):
+    """LDS-C2 (latent-defect sweep): sparse-credit and terminal-progress reward
+    variants must NOT share baseline cache entries — a contrib_team+scaffold
+    config (E1-rev) and a team/no-scaffold config differ in rollout return
+    accounting."""
+    common = dict(
+        kind="random_policy",
+        config=_cfg(),
+        partner="p1",
+        episodes=5,
+        seed=0,
+        max_episode_options=20,
+    )
+    base_path, _ = _baseline_cache_target(tmp_path, layout="asymm", **common)
+
+    def _with_training(**extra):
+        cfg = _cfg()
+        cfg["training"] = {**cfg["training"], **extra}
+        c = dict(common)
+        c["config"] = cfg
+        return _baseline_cache_target(tmp_path, layout="asymm", **c)[0]
+
+    # sparse-credit mode flips the key
+    assert _with_training(sparse_credit="contrib_team") != base_path
+    # contrib_scale (inside the resolved sparse-credit signature) flips the key
+    assert _with_training(
+        sparse_credit="contrib_team", contrib_team={"contrib_scale": 0.5}
+    ) != _with_training(sparse_credit="contrib_team")
+    # terminal-progress shaping flips the key even though eval returns exclude
+    # it since LDS-B1 (over-keying is deliberate: misses are safe, aliasing not)
+    assert _with_training(
+        terminal_progress_shaping={
+            "enabled": True,
+            "ego_plate_pick_bonus": 0.5,
+            "ego_plate_soup_bonus": 1.5,
+            "ego_serve_bonus": 0.0,
+            "max_bonus_per_step": 1.5,
+        }
+    ) != base_path
+
+
+@pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
 def test_cache_roundtrip_key_and_corruption(tmp_path: Path):
     path = tmp_path / "random_policy_abc.json"
     key = "abc"

@@ -47,7 +47,11 @@ from experiments.overcooked_v2.provenance import (
     sha256_file,
     sha256_json,
 )
-from experiments.overcooked_v2.reward_design import ContributionLedger
+from experiments.overcooked_v2.reward_design import (
+    ContributionLedger,
+    terminal_progress_params,
+)
+from experiments.overcooked_v2.sparse_credit import sparse_credit_params
 from experiments.overcooked_v2.state_utils import (
     agent_facing_pos, get_agent_pos, get_inventory,
     get_pot_contents, is_pot_cooking, is_pot_ready_for_plate,
@@ -134,6 +138,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         )
         for ctx in contexts
     }
+    # LDS-B2 (latent-defect sweep): reward-scale verification is a HARD gate for
+    # formal eval — a graph/config objective mismatch must fail the run, not just
+    # be recorded in the output JSON for someone to notice later.
+    _enforce_reward_scale(
+        reward_scale_status,
+        allow_unverified=bool(getattr(args, "allow_unverified_reward_scale", False)),
+    )
     seed = int(args.seed)
     max_episode_options = int(
         args.max_episode_options
@@ -233,6 +244,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "allow_diag_skip": allow_diag_skip,
         "factor_deletion_episodes": factor_deletion_episodes,
         "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
+        # LDS-B1: eval returns exclude training-only shaping so shaped (E1-rev)
+        # and unshaped (E1) checkpoints report on the same scale.
+        "eval_return_excludes": ["terminal_progress_shaping"],
         "reward_scale_verified": all(
             bool(item["reward_scale_verified"])
             for item in reward_scale_status.values()
@@ -599,12 +613,18 @@ def _execute_eval_option(
         ego_contributed = False
         if contribution_ledger is not None:
             ego_contributed = contribution_ledger.query_and_reset_on_delivery(event)
+        # LDS-B1: eval return accounting must stay on the UNSHAPED scale —
+        # terminal-progress shaping is a training scaffold (E1-rev), and
+        # including it here would put shaped/unshaped checkpoints' returns on
+        # different scales. Applies uniformly to checkpoint, random-baseline and
+        # external-reference rollouts (they all execute options through here).
         reward_sum += _training_reward(
             step,
             ctx.config,
             "agent_0",
             event,
             ego_contributed=ego_contributed,
+            include_terminal_shaping=False,
         )
         realized_cost += float(ctx.config["training"].get("cost_per_step", 1.0))
         duration += 1
@@ -1110,20 +1130,31 @@ _OPTIONS_CACHE_KEYS = (
 )
 # Bump when the key scheme or entry shape changes so stale valid-JSON entries from
 # an older code version are rejected rather than trusted (review MEDIUM fix).
-_BASELINE_CACHE_SCHEMA = 2
+# v3: key gained sparse-credit + terminal-progress reward signatures (LDS-C2).
+_BASELINE_CACHE_SCHEMA = 3
 
 
 def _baseline_env_payload(config: dict[str, Any]) -> dict[str, Any]:
     """The subset of config that changes a reference/random rollout's outcome."""
     env_cfg = (config or {}).get("env", {}) or {}
     opt_cfg = (config or {}).get("options", {}) or {}
+    training_cfg = ((config or {}).get("training", {}) or {})
     return {
         "env": {k: env_cfg.get(k) for k in _ENV_CACHE_KEYS},
         "options": {k: opt_cfg.get(k) for k in _OPTIONS_CACHE_KEYS},
         "reward_config": reward_config_payload(config or {}),
-        "partner_set": str(
-            ((config or {}).get("training", {}) or {}).get("partner_set", "standard7")
-        ),
+        # LDS-C2: reward inputs beyond reward_config_payload that change rollout
+        # return accounting — sparse-credit mode/constants and terminal-progress
+        # shaping. Resolved via the SAME helpers the train reward path uses (no
+        # hand-rolled signature that could drift). Terminal shaping is excluded
+        # from eval returns since LDS-B1, but stays in the key: over-keying only
+        # costs cache misses, never correctness.
+        "sparse_credit": sparse_credit_params(training_cfg),
+        "terminal_progress": terminal_progress_params(training_cfg),
+        # codex diff-review blocker: shaped-reward SHARING mode also changes the
+        # rollout return (train_aris._training_reward reads it), so it must key.
+        "allow_shared_shaping": bool(training_cfg.get("allow_shared_shaping", False)),
+        "partner_set": str(training_cfg.get("partner_set", "standard7")),
     }
 
 
@@ -1385,6 +1416,38 @@ def _reference_semantics(has_external_references: bool) -> dict[str, str]:
     }
 
 
+def _throughput_fields(
+    delivery_counts: dict[str, Any], n_episodes: int
+) -> dict[str, Any]:
+    """LDS-C3: canonical throughput fields (METHOD_LOCK sec18.9.2 lens).
+
+    Freezes the denominator (episodes) and actor attribution HERE so downstream
+    aggregation scripts cannot derive divergent throughput definitions.
+    Undefined values are ``None``, never 0.0 — absence of measurement is not a
+    zero (LDS-C4 lesson).
+    """
+    serve_denom = int(delivery_counts["ego_correct_delivery"]) + int(
+        delivery_counts["partner_correct_delivery"]
+    )
+    return {
+        "team_correct_delivery_throughput_per_episode": (
+            float(delivery_counts["correct_delivery"]) / n_episodes
+            if n_episodes > 0
+            else None
+        ),
+        "ego_correct_delivery_throughput_per_episode": (
+            float(delivery_counts["ego_correct_delivery"]) / n_episodes
+            if n_episodes > 0
+            else None
+        ),
+        "ego_serve_share": (
+            float(delivery_counts["ego_correct_delivery"]) / serve_denom
+            if serve_denom > 0
+            else None
+        ),
+    }
+
+
 def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     returns = [float(row["return"]) for row in episodes]
     primitive_steps = sum(int(row["primitive_steps"]) for row in episodes)
@@ -1432,6 +1495,7 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
             int(item["success_count"]) / max(1, int(item["attempt_count"]))
         )
     return {
+        **_throughput_fields(delivery_counts, len(episodes)),
         "mean_return": _mean_or_nan(returns),
         "return_std": float(np.std(returns)) if returns else float("nan"),
         "completion_rate": _mean_or_nan([float(row["completed"]) for row in episodes]),
@@ -1577,6 +1641,22 @@ def _summary(
     summary["mean_partner_delivery_count"] = _mean_or_zero([
         float(r["aggregate"].get("partner_correct_delivery_count", 0.0)) for r in results
     ])
+    # LDS-C3: throughput means. DIRECT indexing (fail closed) — these fields are
+    # emitted by the same code version, so absence means schema corruption, not
+    # zero. A None value (0-episode aggregate) must also crash rather than
+    # silently average as 0.0 (LDS-C4 lesson).
+    summary["mean_team_correct_delivery_throughput_per_episode"] = _mean_or_nan([
+        float(r["aggregate"]["team_correct_delivery_throughput_per_episode"])
+        for r in results
+    ])
+    summary["mean_ego_correct_delivery_throughput_per_episode"] = _mean_or_nan([
+        float(r["aggregate"]["ego_correct_delivery_throughput_per_episode"])
+        for r in results
+    ])
+    _serve_shares = [r["aggregate"]["ego_serve_share"] for r in results]
+    summary["mean_ego_serve_share"] = _mean_or_nan(
+        [float(s) for s in _serve_shares if s is not None]
+    )
     return summary
 
 
@@ -1765,6 +1845,43 @@ def _record_forced_noop(selection_stats: dict[str, int] | None) -> None:
     ) + 1
 
 
+def _enforce_reward_scale(
+    reward_scale_status: dict[str, dict[str, Any]],
+    *,
+    allow_unverified: bool,
+) -> None:
+    """LDS-B2: hard-fail formal eval on unverified reward scale.
+
+    Previously the per-variant ``reward_scale_verified`` booleans were only
+    recorded in the output JSON, so a checkpoint evaluated against a stale or
+    objective-mismatched CE graph still produced a formal-looking artifact.
+    ``--allow_unverified_reward_scale`` is the smoke/debug escape hatch: it
+    downgrades the failure to a stderr warning while the JSON keeps recording
+    the false status for triage.
+    """
+    failures = {
+        variant: status
+        for variant, status in reward_scale_status.items()
+        if not bool(status.get("reward_scale_verified"))
+    }
+    if not failures:
+        return
+    if allow_unverified:
+        print(
+            "[evaluate_aris] WARNING: reward-scale verification FAILED for "
+            f"variants {sorted(failures)}; proceeding only because "
+            "--allow_unverified_reward_scale was passed (smoke/debug use only).",
+            file=sys.stderr,
+        )
+        return
+    raise RuntimeError(
+        "Formal eval refused: reward-scale verification failed for variants "
+        f"{sorted(failures)}: {failures!r}. Regenerate the CE graph with the "
+        "current config (run_ce_pipeline) or, for smoke/debug only, pass "
+        "--allow_unverified_reward_scale."
+    )
+
+
 def _validate_eval_integrity(
     aggregate: dict[str, Any],
     *,
@@ -1916,6 +2033,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--allow_diag_skip",
         action="store_true",
         help="Smoke/debug escape hatch: record diagnostic skips instead of failing formal eval.",
+    )
+    parser.add_argument(
+        "--allow_unverified_reward_scale",
+        action="store_true",
+        help="Smoke/debug ONLY (LDS-B2): downgrade the hard reward-scale "
+        "verification gate to a warning. Formal eval must never pass this.",
     )
     parser.add_argument(
         "--random_policy_only",
