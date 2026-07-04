@@ -24,12 +24,19 @@ class PartnerOptionInferencer:
         classifier_checkpoint: str | None = None,
         allow_heuristic: bool = False,
         mode: str = "inferred",
+        support_mix: float = 0.05,
     ):
         self.option_library = option_library
         self.temperature = temperature
         self.belief: np.ndarray | None = None
         self.classifier: PartnerOptionClassifier | None = None
         self.allow_heuristic = bool(allow_heuristic)
+        # S27: per-step mixing weight of the uniform-over-currently-valid support
+        # floor into the belief prior. 0 disables (reproduces the frozen-support
+        # pre-fix behavior — kept reachable for ablation only).
+        self.support_mix = float(support_mix)
+        if not (0.0 <= self.support_mix < 1.0):
+            raise ValueError(f"support_mix must be in [0,1), got {support_mix!r}.")
         # E2 ablation (EXPERIMENT_CHAIN_PLAN §10.4, METHOD_LOCK sec18.7): "zeroed"
         # emits no option-level intent, only the observable primitive action, so the
         # partner_option_* evidence channels go neutral. Default "inferred" is the
@@ -91,8 +98,22 @@ class PartnerOptionInferencer:
         if self.belief is None or self.belief.shape[0] != num_options:
             self.reset(prev_state)
 
-        likelihood = np.zeros_like(self.belief)
         valid_mask = self.option_library.valid_options(prev_state, agent_id=1)
+        # S27 fix (FINDINGS_LEDGER): support injection. The multiplicative Bayes
+        # update below can never resurrect an option whose belief mass is exactly 0,
+        # and reset() zeroes every option that is invalid at t=0 — so options that
+        # only BECOME valid mid-episode (plate/serve once the soup cooks) were
+        # permanently uninferable (live evidence: a claim partner delivered 9x in
+        # one episode while inferred terminal mass stayed 0.0). Mix a small
+        # uniform-over-currently-valid floor into the prior each step (standard
+        # forgetting-factor filtering). Uses only valid_options(state) — public,
+        # behavior-observable information; the P1 oracle boundary is untouched.
+        support_floor = _normalize(np.asarray(valid_mask, dtype=np.float32))
+        mix = float(self.support_mix)
+        if mix > 0.0:
+            self.belief = _normalize((1.0 - mix) * self.belief + mix * support_floor)
+
+        likelihood = np.zeros_like(self.belief)
         for opt in self.option_library.options:
             is_valid_fn = getattr(self.option_library, "is_valid_for_state", None)
             if callable(is_valid_fn):
@@ -228,4 +249,5 @@ def make_behavior_option_inferencer(
         classifier_checkpoint=cfg.get("classifier_checkpoint"),
         allow_heuristic=bool(cfg.get("allow_heuristic", True)),
         mode=mode,
+        support_mix=float(cfg.get("support_mix", 0.05)),
     )

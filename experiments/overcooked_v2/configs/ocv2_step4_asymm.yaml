@@ -131,6 +131,9 @@ evidence:
     # E2 (METHOD_LOCK sec18.7/18.8): inferred|zeroed. Formal path = inferred;
     # 'zeroed' is the EVAL-ONLY partner-option-channel ablation.
     mode: inferred
+    # S27: per-step support-floor mix so mid-episode-valid options (plate/serve)
+    # stay inferable; 0 reproduces the frozen-support bug (ablation only).
+    support_mix: 0.05
     allow_heuristic: true
     temperature: 1.0
     source_policy: behavior_observable_only
