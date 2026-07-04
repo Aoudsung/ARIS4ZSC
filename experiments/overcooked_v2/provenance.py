@@ -94,6 +94,32 @@ def graph_json_hash(graph_json: dict[str, Any]) -> str:
     return sha256_json(_without_graph_self_hash(graph_json))
 
 
+# S28: metadata keys stamped at RUNTIME (train start / checkpoint save) that are
+# audit trail, not graph semantics. The checkpoint-embedded graph legitimately
+# carries them while the on-disk graph.json does not, so graph-IDENTITY
+# comparisons must ignore them — otherwise the eval-side reward-scale gate
+# (LDS-B2) false-positives on every checkpoint (first caught 2026-07-04 on the
+# E1-rev stage-1 launch; verified content-identical, d945aa… both sides).
+GRAPH_RUNTIME_METADATA_KEYS = frozenset(
+    {"provenance", "formal_experiment", "graph_source", "preflight_gate"}
+)
+
+
+def graph_content_hash(graph_json: dict[str, Any]) -> str:
+    """Canonical hash of a graph's CONTENT: factors/CE plus semantic metadata,
+    with runtime bookkeeping keys stripped (S28). Factor/CE drift and semantic
+    metadata drift still change this hash; runtime stamps do not."""
+    copied = json.loads(json.dumps(_jsonable(graph_json)))
+    metadata = copied.get("metadata")
+    if isinstance(metadata, dict):
+        copied["metadata"] = {
+            key: item
+            for key, item in metadata.items()
+            if key not in GRAPH_RUNTIME_METADATA_KEYS
+        }
+    return sha256_json(copied)
+
+
 def stamp_graph_hash(graph_json: dict[str, Any]) -> dict[str, Any]:
     metadata = graph_json.setdefault("metadata", {})
     provenance = metadata.setdefault("provenance", {})

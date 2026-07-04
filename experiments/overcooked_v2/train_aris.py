@@ -61,6 +61,7 @@ from experiments.overcooked_v2.reward_design import (
 from experiments.overcooked_v2.provenance import (
     GRAPH_HASH_FIELD,
     PROVENANCE_SCHEMA_VERSION,
+    graph_content_hash,
     graph_hash_from_spec,
     runtime_provenance,
     stamp_graph_hash,
@@ -1370,6 +1371,20 @@ def _graph_provenance_status(
         option_lib=option_lib,
         partners=partners,
     )
+    # S28: graph identity is compared CONTENT-to-content, not record-to-record.
+    # The embedded provenance record is stamped after runtime metadata additions
+    # (formal_experiment/graph_source/preflight_gate), so the recorded hash can
+    # NEVER equal the on-disk file's hash on the eval path (checkpoint-embedded
+    # graph) — a guaranteed false positive first caught by the LDS-B2 hard gate.
+    # Recomputing both sides with graph_content_hash keeps the real invariant
+    # ("the graph in use is the file the config points to") fully enforced:
+    # any factor/CE/semantic-metadata drift still mismatches.
+    _graph_path = (config.get("graph", {}) or {}).get("graph_path")
+    if _graph_path and Path(_graph_path).exists() and hasattr(graph, "to_json_dict"):
+        expected[GRAPH_HASH_FIELD] = graph_content_hash(
+            json.loads(Path(_graph_path).read_text(encoding="utf-8"))
+        )
+        observed[GRAPH_HASH_FIELD] = graph_content_hash(graph.to_json_dict())
     missing = sorted(key for key in expected if key not in observed)
     mismatches = {}
     for key, expected_value in expected.items():
