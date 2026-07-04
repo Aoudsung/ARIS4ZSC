@@ -93,6 +93,7 @@ def collect_option_replay(
     credit_params: dict[str, Any] | None = None,
     terminal_progress: dict[str, Any] | None = None,
     exclude_terminal_progress_from_reward_sum: bool = False,
+    evidence_config: dict[str, Any] | None = None,
 ) -> list[OptionReplayRow]:
     import time as _time
     rng = np.random.default_rng(seed)
@@ -112,7 +113,9 @@ def collect_option_replay(
             obs, state = env.reset(reset_seed)
             if hasattr(partner, "reset"):
                 partner.reset(reset_seed)
-            partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+            partner_option_inferencer = make_behavior_option_inferencer(
+                option_lib, evidence_config, require_inferred=True
+            )
             partner_option_inferencer.reset(state)
 
             ledger = ContributionLedger()
@@ -243,6 +246,7 @@ def collect_option_replay_batched(
     credit_params: dict[str, Any] | None = None,
     terminal_progress: dict[str, Any] | None = None,
     exclude_terminal_progress_from_reward_sum: bool = False,
+    evidence_config: dict[str, Any] | None = None,
 ) -> list[OptionReplayRow]:
     from experiments.overcooked_v2.batched_rollout import BatchedEnvPool
 
@@ -291,7 +295,7 @@ def collect_option_replay_batched(
                 partner_options=[],
                 partner_confidences=[],
                 partner_sources=[],
-                partner_option_inferencer=make_behavior_option_inferencer(option_lib),
+                partner_option_inferencer=make_behavior_option_inferencer(option_lib, evidence_config, require_inferred=True),
                 partner=copy.deepcopy(partner_template),
                 done=i >= initial_active,
                 needs_new_option=True,
@@ -312,7 +316,7 @@ def collect_option_replay_batched(
             if not slot.done and hasattr(slot.partner, "reset"):
                 slot.partner.reset(int(init_seeds[i]))
             if not slot.done:
-                slot.partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+                slot.partner_option_inferencer = make_behavior_option_inferencer(option_lib, evidence_config, require_inferred=True)
                 slot.partner_option_inferencer.reset(init_states[i])
 
         active_count = sum(1 for s in slots if not s.done)
@@ -332,7 +336,7 @@ def collect_option_replay_batched(
 
                 state_i = pre_snap[i]
                 if slot.partner_option_inferencer is None:
-                    slot.partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+                    slot.partner_option_inferencer = make_behavior_option_inferencer(option_lib, evidence_config, require_inferred=True)
                     slot.partner_option_inferencer.reset(state_i)
 
                 if slot.needs_new_option:
@@ -501,7 +505,7 @@ def collect_option_replay_batched(
                 )
                 post_reset = pool.snapshot()
                 for reset_i in reset_indices:
-                    slots[int(reset_i)].partner_option_inferencer = make_behavior_option_inferencer(option_lib)
+                    slots[int(reset_i)].partner_option_inferencer = make_behavior_option_inferencer(option_lib, evidence_config, require_inferred=True)
                     slots[int(reset_i)].partner_option_inferencer.reset(post_reset[int(reset_i)])
         _elapsed = _time.monotonic() - _t0
         if completed_episodes != episodes or len(completed_episode_ids) != episodes:

@@ -237,6 +237,7 @@ def main(argv: list[str] | None = None) -> None:
             credit_params=credit_params,
             terminal_progress=terminal_progress_cfg,
             exclude_terminal_progress_from_reward_sum=bool(args.sparse_ce_support),
+            evidence_config=config,
         )
         print(f"Collected {len(rows)} option replay rows")
 
@@ -272,6 +273,37 @@ def main(argv: list[str] | None = None) -> None:
         "ce_min_weight": ce_min_weight,
         "ce_max_options_per_episode": ce_max_options_per_episode,
         "partner_option_evidence_policy": PARTNER_OPTION_EVIDENCE_POLICY,
+        # codex review [A] fix — record inferencer provenance so a future config
+        # divergence (mode / support_mix / temperature / classifier_checkpoint)
+        # is caught by the objective-metadata gate instead of silently mismatching
+        # CE partner weights vs train/eval evidence.
+        "partner_option_inference": {
+            "mode": str(
+                (config.get("evidence", {}) or {})
+                .get("partner_option_inference", {})
+                .get("mode", "inferred")
+            ),
+            "support_mix": float(
+                (config.get("evidence", {}) or {})
+                .get("partner_option_inference", {})
+                .get("support_mix", 0.05)
+            ),
+            "temperature": float(
+                (config.get("evidence", {}) or {})
+                .get("partner_option_inference", {})
+                .get("temperature", 1.0)
+            ),
+            "allow_heuristic": bool(
+                (config.get("evidence", {}) or {})
+                .get("partner_option_inference", {})
+                .get("allow_heuristic", True)
+            ),
+            "classifier_checkpoint": (
+                (config.get("evidence", {}) or {})
+                .get("partner_option_inference", {})
+                .get("classifier_checkpoint")
+            ),
+        },
     }
     save_replay_npz(replay_path, rows, replay_metadata)
     replay_sha256 = sha256_file(replay_path)
