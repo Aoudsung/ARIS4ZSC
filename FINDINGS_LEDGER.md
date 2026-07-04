@@ -377,3 +377,18 @@ LDS-B2 属门严格性）。修复窗口纪律见 bundle/SWEEP_SUMMARY.md §6。
 判据字段、eval 漏 serve_share、eval 缺去重）→ 全部修复 → **APPROVE-WITH-NITS**（nit 已修，
 thread 019f2d46）。远程（全新 archive 目录 ARIS4ZSC-w1fix-6ece080）：定向回归 33 passed、
 gate I1–I17 exit 0、aggregate_e1rev 对真实 25 run 出表成功（表见 EXPERIMENT_LOG 2026-07-04）。
+
+### S28（2026-07-04，LDS-B2 新硬门首战捕获；实现 bug，中）
+- **现象**：stage-1 held-out eval 全部 24 job 被 reward-scale 硬门拒绝（graph_json_sha256
+  mismatch：checkpoint 内嵌记录 1e3af3 vs 文件侧 4ea75d）。
+- **取证**：graph.json mtime（16:47）早于全部 checkpoint（16:55 起）——文件未漂移；全部语义
+  字段匹配；剥离运行时记账键（provenance/formal_experiment/graph_source/preflight_gate）后
+  文件与全部抽样 checkpoint 内容哈希一致（d945aa）。
+- **根因**：`_stamp_runtime_provenance` 在 train 添加运行时 metadata 键**之后**盖 spec 哈希章
+  → checkpoint 内嵌记录与盘上文件哈希**结构性永不相等**；train 门在盖章前比较故历来通过；
+  旧 eval 只记录不拦（LDS-B2 本体）故从未暴露——**新门首战即挖出长期潜伏的 provenance bug**。
+- **修复**：`graph_content_hash`（剥离运行时键的内容哈希）双侧重算 GRAPH_HASH_FIELD
+  （`108bb89`，codex APPROVE-WITH-NITS）；门牙保留（factor/CE/语义 metadata 漂移仍 FAIL，
+  双向回归测试）；真 checkpoint 直验 mismatches:{} → eval 重启放行。
+- **连带教训（记录）**：`python -c` 验证时 cwd 遮蔽 PYTHONPATH（sys.path[0]=''）——首次验证
+  误报 STILL_FAILING；脚本路径执行不受此影响（编排器安全）。
