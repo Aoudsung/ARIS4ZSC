@@ -78,6 +78,13 @@
 - 下一步（待批）: S27 修复（支撑注入/遗忘因子, codex diff 评审）→ **重采 CE**（现 replay 的
   partner dist 已污染）→ 建图 → E1
 
+### 2026-07-04 S27 修复远程验证 — PASS（决定性）
+- 单元测试: test_s27_support_injection (4例, 含 mix=0 冻结复现锚点) + E2/E3/缓存回归 → exit 0
+- **现场探针复验（同 claim 伙伴 9 次送餐场景）**: 修复前终端质量恒 0.00000000 →
+  修复后送餐瞬间 terminal mass=0.9246, **9/9 次 argmax=serve_soup 精确命中**, 峰值 0.9866
+- CE 重采已启动 (outputs/asymm_ce_role_v2_e1_s27fixed, 100ep×6伙伴, 过夜) —— 若 S27 是
+  建图失败主导原因, 本次覆盖门应通过; 若仍失败则 D6/D7 放大器权重上调（targeted-starts 升级）
+
 ## Phase 4 — 主张级实验（E4–E7）
 
 *(待运行)*
