@@ -751,3 +751,43 @@ against E1 outcomes — they predate E1).
   budget escalation preregistered above is the only allowed knob).
 - All integrity gates unchanged (I10-I17); scaffolds are ego-local by
   construction and do not touch the evidence path.
+
+## sec18.13 PREREGISTRATION — held-out collapse diagnosis + role-adaptation win condition (2026-07-05)
+
+Append-only. Written BEFORE the zeroed diagnostic runs.
+
+Trigger (measured, stage-1 held-out eval): aris arm egoCCR=0.125 (4 deployable
+seeds) while base/gru/flat ~0.9-1.0. Behavioral decomposition:
+(A) resource-server-claim = role-yielding, team return HIGHER than base
+(59.0 vs 38.7; partner throughput 2-3 deliveries/ep vs base ego bulldozing to
+partner=0) — a metric-lens effect, not a competence collapse;
+(B) handoff-alternate-yield = mutual-wait deadlock (teamCCR=0 on ALL aris
+seeds; ego in wait_at_bottleneck/cross_bottleneck loops or noop; nobody
+delivers) — a real coordination failure.
+
+### 18.13.1 Diagnostic: E2-zeroed on the collapse case (dual-use: fills sec18.7 E2 row)
+Run: aris_bellman deployable seeds (s0,s1,s2,s4) × heldout-handoff-alternate-yield
+× 25ep, eval-only zeroed channel (sec18.7/18.8), same eval seed/protocol as stage-1.
+| Outcome | Reading |
+|---|---|
+| zeroed teamCCR/egoCCR rises materially where inferred=0 (≥0.5 on ≥2 seeds) | BELIEF-SUPPRESSION: solo competence exists in the network; the inferred belief channel suppresses it on OOD partners → mechanism route = U2 FactorModeFilter |
+| zeroed stays collapsed (teamCCR≈0 all seeds) | POLICY-DEFAULT-WAIT: the policy itself learned defer/wait as default → training-population route (yield-archetype augmentation / FCP spike line) |
+| mixed across seeds | per-seed attribution recorded; U2 route first (subsumes) |
+
+### 18.13.2 Win condition for ANY subsequent fix arm (role adaptation, not bulldozing)
+A fix claims success ONLY if BOTH held-out rows hold:
+- handoff-alternate-yield: egoCCR > 0 on ≥3/5 seeds (ego takes over when partner yields);
+- resource-server-claim: partner correct-delivery throughput NOT degraded vs current
+  aris (ego keeps deferring to a claiming partner — no bulldozing regression).
+base_only-style two-row bulldozing does NOT satisfy this. Headline metric stays
+egoCCR (sec18.6, unchanged); the two-row condition is a preregistered SECONDARY
+reading motivated by the substrate's who-serves design axis (R2.1/sec18.9).
+Secondary metrics (teamCCR, team/ego throughput, partner throughput) are
+co-reported in all tables per sec18.6's original spec.
+
+### 18.13.3 Guards
+- No method-layer change before the 18.13.1 verdict is recorded in EXPERIMENT_LOG.
+- The zeroed run requires the LDS-B3 eval-only CLI overlay; its output must carry a
+  run-level ablation declaration and the integrity gate must reject any run whose
+  evidence policy does not exactly match its declared mode (fixes LDS-B3+LDS-A1).
+- Single-episode diagnostic traces are exploratory; no claims from traces alone.
