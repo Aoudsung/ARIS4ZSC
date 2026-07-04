@@ -123,6 +123,31 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         _load_context(_sibling_checkpoint(anchor, variant), variant)
         for variant in variants
     ]
+    # LDS-B3: explicit eval-only ablation switch. The E2 zeroed-channel run is
+    # "same checkpoint, zeroed evidence" — before this flag existed it required
+    # mutating the checkpoint's config by hand, and the gate admitted the zeroed
+    # policy string with no run-level declaration. The flag overlays the mode on
+    # the LOADED config (checkpoint file untouched) and the declaration is
+    # enforced end-to-end: _validate_eval_integrity now requires the evidence
+    # policy to exactly match the mode this run declared.
+    zeroed_ablation = bool(getattr(args, "zeroed_partner_option_ablation", False))
+    if zeroed_ablation:
+        for ctx in contexts:
+            _apply_zeroed_override(ctx.config)
+    else:
+        # codex review blocker: close the OLD escape path too — a checkpoint
+        # whose config was hand-mutated to a non-formal evidence mode must not
+        # run as if it were a declared ablation (or as a formal run). Without
+        # the flag, only the formal inferred mode is acceptable.
+        for ctx in contexts:
+            _policy = _evidence_policy_for_config(ctx.config)
+            if _policy != "behavior_inferred_v1":
+                raise RuntimeError(
+                    "Checkpoint config carries a non-formal evidence mode "
+                    f"({_policy!r}) but this run did not declare an ablation. "
+                    "Pass --zeroed_partner_option_ablation to run the declared "
+                    "E2 zeroed channel, or restore the formal config."
+                )
     partner_names = _resolve_partner_names(
         contexts[0].option_lib,
         args.partners,
@@ -247,6 +272,9 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         # LDS-B1: eval returns exclude training-only shaping so shaped (E1-rev)
         # and unshaped (E1) checkpoints report on the same scale.
         "eval_return_excludes": ["terminal_progress_shaping"],
+        # LDS-B3: run-level ablation declaration (sec18.13.3). The integrity gate
+        # requires the evidence policy to match this declaration exactly.
+        "eval_ablation": {"zeroed_partner_option": zeroed_ablation},
         "reward_scale_verified": all(
             bool(item["reward_scale_verified"])
             for item in reward_scale_status.values()
@@ -307,6 +335,16 @@ def _load_context(checkpoint_path: Path, variant: str) -> EvalContext:
         option_lib=option_lib,
         obs_dim=obs_dim,
     )
+
+
+def _apply_zeroed_override(config: dict[str, Any]) -> None:
+    """LDS-B3: overlay `evidence.partner_option_inference.mode = "zeroed"` on a
+    loaded checkpoint config (in memory only). Single mutation point so the
+    inferencer construction, the router policy string and the integrity gate all
+    derive the SAME declared mode."""
+    evidence = config.setdefault("evidence", {})
+    inference = evidence.setdefault("partner_option_inference", {})
+    inference["mode"] = "zeroed"
 
 
 def _evidence_policy_for_config(config: dict[str, Any]) -> str:
@@ -382,6 +420,10 @@ def _evaluate_partner(
         aggregate,
         collect_diagnostics=collect_diagnostics,
         allow_diag_skip=allow_diag_skip,
+        # LDS-B3: exact-match against the mode THIS run declared (derived from
+        # the same config the router/inferencer were built from). An undeclared
+        # zeroed run or a declared-zeroed run that silently ran inferred both fail.
+        expected_policy=_evidence_policy_for_config(ctx.config),
     )
     return aggregate, episode_rows
 
@@ -1887,6 +1929,7 @@ def _validate_eval_integrity(
     *,
     collect_diagnostics: bool,
     allow_diag_skip: bool,
+    expected_policy: str = "behavior_inferred_v1",
 ) -> None:
     if int(aggregate.get("forced_noop_count", 0)) > 0:
         raise RuntimeError(
@@ -1895,17 +1938,18 @@ def _validate_eval_integrity(
             "bypassed by --allow_diag_skip."
         )
     evidence = aggregate.get("partner_option_evidence", {})
-    # E2 (METHOD_LOCK sec18.8): admit the explicit zeroed-channel ablation policy
-    # alongside the formal one. The oracle_source/observed_dist/missing hard checks
-    # below still run unconditionally, so admitting this string does NOT weaken the
-    # real-path guarantees — a zeroed run routes withheld steps to `zeroed_count`, so
-    # missing_count stays 0, while any true oracle leak would still hard-fail.
-    _allowed_evidence_policies = {
-        "behavior_inferred_v1",
-        "behavior_inferred_v1_zeroed_ablation",
-    }
-    if str(evidence.get("evidence_policy")) not in _allowed_evidence_policies:
-        raise RuntimeError(f"Formal eval has wrong partner-option evidence policy: {evidence!r}")
+    # E2 (METHOD_LOCK sec18.8) + LDS-B3 hardening: the evidence policy must match
+    # EXACTLY the mode this run declared (config-derived; the zeroed CLI overlay
+    # sets it). A whitelist would admit an UNDECLARED zeroed run — now an
+    # undeclared-zeroed and a declared-zeroed-but-ran-inferred both hard-fail.
+    # The oracle_source/observed_dist/missing hard checks below still run
+    # unconditionally, so the zeroed mode never weakens the real-path guarantees.
+    if str(evidence.get("evidence_policy")) != str(expected_policy):
+        raise RuntimeError(
+            "Formal eval evidence policy mismatch: declared/expected "
+            f"{expected_policy!r} but evidence carries "
+            f"{evidence.get('evidence_policy')!r} ({evidence!r})"
+        )
     if int(evidence.get("observed_dist_count", 0)) > 0:
         raise RuntimeError(
             "Formal eval observed non-behavior partner-option distributions: "
@@ -2039,6 +2083,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Smoke/debug ONLY (LDS-B2): downgrade the hard reward-scale "
         "verification gate to a warning. Formal eval must never pass this.",
+    )
+    parser.add_argument(
+        "--zeroed_partner_option_ablation",
+        action="store_true",
+        help="E2 zeroed-channel ablation (LDS-B3): overlay evidence mode 'zeroed' "
+        "on the loaded checkpoint config (eval-only; checkpoint untouched) and "
+        "declare it in the output. The integrity gate requires the evidence "
+        "policy to match this declaration exactly.",
     )
     parser.add_argument(
         "--random_policy_only",

@@ -337,17 +337,36 @@ class OCV2EvidenceRouter:
         if source == "boundary_failure_annotation":
             self._partner_option_evidence_counts["boundary_annotation_count"] += 1
             return
-        if source == "zeroed_partner_option" and (
-            current_partner_option is None and partner_option_dist is None
-        ):
+        if source == "zeroed_partner_option":
             # E2 ablation: intentionally-withheld option intent. Count it distinctly so
             # the eval gate does NOT read it as `missing_count` (which is a hard fail).
-            # Guard (review fix): only trust the zeroed label when the payload really is
-            # empty. A "zeroed" event that still carries an option id/dist is an
-            # inconsistency — fall through so it lands in observed_dist_count and the
-            # hard gate catches it, rather than being silently excused.
-            self._partner_option_evidence_counts["zeroed_count"] += 1
-            return
+            # LDS-A1 (latent-defect sweep): zeroing is ALL-OR-NOTHING. A "zeroed" event
+            # still carrying an option id, a distribution, or nonzero confidence is a
+            # wiring bug in the ablation itself — the old fall-through only caught the
+            # dist case (via observed_dist_count) and never checked confidence, so a
+            # partially-zeroed channel could leak into the E2 read. Fail loud instead.
+            _confidence = float(
+                getattr(
+                    getattr(self, "_current_event", None),
+                    "partner_option_confidence",
+                    0.0,
+                )
+                or 0.0
+            )
+            if (
+                current_partner_option is None
+                and partner_option_dist is None
+                and _confidence == 0.0
+            ):
+                self._partner_option_evidence_counts["zeroed_count"] += 1
+                return
+            raise RuntimeError(
+                "Malformed zeroed partner-option event (LDS-A1): source claims "
+                "zeroed_partner_option but payload carries "
+                f"option_id={current_partner_option!r}, "
+                f"dist={'set' if partner_option_dist is not None else None}, "
+                f"confidence={_confidence}. Zeroing must be all-or-nothing."
+            )
         oracle_like = (
             "oracle" in source
             or "scripted" in source

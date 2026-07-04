@@ -99,10 +99,39 @@ def _aggregate(policy: str, **evidence_counts):
 
 
 @pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
-def test_gate_admits_zeroed_ablation_policy():
-    """A zeroed run (withheld intent → zeroed_count>0, no oracle) must PASS the gate."""
+def test_gate_admits_zeroed_ablation_policy_when_declared():
+    """A DECLARED zeroed run (expected_policy=zeroed string) must PASS the gate
+    (LDS-B3: declaration is now required, not a whitelist)."""
     agg = _aggregate("behavior_inferred_v1_zeroed_ablation", zeroed_count=40)
-    _validate_eval_integrity(agg, collect_diagnostics=False, allow_diag_skip=False)
+    _validate_eval_integrity(
+        agg,
+        collect_diagnostics=False,
+        allow_diag_skip=False,
+        expected_policy="behavior_inferred_v1_zeroed_ablation",
+    )
+
+
+@pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
+def test_gate_rejects_undeclared_zeroed_run():
+    """LDS-B3: zeroed evidence WITHOUT the run-level declaration must hard-fail
+    (the old whitelist admitted it)."""
+    agg = _aggregate("behavior_inferred_v1_zeroed_ablation", zeroed_count=40)
+    with pytest.raises(RuntimeError, match="mismatch"):
+        _validate_eval_integrity(agg, collect_diagnostics=False, allow_diag_skip=False)
+
+
+@pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
+def test_gate_rejects_declared_zeroed_that_ran_inferred():
+    """LDS-B3: a declared-zeroed run whose evidence shows the inferred policy is a
+    wiring failure of the ablation itself."""
+    agg = _aggregate("behavior_inferred_v1")
+    with pytest.raises(RuntimeError, match="mismatch"):
+        _validate_eval_integrity(
+            agg,
+            collect_diagnostics=False,
+            allow_diag_skip=False,
+            expected_policy="behavior_inferred_v1_zeroed_ablation",
+        )
 
 
 @pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
@@ -112,7 +141,12 @@ def test_gate_still_rejects_oracle_under_zeroed_policy():
         "behavior_inferred_v1_zeroed_ablation", zeroed_count=40, oracle_source_count=1
     )
     with pytest.raises(RuntimeError):
-        _validate_eval_integrity(agg, collect_diagnostics=False, allow_diag_skip=False)
+        _validate_eval_integrity(
+            agg,
+            collect_diagnostics=False,
+            allow_diag_skip=False,
+            expected_policy="behavior_inferred_v1_zeroed_ablation",
+        )
 
 
 @pytest.mark.skipif(not _EVAL_OK, reason="evaluate_aris stack unavailable")
