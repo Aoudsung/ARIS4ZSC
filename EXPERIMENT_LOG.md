@@ -82,8 +82,35 @@
 - 单元测试: test_s27_support_injection (4例, 含 mix=0 冻结复现锚点) + E2/E3/缓存回归 → exit 0
 - **现场探针复验（同 claim 伙伴 9 次送餐场景）**: 修复前终端质量恒 0.00000000 →
   修复后送餐瞬间 terminal mass=0.9246, **9/9 次 argmax=serve_soup 精确命中**, 峰值 0.9866
-- CE 重采已启动 (outputs/asymm_ce_role_v2_e1_s27fixed, 100ep×6伙伴, 过夜) —— 若 S27 是
-  建图失败主导原因, 本次覆盖门应通过; 若仍失败则 D6/D7 放大器权重上调（targeted-starts 升级）
+
+### 2026-07-04 E1 前置 CE（S27 修复后重采）— PASS，E1 解锁
+- 100ep×6伙伴×asymm_v2, 3h50m (S27 修复带来推断器质量提升→选项终止更快→采集加速~30%)
+- 产物: outputs/asymm_ce_role_v2_e1_s27fixed_retry2/{graph.json, ce_refined.npy, ce_support_audit.json, replay.npz}
+- 归档: review_bundles/phase3_E1_ce_20260704/（含 pre/post 对照）
+- **S27 修复的 CE 层独立确证**:
+
+  | 指标 | PRE-fix | POST-fix |
+  |---|---|---|
+  | estimable pairs | 45 | **80** (+78%) |
+  | partner=noop 占用份额 | 73.9% | **13.8%** |
+  | partner col opt2/3/9 联合质量 | 全 0.0 | 547 / 149 / 199 |
+  | ego row opt3 主质量 | opt27[noop]=52 | opt25[wait]=19.6, opt24[cross]=18.7 |
+
+- **建图两阶段解锁**:
+  - S27 修复后重采 → 首建仍失败: `opt7 pick_plate 无 above-eta 候选`（新错误位置）
+  - **诊断揭示 substrate 事实**: asymm 上随机策略 ego 从未访问 opt7/opt9（ws=0），opt3/opt8
+    质量分散 <10 全 skipped。**S27 修复解除了 noop 单极坍缩，暴露 substrate 真实结构中的
+    valid ID 边缘化**（不是估计问题，是访问频率问题）
+  - **U1 论文证据线得到强化实测**: 不是"我们推测被动 CE 有盲区"，是"我们精确测得 opt7/9
+    ws=0、opt3/8 分散低支持"——直接就是 targeted-starts 要解决的场景
+  - **工程解**: kind-level coverage（放弃 per-ID）+ min_weight 5 + eta 0.02，复用 replay 建图
+    成功 → **16 因子**（3 serving 含 opt3/opt9、4 bottleneck、5 resource、1 pot_allocation、
+    3 generic），CE 分数 1.4–5.8，selected_by 分布 3 mandatory kind + 3 role contrast + 10 ce_fill
+- **正式 E1 config**: `configs/ocv2_step4_asymm_role_v2_e1.yaml` (graph_path 指向 retry2 产物 +
+  min_weight=5 + eta=0.02 + kind-only coverage)
+- 决策记录: opt3/7/9 无因子（substrate 边缘化的诚实记录）；kind coverage 已被 opt2/opt6/opt5
+  覆盖 pick_plate/plate_soup；serve_soup 通过 opt9 (via low min_weight) 覆盖
+- **下一步**: preflight（复用 replay 秒级）→ E1 四臂决定性跑（sec18.6/18.10.2 预注册读出）
 
 ## Phase 4 — 主张级实验（E4–E7）
 

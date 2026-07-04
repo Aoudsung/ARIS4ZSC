@@ -1,0 +1,259 @@
+Importing submoduled environments...
+Submoduled environments not found. Skipping import.
+=== Phase 1: Setup ===
+CE collected on TRAIN partners only (held-out excluded): ['ingredient-near-yield', 'ingredient-far-yield', 'server-left-claim', 'server-right-claim', 'bottleneck-yield-terminal-yield', 'bottleneck-push-terminal-claim']
+Options: 28
+  0: fetch_ingredient
+  1: fetch_ingredient
+  2: deliver_ingredient_to_pot
+  3: plate_soup
+  4: deliver_ingredient_to_pot
+  5: plate_soup
+  6: pick_plate
+  7: pick_plate
+  8: serve_soup
+  9: serve_soup
+  10: drop_item_to_counter
+  11: drop_item_to_counter
+  12: drop_item_to_counter
+  13: drop_item_to_counter
+  14: drop_item_to_counter
+  15: drop_item_to_counter
+  16: drop_item_to_counter
+  17: drop_item_to_counter
+  18: drop_item_to_counter
+  19: drop_item_to_counter
+  20: drop_item_to_counter
+  21: drop_item_to_counter
+  22: cross_bottleneck
+  23: wait_at_bottleneck
+  24: cross_bottleneck
+  25: wait_at_bottleneck
+  26: clear_interaction_cell
+  27: noop
+
+=== Phase 2: REUSE Replay (outputs/asymm_ce_role_v2_e1_s27fixed/replay.npz) ===
+Reused 12000 option replay rows (from asymm_ce_role_v2_e1_s27fixed)
+
+--- Replay Coverage ---
+  picked_ingredient: 1283 [OK]
+  ingredient_delivered_to_pot: 287 [OK]
+  pot_became_ready: 965 [OK]
+  plate_picked: 1276 [OK]
+  plated_soup: 618 [OK]
+  served_soup: 496 [OK]
+  ego_delivery_event: 16 [OK]
+  partner_delivery_event: 480 [OK]
+  correct_delivery: 496 [OK]
+  wrong_delivery_event: 0 [MISSING]
+  ego_correct_delivery: 16 [OK]
+  ego_sole_correct_delivery: 16 [OK]
+  partner_correct_delivery: 480 [OK]
+  ego_wrong_delivery_event: 0 [MISSING]
+  partner_wrong_delivery_event: 0 [MISSING]
+  drop_item_to_counter: 1468 [OK]
+  cleared_interaction_cell: 369 [OK]
+Coverage gate: passed
+
+--- Option Kind Stats ---
+  clear_interaction_cell        : attempts=  369 success=  369 rate=100.00% timeout=    0
+  cross_bottleneck              : attempts= 1922 success=    0 rate=0.00% timeout=    0
+  deliver_ingredient_to_pot     : attempts=  294 success=  287 rate=97.62% timeout=    0
+  drop_item_to_counter          : attempts= 1468 success= 1468 rate=100.00% timeout=    0
+  fetch_ingredient              : attempts= 1283 success= 1283 rate=100.00% timeout=    0
+  noop                          : attempts= 1891 success= 1891 rate=100.00% timeout=    0
+  pick_plate                    : attempts=  670 success=  670 rate=100.00% timeout=    0
+  plate_soup                    : attempts=  114 success=  110 rate=96.49% timeout=    0
+  serve_soup                    : attempts=   16 success=   16 rate=100.00% timeout=    0
+  wait_at_bottleneck            : attempts= 3973 success= 2025 rate=50.97% timeout= 1948
+
+=== Phase 3: CE Estimate ===
+CE matrix (non-zero entries):
+  CE(0:fetch_ingredient, 1:fetch_ingredient) = 1.2331
+  CE(0:fetch_ingredient, 2:deliver_ingredient_to_pot) = 0.9800
+  CE(0:fetch_ingredient, 3:plate_soup) = 3.0993
+  CE(0:fetch_ingredient, 4:deliver_ingredient_to_pot) = 0.3624
+  CE(0:fetch_ingredient, 7:pick_plate) = 0.9164
+  CE(0:fetch_ingredient, 9:serve_soup) = 2.8587
+  CE(0:fetch_ingredient, 11:drop_item_to_counter) = 2.3848
+  CE(0:fetch_ingredient, 13:drop_item_to_counter) = 1.9258
+  CE(0:fetch_ingredient, 15:drop_item_to_counter) = 1.2022
+  CE(0:fetch_ingredient, 20:drop_item_to_counter) = 0.6776
+  CE(0:fetch_ingredient, 24:cross_bottleneck) = 0.2307
+  CE(0:fetch_ingredient, 25:wait_at_bottleneck) = 0.2416
+  CE(0:fetch_ingredient, 27:noop) = 0.2511
+  CE(2:deliver_ingredient_to_pot, 1:fetch_ingredient) = 0.6530
+  CE(2:deliver_ingredient_to_pot, 2:deliver_ingredient_to_pot) = 0.2690
+  CE(2:deliver_ingredient_to_pot, 24:cross_bottleneck) = 0.1943
+  CE(2:deliver_ingredient_to_pot, 25:wait_at_bottleneck) = 0.2145
+  CE(2:deliver_ingredient_to_pot, 27:noop) = 0.5908
+  CE(3:plate_soup, 24:cross_bottleneck) = 0.5548
+  CE(3:plate_soup, 25:wait_at_bottleneck) = 0.4829
+  CE(3:plate_soup, 27:noop) = 4.4553
+  CE(4:deliver_ingredient_to_pot, 1:fetch_ingredient) = 1.2962
+  CE(4:deliver_ingredient_to_pot, 2:deliver_ingredient_to_pot) = 1.4369
+  CE(4:deliver_ingredient_to_pot, 24:cross_bottleneck) = 0.0212
+  CE(4:deliver_ingredient_to_pot, 27:noop) = 0.3459
+  CE(5:plate_soup, 24:cross_bottleneck) = 0.5601
+  CE(5:plate_soup, 25:wait_at_bottleneck) = 0.5201
+  CE(6:pick_plate, 1:fetch_ingredient) = 1.4005
+  CE(6:pick_plate, 2:deliver_ingredient_to_pot) = 0.2427
+  CE(6:pick_plate, 3:plate_soup) = 0.5052
+  CE(6:pick_plate, 4:deliver_ingredient_to_pot) = 0.3689
+  CE(6:pick_plate, 7:pick_plate) = 1.8775
+  CE(6:pick_plate, 11:drop_item_to_counter) = 4.9517
+  CE(6:pick_plate, 13:drop_item_to_counter) = 2.5242
+  CE(6:pick_plate, 15:drop_item_to_counter) = 3.3751
+  CE(6:pick_plate, 23:wait_at_bottleneck) = 0.4805
+  CE(6:pick_plate, 24:cross_bottleneck) = 0.2627
+  CE(6:pick_plate, 25:wait_at_bottleneck) = 0.2480
+  CE(6:pick_plate, 27:noop) = 0.0886
+  CE(10:drop_item_to_counter, 1:fetch_ingredient) = 1.7446
+  CE(10:drop_item_to_counter, 2:deliver_ingredient_to_pot) = 1.4211
+  CE(10:drop_item_to_counter, 4:deliver_ingredient_to_pot) = 0.9098
+  CE(10:drop_item_to_counter, 9:serve_soup) = 2.0373
+  CE(10:drop_item_to_counter, 24:cross_bottleneck) = 0.1861
+  CE(10:drop_item_to_counter, 25:wait_at_bottleneck) = 0.2189
+  CE(10:drop_item_to_counter, 27:noop) = 0.6707
+  CE(12:drop_item_to_counter, 1:fetch_ingredient) = 1.3876
+  CE(12:drop_item_to_counter, 2:deliver_ingredient_to_pot) = 1.4678
+  CE(12:drop_item_to_counter, 4:deliver_ingredient_to_pot) = 0.4916
+  CE(12:drop_item_to_counter, 9:serve_soup) = 3.2702
+  CE(12:drop_item_to_counter, 24:cross_bottleneck) = 0.1504
+  CE(12:drop_item_to_counter, 25:wait_at_bottleneck) = 0.1346
+  CE(12:drop_item_to_counter, 27:noop) = 0.6305
+  CE(14:drop_item_to_counter, 1:fetch_ingredient) = 1.2051
+  CE(14:drop_item_to_counter, 2:deliver_ingredient_to_pot) = 0.7964
+  CE(14:drop_item_to_counter, 9:serve_soup) = 0.8130
+  CE(14:drop_item_to_counter, 24:cross_bottleneck) = 0.0327
+  CE(14:drop_item_to_counter, 25:wait_at_bottleneck) = 0.0247
+  CE(14:drop_item_to_counter, 27:noop) = 0.1253
+  CE(16:drop_item_to_counter, 1:fetch_ingredient) = 1.6083
+  CE(16:drop_item_to_counter, 2:deliver_ingredient_to_pot) = 1.9332
+  CE(16:drop_item_to_counter, 4:deliver_ingredient_to_pot) = 1.3363
+  CE(16:drop_item_to_counter, 9:serve_soup) = 1.7238
+  CE(16:drop_item_to_counter, 24:cross_bottleneck) = 0.0288
+  CE(16:drop_item_to_counter, 25:wait_at_bottleneck) = 0.0711
+  CE(16:drop_item_to_counter, 27:noop) = 0.9329
+  CE(18:drop_item_to_counter, 1:fetch_ingredient) = 1.3563
+  CE(18:drop_item_to_counter, 2:deliver_ingredient_to_pot) = 1.1964
+  CE(18:drop_item_to_counter, 9:serve_soup) = 0.1695
+  CE(18:drop_item_to_counter, 24:cross_bottleneck) = 0.0722
+  CE(18:drop_item_to_counter, 25:wait_at_bottleneck) = 0.0875
+  CE(18:drop_item_to_counter, 27:noop) = 0.4958
+  CE(19:drop_item_to_counter, 1:fetch_ingredient) = 0.7181
+  CE(19:drop_item_to_counter, 2:deliver_ingredient_to_pot) = 0.9095
+  CE(19:drop_item_to_counter, 4:deliver_ingredient_to_pot) = 0.9356
+  CE(19:drop_item_to_counter, 9:serve_soup) = 0.4164
+  CE(19:drop_item_to_counter, 24:cross_bottleneck) = 0.0340
+  CE(19:drop_item_to_counter, 25:wait_at_bottleneck) = 0.0560
+  CE(19:drop_item_to_counter, 27:noop) = 0.5059
+  CE(22:cross_bottleneck, 1:fetch_ingredient) = 2.3041
+  CE(22:cross_bottleneck, 2:deliver_ingredient_to_pot) = 1.1068
+  CE(22:cross_bottleneck, 3:plate_soup) = 0.1780
+  CE(22:cross_bottleneck, 4:deliver_ingredient_to_pot) = 0.1509
+  CE(22:cross_bottleneck, 7:pick_plate) = 0.2932
+  CE(22:cross_bottleneck, 9:serve_soup) = 1.2178
+  CE(22:cross_bottleneck, 11:drop_item_to_counter) = 0.8891
+  CE(22:cross_bottleneck, 13:drop_item_to_counter) = 0.3103
+  CE(22:cross_bottleneck, 15:drop_item_to_counter) = 0.1710
+  CE(22:cross_bottleneck, 20:drop_item_to_counter) = 0.1705
+  CE(22:cross_bottleneck, 23:wait_at_bottleneck) = 0.2085
+  CE(22:cross_bottleneck, 24:cross_bottleneck) = 0.1757
+  CE(22:cross_bottleneck, 25:wait_at_bottleneck) = 0.1722
+  CE(22:cross_bottleneck, 26:clear_interaction_cell) = 1.3379
+  CE(22:cross_bottleneck, 27:noop) = 0.1060
+  CE(23:wait_at_bottleneck, 1:fetch_ingredient) = 0.7720
+  CE(23:wait_at_bottleneck, 2:deliver_ingredient_to_pot) = 0.4853
+  CE(23:wait_at_bottleneck, 3:plate_soup) = 0.9089
+  CE(23:wait_at_bottleneck, 4:deliver_ingredient_to_pot) = 0.4150
+  CE(23:wait_at_bottleneck, 7:pick_plate) = 0.5605
+  CE(23:wait_at_bottleneck, 9:serve_soup) = 0.2649
+  CE(23:wait_at_bottleneck, 11:drop_item_to_counter) = 0.5500
+  CE(23:wait_at_bottleneck, 13:drop_item_to_counter) = 0.7359
+  CE(23:wait_at_bottleneck, 15:drop_item_to_counter) = 0.9944
+  CE(23:wait_at_bottleneck, 17:drop_item_to_counter) = 0.2802
+  CE(23:wait_at_bottleneck, 20:drop_item_to_counter) = 0.0748
+  CE(23:wait_at_bottleneck, 21:drop_item_to_counter) = 0.2802
+  CE(23:wait_at_bottleneck, 23:wait_at_bottleneck) = 0.3482
+  CE(23:wait_at_bottleneck, 24:cross_bottleneck) = 0.1098
+  CE(23:wait_at_bottleneck, 25:wait_at_bottleneck) = 0.0908
+  CE(23:wait_at_bottleneck, 26:clear_interaction_cell) = 1.2868
+  CE(23:wait_at_bottleneck, 27:noop) = 0.0998
+  CE(25:wait_at_bottleneck, 1:fetch_ingredient) = 3.5483
+  CE(25:wait_at_bottleneck, 2:deliver_ingredient_to_pot) = 2.8770
+  CE(25:wait_at_bottleneck, 3:plate_soup) = 0.2927
+  CE(25:wait_at_bottleneck, 4:deliver_ingredient_to_pot) = 0.0536
+  CE(25:wait_at_bottleneck, 7:pick_plate) = 0.0177
+  CE(25:wait_at_bottleneck, 9:serve_soup) = 2.6451
+  CE(25:wait_at_bottleneck, 11:drop_item_to_counter) = 1.8037
+  CE(25:wait_at_bottleneck, 13:drop_item_to_counter) = 0.8114
+  CE(25:wait_at_bottleneck, 15:drop_item_to_counter) = 0.5517
+  CE(25:wait_at_bottleneck, 20:drop_item_to_counter) = 0.2903
+  CE(25:wait_at_bottleneck, 23:wait_at_bottleneck) = 0.5199
+  CE(25:wait_at_bottleneck, 24:cross_bottleneck) = 0.4118
+  CE(25:wait_at_bottleneck, 25:wait_at_bottleneck) = 0.4003
+  CE(25:wait_at_bottleneck, 26:clear_interaction_cell) = 0.4303
+  CE(25:wait_at_bottleneck, 27:noop) = 0.1009
+  CE(26:clear_interaction_cell, 1:fetch_ingredient) = 1.3455
+  CE(26:clear_interaction_cell, 2:deliver_ingredient_to_pot) = 1.4225
+  CE(26:clear_interaction_cell, 3:plate_soup) = 4.0632
+  CE(26:clear_interaction_cell, 4:deliver_ingredient_to_pot) = 0.6349
+  CE(26:clear_interaction_cell, 9:serve_soup) = 2.4247
+  CE(26:clear_interaction_cell, 23:wait_at_bottleneck) = 0.4499
+  CE(26:clear_interaction_cell, 24:cross_bottleneck) = 0.3572
+  CE(26:clear_interaction_cell, 25:wait_at_bottleneck) = 0.3648
+  CE(26:clear_interaction_cell, 27:noop) = 0.0783
+  CE(27:noop, 1:fetch_ingredient) = 1.0602
+  CE(27:noop, 2:deliver_ingredient_to_pot) = 0.5416
+  CE(27:noop, 3:plate_soup) = 1.4113
+  CE(27:noop, 4:deliver_ingredient_to_pot) = 0.5862
+  CE(27:noop, 7:pick_plate) = 0.1989
+  CE(27:noop, 9:serve_soup) = 0.7779
+  CE(27:noop, 11:drop_item_to_counter) = 0.7586
+  CE(27:noop, 13:drop_item_to_counter) = 0.8787
+  CE(27:noop, 15:drop_item_to_counter) = 0.5978
+  CE(27:noop, 20:drop_item_to_counter) = 1.5996
+  CE(27:noop, 23:wait_at_bottleneck) = 0.4631
+  CE(27:noop, 24:cross_bottleneck) = 0.0633
+  CE(27:noop, 25:wait_at_bottleneck) = 0.0426
+  CE(27:noop, 26:clear_interaction_cell) = 3.0295
+  CE(27:noop, 27:noop) = 0.3492
+Saved CE metadata sidecar to outputs/asymm_ce_role_v2_e1_s27fixed_retry2/ce_refined.meta.json
+Saved CE support sidecar to outputs/asymm_ce_role_v2_e1_s27fixed_retry2/ce_support_audit.json
+
+=== Phase 4: Graph Build ===
+Graph: 16 factors
+  F0: (26:clear_interaction_cell, 3:plate_soup) CE=5.7956 kind=serving modes=2
+  F1: (6:pick_plate, 11:drop_item_to_counter) CE=5.3740 kind=generic_option_pair modes=3
+  F2: (25:wait_at_bottleneck, 1:fetch_ingredient) CE=3.7225 kind=bottleneck modes=3
+  F3: (0:fetch_ingredient, 3:plate_soup) CE=3.6351 kind=resource modes=2
+  F4: (6:pick_plate, 15:drop_item_to_counter) CE=3.6088 kind=generic_option_pair modes=3
+  F5: (12:drop_item_to_counter, 9:serve_soup) CE=3.0380 kind=serving modes=2
+  F6: (25:wait_at_bottleneck, 2:deliver_ingredient_to_pot) CE=3.0256 kind=bottleneck modes=3
+  F7: (25:wait_at_bottleneck, 9:serve_soup) CE=2.8018 kind=bottleneck modes=3
+  F8: (6:pick_plate, 13:drop_item_to_counter) CE=2.7072 kind=generic_option_pair modes=3
+  F9: (0:fetch_ingredient, 9:serve_soup) CE=2.6785 kind=resource modes=2
+  F10: (0:fetch_ingredient, 13:drop_item_to_counter) CE=2.4528 kind=resource modes=2
+  F11: (0:fetch_ingredient, 11:drop_item_to_counter) CE=2.4131 kind=resource modes=2
+  F12: (22:cross_bottleneck, 1:fetch_ingredient) CE=2.0640 kind=bottleneck modes=3
+  F13: (26:clear_interaction_cell, 9:serve_soup) CE=1.8920 kind=serving modes=2
+  F14: (12:drop_item_to_counter, 2:deliver_ingredient_to_pot) CE=1.8092 kind=pot_allocation modes=2
+  F15: (6:pick_plate, 1:fetch_ingredient) CE=1.3910 kind=resource modes=2
+
+Option kinds in graph: ['clear_interaction_cell', 'cross_bottleneck', 'deliver_ingredient_to_pot', 'drop_item_to_counter', 'fetch_ingredient', 'pick_plate', 'plate_soup', 'serve_soup', 'wait_at_bottleneck']
+
+=== Phase 5: Task Stage Coverage Gate ===
+Required: ['deliver_ingredient_to_pot', 'plate_soup', 'serve_soup']
+Present:  ['deliver_ingredient_to_pot', 'plate_soup', 'serve_soup']
+Missing:  []
+PASS: Task stage coverage validated
+
+=== SUMMARY ===
+Replay rows: 12000
+CE factors: 16
+Replay coverage gate: passed
+plate_soup in CE graph: True
+serve_soup in CE graph: True
+deliver_ingredient_to_pot in CE graph: True
+Outputs saved to: outputs/asymm_ce_role_v2_e1_s27fixed_retry2
