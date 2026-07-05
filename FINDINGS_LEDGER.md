@@ -199,6 +199,12 @@
 处置指向：修订要求见本次会话交付（步1–5+NEW-2 逐项验收判据）；先落基线提交再修
 （2478 行未提交 diff 违反增量可归因纪律）。
 
+**追记（2026-07-05 文档清理）**：CODEX_IMPL_SPEC v1–v4 四个文件已按用户裁决从工作树
+删除（清理 commit：`chore(docs): archive completed review bundles + remove
+quarantined/stale docs`，git 历史可完整取回）。隔离裁决本身**不变**——其中的数字仍然
+永不进入任何主张证据链。role_v1 运行的原始产物已压缩存于
+`archive/raw/role_conditioned_v1_20260702_102332.tar.gz`（见 MANIFEST）。
+
 ---
 
 ## 修复执行记录（2026-07-02，当前分支 baseline 之后）

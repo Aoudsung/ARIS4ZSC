@@ -141,7 +141,7 @@ ID | 来源(audit-N/codex/NEW) | 断言 | 锚点 | 分类 | codex verdict | 人�
 > git 历史中，不在此处重复（追加式修订，不做静默覆盖）。
 
 依赖顺序（前者不修，后者实验必被污染）；**每步一个静态 handoff 文档**（模式同
-[RC_REWARD_CREDIT_FIX.md](RC_REWARD_CREDIT_FIX.md)），经 codex diff 评审（CODE_REVIEW=true）后才进远程验证：
+[RC_REWARD_CREDIT_FIX.md](archive/docs/RC_REWARD_CREDIT_FIX.md)），经 codex diff 评审（CODE_REVIEW=true）后才进远程验证：
 
 | 步 | 修复 | 台账主 ID | 前置 |
 |---|---|---|---|

@@ -64,7 +64,7 @@ All experiments run **remote-only**, never local. Contract pinned in
 - 8 GPUs available.
 - **Discipline: after every code update, produce an explicit `git` diff.**
 - Formal run contract (preflight → CE → graph → train → eval) is defined in
-  [README_FIXES_20260624.md](README_FIXES_20260624.md). Formal training **requires an
+  [README_FIXES_20260624.md](archive/docs/README_FIXES_20260624.md). Formal training **requires an
   accepted preflight** via `--preflight_path`; rejected-layout smoke runs must not
   go through the formal trainer.
 

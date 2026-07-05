@@ -1,0 +1,42 @@
+# archive/raw MANIFEST — 评审原始数据归档（2026-07-05 文档清理）
+# 原目录均位于 review_bundles/（除注明外）；tar.gz 未入 git（.gitignore 全局忽略 *.tar.gz）
+
+152K  f5e045b9d12db8ed341730d739c14d13e731f583aae4c6eab376e86de060bd41  aris4zsc_code_review_89d357f_20260626_161126.tar.gz
+ 92K  ac9f9ed01719082c1606b878802c04a32ea3d9d8f33a21c5ff66af5427398ca8  codex_local_backup_20260625.tar.gz
+3.6M  5ba31fe6ab9bed8d2f3d3d6b40ca9cc4826c31c48ac9e09a7a514db1de83c7eb  ocv2_cramped_room_review_20260625_150230.tar.gz
+1.8M  fd0bedfe57e43d77c80363e0df4a7c4596d1df4d9c6a8ccecf05d8635e2ec4e9  ocv2_cramped_room_review_remote_only_20260625_150230.tar.gz
+3.3M  935cfd2f190aa9b5c51beae9697634787f58a1a772612739d33e9a82751b2b0c  ocv2_heldout_review_20260629_111700.tar.gz
+748K  bdc206280db164a92464f50a2ec714a440869b1669ef6c73baf8e9e9e1fff57a  ocv2_preflight_smoke_review_20260624_223240.tar.gz
+356K  0cfbbfe5cef8532b8eec5602c90d3b8ae0c39ab8845be103056c51faf49298bb  ocv2_rc_reverify_2arm_ade0051_20260629_230910.tar.gz
+ 84K  5a7d18c7e47448860948e14f8295606e624a1a3f1c00259f8ee6360f53292adc  ocv2_rc_reward_credit_review_ade0051_20260629_140257.tar.gz
+ 88K  980d8e3d6ef444ecd8bed1f2e344baf4fe0c2920084cdf5dc5386dd7e6f3c559  ocv2_rc_reward_credit_review_r2_ade0051_20260629_165720.tar.gz
+ 10M  092f26466797581bd2cfef77e2cd17c29c443ffdb5aa616ddcddc42acd800369  ocv2_zscsession_20260701_182027.tar.gz
+280K  47863a0dbfa5a03f6d6e0fa4aa7c1ee02388e0cf747d6cb71fe4d364e7e27383  p0_loose_files.tar.gz
+ 20K  3e44636bef9a109fa9a0a9a84bc80e5f0215b0a4919dc1bd081482786c264933  phase2_e2e3_cache_20260703.tar.gz
+8.0K  17a0ea6e824c80632e8d37feb84fbc7e43dad2308f5248371612f89b7d0b819e  phase2_R2.1_certificate_20260703.tar.gz
+4.0K  14224fef4f98e30dbd81dc66b01ac96561f3f05ca69d7c0936ede8fd4a026694  phase3_E1_20260704.tar.gz
+ 28K  c7e5b75dbed45f01783d0c38d82664679848968c4ce2001df9cc03be47e541a9  phase3_E1_ce_20260704.tar.gz
+ 37M  ac071b75755222a1890f02ccbe0f166432a2626ab904d35659fe731eaab818af  role_conditioned_v1_20260702_102332.tar.gz
+ 32K  410c5831f6aebd7741121adba342f0654aa576f808d1bc4b1f79ee2b6dd23c07  rootcause_review_20260702.tar.gz
+ 12K  7ae42f6e4897ce74491c01876d8f152c476ef7109dcb35240e74057f7d9f5e2e  u1u2_s27_review_20260704.tar.gz
+
+aris4zsc_clean_rootcause_20260702.zip — 07-02 根因修复期工作树快照（原根目录）
+codex_local_backup_20260625.tar.gz — 06-25 apply 前自动备份（原 .codex_local_backup/）
+p0_loose_files.tar.gz — P0 轮散文件（AUDIT_OUTPUT/P0_STEP2_PROMPT/P0_STEP2_OUTPUT）
+
+## 追加（同日）：review_bundles 下的早期 zip 快照（原样移入，未重压缩）
+316K  aris4zsc_clean_rootcause_20260702.zip
+172K  aris4zsc_code_review_89d357f_20260626_161126.zip
+ 18M  ocv2_audit_s0_20260627_163816.zip
+1.9M  ocv2_cramped_room_review_20260625_150230.zip
+1.8M  ocv2_cramped_room_review_remote_only_20260625_150230.zip
+4.9M  ocv2_diag_s0_20260627_204650.zip
+208K  ocv2_executor_review_20260628_160513.zip
+3.3M  ocv2_heldout_review_20260629_111700.zip
+760K  ocv2_preflight_smoke_review_20260624_223240.zip
+372K  ocv2_rc_reverify_2arm_ade0051_20260629_230910.zip
+ 96K  ocv2_rc_reward_credit_review_ade0051_20260629_140257.zip
+100K  ocv2_rc_reward_credit_review_r2_ade0051_20260629_165720.zip
+1.1M  ocv2_train_s0_review_20260627_153653.zip
+ 11M  ocv2_zscsession_20260701_182027.zip
+ 36M  role_conditioned_v1_20260702_102332.zip

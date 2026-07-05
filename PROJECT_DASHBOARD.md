@@ -40,7 +40,7 @@ micro-train" orchestration exist and are being **correctness-hardened** before a
 formal experiment runs. Recent work is gates/semantics, not results:
 event semantics, CE scheduling, **reward-scale consistency gate**, per-variant eval
 split, parallel/​single-GPU eval, preflight-as-hard-gate (see
-[README_FIXES_20260624.md](README_FIXES_20260624.md) and `git log`: P0–P6 fixes).
+[README_FIXES_20260624.md](archive/docs/README_FIXES_20260624.md) and `git log`: P0–P6 fixes).
 
 **Formal Experiments 1–5: NOT STARTED.** Next milestone = first accepted-preflight
 formal run on a diagnostic layout.
