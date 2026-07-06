@@ -291,18 +291,32 @@ def stage_gate(data, out_dir: Path) -> None:
             "class_counts": {LABEL_NAMES[i]: int((lab[m] == i).sum()) for i in range(3)},
         }
     # wiring check: does the partner-history channel actually vary across partners?
-    hists = []
+    # Criterion (amended 2026-07-07, gate round 2): positional twin partners (e.g.
+    # server-left-claim vs server-right-claim, differing only in delivery position)
+    # are IDENTICAL at option-kind granularity by construction, so pairwise-min TV
+    # is the wrong operationalization. The prereg intent ("通道随伙伴变化") is that
+    # each partner's stream differs from at least one other; kind-collapsed twin
+    # pairs are recorded informationally (they share family/response semantics).
+    names = sorted(np.unique(data["partner"][data["split"] == "train"]).tolist())
     n_vocab = len(data["_vocab"])
-    for p in np.unique(data["partner"][data["split"] == "train"]):
+    hists = {}
+    for p in names:
         m = data["partner"] == p
         h = np.bincount(data["hist_kind"][m].ravel(), minlength=n_vocab).astype(float)
         h[0] = 0.0  # drop PAD
-        hists.append(h / max(h.sum(), 1.0))
-    tv = [float(0.5 * np.abs(a - b).sum()) for i, a in enumerate(hists)
-          for b in hists[i + 1:]]
+        hists[p] = h / max(h.sum(), 1.0)
+    tv_pairs = {(a, b): float(0.5 * np.abs(hists[a] - hists[b]).sum())
+                for i, a in enumerate(names) for b in names[i + 1:]}
+    tv = list(tv_pairs.values())
+    per_partner_max = {
+        a: max(tv_pairs.get((a, b), tv_pairs.get((b, a), 0.0))
+               for b in names if b != a) for a in names}
     rep["history_channel_cross_partner_tv"] = {
         "min": min(tv), "max": max(tv), "mean": float(np.mean(tv))}
-    rep["history_channel_varies"] = bool(min(tv) > 0.01)
+    rep["kind_collapsed_pairs"] = [
+        {"pair": list(k), "tv": v} for k, v in tv_pairs.items() if v < 0.01]
+    rep["per_partner_max_tv"] = per_partner_max
+    rep["history_channel_varies"] = bool(min(per_partner_max.values()) > 0.05)
     rep["PASS"] = bool(
         all(rep["splits"][s]["floor_rows_pass"] and rep["splits"][s]["floor_class_pass"]
             for s in HARD_FLOOR_SPLITS) and rep["history_channel_varies"])
