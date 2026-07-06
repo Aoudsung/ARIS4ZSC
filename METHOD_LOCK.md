@@ -891,3 +891,79 @@ aris × 5 seeds × 盲伙伴集 × zeroed（LDS-B3 声明式）；另对任何�
 （checkpoint-free）→ 签② → 正式评估（单次）→ 签③。预计成本：体检 ~20 min，
 正式轮 25 臂 ×6 伙伴 ×100 局 ≈ 15k 局 + zeroed 臂 ≈ 数小时墙钟（评估-only）。
 --->8--- end verbatim ---
+
+### sec18.14.1 SEAL RECORD — blind_v1 landed + certified (2026-07-06, step-② complete)
+
+- **Seal commit**: f870d77755e05298190d7d307d40055eefa7f83f (branch codex/rootcause-current-repair-20260702)
+- sha256(experiments/overcooked_v2/partner_pool.py) = b07f1dc8dfb6f89c65fb1cc26f699f346806d7253932057688e1fc6773cea193
+- sha256(FORMAL_ROUND_PREREG_DRAFT.md at seal) = 0d29ed7a1853ab76eb8ba5fedd6e7f3173959194ac3f37448b16c3f24be8352b
+- **Certification (checkpoint-free; scripted priority carries a noop tail so argmax(Q)
+  is unreachable by construction — trained weights cannot influence any probe)**:
+  1. Completability: 6/6 blind partners, scripted full-chain co-play completion 1.0
+     (returns 107–189).
+  2. Interference sensitivity (25ep A/B, defer/bulldoze return ratio, gate ≥1.2):
+     blind-dish-claim **2.07** (defer 221.0 / bulldoze 107.0; partner 200 vs 75) →
+     **INTERFERENCE-SENSITIVE**; blind-server-nearest-claim-push **2.16**
+     (defer 238.2 / bulldoze 110.1; partner 200 vs 0) → **INTERFERENCE-SENSITIVE**.
+     C3' special read is therefore live on BOTH blind claim partners.
+  3. Pairwise differentiation (rc2b probe, 8ep, FSM-ego): **14/15 pairs distinguishable**;
+     serving-axis spread 1.00 PASS; bottleneck-axis spread 0.40 (layout-admissibility
+     criterion, PARTIAL — recorded as context, not a blind-set gate). Indistinguishable
+     pair: none-recorded
+- **Blindness attestation**: no trained checkpoint has been evaluated against any
+  blind-* partner as of this seal (certification probes were scripted-only; the
+  first evaluate_aris contact with blind_v1 will be the formal preregistered run).
+
+### sec18.14.2 FORMAL BLIND ROUND READOUT (2026-07-06, single-look consumed; user Type-B adjudication pending)
+
+Preregistered computation (formal_readout.py, thresholds frozen in sec18.14 §4-§6):
+
+- Partner-contrast Δ (median per method): aris **+0.500** (s: +1.00/+1.23/+0.01/+0.50/+0.00),
+  base_only **+1.500**, global_gru +1.000, flat_factor +1.000, partner_id_q +1.935.
+- S1: TRUE at the boundary (aris median exactly 0.500; stratified bootstrap CI [+0.538,+0.559]>0).
+- S2: **FALSE** (gap vs base_only = −1.000; seed-wins 1/5).
+- E2 zeroed: **NO collapse** (zeroed median Δ +1.000 > inferred +0.500).
+- **Wording-ladder row (by the letter): L3 — conditioning-like contrast is NOT
+  factor-belief-specific on blind partners.**
+- **Key discovery beyond the ladder (metric confound)**: base_only (no partner
+  perception) shows Δ=+1.5 — blind claim partners (esp. blind-dish-claim, which
+  contests the whole terminal chain) mechanically SUPPRESS ego serving opportunity,
+  so raw Δ measures conditioning + opportunity suppression, not conditioning alone.
+  The dev-heldout claim partner tolerated co-serving, which is why Δ separated
+  methods there and not here. Any successor metric must be opportunity-normalized,
+  and blind_v1 is now SPENT for metric design (first look consumed).
+- Transfer failures (honest record): aris yield-side takeover did not transfer
+  (ego/ep 0.60-0.70 on blind yielders vs 1.0 dev; s2/s4 Δ≈0); C3' aris < best
+  baseline on BOTH interference-sensitive claimers (54.0 vs 69.4; 37.6 vs 57.0);
+  ALL methods far below the scripted-defer optimum there (221-238) — large open
+  headroom, good benchmark property.
+- Off-axis: aris returns lowest of all methods (36-40 vs 44-73) — no degeneracy,
+  but no advantage.
+- Candidate claims C1'/C2' (sec18.14 §6 L1 wording): NOT supported on blind
+  partners in current form.
+
+### sec18.14.3 USER TYPE-B ADJUDICATION of the blind round (2026-07-06, sign-③)
+
+用户裁决原文："那就是证明这个模型不能自然涌现出新队友的泛化适配能力。"
+
+Adjudicated reading (recorded verbatim-faithful, with scope):
+1. **PROVEN (this training recipe)**: under 6 fixed scripted training partners +
+   single-TD @ 2000 episodes, aris_bellman does NOT emerge generalizable
+   new-partner adaptation. Its partner-conditioning machinery is in-distribution
+   RECOGNITION and out-of-distribution a LIABILITY (fails-closed to defer;
+   zeroing the evidence channel improves behavior vs strangers) — negative
+   transfer, worse than the unconditional baselines' robust default.
+2. **ALSO OBSERVED**: no method in the comparison emerged adaptation under this
+   recipe; baselines' blind-partner contrast is mechanical opportunity
+   suppression, not adaptation (sec18.14.2 metric-confound finding).
+3. **NOT SETTLED**: whether the architecture can produce adaptation under a
+   diverse-partner training distribution (population-style) — untested; no claim
+   either way.
+4. Paper-grade honest sentence: "The method failed to produce generalizable
+   partner adaptation in the ZSC setting it was designed for; its partner
+   conditioning is recognition in-distribution and a liability out-of-
+   distribution."
+Method-layer claims (C1'/C2' and all granularity headlines): CLOSED as
+unsupported. Surviving assets: data-sufficiency finding (L1), rebuilt substrate
++ ~18x eval speedup, blind-protocol discipline, failure anatomy. Next direction
+= separate user decision; nothing scheduled.
