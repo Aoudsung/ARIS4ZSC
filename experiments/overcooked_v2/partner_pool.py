@@ -190,10 +190,77 @@ ROLE_CONDITIONED_V2_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
     ),
 )
 
+BLIND_V1_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
+    # FORMAL BLIND ROUND partner set (METHOD_LOCK sec18.14, signed 2026-07-06).
+    # Constructed from parameter-space principles ONLY — no model behavior was
+    # consulted. SINGLE-LOOK RULE: no trained checkpoint may be evaluated against
+    # any "blind-*" partner before the formal preregistered run; certification
+    # probes are checkpoint-free (scripted-ego only). This registry must NEVER be
+    # merged into a training partner_set.
+    (
+        "blind-dish-yield",
+        ProtocolSpec(
+            role="dish_person",
+            terminal_policy="yield",
+            curriculum_group="blind_yield",
+        ),
+    ),
+    (
+        "blind-prep-alternate-yield",
+        ProtocolSpec(
+            role="prep_partner",
+            pot_preference="far",
+            bottleneck_policy="alternate",
+            terminal_policy="yield",
+            curriculum_group="blind_yield",
+        ),
+    ),
+    (
+        "blind-dish-claim",
+        ProtocolSpec(
+            role="dish_person",
+            terminal_policy="claim",
+            delivery_preference="nearest",
+            curriculum_group="blind_claim",
+        ),
+    ),
+    (
+        "blind-server-nearest-claim-push",
+        ProtocolSpec(
+            role="server",
+            delivery_preference="nearest",
+            bottleneck_policy="push",
+            terminal_policy="claim",
+            counter_preference="clear",
+            curriculum_group="blind_claim",
+        ),
+    ),
+    (
+        "blind-bottleneck-alternate-neutral",
+        ProtocolSpec(
+            role="flexible",
+            bottleneck_policy="alternate",
+            counter_preference="clear",
+            curriculum_group="blind_offaxis",
+        ),
+    ),
+    (
+        "blind-ingredient-near-neutral",
+        ProtocolSpec(
+            role="ingredient_person",
+            pot_preference="near",
+            counter_preference="handoff",
+            curriculum_group="blind_offaxis",
+        ),
+    ),
+)
+
 PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec], ...]] = {
     "standard7": STANDARD7_PROTOCOLS,
     "role_conditioned_v1": ROLE_CONDITIONED_V1_PROTOCOLS,
     "role_conditioned_v2": ROLE_CONDITIONED_V2_PROTOCOLS,
+    # Eval-only blind set (sec18.14). Never a training partner_set.
+    "blind_v1": BLIND_V1_PROTOCOLS,
 }
 
 

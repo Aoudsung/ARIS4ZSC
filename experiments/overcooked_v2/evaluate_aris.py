@@ -104,6 +104,12 @@ class EvalContext:
     # RC-2b state-aware scripted oracle: callable(ctx, state, valid_ids) -> option_id, used by the
     # reachability probe to drive the full pipeline with stage/inventory awareness (bypasses Q).
     scripted_fsm: object | None = None
+    # sec18.14 (formal blind round): eval-only partner-registry override. When set,
+    # ALL partner lookups for this context (main eval, random/reference baselines,
+    # factor-deletion rollouts) resolve from this registry instead of the config's
+    # training partner_set. The config itself is never mutated (the graph-objective
+    # gate compares config.partner_set against graph metadata).
+    partner_set_override: str | None = None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -134,6 +140,17 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if zeroed_ablation:
         for ctx in contexts:
             _apply_zeroed_override(ctx.config)
+    # sec18.14 (formal blind round): eval-only partner-registry override. This is
+    # deliberately NOT a config mutation — the graph-objective gate compares
+    # config.training.partner_set against the graph metadata (train_aris.
+    # _graph_objective_metadata_status), so the override is threaded only into
+    # the partner LOOKUP sites below and declared in the output payload. Partner
+    # names are globally unique across registries, so baseline caches cannot
+    # collide across sets.
+    partner_set_override = str(getattr(args, "partner_set", "") or "") or None
+    if partner_set_override:
+        for ctx in contexts:
+            ctx.partner_set_override = partner_set_override
     else:
         # codex review blocker: close the OLD escape path too — a checkpoint
         # whose config was hand-mutated to a non-formal evidence mode must not
@@ -151,7 +168,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     partner_names = _resolve_partner_names(
         contexts[0].option_lib,
         args.partners,
-        partner_set=str(contexts[0].config.get("training", {}).get("partner_set", "standard7")),
+        partner_set=partner_set_override
+        or str(contexts[0].config.get("training", {}).get("partner_set", "standard7")),
     )
     reward_scale_status = {
         ctx.graph_variant: _graph_objective_metadata_status(
@@ -275,6 +293,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         # LDS-B3: run-level ablation declaration (sec18.13.3). The integrity gate
         # requires the evidence policy to match this declaration exactly.
         "eval_ablation": {"zeroed_partner_option": zeroed_ablation},
+        "eval_partner_set_override": partner_set_override,
         "reward_scale_verified": all(
             bool(item["reward_scale_verified"])
             for item in reward_scale_status.values()
@@ -378,6 +397,7 @@ def _evaluate_partner(
     random_policy: bool,
     collect_diagnostics: bool,
     allow_diag_skip: bool = False,
+    partner_set_override: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     rng = np.random.default_rng(seed)
     env = _build_env(graph_override.layout_name, ctx.config)
@@ -390,7 +410,9 @@ def _evaluate_partner(
     )
     partners = {partner.name: partner for partner in make_training_partners(
         ctx.option_lib,
-        partner_set=str(ctx.config.get("training", {}).get("partner_set", "standard7")),
+        partner_set=partner_set_override
+        or getattr(ctx, "partner_set_override", None)
+        or str(ctx.config.get("training", {}).get("partner_set", "standard7")),
     )}
     if partner_name not in partners:
         raise KeyError(f"Unknown partner {partner_name!r}; choices={sorted(partners)}")
@@ -2068,6 +2090,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--graph_variants", required=True)
     parser.add_argument("--partners", default="all")
+    parser.add_argument(
+        "--partner_set",
+        default=None,
+        help="sec18.14: eval-only partner-registry override (e.g. blind_v1). "
+        "Redirects partner lookup only; the checkpoint config is not mutated. "
+        "Declared in the output as eval_partner_set_override.",
+    )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=0)
