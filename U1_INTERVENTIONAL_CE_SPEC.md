@@ -2,7 +2,8 @@
 
 **Status:** DESIGN — 未实现；**已通过 codex 评审为 GO-WITH-CHANGES**（本轮修订版含所有必需修改）
 **Ledger:** U1（预注册 METHOD_LOCK sec18.11；计划 ICLR_UPGRADE_PLAN §2-C1）
-**Date:** 2026-07-04
+**Date:** 2026-07-04 · **rev 增补 2026-07-05**：并入 ChatGPT 深审裁决 [13][14]——top-up
+策略稳健性检查（§2.4）与"图差异+下游差异+新增因子逐一删除"三段式读出（§5）。
 
 ## 0. 动机（实测证据）
 
@@ -92,6 +93,14 @@ Phase 4  建图: 因子候选 = passive-estimable ∪ interventional-estimable
 `refine_interventional_ce(..., intervention_runner=...)` 的 runner 实现（pair 级强制对照）。
 top-up 已满足 E1 需要；runner 属 C1 完整故事的加强件，E1 后视需要实施。
 
+**rev 增补（裁决 [14]）——top-up 策略稳健性检查（E1-ext 窗口执行）**：FSM top-up 下的
+CE_int 是"FSM 分布下的估计量"，存在把 FSM 的任务结构注入图、而非从交互数据发现因子的
+风险（与本项目"基建修复不得替方法完成现象"的原则同类）。同一 required factor 至少用两
+种 top-up 基线复估（uniform+target / fsm+target；可加 weak-learned+target），报告 CE
+排序稳定性与下游建图稳定性；仅在 FSM top-up 下成立的因子，论文措辞降为
+"FSM-guided graph construction"，不得声称一般干预式发现。估计量 KEEP SEPARATE 原则对
+每种基线分别适用。
+
 ## 3. 不变量影响（I1–I17 + 新 I18-CE）
 - I4（CE=预处理）**加强**：干预行必须 preprocessing-only；训练/eval 时 `partition_replay_rows`
   在训练读 replay 时若混入 interventional 行 = FAIL（防止 U1 数据泄入 online replay）。
@@ -127,6 +136,8 @@ top-up 已满足 E1 需要；runner 属 C1 完整故事的加强件，E1 后视�
 | top-up 后可估但 CE≈0（有支持的测得零） | asymm×v2 终端交互真实微弱——诚实记录，布局降级理由升级为"测得"而非"哨兵" |
 | top-up 后仍不可估（支持度仍不足） | 采集预算/偏置设计问题——升级 K、修 FSM 基线，不得下科学结论 |
 | E1: interventional-CE 图 vs passive-CE 图 臂对比 | 图差异 + 下游回报差 = C1 的价值直读（ICLR_UPGRADE_PLAN §5） |
+| top-up 策略稳健性（rev，裁决 [14]）：CE 排序跨 top-up 基线稳定 | 干预式发现具一般性；仅 FSM 下成立 ⇒ 措辞降为 FSM-guided graph construction |
+| 新增干预因子逐一删除（rev，裁决 [13]）：删除致下游行为/回报退化 | 盲区因子确为决策承重——补齐"图差异+行为差异+因子消融"三段式；无退化 ⇒ 如实报告"盲区存在但不承重"，U1 降级为估计质量工程 |
 
 ## 6. 回滚与提交
 - 全部改动 flag-gated（默认关 ⇒ 现状 bit-不变）；一机制一提交：

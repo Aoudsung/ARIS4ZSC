@@ -77,6 +77,15 @@ class OCV2Adapter:
         self.key = jax.random.PRNGKey(seed)
         self.key, subkey = jax.random.split(self.key)
         obs, state = self._jit_reset(subkey)
+        # PERF (2026-07-06, profile-driven; semantics unchanged): materialize the
+        # state as a host/numpy pytree ONCE per boundary. Every downstream reader
+        # (state_utils getters, option preconditions, event extractor, featurizer,
+        # scripted partners) indexes state fields scalar-by-scalar; on a JAX array
+        # each such index dispatches a full slice primitive (~250k dispatches per
+        # episode ≈ 2/3 of eval wall time). numpy leaves make those reads ~free.
+        # The jitted step/reset accept numpy leaves as inputs unchanged (same
+        # shapes/dtypes -> no retrace; CPU backend device_put is near zero-copy).
+        state = jax.device_get(state)
         self.obs = self._apply_featurizer(obs, state)
         self.state = state
         return self.obs, self.state
@@ -95,6 +104,10 @@ class OCV2Adapter:
             self.state,
             actions,
         )
+        # PERF: one host materialization for everything downstream (see reset()).
+        # device_get preserves pytree structure; leaves become numpy with the same
+        # dtypes, so _to_float/_to_bool/np.asarray consumers see identical values.
+        state, rewards, dones, info = jax.device_get((state, rewards, dones, info))
         self.state = state
         self.obs = self._apply_featurizer(obs, state)
         return OCV2Step(
@@ -114,9 +127,10 @@ class OCV2Adapter:
         raw_obs: Mapping[str, Any],
         state: Any,
     ) -> dict[str, np.ndarray]:
-        raw_np = self._to_numpy_obs(raw_obs)
+        # PERF: when a featurizer is set, the raw observation tensors are unused —
+        # do not pay a per-step host conversion for arrays we immediately discard.
         if self.featurizer is None:
-            return raw_np
+            return self._to_numpy_obs(raw_obs)
         return {
             key: np.asarray(value, dtype=np.float32)
             for key, value in self.featurizer(state).items()

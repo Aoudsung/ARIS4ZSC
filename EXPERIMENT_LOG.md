@@ -224,3 +224,186 @@
   探针首launch 因嵌套引号本地展开失败（编排器事故同族），改脚本文件后成功（教训入档）。
 - **下一步**：群体压力干预新预注册（草案见
   review_bundles/latent_defect_sweep_20260704/E1REV2_POPULATION_PREREG_DRAFT.md）待用户 Type-B。
+
+### 2026-07-05/06 override 门 + seed 行为取证（e1rev 重建基底；用户授权远程执行）
+
+- **背景**：原 e1rev 产物（ckpt/CE/图/preflight）已从远程与本地全部丢失（编排器误删旧账）。
+  用户批准同配方重建：代码 tar 同步（hash 核验一致）→ CE（role_conditioned_v2，6 伙伴×100ep）
+  → preflight → 训 aris seeds 0/1/2/4（5000 updates，全部 guard-pass 发布）→ override 门 +
+  行为探针。产物：`CPR_REPO/results_override/`、`outputs/asymm_ce_role_v2_e1rev/`、
+  `logs_override/`。**非 bit-identical 原模型**（CE 重采样，图 16 因子、覆盖门全满足）。
+- **override 门**（`scripts/override_gate.py`，骑 scripted_priority 钩子；两臂同 seed 逐局配对，
+  终端链=serve/plate/pick_plate 强制、否则回落 argmax；codex 复评修正 pairing）：
+  对 heldout-handoff-alternate-yield（25ep×4seeds）：
+  | seed | argmax | override | 读法 |
+  |---|---|---|---|
+  | s0 | 1.00 | **142.14** | 汤已煮好、守着不端；强制拿盘即通 |
+  | s1 | 82.88 | 82.88（全同） | 自发全链，override 无事可做 |
+  | s2 | −8.00 | −8.00（全同） | 从不碰锅 → 终端前置从未成立 → override 惰性 |
+  | s4 | −1.42 | −1.42（全同） | 同上 |
+  pooled lift CI[24.0,48.0] **由 s0 单独驱动**（per-seed 1/4）——pooled 读数作废，按 seed 读。
+  对 heldout-resource-server-claim（跑至 s0）：argmax 187.5 > override 150.6 —— 对 claimer
+  让位正确、强制接管有代价（角色不对称成立）。完整 JSON 待该臂跑完补档。
+- **行为指纹**（`scripts/probe_behavior.py`，3ep/组，探索性诊断）：
+  - s1 argmax：fetch27/deliver27/pick9/plate6/serve6，完成率 1.0——完整迁移；
+  - s0 argmax：fetch12/deliver9（会做菜）→ **cross_bottleneck 45 次全败 + wait 42 次**，
+    守着煮好的锅不拿盘（pick_plate 明明 valid）——**中链价值错误**；
+  - s2 argmax：wait_at_bottleneck×75 从开局；s4 argmax：**noop×177**（fetch valid 但不选）；
+  - **s2/s4 全链脚本强制：完成率 1.0、每局 3 汤、回报 119.1（两 ckpt 逐位相同）**——
+    环境/伙伴完全允许单干通关，**死锁 100% 在学到的 Q 里**。
+- **训练侧取证（根因候选，L1）**：4/4 seed 最优 checkpoint 全在 **update 500–1000/5000**；
+  全部记录 `last_ineligible_checkpoint_reason=no_ego_sole_correct_delivery`（后期 checkpoint
+  反复零独立上菜）；守卫语义="曾出现过会上菜的快照即发布"。结合脚手架 anneal_updates=2500：
+  **终端能力是脚手架窗口期的瞬态，TD 未将其巩固**——退火后 contrib_team 备菜局部最优重新
+  接管。sec18.12 "脚手架解锁终端能力" 读数需修正为"暂时解锁、随退火蒸发"。含义：一切
+  stage-1 读数（0.125、belief 平移翻不动、四粒度行）均测于 10–20% 训练进度的早期快照。
+- **排除项**：守卫未失职（4/4 训练伙伴上真实 ego-sole 2/3/6/9）；重采样图结构健全；
+  门接线正确（s0 生效、s1 两臂同因 argmax 本在终端链上）；环境无 bug（全链 100% 通关）。
+- **原现象复现判定**：s0/s2/s4 三相与 stage-1 描述"wait_at_bottleneck/cross_bottleneck
+  loops or noop"逐字吻合 + 原探针矩阵本就记录 seed 斑驳（s2 对两 yield 伙伴 1.00/0.00）——
+  **重建基底忠实复现了现象类，包括其斑驳性**。
+- **纪律注记**：sec18.12.4 禁止在见到 E1-rev 结果后再调 reward/exploration；任何 L1 修复
+  （退火策略/credit/终端探索持续性）须新预注册条目 + Type-B 裁决后方可执行。
+- **下一步（单一）**：待用户裁决——1–2 seed 的"脚手架不退火"诊断训练（anneal→∞，其余全同），
+  检验"退火是否是能力蒸发的因"：后期 checkpoint 出现持续 ego-sole ⇒ 退火时机是旋钮；
+  仍蒸发 ⇒ credit 结构问题更深。一次测量，直接命中 L1 机制。
+
+### 2026-07-06 L1 巩固预注册执行：0/2 + 数据规模发现（用户授权）
+
+- **L1_CONSOLIDATION_PREREG_DRAFT.md 按写定执行**：l1fix config（仅 bias_end 0.9、
+  epsilon_end 0.5 两键，按基线起始值持平）× seeds{0,2} × 5000 updates ×
+  --save_all_checkpoints；接线回读通过。codex 部署前复评抓到 yaml 重复键 BLOCKER
+  （training 块后段真实 ε 键 0.5→0.1 会静默覆盖前段插入值）——修正后基线机制数字
+  更正为：有效终端探索率 = ε(0.5→0.1) × bias(0.9→0.35) ≈ 36%→3.5%。
+- **判定 0/2**：探索通道全程常驻（pick_count 75/93）仍不巩固——u500 后独立上菜全零，
+  与基线逐点一致。**探索支持塌缩假设被证伪为主因。**
+- **上游发现（本轮最重要）**：`updates_per_transition: 8` ⇒ 全训练仅 **625 transitions
+  = 32 局经验**（episode_returns len=32）；每条经验被梯度复用 8 次。u500 能力≈前 3 局
+  上的塑形先验；后续"蒸发"、seed 斑驳、OOD 四相，在 32 局尺度上都是小样本现象。
+  **一切既往本基底结论（G2 时代含 5/5 分离实验、stage-1、override 门）都测于 32 局
+  训练量的模型之上**——此事实此前从未被任何文档记录。
+- **下一步（单一，待 Type-B）**：数据规模探针预注册——l1fix config + 数据量 ×8
+  （updates_per_transition: 1，5000 transitions ≈ 250 局，其余不动），2 seeds，
+  判据沿用晚期窗口巩固；巩固 ⇒ 根因=样本饥饿；仍不巩固 ⇒ 信用结构预注册顺位执行。
+
+### 2026-07-06 基建提速：环境执行层 4.2×/单局 ~18×，golden 逐字节一致（用户授权）
+
+- **动机**：数据规模探针前先修执行效率。cProfile 实测（1 局 61.4s，4970 万次函数调用）：
+  **~2/3 时间 = 25 万次对 JAX 数组的逐元素索引**（state 读取/事件抽取/featurizer/伙伴脚本
+  每步 ~4200 次 getitem，每次走完整 JAX 原语分发）；次因 = torch/OpenMP 144 核线程池对
+  小张量的空转（user 2m47s vs real 45s）。
+- **改动 1（代码，env_adapter.py 单文件）**：step/reset 后 `jax.device_get` 一次性把
+  state/rewards/dones/info 物化为 numpy pytree 再暴露——下游全部标量读取变纳秒级；
+  jit step 接受 numpy 叶子（同形状不重编译）。附带删掉 featurizer 路径下每步转换后即
+  丢弃的 raw-obs 浪费。**下游零改动。**
+- **改动 2（零代码，launch 配方）**：`OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
+  OPENBLAS_NUM_THREADS=1`（配 JAX_PLATFORMS=cpu）。**今后所有远程 train/eval 启动
+  必须带此三变量**——不带则单进程占满 144 核互踩，并行舰队吞吐塌方。
+- **验证**：golden 1 局逐字节 diff 一致；3 局数值与改前老代码逐项一致（82.88/1.0/6）；
+  `experiments/overcooked_v2/tests/` 47/47 通过（p0_p1 回归 + 静态不变量；
+  test_deadlock_recovery 收集错误为远程同名目录残留 + 路径问题，先于本次改动存在）。
+- **数字**：1 局含启动 45.1s→10.8s（4.2×）；启动 ~8.8s、单局本体 ~37-40s→**~2s（≈18×）**；
+  user/real 从 3.6min/35s → 11s/10.8s（线程空转清零 ⇒ 144 核可干净并行 ~百个进程）。
+- **外推**：数据规模探针（5000 transitions）从 ~3-4h/seed 降至 **~15-25min/seed**；
+  stage-1 级评估（25ep×24 ckpt）从 ~6-8h 降至 **~1h 内**。改动未提交 git（待用户指示）。
+
+### 2026-07-06 DATA-8x 双臂判定：样本饥饿实锤为根因；探索常驻假设二次证伪（用户授权）
+
+- 双臂 × 双 seed（预注册 L1 草案 §6，先写后跑；接线回读全过；episodes=251 双臂确认）：
+  **A（l1fix-8x 探索常驻）0/2 巩固；B（e1rev-8x 原退火）2/2 巩固**（B-s2 晚期
+  ego_sole 1/2/4/4、回报升至 ~40 且 u5000 仍上行）。
+- 结论：(1) **32 局样本饥饿是巩固失败的根因**——原退火调度在 250 局下自然巩固，
+  此前一切"瞬态/蒸发"现象是数据量问题的表象；(2) 探索常驻（l1fix）不但无效且有害
+  （ε 恒 0.5 ⇒ 数据永远高噪、贪心不收敛），**退火设计无罪，l1fix 调度废弃**；
+  (3) 250 局未饱和，正式重建取更大预算。
+- 影响面：既往全部基底结论的重测路径明确——不需要动方法/奖励/探索任何一处，
+  只需要正常的数据量。U2/信念粒度问题的检验条件（一个巩固的基底）现在有了实现路径。
+- 下一步（单一，待 Type-B）：SUBSTRATE_REBUILD 预注册——e1rev 原调度 ×
+  total_updates 40000（~2000 局）× 5 seeds + stage-1 held-out 重测。
+
+### 2026-07-06 stage-1 held-out 对比：32 局 vs 250 局基底（用户授权；25ep×2 held-out×seed0 协议）
+
+| 基底 | vs yield 伙伴（egoCCR / ego上菜 / 回报） | vs claim 伙伴（ego / 伙伴正确上菜 / 回报） |
+|---|---|---|
+| 32 局 s0 | 0.000 / 0 / 5.0（死锁） | 0 / **50** / **59.0**（让位配合） |
+| 32 局 s2 | 0.000 / 0 / −6.0（死锁） | 0 / **75** / 16.0（让位） |
+| 250 局 s0 | **1.000 / 25 / 41.5** | **25 / 0** / 36.1（全包） |
+| 250 局 s2 | **1.000 / 25 / 38.7** | **25 / 0** / 35.8（全包） |
+
+- **死锁消失**：对让位伙伴 egoCCR 0→1.0（两 seed 25/25 局全部 ego 上菜）。
+- **让位同时消失**：对抢活伙伴从"让对方上 50–75 次、团队 59"变为"ego 全包 25 次、
+  对方 0 次、团队 36"——base_only 式全包表型，s0 上比配合少 ~23 分/局面。
+- **u500/sel/final 三份 checkpoint 行为逐分相同**（异常解释）：8x 数据下 u500 已含
+  25 局经验（≈旧全量），held-out 贪心行为在 u500 即饱和为"永远上菜"，其后不变；
+  选择器照常选 u500，无 bug。中期验证的回落-回升是对训练伙伴的行为，与 held-out 无冲突。
+- **判读（sec18.13.2 双判据首次真实咬合）**：第 1 条（yield 接管）2/2 PASS；
+  第 2 条（claim 不全包）2/2 **FAIL**。**伙伴条件化行为在两个基底上都不存在**：
+  32 局=永远让位，250 局=永远上菜。项目核心问题（信念能否让行为随伙伴切换）第一次
+  站在一个有能力的基底上，且有量化奖金（对 claimer：条件化值 ~+23 回报 + 伙伴吞吐 2-3/局）。
+- 注意：aris_bellman 的信念机制在 250 局训练中在场，未产生条件化——与"信念平移 Q
+  不翻转 argmax"的旧诊断连续。s2 训练验证 u4500 对训练 claimer 出现 partner=8 上菜，
+  提示条件化可能随更多数据萌芽——SUBSTRATE_REBUILD（2000 局）的读出应加入
+  claim-deference 指标以裁决"数据独自能否长出条件化"这一零假设。
+
+### 2026-07-06 SUBSTRATE_REBUILD（2000 局 × 5 seeds）：伙伴条件化由数据涌现；双判据 4/5 达标（用户授权）
+
+- e1rev 原调度 @ 40000 transitions（eps=2001 确认）× seeds 0–4，guard 5/5，~1h。
+- **held-out 决定性表（25ep×2 伙伴×seed0，sel=final 行为一致）**：
+  | seed | yield 伙伴 egoCCR / ego上菜 | claim 伙伴 ego / 伙伴正确上菜 / 回报 |
+  |---|---|---|
+  | s0 | **1.000** / 25 | 0 / **50** / 50.0 |
+  | s1 | **1.000** / 25 | 0 / **75** / 24.6 |
+  | s2 | 0.000 / 0 | 0 / 25 / 26.8 |
+  | s3 | **1.000** / 25 | 0 / 25 / 27.3 |
+  | s4 | **1.000** / 25 | 0 / 25 / 27.1 |
+- **判定**：R1 巩固 5/5；R2 让位涌现分支触发（5/5 对 claimer 让位 + 4/5 对 yielder 接管
+  ——32 局"永远让"、250 局"永远抢"、2000 局"看人下菜碟"）；R3 sec18.13.2 双判据
+  **4/5 双条通过**（s2 第 1 条不过，seed 方差如实报）。
+- **含义**：(1) 角色自适应在现有 aris_bellman（含其因子信念机制）+ 足量数据下涌现，
+  无需 U2/换粒度/改奖励——**U2"必要性"口径死亡**；(2) 但条件化是否由信念通道承载
+  未裁决——方法核心主张的正面证据窗口打开：**下一步（单一，待 Type-B）= 本基底 E2
+  zeroed**（置零证据通道，看 claim-让位/yield-接管是否塌回无条件行为），一次运行裁决
+  信念是否承重；(3) 既往全部否定性诊断（0.125、四粒度表、belief 翻不动）确认为
+  32 局样本饥饿的伪影，需按新基底重建证据链。范围：dev-heldout、单布局。
+
+### 2026-07-06 E2-zeroed @ 2000 局基底：信念通道对 claim-配合承重 3/5（用户授权）
+
+- 协议：stage-1 同款 + `--zeroed_partner_option_ablation`（LDS-B3），5 rebuild ckpt，
+  对照=已在盘 inferred 评估。声明与完整性门全过。
+- **yield 维度 5/5 不变**（接管=状态承载）；**claim 维度 4/5 改变**：s0/s2/s3 配合塌为
+  互相干扰（伙伴上菜 50/25/25→0、回报→7.9；同 ego 对 yielder 仍 25/25 ⇒ 能力完好，
+  塌的是伙伴识别/配合）；s4 反向（zeroed 双方各 25、回报 58.5>27——证据过度让位案例）；
+  s1 不变。
+- **结论**：角色条件化中"对抢活者的配合"在 3/5 seed 由证据→信念通道承载——
+  ARIS-Bellman 核心主张的首份正面证据（范围：dev-heldout 单布局）。与 32 局 E2
+  （zeroed==inferred，通道无作用）对照：通道承重性随数据量修复而出现。
+- 下一步候选（待用户）：行为指纹 zeroed-claim 塌态（ego 在干什么：堵路/抢盘/误上菜），
+  把"通道承重"从数字变成机制陈述；或直接进入证据链正式重建（加局数/CI/盲测 split）。
+
+### 2026-07-06 E1 多臂对照 @ 2000 局基底（5 方法 × 5 seeds，--fast 统一协议；用户授权）
+
+- 20 基线训练全绿（eps=2001 全臂回读确认，guard 20/20 pass，ITT 无剔除）。首轮评估
+  15 臂被完整性门拒（无信念方法产不出 Δ_info/MI；stage-1 原协议为全方法 --fast，
+  本轮漏带旗标），按原协议统一 --fast 重评 25 臂。aris fast vs full 数字逐项一致
+  ⇒ 诊断收集不扰动 rollout（附带接线验证）。
+- **两行判据汇总（row1 对 yielder 接管 / row2 对 claimer 不全包 / 双过）**：
+  aris 4/5 | **5/5** | **4/5**；base_only 5/5|2/5|2/5；global_gru 5/5|2/5|2/5；
+  flat_factor 5/5|1/5|1/5；partner_id_q 5/5|2/5|2/5。
+- **三个关键读数**：
+  1. row1 在 2000 局下**全方法普遍通过**（数据即能力，不再有判别力——符合预期）；
+  2. **真正的判别轴 = 伙伴对比度**：aris 是唯一"对 yielder 全上（25）、对 claimer
+     全让（0）"的方法（4/5 seed，Δ=+25）；全部 baseline 对两类伙伴**无差别上菜**
+     （claim 侧 ego 25–50，Δ≤0）。baseline 的 row2"通过"（各 1–2/5）全部经由
+     **共同上菜**（25/25）而非让位——row2-screen 的"吞吐不降"可被共serve冒充
+     （ChatGPT R1-[09] 预警成真），正式轮主指标应改为**伙伴对比度**
+     （Δ ego-deliveries across partner types）+ E2 因果。
+  3. **诚实披露（不利面）**：对 claimer 的团队回报，共serve/全包 baseline（57–70）
+     **高于** aris 的让位（24.6–50）——该脚本 claimer 在共serve下照常出菜，此布局
+     上"角色互补"不等于"回报最优"。主张措辞必须是"因子信念产生伙伴条件化的
+     互补行为（对照+E2 因果双证据）"，不得写"对 claimer 回报更高"。
+- **预注册 §9 分支判定**：落于两分支之间（baseline both=1–2/5，既非 ≤1/5 也非 ≥3/5）；
+  aris（4/5）与全部 baseline（≤2/5）分离成立，但 row2-screen 判据需按上条收紧后
+  进入正式轮。base_only 2/5 过 row2 = 判据松弛证据（共serve路径），非伪影。
+- **下一步（单一，待 Type-B）**：正式轮 = 盲 held-out 伙伴（全新脚本）+ 50–100 局 +
+  多评估 seed + 预注册主指标改为伙伴对比度（Δ ego-serve）+ E2-zeroed 因果对照
+  （aris 与任一"对比度非零"的 baseline 同跑）。

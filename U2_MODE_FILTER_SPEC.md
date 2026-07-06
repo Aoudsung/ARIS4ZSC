@@ -30,6 +30,10 @@ b_t(z)   ∝ b̃_t(z) · exp( g_θ(x_t^f, e_f, z) )          # 学习的逐模�
   参数（同现有 belief 模型的共享模式）；
 - λ（`mode_forgetting`，默认 0.02，config 化）：与 S27 的 support_mix 同构——在模式层
   它同时就是自适应伙伴的漂移先验，一个机制两个语义（论文卖点之一）。
+  **rev 补充（2026-07-05 深审裁决 [15]）：λ 是预注册机制变量，不是工程常数**——
+  λ∈{0, 0.002, 0.02, 0.1} sweep 列入 E1-ext-D（U2_ROLE_BELIEF_PROPOSAL §4b-4）。
+  措辞规范：用"**λ-有界的局内持久**"，不用无条件"整局持久"（λ=0.02 对单次早期证据的
+  记忆半衰期 ≈34 步；对持续重复到达的证据，后验稳定在似然驱动定点，受 λ 影响小）。
 
 **训练：单一 TD objective**（codex Q2 措辞修订）。b_t 是 g_θ 的可微函数（softmax-normalized
 递归），TD 梯度经 belief→Q 路径回传穿过递归。**表述规范**（避免夸大）：本设计**不声明**
@@ -101,8 +105,17 @@ likelihood"（避免暗示存在独立 Bayesian evidence 目标）。
   - **掩码模式零质量守恒**：`softmax(log_b)[masked] == 0.0`（数值容差）；
   - random_policy/partner_id_q 分支 belief_filter 记录为 `"unused"` 或加载被明确拒绝；
   - GRU/Bayes 混装载 = FAIL。
+- **新 I20-blind（候选；2026-07-05 深审裁决 [02]，随 U2 proposal §4a-4 盲化门加入
+  fidelity gate）**：训练/评估/日志分析代码不得按伙伴名称或协议标签字面量
+  （claim/yield/flexible、handoff/resource-server 等）分支；grep tripwire，模式同
+  U1 spec 的 I10 扩展。
 
 ## 5. 测试计划（write-only，codex 要求扩展）
+
+**口径（2026-07-05 深审裁决 [21]）**：本节全部是工程正确性门（张量/掩码/梯度/持久化/
+加载）；它们**不支撑**"后验=角色信念"的语义主张。机制门（后验语义、证据 OOD、机会
+条件化、控制支持）在 U2_ROLE_BELIEF_PROPOSAL §4a/§4b 定义并单独读出——工程门通过
+≠ 机制主张成立。
 1. 递归性质：归一性（∑_{z 有效} softmax(log_b) = 1，log-domain via logsumexp）、
    持久性（无证据时 b 仅按 λ 向 uniform-over-valid 漂移）、
    支撑完整（S27 类冻结不可能——任意步任意有效模式 softmax > 0）。
@@ -124,12 +137,14 @@ likelihood"（避免暗示存在独立 Bayesian evidence 目标）。
 7. E2 正交性：zeroed 通道模式下 BayesModeFilter 正常运行（证据少≠崩溃，只影响 posterior
    收敛速度）。
 
-## 6. 预注册读出（已入 sec18.11 / ICLR_UPGRADE_PLAN §5）
-| E1 臂对比 | 结论 |
-|---|---|
-| aris(bayes_mode) > aris(gru) > flat | 结构化模式递归是真实贡献（C2 headline） |
-| aris(bayes_mode) ≈ aris(gru) | C2 降级为"等效+可解释+免疫 S27 类缺陷"的工程论证（诚实路径，仍可作为分析节） |
-| aris(bayes_mode) < aris(gru) | 如实报告；C2 退出 headline，检查 λ/容量假设后仅作负结果附录 |
+## 6. 预注册读出（口径收敛 2026-07-05：本节不再维护平行读出表）
+
+**读出口径的唯一权威来源 = U2_ROLE_BELIEF_PROPOSAL（rev3）§5**（签收后随 METHOD_LOCK
+sec18.14 冻结；sec18.11 所引 ICLR_UPGRADE_PLAN §5 的旧措辞同时被取代）。方向性摘要，
+以 rev3 §5 为准：
+- aris(bayes_mode) 优于 aris(gru)/flat ⇒ **候选机制贡献**（限当前脚本伙伴与现图）；
+  C2 headline 需容量匹配归因（L4）+ 非角色伙伴（P3/G 判据）+ 语义门（G-mech）同时支持；
+- ≈ 或 < ⇒ 按 rev3 §5.4 写作阶梯降级（工程论证 / 负结果），如实报告。
 
 诊断增强（C3 联动）：显式后验使 belief-swap / Δ_info / 探测行为分析直接可读——E4/E6 的
 机制证据质量提升是 C2 的次级卖点，无论主对比落哪个分支都成立。

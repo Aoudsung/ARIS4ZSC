@@ -123,3 +123,43 @@ user to approve a new hook before it runs. Until approved, the boundary remains
 request as a stop-and-confirm. Once approved, matching local-exec commands raise an
 approval prompt (the user may authorize a one-off, or "always allow" to relax for
 the session); the guard can only add a prompt, never hard-block.
+
+---
+
+## 6. Data-sufficiency discipline (2026-07-06 — user directive after the 32-episode misdiagnosis)
+
+**Origin (measured, one month of damage):** the formal e1rev configs carried
+`total_updates: 5000` × `updates_per_transition: 8` ⇒ **625 transitions ≈ 32
+episodes of total training experience**, and no document ever stated this
+number. Every negative diagnosis produced on that substrate — held-out egoCCR
+0.125, the four-granularity table, "belief shifts Q but cannot flip wait",
+"terminal competence evaporates" — was later shown to be a sample-starvation
+artifact: at 2000 episodes the SAME method with NO mechanism change passed the
+preregistered role-adaptation criterion (4/5 seeds) and the E2 zeroed test
+showed the belief channel load-bearing. Cost: ~1 month, three external review
+rounds, multiple mechanism hypotheses chased.
+
+**Rules (binding for every future run):**
+
+1. **Effective data budget must be computed and recorded** for every training
+   run, at launch and in the log entry: transitions
+   (= total_updates / updates_per_transition under the 1-collect loop) and
+   episodes (≈ transitions / max_episode_options). Read it back from produced
+   artifacts (`metrics.episode_returns` length, `resolved_config.json`), never
+   from config intent.
+2. **Smoke-scale runs may satisfy Type-A gates only** (does it run / compile /
+   produce artifacts). They must be labeled SMOKE in EXPERIMENT_LOG and their
+   numbers may not enter any table, comparison, diagnosis, or claim readout.
+   Cheap smoke tests remain encouraged — for wiring, never for science.
+3. **Type-B / claim-level readouts require a data-sufficient substrate.** The
+   floor is set by the latest recorded sufficiency evidence for that substrate
+   (currently asymm×role_conditioned_v2: **≥ 2000 episodes / 40k transitions**,
+   EXPERIMENT_LOG 2026-07-06), plus a passed consolidation check (late-window
+   validation competence persists; if the curve is still rising, scale further
+   before adjudicating).
+4. **Any change to a data-quantity parameter** (`updates_per_transition`,
+   `total_updates`, `max_episode_options`, `replay_size`) requires restating
+   the effective episode count in the change record.
+5. When a result looks like a method failure, **check the data budget before
+   hypothesizing mechanisms** — "how many episodes did this model actually
+   experience?" is the first diagnostic question, not the last.
