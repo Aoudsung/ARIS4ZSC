@@ -1,0 +1,40 @@
+dp000 step[0:5) gate_main=0 gate_strict=0 ego_opt=fetch_ingredient deliv_in_opt=[0, 0, 0, 0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=0
+dp001 step[5:9) gate_main=0 gate_strict=0 ego_opt=deliver_ingredient_to_pot deliv_in_opt=[0, 0, 0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=3
+dp002 step[9:11) gate_main=1 gate_strict=0 ego_opt=pick_plate deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=6
+dp003 step[11:16) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0, 0, 0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=8
+dp004 step[16:18) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=11
+dp005 step[18:20) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=13
+dp006 step[20:22) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=13
+dp007 step[22:24) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=13
+dp008 step[24:26) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=13
+dp009 step[26:28) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=13
+dp010 step[28:31) gate_main=1 gate_strict=1 ego_opt=plate_soup deliv_in_opt=[0, 0, 1] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=13
+dp011 step[31:33) gate_main=0 gate_strict=0 ego_opt=serve_soup deliv_in_opt=[0, 1] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=13
+dp012 step[33:38) gate_main=0 gate_strict=0 ego_opt=fetch_ingredient deliv_in_opt=[0, 0, 0, 0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=13
+dp013 step[38:42) gate_main=0 gate_strict=0 ego_opt=deliver_ingredient_to_pot deliv_in_opt=[0, 0, 0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=15
+dp014 step[42:47) gate_main=0 gate_strict=0 ego_opt=fetch_ingredient deliv_in_opt=[0, 0, 0, 0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=17
+dp015 step[47:60) gate_main=0 gate_strict=0 ego_opt=deliver_ingredient_to_pot deliv_in_opt=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=19
+dp016 step[60:63) gate_main=1 gate_strict=0 ego_opt=deliver_ingredient_to_pot deliv_in_opt=[0, 0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=24
+dp017 step[63:65) gate_main=1 gate_strict=0 ego_opt=pick_plate deliv_in_opt=[0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=24
+dp018 step[65:70) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0, 0, 0, 2] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=24
+dp019 step[70:72) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=25
+dp020 step[72:74) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=27
+dp021 step[74:76) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[2, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=29
+dp022 step[76:78) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=31
+dp023 step[78:80) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=32
+dp024 step[80:82) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=32
+dp025 step[82:95) gate_main=1 gate_strict=1 ego_opt=plate_soup deliv_in_opt=[0, 2, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0] label_k5=2 ambig_k5=0 censored_k5=0 hist_len=32
+dp026 step[95:100) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0, 0, 0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp027 step[100:102) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp028 step[102:104) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp029 step[104:106) gate_main=0 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp030 step[106:108) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp031 step[108:110) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp032 step[110:112) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp033 step[112:114) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp034 step[114:116) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=0 ambig_k5=0 censored_k5=0 hist_len=32
+dp035 step[116:118) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=32
+dp036 step[118:120) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=32
+dp037 step[120:122) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=32
+dp038 step[122:124) gate_main=1 gate_strict=0 ego_opt=wait_at_bottleneck deliv_in_opt=[0, 0] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=32
+dp039 step[124:127) gate_main=1 gate_strict=1 ego_opt=plate_soup deliv_in_opt=[0, 0, 1] label_k5=1 ambig_k5=0 censored_k5=0 hist_len=32
