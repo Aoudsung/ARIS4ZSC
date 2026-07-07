@@ -9,7 +9,7 @@ Stages (run in order; later stages refuse to peek earlier):
             Floors are HARD on the two judged splits (indist_val, blind_terminal) and
             reported (soft) on co-report splits (indist_train, dev, blind_offaxis).
   tune    : train FULL / NOHIST (x K in {3,5,8}) + IDORACLE (K=5) x 3 seeds on training
-            partners only (relaxed-gate rows, ambiguous-window rows dropped). Reports
+            partners only (main-gate onset rows, ambiguous-window rows dropped). Reports
             in-distribution metrics ONLY; dev/blind rows are physically excluded from
             the tensors this stage builds.
   readout : SINGLE-LOOK. Requires dataset_gate_report.json PASS. Loads frozen models,
@@ -42,7 +42,7 @@ FLOOR_GATED = 5000
 FLOOR_MINCLASS = 500
 R1_GAIN_FLOOR = 0.10
 R2_RETENTION = 0.5
-LABEL_NAMES = ("no_one", "ego_serves", "partner_serves")
+LABEL_NAMES = ("no_initiation", "ego_first", "partner_first")  # D1-rev (prereg §9)
 HARD_FLOOR_SPLITS = ("indist_val", "blind_terminal")
 
 
@@ -368,7 +368,7 @@ def stage_tune(data, out_dir: Path, device: str) -> None:
            for k, v in data.items()}
     train_partners = sorted(np.unique(sub["partner"]).tolist())
     partner_to_idx = {p: i for i, p in enumerate(train_partners)}
-    relaxed = sub["gate_relaxed"].astype(bool)
+    gmain = sub["gate_main"].astype(bool)
     dev = torch.device(device)
     n_vocab = len(sub["_vocab"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -376,19 +376,19 @@ def stage_tune(data, out_dir: Path, device: str) -> None:
 
     for k in K_SET:
         ok = ok_rows(sub, k)
-        tr = ~sub["indist_val"] & relaxed & ok
-        va = sub["indist_val"] & relaxed & ok
-        va_main = sub["indist_val"] & sub["gate_main"].astype(bool) & ok
+        tr = ~sub["indist_val"] & gmain & ok
+        va = sub["indist_val"] & gmain & ok
+        va_main = va  # D1-rev: training gate == judged gate (strict gate is co-report)
         # norm stats from exactly this K's training rows (ambig-filtered; codex re-review)
         norm_x = build_state(sub, np.flatnonzero(tr))
         norm = (norm_x.mean(0), norm_x.std(0) + 1e-6)
         state_dim = norm_x.shape[1]
         b_tr = tensors_for(sub, np.flatnonzero(tr), norm, partner_to_idx, dev, k)
         b_va = tensors_for(sub, np.flatnonzero(va), norm, partner_to_idx, dev, k)
-        b_va_main = tensors_for(sub, np.flatnonzero(va_main), norm, partner_to_idx, dev, k)
+        b_va_main = b_va
         variants = ("full", "nohist", "idoracle") if k == JUDGED_K else ("full", "nohist")
-        blk: dict = {"n_train": int(tr.sum()), "n_val_relaxed": int(va.sum()),
-                     "n_val_main": int(va_main.sum()), "variants": {}}
+        blk: dict = {"n_train": int(tr.sum()), "n_val_main": int(va.sum()),
+                     "variants": {}}
         probs_main: dict[str, list[np.ndarray]] = {}
         for variant in variants:
             blk["variants"][variant] = []
@@ -404,7 +404,7 @@ def stage_tune(data, out_dir: Path, device: str) -> None:
                 pm = predict(model, b_va_main)
                 probs_main.setdefault(variant, []).append(pm)
                 blk["variants"][variant].append({
-                    "seed": seed, "val_logloss_relaxed": best_ll,
+                    "seed": seed, "val_logloss": best_ll,
                     "val_main_logloss": logloss(pm, b_va_main["labels"].cpu().numpy()),
                     "val_main_auc_ps": auc_binary(
                         pm[:, 2], b_va_main["labels"].cpu().numpy() == 2),
@@ -442,6 +442,9 @@ def _load_models(out_dir: Path, device: str, k: int):
 
 def _eval_pack(data, mask, models, norm, partner_to_idx, device, k):
     idx = np.flatnonzero(mask)
+    if idx.size == 0:  # strict onset gates can empty a co-report split (codex rev)
+        empty = np.zeros((0, 3), dtype=np.float64)
+        return idx, None, np.zeros(0, dtype=np.int64), {v: empty for v in models}
     batch = tensors_for(data, idx, norm, partner_to_idx, torch.device(device), k)
     labels = batch["labels"].cpu().numpy()
     probs = {v: np.mean([predict(m, batch) for m in models[v]], axis=0)
@@ -465,13 +468,17 @@ def stage_readout(data, out_dir: Path, device: str) -> None:
     models, norm, partner_to_idx, shas = _load_models(out_dir, device, JUDGED_K)
     ok5 = ok_rows(data, JUDGED_K)
     gm = data["gate_main"].astype(bool) & ok5
-    gr = data["gate_relaxed"].astype(bool) & ok5
+    gs = data["gate_strict"].astype(bool) & ok5
     res: dict = {"judged_k": JUDGED_K, "model_sha256": shas,
                  "gate_report_pass": True, "splits": {}}
 
     def add(name, mask, boot=False):
         idx, batch, labels, probs = _eval_pack(
             data, mask, models, norm, partner_to_idx, device, JUDGED_K)
+        if idx.size == 0:
+            blk = {"n": 0, "note": "empty mask under onset gate"}
+            res["splits"][name] = blk
+            return blk
         blk = metric_block(probs["full"], probs["nohist"], labels)
         blk["censoring_rate"] = float(data[f"censored_k{JUDGED_K}"][idx].mean()) \
             if idx.size else float("nan")
@@ -488,12 +495,12 @@ def stage_readout(data, out_dir: Path, device: str) -> None:
         return blk
 
     iv = add("indist_val_main", gm & data["indist_val"], boot=True)
-    add("indist_val_relaxed", gr & data["indist_val"])
+    add("indist_val_strict", gs & data["indist_val"])
     add("dev_main", gm & (data["split"] == "dev"))
     bt = add("blind_terminal_main",
              gm & (data["split"] == "blind") & (data["family"] != "offaxis"), boot=True)
-    add("blind_terminal_relaxed",
-        gr & (data["split"] == "blind") & (data["family"] != "offaxis"))
+    add("blind_terminal_strict",
+        gs & (data["split"] == "blind") & (data["family"] != "offaxis"))
     add("blind_offaxis_main",
         gm & (data["split"] == "blind") & (data["family"] == "offaxis"))
     for fam in ("yield", "claim"):
@@ -521,10 +528,12 @@ def stage_readout(data, out_dir: Path, device: str) -> None:
             data, gmk & (data["split"] == "blind") & (data["family"] != "offaxis"),
             mk, nk, pk, device, k)
         res["k_sensitivity"][f"k{k}"] = {
-            "G_indist": auc_binary(pr_i["full"][:, 2], lab_i == 2)
-            - auc_binary(pr_i["nohist"][:, 2], lab_i == 2),
-            "G_blind_terminal": auc_binary(pr_b["full"][:, 2], lab_b == 2)
-            - auc_binary(pr_b["nohist"][:, 2], lab_b == 2),
+            "G_indist": (auc_binary(pr_i["full"][:, 2], lab_i == 2)
+                         - auc_binary(pr_i["nohist"][:, 2], lab_i == 2))
+            if lab_i.size else float("nan"),
+            "G_blind_terminal": (auc_binary(pr_b["full"][:, 2], lab_b == 2)
+                                 - auc_binary(pr_b["nohist"][:, 2], lab_b == 2))
+            if lab_b.size else float("nan"),
         }
     signs_i = {np.sign(v["G_indist"]) for v in res["k_sensitivity"].values()}
     signs_b = {np.sign(v["G_blind_terminal"]) for v in res["k_sensitivity"].values()}

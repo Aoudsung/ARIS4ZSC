@@ -11,13 +11,15 @@ Per ego option-decision point we record:
   - partner public event history (run-length-encoded inferred option kinds + delivery
     punctuation events), truncated to the most recent --hist-window events
   - the ego option kind actually executed
-  - labels: first correct-delivery attribution (no_one / ego / partner) within the next
-    K in {3,5,8} ego option decisions. Strict attribution (codex review 2026-07-07):
-    ego counts only via ego_sole_correct_delivery; partner counts only when ego did not
-    deliver in the same step; same-step double deliveries are AMBIGUOUS and the affected
+  - labels (D1-rev, prereg §9): first TERMINAL-CHAIN INITIATION attribution
+    (no_initiation / ego_first / partner_first) within the next K in {3,5,8} ego option
+    decisions. Initiation = the agent ACQUIRES the soup (inventory transitions to
+    carrying a plated soup — raw state bits, NOT inferred kinds) or correct-delivers
+    (strict D1 attribution). Same-step double initiation is AMBIGUOUS and the affected
     windows are flagged for exclusion (fraction reported).
-  - opportunity gates: main = cooked soup exists (pot ready OR someone carries soup);
-    relaxed = main OR any pot cooking (prereg §3 as amended 2026-07-07)
+  - opportunity-onset gates (D1-rev): main = (any pot ready OR cooking) AND neither
+    agent carries soup; strict = any pot ready AND neither carries soup (co-report)
+  - step-level audit arrays (audit_*) are stored per chunk for offline relabeling
 
 Ego modes (all share ONE anchor checkpoint context; trained weights influence rollouts
 only in argmax mode):
@@ -84,9 +86,12 @@ def _carries_soup(inv: int) -> bool:
 
 
 def _pot_signals(state, pot_positions) -> tuple[int, int, float]:
+    # D1-rev (prereg §9): gate readiness is ANY-recipe ready — wrong-recipe soup
+    # acquisition counts as initiation, so wrong-recipe-ready pots must gate too
+    # (codex D1-rev review, blocker 1). Correct-recipe count is a separate feature.
     n_ready = sum(
         1 for p in pot_positions
-        if is_pot_ready_for_plate(state, p, require_correct_recipe=True)
+        if is_pot_ready_for_plate(state, p, require_correct_recipe=False)
     )
     n_cooking = sum(1 for p in pot_positions if is_pot_cooking(state, p))
     timers = [int(get_cell_extra(state, p)) for p in pot_positions]
@@ -191,9 +196,11 @@ def run(args: argparse.Namespace) -> None:
     rng = np.random.default_rng(args.seed)
     rows: dict[str, list] = {k: [] for k in (
         "state_feat", "extra_feat", "hist_kind", "hist_dur", "hist_ago", "hist_len",
-        "ego_opt_kind", "valid_kinds", "gate_main", "gate_relaxed",
+        "ego_opt_kind", "valid_kinds", "gate_main", "gate_strict",
         "episode_id", "dp_index", "dp_step",
     )}
+    audit: dict[str, list] = {k: [] for k in (
+        "ep", "code", "inv0b", "inv0a", "inv1b", "inv1a", "n_ready", "n_cooking")}
     label_cols: dict[str, list] = {}
     for k in K_WINDOWS:
         label_cols[f"label_k{k}"] = []
@@ -245,8 +252,10 @@ def run(args: argparse.Namespace) -> None:
             n_ready, n_cooking, min_timer = _pot_signals(state, pot_positions)
             inv0, inv1 = int(get_inventory(state, 0)), int(get_inventory(state, 1))
             ego_soup, partner_soup = _carries_soup(inv0), _carries_soup(inv1)
-            gate_main = bool(n_ready > 0 or ego_soup or partner_soup)
-            gate_relaxed = bool(gate_main or n_cooking > 0)
+            # D1-rev opportunity-onset gates (prereg §9): soup pending, nobody holds it
+            clean_hands = not ego_soup and not partner_soup
+            gate_main = bool((n_ready > 0 or n_cooking > 0) and clean_hands)
+            gate_strict = bool(n_ready > 0 and clean_hands)
             valid = ctx.option_lib.valid_options(state, 0)
             valid_ids = np.flatnonzero(valid)
             valid_kind_hot = np.zeros(len(vocab), dtype=np.uint8)
@@ -278,7 +287,7 @@ def run(args: argparse.Namespace) -> None:
                 np.int16(kind_to_id.get(str(opt.kind), kind_to_id[UNK])))
             rows["valid_kinds"].append(valid_kind_hot)
             rows["gate_main"].append(np.uint8(gate_main))
-            rows["gate_relaxed"].append(np.uint8(gate_relaxed))
+            rows["gate_strict"].append(np.uint8(gate_strict))
             rows["episode_id"].append(np.int32(episode_idx))
             rows["dp_index"].append(np.int16(option_count))
             rows["dp_step"].append(np.int32(primitive_steps))
@@ -323,10 +332,36 @@ def run(args: argparse.Namespace) -> None:
                     bool(event.partner_correct_delivery),
                     bool(getattr(event, "partner_wrong_delivery_event", False)),
                 )
-                code = _step_delivery_code(event)
-                if code == D_AMBIG:
+                # D1-rev initiation coding (prereg §9): acquisition from RAW inventory
+                # bits + strict delivery attribution; inferred kinds never touch labels.
+                dcode = _step_delivery_code(event)
+                inv0_b = int(get_inventory(ostep.prev_state, 0))
+                inv1_b = int(get_inventory(ostep.prev_state, 1))
+                inv0_a = int(get_inventory(ostep.step.state, 0))
+                inv1_a = int(get_inventory(ostep.step.state, 1))
+                ego_init = (_carries_soup(inv0_a) and not _carries_soup(inv0_b)) \
+                    or dcode == D_EGO
+                partner_init = (_carries_soup(inv1_a) and not _carries_soup(inv1_b)) \
+                    or dcode == D_PARTNER
+                if dcode == D_AMBIG or (ego_init and partner_init):
+                    code = D_AMBIG
                     ambiguous_steps += 1
+                elif ego_init:
+                    code = D_EGO
+                elif partner_init:
+                    code = D_PARTNER
+                else:
+                    code = D_NONE
                 step_deliv.append(code)
+                sr, sc, _ = _pot_signals(ostep.step.state, pot_positions)
+                audit["ep"].append(episode_idx)
+                audit["code"].append(code)
+                audit["inv0b"].append(inv0_b)
+                audit["inv0a"].append(inv0_a)
+                audit["inv1b"].append(inv1_b)
+                audit["inv1a"].append(inv1_a)
+                audit["n_ready"].append(sr)
+                audit["n_cooking"].append(sc)
                 x_f = router.route(
                     event, ego_option_id=int(option_id),
                     ego_option_elapsed=duration, ego_option_max_steps=opt.max_steps,
@@ -396,7 +431,7 @@ def run(args: argparse.Namespace) -> None:
                 e = dp_first_step[i + 1] if i + 1 < n_dp else total_steps
                 golden_lines.append(
                     f"dp{i:03d} step[{s}:{e}) gate_main={rows['gate_main'][ep_row_start + i]} "
-                    f"gate_relaxed={rows['gate_relaxed'][ep_row_start + i]} "
+                    f"gate_strict={rows['gate_strict'][ep_row_start + i]} "
                     f"ego_opt={vocab[int(rows['ego_opt_kind'][ep_row_start + i])]} "
                     f"deliv_in_opt={deliv[s:e].tolist()} "
                     f"label_k5={int(label_cols['label_k5'][ep_row_start + i])} "
@@ -412,6 +447,9 @@ def run(args: argparse.Namespace) -> None:
     for k, v in label_cols.items():
         arrays[k] = np.asarray(v)
     assert all(len(a) == n for a in arrays.values()), "ragged record arrays"
+    for k, v in audit.items():
+        arrays[f"audit_{k}"] = np.asarray(
+            v, dtype=np.int32 if k == "ep" else np.int16)
 
     gm = arrays["gate_main"].astype(bool)
     lab5 = arrays["label_k5"]
@@ -435,18 +473,19 @@ def run(args: argparse.Namespace) -> None:
         "ambiguous_delivery_steps": int(ambiguous_steps),
         "ambig_record_counts": {
             f"k{k}": int(arrays[f"ambig_k{k}"].sum()) for k in K_WINDOWS},
+        "label_version": "rev1_initiation (prereg §9)",
         "n_records": int(n),
         "n_gate_main": int(gm.sum()),
-        "n_gate_relaxed": int(arrays["gate_relaxed"].sum()),
+        "n_gate_strict": int(arrays["gate_strict"].sum()),
         "class_counts_k5_gate_main": {
-            "no_one": int(((lab5 == 0) & gm).sum()),
-            "ego_serves": int(((lab5 == 1) & gm).sum()),
-            "partner_serves": int(((lab5 == 2) & gm).sum()),
+            "no_initiation": int(((lab5 == 0) & gm).sum()),
+            "ego_first": int(((lab5 == 1) & gm).sum()),
+            "partner_first": int(((lab5 == 2) & gm).sum()),
         },
         "selection_stats_last_episode": selection_stats,
         "opportunity_gate_def": {
-            "main": "any pot ready (correct recipe) OR any agent carries soup",
-            "relaxed": "main OR any pot cooking (prereg §3 amendment 2026-07-07)",
+            "main": "(any pot ready OR cooking) AND neither agent carries soup",
+            "strict": "any pot ready AND neither agent carries soup",
         },
     }
     if oracle_source_count != 0:
@@ -461,7 +500,7 @@ def run(args: argparse.Namespace) -> None:
     if args.golden:
         out.with_suffix(".golden.txt").write_text("\n".join(golden_lines))
     print(json.dumps({k: meta[k] for k in (
-        "partner", "ego", "n_records", "n_gate_main", "n_gate_relaxed",
+        "partner", "ego", "n_records", "n_gate_main", "n_gate_strict",
         "class_counts_k5_gate_main", "ambiguous_delivery_steps",
         "oracle_source_count")}, indent=1), flush=True)
 
