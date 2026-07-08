@@ -8,6 +8,11 @@ import numpy as np
 from jaxmarl.environments.overcooked_v2.common import Actions
 from src.aris_bellman.specs import OptionSpec, PartnerAction
 
+from .partner_modes import (
+    LatentModeController,
+    LatentModeSpec,
+    LatentPartnerSpec,
+)
 from .option_termination import OptionRuntime, cross_bottleneck_terminated
 from .state_utils import (
     get_agent_pos,
@@ -255,12 +260,214 @@ BLIND_V1_PROTOCOLS: tuple[tuple[str, ProtocolSpec], ...] = (
     ),
 )
 
-PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec], ...]] = {
+
+def _latent(
+    geometry_profile: str,
+    base_protocol: ProtocolSpec,
+    family: str,
+    param: int | None = None,
+    *,
+    curriculum_group: str,
+    epsilon: float = 0.10,
+) -> LatentPartnerSpec:
+    return LatentPartnerSpec(
+        geometry_profile=geometry_profile,
+        base_protocol=base_protocol,
+        mode=LatentModeSpec(family=family, param=param, epsilon=epsilon),
+        curriculum_group=curriculum_group,
+    )
+
+
+LATENT_V3_DEV_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = (
+    (
+        "latent-ingnear-patience2",
+        _latent(
+            "ingredient_near",
+            ProtocolSpec(role="ingredient_person", pot_preference="near"),
+            "patience",
+            2,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-ingnear-escalate2",
+        _latent(
+            "ingredient_near",
+            ProtocolSpec(role="ingredient_person", pot_preference="near"),
+            "escalate_after_defer",
+            2,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-ingfar-patience4",
+        _latent(
+            "ingredient_far",
+            ProtocolSpec(role="ingredient_person", pot_preference="far"),
+            "patience",
+            4,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-ingfar-titfortat1",
+        _latent(
+            "ingredient_far",
+            ProtocolSpec(role="ingredient_person", pot_preference="far"),
+            "tit_for_tat",
+            1,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-prepnear-block12",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
+            "block_switch",
+            12,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-prepnear-static-yield",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
+            "static_yield",
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-prepfar-block18",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="far", bottleneck_policy="yield"),
+            "block_switch",
+            18,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-prepfar-static-claim",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="far", bottleneck_policy="yield"),
+            "static_claim",
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-bneck-titfortat2",
+        _latent(
+            "bottleneck_zone",
+            ProtocolSpec(role="flexible", bottleneck_policy="alternate"),
+            "tit_for_tat",
+            2,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-bneck-escalate3",
+        _latent(
+            "bottleneck_zone",
+            ProtocolSpec(role="flexible", bottleneck_policy="alternate"),
+            "escalate_after_defer",
+            3,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-flex-patience6",
+        _latent(
+            "flexible",
+            ProtocolSpec(role="flexible", bottleneck_policy="yield", counter_preference="handoff"),
+            "patience",
+            6,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "latent-flex-block25",
+        _latent(
+            "flexible",
+            ProtocolSpec(role="flexible", bottleneck_policy="yield", counter_preference="handoff"),
+            "block_switch",
+            25,
+            curriculum_group="latent_v3_train",
+        ),
+    ),
+    (
+        "blind-cert-ingnear-titfortat3",
+        _latent(
+            "ingredient_near",
+            ProtocolSpec(role="ingredient_person", pot_preference="near"),
+            "tit_for_tat",
+            3,
+            curriculum_group="latent_v3_cert",
+        ),
+    ),
+    (
+        "blind-cert-ingfar-escalate2",
+        _latent(
+            "ingredient_far",
+            ProtocolSpec(role="ingredient_person", pot_preference="far"),
+            "escalate_after_defer",
+            2,
+            curriculum_group="latent_v3_cert",
+        ),
+    ),
+    (
+        "blind-cert-prepnear-patience5",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
+            "patience",
+            5,
+            curriculum_group="latent_v3_cert",
+        ),
+    ),
+    (
+        "blind-cert-prepfar-block20",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="far", bottleneck_policy="yield"),
+            "block_switch",
+            20,
+            curriculum_group="latent_v3_cert",
+        ),
+    ),
+    (
+        "blind-cert-bneck-patience3",
+        _latent(
+            "bottleneck_zone",
+            ProtocolSpec(role="flexible", bottleneck_policy="alternate"),
+            "patience",
+            3,
+            curriculum_group="latent_v3_cert",
+        ),
+    ),
+    (
+        "blind-cert-flex-block16",
+        _latent(
+            "flexible",
+            ProtocolSpec(role="flexible", bottleneck_policy="yield", counter_preference="handoff"),
+            "block_switch",
+            16,
+            curriculum_group="latent_v3_cert",
+        ),
+    ),
+)
+
+
+PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec | LatentPartnerSpec], ...]] = {
     "standard7": STANDARD7_PROTOCOLS,
     "role_conditioned_v1": ROLE_CONDITIONED_V1_PROTOCOLS,
     "role_conditioned_v2": ROLE_CONDITIONED_V2_PROTOCOLS,
     # Eval-only blind set (sec18.14). Never a training partner_set.
     "blind_v1": BLIND_V1_PROTOCOLS,
+    # Link-A certificate substrate only. This is not Link-C's blind_v3.
+    "latent_v3_dev": LATENT_V3_DEV_PROTOCOLS,
 }
 
 
@@ -458,7 +665,7 @@ class ScriptedProtocolPartner:
 def make_training_partners(
     option_library: Any,
     partner_set: str = "standard7",
-) -> list[ScriptedProtocolPartner]:
+) -> list[PartnerPolicy]:
     try:
         protocols = PARTNER_REGISTRIES[str(partner_set)]
     except KeyError as exc:
@@ -466,15 +673,60 @@ def make_training_partners(
         raise ValueError(
             f"unknown partner_set {partner_set!r}; expected one of {choices}"
         ) from exc
-    return [
-        ScriptedProtocolPartner(
-            name=name,
-            option_library=option_library,
-            protocol=protocol,
-            partner_id=partner_id,
-        )
-        for partner_id, (name, protocol) in enumerate(protocols)
-    ]
+    partners: list[PartnerPolicy] = []
+    for partner_id, (name, protocol) in enumerate(protocols):
+        if isinstance(protocol, LatentPartnerSpec):
+            partners.append(
+                LatentModeController(
+                    name=name,
+                    option_library=option_library,
+                    spec=protocol,
+                    partner_cls=ScriptedProtocolPartner,
+                    partner_id=partner_id,
+                )
+            )
+        else:
+            partners.append(
+                ScriptedProtocolPartner(
+                    name=name,
+                    option_library=option_library,
+                    protocol=protocol,
+                    partner_id=partner_id,
+                )
+            )
+    return partners
+
+
+def sample_mode_spec(
+    rng: np.random.Generator,
+    family_quotas: dict[str, float] | None = None,
+) -> LatentModeSpec:
+    quotas = family_quotas or {
+        "static_claim": 1.0,
+        "static_yield": 1.0,
+        "patience": 1.0,
+        "block_switch": 1.0,
+        "tit_for_tat": 1.0,
+        "escalate_after_defer": 1.0,
+    }
+    families = [str(family) for family, weight in quotas.items() if float(weight) > 0.0]
+    if not families:
+        raise ValueError("family_quotas selected no positive-weight families")
+    weights = np.asarray([float(quotas[family]) for family in families], dtype=float)
+    weights = weights / weights.sum()
+    family = str(rng.choice(families, p=weights))
+    epsilon = float(rng.uniform(0.05, 0.15))
+    if family in {"static_claim", "static_yield"}:
+        return LatentModeSpec(family=family, epsilon=epsilon)
+    if family == "patience":
+        return LatentModeSpec(family=family, param=int(rng.integers(2, 7)), epsilon=epsilon)
+    if family == "block_switch":
+        return LatentModeSpec(family=family, param=int(rng.integers(12, 26)), epsilon=epsilon)
+    if family == "tit_for_tat":
+        return LatentModeSpec(family=family, param=int(rng.integers(1, 4)), epsilon=epsilon)
+    if family == "escalate_after_defer":
+        return LatentModeSpec(family=family, param=int(rng.choice([2, 3])), epsilon=epsilon)
+    raise ValueError(f"unknown latent mode family {family!r}")
 
 
 

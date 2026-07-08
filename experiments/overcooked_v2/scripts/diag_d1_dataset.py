@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import json
 import sys
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,11 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from experiments.overcooked_v2 import evaluate_aris as E  # noqa: E402
 from experiments.overcooked_v2.option_executor import option_primitive_step  # noqa: E402
+from experiments.overcooked_v2.partner_modes import (  # noqa: E402
+    ID_TO_FAMILY,
+    ID_TO_POLICY,
+    ID_TO_TRIGGER,
+)
 from experiments.overcooked_v2.partner_pool import make_training_partners  # noqa: E402
 from experiments.overcooked_v2.state_utils import (  # noqa: E402
     get_cell_extra,
@@ -83,6 +89,34 @@ def _kind_vocab(option_lib) -> list[str]:
 
 def _carries_soup(inv: int) -> bool:
     return is_cooked(inv) and has_plate(inv)
+
+
+def _mode_diag(partner) -> dict[str, int]:
+    fn = getattr(partner, "diagnostic_mode_state", None)
+    if not callable(fn):
+        return {
+            "mode_policy_id": -1,
+            "mode_family_id": -1,
+            "mode_param": -1,
+            "mode_age": -1,
+            "mode_opportunity_count": -1,
+            "mode_last_trigger_id": -1,
+        }
+    diag = fn()
+    return {
+        "mode_policy_id": int(diag.get("mode_policy_id", -1)),
+        "mode_family_id": int(diag.get("mode_family_id", -1)),
+        "mode_param": int(diag.get("mode_param", -1)),
+        "mode_age": int(diag.get("mode_age", -1)),
+        "mode_opportunity_count": int(diag.get("mode_opportunity_count", -1)),
+        "mode_last_trigger_id": int(diag.get("mode_last_trigger_id", -1)),
+    }
+
+
+def _jsonable_dataclass(obj):
+    if is_dataclass(obj):
+        return asdict(obj)
+    return None
 
 
 def _pot_signals(state, pot_positions) -> tuple[int, int, float]:
@@ -198,6 +232,8 @@ def run(args: argparse.Namespace) -> None:
         "state_feat", "extra_feat", "hist_kind", "hist_dur", "hist_ago", "hist_len",
         "ego_opt_kind", "valid_kinds", "gate_main", "gate_strict",
         "episode_id", "dp_index", "dp_step",
+        "mode_policy_id", "mode_family_id", "mode_param", "mode_age",
+        "mode_opportunity_count", "mode_last_trigger_id",
     )}
     audit: dict[str, list] = {k: [] for k in (
         "ep", "code", "inv0b", "inv0a", "inv1b", "inv1a", "n_ready", "n_cooking")}
@@ -263,6 +299,10 @@ def run(args: argparse.Namespace) -> None:
                 valid_kind_hot[kind_to_id.get(
                     str(ctx.option_lib.options[int(vid)].kind), kind_to_id[UNK])] = 1
             hk, hd, ha, hl = tracker.snapshot(args.hist_window)
+            sync_public_state = getattr(partner, "sync_public_state", None)
+            if callable(sync_public_state):
+                sync_public_state(state)
+            md = _mode_diag(partner)
 
             option_id = E._select_option(
                 ctx, obs, state, evidence_buffer, graph, rng, random_policy,
@@ -291,6 +331,12 @@ def run(args: argparse.Namespace) -> None:
             rows["episode_id"].append(np.int32(episode_idx))
             rows["dp_index"].append(np.int16(option_count))
             rows["dp_step"].append(np.int32(primitive_steps))
+            rows["mode_policy_id"].append(np.int16(md["mode_policy_id"]))
+            rows["mode_family_id"].append(np.int16(md["mode_family_id"]))
+            rows["mode_param"].append(np.int16(md["mode_param"]))
+            rows["mode_age"].append(np.int16(md["mode_age"]))
+            rows["mode_opportunity_count"].append(np.int16(md["mode_opportunity_count"]))
+            rows["mode_last_trigger_id"].append(np.int16(md["mode_last_trigger_id"]))
             dp_first_step.append(primitive_steps)
 
             # ---- execute the option (mirrors _execute_eval_option semantics) ----
@@ -432,6 +478,12 @@ def run(args: argparse.Namespace) -> None:
                 golden_lines.append(
                     f"dp{i:03d} step[{s}:{e}) gate_main={rows['gate_main'][ep_row_start + i]} "
                     f"gate_strict={rows['gate_strict'][ep_row_start + i]} "
+                    f"mode_policy={int(rows['mode_policy_id'][ep_row_start + i])} "
+                    f"mode_family={int(rows['mode_family_id'][ep_row_start + i])} "
+                    f"mode_param={int(rows['mode_param'][ep_row_start + i])} "
+                    f"mode_age={int(rows['mode_age'][ep_row_start + i])} "
+                    f"mode_opp={int(rows['mode_opportunity_count'][ep_row_start + i])} "
+                    f"mode_trigger={int(rows['mode_last_trigger_id'][ep_row_start + i])} "
                     f"ego_opt={vocab[int(rows['ego_opt_kind'][ep_row_start + i])]} "
                     f"deliv_in_opt={deliv[s:e].tolist()} "
                     f"label_k5={int(label_cols['label_k5'][ep_row_start + i])} "
@@ -487,6 +539,10 @@ def run(args: argparse.Namespace) -> None:
             "main": "(any pot ready OR cooking) AND neither agent carries soup",
             "strict": "any pot ready AND neither agent carries soup",
         },
+        "mode_policy_vocab": [ID_TO_POLICY[i] for i in sorted(ID_TO_POLICY)],
+        "mode_family_vocab": [ID_TO_FAMILY[i] for i in sorted(ID_TO_FAMILY)],
+        "mode_trigger_vocab": [ID_TO_TRIGGER[i] for i in sorted(ID_TO_TRIGGER)],
+        "latent_partner_spec": _jsonable_dataclass(getattr(partner, "spec", None)),
     }
     if oracle_source_count != 0:
         raise RuntimeError(
@@ -511,7 +567,7 @@ def main() -> None:
                     help="checkpoint providing env/option_lib/graph; also the argmax ego")
     ap.add_argument("--partner", required=True)
     ap.add_argument("--partner_set", default="role_conditioned_v2",
-                    choices=("role_conditioned_v2", "blind_v1"))
+                    choices=("role_conditioned_v2", "blind_v1", "latent_v3_dev"))
     ap.add_argument("--ego", required=True, choices=("argmax", "fullchain", "random"))
     ap.add_argument("--episodes", type=int, required=True)
     ap.add_argument("--seed", type=int, required=True)

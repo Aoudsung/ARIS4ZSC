@@ -1,6 +1,6 @@
 # THREE_LINKS_IMPLEMENTATION_PLAN — Instantiating, Pressuring, and Fairly Testing Emergent Zero-Shot Coordination
 
-**Date:** 2026-07-07 · **Status:** design plan, awaiting user sign (Sign-A1)
+**Date:** 2026-07-07 · **Status:** design plan, execution protocol clarified, awaiting user sign (Sign-A1)
 **Upstream evidence:** D1/D1-rev cross-instrument adjudication (commits `619a224`, `da32140`,
 `87b3d0b`; METHOD_LOCK sec18.14.3 blind-round sign-③). The current substrate's terminal-axis
 partner response is a near-deterministic function of instantaneous public state and this
@@ -200,7 +200,121 @@ amendment prereg. Nothing beyond this sentence is pre-planned.
 
 ---
 
-## 4. Phases, sign points, cost
+## 4. Execution protocol — what each link actually does
+
+This section is the agent-facing execution contract. Treat Sections 1–3 as the design
+specification and this section as the operational order. Each change set belongs to one
+link only; do not mix Link-A substrate work, Link-B distribution/seal work, and Link-C
+experiment/readout work in the same diff.
+
+**Common rules.**
+
+- The active next step after Sign-A1 is **Link A/A2 only**.
+- Local-machine work is static maintenance unless the user explicitly relaxes the project
+  execution constraint. Runnable tests, dataset generation, training, evaluation, and probes
+  execute only under the remote contract in `CUSTOMER.md` after explicit authorization.
+- `METHOD_LOCK` and method-layer code stay unchanged. Any diff touching selection logic,
+  losses, factor-belief semantics, or factor-local Q is out of scope for this plan.
+- Every executable round records commit hash, command, seed set, artifact paths, and readback
+  counts. Scientific interpretation uses artifact readback, never config intent.
+- A failed upstream gate stops the chain. Link B does not start without the Link-A
+  certificate artifact; Link C does not start without the Link-B coverage artifact and
+  blind-set seal.
+
+### 4.1 Link A execution — instantiate and certify the phenomenon
+
+**Entry condition:** Sign-A1 recorded by the user. No experiment-status gate is assumed passed
+unless its artifact is inspected.
+
+**Execution order:**
+
+1. Implement the v3 partner substrate by composition: add `partner_modes.py`, add
+   `latent_v3_dev` and fixed certification specs in `partner_pool.py`, and add the parametric
+   `sample_mode_spec(...)` API needed later by Link B.
+2. Add static review material and runnable test artifacts: family trigger tables, dwell-timer
+   checks, reaction-latency checks, and one golden trace spec per disposition family. These
+   files are created before execution; they are not run locally under the current project
+   constraint.
+3. Extend the D1 certificate machinery only at the diagnostic layer: mode-label readout by
+   observation count, state-only mode classifier, and paired mode-informed vs mode-blind
+   scripted probes. The extension must not create an ego-side oracle input.
+4. Obtain code review on the Link-A diff before any certificate generation.
+5. When remote execution is explicitly authorized, run certificate rounds on `latent_v3_dev`.
+   Each round adjusts only the single parameter axis implicated by the failing band
+   (`epsilon`, dwell, geometry decorrelation, or reaction sharpness), then logs the full
+   before/after numbers.
+
+**Required output artifact:** `artifacts/latent_v3_phenomenon_certificate.{md,json}` with
+C-1..C-6 values, confidence intervals where applicable, oracle-source count, golden verdicts,
+commit hash, commands, seeds, and the final frozen [F@A3] parameter values.
+
+**Exit condition:** all C-1..C-6 certificate bands pass on the inspected artifact. Only then
+may Link B begin.
+
+### 4.2 Link B execution — make training exercise the phenomenon
+
+**Entry condition:** the Link-A certificate artifact exists and passes C-1..C-6.
+
+**Execution order:**
+
+1. Implement `SamplerTrain` so every episode samples geometry, disposition, dynamics, and
+   noise independently, with no persistent individual identity.
+2. Freeze Link-B family quotas and minimum opportunity-count cells at Sign-B1 before any
+   training data is used for model fitting.
+3. Update CE/data plumbing to consume `SamplerTrain` and report coverage by disposition
+   family and factor, not by named individual.
+4. Define `dev-heldout` as declared held-out parameter regions and use it only for calibration.
+5. Author `blind_v3` mechanism classes only after the training manifold is frozen. Seal the
+   blind specs and relevant code hashes together before any model contact.
+6. Implement `aggregate_emerge.py` once for opportunity-normalized metrics and reuse it for
+   both dev-heldout and blind readouts.
+7. When remote execution is explicitly authorized, generate the audited training/CE artifacts
+   and read back actual episodes, transitions, opportunity cells, and family shares.
+
+**Required output artifacts:** `artifacts/latent_v3_training_coverage.{md,json}` and
+`artifacts/blind_v3_seal.md`. The coverage artifact records effective data budget from
+artifacts, per-family/per-factor opportunity counts, quota compliance, CE-support audit
+status, and the commit hash. The seal records blind mechanism classes, spec hashes, code
+hashes, creation time, and a zero-contact declaration.
+
+**Exit condition:** coverage green, effective budget recorded from artifacts, and `blind_v3`
+sealed with zero model contact. Only then may Link C begin.
+
+### 4.3 Link C execution — run the fair emergence test
+
+**Entry condition:** Link-B coverage is green and the `blind_v3` seal is recorded.
+
+**Execution order:**
+
+1. Run the ARIS-only sufficiency recalibration probe on the certified substrate after remote
+   execution is explicitly authorized. Read back actual episode counts, transitions, and
+   late-window validation behavior from artifacts.
+2. Freeze the full-run floor at the smallest recorded plateau point and write
+   `artifacts/latent_v3_sufficiency_floor.md`. If no plateau is recorded by 8000 episodes,
+   stop at substrate-difficulty adjudication instead of scaling silently.
+3. At Sign-C2, freeze the exact E-EMERGE numerics, seed list, primary/secondary/causal
+   metrics, and wording ladder before the blind single look.
+4. Run the preregistered arms unchanged: `aris_bellman`, `base_only`, `global_gru`,
+   `flat_factor`, plus `mode_oracle` as an upper-reference arm only. Use ITT accounting:
+   launched seeds remain in the readout.
+5. Evaluate dev-heldout for calibration and `blind_v3` once for the primary readout. Do not
+   tune from the blind result.
+6. Aggregate opportunity-normalized `Delta_norm`, switch-tracking latency, E2-zeroed collapse,
+   and belief-swap results; then route the readout through cross-model review and human
+   Type-B adjudication before any claim status changes.
+
+**Required output artifacts:** `artifacts/latent_v3_sufficiency_floor.md`,
+`artifacts/e_emerge_prereg.md`, `artifacts/e_emerge_readout.{md,json}`, and an
+`EXPERIMENT_LOG.md` entry if a real result is produced. The readout must include per-seed
+rows, bootstrap intervals, blind single-look declaration, zeroed/swap causal checks, and the
+review/adjudication status.
+
+**Exit condition:** E-EMERGE has a recorded Type-B adjudication: supported, partially
+supported under the preregistered wording ladder, or negative. A negative result on a
+certified substrate is evidence-bearing and is the only point at which a predictive-
+representation method amendment becomes eligible for a separate prereg.
+
+## 5. Phases, sign points, cost
 
 | Phase | Content | Gate | Est. wall time |
 |---|---|---|---|
@@ -217,7 +331,7 @@ Total ≈ 1 week wall clock including review cycles; compute well inside the pro
 
 ---
 
-## 5. Risks and kill-criteria
+## 6. Risks and kill-criteria
 
 | Risk | Mitigation / kill |
 |---|---|
@@ -233,7 +347,7 @@ Total ≈ 1 week wall clock including review cycles; compute well inside the pro
 
 ---
 
-## 6. Relation to existing locks and disciplines
+## 7. Relation to existing locks and disciplines
 
 - **METHOD_LOCK / G2:** unchanged. This plan is substrate/evaluation-layer only.
 - **G0.1 governance:** v3 inherits the "scripted = mechanism-diagnostic substrate" framing;

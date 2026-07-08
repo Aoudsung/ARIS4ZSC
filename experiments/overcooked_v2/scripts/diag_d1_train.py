@@ -47,6 +47,8 @@ HARD_FLOOR_SPLITS = ("indist_val", "blind_terminal")
 
 
 def family_of(partner: str) -> str:
+    if partner.startswith("latent-") or partner.startswith("blind-cert-"):
+        return "latent"
     if "claim" in partner:
         return "claim"
     if "yield" in partner:
