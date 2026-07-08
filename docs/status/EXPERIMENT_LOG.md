@@ -479,3 +479,25 @@
   3. harness 缺口: golden 场景未按族配 ego。
 - **正向信号照录**: C-2 较 v2 提升 9 倍且 CI 首次干净为正；C-3 首次为正；C-1 从 0.998 移动到 0.966——方向全对，量级不足。
 - 第 2 轮 delta（详 review_bundles/linka_cert_r1_20260707/PROTOCOL_NOTES.md）: ①表达通道移到"共同前置、最后一刻分化"的离散行为（handoff 接受/拒绝、bottleneck 让行/抢行、末步转向）；②放弃规则识别野心（族/参数降为永久共报）；③golden 按族配 ego；④**C-5 聚合修正为"对最优单一盲策略（含 reactive 臂）的池化提升"——属 [F@A3] 条带定义变更，待用户签**；⑤C-1/C-3 条带不预调。
+
+### 2026-07-09 Link-A 证书第 2 轮：FAIL（6/6）——干净的基底级负结果；去电报化后倾向仍状态可读，反应式够用、预判无价值（结构性，非参数性）；codex 签 C CONFIRM-WITH-CAVEATS（用户"继续推进"授权，签 C 直通）
+
+- 代码: `5f9ce3a`（去电报化选项选择恒抢活形 + 让位仅末刻中止 + reactive 池化 VOI + prepchain ego）+ `025b1ee`（GPU 续跑脚本）· 远端 `results_linka_v3r2/` · 证书 `artifacts/latent_v3_r2_certificate.{json,md}` · 归档 `review_bundles/linka_cert_r2_20260709/`
+- 执行事故（不影响科学）: SSH 隔夜两断（编排器被 init 收养仍跑，chunks 72/72 + 门 PASS 无损）；**CPU tune 11h 才 8/21**（数据 8 万点、大 4-5×）→ 切 GPU4（0 ECC、setsid 脱离控制连接）**21 模型 ~18min**；3-seed 集成吸收设备浮点差异
+- 完整性: oracle_source_count=0（72/72）· 门一轮 PASS（indist_val 79547 / blind_terminal 99294）· 机制 golden 核验（非控制器 bug）
+- **证书判定表**:
+  | 带 | 值 | 门 | r1 |
+  |---|---|---|---|
+  | C-1 不饱和 | NOHIST 盲 AUC **0.9475** | ≤0.80 | 0.966 |
+  | C-2 历史信号 | +0.0199（CI lo +0.018） | ≥0.10 | 0.0115 |
+  | C-3 身份超状态 | +0.0141 | ≥0.05 | 0.0158 |
+  | C-4 可识别性 | history 0.905✓ / **state-only 0.857✗** | ≥0.75/≤0.60 | 0.849 |
+  | C-5 信息价值 | 池化 oracle 175.5 vs **reactive 169.8 = +3.3%** | ≥0.15 | (口径错) |
+  | C-6 接线 | oracle=0✓ / golden 5/6 | 全过 | 5/6 |
+  C-5 各臂: oracle 175.5 / full 160.2 / prep 72.4 / **reactive 169.8**；最强盲 = reactive
+- **机制 golden 核验**: static-yield×抢活ego partner_first=0/60（yield_abort 触发、ego 接手）；static-claim×让位ego partner_first=20（抢活透传）——机制正常。**escalate_after_defer 真 bug**：双方都让→汤摆着没人拿→机会门永不关→升级计数（只在关闭时累加）永不触发。**此 bug 恰点破核心：机会持久不关 = 反应式够用的根因。**
+- **核心裁决（基底级、由正常工作族驱动）**: 即便选项**选择**去电报化、让位只以末刻中止表达，潜倾向**仍可从瞬时公共状态读出**（state-only 0.857，几乎未动）——因让位**表达**（接近-绕开）本身即位置签名。故反应式"等着看伙伴转不转"的 ego 捕获 oracle 约 97% 价值（+3.3%），**预判信念在本基底无价值**。
+- **结构性非参数性**: 非调 ε/dwell/wait 可修。预判仅在"反应太迟或太贵"时胜出；当前终端交接机会持久、观察无代价 → 反应恒够用。**追溯统一整条弧**（D1 饱和、盲轮全不适配、latent_v3 两轮）：基底从未对等待-反应施加代价。
+- **Type-B（签 C，用户预授权直通）· codex CONFIRM-WITH-CAVEATS**: (A) 去掉 reactive 臂 oracle vs full 仍仅 +9.6%<15%，fail 稳健；(B) C-4 state-only 参数性（换非位置表达可修）但修不了基底——藏到末刻+机会不关只帮反应臂，C-5 失败结构性；(C) escalate 修了救不回（需该族 oracle 172→224+，超量纲）；(E) "一修就过"DISPUTE（五带独立差太远）。措辞收窄为"本终端交接基底缺等待的不可逆代价"，非全 Overcooked 定理
+- **方向建议（Type-B，用户裁量；超出分支表）**: 第 3 轮加**预判强制结构=等待的真实代价**——(a) 易腐汤/机会 N 步关闭；(b) 承诺代价（备餐须先于揭示、被抢则废）；(c) **同时多锅分工+可达/时间约束**使反应式无法两头兼顾（最干净，让反应不足可证）。北极星判据：reactive 臂须证明性够不着 oracle
+- 存活资产: D1/Link-A 仪器（含 reactive 池化 C-5）经两轮验证 = 现象存在性证书；去电报化控制器 + GPU 基建可复用；escalate bug 随第 3 轮基底重设计一并修

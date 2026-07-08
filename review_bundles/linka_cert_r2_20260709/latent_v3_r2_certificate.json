@@ -1,0 +1,86 @@
+{
+ "certificate": "latent_v3 Phenomenon-Existence Certificate",
+ "status": "FAIL",
+ "commit": "5f9ce3a-r2gpu",
+ "artifacts": {
+  "d1_readout": "results_linka_v3r2/d1/readout_frozen.json",
+  "d1_tune": "results_linka_v3r2/d1/tune_report.json",
+  "mode_cert": "results_linka_v3r2/mode_cert.json",
+  "voi": "results_linka_v3r2/voi.json",
+  "chunks": "results_linka_v3r2/chunks",
+  "golden_review": "results_linka_v3r2/golden_review.json"
+ },
+ "commands": [
+  "EPS_SCALE=2 bash experiments/overcooked_v2/scripts/diag_link_a_generate_all.sh <anchor_ckpt> <chunks_dir> <jobs>",
+  "python experiments/overcooked_v2/scripts/diag_d1_train.py --chunks <chunks_dir> --out <d1_out> --stage gate",
+  "python experiments/overcooked_v2/scripts/diag_d1_train.py --chunks <chunks_dir> --out <d1_out> --stage tune",
+  "python experiments/overcooked_v2/scripts/diag_d1_train.py --chunks <chunks_dir> --out <d1_out> --stage readout",
+  "python experiments/overcooked_v2/scripts/diag_link_a_mode_cert.py --chunks <chunks_dir> --out <mode_cert>",
+  "python experiments/overcooked_v2/scripts/latent_v3_voi_probe.py --checkpoint <anchor_ckpt> --out <voi>"
+ ],
+ "criteria": {
+  "C-1": {
+   "name": "unsaturation",
+   "value": 0.9475354486758836,
+   "threshold": "NOHIST blind AUC <= 0.80",
+   "pass": false
+  },
+  "C-2": {
+   "name": "signal exists and needs history",
+   "gain": 0.01988107276047435,
+   "gain_ci_lo": 0.017963098971542246,
+   "threshold": "G_blind >= 0.10 and gain_ci.lo > 0",
+   "pass": false
+  },
+  "C-3": {
+   "name": "identity beyond state",
+   "value": 0.01412747834767114,
+   "threshold": "IDORACLE - NOHIST indist >= 0.05",
+   "pass": false
+  },
+  "C-4": {
+   "name": "identifiability",
+   "history_full_balanced_acc": 0.9051746682561481,
+   "state_only_balanced_acc": 0.8569816932600554,
+   "threshold": "history_full >= 0.75 and state_only <= 0.60",
+   "pass": false
+  },
+  "C-5": {
+   "name": "value of information",
+   "value": 0.0332141674006594,
+   "threshold": "pooled mode_oracle relative lift >= 0.15 vs best single blind ego (fullchain/prepchain/reactive)",
+   "pass": false
+  },
+  "C-6": {
+   "name": "wiring",
+   "summary": {
+    "n_chunks": 72,
+    "n_golden_files": 72,
+    "evidence_policies": [
+     "behavior_inferred_v1"
+    ],
+    "oracle_source_count": 0,
+    "families": [
+     "block_switch",
+     "escalate_after_defer",
+     "patience",
+     "static_claim",
+     "static_yield",
+     "tit_for_tat"
+    ],
+    "golden_review_path": "results_linka_v3r2/golden_review.json",
+    "golden_reviewed_pass_families": [
+     "block_switch",
+     "patience",
+     "static_claim",
+     "static_yield",
+     "tit_for_tat"
+    ],
+    "golden_review_pass": false,
+    "PASS": false
+   },
+   "threshold": "oracle_source_count=0, evidence_policy=behavior_inferred_v1, golden PASS per family",
+   "pass": false
+  }
+ }
+}

@@ -1,0 +1,290 @@
+{
+ "floors": {
+  "gated_rows": 5000,
+  "min_class": 500,
+  "hard_floor_splits": [
+   "indist_val",
+   "blind_terminal"
+  ]
+ },
+ "splits": {
+  "indist_val": {
+   "n_gate_main": 79547,
+   "class_counts": {
+    "no_initiation": 45132,
+    "ego_first": 22598,
+    "partner_first": 11817
+   },
+   "floor_rows_pass": true,
+   "floor_class_pass": true,
+   "hard_floor": true,
+   "co_report_only": false
+  },
+  "blind_terminal": {
+   "n_gate_main": 99294,
+   "class_counts": {
+    "no_initiation": 55984,
+    "ego_first": 28651,
+    "partner_first": 14659
+   },
+   "floor_rows_pass": true,
+   "floor_class_pass": true,
+   "hard_floor": true,
+   "co_report_only": false
+  },
+  "indist_train": {
+   "n_gate_main": 316020,
+   "class_counts": {
+    "no_initiation": 179026,
+    "ego_first": 89802,
+    "partner_first": 47192
+   },
+   "floor_rows_pass": true,
+   "floor_class_pass": true,
+   "hard_floor": false,
+   "co_report_only": true
+  },
+  "dev": {
+   "n_gate_main": 0,
+   "class_counts": {
+    "no_initiation": 0,
+    "ego_first": 0,
+    "partner_first": 0
+   },
+   "floor_rows_pass": false,
+   "floor_class_pass": false,
+   "hard_floor": false,
+   "co_report_only": true
+  },
+  "blind_offaxis": {
+   "n_gate_main": 0,
+   "class_counts": {
+    "no_initiation": 0,
+    "ego_first": 0,
+    "partner_first": 0
+   },
+   "floor_rows_pass": false,
+   "floor_class_pass": false,
+   "hard_floor": false,
+   "co_report_only": true
+  }
+ },
+ "per_partner": {
+  "blind-cert-bneck-patience3": {
+   "n_gate_main": 17128,
+   "episodes": 400,
+   "class_counts": {
+    "no_initiation": 11786,
+    "ego_first": 4751,
+    "partner_first": 591
+   }
+  },
+  "blind-cert-flex-block16": {
+   "n_gate_main": 15927,
+   "episodes": 400,
+   "class_counts": {
+    "no_initiation": 8090,
+    "ego_first": 4115,
+    "partner_first": 3722
+   }
+  },
+  "blind-cert-ingfar-escalate2": {
+   "n_gate_main": 18312,
+   "episodes": 400,
+   "class_counts": {
+    "no_initiation": 12610,
+    "ego_first": 5702,
+    "partner_first": 0
+   }
+  },
+  "blind-cert-ingnear-titfortat3": {
+   "n_gate_main": 15018,
+   "episodes": 400,
+   "class_counts": {
+    "no_initiation": 4252,
+    "ego_first": 4480,
+    "partner_first": 6286
+   }
+  },
+  "blind-cert-prepfar-block20": {
+   "n_gate_main": 14379,
+   "episodes": 400,
+   "class_counts": {
+    "no_initiation": 6590,
+    "ego_first": 3881,
+    "partner_first": 3908
+   }
+  },
+  "blind-cert-prepnear-patience5": {
+   "n_gate_main": 18530,
+   "episodes": 400,
+   "class_counts": {
+    "no_initiation": 12656,
+    "ego_first": 5722,
+    "partner_first": 152
+   }
+  },
+  "latent-bneck-escalate3": {
+   "n_gate_main": 35018,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 23540,
+    "ego_first": 11478,
+    "partner_first": 0
+   }
+  },
+  "latent-bneck-titfortat2": {
+   "n_gate_main": 28255,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 7997,
+    "ego_first": 8987,
+    "partner_first": 11271
+   }
+  },
+  "latent-flex-block25": {
+   "n_gate_main": 32550,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 17019,
+    "ego_first": 8109,
+    "partner_first": 7422
+   }
+  },
+  "latent-flex-patience6": {
+   "n_gate_main": 37206,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 25539,
+    "ego_first": 11602,
+    "partner_first": 65
+   }
+  },
+  "latent-ingfar-patience4": {
+   "n_gate_main": 35735,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 24872,
+    "ego_first": 10140,
+    "partner_first": 723
+   }
+  },
+  "latent-ingfar-titfortat1": {
+   "n_gate_main": 28498,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 9795,
+    "ego_first": 7358,
+    "partner_first": 11345
+   }
+  },
+  "latent-ingnear-escalate2": {
+   "n_gate_main": 37319,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 25498,
+    "ego_first": 11821,
+    "partner_first": 0
+   }
+  },
+  "latent-ingnear-patience2": {
+   "n_gate_main": 35260,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 24734,
+    "ego_first": 8291,
+    "partner_first": 2235
+   }
+  },
+  "latent-prepfar-block18": {
+   "n_gate_main": 29187,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 13633,
+    "ego_first": 7958,
+    "partner_first": 7596
+   }
+  },
+  "latent-prepfar-static-claim": {
+   "n_gate_main": 26925,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 9485,
+    "ego_first": 6250,
+    "partner_first": 11190
+   }
+  },
+  "latent-prepnear-block12": {
+   "n_gate_main": 32293,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 16263,
+    "ego_first": 8868,
+    "partner_first": 7162
+   }
+  },
+  "latent-prepnear-static-yield": {
+   "n_gate_main": 37321,
+   "episodes": 800,
+   "class_counts": {
+    "no_initiation": 25783,
+    "ego_first": 11538,
+    "partner_first": 0
+   }
+  }
+ },
+ "ambig_drop_rate": {
+  "k3": 0.0001587509364912701,
+  "k5": 0.00021166791532169346,
+  "k8": 0.000286865727343874
+ },
+ "censoring_rate_k5": 0.060145716649074095,
+ "history_channel_cross_partner_tv": {
+  "min": 0.004020634070403498,
+  "max": 0.4093600621781549,
+  "mean": 0.22649108667286544
+ },
+ "kind_collapsed_pairs": [
+  {
+   "pair": [
+    "latent-flex-patience6",
+    "latent-ingnear-escalate2"
+   ],
+   "tv": 0.007727980133996769
+  },
+  {
+   "pair": [
+    "latent-flex-patience6",
+    "latent-prepnear-static-yield"
+   ],
+   "tv": 0.004020634070403498
+  },
+  {
+   "pair": [
+    "latent-ingnear-escalate2",
+    "latent-prepnear-static-yield"
+   ],
+   "tv": 0.004154387109343323
+  }
+ ],
+ "per_partner_max_tv": {
+  "latent-bneck-escalate3": 0.3600611725001,
+  "latent-bneck-titfortat2": 0.3153037466793387,
+  "latent-flex-block25": 0.34135426207173974,
+  "latent-flex-patience6": 0.40468309071627834,
+  "latent-ingfar-patience4": 0.3554254248048161,
+  "latent-ingfar-titfortat1": 0.4093600621781549,
+  "latent-ingnear-escalate2": 0.4093600621781549,
+  "latent-ingnear-patience2": 0.3048316193066107,
+  "latent-prepfar-block18": 0.3481917145076938,
+  "latent-prepfar-static-claim": 0.39643674306401294,
+  "latent-prepnear-block12": 0.30807550791731353,
+  "latent-prepnear-static-yield": 0.4076163086421241
+ },
+ "history_channel_varies": true,
+ "PASS": true,
+ "soft_floor_failures": [
+  "dev",
+  "blind_offaxis"
+ ]
+}
