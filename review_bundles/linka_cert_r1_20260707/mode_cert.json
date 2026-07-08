@@ -1,0 +1,173 @@
+{
+ "diag": "Link-A C-4 mode identifiability",
+ "judged_target": "mode_policy_id (yield=0, claim=1)",
+ "max_observations": 8,
+ "row_counts": {
+  "train": 186070,
+  "val": 46860,
+  "blind": 54781
+ },
+ "class_counts": {
+  "train_policy": {
+   "0": 132201,
+   "1": 53869
+  },
+  "blind_policy": {
+   "0": 42845,
+   "1": 11936
+  },
+  "blind_family": {
+   "2": 14069,
+   "3": 16995,
+   "4": 10342,
+   "5": 13375
+  },
+  "blind_param": {
+   "2": 13375,
+   "3": 17478,
+   "5": 6933,
+   "16": 9362,
+   "20": 7633
+  }
+ },
+ "variants": {
+  "history_full": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "val_loss": 0.09157083183526993,
+     "blind_balanced_acc": 0.8958628654570984,
+     "blind_accuracy": 0.9371314871944653
+    },
+    {
+     "seed": 1,
+     "val_loss": 0.08521602302789688,
+     "blind_balanced_acc": 0.8710007150596154,
+     "blind_accuracy": 0.9243350796809112
+    },
+    {
+     "seed": 2,
+     "val_loss": 0.09114375710487366,
+     "blind_balanced_acc": 0.8982805571442293,
+     "blind_accuracy": 0.9389751921286578
+    }
+   ],
+   "blind_balanced_acc_mean": 0.8883813792203142,
+   "blind_balanced_acc_median": 0.8958628654570984
+  },
+  "state_only": {
+   "per_seed": [
+    {
+     "seed": 0,
+     "val_loss": 0.17148050665855408,
+     "blind_balanced_acc": 0.8486129587699536,
+     "blind_accuracy": 0.9101148208320403
+    },
+    {
+     "seed": 1,
+     "val_loss": 0.17241397500038147,
+     "blind_balanced_acc": 0.8257789472432739,
+     "blind_accuracy": 0.8995454628429564
+    },
+    {
+     "seed": 2,
+     "val_loss": 0.1710868924856186,
+     "blind_balanced_acc": 0.849631555012973,
+     "blind_accuracy": 0.9120863072963253
+    }
+   ],
+   "blind_balanced_acc_mean": 0.8413411536754002,
+   "blind_balanced_acc_median": 0.8486129587699536
+  }
+ },
+ "thresholds": {
+  "history_full_balanced_acc_min": 0.75,
+  "state_only_balanced_acc_max": 0.6
+ },
+ "criteria": {
+  "history_full_pass": true,
+  "state_only_hidden_pass": false,
+  "PASS": false
+ },
+ "co_report": {
+  "family_and_param_are_not_judged_targets": true,
+  "family_class_counts_blind": {
+   "2": 14069,
+   "3": 16995,
+   "4": 10342,
+   "5": 13375
+  },
+  "param_class_counts_blind": {
+   "2": 13375,
+   "3": 17478,
+   "5": 6933,
+   "16": 9362,
+   "20": 7633
+  },
+  "family_history_full": {
+   "status": "ok",
+   "target_col": "mode_family_id",
+   "class_counts_blind": {
+    "2": 14069,
+    "3": 16995,
+    "4": 10342,
+    "5": 13375
+   },
+   "per_seed": [
+    {
+     "seed": 0,
+     "val_loss": 0.4366559386253357,
+     "blind_balanced_acc": 0.3390097303412678,
+     "blind_accuracy": 0.37929209032328726
+    },
+    {
+     "seed": 1,
+     "val_loss": 0.4599010944366455,
+     "blind_balanced_acc": 0.3246130524409676,
+     "blind_accuracy": 0.3602161333308994
+    },
+    {
+     "seed": 2,
+     "val_loss": 0.4394710063934326,
+     "blind_balanced_acc": 0.32698460700042586,
+     "blind_accuracy": 0.36687902740001094
+    }
+   ],
+   "blind_balanced_acc_median": 0.32698460700042586,
+   "blind_accuracy_median": 0.36687902740001094
+  },
+  "param_history_full": {
+   "status": "ok",
+   "target_col": "mode_param",
+   "class_counts_blind": {
+    "2": 13375,
+    "3": 17478,
+    "5": 6933,
+    "16": 9362,
+    "20": 7633
+   },
+   "per_seed": [
+    {
+     "seed": 0,
+     "val_loss": 0.267963171005249,
+     "blind_balanced_acc": 0.08543729184780226,
+     "blind_accuracy": 0.13152370347383216
+    },
+    {
+     "seed": 1,
+     "val_loss": 0.27707046270370483,
+     "blind_balanced_acc": 0.08777840018907615,
+     "blind_accuracy": 0.13510158631642358
+    },
+    {
+     "seed": 2,
+     "val_loss": 0.28137320280075073,
+     "blind_balanced_acc": 0.08626355974346388,
+     "blind_accuracy": 0.1331666088607364
+    }
+   ],
+   "blind_balanced_acc_median": 0.08626355974346388,
+   "blind_accuracy_median": 0.1331666088607364
+  }
+ }
+}
