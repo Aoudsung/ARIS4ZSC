@@ -100,7 +100,7 @@ same gates/labels as D1-rev, EPS_SCALE=2). **Certificate bands (all must hold; [
 | C-2 signal exists & needs history | G_blind = FULL − NOHIST ≥ **0.10**, CI lower > 0 | "nothing to infer" |
 | C-3 identity beyond state | IDORACLE − NOHIST (in-dist) ≥ **0.05** | positional readability (A-R1 empirical) |
 | C-4 identifiability | history-based mode classifier balanced-acc ≥ **0.75** within ≤ 8 opportunity observations; state-only mode classifier ≤ **0.60** | "too hidden" (tightrope left edge) |
-| C-5 value of information | paired scripted probes (override-gate machinery): mode-informed best-response ego vs mode-blind ego team return ≥ **+15%** on mode-sensitive partners | "predictable but value-irrelevant" |
+| C-5 value of information | **[amended 2026-07-08, user-signed after cert r1]** POOLED mode_oracle return lift ≥ **+15%** over the best SINGLE mode-blind ego (fullchain / prepchain / **reactive wait-and-see**) across the certified set; per-partner min-vs-post-hoc-best-static demoted to co-report (≈0 by construction for 2-policy modes) | "predictable but value-irrelevant"; reactive arm is the north-star bar — anticipation must beat reaction |
 | C-6 wiring | oracle_source_count=0; evidence_policy=behavior_inferred_v1; golden PASS | leakage / label bugs |
 
 C-4/C-5 are small additions to `diag_d1_train.py` (a mode-label head evaluated at increasing

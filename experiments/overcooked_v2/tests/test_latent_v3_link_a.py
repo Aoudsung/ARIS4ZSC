@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
-from experiments.overcooked_v2.partner_modes import LatentModeRuntime, LatentModeSpec
+from experiments.overcooked_v2.partner_modes import (
+    LatentModeController,
+    LatentModeRuntime,
+    LatentModeSpec,
+    LatentPartnerSpec,
+    _OCActions,
+)
 from experiments.overcooked_v2.partner_pool import (
     LATENT_V3_DEV_PROTOCOLS,
     PARTNER_REGISTRIES,
     sample_mode_spec,
 )
+from src.aris_bellman.specs import PartnerAction
 
 
 def _finish_opportunity(runtime: LatentModeRuntime, *, ego: bool = False) -> None:
@@ -79,4 +88,80 @@ def test_sample_mode_spec_is_seeded_and_in_declared_ranges():
     assert spec.family == "block_switch"
     assert 12 <= int(spec.param) <= 25
     assert 0.05 <= float(spec.epsilon) <= 0.15
+
+
+# ---- round-2 expression channel: last-moment yield abort ----
+
+@dataclass
+class _Proto:
+    terminal_policy: str = "claim"
+
+
+class _Opt:
+    def __init__(self, kind: str):
+        self.kind = kind
+
+
+class _EmptyLayoutGraph:
+    entities: dict = {}
+
+
+class _StubLib:
+    def __init__(self):
+        self.options = [_Opt("serve_soup"), _Opt("fetch_ingredient")]
+        self.layout_graph = _EmptyLayoutGraph()
+
+    def valid_options(self, state, agent_id):  # no retreat available -> stay fallback
+        return np.zeros(len(self.options), dtype=bool)
+
+    def primitive_action(self, state, agent_id, option_id):
+        return 0
+
+
+class _StubInner:
+    def __init__(self, **kwargs):
+        self.current_option = 0
+        self.protocol = kwargs.get("protocol")
+
+    def reset(self, seed):
+        pass
+
+
+def _interact_action() -> PartnerAction:
+    return PartnerAction(
+        primitive_action=int(_OCActions.interact),
+        option_id=None,
+        option_confidence=0.0,
+        option_dist=None,
+        source="test",
+    )
+
+
+def test_yield_abort_replaces_terminal_interact_and_claim_passes_through():
+    lib = _StubLib()
+    spec = LatentPartnerSpec(
+        geometry_profile="stub",
+        base_protocol=_Proto(),
+        mode=LatentModeSpec("static_yield", epsilon=0.0),
+    )
+    ctrl = LatentModeController(
+        name="stub", option_library=lib, spec=spec,
+        partner_cls=_StubInner, partner_id=1,
+    )
+    ctrl.runtime.reset(0)
+    assert ctrl.runtime.policy == "yield"
+
+    ctrl._inner.current_option = 0  # serve_soup (terminal)
+    out = ctrl._maybe_yield_abort(_interact_action(), state=object())
+    assert int(out.primitive_action) == int(_OCActions.stay)
+    assert ctrl.runtime.last_trigger == "yield_abort"
+
+    ctrl.runtime.policy = "claim"  # claim mode converts: interact passes through
+    out2 = ctrl._maybe_yield_abort(_interact_action(), state=object())
+    assert int(out2.primitive_action) == int(_OCActions.interact)
+
+    ctrl.runtime.policy = "yield"  # non-terminal option: no interception
+    ctrl._inner.current_option = 1
+    out3 = ctrl._maybe_yield_abort(_interact_action(), state=object())
+    assert int(out3.primitive_action) == int(_OCActions.interact)
 

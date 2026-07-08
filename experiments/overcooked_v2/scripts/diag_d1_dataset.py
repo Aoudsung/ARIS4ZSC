@@ -26,6 +26,8 @@ only in argmax mode):
   argmax    : anchor checkpoint policy as-is (use a base_only ckpt per prereg)
   fullchain : scripted priority full task chain (probe_behavior semantics), noop tail
   random    : uniform over valid options
+  prepchain : full chain minus terminal kinds (deferring competent ego; Link-A r2 —
+              reaction-family defer triggers only appear under a deferring ego)
 """
 from __future__ import annotations
 
@@ -205,7 +207,16 @@ def run(args: argparse.Namespace) -> None:
     ctx = E._load_context(ckpt, "d1_anchor")
     ctx.qaudit = None
     ctx.scripted_fsm = None
-    ctx.scripted_priority = _full_priority(ctx.option_lib) if args.ego == "fullchain" else None
+    if args.ego == "fullchain":
+        ctx.scripted_priority = _full_priority(ctx.option_lib)
+    elif args.ego == "prepchain":
+        # deferring competent ego (Link-A r2): reaction-family triggers
+        # (escalate/tit-for-tat punish paths) only fire under ego deferrals
+        terminal = ("serve_soup", "plate_soup", "pick_plate")
+        ctx.scripted_priority = [
+            k for k in _full_priority(ctx.option_lib) if k not in terminal]
+    else:
+        ctx.scripted_priority = None
     random_policy = args.ego == "random"
 
     policy = E._evidence_policy_for_config(ctx.config)
@@ -568,7 +579,8 @@ def main() -> None:
     ap.add_argument("--partner", required=True)
     ap.add_argument("--partner_set", default="role_conditioned_v2",
                     choices=("role_conditioned_v2", "blind_v1", "latent_v3_dev"))
-    ap.add_argument("--ego", required=True, choices=("argmax", "fullchain", "random"))
+    ap.add_argument("--ego", required=True,
+                    choices=("argmax", "fullchain", "random", "prepchain"))
     ap.add_argument("--episodes", type=int, required=True)
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--max-episode-options", type=int, default=40)

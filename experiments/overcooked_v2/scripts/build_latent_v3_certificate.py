@@ -79,7 +79,12 @@ def run(args: argparse.Namespace) -> None:
     c3_value = float(indist["auc_ps_idoracle"]) - float(indist["auc_ps_nohist"])
     c4_full = float(mode_cert["variants"]["history_full"]["blind_balanced_acc_median"])
     c4_state = float(mode_cert["variants"]["state_only"]["blind_balanced_acc_median"])
-    c5_value = float(voi["criteria"]["min_relative_lift"])
+    # C-5 aggregation amended 2026-07-08 (user-signed, cert r1 overturn): the judged
+    # statistic is the POOLED lift of mode_oracle over the best SINGLE mode-blind
+    # ego (fullchain/prepchain/reactive) across the certified set. The per-partner
+    # min-vs-post-hoc-best-static is ~0 by construction for 2-policy modes and is
+    # retained only as a co-report (legacy_min_relative_lift).
+    c5_value = float(voi["criteria"]["pooled_relative_lift"])
 
     criteria = {
         "C-1": _criterion("unsaturation", c1_value, "NOHIST blind AUC <= 0.80", c1_value <= 0.80),
@@ -106,7 +111,8 @@ def run(args: argparse.Namespace) -> None:
         "C-5": _criterion(
             "value of information",
             c5_value,
-            "mode_oracle relative lift >= 0.15 vs best blind scripted ego",
+            "pooled mode_oracle relative lift >= 0.15 vs best single blind ego "
+            "(fullchain/prepchain/reactive)",
             bool(voi["criteria"]["PASS"]),
         ),
         "C-6": {

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import numpy as np
+from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
 from src.aris_bellman.specs import PartnerAction
 
 from .option_termination import OptionRuntime
@@ -38,8 +39,23 @@ TRIGGER_TO_ID = {
     "ego_claim": 5,
     "ego_defer": 6,
     "epsilon": 7,
+    "yield_abort": 8,
 }
 ID_TO_TRIGGER = {value: key for key, value in TRIGGER_TO_ID.items()}
+
+# Round-2 expression channel (cert r1: state-only BA 0.849 — trajectories telegraphed
+# the current policy). Option SELECTION is always claim-shaped; yield expresses only
+# as a last-moment abort of the terminal INTERACT, replaced by a retreat option that
+# vacates the stand cell. Disposition becomes an event stream, not a trajectory.
+TERMINAL_KINDS = ("serve_soup", "plate_soup", "pick_plate")
+RETREAT_KIND_ORDER = (
+    "clear_interaction_cell",
+    "wait_at_bottleneck",
+    "cross_bottleneck",
+    "wait_duration_after_arrival",
+    "wait_duration",
+    "drop_item_to_counter",
+)  # noop deliberately LAST-resort (codex r2): it camps the stand cell
 
 VALID_MODE_FAMILIES = frozenset(FAMILY_TO_ID)
 
@@ -254,16 +270,67 @@ class LatentModeController:
         self.sync_public_state(state)
         if self._will_choose_new_option(state):
             self.runtime.observe_option_boundary()
+            # Round-2 de-telegraphing: selection is ALWAYS claim-shaped so approach
+            # trajectories are mode-invariant; the latent policy expresses only via
+            # _maybe_yield_abort below (cert r1 C-1/C-4 anatomy).
             self._inner.protocol = replace(
                 self.spec.base_protocol,
-                terminal_policy=self.runtime.policy,
+                terminal_policy="claim",
             )
             if self._epsilon_force_option(state, rng):
                 self.runtime.last_trigger = "epsilon"
         action = self._inner.act(obs_partner, state, rng)
+        action = self._maybe_yield_abort(action, state)
         self._last_state = state
         self._last_gate_main = _gate_main(state, self._pot_positions)
         return action
+
+    def _maybe_yield_abort(self, action: PartnerAction, state: Any) -> PartnerAction:
+        """Last-moment yield expression: replace the terminal INTERACT with a
+        retreat option so the stand cell is vacated for the ego. Runs every step
+        while policy stays yield, so the partner orbits (approach, veer off,
+        re-approach) instead of converting."""
+        if self.runtime.policy != "yield":
+            return action
+        current = getattr(self._inner, "current_option", None)
+        if current is None:
+            return action
+        if str(self.option_library.options[int(current)].kind) not in TERMINAL_KINDS:
+            return action
+        if int(action.primitive_action) != int(_OCActions.interact):
+            return action
+        self.runtime.last_trigger = "yield_abort"
+        retreat = self._pick_retreat_option(state)
+        if retreat is None:
+            return replace(action, primitive_action=int(_OCActions.stay))
+        self._inner.current_option = int(retreat)
+        self._inner.option_runtime = OptionRuntime(
+            option_id=int(retreat),
+            start_pos=get_agent_pos(state, 1),
+        )
+        self._inner.elapsed = 0
+        new_primitive = int(self.option_library.primitive_action(state, 1, int(retreat)))
+        if hasattr(self._inner, "last_primitive_action"):
+            self._inner.last_primitive_action = new_primitive
+        return replace(action, primitive_action=new_primitive)
+
+    def _pick_retreat_option(self, state: Any) -> int | None:
+        valid = self.option_library.valid_options(state, agent_id=1)
+        valid_ids = np.flatnonzero(valid)
+        if valid_ids.size == 0:
+            return None
+        kinds = {int(i): str(self.option_library.options[int(i)].kind) for i in valid_ids}
+        for want in RETREAT_KIND_ORDER:
+            for vid in valid_ids:
+                if kinds[int(vid)] == want:
+                    return int(vid)
+        for vid in valid_ids:  # any mobile non-terminal before noop (vacate the cell)
+            if kinds[int(vid)] not in TERMINAL_KINDS and kinds[int(vid)] != "noop":
+                return int(vid)
+        for vid in valid_ids:  # noop only as the true last resort
+            if kinds[int(vid)] == "noop":
+                return int(vid)
+        return None
 
     def sync_public_state(self, state: Any) -> None:
         self._observe_public_state(state)

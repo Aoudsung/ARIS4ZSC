@@ -37,7 +37,9 @@ BLIND_CERT_PARTNERS=(
   blind-cert-flex-block16
 )
 
-EGOS=(argmax fullchain random)
+# prepchain added round 2: reaction-family triggers (escalate/tit-for-tat punish
+# paths) require a deferring ego to appear in the data + golden traces at all.
+EGOS=(argmax fullchain random prepchain)
 
 worklist=$(mktemp)
 i=0
