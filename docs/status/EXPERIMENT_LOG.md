@@ -1,9 +1,45 @@
 # EXPERIMENT_LOG.md — 正式实验结果记录（ARIS 惯例）
 
-**Created:** 2026-07-02（Phase 0 · G0.5）· **Status:** 骨架，无正式结果
-**规则**：只记录**执行门控下的正式运行**（preflight 接受 + 完整性硬门全 true + git commit 哈希 +
-远程产物路径）。诊断/冒烟跑不入此文件。每条结果的解读**必须引用** METHOD_LOCK sec18 预注册分支表，
-禁止事后重解释。NEW-4 隔离材料（CODEX_IMPL_SPEC v1–v4 数字）永不入此文件。
+**Created:** 2026-07-02（Phase 0 · G0.5）· **Status:** active historical
+record; latest recorded scientific state = Link-A round 2 failed on 2026-07-09,
+and the active project line is now Path C.
+**规则**：本文件记录执行门控下的正式运行、已经成为方向决策依据的诊断终读、以及基底证书终读。
+每条 claim 读数必须引用对应预注册或冻结判读规则，禁止事后重解释。NEW-4 隔离材料
+（CODEX_IMPL_SPEC v1–v4 数字）永不入此文件。
+
+## 当前状态快照 — 2026-07-09
+
+- **旧不对称布局 + role-conditioned v2 伙伴路线已关闭为正向论文路径。** 32 局训练量上的负面诊断已被
+  2000 局基底推翻，随后正式盲测又显示 dev-heldout 的伙伴条件化没有迁移到新盲测伙伴；
+  这些记录可作为受限负结论和方法转向依据，不能作为 ARIS-Bellman 正向主张证据。
+- **Link-A 基底证书第 2 轮失败。** 终端交接机会仍能从瞬时公共状态读出；等待观察后再反应
+  捕获了接近 oracle 的价值，预判式信念没有被迫产生额外价值。下一条基底线必须让等待或
+  反应付出真实代价。
+- **当前活跃线是 Path C。** Path C 指 active value probing for value-sufficient residual
+  partner abstractions，即用价值驱动探针恢复公共状态之外仍改变控制的最小伙伴抽象。Path C
+  目前只有静态方案、默认关闭代码脚手架和预注册草案；本文件尚无 Path C 运行结果。
+- **下一条可记录事件。** Path C 预注册冻结或 Phase A 静态核验完成；不得把任何小批量接线
+  检查读成科学结论。
+
+### 2026-07-09 CUDA/JAX 远程环境体检 — PASS（Type-A，非科学结果）
+- 范围: 只修复 `zsc-customer` 上项目运行环境对 JAX/CUDA 的选择；不改系统
+  `/usr/local/cuda`，不重装 JAX，不运行训练，不生成 Path C 科学读数。
+- 落地: 新增 `experiments/overcooked_v2/scripts/with_jax_cuda12.sh` 和
+  `experiments/overcooked_v2/scripts/check_jax_cuda.py`。包装脚本把虚拟环境里的 CUDA 12
+  `ptxas` 放到 `PATH` 最前面，设置
+  `XLA_FLAGS=--xla_gpu_cuda_data_dir=<venv>/site-packages/nvidia/cuda_nvcc`，并默认使用
+  `CUDA_VISIBLE_DEVICES=5`、`JAX_PLATFORMS=cuda`；GPU3 因 ECC 错误默认避开。
+- 体检命令:
+  `CUDA_VISIBLE_DEVICES=5 bash experiments/overcooked_v2/scripts/with_jax_cuda12.sh .venv/bin/python experiments/overcooked_v2/scripts/check_jax_cuda.py`
+- 体检结果: `jax=0.4.38`、`jaxlib=0.4.38`；
+  `ptxas=.venv_tgssa/lib/python3.10/site-packages/nvidia/cuda_nvcc/bin/ptxas`；
+  `Cuda compilation tools, release 12.9, V12.9.86`；JAX backend=`gpu`；
+  devices=`['cuda:0']`；最小编译 `jnp.arange(4).sum()` 返回 `6.0`。
+- 负向保护: `CUDA_VISIBLE_DEVICES=3 bash experiments/overcooked_v2/scripts/with_jax_cuda12.sh true`
+  在 JAX 初始化前退出，提示 GPU3 有 ECC 错误，应选择其他 GPU。
+- Path C 接线检查:
+  `CUDA_VISIBLE_DEVICES=5 bash experiments/overcooked_v2/scripts/with_jax_cuda12.sh .venv/bin/python -m pytest experiments/overcooked_v2/tests/test_path_c_scaffold.py -q`
+  → `11 passed, 1 warning`。该结果只证明远程环境和脚手架可运行；不得读成 Path C 的方法证据。
 
 ## 记录模板
 
