@@ -40,6 +40,10 @@ from experiments.overcooked_v2.option_inferencer import (
     make_behavior_option_inferencer,
 )
 from experiments.overcooked_v2.options import OCV2OptionLibrary
+from experiments.overcooked_v2.path_c_config import (
+    normalize_path_c_config,
+    path_c_metadata,
+)
 from experiments.overcooked_v2.partner_pool import make_training_partners
 from experiments.overcooked_v2.provenance import (
     reward_config_payload,
@@ -67,8 +71,11 @@ from experiments.overcooked_v2.train_aris import (
     _graph_objective_metadata_status,
     _graph_tensors,
     _initialise_persistent_belief,
+    _load_path_c_probe_baseline_q_net,
     _obs_vector,
     _partner_id_tensor,
+    _path_c_probe_choice,
+    _path_c_reset_probe_decision,
     _q_forward_kwargs,
     _select_train_partners,
     _state_repr,
@@ -110,6 +117,10 @@ class EvalContext:
     # training partner_set. The config itself is never mutated (the graph-objective
     # gate compares config.partner_set against graph metadata).
     partner_set_override: str | None = None
+    # Path C data-collection hooks. Formal benchmark eval keeps active probing off
+    # unless --path-c-active-probe-collection/--active_probe_collection is passed explicitly.
+    active_probe_collection: bool = False
+    path_c_probe_base_q_net: torch.nn.Module | None = None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -140,6 +151,23 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if zeroed_ablation:
         for ctx in contexts:
             _apply_zeroed_override(ctx.config)
+    active_probe_collection = bool(
+        getattr(args, "path_c_active_probe_collection", False)
+        or getattr(args, "active_probe_collection", False)
+    )
+    for ctx in contexts:
+        probe = ctx.config.setdefault("path_c", {}).setdefault("probe", {})
+        if getattr(args, "path_c_probe_base_checkpoint", None):
+            probe["base_checkpoint"] = str(args.path_c_probe_base_checkpoint)
+        ctx.active_probe_collection = bool(active_probe_collection)
+        ctx.path_c_probe_base_q_net = None
+        if active_probe_collection:
+            ctx.path_c_probe_base_q_net = _load_path_c_probe_baseline_q_net(
+                ctx.config,
+                ctx.obs_dim,
+                ctx.graph,
+                torch.device("cpu"),
+            )
     # sec18.14 (formal blind round): eval-only partner-registry override. This is
     # deliberately NOT a config mutation — the graph-objective gate compares
     # config.training.partner_set against the graph metadata (train_aris.
@@ -276,8 +304,25 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     else:
         _attach_within_run_relative_returns(results, baselines)
 
+    evaluation_kind = (
+        "data_collection_only" if active_probe_collection else "formal_benchmark"
+    )
+    summary = (
+        _collection_only_summary(results, baselines, time.time() - start)
+        if active_probe_collection
+        else _summary(
+            results,
+            baselines,
+            time.time() - start,
+            evaluation_kind=evaluation_kind,
+        )
+    )
     return {
         "schema_version": "ocv2_eval_v1",
+        "evaluation_kind": evaluation_kind,
+        "collection_role": evaluation_kind,
+        "benchmark_return_eligible": not active_probe_collection,
+        "active_probe_collection": active_probe_collection,
         "anchor_checkpoint": str(anchor),
         "graph_variants": variants,
         "partners": partner_names,
@@ -307,6 +352,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             ctx.graph_variant: (ctx.graph.metadata or {}).get("provenance", {})
             for ctx in contexts
         },
+        "path_c": {
+            ctx.graph_variant: {
+                **path_c_metadata(ctx.config),
+                "active_probe_collection_eval": bool(ctx.active_probe_collection),
+            }
+            for ctx in contexts
+        },
         "eval_provenance": {
             ctx.graph_variant: _eval_provenance(ctx)
             for ctx in contexts
@@ -315,7 +367,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "results": results,
         "reference_baselines": baselines,
         "external_reference_baselines": external_references,
-        "summary": _summary(results, baselines, time.time() - start),
+        "summary": summary,
     }
 
 
@@ -326,6 +378,7 @@ def _load_context(checkpoint_path: Path, variant: str) -> EvalContext:
         )
     checkpoint = _torch_load(checkpoint_path)
     config = checkpoint["config"]
+    normalize_path_c_config(config)
     graph = GraphSpec.from_json_dict(checkpoint["graph"])
     method = str(checkpoint["method"])
 
@@ -998,6 +1051,7 @@ def _select_option(
     selection_stats: dict[str, int] | None = None,
 ) -> int:
     _record_selection_attempt(selection_stats)
+    _path_c_reset_probe_decision(selection_stats)
     valid = ctx.option_lib.valid_options(state, 0)
     valid_ids = np.flatnonzero(valid)
     if valid_ids.size == 0:
@@ -1030,6 +1084,34 @@ def _select_option(
             _record_qaudit(ctx, obs_tensor, graph_batch, q_values, valid)
         valid_tensor = torch.as_tensor(valid, dtype=torch.bool)
         q_values = q_values.masked_fill(~valid_tensor, -1e9)
+        active_probe = bool(getattr(ctx, "active_probe_collection", False))
+        probe_cfg = ((ctx.config.get("path_c") or {}).get("probe") or {})
+        if active_probe or bool(probe_cfg.get("enable", False)):
+            base_q_values = None
+            base_q_net = getattr(ctx, "path_c_probe_base_q_net", None)
+            if active_probe and base_q_net is not None:
+                base_q_values = base_q_net(
+                    obs_tensor,
+                    belief,
+                    **_q_forward_kwargs(graph_batch),
+                )
+            probe_choice = _path_c_probe_choice(
+                ctx.q_net,
+                obs_tensor,
+                belief,
+                graph_batch,
+                q_values,
+                valid_tensor,
+                ctx.config,
+                partner_id=partner_id,
+                device=torch.device("cpu"),
+                selection_stats=selection_stats,
+                base_q_values=base_q_values,
+                eval_mode=not active_probe,
+                probe_rng=rng,
+            )
+            if probe_choice is not None:
+                return probe_choice
         return int(torch.argmax(q_values).item())
 
 
@@ -1523,12 +1605,16 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
     option_selection_count = 0
     forced_noop_count = 0
     no_valid_option_count = 0
+    path_c_probe_selected_count = 0
+    path_c_probe_opportunity_count = 0
     for row in episodes:
         _merge_counts(delivery_counts, row.get("delivery_counts", {}))
         _merge_counts(diagnostic_status_counts, row.get("diagnostic_status_counts", {}))
         option_selection_count += int(row.get("option_selection_count", 0))
         forced_noop_count += int(row.get("forced_noop_count", 0))
         no_valid_option_count += int(row.get("no_valid_option_count", 0))
+        path_c_probe_selected_count += int(row.get("path_c_probe_selected_count", 0))
+        path_c_probe_opportunity_count += int(row.get("path_c_probe_opportunity_count", 0))
         for key, value in row["termination_counts"].items():
             term_counts[key] = term_counts.get(key, 0) + int(value)
         for kind, item in row.get("option_kind_stats", {}).items():
@@ -1586,6 +1672,10 @@ def _aggregate_episodes(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "option_selection_count": int(option_selection_count),
         "forced_noop_count": int(forced_noop_count),
         "no_valid_option_count": int(no_valid_option_count),
+        "path_c_probe": {
+            "selected": int(path_c_probe_selected_count),
+            "opportunities": int(path_c_probe_opportunity_count),
+        },
         "forced_noop_fraction": float(forced_noop_count / max(1, option_selection_count)),
         "no_valid_option_fraction": float(no_valid_option_count / max(1, option_selection_count)),
         "diagnostic_status_counts": diagnostic_status_counts,
@@ -1655,7 +1745,11 @@ def _summary(
     results: list[dict[str, Any]],
     baselines: dict[str, Any],
     wall: float,
+    *,
+    evaluation_kind: str,
 ) -> dict[str, Any]:
+    if evaluation_kind != "formal_benchmark":
+        raise ValueError("Formal result aggregation rejects data-collection-only artifacts.")
     def _mean_or_zero(vals: list[float]) -> float:
         return float(np.mean(vals)) if vals else 0.0
 
@@ -1722,6 +1816,30 @@ def _summary(
         [float(s) for s in _serve_shares if s is not None]
     )
     return summary
+
+
+def _collection_only_summary(
+    results: list[dict[str, Any]],
+    baselines: dict[str, Any],
+    wall: float,
+) -> dict[str, Any]:
+    selected = 0
+    opportunities = 0
+    for row in results:
+        aggregate = row.get("aggregate", {})
+        probe = aggregate.get("path_c_probe", {})
+        if isinstance(probe, dict):
+            selected += int(probe.get("selected", 0) or 0)
+            opportunities += int(probe.get("opportunities", 0) or 0)
+    return {
+        "evaluation_kind": "data_collection_only",
+        "benchmark_return_eligible": False,
+        "num_results": len(results),
+        "partners": sorted(baselines),
+        "probe_selected": selected,
+        "probe_opportunities": opportunities,
+        "wall_time_sec": float(wall),
+    }
 
 
 def _relative_values(
@@ -2088,6 +2206,14 @@ def _jsonable(value: Any) -> Any:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate OvercookedV2 ARIS checkpoints.")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--path-c-active-probe-collection",
+        action="store_true",
+        help=(
+            "Enable Path C active probes during this eval run for data collection. "
+            "Formal benchmark evaluation keeps probes disabled by default."
+        ),
+    )
     parser.add_argument("--graph_variants", required=True)
     parser.add_argument("--partners", default="all")
     parser.add_argument(
@@ -2127,10 +2253,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use the checkpoint only to load env/graph context and evaluate random valid options.",
     )
     parser.add_argument(
+        "--active_probe_collection",
+        action="store_true",
+        help="Data-collection mode only: allow Path C active probes during this evaluation run. "
+        "Formal benchmark return eval leaves active probes disabled even when the checkpoint config "
+        "contains path_c.probe.enable=true.",
+    )
+    parser.add_argument(
         "--fast",
         action="store_true",
         help="Gate-only mode: skip per-option diagnostics and factor q-proxy "
         "(mean_return unaffected). Used for fast verification matrices.",
+    )
+    parser.add_argument(
+        "--path_c_probe_base_checkpoint",
+        default=None,
+        help="base_only checkpoint used for residual-signature probe selection in active collection mode.",
     )
     parser.add_argument("--reference_base_checkpoint", default=None)
     parser.add_argument("--reference_ref_checkpoint", default=None)

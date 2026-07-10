@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -52,7 +53,16 @@ from experiments.overcooked_v2.option_inferencer import (
 )
 from experiments.overcooked_v2.option_termination import OptionRuntime, option_success
 from experiments.overcooked_v2.options import OCV2OptionLibrary
+from experiments.overcooked_v2.path_c_config import (
+    normalize_path_c_config,
+    path_c_metadata,
+)
+from experiments.overcooked_v2.path_c_evaluation import PATH_C_PROBE_PROVENANCE_IDS
 from experiments.overcooked_v2.partner_pool import PARTNER_REGISTRIES, make_training_partners
+from experiments.overcooked_v2.residual_signature import (
+    residual_signature_disagreement,
+    select_probe_candidate,
+)
 from experiments.overcooked_v2.reward_design import (
     ContributionLedger,
     terminal_progress_bonus,
@@ -116,6 +126,19 @@ class ArisBellmanQNetwork(nn.Module):
         encoded = self.encoder(obs_feat)
         return self.q_net(encoded, belief, **graph_kwargs)
 
+    def forward_mean(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        return self.forward(obs_feat, belief, **graph_kwargs)
+
+    def forward_heads(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        return self.forward(obs_feat, belief, **graph_kwargs).unsqueeze(1)
+
+    def disagreement_values(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        q_values = self.forward(obs_feat, belief, **graph_kwargs)
+        return {
+            "per_option": torch.zeros_like(q_values),
+            "scalar": torch.zeros(q_values.shape[0], dtype=q_values.dtype, device=q_values.device),
+        }
+
     def forward_with_belief_override(
         self,
         obs: torch.Tensor,
@@ -135,6 +158,142 @@ class ArisBellmanQNetwork(nn.Module):
                 bypass_evidence_recompute=bypass_evidence_recompute,
             )
         return self.q_net(encoded, belief_override, **graph_kwargs)
+
+
+class EnsembleArisBellmanQNetwork(nn.Module):
+    def __init__(
+        self,
+        obs_dim: Any,
+        hidden_dim: int,
+        graph: GraphSpec,
+        *,
+        n_heads: int,
+        encoder_type: str = "auto",
+        advantage_norm: str = "none",
+        value_bound: bool = False,
+        vmax: float = 20.0,
+        base_bound: float | None = None,
+        adv_bound: float | None = None,
+        adv_unit: float = 1.0,
+        disagreement_stat: str = "variance",
+        prior_scale: float = 0.0,
+    ):
+        super().__init__()
+        if int(n_heads) <= 1:
+            raise ValueError("EnsembleArisBellmanQNetwork requires n_heads > 1.")
+        self.n_heads = int(n_heads)
+        self.disagreement_stat = str(disagreement_stat)
+        self.prior_scale = float(prior_scale)
+        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
+        self.heads = nn.ModuleList(
+            [
+                FactorLocalQNetwork(
+                    obs_dim=hidden_dim,
+                    max_options=graph.num_options,
+                    max_factors=max(1, graph.num_factors),
+                    max_modes=max(1, graph.max_modes),
+                    hidden_dim=hidden_dim,
+                    relevance_mask=graph.relevance,
+                    advantage_norm=advantage_norm,
+                    value_bound=value_bound,
+                    vmax=vmax,
+                    base_bound=base_bound,
+                    adv_bound=adv_bound,
+                    adv_unit=adv_unit,
+                )
+                for _ in range(self.n_heads)
+            ]
+        )
+        self.prior_encoder: nn.Module | None = None
+        self.prior_heads = nn.ModuleList()
+        if self.prior_scale != 0.0:
+            self.prior_encoder = OCV2ObsEncoder(
+                obs_dim,
+                hidden_dim,
+                encoder_type=encoder_type,
+            )
+            self.prior_heads = nn.ModuleList(
+                [
+                    FactorLocalQNetwork(
+                        obs_dim=hidden_dim,
+                        max_options=graph.num_options,
+                        max_factors=max(1, graph.num_factors),
+                        max_modes=max(1, graph.max_modes),
+                        hidden_dim=hidden_dim,
+                        relevance_mask=graph.relevance,
+                        advantage_norm=advantage_norm,
+                        value_bound=value_bound,
+                        vmax=vmax,
+                        base_bound=base_bound,
+                        adv_bound=adv_bound,
+                        adv_unit=adv_unit,
+                    )
+                    for _ in range(self.n_heads)
+                ]
+            )
+            for param in self.prior_heads.parameters():
+                param.requires_grad_(False)
+            for param in self.prior_encoder.parameters():
+                param.requires_grad_(False)
+            self.prior_encoder.eval()
+            self.prior_heads.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.prior_encoder is not None:
+            self.prior_encoder.eval()
+            self.prior_heads.eval()
+        return self
+
+    def forward_heads(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        graph_kwargs.pop("partner_id", None)
+        encoded = self.encoder(obs_feat)
+        learned = torch.stack(
+            [head(encoded, belief, **graph_kwargs) for head in self.heads],
+            dim=1,
+        )
+        if self.prior_scale == 0.0:
+            return learned
+        if self.prior_encoder is None:
+            raise RuntimeError("Randomized prior encoder is missing.")
+        with torch.no_grad():
+            prior_encoded = self.prior_encoder(obs_feat)
+            prior = torch.stack(
+                [head(prior_encoded, belief, **graph_kwargs) for head in self.prior_heads],
+                dim=1,
+            )
+        return learned + self.prior_scale * prior
+
+    def forward_mean(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        return self.forward_heads(obs_feat, belief, **graph_kwargs).mean(dim=1)
+
+    def forward(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        return self.forward_mean(obs_feat, belief, **graph_kwargs)
+
+    def forward_with_belief_override(
+        self,
+        obs: torch.Tensor,
+        belief_override: torch.Tensor,
+        *,
+        graph_kwargs: dict[str, Any] | None = None,
+        bypass_evidence_recompute: bool = True,
+    ) -> torch.Tensor:
+        del bypass_evidence_recompute
+        return self.forward_mean(obs, belief_override, **(graph_kwargs or {}))
+
+    def disagreement_values(self, obs_feat: torch.Tensor, belief: torch.Tensor, **graph_kwargs):
+        heads = self.forward_heads(obs_feat, belief, **graph_kwargs)
+        if self.disagreement_stat == "range":
+            per_option = heads.max(dim=1).values - heads.min(dim=1).values
+        else:
+            per_option = heads.var(dim=1, unbiased=False)
+        option_mask = graph_kwargs.get("option_mask")
+        if option_mask is not None:
+            per_option = per_option.masked_fill(~option_mask.bool(), 0.0)
+        return {
+            "per_option": per_option,
+            "scalar": per_option.max(dim=1).values,
+        }
 
 
 class BaseOnlyQNetwork(nn.Module):
@@ -298,10 +457,12 @@ class PartnerIDQNetwork(nn.Module):
         return _mask_q_values(q_values, option_mask)
 
 
+
 def train(args: argparse.Namespace) -> dict[str, Any]:
     config = _load_config(args.config)
     _apply_cli_overrides(config, args)
     _normalize_training_stability_config(config)
+    normalize_path_c_config(config, config_path=args.config)
     _set_seeds(args.seed)
 
     layout_name = str(config["layout"])
@@ -327,6 +488,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     graph.metadata = {
         **(graph.metadata or {}),
         "preflight_gate": preflight_gate,
+        "path_c": path_c_metadata(config),
     }
     _stamp_runtime_provenance(
         graph,
@@ -345,6 +507,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.method == "random_policy":
         metrics = _run_random_policy(env, obs, option_lib, router, config, args, output_dir)
+        metrics["path_c"] = path_c_metadata(config)
         _save_checkpoint(output_dir, args.method, config, graph, metrics, None, None, None)
         return metrics
 
@@ -352,6 +515,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     q_net = _build_q_network(args.method, obs_dim, graph, config).to(device)
     target_q_net = copy.deepcopy(q_net).to(device)
     target_q_net.eval()
+    path_c_probe_base_q_net = _load_path_c_probe_baseline_q_net(
+        config,
+        obs_dim,
+        graph,
+        device,
+    )
     belief_model = _build_belief_model(graph, config).to(device)
     optimizer_params = list(q_net.parameters())
     if args.method in {"aris_bellman", "flat_factor"}:
@@ -360,7 +529,6 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         optimizer_params,
         lr=float(config["training"]["learning_rate"]),
     )
-
     replay = OptionReplayBuffer(
         capacity=int(config["training"]["replay_size"]),
         seed=args.seed,
@@ -372,6 +540,16 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     )
     rng = np.random.default_rng(args.seed)
     metrics = _empty_metrics(args.method, graph, output_dir)
+    metrics["path_c"] = path_c_metadata(config)
+    probe_cfg = ((config.get("path_c") or {}).get("probe") or {})
+    metrics["path_c_probe_baseline"] = {
+        "loaded": path_c_probe_base_q_net is not None,
+        "checkpoint": probe_cfg.get("base_checkpoint") or probe_cfg.get("public_baseline_checkpoint"),
+        "registered_as_trainable_module": False,
+        "gradient_source": "none_eval_only",
+    }
+    if path_c_probe_base_q_net is not None:
+        metrics["path_c"]["probe"]["public_baseline_loaded"] = True
     seed_summary = _maybe_seed_terminal_replay(
         env,
         partners,
@@ -460,6 +638,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             device,
             partner_id=int(getattr(current_partner, "partner_id", 0)),
             selection_stats=metrics,
+            path_c_probe_base_q_net=path_c_probe_base_q_net,
         )
         transition, done, obs = _execute_option(
             env,
@@ -1436,6 +1615,95 @@ def _expected_provenance_hashes(
     }
 
 
+
+def _load_path_c_probe_baseline_q_net(
+    config: dict[str, Any],
+    obs_dim: Any,
+    graph: GraphSpec,
+    device: torch.device,
+) -> nn.Module | None:
+    path_c = config.get("path_c") or {}
+    probe = path_c.get("probe") or {}
+    if not bool(probe.get("enable", False)):
+        return None
+    if int((path_c.get("ensemble") or {}).get("n_heads", 1)) <= 1:
+        return None
+    ckpt_path = (
+        probe.get("base_checkpoint")
+        or probe.get("residual_baseline_checkpoint")
+        or probe.get("public_baseline_checkpoint")
+    )
+    if ckpt_path in {None, ""}:
+        if bool(probe.get("require_residual_baseline", probe.get("require_public_residual_baseline", True))):
+            raise ValueError(
+                "path_c.probe.base_checkpoint is required for active "
+                "residual-control-signature probes."
+            )
+        return None
+    path = Path(str(ckpt_path))
+    if not path.exists():
+        raise FileNotFoundError(f"Path C public baseline checkpoint not found: {path}")
+    expected_sha256 = probe.get("base_checkpoint_sha256")
+    observed_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    if expected_sha256 in {None, ""} or observed_sha256 != str(expected_sha256):
+        raise ValueError(
+            "Path C public baseline checkpoint SHA-256 does not match the frozen config."
+        )
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if str(checkpoint.get("method")) != "base_only":
+        raise ValueError(
+            "path_c.probe.base_checkpoint must be a base_only checkpoint; "
+            f"got method={checkpoint.get('method')!r}."
+        )
+    base_graph = GraphSpec.from_json_dict(checkpoint["graph"])
+    if graph_hash_from_spec(base_graph) != graph_hash_from_spec(graph):
+        raise ValueError(
+            "Path C probe baseline graph does not match the active graph."
+        )
+    base_option_order = [(option.id, option.name, option.kind) for option in base_graph.options]
+    active_option_order = [(option.id, option.name, option.kind) for option in graph.options]
+    if base_option_order != active_option_order:
+        raise ValueError("Path C probe baseline option order does not match the active graph.")
+    base_config = checkpoint.get("config") or config
+    base_q_net = _build_q_network("base_only", obs_dim, graph, base_config).to(device)
+    base_q_net.load_state_dict(checkpoint["q_net"])
+    base_q_net.eval()
+    for param in base_q_net.parameters():
+        param.requires_grad_(False)
+    return base_q_net
+
+
+def _path_c_attach_probe_baseline_if_configured(
+    q_net: nn.Module,
+    obs_dim: Any,
+    graph: GraphSpec,
+    config: dict[str, Any],
+    device: torch.device,
+    *,
+    config_path: Path | str | None = None,
+) -> nn.Module | None:
+    """Attach the frozen public-state baseline used only by Path C probe selection.
+
+    The baseline is intentionally installed with ``object.__setattr__`` instead of
+    as a registered child module: it is not part of the trainable ego and cannot
+    receive optimizer updates.
+    """
+    base_q_net = _load_path_c_probe_baseline_q_net(config, obs_dim, graph, device)
+    if base_q_net is None:
+        return None
+    object.__setattr__(q_net, "path_c_base_q_net", base_q_net)
+    probe = (config.get("path_c") or {}).get("probe") or {}
+    object.__setattr__(
+        q_net,
+        "path_c_base_checkpoint",
+        probe.get("base_checkpoint")
+        or probe.get("residual_baseline_checkpoint")
+        or probe.get("public_baseline_checkpoint")
+        or config_path,
+    )
+    return base_q_net
+
+
 def _build_q_network(
     method: str,
     obs_dim: Any,
@@ -1451,6 +1719,25 @@ def _build_q_network(
         else None
     )
     if method == "aris_bellman":
+        path_c = config.get("path_c") or {}
+        ensemble_cfg = path_c.get("ensemble") or {}
+        n_heads = int(ensemble_cfg.get("n_heads", 1))
+        if n_heads > 1:
+            return EnsembleArisBellmanQNetwork(
+                obs_dim,
+                hidden_dim,
+                graph,
+                n_heads=n_heads,
+                encoder_type=encoder_type,
+                advantage_norm=str(config["training"].get("advantage_norm", "none")),
+                value_bound=bool(vb.get("enabled", False)),
+                vmax=float(vb.get("vmax", 20.0)),
+                base_bound=(float(vb["base_bound"]) if vb.get("base_bound") is not None else None),
+                adv_bound=(float(vb["adv_bound"]) if vb.get("adv_bound") is not None else None),
+                adv_unit=float(vb.get("adv_unit", 1.0)),
+                disagreement_stat=str(ensemble_cfg.get("disagreement_stat", "variance")),
+                prior_scale=float(ensemble_cfg.get("prior_scale", 0.0)),
+            )
         return ArisBellmanQNetwork(
             obs_dim,
             hidden_dim,
@@ -1775,10 +2062,26 @@ def _execute_option(
             graph_id=f"{graph.layout_name}:{graph.metadata.get('graph_variant', 'graph')}",
             partner_id=int(getattr(partner, "partner_id", 0)),
             event_summary=event_summary,
+            bootstrap_mask=_path_c_bootstrap_mask(config, rng),
         ),
         done,
         obs,
     )
+
+
+def _path_c_bootstrap_mask(
+    config: dict[str, Any],
+    rng: np.random.Generator,
+) -> np.ndarray | None:
+    ensemble = (config.get("path_c") or {}).get("ensemble") or {}
+    n_heads = int(ensemble.get("n_heads", 1))
+    if n_heads <= 1:
+        return None
+    p = float(ensemble.get("bootstrap_p", 1.0))
+    mask = rng.random(n_heads) < p
+    if not bool(mask.any()):
+        mask[int(rng.integers(0, n_heads))] = True
+    return mask.astype(np.bool_)
 
 
 def _td_update(
@@ -1831,6 +2134,7 @@ def _td_update(
 
     optimizer.zero_grad(set_to_none=True)
     _vb = config["training"].get("value_bound", {}) or {}
+    bootstrap_mask = _bootstrap_mask_from_batch(batch, device)
     loss = aris_td_loss(
         q_net,
         target_q_net,
@@ -1853,6 +2157,7 @@ def _td_update(
         double_q=_as_bool(config["training"].get("double_q", True), "double_q"),
         reward_scale=float(_vb.get("reward_scale", 1.0)),
         vmax=(float(_vb["vmax"]) if _vb.get("enabled") and _vb.get("vmax") is not None else None),
+        bootstrap_mask=bootstrap_mask,
     )
     loss.backward()
     torch.nn.utils.clip_grad_norm_(
@@ -1861,6 +2166,21 @@ def _td_update(
     )
     optimizer.step()
     return float(loss.detach().cpu().item())
+
+
+def _bootstrap_mask_from_batch(
+    batch: dict[str, Any],
+    device: torch.device,
+) -> torch.Tensor | None:
+    raw = batch.get("bootstrap_mask")
+    if raw is None:
+        return None
+    if isinstance(raw, list) and all(item is None for item in raw):
+        return None
+    arr = np.asarray(raw, dtype=bool)
+    if arr.ndim != 2:
+        return None
+    return torch.as_tensor(arr, dtype=torch.bool, device=device)
 
 
 def _batch_evidence_mask(
@@ -1999,6 +2319,11 @@ def _run_greedy_validation(
     greedy_config.setdefault("training", {})
     greedy_config["training"]["epsilon_start"] = 0.0
     greedy_config["training"]["epsilon_end"] = 0.0
+    # Checkpoint-selection return is a formal greedy policy readout, not an active
+    # probe-collection run. Probes are disabled here even if training used them.
+    greedy_probe = greedy_config.setdefault("path_c", {}).setdefault("probe", {})
+    greedy_probe["enable"] = False
+    greedy_probe["eval_enable"] = False
     rng = np.random.default_rng(seed)
     returns: list[float] = []
     option_counts: list[int] = []
@@ -2063,6 +2388,7 @@ def _run_greedy_validation(
                         device,
                         partner_id=int(getattr(partner, "partner_id", 0)),
                         selection_stats=None,
+                        eval_mode=True,
                     )
                     transition, done, obs = _execute_option(
                         env,
@@ -2183,8 +2509,11 @@ def _select_option(
     device: torch.device,
     partner_id: int | None = None,
     selection_stats: dict[str, Any] | None = None,
+    path_c_probe_base_q_net: nn.Module | None = None,
+    eval_mode: bool = False,
 ) -> int:
     _record_selection_attempt(selection_stats)
+    _path_c_reset_probe_decision(selection_stats)
     valid = option_lib.valid_options(state, 0)
     valid_ids = np.flatnonzero(valid)
     if valid_ids.size == 0:
@@ -2234,8 +2563,226 @@ def _select_option(
         ).squeeze(0)
         valid_tensor = torch.as_tensor(valid, dtype=torch.bool, device=device)
         q_values = q_values.masked_fill(~valid_tensor, -1e9)
+        base_q_values = None
+        if path_c_probe_base_q_net is not None:
+            base_q_values = path_c_probe_base_q_net(
+                obs_tensor,
+                state_repr,
+                **_q_forward_kwargs(graph_batch),
+            )
+        probe_choice = _path_c_probe_choice(
+            q_net,
+            obs_tensor,
+            state_repr,
+            graph_batch,
+            q_values,
+            valid_tensor,
+            config,
+            partner_id=partner_id,
+            device=device,
+            selection_stats=selection_stats,
+            base_q_values=base_q_values,
+            eval_mode=eval_mode,
+            probe_rng=rng,
+        )
+        if probe_choice is not None:
+            return probe_choice
         return int(torch.argmax(q_values).item())
 
+
+def _path_c_reset_probe_decision(selection_stats: dict[str, Any] | None) -> None:
+    if selection_stats is None:
+        return
+    record = {
+        "selected": False,
+        "option_id": -1,
+        "reason": "none",
+        "scalar": None,
+        "candidate_mean_q": None,
+        "rule": "none",
+        "selection_count": int(selection_stats.get("option_selection_count", 0)),
+    }
+    selection_stats["path_c_probe_last"] = dict(record)
+    selection_stats["path_c_probe_last_decision"] = dict(record)
+
+
+def _path_c_record_probe_decision(
+    selection_stats: dict[str, Any] | None,
+    selected: bool,
+    reason: str,
+    *,
+    option_id: int = -1,
+    scalar: float | None = None,
+    candidate_mean_q: float | None = None,
+    rule: str | None = None,
+) -> None:
+    if selection_stats is None:
+        return
+    if reason not in PATH_C_PROBE_PROVENANCE_IDS:
+        raise ValueError(f"Unknown Path C probe provenance reason: {reason!r}")
+    record = {
+        "selected": bool(selected),
+        "option_id": int(option_id) if option_id is not None else -1,
+        "reason": str(reason),
+        "scalar": None if scalar is None else float(scalar),
+        "candidate_mean_q": (
+            None if candidate_mean_q is None else float(candidate_mean_q)
+        ),
+        "rule": "none" if rule is None else str(rule),
+        "target": "residual_control_signature_disagreement",
+        "selection_count": int(selection_stats.get("option_selection_count", 0)),
+    }
+    selection_stats["path_c_probe_last"] = dict(record)
+    selection_stats["path_c_probe_last_decision"] = dict(record)
+
+
+def _path_c_probe_choice(
+    q_net: nn.Module,
+    obs_tensor: torch.Tensor,
+    state_repr: Any,
+    graph_batch: dict[str, torch.Tensor],
+    q_values: torch.Tensor,
+    valid_tensor: torch.Tensor,
+    config: dict[str, Any],
+    *,
+    partner_id: int | None,
+    device: torch.device,
+    selection_stats: dict[str, Any] | None,
+    base_q_values: torch.Tensor | None = None,
+    eval_mode: bool = False,
+    probe_rng: np.random.Generator | None = None,
+) -> int | None:
+    path_c = config.get("path_c") or {}
+    probe = path_c.get("probe") or {}
+    if not bool(probe.get("enable", False)):
+        return None
+    if eval_mode and not bool(probe.get("eval_enable", False)):
+        _path_c_record_probe_decision(selection_stats, False, "disabled")
+        return None
+    if selection_stats is not None:
+        _increment_count(selection_stats, "path_c_probe_opportunity_count")
+    if int((path_c.get("ensemble") or {}).get("n_heads", 1)) <= 1:
+        if selection_stats is not None:
+            _increment_count(selection_stats, "path_c_probe_skipped_single_head_count")
+        _path_c_record_probe_decision(selection_stats, False, "disabled")
+        return None
+    if base_q_values is None:
+        base_q_net = getattr(q_net, "path_c_base_q_net", None)
+        if base_q_net is not None:
+            base_q_values = base_q_net(
+                obs_tensor,
+                state_repr,
+                **_q_forward_kwargs(graph_batch),
+            )
+    if base_q_values is None:
+        if bool(probe.get("require_public_residual_baseline", True)):
+            if selection_stats is not None:
+                _increment_count(selection_stats, "path_c_probe_skipped_missing_public_baseline_count")
+            _path_c_record_probe_decision(selection_stats, False, "disabled")
+            return None
+        if selection_stats is not None:
+            _increment_count(selection_stats, "path_c_probe_skipped_missing_public_baseline_count")
+        _path_c_record_probe_decision(selection_stats, False, "disabled")
+        return None
+    if not hasattr(q_net, "forward_heads"):
+        _path_c_record_probe_decision(selection_stats, False, "disabled")
+        return None
+    head_values = q_net.forward_heads(
+        obs_tensor,
+        state_repr,
+        **_q_forward_kwargs(graph_batch),
+        partner_id=_partner_id_tensor(partner_id, 1, device),
+    )
+    if base_q_values.ndim == 1:
+        base_q_values = base_q_values.unsqueeze(0)
+    disagreement = residual_signature_disagreement(
+        head_values,
+        base_q_values,
+        option_mask=valid_tensor.unsqueeze(0) if valid_tensor.ndim == 1 else valid_tensor,
+        stat=str((path_c.get("ensemble") or {}).get("disagreement_stat", "variance")),
+        tie_atol=float((path_c.get("ensemble") or {}).get("tie_atol", 1.0e-6)),
+    )
+    collection_selection_mode = str(
+        probe.get("collection_selection_mode", "residual")
+    )
+    if collection_selection_mode == "random":
+        if probe_rng is None:
+            raise ValueError("Random-probe collection requires an explicit RNG.")
+        valid_ids = np.flatnonzero(valid_tensor.detach().cpu().numpy().astype(bool))
+        choice = int(probe_rng.choice(valid_ids))
+        score = float(disagreement["scalar"].detach().cpu().reshape(-1)[0])
+        candidate_mean_q = float(q_values.reshape(-1)[choice].detach().cpu().item())
+        threshold = probe.get("disagreement_threshold")
+        return_floor = probe.get("return_floor")
+        if threshold is None or score < float(threshold):
+            reason = "threshold"
+        elif return_floor is None or candidate_mean_q < float(return_floor):
+            reason = "return_floor"
+        else:
+            reason = "selected"
+        decision = {
+            "selected": reason == "selected",
+            "reason": reason,
+            "option_id": choice,
+            "score": score,
+            "candidate_mean_q": candidate_mean_q,
+        }
+    elif collection_selection_mode == "residual":
+        decision = select_probe_candidate(
+            disagreement["per_option"],
+            q_values,
+            valid_tensor,
+            disagreement_threshold=probe.get("disagreement_threshold"),
+            return_floor=probe.get("return_floor"),
+        )
+    else:
+        raise ValueError(
+            f"Unknown Path C collection_selection_mode={collection_selection_mode!r}."
+        )
+    choice = int(decision["option_id"])
+    scalar = decision.get("score")
+    candidate_mean_q = decision.get("candidate_mean_q")
+    if decision["reason"] == "threshold":
+        if selection_stats is not None:
+            _increment_count(selection_stats, "path_c_probe_skipped_threshold_count")
+        _path_c_record_probe_decision(
+            selection_stats,
+            False,
+            "threshold",
+            scalar=scalar,
+            candidate_mean_q=candidate_mean_q,
+        )
+        return None
+    if decision["reason"] == "return_floor":
+        if selection_stats is not None:
+            _increment_count(selection_stats, "path_c_probe_skipped_return_floor_count")
+        _path_c_record_probe_decision(
+            selection_stats,
+            False,
+            "return_floor",
+            scalar=scalar,
+            candidate_mean_q=candidate_mean_q,
+        )
+        return None
+    if not decision["selected"]:
+        _path_c_record_probe_decision(selection_stats, False, "disabled")
+        return None
+    if selection_stats is not None:
+        _increment_count(selection_stats, "path_c_probe_selected_count")
+    _path_c_record_probe_decision(
+        selection_stats,
+        True,
+        "selected",
+        option_id=choice,
+        scalar=scalar,
+        candidate_mean_q=candidate_mean_q,
+        rule=(
+            "random_probe_valid"
+            if collection_selection_mode == "random"
+            else str(probe.get("rule", "max_residual_signature_disagreement"))
+        ),
+    )
+    return choice
 
 def _sample_exploration_option(
     option_lib: OCV2OptionLibrary,
@@ -3275,11 +3822,18 @@ def _save_checkpoint(
     *,
     filename: str = "checkpoint.pt",
 ) -> None:
+    path_c = path_c_metadata(config)
     payload: dict[str, Any] = {
         "method": method,
         "config": config,
         "graph": graph.to_json_dict(),
         "metrics_summary": _metrics_summary(metrics),
+        "path_c_artifact_binding": {
+            "preregistration_sha256": (
+                (path_c.get("preregistration") or {}).get("sha256")
+            ),
+            "resolved_path_c_sha256": path_c.get("resolved_path_c_sha256"),
+        },
     }
     if q_net is not None:
         payload["q_net"] = q_net.state_dict()
@@ -3287,7 +3841,31 @@ def _save_checkpoint(
         payload["belief_model"] = belief_model.state_dict()
     if optimizer is not None:
         payload["optimizer"] = optimizer.state_dict()
-    torch.save(payload, output_dir / filename)
+    checkpoint_path = output_dir / filename
+    torch.save(payload, checkpoint_path)
+    trainable_parameters: dict[str, list[int]] = {}
+    for prefix, module in (("q_net", q_net), ("belief_model", belief_model)):
+        if module is None:
+            continue
+        for name, parameter in module.named_parameters():
+            if parameter.requires_grad:
+                trainable_parameters[f"{prefix}.{name}"] = list(parameter.shape)
+    parameter_manifest = {
+        "checkpoint_sha256": hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+        "preregistration_sha256": (
+            (path_c.get("preregistration") or {}).get("sha256")
+        ),
+        "resolved_path_c_sha256": path_c.get("resolved_path_c_sha256"),
+        "trainable_parameters": trainable_parameters,
+        "parameter_count": int(sum(
+            int(np.prod(np.asarray(shape, dtype=np.int64)))
+            for shape in trainable_parameters.values()
+        )),
+    }
+    _write_json(
+        checkpoint_path.with_suffix(".parameters.json"),
+        parameter_manifest,
+    )
 
 
 def _remove_stale_deployable_checkpoints(
@@ -3359,6 +3937,13 @@ def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> No
         config["output_dir"] = str(args.output_dir)
     if getattr(args, "preflight_path", None) is not None:
         config.setdefault("preflight", {})["path"] = str(args.preflight_path)
+    if getattr(args, "path_c_preregistration", None) is not None:
+        config.setdefault("path_c", {})["preregistration_path"] = str(
+            args.path_c_preregistration
+        )
+    if getattr(args, "path_c_probe_base_checkpoint", None) is not None:
+        probe_cfg = config.setdefault("path_c", {}).setdefault("probe", {})
+        probe_cfg["base_checkpoint"] = str(args.path_c_probe_base_checkpoint)
     if bool(getattr(args, "allow_shared_shaping", False)):
         config["training"]["allow_shared_shaping"] = True
     for key in (
@@ -3739,6 +4324,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates", type=int, default=None)
     parser.add_argument("--output_dir", default=None)
     parser.add_argument("--preflight_path", default=None)
+    parser.add_argument(
+        "--path_c_preregistration",
+        default=None,
+        help=(
+            "Optional Path C preregistration YAML. Required when any path_c feature "
+            "is enabled; read-only and recorded in resolved_config/metrics."
+        ),
+    )
+    parser.add_argument(
+        "--path_c_probe_base_checkpoint",
+        default=None,
+        help=(
+            "Frozen base_only checkpoint used for residual-control-signature "
+            "probe selection. Required when path_c.probe.enable=true."
+        ),
+    )
     parser.add_argument("--td_loss", choices=("huber", "mse"), default=None)
     parser.add_argument("--huber_delta", type=float, default=None)
     double_q_group = parser.add_mutually_exclusive_group()

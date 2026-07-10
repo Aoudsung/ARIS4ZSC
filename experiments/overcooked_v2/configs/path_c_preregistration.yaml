@@ -1,0 +1,242 @@
+# Path C preregistration TEMPLATE for the static-review code package.
+# This file is intentionally not admissible as a run preregistration. A real run
+# must copy it, set status:frozen before execution, keep the frozen copy
+# read-only, and record its SHA-256 in all artifacts.
+
+version: path_c_preregistration_v2_template
+status: template_not_valid_for_runs
+freeze_timestamp:
+
+ensemble:
+  n_heads: 5
+  bootstrap_p: 0.8
+  prior_scale: 0.05
+  disagreement_stat: variance
+  tie_atol: 1.0e-6
+
+probe:
+  enable: true
+  eval_enable: false
+  collection_enable: true
+  rule: max_residual_signature_disagreement
+  disagreement_threshold: 0.02
+  return_floor: 0.0
+  base_checkpoint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+  require_public_residual_baseline: true
+  allow_raw_q_fallback: false
+  min_selected_probes: 100
+  min_probe_opportunities: 1000
+  min_context_coverage: 0.8
+  min_action_coverage: 0.8
+
+rv_summary_spec:
+  enable: true
+  source: frozen_value_event_grammar
+  window_decisions: 5
+  events:
+    - partner_option_commitment
+    - target_object
+    - response_latency
+    - defer
+    - escalate
+    - wait
+    - help
+    - block
+    - delivery_outcome
+  raw_columns:
+    - resp_raw_ego_commit_count
+    - resp_raw_partner_commit_count
+    - resp_raw_ambig_count
+    - resp_raw_response_primitive_len
+    - resp_raw_partner_commitment_seq
+    - resp_raw_delivery_outcome_seq
+  rv_columns:
+    - resp_rv_value_event_partner_commitment
+    - resp_rv_value_event_target_object
+    - resp_rv_value_event_response_latency
+    - resp_rv_value_event_defer
+    - resp_rv_value_event_escalate
+    - resp_rv_value_event_wait
+    - resp_rv_value_event_help
+    - resp_rv_value_event_block
+    - resp_rv_value_event_delivery_outcome
+  excludes:
+    - identity
+    - seed
+    - style
+    - layout_style
+    - trajectory_source
+    - absolute_target_coordinates
+  coordinate_policy: absolute_target_x_y_excluded
+  joint_likelihood_order:
+    - resp_rv_value_event_partner_commitment
+    - resp_rv_value_event_target_object
+    - resp_rv_value_event_response_latency
+    - resp_rv_value_event_defer
+    - resp_rv_value_event_escalate
+    - resp_rv_value_event_wait
+    - resp_rv_value_event_help
+    - resp_rv_value_event_block
+    - resp_rv_value_event_delivery_outcome
+  public_context_strata:
+    - layout_style
+    - public_task_stage
+    - public_inventory_stage
+    - probe_action
+
+fingerprint:
+  enable: true
+  kind: counterbalanced_value_null_candidate
+  vocab: [0, 1]
+  positive_control_kind: raw_response_value_null
+  negative_control_kind: metadata_only
+  admission_required: true
+  counterbalanced_across_mechanisms: true
+  require_raw_visibility: true
+  require_value_null: true
+  require_joint_rv_null: true
+  require_residual_signature_null: true
+
+cross_identity_split:
+  enable: true
+  group_key: [mode.family, mode.param]
+  identity_key: surface_identity_key
+  split: same_mechanism_disjoint_surface_seed_layout
+  folds: 5
+
+budget:
+  effective_episode_floor: 2000
+  effective_transition_floor: 40000
+  split_unit: episode_uid
+  matched_budget_required: true
+  required_budget_keys:
+    - probe
+    - random_probe
+    - no_probe
+    - synthetic_power
+    - fingerprint_negative
+    - terminal_axis_null
+    - recovery
+    - global_gru
+    - base_only
+    - partner_id
+    - belief_filter
+    - rnn_residualized
+    - no_admission
+    - unpruned_ensemble
+
+baselines:
+  matched_capacity_and_split: true
+  max_trainable_parameters: 1000000
+  required_variants:
+    - global_gru
+    - base_only
+    - partner_id
+    - belief_filter
+    - rnn_residualized
+    - random_probe
+    - no_probe
+    - no_admission
+    - unpruned_ensemble
+  strong_history_or_belief_variants:
+    - global_gru
+    - rnn_residualized
+    - belief_filter
+
+readout:
+  model: mlp
+  hidden: 64
+  epochs: 40
+  batch: 2048
+  folds: 5
+  split_unit: episode_uid
+  rv_likelihood: autoregressive_joint
+
+pass_af:
+  enable: true
+  fallback_rule: >
+    If any strong history or belief baseline passes the same rule at matched budget,
+    demote the claim to sample efficiency, minimality, and robustness; otherwise
+    a failed rule stops Path C.
+  thresholds:
+    G1: 0.0
+    G_value: 0.0
+    G2: 0.0
+    G3: 0.01
+    G4: 0.05
+    epsilon_V: 0.05
+    epsilon_F: 0.05
+    epsilon_R: 0.15
+    value_label_tv_equivalence_threshold: 0.05
+    rv_tv_equivalence_threshold: 0.05
+    gamma_c_l1_equivalence_threshold: 0.05
+    fingerprint_visibility_l1_threshold: 0.01
+    raw_fingerprint_balanced_accuracy_margin: 0.05
+    fingerprint_value_null_equivalence: 0.05
+    fingerprint_joint_rv_null_equivalence: 0.05
+    fingerprint_residual_null_equivalence: 0.05
+    leakage_logloss_advantage_equivalence: 0.01
+    leakage_balanced_accuracy_margin: 0.05
+    null_equivalence_gain: 0.05
+    synthetic_power_min_mechanism_advantage: 0.05
+    value_ablation_min_degradation: 0.01
+    nuisance_value_gain_equivalence: 0.01
+    full_leakage_max_advantage: 0.01
+    kernel_bootstrap_iters: 10000
+    kernel_confidence: 0.95
+    kernel_min_context_rows: 50
+
+go_no_go:
+  logic: GO iff frozen preregistration, artifact budget, kernel margin, required hard baselines, G1, G_value, G2, G3 and G4 pass; strong history/belief baseline pass demotes the claim.
+  hard_fail_margin: epsilon_F + 2*delta < epsilon_R
+  threshold_source: artifact_read_back
+
+# 2026-07-10 instrument correction (review rounds 2-4): kernel certificates must
+# estimate the belief-averaged intervention kernel K(.|h) = E_{U~P(U|h)} G(.|h,U),
+# NOT the realized-state continuation kernel G(.|h,u) that single-checkpoint
+# forking consistently estimates. Spec: idea-stage/refine-logs/PATH_C_PROPOSAL.md
+# section 4.5 + PATH_C_THEORY.md sections 3-8.
+belief_kernel_audit:
+  enable: true
+  estimand: belief_averaged_intervention_kernel
+  naive_single_checkpoint_fork_admissible: false
+  audit_unit: registered_audit_information_state
+  inference_cluster_unit: outer_replica
+  tv_convention: half_l1
+  recovery_condition: "beta - alpha > 4 * (eta_M + rho + xi)"
+  outer_replicas_M: null          # freeze before E0
+  inner_forks_L: null             # freeze before E0
+  audit_information_states: null  # freeze before E0
+  tier1_exact_enumeration_replay:
+    enable: true
+    partner_registry_frozen_required: true
+    prior_over_theta: generation_protocol_frozen
+    likelihood: forward_algorithm_over_discrete_execution_chain
+    boundary_emission: epsilon_mixture_with_argmax_tiebreak_and_noop_reroute
+    reconstruction_state_basis: raw_observable_state
+    execution_state_resample: forward_filtered_conditional
+    tier1_hypothesis_prune: 1.0e-6   # forward-pass hypothesis mass below this is pruned; pruned mass reported
+    rho: 0.0
+    xi: 0.0
+  tier2_hash_and_match:
+    enable: true
+    group_key: exact_ego_observable_history
+    open_loop_ego_action_replay_allowed: true
+    support_bias_registration_required: true
+    degrade_unmatched_contexts_to_distributional_cells: true
+    rho: 0.0
+    xi: 0.0
+  learned_posterior_route:
+    blackbox_partners_only: true
+    requires_auditable_rho_xi_bounds: true
+  never_splice: true
+  validity_gate_c_belief_kernel:
+    - posterior_replicas_match_exact_posterior_on_synthetic
+    - reconstituted_state_preserves_registered_observable_information
+    - outer_replica_ess_and_independence
+    - ci_and_bootstrap_clustered_by_outer_replica
+    - point_mass_posterior_control_naive_fork_agrees
+    - overlapping_posterior_control_naive_fork_fails_corrected_recovers
+    - tier1_tier2_agreement_on_shared_audit_units
+    - true_theta_replay_reproduces_diagnostic_state_fields
+    - tie_and_noop_reroute_likelihood_unit_tests

@@ -83,6 +83,8 @@ class LatentPartnerSpec:
     base_protocol: Any
     mode: LatentModeSpec
     curriculum_group: str | None = "latent_v3"
+    fingerprint_id: int | None = None
+    fingerprint_bias: str | None = None
 
 
 @dataclass
@@ -243,6 +245,13 @@ class LatentModeController:
         self.spec = spec
         self.protocol = spec
         self.partner_id = int(partner_id)
+        # A missing fingerprint is encoded as -1, not partner_id.  Partner id is an
+        # identity oracle and must not become the default F_C/nuisance label.
+        self.mode_fingerprint_id = (
+            int(spec.fingerprint_id)
+            if spec.fingerprint_id is not None
+            else -1
+        )
         self.runtime = LatentModeRuntime(spec.mode)
         self._inner = partner_cls(
             name=str(name),
@@ -320,7 +329,8 @@ class LatentModeController:
         if valid_ids.size == 0:
             return None
         kinds = {int(i): str(self.option_library.options[int(i)].kind) for i in valid_ids}
-        for want in RETREAT_KIND_ORDER:
+        retreat_order = self._fingerprint_retreat_order()
+        for want in retreat_order:
             for vid in valid_ids:
                 if kinds[int(vid)] == want:
                     return int(vid)
@@ -338,7 +348,18 @@ class LatentModeController:
         self._last_gate_main = _gate_main(state, self._pot_positions)
 
     def diagnostic_mode_state(self) -> dict[str, int | str]:
-        return self.runtime.diagnostic_state()
+        state = self.runtime.diagnostic_state()
+        state["mode_fingerprint_id"] = int(self.mode_fingerprint_id)
+        state["mode_fingerprint_bias"] = str(self.spec.fingerprint_bias or "none")
+        state["mode_fingerprint_control_kind"] = (
+            "raw_response_value_null"
+            if self.spec.fingerprint_bias in {
+                "retreat_order_rotate_candidate",
+                "retreat_order_rotate_admitted",
+            }
+            else "metadata_only"
+        )
+        return state
 
     @property
     def current_option(self) -> int | None:
@@ -366,6 +387,19 @@ class LatentModeController:
         if current is None:
             return True
         return bool(self._inner._option_done(state, agent_id=1))
+
+    def _fingerprint_retreat_order(self) -> tuple[str, ...]:
+        # Candidate behavior must be observable before offline admission can test
+        # whether it is value-, joint-R^V-, and residual-signature-null.
+        if self.spec.fingerprint_bias not in {
+            "retreat_order_rotate_candidate",
+            "retreat_order_rotate_admitted",
+        }:
+            return RETREAT_KIND_ORDER
+        if not RETREAT_KIND_ORDER:
+            return RETREAT_KIND_ORDER
+        shift = int(self.mode_fingerprint_id) % len(RETREAT_KIND_ORDER)
+        return RETREAT_KIND_ORDER[shift:] + RETREAT_KIND_ORDER[:shift]
 
     def _epsilon_force_option(self, state: Any, rng: np.random.Generator) -> bool:
         epsilon = float(self.spec.mode.epsilon)

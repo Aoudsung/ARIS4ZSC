@@ -178,6 +178,7 @@ class OptionTransition:
     graph_id: str | None = None
     partner_id: int | None = None
     event_summary: dict[str, Any] | None = None
+    bootstrap_mask: np.ndarray | None = None
 
 
 def _array_or_none(value: Any) -> np.ndarray | None:

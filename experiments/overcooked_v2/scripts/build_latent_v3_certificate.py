@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 def _load(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text())
 
@@ -122,6 +121,11 @@ def run(args: argparse.Namespace) -> None:
             "pass": bool(wiring["PASS"]),
         },
     }
+    pass_af = None
+    if args.pass_af_readout or args.pass_af_thresholds:
+        if not args.pass_af_readout or not args.pass_af_thresholds:
+            raise ValueError("--pass-af-readout and --pass-af-thresholds must be provided together.")
+        pass_af = _build_pass_af(args.pass_af_readout, args.pass_af_thresholds)
     passed = all(bool(item["pass"]) for item in criteria.values())
     cert = {
         "certificate": "latent_v3 Phenomenon-Existence Certificate",
@@ -145,6 +149,8 @@ def run(args: argparse.Namespace) -> None:
         ],
         "criteria": criteria,
     }
+    if pass_af is not None:
+        cert["pass_af"] = pass_af
 
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -187,8 +193,51 @@ def run(args: argparse.Namespace) -> None:
         f"- VOI: `{args.voi}`",
         f"- Chunks: `{args.chunks}`",
     ])
+    if pass_af is not None:
+        lines.extend([
+            "",
+            "Legacy Path C diagnostic (not decision-eligible):",
+            "- This section does not affect the latent_v3 certificate or Path C judgment.",
+        ])
+        for key, item in pass_af["criteria"].items():
+            lines.append(f"- {key}: pass={item['pass']} value={item.get('value')}")
     out_md.write_text("\n".join(lines) + "\n")
     print(json.dumps({"status": cert["status"], "criteria": {k: v["pass"] for k, v in criteria.items()}}, indent=1))
+
+
+def _build_pass_af(readout_path: str, thresholds_path: str) -> dict[str, Any]:
+    """Preserve old fields as diagnostics without emitting a Path C decision."""
+    readout = _load(readout_path)
+    required = ("C_resp^V", "C_fact", "C_value", "C_transfer", "C_leak", "C_null")
+    criteria: dict[str, dict[str, Any]] = {}
+    missing = []
+    for key in required:
+        item = readout.get(key)
+        if not isinstance(item, dict):
+            missing.append(key)
+            continue
+        if "pass" not in item:
+            raise ValueError(f"Pass_AF readout item {key} is missing 'pass'.")
+        criteria[key] = {
+            "name": str(item.get("name", key)),
+            "value": item.get("value"),
+            "threshold": item.get("threshold"),
+            "pass": bool(item["pass"]),
+        }
+    if missing:
+        raise ValueError(
+            "Pass_AF readout missing required item(s): " + ", ".join(sorted(missing))
+        )
+    return {
+        "artifact_kind": "legacy_latent_v3_path_c_diagnostic",
+        "path_c_decision_eligible": False,
+        "affects_latent_v3_certificate": False,
+        "artifacts": {
+            "readout": str(readout_path),
+            "thresholds": str(thresholds_path),
+        },
+        "criteria": criteria,
+    }
 
 
 def main() -> None:
@@ -199,6 +248,8 @@ def main() -> None:
     ap.add_argument("--voi", required=True)
     ap.add_argument("--chunks", required=True)
     ap.add_argument("--golden-review", default=None)
+    ap.add_argument("--pass-af-readout", default=None)
+    ap.add_argument("--pass-af-thresholds", default=None)
     ap.add_argument("--commit", default="UNKNOWN")
     ap.add_argument("--out-json", default="artifacts/latent_v3_phenomenon_certificate.json")
     ap.add_argument("--out-md", default="artifacts/latent_v3_phenomenon_certificate.md")
@@ -207,4 +258,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

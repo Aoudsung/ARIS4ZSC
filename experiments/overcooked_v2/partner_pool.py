@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 import numpy as np
@@ -269,12 +269,16 @@ def _latent(
     *,
     curriculum_group: str,
     epsilon: float = 0.10,
+    fingerprint_id: int | None = None,
+    fingerprint_bias: str | None = None,
 ) -> LatentPartnerSpec:
     return LatentPartnerSpec(
         geometry_profile=geometry_profile,
         base_protocol=base_protocol,
         mode=LatentModeSpec(family=family, param=param, epsilon=epsilon),
         curriculum_group=curriculum_group,
+        fingerprint_id=fingerprint_id,
+        fingerprint_bias=fingerprint_bias,
     )
 
 
@@ -460,6 +464,124 @@ LATENT_V3_DEV_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = (
 )
 
 
+PATH_C_SYNTHETIC_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = (
+    # Factorial synthetic-positive pool: mechanism × identity/surface × fingerprint.
+    # fingerprint_id is deliberately counterbalanced within every mechanism and
+    # does not determine geometry, role, or pot preference. This pool exposes a
+    # raw-response candidate, but admission still requires the offline value,
+    # joint-R^V, and residual-signature equivalence tests.
+    (
+        "pathc-ingnear-patience2-fp0",
+        _latent(
+            "ingredient_near",
+            ProtocolSpec(role="ingredient_person", pot_preference="near"),
+            "patience",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=0,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-ingnear-patience2-fp1",
+        _latent(
+            "ingredient_near",
+            ProtocolSpec(role="ingredient_person", pot_preference="near"),
+            "patience",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=1,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-ingfar-patience2-fp0",
+        _latent(
+            "ingredient_far",
+            ProtocolSpec(role="ingredient_person", pot_preference="far"),
+            "patience",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=0,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-ingfar-patience2-fp1",
+        _latent(
+            "ingredient_far",
+            ProtocolSpec(role="ingredient_person", pot_preference="far"),
+            "patience",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=1,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-prepnear-escalate2-fp0",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
+            "escalate_after_defer",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=0,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-prepnear-escalate2-fp1",
+        _latent(
+            "prep_zone",
+            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
+            "escalate_after_defer",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=1,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-flexfar-escalate2-fp0",
+        _latent(
+            "flexible",
+            ProtocolSpec(role="flexible", pot_preference="far", bottleneck_policy="yield"),
+            "escalate_after_defer",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=0,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+    (
+        "pathc-flexfar-escalate2-fp1",
+        _latent(
+            "flexible",
+            ProtocolSpec(role="flexible", pot_preference="far", bottleneck_policy="yield"),
+            "escalate_after_defer",
+            2,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=1,
+            fingerprint_bias="retreat_order_rotate_candidate",
+        ),
+    ),
+)
+
+
+PATH_C_FINGERPRINT_NEGATIVE_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = tuple(
+    (
+        name.replace("pathc-", "pathc-meta-", 1),
+        replace(
+            spec,
+            curriculum_group="path_c_fingerprint_negative",
+            fingerprint_bias="metadata_only_value_null",
+        ),
+    )
+    for name, spec in PATH_C_SYNTHETIC_PROTOCOLS
+)
+
+
 PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec | LatentPartnerSpec], ...]] = {
     "standard7": STANDARD7_PROTOCOLS,
     "role_conditioned_v1": ROLE_CONDITIONED_V1_PROTOCOLS,
@@ -468,6 +590,10 @@ PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec | LatentPartnerSpec]
     "blind_v1": BLIND_V1_PROTOCOLS,
     # Link-A certificate substrate only. This is not Link-C's blind_v3.
     "latent_v3_dev": LATENT_V3_DEV_PROTOCOLS,
+    # Candidate positive control; artifact admission decides whether it is usable.
+    "path_c_synthetic": PATH_C_SYNTHETIC_PROTOCOLS,
+    # Metadata-only negative control cannot satisfy raw fingerprint visibility.
+    "path_c_fingerprint_negative": PATH_C_FINGERPRINT_NEGATIVE_PROTOCOLS,
 }
 
 
