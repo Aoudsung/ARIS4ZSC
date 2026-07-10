@@ -145,7 +145,7 @@ training:
   require_ego_delivery_selection: true
   require_preflight_accepted: true
   total_updates: 5000
-  # DATA-8x probe (prereg L1_CONSOLIDATION_PREREG_DRAFT.md §6): collect one
+  # DATA-8x probe (prereg archive/2026-07_asymm-role-v2-line/L1_CONSOLIDATION_PREREG_DRAFT.md §6): collect one
   # transition per update instead of eight updates per transition -> 5000
   # transitions ≈ 250 episodes (baseline: 625 ≈ 32 episodes), SAME update budget.
   updates_per_transition: 1

@@ -3,6 +3,26 @@
   "register": "invariant/method-fidelity",
   "overall": "PASS",
   "green": true,
+  "governance_note": "治理精简 2026-07-08（依据 docs/status/GOVERNANCE_CUTLIST.md；退休阀门 OPERATING_CONSTRAINTS.md §7）。本门是一次静态检查，整体要求在读结论前 / 部署改过的方法代码前为绿，不是每次开跑前的启动关卡；不设每次启动或实验中途的人工签字。I1–I9 是事后/部署前的方法身份审计（出生即绿，改方法代码后或读数前复核）；I10–I17 是载重真缺陷护栏（各对应一次有记录的真实失败）。工具仍机械运行 I1–I9，pass/fail 语义不变，没有任何检查被删除。",
+  "altitude": {
+    "I1": "降级 · 方法身份审计（改方法代码后 / 读数前）",
+    "I2": "降级 · 方法身份审计（训练环单目标）",
+    "I3": "合并 → I1（同禁部署期选择器）",
+    "I4": "合并 → I2（训练环单目标 / training-loop purity）",
+    "I5": "降级 · 结构备注（数值等价属语义，归 jury / human）",
+    "I6": "降级 · 方法身份审计（改 layout parser 时审）",
+    "I7": "降级 · 部署前审计（核对 preflight raise 仍在；运行时 preflight 启动门未削弱，另归 OPERATING §2 / DASHBOARD §4）",
+    "I8": "归档 · WARN-only；claim 尺度归 cross-model 陪审 + 人工最终读数",
+    "I9": "降级 · 跑因子删除消融时审",
+    "I10": "保留 · 载重护栏（P1 去 oracle 证据路径）",
+    "I11": "保留 · 载重护栏（P4 信念隐状态持续）",
+    "I12": "保留 · 载重护栏（P3 CE 支持哨兵）",
+    "I13": "保留 · 载重护栏（P5 去 terminal-policy 条件）",
+    "I14": "保留 · 载重护栏（S17 完整性门不可被 flag 绕过）",
+    "I15": "保留 · 载重护栏（S20 headline 归我方、分角色记录）",
+    "I16": "保留 · 载重护栏（NEW-2 检查点先判定后存盘）",
+    "I17": "保留 · 载重护栏（S23 train 划分不污染）"
+  },
   "findings": [
     {
       "id": "I1",

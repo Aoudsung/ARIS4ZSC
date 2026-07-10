@@ -107,7 +107,7 @@ training:
   terminal_exploration:
     enabled: true
     bias_start: 0.9
-    # L1-fix (prereg L1_CONSOLIDATION_PREREG_DRAFT.md): hold the terminal-exploration
+    # L1-fix (prereg archive/2026-07_asymm-role-v2-line/L1_CONSOLIDATION_PREREG_DRAFT.md): hold the terminal-exploration
     # channel constant — bias_end == bias_start makes the 2500-update anneal inert.
     # Baseline (e1rev, 0.35) measured: effective terminal-exploration rate eps*bias
     # collapses ~36% -> ~3.5% and ego-sole competence collapses with it (4/4 seeds).

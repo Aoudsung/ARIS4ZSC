@@ -1,6 +1,13 @@
 # METHOD_LOCK — ARIS-Bellman OvercookedV2 ZSC (asymm_advantages)
 
-Status: **method-locking + validation phase** (no further method interventions).
+> 治理精简 2026-07-08：本文件的门已按 GOVERNANCE_CUTLIST.md 处置；加/减门须过 OPERATING_CONSTRAINTS.md §7 退休阀门。
+
+Status: **validation / read-out phase** — the G2-lite method line is closed as
+unsupported (sec18.14.3). The former "freeze the method once decisive numbers
+arrive" contract is **not** a standalone gate; its one load-bearing rule — do not
+tune the method on decisive-run outcomes — is folded into the preregistration
+decision rules (sec18.6 forbids post-hoc reinterpretation; sec18.11 forbids tuning
+designs on decisive-run results).
 Frozen candidate: `aris_bellman_g2_coverage_constrained_progression_seed_v1`
 (immutable at `frozen/…_v1/` on the remote). All comparisons are against it.
 
@@ -40,6 +47,10 @@ load-bearing — not decorative.
 
 ## 3. Necessary vs removable (this layout/split)
 
+> 已归档（2026-07-08，见文末「已归档 / 已合并」）：本节的 NECESSARY 载重组件清单与
+> REMOVABLE 可移除组件台账属于 G2-lite 方法线；该方法线已在 sec18.14.3 判为不成立而关闭。
+> 下表保留为历史消融记录，**不再是**在架的方法组成要求；新基底须重新建立自己的载重组件证据。
+
 ```
 NECESSARY / load-bearing:
   actor-specific sparse credit (ego_delivery)
@@ -70,6 +81,9 @@ dynamic next-option TD mask + terminal-yield partner` — NO progression shaping
 NO seed replay, NO directed exploration, NO yield-upweight.
 
 ## 4. G2-lite (locked simplified candidate)
+
+> 已归档（2026-07-08）：G2-lite 是上述已关闭方法线（sec18.14.3）的候选，仅存档；不再作为
+> 在架的锁定方法。见文末「已归档 / 已合并」。
 
 `ocv2_step4_asymm_G2lite.yaml` = G2 minus seed-replay, minus directed-exploration,
 yield-upweight → 1×. Keeps everything in "NECESSARY" above + progression shaping
@@ -134,7 +148,11 @@ The A1/A2/A7 dissociation still shows the graph is causal *for the ARIS controll
 but base_only needs no graph and still completes, so task-level ARIS superiority is
 **unproven on this split**. Next work is BENCHMARK CONSTRUCTION, not ARIS changes.
 
-## 8b. G2-lite FINAL (frozen engineering candidate — no more method changes)
+## 8b. G2-lite FINAL (归档的工程候选)
+
+> 已归档（2026-07-08）：G2-lite 属 sec18.14.3 判负关闭的方法线，仅存档。原「no more method
+> changes / 冻结」的说法不再作为独立的门——「拿到决定性数字后不再调方法」已并入 preregistration
+> 决策规则（sec18.6 禁事后重释、sec18.11 禁在决定性结果上调设计）。见文末「已归档 / 已合并」。
 
 ```
 keep:    actor-specific sparse credit; coverage-constrained CE graph (+ serve/plate/
@@ -429,7 +447,7 @@ Next valid claim transition requires: remote gated verification of I10-I18, the 
 ## sec18. Phase-0 decisions + preregistration (2026-07-02, pre-Phase-1 lock)
 
 Append-only. Records the two governance decisions closing Phase 0 of
-[EXPERIMENT_CHAIN_PLAN.md](EXPERIMENT_CHAIN_PLAN.md), and PREREGISTERS the
+[EXPERIMENT_CHAIN_PLAN.md](../../archive/2026-07_asymm-role-v2-line/EXPERIMENT_CHAIN_PLAN.md), and PREREGISTERS the
 decision rules for R2.1/R2.2/E1/E2/E3. Per plan §8: results are read out by
 these tables verbatim; post-hoc reinterpretation is forbidden.
 
@@ -471,6 +489,13 @@ archive + Type-B human checkpoint) is process-level, not statically checkable:
 it is tracked by EXPERIMENT_CHAIN_PLAN Phases 3–5 and this file's dated
 entries, not by the gate.
 
+> §7 调和（2026-07-08，OPERATING_CONSTRAINTS §7）：静态 fidelity 门是 **读数前 / 部署前
+> 审计**，不是每次启动的门——在读 claim 或改方法代码前要求它绿即可，不必每次启动都过。eval
+> 完整性标志 I10–I17 仍**硬拦读数**（claim 高度，非启动门），§7 允许保留。Type-B 人工签字只保留
+> 一个：**终读裁决 / claim 接受**（I18 的 Type-B 检查点；sec18.14 签③）。sec18.14 里更早的启动前
+> 签①（预注册）与中途签②（盲集落地）是那一轮**已执行完的盲测轮的历史记录**，不构成对未来运行的
+> 启动门；不得再把启动前或实验中途的人工签字当作开跑前必过的门。
+
 ### 18.4 PREREGISTRATION — R2.1 partner-differentiation certificate
 
 Procedure: per candidate layout × partner set: fixed seeds + randomized
@@ -486,6 +511,12 @@ partner-only play does not saturate the task.
 | Collapse (indistinguishable) | FAIL — STOP; no ARIS-vs-baseline claim on this substrate; escalate to FCP/MEP line |
 
 ### 18.5 PREREGISTRATION — R2.2 asymm CE support probe
+
+> 降级（2026-07-08，OPERATING_CONSTRAINTS §7；文档已在 sec18.10.3 先行降级）：R2.2 不再是
+> 启动门或分叉门。它是 **事后 / 读数前审计**——在 E1 之后跑一次 P3 支持哨兵：CE=0 记为
+> 「支持不足」而非「测得零外部性」，某单元格的零只有在 `estimable_mask=true` 且 support ≥
+> min_weight 时才可解释。P3 支持哨兵规则本身保留（它 localize 了 S27 的 12000 行污染）；此处
+> 改的只是它的高度——从拦启动改为读 claim 前审。
 
 500–1000 episodes/train-partner; artifact must carry per-pair weight_sum +
 all masks + CI. Citation rule: a zero is interpretable only with
@@ -538,12 +569,22 @@ E3: window-4 / window-8 / persistent-hidden (main), 3 seeds each.
 2. **sec18.7 E2 zeroed-mode integrity note:** the zeroed-channel ablation eval must
    record `evidence_policy=behavior_inferred_v1_zeroed_ablation` (explicit mode) so
    the S17 hard gate can admit it without weakening the formal-path check.
-3. **Formal-path rule (Phase-1 finding R1-A):** formal runs consume the pipeline
-   `graph.json` via the `graph_path` branch (unconditional coverage gate + stamped
-   provenance). The `ce_path` branch with `require_task_stage_coverage=false` is
-   smoke-only and must never appear in a formal config.
+3. **Formal-path config audit (Phase-1 finding R1-A):** formal runs should consume
+   the pipeline `graph.json` via the `graph_path` branch (unconditional coverage
+   gate + stamped provenance); the `ce_path` branch with
+   `require_task_stage_coverage=false` is smoke-only. Per OPERATING_CONSTRAINTS §7
+   this is a **post-hoc / pre-claim audit, not a start-blocking gate**: R1-A itself
+   recorded "no headline incident, minor", and the build-time coverage gate already
+   fails fast if `ce_path` slips into a formal build. Read the effective config back
+   from the built run object before reading a claim (or before deploying changed
+   config), rather than gating every launch on it.
 
 ## sec18.9 R2.1 supplemental preregistration — throughput lens + layout sweep (2026-07-03)
+
+> 已归档（2026-07-08，见文末「已归档 / 已合并」）：本节的 FSM 脚本-ego 吞吐/完成「可容许门」
+> （fsm_throughput / rand / ponly 阈值）已被 sec18.10 自我取代——改由 E1 四臂自身作可容许判读
+> （sec18.10.1–18.10.2）。**须区分**：R2.1 差异化证书（成对可区分性探针，27/28 对可区分，已
+> PASS）**保留**为在架前置；这里归档的只是基于 FSM-oracle 的**可容许**读法。下文保留为历史记录。
 
 Append-only. Extends the R2.1 preregistration (sec18.4) after the 2026-07-03 result
 revealed that the completion-rate lens saturates on asymm_advantages: three of the
@@ -671,6 +712,10 @@ already resolved.
 - sec18.9 stays on file as a completed but methodologically superseded gate.
 
 ## sec18.11 Pre-E1 innovation preregistration (2026-07-04, user-directed)
+
+> 已归档（2026-07-08，见文末「已归档 / 已合并」）：本节第 5 条的 /novelty-check + 形式化义务
+> 附于 U1/U2 方法线，该线已在 sec18.14.3 判负关闭；此义务随之归档。真正开新方法故事时再启一次
+> 轻量查新即可，不作在架门。下文保留为历史记录（含预注册决策规则，仍是 method-freeze 唯一归属）。
 
 Append-only. User directive: correctness as precondition, innovation as goal,
 ICLR as the bar. Recorded BEFORE any E1 data exists — this is the only honest
@@ -967,3 +1012,35 @@ Method-layer claims (C1'/C2' and all granularity headlines): CLOSED as
 unsupported. Surviving assets: data-sufficiency finding (L1), rebuilt substrate
 + ~18x eval speedup, blind-protocol discipline, failure anatomy. Next direction
 = separate user decision; nothing scheduled.
+
+---
+
+## 已归档 / 已合并（2026-07-08，依据 GOVERNANCE_CUTLIST.md）
+
+本节按 GOVERNANCE_CUTLIST.md 的 METHOD_LOCK 处置表落库。归档＝移出在架门面、留档不删；
+合并＝并入唯一归属、删重复表述。上文的历史消融与预注册文本仍留在原处（本项目 append-only
+纪律），本节只做「不再作为在架门」的登记，并在原处加了指回本节的说明。
+
+- **necessary-component-checklist（sec3 NECESSARY 载重组件清单 / sec4 / sec8b G2-lite）** —
+  归档。属已在 sec18.14.3 判负关闭的 G2-lite 方法线；无过程事故（内容是消融结果本身），保留
+  为历史消融记录，不再是在架的方法组成要求。新基底须自建载重组件证据。
+- **removable-component-ledger（sec3 REMOVABLE 可移除组件台账）** — 归档。同一关闭方法线的
+  非阻塞简化结果，随该线归档。
+- **FSM-oracle-admissibility gate（sec18.4 完成可容许读 + sec18.9 吞吐可容许门 + FSM 脚本-ego
+  体检读法）** — 归档。已被 sec18.10 自我取代（改由 E1 四臂自身作可容许判读）。活的前置转入
+  **R2.1 差异化证书**（成对可区分性探针，已 PASS，保留不动）。
+- **NEW-4 quarantine（sec17 第 7 条 / CODEX_IMPL_SPEC v1–v4 远程数字）** — 归档。一次性关闭
+  的隔离事件。残留事实一行「修复前 v1–v4 远程数字作废，仅诊断，不可支持或反驳任何主张」保留
+  在 sec17.7 的在架面上。
+- **/novelty-check + 形式化义务（sec18.11 第 5 条）** — 归档。附于 sec18.14.3 已关闭的 U1/U2
+  方法线；真正开新方法故事时再启一次轻量查新，不作在架门。
+- **method-freeze-contract（顶部 Status「no further method interventions」/ sec8b「no more
+  method changes」/ sec18.11 冻结句）** — 合并进 preregistration 决策规则。唯一载重内容「不对
+  决定性数字后调方法」由 sec18.6（禁事后重释）+ sec18.11（禁在决定性结果上调设计）承载；删除
+  独立的冻结契约表述，只留指针。
+
+降级（DEMOTE，仍在原处、未移出，仅登记去向）：
+- **CE=0 estimable_mask 可解释规则（R2.2 / sec18.5）** — 降为事后 / 读数前的 P3 支持哨兵审计
+  （见 sec18.5、sec18.10.3）；P3 支持哨兵规则本身保留（KEEP），只改高度。
+- **正式路径 config 不变量（graph_path vs ce_path，sec18.8 第 3 条）** — 降为事后 / 读 claim 前
+  的 config 回读审计；构建期 coverage 门已 fail-fast，无需拦每次启动。

@@ -1,9 +1,11 @@
 # FINDINGS_LEDGER.md — 根因裁定发现台账（唯一真相源）
 
+> 治理精简 2026-07-08：本文件的门已按 GOVERNANCE_CUTLIST.md 处置；加/减门须过 OPERATING_CONSTRAINTS.md §7 退休阀门。
+
 **Status:** ROUND-1 已收敛，7处分歧全部裁决(采纳codex) · **执行暂缓**（用户裁定"都先不做"）
 **Date:** 2026-07-02 · **Branch:** `rc-rootcause-fix`
 
-> 规则（[ROOTCAUSE_REVIEW_PLAN.md](ROOTCAUSE_REVIEW_PLAN.md) §2.1）：后续一切讨论、提交、重跑结论
+> 规则（[ROOTCAUSE_REVIEW_PLAN.md](../../archive/2026-07_asymm-role-v2-line/ROOTCAUSE_REVIEW_PLAN.md) §2.1）：后续一切讨论、提交、重跑结论
 > **只能引用本表 ID**；不在表里的问题视为不存在；不想修的问题必须记 `wontfix+理由`，不能
 > 静默丢弃。历史记录**追加不覆盖**——分歧的原始双方论证保留在文末，裁决作为追加记录，不删除
 > 争议过程本身。
@@ -12,7 +14,7 @@
 `修复中` · `已提交` · `已验证` · `已关闭` · `wontfix` · `阻塞于治理`
 
 **快照统计**：51 条。codex 本轮覆盖 50/51（仅W8待下一轮）。**分歧：0**（7处本轮全部裁决，
-均采纳codex修正）。**治理未决：1**（§5.1，见下，明确延后，非阻塞当前状态）。
+均采纳codex修正）。**治理未决：0**（§5.1 已于 2026-07-08 归档——该治理决策已在 Phase 0 G0.1/G0.2 闭合，见下）。
 
 **当前动作状态：暂停**。用户明确"都先不做"——不打包clean zip、不进
 `ROOTCAUSE_FIX_EXECUTOR_PROMPT.txt`、不再调用codex。本文件此次更新仅做**决策固化**（把已经
@@ -20,20 +22,16 @@
 
 ---
 
-## §5.1 治理决策——明确延后（不是待定，是用户主动选择晚定）
+## §5.1 治理决策——已闭合（2026-07-08 归档，依据 GOVERNANCE_CUTLIST.md）
 
-**用户裁定（2026-07-02）**："等我修订完代码再决定。"
+原状态（2026-07-02）："等我修订完代码再决定"——即 role_conditioned_v1 工作区伙伴库重设计是否
+可用（是否违反 7/1 合成数据禁令）曾被"明确延后"，并把 W 系列整体标记 `阻塞于治理`、把修复顺序
+步骤6 前置于本决策。
 
-含义：role_conditioned_v1 工作区伙伴库重设计是否可用（是否违反7/1合成数据禁令）这一问题，
-**不在本次会话裁定**，触发条件是"相关代码修订工作完成之后"。在此之前：
-
-- W系列（W1-W8）整体标记 `阻塞于治理`，即使个别条目（如W1、W7）本轮已经通过分歧裁决更正了
-  严重度/是否成立，**这不解除治理阻塞**——分歧裁决解决的是"这条发现本身对不对"，治理决策解决
-  的是更上位的"这个重设计的伙伴库能不能作为正式benchmark使用"，两者独立，不能互相替代。
-- 修复顺序步骤6（伙伴库修复，见下）保持"前置：§5.1治理裁决"不变。
-- 提醒：`ROOTCAUSE_FIX_EXECUTOR_PROMPT.txt` 步骤7本身也要求这个治理决策（"mark it as benchmark
-  v2... requires human governance decision before becoming a benchmark"）——两处来源独立要求
-  同一个决策，说明这确实是真实阻塞点，不是本计划过度设卡。
+残留事实（留档）：该决策已在 Phase 0 裁决闭合——role_conditioned_v2 有条件允许作受控机制诊断基底
+（G0.1，headline ZSC 主张走 FCP/MEP 群体），`require_ego_delivery_selection` 置 true（G0.2）；详见
+下方 Phase 0 执行记录与 METHOD_LOCK sec18.1–18.2。因此本节不再作为"阻塞于治理"的启动门，W 系列
+早先的"阻塞于治理"标记同被此裁决取代。全节叙事已归档（见文末"已归档 / 已合并"段）。
 
 ---
 
@@ -47,7 +45,7 @@
 （W7=REFUTED无排名；E1-E9=豁免无排名；NEW-1/2/3=新发现未排名）
 ```
 
-**修复顺序已按分歧7裁决更新**——详见 [ROOTCAUSE_REVIEW_PLAN.md](ROOTCAUSE_REVIEW_PLAN.md) §2.3
+**修复顺序已按分歧7裁决更新**——详见 [ROOTCAUSE_REVIEW_PLAN.md](../../archive/2026-07_asymm-role-v2-line/ROOTCAUSE_REVIEW_PLAN.md) §2.3
 （本次同步更新，P5提前、评估完整性提前、新增治理门步骤）。
 
 ---
@@ -57,10 +55,13 @@
 | ID | 断言（我方原判） | 严重度(我方) | codex verdict | 人类裁决(2026-07-02) | 处置 | 目标提交/验证 | 状态 |
 |---|---|---|---|---|---|---|---|
 | P1 | 脚本伙伴真实执行选项被直接注入证据流(train/eval/CE)；行为推断器死代码 | 高 | CONFIRMED·HIGH·#1 | **采纳codex**：Q-B命题措辞软化为"P1使parity更可能、使'习得推断'主张不可采信，但不构成parity的机械证明——效应量只能由去oracle重跑测定"（不是"P1⇒parity"的机械蕴含） | fix | 步1(去oracle)，不变 | 已裁定 |
-| P2 | HEAD:+100吞没±4/−1⇒伙伴同一；工作区已重缩放但恢复项未同步 | 高 | REFINED·HIST-HIGH/现状MED·#5 | **采纳codex**：历史结论(HEAD)归档为artifact-suspect，**当前工作区树不需要专项修复**——工作区已无该swamping算术，原判"高"仅适用于历史版本 | archive(历史)/no-op(当前树) | 无需独立修复步骤；残余风险随W系列跟踪(阻塞于治理) | 已裁定 |
 | P3 | asymm的`serve_soup CE=0.000`是支持度不足哨兵值非测量 | 高 | CONFIRMED·HIGH·#4 | 无分歧，维持原判 | fix | 步3(CE支持度sidecar+重测) | 已裁定 |
-| P4 | 信念=4步滑窗每次从零隐状态重编码，无跨决策记忆 | 高 | CONFIRMED·HIGH·#2 | 无分歧，维持原判 | fix | 步2(信念持久化) | 已裁定 |
+| P4 | 信念=4步滑窗每次从零隐状态重编码，无跨决策记忆 | 高 | CONFIRMED·HIGH·#2 | 无分歧，维持原判 | fix | 步2(信念持久化)；含 LDS-B6：每个正式 config 须显式钉住 belief_persistence | 已裁定 |
 | P5 | 奖励/探索/回放播种以伙伴`terminal_policy`真值为条件 | 高 | CONFIRMED·HIGH·#3 | 无分歧(措辞已一致)；**排序采纳codex**：从原步5提前到步4 | fix | **步4**(原步5，提前) | 已裁定 |
+
+> **P2 已归档（2026-07-08）**：P2 说的"恢复项 +100 吞没角色奖励⇒伙伴同一"只存在于历史 HEAD 版本；
+> 当前工作区树已重缩放、无该吞没算术，属 no-op，无可执行修复。残留事实：历史 HEAD 的相关数字为
+> artifact-suspect，已隔离/作废。详见文末"已归档 / 已合并"段。
 
 ---
 
@@ -81,7 +82,7 @@
 | S12 | preflight回退用team credit | 中低 | REFINED·MED-HIGH·#12(升级) | 已裁定 |
 | S16 | global_gru诊断形状崩溃 | 中 | CONFIRMED·MED-HIGH·#14 +实锤log | 已裁定 |
 | S17 | `--allow_diag_skip`短路全部完整性门 | 中高 | CONFIRMED·HIGH·#7(升级) +实锤 | 已裁定 |
-| S18 | `reward_scale_verified`永假 | 中 | CONFIRMED·MED-HIGH·#9 +实锤，关联NEW-3 | 已裁定 |
+| S18 | `reward_scale_verified`永假 | 中 | CONFIRMED·MED-HIGH·#9 +实锤；含 NEW-3（已归档 role-v1 eval 报告 `reward_scale_verified=false`，与 S18 同因）——排除口径保留：归档 role-v1 数字视为诊断性非正式结果，不进任何主张证据链 | 已裁定 |
 | S19 | diagnose_traces.py三缺陷 | 中 | CONFIRMED·LOW-MED·#28 | 已裁定 |
 | S20 | completion计入伙伴/错误送餐 | 中 | CONFIRMED·HIGH·#6(大幅升级) | 已裁定 |
 | S21 | eval种子惰性+跨伙伴复用序列 | 中 | CONFIRMED·MED·#24 | 已裁定 |
@@ -92,7 +93,7 @@
 
 ---
 
-## 工作区伙伴库重设计（W）— 全部 `阻塞于治理`（§5.1，见上）
+## 工作区伙伴库重设计（W）— §5.1 治理已闭合（2026-07-02），下列 `阻塞于治理` 标记已作废；活的可用性把关归 R2.1 伙伴差异化证书
 
 | ID | 断言（我方原判） | 严重度(我方) | codex verdict | 人类裁决(2026-07-02) | 处置 | 状态 |
 |---|---|---|---|---|---|---|
@@ -114,7 +115,7 @@
 | D1 | ~~伙伴差异性前提从未写为可检验前提，accept_layout()从未操作化该指标~~ | 高 | REFINED·LOW-MED·#34："此断言已过时(stale)：当前`layout_diagnostics.py:89-112`确已包含`partner_return_variance_proxy`" | **采纳codex，更正断言**：`accept_layout()` **已经**包含`partner_return_variance_proxy`代理指标；原"从未操作化"表述不成立。**存活的更精确批评已转移到D2**（该代理只是训练前粗粒度门，无训后复检——即真正的盲点） | 已裁定(断言已更正，见下方[修正记录]) |
 | D2 | reference_base_gap门只训练前检查，无训后复检 | 中 | CONFIRMED·MED-HIGH·#13 | 无分歧；D1软化后，**D2成为本类设计局限中存活的核心批评** | 已裁定 |
 | D3 | 闭合模式集⇒仅重组式泛化，Exp2预期与非声明矛盾 | 中 | REFINED·MED claim-scope·#35，措辞一致 | 无分歧 | 已裁定 |
-| D4 | CE估计量把可测性与占用率混同 | 高 | CONFIRMED·HIGH estimator·#36 | 无分歧 | 已裁定 |
+| D4 | CE估计量把可测性与占用率混同 | 高 | CONFIRMED·HIGH estimator·#36 | 无分歧 | 已裁定 · 降级为读 claim 前审计：读该 claim 时限定"支持相对"口径（S27 已由 P3 sidecar + 修复处理），不作启动门 |
 | D5 | 价值充分性相对训练伙伴分布定义(鸡生蛋) | 中高 | CONFIRMED·MED claim-scope·#37 | 无分歧 | 已裁定 |
 
 **[D1修正记录 2026-07-02]**：round-1我方综合曾表述"提案从未把伙伴差异性前提写成可检验前提，
@@ -140,26 +141,20 @@
 | ID | 断言 | severity | 说明 | 状态 |
 |---|---|---|---|---|
 | **NEW-2** | checkpoint选择在free-rider guard判定**之前**就已保存`checkpoint.pt`；guard事后标`fail`不撤回文件(除非`select_final=true`) | **高**(与P1/P4/P3/P5同级优先) | 意味着历史上任何guard=fail的跑，其`checkpoint.pt`可能仍是被拒绝的free-riding checkpoint。**建议在信任任何历史"guard: fail"跑的结论前，先做一次产物审计**（哪些checkpoint.pt对应fail verdict、是否被下游引用过） | 待人类裁决(新发现，优先级高，未纳入本轮6项分歧) |
-| NEW-1 | preflight回退路径可能用错伙伴池/信用目标 | MED-HIGH | `layout_diagnostics.py`无replay可复用时调用`make_training_partners`不带`partner_set`，收集replay不带`credit_params` | 待人类裁决(新发现) |
-| NEW-3 | 当前role-v1 config与已归档role-v1产物目标/provenance口径不一致 | MED | 归档role-v1 eval报告`reward_scale_verified=false`，与S18同因；**归档role-v1数字应视为诊断性非正式结果** | 待人类裁决(新发现，关联S18) |
+
+> NEW-1、NEW-3 已于 2026-07-08 处置：**NEW-1 归档**（preflight 回退用错伙伴池/信用目标——已修复并 ACCEPTED，代码护栏独立存在，见下方"静态验收 PASS"段）；**NEW-3 合并入 S18**（同 `reward_scale_verified` 根因；"归档 role-v1 数字视为诊断性非正式结果"的排除口径已并入 S18）。NEW-2 保留。详见文末"已归档 / 已合并"段。
 
 ---
 
-## 修复顺序（已按分歧7裁决更新——权威版本见 [ROOTCAUSE_REVIEW_PLAN.md](ROOTCAUSE_REVIEW_PLAN.md) §2.3）
+## 修复顺序——步骤叙事已归档（2026-07-08，依据 GOVERNANCE_CUTLIST.md）
 
-```
-步1 去oracle证据(P1)                                          [无前置]
-步2 信念持久化(P4,S2)                                          [前置:步1]
-步3 CE支持度sidecar+重测asymm，仅估计量不碰policy(P3,S9,S10,S11) [可与步1-2并行]
-步4 课程去oracle(P5)                          [原步5，2026-07-02采纳codex提前]
-步5 评估完整性(S16,S17,S18,S19,S20)            [原步6，2026-07-02采纳codex提前；任何决定性重跑前必过]
-步6 伙伴库修复(W2,W3,W5,W6；W1已证伪不再需要)   [前置:§5.1治理裁决——当前延后，见上]
-步7 preflight/selection治理门(D1[已更正],D2,S12,S23,NEW-1,NEW-2)
-                                    [2026-07-02 codex新增建议已采纳；任何新主张声明前必过]
-```
+原步1–步7 的顺序叙事已归档：步骤叙事本身从未抓到任何失败，且其中"任何决定性重跑前必过""任何
+新主张声明前必过"等"拦启动"措辞与 OPERATING_CONSTRAINTS §7（默认拦 claim、不拦启动）相抵。
 
-**当前状态：以上顺序已裁定，但整体执行暂缓**（用户："都先不做"）。下一次推进由用户发起，
-不需要重新走分歧裁决流程——直接从步1开始，或先处理NEW-2的历史产物审计。
+残留事实（留档）：步1–5 已完成实施与静态验收（见下方"静态验收 PASS"段，P1/P4/P5/P3/S16/S17/S18/
+S19/S20 均已 `已验证(静态)`）；两个仍活的残留——W 伙伴库重设计、preflight/selection 治理门——各自
+另立门跟踪（前者见 W 表 + r2.1 差异化证书，后者见 S12/S23/NEW-2 各自归属），不再以统一"修复顺序"
+的启动门形式存在。原七步顺序的一行摘要见文末"已归档 / 已合并"段。
 
 ---
 
@@ -167,7 +162,7 @@
 
 - **执行路径A（进`ROOTCAUSE_FIX_EXECUTOR_PROMPT.txt`）**：暂缓。
 - **执行路径B（clean-zip二轮独立评审）**：暂缓。
-- **§5.1治理决策**：延后至"代码修订完成后"，见上方专节。
+- **§5.1 治理决策**：已闭合（2026-07-02 Phase-0 G0.1/G0.2 裁定），见上方专节与文末归档记录。活的可用性把关现由 R2.1 伙伴差异化证书承担。
 - 待用户发起时，直接引用本文件的"修复顺序"章节即可，无需重新裁决已解决的7项分歧。
 
 ---
@@ -259,13 +254,14 @@ F10 gap-proxy回退缺credit_params(layout_diagnostics.py:132-144) · F12 fideli
 F13 evidence_window 4vs8消融值得列入实验链 · F14 W3±1500伙伴行为重设计随de-oracle捆绑(已被benchmark-v2 candidate框架覆盖，仍需certificate)
 
 **待用户决策（进入正式实验前）**：
-D-A `require_ego_delivery_selection` 在 role_v1/role_v1_novb 两个正式候选 config 中为 **false**
-（asymm/armA/armB 为 true）——要么论证 contrib_team 已使 free-rider 无利可图故不需要，要么翻开。
+D-A `require_ego_delivery_selection`（role_v1/role_v1_novb 曾为 **false**，asymm/armA/armB 为 true）
+——**已合并入 S20/NEW-2 自我交付族**并于 Phase 0 G0.2 置 **true**（书面豁免路线被否决）；本项已闭合，
+2026-07-08 治理精简折入该族，见文末"已归档 / 已合并"段。
 D-B **§5.1 治理决策现在成熟**（用户原话"等我修订完代码再决定"——代码修订已完成并验收）：
 role_conditioned_v2 candidate 能否作为 benchmark-v2 使用（须先过 partner-differentiation certificate）。
 
 **状态推进**：P1/P3/P4/P5/S1/S2/S3/S16/S17/S18/S20/S23/NEW-1/NEW-2 → `已验证(静态)`；
-远程 I10-I18 验证 = 实验链 Phase 1（见 [EXPERIMENT_CHAIN_PLAN.md](EXPERIMENT_CHAIN_PLAN.md)）。
+远程 I10-I18 验证 = 实验链 Phase 1（见 [EXPERIMENT_CHAIN_PLAN.md](../../archive/2026-07_asymm-role-v2-line/EXPERIMENT_CHAIN_PLAN.md)）。
 
 ---
 
@@ -371,13 +367,12 @@ LDS-B2 属门严格性）。修复窗口纪律见 bundle/SWEEP_SUMMARY.md §6。
 | LDS-C2 | B | C9 | 基线缓存 key 漏 sparse-credit/terminal-shaping/allow_shared_shaping | **FIXED** `98fe149`（schema v3，旧条目全失效） |
 | LDS-C3 | B | C5 | eval 无 canonical throughput 字段（分母口径可漂） | **FIXED** `98fe149`（`_throughput_fields`，sec18.9.2 口径，None≠0） |
 | PM-7 | — | — | 25-run 表无合规汇总工具 | **FIXED** `6ece080`（aggregate_e1rev.py，已对真实 25 run 出表） |
-| LDS-A1 | B | C7 | E2 zeroed 门漏 confidence/半置零 | OPEN，窗口二（E2 前修） |
-| LDS-B3 | B | C6 | E2 无 CLI 消融开关（需篡改 ckpt config） | OPEN，窗口二（E2 前修） |
-| LDS-B4 | B | C3 | `graph.sparse_ce_support` config 被 CE 脚本忽略（认 CLI flag） | OPEN，窗口二（CE 重建前修） |
+| LDS-A1 | B | C7 | E2 zeroed 门漏 confidence/半置零 | 降级为事后审计：E2 跑完后核验推断通道是否真置零（含 confidence/半置零），不作 E2 启动门 |
+| LDS-B3 | B | C6 | E2 无 CLI 消融开关（需篡改 ckpt config） | 降级为事后审计：E2 跑完后核验消融条件确已置零，不作 E2 启动门 |
+| LDS-B4 | B | C3 | `graph.sparse_ce_support` config 被 CE 脚本忽略（认 CLI flag） | 降级为事后审计：从构建对象回读有效 config，核验 sparse_ce_support 是否被 CLI 静默覆盖，不拦启动 |
 | LDS-B5 | B | C11 | `--reuse_replay` 门盲于 support_mix/reward/shaping 等 | OPEN，窗口二（CE 复用前修） |
-| LDS-B6 | B | C2 | `belief_persistence` 未在任何正式 config 显式钉 | OPEN，窗口二（E3 前钉 config） |
-| LDS-B7 | C | C11 | eval 完整性门可被零证据 vacuous 通过 | OPEN，窗口二 |
-| LDS-C4 | C | C4 | summary 均值把缺失字段静默当 0.0 | OPEN，窗口二（新字段已用 fail-closed 索引，旧字段待改） |
+| LDS-B7 | C | C11 | eval 完整性门可被零证据 vacuous 通过 | 降级为事后审计：并入 P3/S9 支持度审计，读数前核验非零证据（现有门已两次正确 fail-closed），不拦启动 |
+| LDS-C4 | C | C4 | summary 均值把缺失字段静默当 0.0 | 降级为事后审计：旧字段一次性审 summary 均值是否把缺失当 0（新字段已 fail-closed），不拦启动 |
 
 修复验证记录：codex diff 复评 BLOCK（4 阻塞：cache key 漏 allow_shared_shaping、competence
 判据字段、eval 漏 serve_share、eval 缺去重）→ 全部修复 → **APPROVE-WITH-NITS**（nit 已修，
@@ -398,3 +393,44 @@ gate I1–I17 exit 0、aggregate_e1rev 对真实 25 run 出表成功（表见 EX
   双向回归测试）；真 checkpoint 直验 mismatches:{} → eval 重启放行。
 - **连带教训（记录）**：`python -c` 验证时 cwd 遮蔽 PYTHONPATH（sys.path[0]=''）——首次验证
   误报 STILL_FAILING；脚本路径执行不受此影响（编排器安全）。
+
+---
+
+## 已归档 / 已合并（2026-07-08，依据 GOVERNANCE_CUTLIST.md）
+
+本段按 GOVERNANCE_CUTLIST.md 第二节 FINDINGS_LEDGER.md 处置表落库。归档＝移出在架门、留档不删；
+合并＝删去重复、折入唯一归属。加/减门须过 OPERATING_CONSTRAINTS.md §7 退休阀门。
+
+**归档（移出在架门，仅留档）**
+
+- **P2**（恢复项 +100 吞没角色奖励⇒伙伴同一）：当前工作区树已重缩放为 no-op，无可执行修复；历史
+  HEAD 数字为 artifact-suspect、已隔离/作废。归档理由＝闭合事故，当前树无内容可执行。残留一行留在 P 表下。
+- **NEW-1**（preflight 回退可能用错伙伴池/信用目标）：已修复并 ACCEPTED（见"静态验收 PASS"段——
+  preflight 伙伴子集 + credit 修复），代码护栏独立存在。归档理由＝闭合事故，已离开待裁决面。
+- **修复顺序 步1–步7**（步1 去 oracle 证据 P1；步2 信念持久化 P4/S2；步3 CE 支持度 sidecar+重测
+  P3/S9/S10/S11；步4 课程去 oracle P5；步5 评估完整性 S16/S17/S18/S19/S20；步6 伙伴库修复 W2/W3/W5/W6；
+  步7 preflight/selection 治理门 S12/S23/NEW-2 等）：步骤叙事从未抓到失败，且含"任何决定性重跑/新主张
+  前必过"的拦启动措辞（与 §7 相抵）。归档理由＝无记录失败的礼仪叙事。残留：步1–5 已静态验收，两个活的
+  残留（W 伙伴库重设计、preflight/selection 治理门）各自另立门。
+- **§5.1 治理决策——明确延后**（role_conditioned_v1 伙伴库可用性是否违反 7/1 合成数据禁令）：已在
+  Phase 0 裁决闭合——role_conditioned_v2 有条件允许作诊断基底（G0.1）、`require_ego_delivery_selection`
+  置 true（G0.2）。归档理由＝闭合事故。残留一行留在原节与顶部快照。
+
+**合并（删重复、折入唯一归属）**
+
+- **NEW-3**（归档 role-v1 config 与产物 provenance 口径不一致）→ 折入 **S18**：同 `reward_scale_verified`
+  根因；唯一内容"归档 role-v1 数字视为诊断性非正式结果、不进主张证据链"已并入 S18 的 codex verdict 列。
+- **LDS-B6**（`belief_persistence` 未在任何正式 config 显式钉）→ 折入 **P4**：属 P4 的 config 形态；
+  "每个正式 config 须显式钉住 belief_persistence"已并入 P4 的目标提交/验证列。
+- **D-A**（`require_ego_delivery_selection` 正式 config 须为 true）→ 折入 **S20/NEW-2** 自我交付族：
+  同族且已于 Phase 0 G0.2 置 true（见上"待用户决策"条已标闭合）。
+
+**降级（仍在架，就地从"拦启动"改为事后/读数前审计）**
+
+以下五项检查实质保留，只是不再作"开跑前必绿"的启动门；改动已就地写入各自表行：
+
+- **LDS-A1 / LDS-B3**：E2 跑完后核验推断通道是否真置零（不作 E2 启动门）。
+- **LDS-B4**：从构建对象回读有效 config，核验 `graph.sparse_ce_support` 是否被 CLI 静默覆盖。
+- **LDS-B7**：并入 P3/S9 支持度审计，读数前核验非零证据。
+- **LDS-C4**：旧字段一次性审 summary 均值是否把缺失当 0（新字段已 fail-closed）。
+- **D4**：读该 claim 前限定"支持相对"口径。

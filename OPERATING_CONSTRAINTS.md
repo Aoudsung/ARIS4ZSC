@@ -1,7 +1,9 @@
 # OPERATING_CONSTRAINTS.md
 
 **Authoritative execution boundary for the ARIS4ZSC project.**
-Last updated: 2026-06-26 · Owner: project lead
+Last updated: 2026-07-08 · Owner: project lead
+
+> 治理精简 2026-07-08：本文件的门已按 docs/status/GOVERNANCE_CUTLIST.md 处置；加/减门须过 OPERATING_CONSTRAINTS.md §7 退休阀门。
 
 > Precedence: this file is the source of truth for *what an agent may execute* in
 > this project. If a generic ARIS skill's default behavior conflicts with the
@@ -62,7 +64,9 @@ All experiments run **remote-only**, never local. Contract pinned in
 - Host: `ssh zsc-customer` (persistent control connection, 8h reuse; password in CUSTOMER.md).
 - Project path (has `.venv`): `/apps/users/cxw/Document/CodeSpace/Selfs/CPR_REPO`.
 - 8 GPUs available.
-- **Discipline: after every code update, produce an explicit `git` diff.**
+- **Drift check (after-the-fact audit, not a start gate): after a code update,
+  produce an explicit `git` diff and review it when checking what changed.** This
+  is a cheap post-hoc drift check — it does not gate whether a run may start (§7.2).
 - Formal run contract (preflight → CE → graph → train → eval) is defined in
   [README_FIXES_20260624.md](archive/docs/README_FIXES_20260624.md). Formal training **requires an
   accepted preflight** via `--preflight_path`; rejected-layout smoke runs must not
@@ -83,11 +87,13 @@ by the Phase-1 PreToolUse hook (`.claude/hooks/`, not yet installed).
 | Parameter | Project default | Why |
 |-----------|----------------|-----|
 | `GPU` | `remote` | No local execution; §2 contract |
-| `AUTO_PROCEED` | `false` | Human gates every irreversible / outward step |
-| `human checkpoint` | `true` | Approval before experiment launch + claim acceptance |
+| `AUTO_PROCEED` | `false` | Stops the loop for human judgment only at the two points that have caught real failures — run authorization and final read-out adjudication (§7.5). Not a sign-off before every launch or mid-experiment. |
+| `human checkpoint` | `run authorization + final read-out only` | Per §7.5, human sign-off is reserved for run authorization (the execution-boundary consent) and final read-out adjudication. No per-launch or mid-experiment sign-off — that maps to no recorded catch; the claim-acceptance judgment is carried by the Type-B acceptance gate (§4). |
 | `CODE_REVIEW` | `true` | Cross-model review of experiment code before deploy |
 | `reviewer` | `codex` (GPT-5.5, xhigh) | Must be a **different model family** than the Claude executor |
-| `assurance` | `submission` for any final artifact | Full 5-layer audit chain gates the result |
+
+Final-artifact assurance (the full audit chain, `assurance = submission`) is
+folded into the Type-B acceptance gate — see §4.
 
 ---
 
@@ -106,6 +112,11 @@ is allowed to **drive** but never to **acquit** — per
 The five decisive scientific claims ([PROJECT_DASHBOARD.md](PROJECT_DASHBOARD.md) §3)
 are Type-B. No loop may declare them supported on its own verdict.
 
+**Final / outward artifacts** (submission-scale deliverables) are the product-scale
+form of the same rule: they require the full assurance audit chain
+(`assurance = submission`) and may never be self-signed. This is the merged home
+of the former §3 `assurance` default.
+
 ---
 
 ## 5. Enforcement status
@@ -115,7 +126,12 @@ are Type-B. No loop may declare them supported on its own verdict.
 | Declared intent | this file + [`.aris/config.json`](.aris/config.json) | ✅ in place |
 | Always-loaded restatement | [CLAUDE.md](CLAUDE.md) entrypoints | ✅ in place |
 | Mechanical enforcement | `.claude/hooks/no_local_exec_guard.py` PreToolUse guard (stop-and-**ask** on local exec; remote `zsc-customer` never gated; fail-open) | 🟡 drafted — **pending user approval** via `/hooks` or session restart |
-| Scientific-invariant gate | `.aris/tools/aris_bellman_fidelity_gate.py` — static, 9 checks (I1–I9), 6-state verdict, exit 1 on RED; runs in-boundary | ✅ built — green on current tree (`FIDELITY_GATE.{json,md}`) |
+| Scientific-invariant gate (pre-claim / pre-deploy audit) | `.aris/tools/aris_bellman_fidelity_gate.py` — static, 9 checks (I1–I9), 6-state verdict, exit 1 on RED; runs in-boundary | ✅ built — green on current tree (`FIDELITY_GATE.{json,md}`) |
+
+The static fidelity gate (I1–I9) is an **after-the-fact audit, not a start gate**:
+require it green *before reading a claim or before deploying changed method code*,
+not before every run (§7.2). It checks method identity; it never decides whether a
+run may launch.
 
 The guard is registered in `.claude/settings.json` but Claude Code requires the
 user to approve a new hook before it runs. Until approved, the boundary remains
@@ -163,3 +179,54 @@ rounds, multiple mechanism hypotheses chased.
 5. When a result looks like a method failure, **check the data budget before
    hypothesizing mechanisms** — "how many episodes did this model actually
    experience?" is the first diagnostic question, not the last.
+
+---
+
+## 7. Gate lifecycle — every gate must be able to die (2026-07-08)
+
+**Origin:** the governance layer grew monotonically — every recorded failure
+added a permanent gate, discipline, ledger ID, or pre-registration, and none
+were ever retired. The accumulated mass made starting an experiment feel like
+"build all the gates first." A full audit (`docs/status/GOVERNANCE_CUTLIST.md`) found ~124
+gate-entries across 7 docs collapsing to ~20–25 unique load-bearing rules; the
+rest were duplicate restatements, closed incidents, or ceremony mapping to no
+recorded failure. This section is the ratchet's retirement valve.
+
+**Rules (binding for every future gate):**
+
+1. **A new gate must record two things or it is not added:** the *specific real
+   recorded failure* it prevents, and its *retirement condition*. A rule that
+   maps to no recorded incident is at most a post-hoc audit, never a
+   start-blocking gate.
+2. **Default altitude = gate the claim, not the run start.** A check may block
+   *starting* a run only when its failure cannot be detected or repaired after
+   the fact — currently: preflight layout validity, effective data budget,
+   oracle-free evidence path, and blind-split non-contamination. Everything else
+   (static fidelity invariants, wiring read-backs, wording ladders, method-
+   identity checks) runs as a **pre-claim / pre-deploy audit**, not a per-launch
+   hoop. The fidelity gate is one fast static command; require it green *before
+   reading a claim or changing method code*, not before every run.
+3. **One home per rule.** A rule lives in exactly one file; everywhere else links
+   to it. Do not restate the same gate in CLAUDE.md + this file + AGENTS.md +
+   the dashboard + the ledger.
+4. **Periodic sweep.** When a gate's incident is closed or its retirement
+   condition is met, archive it. Closed/tautological gates do not stay listed as
+   active.
+5. **Human sign-off is scarce.** Retain human Type-B judgment at the two points
+   that have caught real failures — run authorization (the execution-boundary
+   consent) and final read-out adjudication. Do not add per-launch or
+   mid-experiment human sign-offs; they map to no recorded catch and are pure
+   start-latency.
+
+---
+
+## 已归档 / 已合并（2026-07-08，依据 docs/status/GOVERNANCE_CUTLIST.md）
+
+- **`assurance = submission` 五层审计链（原 §3 表的一行）** → 合并进 §4 Type-B
+  接受门。理由：它没有独立对应的真实失败，是"不得自我签收对外产物"原则在产物尺度上
+  的重复表述。唯一内容（最终/对外产物须过完整审计链、不得自判）现由 §4 承载。
+
+注：以下三项为**降级**（保留检查、改为事后/读数前审计），仍在各自章节的在架面上，
+不移入本节——每次代码更新后的 `git` diff（§2，事后漂移检查）、`AUTO_PROCEED` /
+`human checkpoint` 的启动前签字（§3，只保留 §7.5 的两个人工判断点）、静态 fidelity
+门 I1–I9（§5，读数前 / 改方法后审计）。
