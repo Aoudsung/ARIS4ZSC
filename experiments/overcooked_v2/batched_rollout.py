@@ -11,6 +11,24 @@ class BatchedRolloutUnsupported(RuntimeError):
     pass
 
 
+def _validated_uint32_seeds(seeds: Any, *, name: str = "seeds") -> np.ndarray:
+    """Cast seeds to uint32 for JAX PRNGKey use, refusing silent wraparound."""
+
+    array = np.asarray(seeds).reshape(-1)
+    if array.size and not np.issubdtype(array.dtype, np.integer):
+        raise TypeError(f"{name} must be integers.")
+    if array.size:
+        as_int64_capable = array.astype(object)
+        for value in as_int64_capable:
+            value = int(value)
+            if value < 0 or value > 0xFFFFFFFF:
+                raise ValueError(
+                    f"{name} must lie in [0, 2**32-1]; got {value}. "
+                    "Derive execution seeds via derive_ocv2_execution_seed."
+                )
+    return array.astype(np.uint32)
+
+
 @dataclass(frozen=True)
 class BatchedResetResult:
     obs: Any
@@ -31,7 +49,7 @@ def batched_reset(adapter: Any, seeds: np.ndarray | list[int]) -> BatchedResetRe
     except ImportError as exc:  # pragma: no cover - optional runtime dependency
         raise BatchedRolloutUnsupported("batched_reset requires JAX.") from exc
 
-    seed_array = np.asarray(seeds, dtype=np.int64).reshape(-1)
+    seed_array = _validated_uint32_seeds(seeds, name="batched_reset seeds")
     if seed_array.size == 0:
         raise ValueError("batched_reset requires at least one seed.")
 
@@ -87,8 +105,15 @@ class BatchedEnvPool:
         import jax
         import jax.numpy as jnp
 
+        if isinstance(batch_size, bool) or not isinstance(
+            batch_size,
+            (int, np.integer),
+        ):
+            raise TypeError("BatchedEnvPool batch_size must be an integer.")
+        if int(batch_size) <= 0:
+            raise ValueError("BatchedEnvPool batch_size must be positive.")
         self.env = env
-        self.batch_size = batch_size
+        self.batch_size = int(batch_size)
         self._jax = jax
         self._jnp = jnp
         self._vmap_reset = jax.jit(jax.vmap(env.reset))
@@ -101,7 +126,11 @@ class BatchedEnvPool:
 
     def reset(self, seeds: np.ndarray) -> None:
         jnp = self._jnp
-        seed_arr = jnp.asarray(np.asarray(seeds, dtype=np.int64).reshape(-1))
+        seed_arr = jnp.asarray(_validated_uint32_seeds(seeds, name="reset seeds"))
+        if int(seed_arr.shape[0]) != int(self.batch_size):
+            raise ValueError(
+                f"Expected {self.batch_size} reset seeds; got {seed_arr.shape[0]}."
+            )
         self.keys = self._vmap_prng(seed_arr)
         sub, self.keys = self._split_keys()
         self.obs, self.state = self._vmap_reset(sub)
@@ -111,11 +140,28 @@ class BatchedEnvPool:
         ego_actions: np.ndarray,
         partner_actions: np.ndarray,
     ) -> tuple[Any, Any, Any, Any, Any]:
+        """Legacy agent-0/agent-1 wrapper retained for CE collection."""
+
+        return self.step_joint(ego_actions, partner_actions)
+
+    def step_joint(
+        self,
+        agent_0_actions: np.ndarray,
+        agent_1_actions: np.ndarray,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Step a batch without assigning ego or partner meaning to a slot."""
+
         jnp = self._jnp
+        action_0 = np.asarray(agent_0_actions).reshape(-1)
+        action_1 = np.asarray(agent_1_actions).reshape(-1)
+        if action_0.size != self.batch_size or action_1.size != self.batch_size:
+            raise ValueError(
+                "Joint action arrays must match BatchedEnvPool.batch_size."
+            )
         sub, self.keys = self._split_keys()
         actions = {
-            "agent_0": jnp.asarray(ego_actions, dtype=jnp.int32),
-            "agent_1": jnp.asarray(partner_actions, dtype=jnp.int32),
+            "agent_0": jnp.asarray(action_0, dtype=jnp.int32),
+            "agent_1": jnp.asarray(action_1, dtype=jnp.int32),
         }
         obs, state, rewards, dones, info = self._vmap_step(sub, self.state, actions)
         self.state = state
@@ -149,10 +195,17 @@ class BatchedEnvPool:
     def reset_indices(self, indices: np.ndarray, seeds: np.ndarray) -> None:
         jax = self._jax
         jnp = self._jnp
-        idx = np.asarray(indices, dtype=int)
+        idx = np.asarray(indices, dtype=int).reshape(-1)
         if idx.size == 0:
             return
-        sub_keys = self._vmap_prng(jnp.asarray(np.asarray(seeds, dtype=np.int64)))
+        seed_array = _validated_uint32_seeds(seeds, name="reset_indices seeds")
+        if seed_array.size != idx.size:
+            raise ValueError("reset_indices requires one seed per environment index.")
+        if np.unique(idx).size != idx.size:
+            raise ValueError("reset_indices does not accept duplicate environment indices.")
+        if bool((idx < 0).any()) or bool((idx >= self.batch_size).any()):
+            raise ValueError("reset_indices contains an out-of-range environment index.")
+        sub_keys = self._vmap_prng(jnp.asarray(seed_array))
         sub_split = jax.vmap(jax.random.split)(sub_keys)
         new_keys = sub_split[:, 0]
         reset_keys = sub_split[:, 1]

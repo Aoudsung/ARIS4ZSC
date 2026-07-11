@@ -1735,6 +1735,67 @@ def per_head_masked_mean(
     return per_head, support, supported
 
 
+def sequence_td_core(
+    q_online_all: torch.Tensor,
+    q_target_all: torch.Tensor,
+    *,
+    actions: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    discounts: torch.Tensor,
+    n_heads: int,
+    td_loss: str = "huber",
+    huber_delta: float = 1.0,
+    double_q: bool = True,
+    vmax: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Shared double-Q sequence TD math over aligned Q traces ``[B,S,K,A]``.
+
+    This is the single home of the TD target/prediction arithmetic; both the
+    option-level ``sequence_td_loss`` and the standard-path primitive loss
+    delegate here so a correction cannot reach one training regime and silently
+    miss the other. Returns ``(predictions, targets, elementwise_loss)``.
+    """
+
+    safe_actions = actions.clamp(min=0)
+    gather_index = safe_actions[:, :, None, None].expand(-1, -1, int(n_heads), 1)
+    predictions = q_online_all[:, :-1].gather(-1, gather_index).squeeze(-1)
+
+    with torch.no_grad():
+        q_target_next = q_target_all[:, 1:]
+        if double_q:
+            next_actions = q_online_all[:, 1:].argmax(dim=-1)
+            next_values = q_target_next.gather(
+                -1,
+                next_actions.unsqueeze(-1),
+            ).squeeze(-1)
+        else:
+            next_values = q_target_next.max(dim=-1).values
+        next_values = torch.where(
+            dones.unsqueeze(-1),
+            torch.zeros_like(next_values),
+            next_values,
+        )
+        targets = rewards.unsqueeze(-1) + discounts.unsqueeze(-1) * next_values
+        if vmax is not None:
+            targets = targets.clamp(min=-float(vmax), max=float(vmax))
+
+    if td_loss == "mse":
+        elementwise = F.mse_loss(predictions, targets, reduction="none")
+    elif td_loss == "huber":
+        if not math.isfinite(float(huber_delta)) or float(huber_delta) <= 0.0:
+            raise ValueError("huber_delta must be positive when td_loss='huber'.")
+        elementwise = F.smooth_l1_loss(
+            predictions,
+            targets,
+            beta=float(huber_delta),
+            reduction="none",
+        )
+    else:
+        raise ValueError("td_loss must be one of {'huber', 'mse'}.")
+    return predictions, targets, elementwise
+
+
 def sequence_td_loss(
     q_net: RecurrentEnsembleQ,
     target_q_net: RecurrentEnsembleQ,
@@ -1785,45 +1846,19 @@ def sequence_td_loss(
             "forward_sequence must return Q[B,S,K,A] matching the batch dimensions."
         )
 
-    safe_actions = batch.actions.clamp(min=0)
-    gather_index = safe_actions[:, :, None, None].expand(-1, -1, q_net.n_heads, 1)
-    predictions = q_online_all[:, :-1].gather(-1, gather_index).squeeze(-1)
-
-    with torch.no_grad():
-        q_target_next = q_target_all[:, 1:]
-        if double_q:
-            next_actions = q_online_all[:, 1:].argmax(dim=-1)
-            next_values = q_target_next.gather(
-                -1,
-                next_actions.unsqueeze(-1),
-            ).squeeze(-1)
-        else:
-            next_values = q_target_next.max(dim=-1).values
-        next_values = torch.where(
-            batch.dones.unsqueeze(-1),
-            torch.zeros_like(next_values),
-            next_values,
-        )
-        targets = (
-            batch.rewards.unsqueeze(-1)
-            + batch.discounts.unsqueeze(-1) * next_values
-        )
-        if vmax is not None:
-            targets = targets.clamp(min=-float(vmax), max=float(vmax))
-
-    if td_loss == "mse":
-        elementwise = F.mse_loss(predictions, targets, reduction="none")
-    elif td_loss == "huber":
-        if not math.isfinite(float(huber_delta)) or float(huber_delta) <= 0.0:
-            raise ValueError("huber_delta must be positive when td_loss='huber'.")
-        elementwise = F.smooth_l1_loss(
-            predictions,
-            targets,
-            beta=float(huber_delta),
-            reduction="none",
-        )
-    else:
-        raise ValueError("td_loss must be one of {'huber', 'mse'}.")
+    predictions, targets, elementwise = sequence_td_core(
+        q_online_all,
+        q_target_all,
+        actions=batch.actions,
+        rewards=batch.rewards,
+        dones=batch.dones,
+        discounts=batch.discounts,
+        n_heads=q_net.n_heads,
+        td_loss=td_loss,
+        huber_delta=huber_delta,
+        double_q=double_q,
+        vmax=vmax,
+    )
 
     per_head, support, supported = per_head_masked_mean(
         elementwise,

@@ -15,6 +15,8 @@ Last updated: 2026-07-11 · Read this first for "where am I" (30 seconds).
 - **ARIS** = the harness (Auto-claude-code Research In Sleep). The tooling under `.claude/skills/`.
 - **ARIS-Bellman** = the research method. Factor-local Bellman control for ZSC.
   Code in `src/aris_bellman/` + `experiments/overcooked_v2/`.
+- **SP / XP** = self-play within one independent training run / cross-play between
+  different independent training runs.
 
 This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman method.*
 
@@ -36,7 +38,7 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 
 ## 2. Pipeline status — CURRENT STAGE
 
-**Stage: Path C third-version static implementation review.**
+**Stage: Path C public-benchmark migration; R010 smoke passed, then a static code review fixed the probe gate and hot paths — remote evidence re-binding pending before R020 configuration freeze.**
 
 The earlier asymmetric-layout + role-conditioned v2 partner line reached a
 negative blind-test readout, and the Link-A substrate certificates reached a
@@ -61,7 +63,7 @@ The preregistration remains an inadmissible template with unfilled numeric and
 semantic-hash slots. No Path C training, data generation, instrument result, primary
 result, or scientific readout is recorded.
 
-R003's minimal research semantics are complete after a fail-closed CUDA JAX
+R003's minimal software semantics are complete after a fail-closed CUDA JAX
 compatibility scan on GPU 5.
 All four proposal candidate layouts expose 96-dimensional public observations, but
 their option counts are 28, 28, 26 and 27 and their ordered option identifiers differ.
@@ -72,38 +74,86 @@ the four role-isolated layouts required by the proposal. The bound Type-A artifa
 with SHA-256
 `6268916dc37a5571e024224e919e596e3d80e1346cd3c86d74266ee8db4798a1`.
 The current single `EgoEvidenceSpecV1` vocabulary and raw numeric probe scripts would
-therefore change action meaning across layouts. The project does not add a cross-layout
-action layer: it was not required by the primary scientific question and would add
-method complexity. The primary identity experiment now fixes `asymm_advantages` across
-all four roles while isolating identity, style and seed groups; layout shift remains a
-separate secondary analysis. Final battery size, group count and numeric seeds remain
-calibration outputs rather than premature R003 bindings.
+therefore change action meaning across layouts. The project did not add a cross-layout
+action layer. R003 consequently fixed `asymm_advantages` as an internal single-layout
+software target; that choice remains a valid Type-A compatibility result but is no longer
+the paper's main benchmark layout.
 
 The resulting code object is commit
 `b6f32578837dd3b5146c355500b911400cb42f78`. GPU 5 then passed 108 targeted tests
 and the broader 339-test suite with zero failures and zero skips. The broader JUnit
 report SHA-256 is
 `89116841aad9d63a2c1e7f4a6641b0f17f7b44e27979fc967ce2ebfa9a3e3390`.
-The minimal R010 input fixes `asymm_advantages`, a 96-dimensional public observation,
+The old R010 input fixes `asymm_advantages`, a 96-dimensional public observation,
 28 options, the 30-theta `path_c_synthetic` partner registry and the existing random-key
 schedule. Its remote artifact SHA-256 is
 `1a548d0800d4052b45920cc746184af3de280004fff686c96af52b07ce9c2406`.
-Response bins, probe scripts and all sample-size or seed counts remain owned by design
-or calibration. R010 is ready but has not been run; no locked data was accessed.
+It has not been run, and no locked data was accessed. The planned R010 instrument smoke
+is now paused because it does not test compatibility with published benchmark results.
 
-Three modules remain deliberately `planned`. The static revision now includes a
+The experiment direction was corrected on 2026-07-11. The main paper comparison now
+uses the published ICLR 2025 OvercookedV2 Test Time protocol: `test_time_simple` is the
+primary layout and `test_time_wide` is the prespecified replication. The standard metric
+is mean cross-play (XP) episode return, where independently trained policies are paired
+at test time. The official scale is 10 independent seeds, 90 directed cross-seed pairings
+covering both player positions, and 500 episodes per pairing. Self-play return and the
+self-play-minus-XP gap are co-reported. A literature check through 2026-07-11 found no
+later published result using the exact same Test Time Simple/Wide protocol. Fictitious
+Co-Play is therefore the best directly comparable published reference found, with XP
+`6±29` on Test Time Simple and `23±40` on Test Time Wide; it is not labelled a
+protocol-independent global best result.
+The official repository publishes code and configuration but no release or downloadable
+baseline checkpoint, so published numbers are the current external reference.
+
+The R005 static gap check completed on 2026-07-11 without running any code. Loading the
+two Test Time layouts is not a blocker (both are registered in jaxmarl v0.1.0, and R003
+already reset all 22 two-agent layouts). Among environment kwargs, only
+`indicate_successful_delivery` requires an `OCV2Adapter` code change; view size, random
+agent positions, 400 steps and path-planning flags are config-only. The real blockers are
+six protocol-semantic gaps: privileged global observation (the 96-dim featurizer reads the
+full grid and `state.recipe`), an option action space whose primitive expansion reads full
+simulator state, fixed-ego-versus-scripted-partner training with no self-play, reshaped
+return accounting instead of raw episode returns, no pairing-matrix/role-swap evaluation,
+and a gradient-update budget with no 30M-env-step path. The fixed revision: build a
+parallel standard path (official partial observation → recurrent TD ensemble Q → primitive
+actions), train each seed self-contained with a within-run self-play partner pool (the same
+partner-formation class as Fictitious Co-Play, still a single TD loss), and evaluate with a
+pairing-matrix driver producing official SP/XP records; the legacy option/CE/featurizer/
+scripted-partner stack is retained only as the mechanism-instrument and ablation line.
+Details: `idea-stage/refine-logs/EXPERIMENT_PLAN.md` §9.
+
+The parallel standard path was then implemented statically on 2026-07-11. It adds the
+delivery-indicator adapter argument and slot-neutral stepping; exact Simple/Wide
+environment files; a convolutional local-observation encoder feeding the existing
+recurrent ensemble value network over six primitive actions; seed-contained self-play
+pool formation followed by Path C training; and a separate checkpoint-pairing evaluator
+that persists raw 400-step episode returns and summarizes 10 self-play plus 90 directed
+cross-play pairings. The smoke configuration is explicitly marked as ineligible for
+scientific readout and requires the CUDA JAX backend. No local or remote code was run,
+and the working tree has not been committed, so this implementation is not yet a
+software compatibility result.
+
+R010 passed remotely on 2026-07-11 using GPU 0 and the CUDA 12 JAX wrapper. The
+targeted regression contains 56 passed tests with no failures or skips. The smoke
+artifact reports `jax_backend=gpu`, device `cuda:0`, two independent training seeds,
+2 self-play pairings, 2 directed cross-play pairings, 2 episodes per pairing and all
+8 raw-return rows. Each seed completed 1,600 environment steps, split evenly between
+self-play pool formation and Path C training. The run also corrected a static shape
+assumption: with the delivery indicator enabled, Simple observations are 5×5×39 and
+Wide observations are 5×5×43. The final smoke remains ineligible for scientific
+readout; its zero returns are not evidence about performance.
+
+Three legacy modules remain deliberately `planned`. The static revision now includes a
 cross-fitted ecological return estimator that excludes the target episode outcome,
 a content-addressed secondary-profile recomputation path, a restorable OCV2 adapter,
 restorable partner controllers, and a split-manifest-bound numeric seed chain from
 collection through evaluation. Exact posterior inference now binds the registered
 generation controllers, enumerates hidden option choices over the complete primitive
 action and public-state path, and uses the same option distribution as generation. The
-unresolved work is producing admissible trained acting baseline artifacts, completing
-the return-budget primary dependency chain, and freezing the final claim-critical
-artifact contract against a real commit. Weak or missing acting artifacts fail closed,
-locked-audit ledgers are inaccessible while the primary result is marked not run, and
-secondary mappings cannot create or veto a decision. This project is therefore not
-benchmark-ready.
+current unresolved work is different from the old registry wording: freeze the still-open
+formal training numbers and layout-specific model configurations before R020. Only Path C itself must be trained
+for the main table; the internal recurrent and belief systems are ablations. This project
+is therefore not yet benchmark-ready.
 
 The instrument correction is binding: a single saved simulator state estimates only
 the response law conditional on that realized hidden state. Every outer replicate must
@@ -139,10 +189,10 @@ All claim-level readouts are Type-B (cross-model + human acquittal required; see
 | Required result | Question | Status |
 |---|---|---|
 | Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | 🟢 CODE COMMIT + CUDA JAX 290-TEST REPORT BOUND; FROZEN PREREGISTRATION STILL MISSING |
-| Instrument validity | Do the preregistered checks pass and does `beta_lower > alpha_upper` using cell-specific simultaneous bounds? | ⬜ NOT RUN |
-| Design/calibration freeze | Were summary, battery, strongest deployable baseline, margins and sample sizes fixed without locked-audit access? | ⬜ NOT FROZEN |
-| Locked primary efficacy | Is the lower confidence bound of cross-identity normalized net-return versus probe-budget area-under-the-curve difference greater than the frozen margin? | ⬜ NOT RUN |
-| Secondary mechanisms | Do finite-token response, normalized-advantage representation, fingerprint leakage, power/null and ecological cross-fitted value-bin analyses support the scoped interpretation? | ⬜ NOT RUN |
+| Published-protocol compatibility | Can Path C produce 10 independent policies and the official `test_time_simple`/`test_time_wide` SP/XP, all-pairing and role-swapped records? | 🟡 R010 CUDA JAX SMOKE PASS 2026-07-11 (small-scale SP/XP and role-swap wiring verified), then same-day static review confirmed all eight protocol clauses but fixed a degenerate probe-gate default and hot-path waste; remote regression + smoke must re-bind evidence to the fixed code before R020 |
+| Standard benchmark performance | What are Path C's mean XP episode returns on both Test Time layouts relative to the published FCP references `6±29` and `23±40`? | ⬜ NOT RUN |
+| Probe ablation | Under the same Path C checkpoint and interaction cost, does value-directed probing outperform random and no probe? | ⬜ NOT RUN |
+| Instrument and mechanism validity | Do the belief-kernel, positive/null and fingerprint checks support the scoped representation interpretation? | ⬜ NOT RUN; DOES NOT BLOCK STANDARD XP PERFORMANCE |
 
 Source of truth for run status: [EXPERIMENT_TRACKER.md](idea-stage/refine-logs/EXPERIMENT_TRACKER.md)
 (execution checklist) + `docs/status/EXPERIMENT_LOG.md` (results record — active;
@@ -155,9 +205,9 @@ ARIS convention, see §6).
 | Phase / skill | Locked until… |
 |---------------|---------------|
 | Path C Phase A — static build and audit | Unlocked for static maintenance only: file edits, code inspection, configuration drafting, and preregistration drafting. No local tests or runs. |
-| Path C software and instrument validation | Static implementation reviewed, tests authorized and actually passed, preregistration fully frozen, static cost estimate accepted, and explicit remote-run authorization recorded. Each run must read back effective data budget from artifacts. |
-| Path C locked primary evaluation | Software conformance and instrument validity have recorded evidence; design/calibration choices and hashes are frozen before locked-audit access. |
-| Path C secondary mechanism evaluation | The locked primary confidence-interval lower bound strictly exceeds the preregistered margin, and Type-B review agrees the scoped continuation is justified. |
+| Path C standard benchmark smoke | ✅ R010 passed remotely on CUDA JAX; smoke artifacts are Type-A only. |
+| Path C main training and XP evaluation | Standard smoke passes; official Test Time configuration and 10-seed/30M-step/500-episode schedule are fixed; explicit remote-run authorization recorded. Each run reads back its effective data budget. Instrument validity is not a start condition. |
+| Path C mechanism evaluation | The relevant posterior/reset and instrument checks have recorded evidence. These checks gate mechanism wording only. |
 | `/auto-review-loop` (W2) | ≥1 decisive result supported by cross-model verdict |
 | `/paper-writing` (W3) | `NARRATIVE_REPORT.md` exists + main claims supported |
 
@@ -180,25 +230,23 @@ Core set — checked mechanically by [`.aris/tools/aris_bellman_fidelity_gate.py
   is a design-only diagnostic baseline.
 - **Single TD loss.** No response-prediction / calibration / sparsity / supervised
   factor-label / probe-selection losses in the main method.
-- **Shared history contract.** Main and deployable history baselines receive the same
+- **Shared history contract.** Main and internal history ablations receive the same
   `EgoEvidenceSpecV1`; identity, mechanism and style never enter it.
-- **Primary endpoint first.** The decisive comparison is cross-identity normalized
-  net-return versus probe-budget area under the curve against the strongest baseline
-  selected on the design split. Response prediction is secondary.
+- **Primary endpoint first.** The decisive comparison is mean XP episode return on
+  `test_time_simple` and `test_time_wide`, using the published protocol. SP and the
+  SP-minus-XP gap are co-reported. The probe-budget curve is a supporting ablation.
 - **Complete-state outer draws.** Each belief-kernel outer replicate independently
   samples the complete hidden state. Inner continuations do not increase the outer
   sample count.
 - **Finite canonical response.** The theorem-level kernel uses one token from the
   frozen `ResponseSummarySpecV1`; structured multi-label outputs are secondary.
-- **Cost must pass before launch.** The static audit-cost artifact reads all dimensions
-  and the maximum primitive-step budget from the frozen preregistration. A cost above
-  that budget fails before any rollout starts.
-- **Decision order is fixed.** Software conformance and the cost artifact are checked
-  first, followed by instrument validity, the frozen design baseline, locked primary
-  efficacy, and only then secondary mechanism analyses.
-- **Summaries are recomputed.** Software conformance binds archived module-registry
-  test rows; instrument alpha/beta is rebuilt from outer-cluster token cells; design
-  and locked primary statistics are rebuilt from separate complete episode ledgers.
+- **Instrument cost is scoped.** The static audit-cost artifact applies to belief-kernel
+  instrument rollouts. It does not gate standard Test Time training or XP evaluation.
+- **Decision order is fixed.** First align and run the published benchmark protocol;
+  then run Path C ablations; then use the instrument to justify mechanism wording.
+- **Summaries are recomputed.** Standard SP/XP statistics are rebuilt from raw episode,
+  seed-pair and player-position records. Instrument alpha/beta is separately rebuilt
+  from outer-cluster token cells.
 - **Dataset roles are derived.** Version-3 collection accepts a frozen split group,
   derives its role from `SplitManifestV1`, and the evaluator parses Parquet rows to
   recompute episode, transition and group coverage rather than trusting manifest totals.
@@ -245,9 +293,15 @@ The machine-readable source is `experiments/overcooked_v2/configs/module_registr
 The P1–P5 code object is bound to commit
 `fc647fb00255c5bfc58253a38fa145cb8864afd7`; its remote CUDA JAX run passed 290
 tests with no skips and archived a JUnit report hash. Modules with complete registered
-test coverage are therefore `tested`. C2, C5 and D1 remain `planned` because they
-require training, design selection and frozen semantic/numeric bindings. Nothing is
-`frozen`.
+test coverage are therefore `tested`. C2, C5 and D1 retain their historical `planned`
+labels because the registry has not yet been migrated to the public-benchmark protocol.
+Nothing is `frozen`.
+
+The registry identifiers `C2_PRIMARY_RETURN_BUDGET_AUC` and
+`C5_ACTING_BASELINE_BENCHMARK` describe the superseded internal-baseline plan.
+Their `planned` status no longer means that five self-built baselines must be trained
+before the public benchmark. A later code revision must either rename them or scope
+them explicitly to ablations, and add the standard Test Time SP/XP evaluator.
 
 <!-- PATH_C_MODULE_TRACEABILITY:BEGIN -->
 | Module ID | Status |

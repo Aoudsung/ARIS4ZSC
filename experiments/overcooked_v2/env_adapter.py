@@ -72,6 +72,7 @@ class OCV2Adapter:
         agent_view_size: int | None = None,
         negative_rewards: bool = True,
         sample_recipe_on_delivery: bool = True,
+        indicate_successful_delivery: bool = False,
         random_reset: bool = False,
         random_agent_positions: bool = False,
         force_path_planning: bool = True,
@@ -84,6 +85,7 @@ class OCV2Adapter:
             agent_view_size=agent_view_size,
             negative_rewards=negative_rewards,
             sample_recipe_on_delivery=sample_recipe_on_delivery,
+            indicate_successful_delivery=indicate_successful_delivery,
             random_reset=random_reset,
             random_agent_positions=random_agent_positions,
             force_path_planning=force_path_planning,
@@ -131,11 +133,18 @@ class OCV2Adapter:
         return self.obs, self.state
 
     def step(self, ego_action: int, partner_action: int) -> OCV2Step:
+        """Legacy agent-0/agent-1 wrapper retained for the option-based path."""
+
+        return self.step_joint(agent_0_action=ego_action, agent_1_action=partner_action)
+
+    def step_joint(self, agent_0_action: int, agent_1_action: int) -> OCV2Step:
+        """Advance one slot-neutral primitive joint action."""
+
         source = self.capture_state()
-        result = self.step_from_state(
+        result = self.step_joint_from_state(
             source,
-            ego_action=ego_action,
-            partner_action=partner_action,
+            agent_0_action=agent_0_action,
+            agent_1_action=agent_1_action,
         )
         self.restore_state(result.snapshot)
         return result.step
@@ -170,7 +179,22 @@ class OCV2Adapter:
         ego_action: int,
         partner_action: int,
     ) -> OCV2PureStep:
-        """Advance a supplied snapshot without changing adapter runtime fields."""
+        """Legacy agent-0/agent-1 wrapper for the option-based path."""
+
+        return self.step_joint_from_state(
+            snapshot,
+            agent_0_action=ego_action,
+            agent_1_action=partner_action,
+        )
+
+    def step_joint_from_state(
+        self,
+        snapshot: OCV2AdapterSnapshot,
+        *,
+        agent_0_action: int,
+        agent_1_action: int,
+    ) -> OCV2PureStep:
+        """Advance a supplied snapshot using slot-neutral primitive actions."""
 
         self._validate_snapshot(snapshot)
         source_key = _clone_pytree(snapshot.key)
@@ -178,8 +202,8 @@ class OCV2Adapter:
 
         next_key, subkey = jax.random.split(source_key)
         actions = {
-            "agent_0": jnp.asarray(ego_action, dtype=jnp.int32),
-            "agent_1": jnp.asarray(partner_action, dtype=jnp.int32),
+            "agent_0": jnp.asarray(agent_0_action, dtype=jnp.int32),
+            "agent_1": jnp.asarray(agent_1_action, dtype=jnp.int32),
         }
         raw_obs, state, rewards, dones, info = self._jit_step(
             subkey,
