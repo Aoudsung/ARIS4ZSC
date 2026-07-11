@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 import numpy as np
 
@@ -40,6 +41,35 @@ class PartnerPolicy(Protocol):
     def reset(self, seed: int) -> None: ...
 
     def act(self, obs_partner: Any, state: Any, rng: np.random.Generator) -> PartnerAction: ...
+
+    def get_state(self) -> Mapping[str, Any]: ...
+
+    def set_state(self, state: Mapping[str, Any]) -> None: ...
+
+    def exact_observed_action_branches(
+        self,
+        state: Any,
+        observed_primitive_action: int,
+    ) -> tuple[tuple[Mapping[str, Any], float], ...]: ...
+
+
+class _ForcedOptionChoiceRNG:
+    """Minimal RNG adapter that enumerates one registered option draw exactly."""
+
+    def __init__(self, forced_choice: int | None) -> None:
+        self.forced_choice = forced_choice
+
+    def choice(self, values: Any, *, p: Any) -> int:
+        if self.forced_choice is None:
+            raise RuntimeError("An unexpected stochastic option boundary was reached.")
+        support = np.asarray(values, dtype=np.int64).reshape(-1)
+        probabilities = np.asarray(p, dtype=np.float64).reshape(-1)
+        if support.shape != probabilities.shape:
+            raise ValueError("Enumerated option support and probabilities are unaligned.")
+        matches = np.flatnonzero(support == int(self.forced_choice))
+        if matches.size != 1 or probabilities[int(matches[0])] <= 0.0:
+            raise ValueError("Forced option choice is outside positive generation support.")
+        return int(self.forced_choice)
 
 
 @dataclass(frozen=True)
@@ -271,6 +301,10 @@ def _latent(
     epsilon: float = 0.10,
     fingerprint_id: int | None = None,
     fingerprint_bias: str | None = None,
+    value_class_id: str | None = None,
+    surface_identity_key: str | None = None,
+    style_id: str | None = None,
+    overlap_posterior_group: str | None = None,
 ) -> LatentPartnerSpec:
     return LatentPartnerSpec(
         geometry_profile=geometry_profile,
@@ -279,6 +313,10 @@ def _latent(
         curriculum_group=curriculum_group,
         fingerprint_id=fingerprint_id,
         fingerprint_bias=fingerprint_bias,
+        value_class_id=value_class_id,
+        surface_identity_key=surface_identity_key,
+        style_id=style_id,
+        overlap_posterior_group=overlap_posterior_group,
     )
 
 
@@ -464,106 +502,109 @@ LATENT_V3_DEV_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = (
 )
 
 
-PATH_C_SYNTHETIC_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = (
-    # Factorial synthetic-positive pool: mechanism × identity/surface × fingerprint.
-    # fingerprint_id is deliberately counterbalanced within every mechanism and
-    # does not determine geometry, role, or pot preference. This pool exposes a
-    # raw-response candidate, but admission still requires the offline value,
-    # joint-R^V, and residual-signature equivalence tests.
+PATH_C_SYNTHETIC_IDENTITIES: tuple[tuple[str, str, ProtocolSpec], ...] = (
     (
-        "pathc-ingnear-patience2-fp0",
+        "ingredient-near",
+        "ingredient_near",
+        ProtocolSpec(role="ingredient_person", pot_preference="near"),
+    ),
+    (
+        "ingredient-far",
+        "ingredient_far",
+        ProtocolSpec(role="ingredient_person", pot_preference="far"),
+    ),
+    (
+        "prep-near",
+        "prep_zone",
+        ProtocolSpec(
+            role="prep_partner",
+            pot_preference="near",
+            bottleneck_policy="yield",
+        ),
+    ),
+    (
+        "flexible-far",
+        "flexible_far",
+        ProtocolSpec(
+            role="flexible",
+            pot_preference="far",
+            bottleneck_policy="yield",
+        ),
+    ),
+    (
+        "dish-nearest",
+        "dish_zone",
+        ProtocolSpec(
+            role="dish_person",
+            delivery_preference="nearest",
+            bottleneck_policy="alternate",
+        ),
+    ),
+)
+
+PATH_C_SYNTHETIC_MECHANISMS: tuple[tuple[str, str, int], ...] = (
+    ("delayed_yield", "patience", 2),
+    ("defer_escalation", "escalate_after_defer", 2),
+    ("reciprocal_response", "tit_for_tat", 1),
+)
+
+# Three value mechanisms, five independent surface/style realizations per
+# mechanism, and both planted fingerprints in every cell. Fingerprint admission
+# remains an offline equivalence test and is never inferred from this declaration.
+PATH_C_SYNTHETIC_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = tuple(
+    (
+        f"pathc-{identity_name}-{family}{param}-fp{fingerprint_id}",
         _latent(
-            "ingredient_near",
-            ProtocolSpec(role="ingredient_person", pot_preference="near"),
+            geometry_profile,
+            protocol,
+            family,
+            param,
+            curriculum_group="path_c_synthetic",
+            fingerprint_id=fingerprint_id,
+            fingerprint_bias="retreat_order_rotate_candidate",
+            value_class_id=value_class_id,
+            surface_identity_key=f"pathc-{identity_name}",
+            style_id=f"style-{identity_index}",
+        ),
+    )
+    for value_class_id, family, param in PATH_C_SYNTHETIC_MECHANISMS
+    for identity_index, (identity_name, geometry_profile, protocol) in enumerate(
+        PATH_C_SYNTHETIC_IDENTITIES
+    )
+    for fingerprint_id in (0, 1)
+)
+
+# A separate validity-only pair with overlapping prior support. It is not mixed
+# into the main factorial pool and cannot be used for model or threshold selection.
+PATH_C_OVERLAPPING_POSTERIOR_PROTOCOLS: tuple[tuple[str, LatentPartnerSpec], ...] = (
+    (
+        "pathc-overlap-patience2",
+        _latent(
+            "overlap_shared_surface",
+            ProtocolSpec(role="flexible", bottleneck_policy="yield"),
             "patience",
             2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=0,
-            fingerprint_bias="retreat_order_rotate_candidate",
+            epsilon=0.35,
+            curriculum_group="path_c_overlap_posterior",
+            value_class_id="overlap_delayed_yield",
+            surface_identity_key="pathc-overlap-shared",
+            style_id="overlap-style",
+            overlap_posterior_group="overlap-pair-v1",
         ),
     ),
     (
-        "pathc-ingnear-patience2-fp1",
+        "pathc-overlap-escalate2",
         _latent(
-            "ingredient_near",
-            ProtocolSpec(role="ingredient_person", pot_preference="near"),
-            "patience",
-            2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=1,
-            fingerprint_bias="retreat_order_rotate_candidate",
-        ),
-    ),
-    (
-        "pathc-ingfar-patience2-fp0",
-        _latent(
-            "ingredient_far",
-            ProtocolSpec(role="ingredient_person", pot_preference="far"),
-            "patience",
-            2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=0,
-            fingerprint_bias="retreat_order_rotate_candidate",
-        ),
-    ),
-    (
-        "pathc-ingfar-patience2-fp1",
-        _latent(
-            "ingredient_far",
-            ProtocolSpec(role="ingredient_person", pot_preference="far"),
-            "patience",
-            2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=1,
-            fingerprint_bias="retreat_order_rotate_candidate",
-        ),
-    ),
-    (
-        "pathc-prepnear-escalate2-fp0",
-        _latent(
-            "prep_zone",
-            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
+            "overlap_shared_surface",
+            ProtocolSpec(role="flexible", bottleneck_policy="yield"),
             "escalate_after_defer",
             2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=0,
-            fingerprint_bias="retreat_order_rotate_candidate",
-        ),
-    ),
-    (
-        "pathc-prepnear-escalate2-fp1",
-        _latent(
-            "prep_zone",
-            ProtocolSpec(role="prep_partner", pot_preference="near", bottleneck_policy="yield"),
-            "escalate_after_defer",
-            2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=1,
-            fingerprint_bias="retreat_order_rotate_candidate",
-        ),
-    ),
-    (
-        "pathc-flexfar-escalate2-fp0",
-        _latent(
-            "flexible",
-            ProtocolSpec(role="flexible", pot_preference="far", bottleneck_policy="yield"),
-            "escalate_after_defer",
-            2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=0,
-            fingerprint_bias="retreat_order_rotate_candidate",
-        ),
-    ),
-    (
-        "pathc-flexfar-escalate2-fp1",
-        _latent(
-            "flexible",
-            ProtocolSpec(role="flexible", pot_preference="far", bottleneck_policy="yield"),
-            "escalate_after_defer",
-            2,
-            curriculum_group="path_c_synthetic",
-            fingerprint_id=1,
-            fingerprint_bias="retreat_order_rotate_candidate",
+            epsilon=0.35,
+            curriculum_group="path_c_overlap_posterior",
+            value_class_id="overlap_defer_escalation",
+            surface_identity_key="pathc-overlap-shared",
+            style_id="overlap-style",
+            overlap_posterior_group="overlap-pair-v1",
         ),
     ),
 )
@@ -592,6 +633,8 @@ PARTNER_REGISTRIES: dict[str, tuple[tuple[str, ProtocolSpec | LatentPartnerSpec]
     "latent_v3_dev": LATENT_V3_DEV_PROTOCOLS,
     # Candidate positive control; artifact admission decides whether it is usable.
     "path_c_synthetic": PATH_C_SYNTHETIC_PROTOCOLS,
+    # Validity-only posterior-overlap stress pair; never a training registry.
+    "path_c_overlap_posterior": PATH_C_OVERLAPPING_POSTERIOR_PROTOCOLS,
     # Metadata-only negative control cannot satisfy raw fingerprint visibility.
     "path_c_fingerprint_negative": PATH_C_FINGERPRINT_NEGATIVE_PROTOCOLS,
 }
@@ -619,6 +662,112 @@ class ScriptedProtocolPartner:
         self.bottleneck_alternate_phase = 0
         if hasattr(self, "_behavior_option_inferencer"):
             setattr(self, "_behavior_option_inferencer", None)
+
+    def get_state(self) -> Mapping[str, Any]:
+        """Return every mutable field that can affect future partner actions."""
+
+        return {
+            "schema_version": "path_c_scripted_partner_state_v1",
+            "current_option": self.current_option,
+            "last_state": copy.deepcopy(self.last_state),
+            "last_primitive_action": self.last_primitive_action,
+            "option_runtime": _option_runtime_to_mapping(self.option_runtime),
+            "elapsed": int(self.elapsed),
+            "bottleneck_alternate_phase": int(self.bottleneck_alternate_phase),
+        }
+
+    def set_state(self, state: Mapping[str, Any]) -> None:
+        """Restore a state produced by get_state without retaining caller aliases."""
+
+        expected = {
+            "schema_version",
+            "current_option",
+            "last_state",
+            "last_primitive_action",
+            "option_runtime",
+            "elapsed",
+            "bottleneck_alternate_phase",
+        }
+        if not isinstance(state, Mapping) or set(state) != expected:
+            raise ValueError("Scripted partner state has the wrong fields.")
+        if state["schema_version"] != "path_c_scripted_partner_state_v1":
+            raise ValueError("Scripted partner state schema version changed.")
+        current_option = state["current_option"]
+        last_action = state["last_primitive_action"]
+        if current_option is not None and (
+            isinstance(current_option, bool) or int(current_option) < 0
+        ):
+            raise ValueError("Scripted partner current_option is invalid.")
+        if last_action is not None and (
+            isinstance(last_action, bool) or int(last_action) < 0
+        ):
+            raise ValueError("Scripted partner last primitive action is invalid.")
+        elapsed = int(state["elapsed"])
+        phase = int(state["bottleneck_alternate_phase"])
+        if elapsed < 0 or phase not in {0, 1}:
+            raise ValueError("Scripted partner elapsed or alternate phase is invalid.")
+        self.current_option = None if current_option is None else int(current_option)
+        self.last_state = copy.deepcopy(state["last_state"])
+        self.last_primitive_action = None if last_action is None else int(last_action)
+        self.option_runtime = _option_runtime_from_mapping(state["option_runtime"])
+        self.elapsed = elapsed
+        self.bottleneck_alternate_phase = phase
+        if hasattr(self, "_behavior_option_inferencer"):
+            setattr(self, "_behavior_option_inferencer", None)
+
+    def exact_observed_action_branches(
+        self,
+        state: Any,
+        observed_primitive_action: int,
+    ) -> tuple[tuple[Mapping[str, Any], float], ...]:
+        """Enumerate hidden option draws compatible with one observed action."""
+
+        observed = int(observed_primitive_action)
+        source = copy.deepcopy(self.get_state())
+        try:
+            self._update_option_runtime(state, agent_id=1)
+            choose_new = self.current_option is None or self._option_done(
+                state,
+                agent_id=1,
+            )
+            if choose_new:
+                valid = self.option_library.valid_options(state, agent_id=1)
+                distribution = option_distribution(
+                    self.protocol,
+                    {
+                        "elapsed": int(self.elapsed),
+                        "bottleneck_alternate_phase": int(
+                            self.bottleneck_alternate_phase
+                        ),
+                        "epsilon": float(getattr(self, "option_epsilon", 0.0)),
+                        "valid_options": np.asarray(valid, dtype=bool),
+                    },
+                    state,
+                    option_library=self.option_library,
+                )
+                choices = tuple(
+                    (int(option_id), float(distribution[int(option_id)]))
+                    for option_id in np.flatnonzero(distribution > 0.0)
+                )
+            else:
+                choices = ((None, 1.0),)
+        finally:
+            self.set_state(source)
+
+        branches: list[tuple[Mapping[str, Any], float]] = []
+        try:
+            for choice, probability in choices:
+                self.set_state(source)
+                action = self.act(
+                    None,
+                    state,
+                    _ForcedOptionChoiceRNG(choice),
+                )
+                if int(action.primitive_action) == observed:
+                    branches.append((copy.deepcopy(self.get_state()), probability))
+        finally:
+            self.set_state(source)
+        return tuple(branches)
 
     def act(self, obs_partner: Any, state: Any, rng: np.random.Generator) -> PartnerAction:
         del obs_partner
@@ -654,16 +803,18 @@ class ScriptedProtocolPartner:
         valid: np.ndarray,
         rng: np.random.Generator,
     ) -> int:
-        valid_ids = np.flatnonzero(valid)
-        if valid_ids.size == 0:
-            return _noop_option_id(self.option_library)
-
-        scores = np.asarray(
-            [self._protocol_score(self.option_library.options[idx], state) for idx in valid_ids],
-            dtype=float,
+        distribution = option_distribution(
+            self.protocol,
+            {
+                "elapsed": int(self.elapsed),
+                "bottleneck_alternate_phase": int(self.bottleneck_alternate_phase),
+                "epsilon": float(getattr(self, "option_epsilon", 0.0)),
+                "valid_options": np.asarray(valid, dtype=bool),
+            },
+            state,
+            option_library=self.option_library,
         )
-        best = np.flatnonzero(scores == np.max(scores))
-        choice = int(rng.choice(valid_ids[best]))
+        choice = int(rng.choice(np.arange(distribution.size), p=distribution))
         chosen_kind = str(self.option_library.options[choice].kind)
         if self.protocol.bottleneck_policy == "alternate" and chosen_kind in {
             "cross_bottleneck",
@@ -673,77 +824,14 @@ class ScriptedProtocolPartner:
         return choice
 
     def _protocol_score(self, opt: OptionSpec, state: Any) -> float:
-        score = _task_progress_score(opt, state)
-
-        if self.protocol.role == "dish_person":
-            score += _role_bonus(opt.kind in {"pick_plate", "plate_soup", "serve_soup"})
-        elif self.protocol.role == "ingredient_person":
-            score += _role_bonus(
-                opt.kind in {"fetch_ingredient", "deliver_ingredient_to_pot"}
-            )
-        elif self.protocol.role == "server":
-            score += _role_bonus(opt.kind == "serve_soup")
-        elif self.protocol.role == "prep_partner":
-            # Train-only curriculum partner: create ego-owned terminal-stage data
-            # distribution without adding a fallback controller or supervised loss.
-            score += _role_bonus(
-                opt.kind in {
-                    "fetch_ingredient",
-                    "deliver_ingredient_to_pot",
-                    "drop_item_to_counter",
-                    "clear_interaction_cell",
-                    "wait_at_bottleneck",
-                }
-            )
-
-        score += _terminal_policy_bonus(opt, self.protocol.terminal_policy)
-
-        if opt.kind == "deliver_ingredient_to_pot":
-            score += _positional_preference_bonus(
-                opt.target_pos,
-                state,
-                self.protocol.pot_preference,
-                agent_id=1,
-            )
-        if opt.kind == "fetch_ingredient" and not _fetch_has_current_pot_sink(
-            self.option_library,
+        return _protocol_score_for(
+            self.protocol,
             opt,
             state,
-        ):
-            score -= 10.0
-        if opt.kind == "drop_item_to_counter" and _carrying_unusable_item(
-            self.option_library,
-            state,
-            agent_id=1,
-        ):
-            score += 100.0
-        if opt.kind == "clear_interaction_cell" and _blocking_critical_cell(
-            self.option_library,
-            state,
-            agent_id=1,
-        ):
-            score += 100.0
-        if opt.kind in {"cross_bottleneck", "wait_at_bottleneck"}:
-            score += _bottleneck_bonus(
-                opt,
-                self.protocol.bottleneck_policy,
-                self.elapsed,
-                self.bottleneck_alternate_phase,
-            )
-        score += _counter_preference_bonus(opt, self.protocol.counter_preference)
-        if opt.kind == "serve_soup":
-            score += _positional_preference_bonus(
-                opt.target_pos,
-                state,
-                self.protocol.delivery_preference,
-                agent_id=1,
-            )
-        if opt.kind == "press_recipe_button":
-            score += _role_bonus(self.protocol.button_policy == "check_first")
-
-        score -= _path_length_penalty(self.option_library, state, opt, agent_id=1)
-        score -= _congestion_penalty(opt, state)
-        return score
+            option_library=self.option_library,
+            elapsed=int(self.elapsed),
+            bottleneck_alternate_phase=int(self.bottleneck_alternate_phase),
+        )
 
     def _option_done(self, state: Any, agent_id: int) -> bool:
         opt = self.option_library.options[self.current_option]
@@ -786,6 +874,54 @@ class ScriptedProtocolPartner:
                 opt,
                 agent_id,
             )
+
+
+def _option_runtime_to_mapping(runtime: OptionRuntime | None) -> Mapping[str, Any] | None:
+    if runtime is None:
+        return None
+    return {
+        "option_id": int(runtime.option_id),
+        "start_pos": tuple(map(int, runtime.start_pos)),
+        "elapsed": int(runtime.elapsed),
+        "reached_region": bool(runtime.reached_region),
+        "wait_elapsed_after_arrival": int(runtime.wait_elapsed_after_arrival),
+        "entry_side": (
+            None if runtime.entry_side is None else tuple(map(int, runtime.entry_side))
+        ),
+    }
+
+
+def _option_runtime_from_mapping(value: Any) -> OptionRuntime | None:
+    if value is None:
+        return None
+    expected = {
+        "option_id",
+        "start_pos",
+        "elapsed",
+        "reached_region",
+        "wait_elapsed_after_arrival",
+        "entry_side",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("Partner option runtime has the wrong fields.")
+    start_pos = tuple(map(int, value["start_pos"]))
+    entry_side = (
+        None if value["entry_side"] is None else tuple(map(int, value["entry_side"]))
+    )
+    if len(start_pos) != 2 or (entry_side is not None and len(entry_side) != 2):
+        raise ValueError("Partner option runtime positions must be two-dimensional.")
+    elapsed = int(value["elapsed"])
+    wait_elapsed = int(value["wait_elapsed_after_arrival"])
+    if elapsed < 0 or wait_elapsed < 0:
+        raise ValueError("Partner option runtime elapsed values must be non-negative.")
+    return OptionRuntime(
+        option_id=int(value["option_id"]),
+        start_pos=start_pos,
+        elapsed=elapsed,
+        reached_region=bool(value["reached_region"]),
+        wait_elapsed_after_arrival=wait_elapsed,
+        entry_side=entry_side,
+    )
 
 
 def make_training_partners(
@@ -855,12 +991,155 @@ def sample_mode_spec(
     raise ValueError(f"unknown latent mode family {family!r}")
 
 
+def option_distribution(
+    theta: ProtocolSpec | LatentPartnerSpec,
+    runtime_state: Mapping[str, Any],
+    public_state: Any,
+    *,
+    option_library: Any,
+) -> np.ndarray:
+    """Pure option emission shared by generation and Tier-1 inference.
+
+    The vector is defined over the complete option library. Argmax ties are
+    uniform, epsilon exploration is mixed over valid support, and an empty valid
+    set is rerouted to the registered noop. No input object or random stream is
+    mutated here.
+    """
+
+    if isinstance(theta, LatentPartnerSpec):
+        # LatentModeController always chooses the approach option under the
+        # claim-shaped public protocol; latent yield is expressed later by the
+        # primitive-action retreat transition. Tier-1 inference must use this
+        # exact same option-emission rule.
+        protocol = replace(theta.base_protocol, terminal_policy="claim")
+        default_epsilon = float(theta.mode.epsilon)
+    elif isinstance(theta, ProtocolSpec):
+        protocol = theta
+        default_epsilon = 0.0
+    else:
+        raise TypeError("theta must be ProtocolSpec or LatentPartnerSpec.")
+    n_options = len(option_library.options)
+    if n_options <= 0:
+        raise ValueError("option_library must contain at least one option.")
+    option_ids = tuple(int(option.id) for option in option_library.options)
+    if option_ids != tuple(range(n_options)):
+        raise ValueError(
+            "The frozen option library must use contiguous ids aligned with its table."
+        )
+    raw_valid = runtime_state.get("valid_options")
+    valid = (
+        np.asarray(raw_valid, dtype=bool)
+        if raw_valid is not None
+        else np.asarray(option_library.valid_options(public_state, agent_id=1), dtype=bool)
+    )
+    if valid.shape != (n_options,):
+        raise ValueError(
+            f"valid_options must have shape {(n_options,)}, got {valid.shape}."
+        )
+    probabilities = np.zeros(n_options, dtype=np.float64)
+    valid_ids = np.flatnonzero(valid)
+    if valid_ids.size == 0:
+        probabilities[_noop_option_id(option_library)] = 1.0
+        return probabilities
+    elapsed = int(runtime_state.get("elapsed", 0))
+    alternate_phase = int(runtime_state.get("bottleneck_alternate_phase", 0))
+    epsilon = float(runtime_state.get("epsilon", default_epsilon))
+    if not 0.0 <= epsilon <= 1.0:
+        raise ValueError("Option-distribution epsilon must be in [0, 1].")
+    scores = np.asarray(
+        [
+            _protocol_score_for(
+                protocol,
+                option_library.options[int(option_id)],
+                public_state,
+                option_library=option_library,
+                elapsed=elapsed,
+                bottleneck_alternate_phase=alternate_phase,
+            )
+            for option_id in valid_ids
+        ],
+        dtype=np.float64,
+    )
+    best_local = np.flatnonzero(scores == np.max(scores))
+    best_ids = valid_ids[best_local]
+    probabilities[valid_ids] += epsilon / float(valid_ids.size)
+    probabilities[best_ids] += (1.0 - epsilon) / float(best_ids.size)
+    total = float(probabilities.sum())
+    if not np.isclose(total, 1.0, rtol=0.0, atol=1.0e-12):
+        raise RuntimeError(f"Option distribution did not normalize; total={total}.")
+    return probabilities
+
+
+def _protocol_score_for(
+    protocol: ProtocolSpec,
+    opt: OptionSpec,
+    state: Any,
+    *,
+    option_library: Any,
+    elapsed: int,
+    bottleneck_alternate_phase: int,
+) -> float:
+    score = _task_progress_score(opt, state)
+    if protocol.role == "dish_person":
+        score += _role_bonus(opt.kind in {"pick_plate", "plate_soup", "serve_soup"})
+    elif protocol.role == "ingredient_person":
+        score += _role_bonus(
+            opt.kind in {"fetch_ingredient", "deliver_ingredient_to_pot"}
+        )
+    elif protocol.role == "server":
+        score += _role_bonus(opt.kind == "serve_soup")
+    elif protocol.role == "prep_partner":
+        score += _role_bonus(
+            opt.kind in {
+                "fetch_ingredient",
+                "deliver_ingredient_to_pot",
+                "drop_item_to_counter",
+                "clear_interaction_cell",
+                "wait_at_bottleneck",
+            }
+        )
+    score += _terminal_policy_bonus(opt, protocol.terminal_policy)
+    if opt.kind == "deliver_ingredient_to_pot":
+        score += _positional_preference_bonus(
+            opt.target_pos, state, protocol.pot_preference, agent_id=1
+        )
+    if opt.kind == "fetch_ingredient" and not _fetch_has_current_pot_sink(
+        option_library, opt, state
+    ):
+        score -= 10.0
+    if opt.kind == "drop_item_to_counter" and _carrying_unusable_item(
+        option_library, state, agent_id=1
+    ):
+        score += 100.0
+    if opt.kind == "clear_interaction_cell" and _blocking_critical_cell(
+        option_library, state, agent_id=1
+    ):
+        score += 100.0
+    if opt.kind in {"cross_bottleneck", "wait_at_bottleneck"}:
+        score += _bottleneck_bonus(
+            opt,
+            protocol.bottleneck_policy,
+            int(elapsed),
+            int(bottleneck_alternate_phase),
+        )
+    score += _counter_preference_bonus(opt, protocol.counter_preference)
+    if opt.kind == "serve_soup":
+        score += _positional_preference_bonus(
+            opt.target_pos, state, protocol.delivery_preference, agent_id=1
+        )
+    if opt.kind == "press_recipe_button":
+        score += _role_bonus(protocol.button_policy == "check_first")
+    score -= _path_length_penalty(option_library, state, opt, agent_id=1)
+    score -= _congestion_penalty(opt, state)
+    return float(score)
+
+
 
 def _noop_option_id(option_library: Any) -> int:
     for opt in option_library.options:
         if str(opt.kind) == "noop":
             return int(opt.id)
-    return 0
+    raise ValueError("The frozen option library has no registered noop fallback.")
 
 
 

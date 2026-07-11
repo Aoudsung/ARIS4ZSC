@@ -29,6 +29,35 @@ class OCV2Step:
     info: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class OCV2AdapterSnapshot:
+    """Detached OCV2 environment state for deterministic replay or forking."""
+
+    layout_name: str
+    max_steps: int
+    key: Any
+    state: Any
+    raw_obs: dict[str, np.ndarray]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.layout_name, str) or not self.layout_name.strip():
+            raise ValueError("OCV2 snapshot layout_name must be non-empty.")
+        if isinstance(self.max_steps, bool) or int(self.max_steps) <= 0:
+            raise ValueError("OCV2 snapshot max_steps must be positive.")
+        if self.key is None or self.state is None:
+            raise ValueError("OCV2 snapshot requires key and state.")
+        if not isinstance(self.raw_obs, Mapping) or not self.raw_obs:
+            raise ValueError("OCV2 snapshot requires raw observations.")
+
+
+@dataclass(frozen=True)
+class OCV2PureStep:
+    """One primitive transition without mutating the source adapter snapshot."""
+
+    snapshot: OCV2AdapterSnapshot
+    step: OCV2Step
+
+
 class OCV2Adapter:
     def __init__(
         self,
@@ -61,6 +90,7 @@ class OCV2Adapter:
         self._jit_step = jax.jit(self.env.step_env)
         self.key = None
         self.state = None
+        self.raw_obs: dict[str, np.ndarray] | None = None
         self.obs: dict[str, np.ndarray] | None = None
 
     @property
@@ -76,7 +106,7 @@ class OCV2Adapter:
     def reset(self, seed: int) -> tuple[dict[str, np.ndarray], Any]:
         self.key = jax.random.PRNGKey(seed)
         self.key, subkey = jax.random.split(self.key)
-        obs, state = self._jit_reset(subkey)
+        raw_obs, state = self._jit_reset(subkey)
         # PERF (2026-07-06, profile-driven; semantics unchanged): materialize the
         # state as a host/numpy pytree ONCE per boundary. Every downstream reader
         # (state_utils getters, option preconditions, event extractor, featurizer,
@@ -86,37 +116,96 @@ class OCV2Adapter:
         # The jitted step/reset accept numpy leaves as inputs unchanged (same
         # shapes/dtypes -> no retrace; CPU backend device_put is near zero-copy).
         state = jax.device_get(state)
-        self.obs = self._apply_featurizer(obs, state)
+        self.raw_obs = self._to_numpy_obs(jax.device_get(raw_obs))
+        self.obs = self._apply_featurizer(self.raw_obs, state)
         self.state = state
         return self.obs, self.state
 
     def step(self, ego_action: int, partner_action: int) -> OCV2Step:
-        if self.key is None or self.state is None:
-            raise RuntimeError("OCV2Adapter.step() called before reset().")
+        source = self.capture_state()
+        result = self.step_from_state(
+            source,
+            ego_action=ego_action,
+            partner_action=partner_action,
+        )
+        self.restore_state(result.snapshot)
+        return result.step
 
-        self.key, subkey = jax.random.split(self.key)
+    def capture_state(self) -> OCV2AdapterSnapshot:
+        """Capture a detached state; later adapter mutations cannot alter it."""
+
+        if self.key is None or self.state is None or self.raw_obs is None:
+            raise RuntimeError("OCV2Adapter.step() called before reset().")
+        return OCV2AdapterSnapshot(
+            layout_name=str(self.layout_name),
+            max_steps=int(self.max_steps),
+            key=_clone_pytree(self.key),
+            state=_clone_pytree(self.state),
+            raw_obs=_clone_observation(self.raw_obs),
+        )
+
+    def restore_state(self, snapshot: OCV2AdapterSnapshot) -> tuple[dict[str, np.ndarray], Any]:
+        """Restore an exact detached snapshot into this adapter instance."""
+
+        self._validate_snapshot(snapshot)
+        self.key = _clone_pytree(snapshot.key)
+        self.state = _clone_pytree(snapshot.state)
+        self.raw_obs = _clone_observation(snapshot.raw_obs)
+        self.obs = self._apply_featurizer(self.raw_obs, self.state)
+        return _clone_observation(self.obs), _clone_pytree(self.state)
+
+    def step_from_state(
+        self,
+        snapshot: OCV2AdapterSnapshot,
+        *,
+        ego_action: int,
+        partner_action: int,
+    ) -> OCV2PureStep:
+        """Advance a supplied snapshot without changing adapter runtime fields."""
+
+        self._validate_snapshot(snapshot)
+        source_key = _clone_pytree(snapshot.key)
+        source_state = _clone_pytree(snapshot.state)
+
+        next_key, subkey = jax.random.split(source_key)
         actions = {
             "agent_0": jnp.asarray(ego_action, dtype=jnp.int32),
             "agent_1": jnp.asarray(partner_action, dtype=jnp.int32),
         }
-        obs, state, rewards, dones, info = self._jit_step(
+        raw_obs, state, rewards, dones, info = self._jit_step(
             subkey,
-            self.state,
+            source_state,
             actions,
         )
         # PERF: one host materialization for everything downstream (see reset()).
         # device_get preserves pytree structure; leaves become numpy with the same
         # dtypes, so _to_float/_to_bool/np.asarray consumers see identical values.
         state, rewards, dones, info = jax.device_get((state, rewards, dones, info))
-        self.state = state
-        self.obs = self._apply_featurizer(obs, state)
-        return OCV2Step(
-            obs=self.obs,
+        raw_obs_host = self._to_numpy_obs(jax.device_get(raw_obs))
+        public_obs = self._apply_featurizer(raw_obs_host, state)
+        next_snapshot = OCV2AdapterSnapshot(
+            layout_name=str(self.layout_name),
+            max_steps=int(self.max_steps),
+            key=_clone_pytree(next_key),
+            state=_clone_pytree(state),
+            raw_obs=_clone_observation(raw_obs_host),
+        )
+        step = OCV2Step(
+            obs=_clone_observation(public_obs),
             state=state,
             rewards={key: _to_float(value) for key, value in rewards.items()},
             dones={key: _to_bool(value) for key, value in dones.items()},
             info=self._to_numpy_info(info),
         )
+        return OCV2PureStep(snapshot=next_snapshot, step=step)
+
+    def _validate_snapshot(self, snapshot: OCV2AdapterSnapshot) -> None:
+        if not isinstance(snapshot, OCV2AdapterSnapshot):
+            raise TypeError("snapshot must be OCV2AdapterSnapshot.")
+        if snapshot.layout_name != self.layout_name:
+            raise ValueError("OCV2 snapshot layout differs from the adapter.")
+        if int(snapshot.max_steps) != int(self.max_steps):
+            raise ValueError("OCV2 snapshot max_steps differs from the adapter.")
 
     @staticmethod
     def _to_numpy_obs(obs: Mapping[str, Any]) -> dict[str, np.ndarray]:
@@ -170,3 +259,17 @@ def _to_numpy_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_to_numpy_value(item) for item in value]
     return np.asarray(value)
+
+
+def _clone_pytree(value: Any) -> Any:
+    return jax.tree_util.tree_map(
+        lambda leaf: np.asarray(leaf).copy(),
+        value,
+    )
+
+
+def _clone_observation(value: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    return {
+        str(key): np.asarray(item).copy()
+        for key, item in value.items()
+    }

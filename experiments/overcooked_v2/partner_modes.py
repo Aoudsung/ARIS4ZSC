@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
@@ -60,6 +61,25 @@ RETREAT_KIND_ORDER = (
 VALID_MODE_FAMILIES = frozenset(FAMILY_TO_ID)
 
 
+class _ForcedOptionChoiceRNG:
+    """Enumerate one option draw while reusing the generation controller."""
+
+    def __init__(self, forced_choice: int | None) -> None:
+        self.forced_choice = forced_choice
+
+    def choice(self, values: Any, *, p: Any) -> int:
+        if self.forced_choice is None:
+            raise RuntimeError("An unexpected latent option boundary was reached.")
+        support = np.asarray(values, dtype=np.int64).reshape(-1)
+        probabilities = np.asarray(p, dtype=np.float64).reshape(-1)
+        if support.shape != probabilities.shape:
+            raise ValueError("Latent option support and probabilities are unaligned.")
+        matches = np.flatnonzero(support == int(self.forced_choice))
+        if matches.size != 1 or probabilities[int(matches[0])] <= 0.0:
+            raise ValueError("Forced latent option is outside positive generation support.")
+        return int(self.forced_choice)
+
+
 @dataclass(frozen=True)
 class LatentModeSpec:
     family: str
@@ -85,6 +105,10 @@ class LatentPartnerSpec:
     curriculum_group: str | None = "latent_v3"
     fingerprint_id: int | None = None
     fingerprint_bias: str | None = None
+    value_class_id: str | None = None
+    surface_identity_key: str | None = None
+    style_id: str | None = None
+    overlap_posterior_group: str | None = None
 
 
 @dataclass
@@ -113,6 +137,67 @@ class LatentModeRuntime:
         self.in_opportunity = False
         self.ego_initiated_current = False
         self.partner_initiated_current = False
+
+    def get_state(self) -> Mapping[str, Any]:
+        return {
+            "schema_version": "path_c_latent_mode_runtime_state_v1",
+            "policy": self.policy,
+            "mode_age": int(self.mode_age),
+            "option_decisions": int(self.option_decisions),
+            "opportunity_count": int(self.opportunity_count),
+            "consecutive_ego_defers": int(self.consecutive_ego_defers),
+            "yield_remaining": int(self.yield_remaining),
+            "last_trigger": self.last_trigger,
+            "in_opportunity": bool(self.in_opportunity),
+            "ego_initiated_current": bool(self.ego_initiated_current),
+            "partner_initiated_current": bool(self.partner_initiated_current),
+        }
+
+    def set_state(self, state: Mapping[str, Any]) -> None:
+        expected = {
+            "schema_version",
+            "policy",
+            "mode_age",
+            "option_decisions",
+            "opportunity_count",
+            "consecutive_ego_defers",
+            "yield_remaining",
+            "last_trigger",
+            "in_opportunity",
+            "ego_initiated_current",
+            "partner_initiated_current",
+        }
+        if not isinstance(state, Mapping) or set(state) != expected:
+            raise ValueError("Latent mode runtime state has the wrong fields.")
+        if state["schema_version"] != "path_c_latent_mode_runtime_state_v1":
+            raise ValueError("Latent mode runtime state schema version changed.")
+        policy = str(state["policy"])
+        trigger = str(state["last_trigger"])
+        if policy not in POLICY_TO_ID or trigger not in TRIGGER_TO_ID:
+            raise ValueError("Latent mode runtime policy or trigger is invalid.")
+        integer_fields = (
+            "mode_age",
+            "option_decisions",
+            "opportunity_count",
+            "consecutive_ego_defers",
+            "yield_remaining",
+        )
+        values = {name: int(state[name]) for name in integer_fields}
+        if any(value < 0 for value in values.values()):
+            raise ValueError("Latent mode runtime counters must be non-negative.")
+        boolean_fields = (
+            "in_opportunity",
+            "ego_initiated_current",
+            "partner_initiated_current",
+        )
+        if any(type(state[name]) is not bool for name in boolean_fields):
+            raise TypeError("Latent mode runtime flags must be boolean.")
+        self.policy = policy
+        self.last_trigger = trigger
+        for name, value in values.items():
+            setattr(self, name, value)
+        for name in boolean_fields:
+            setattr(self, name, bool(state[name]))
 
     def observe_public_transition(
         self,
@@ -259,6 +344,9 @@ class LatentModeController:
             protocol=spec.base_protocol,
             partner_id=partner_id,
         )
+        # Generation and Tier-1 inference use partner_pool.option_distribution.
+        # The inner generator reads this immutable mode parameter at boundaries.
+        self._inner.option_epsilon = float(spec.mode.epsilon)
         self._last_state: Any | None = None
         self._last_gate_main = False
         self._pot_positions = tuple(
@@ -275,19 +363,109 @@ class LatentModeController:
         if hasattr(self, "_behavior_option_inferencer"):
             setattr(self, "_behavior_option_inferencer", None)
 
+    def exact_observed_action_branches(
+        self,
+        state: Any,
+        observed_primitive_action: int,
+    ) -> tuple[tuple[Mapping[str, Any], float], ...]:
+        """Enumerate latent option draws compatible with one primitive action."""
+
+        from .partner_pool import option_distribution
+
+        observed = int(observed_primitive_action)
+        source = copy.deepcopy(self.get_state())
+        try:
+            self.sync_public_state(state)
+            choose_new = self._will_choose_new_option(state)
+            if choose_new:
+                self.runtime.observe_option_boundary()
+                self._inner.protocol = replace(
+                    self.spec.base_protocol,
+                    terminal_policy="claim",
+                )
+                valid = self.option_library.valid_options(state, agent_id=1)
+                distribution = option_distribution(
+                    self.spec,
+                    {
+                        "elapsed": int(self._inner.elapsed),
+                        "bottleneck_alternate_phase": int(
+                            self._inner.bottleneck_alternate_phase
+                        ),
+                        "epsilon": float(self.spec.mode.epsilon),
+                        "valid_options": np.asarray(valid, dtype=bool),
+                    },
+                    state,
+                    option_library=self.option_library,
+                )
+                choices = tuple(
+                    (int(option_id), float(distribution[int(option_id)]))
+                    for option_id in np.flatnonzero(distribution > 0.0)
+                )
+            else:
+                choices = ((None, 1.0),)
+        finally:
+            self.set_state(source)
+
+        branches: list[tuple[Mapping[str, Any], float]] = []
+        try:
+            for choice, probability in choices:
+                self.set_state(source)
+                action = self.act(
+                    None,
+                    state,
+                    _ForcedOptionChoiceRNG(choice),
+                )
+                if int(action.primitive_action) == observed:
+                    branches.append((copy.deepcopy(self.get_state()), probability))
+        finally:
+            self.set_state(source)
+        return tuple(branches)
+
+    def get_state(self) -> Mapping[str, Any]:
+        if not hasattr(self._inner, "get_state"):
+            raise TypeError("Latent partner inner controller is not restorable.")
+        return {
+            "schema_version": "path_c_latent_partner_state_v1",
+            "runtime": dict(self.runtime.get_state()),
+            "inner": copy.deepcopy(self._inner.get_state()),
+            "last_state": copy.deepcopy(self._last_state),
+            "last_gate_main": bool(self._last_gate_main),
+        }
+
+    def set_state(self, state: Mapping[str, Any]) -> None:
+        expected = {
+            "schema_version",
+            "runtime",
+            "inner",
+            "last_state",
+            "last_gate_main",
+        }
+        if not isinstance(state, Mapping) or set(state) != expected:
+            raise ValueError("Latent partner state has the wrong fields.")
+        if state["schema_version"] != "path_c_latent_partner_state_v1":
+            raise ValueError("Latent partner state schema version changed.")
+        if type(state["last_gate_main"]) is not bool:
+            raise TypeError("Latent partner last_gate_main must be boolean.")
+        if not hasattr(self._inner, "set_state"):
+            raise TypeError("Latent partner inner controller is not restorable.")
+        self.runtime.set_state(state["runtime"])
+        self._inner.set_state(copy.deepcopy(state["inner"]))
+        self._last_state = copy.deepcopy(state["last_state"])
+        self._last_gate_main = bool(state["last_gate_main"])
+        if hasattr(self, "_behavior_option_inferencer"):
+            setattr(self, "_behavior_option_inferencer", None)
+
     def act(self, obs_partner: Any, state: Any, rng: np.random.Generator) -> PartnerAction:
         self.sync_public_state(state)
         if self._will_choose_new_option(state):
             self.runtime.observe_option_boundary()
-            # Round-2 de-telegraphing: selection is ALWAYS claim-shaped so approach
-            # trajectories are mode-invariant; the latent policy expresses only via
-            # _maybe_yield_abort below (cert r1 C-1/C-4 anatomy).
+            # In the second-round control, option selection always follows the
+            # claim policy so the approach trajectory does not reveal the latent
+            # policy. Yielding is expressed only by _maybe_yield_abort below.
             self._inner.protocol = replace(
                 self.spec.base_protocol,
                 terminal_policy="claim",
             )
-            if self._epsilon_force_option(state, rng):
-                self.runtime.last_trigger = "epsilon"
         action = self._inner.act(obs_partner, state, rng)
         action = self._maybe_yield_abort(action, state)
         self._last_state = state
@@ -359,6 +537,17 @@ class LatentModeController:
             }
             else "metadata_only"
         )
+        state["value_class_id"] = str(
+            self.spec.value_class_id
+            or f"{self.spec.mode.family}:{self.spec.mode.param}"
+        )
+        state["surface_identity_key"] = str(
+            self.spec.surface_identity_key or self.name
+        )
+        state["style_id"] = str(self.spec.style_id or "unspecified")
+        state["overlap_posterior_group"] = str(
+            self.spec.overlap_posterior_group or "none"
+        )
         return state
 
     @property
@@ -400,24 +589,6 @@ class LatentModeController:
             return RETREAT_KIND_ORDER
         shift = int(self.mode_fingerprint_id) % len(RETREAT_KIND_ORDER)
         return RETREAT_KIND_ORDER[shift:] + RETREAT_KIND_ORDER[:shift]
-
-    def _epsilon_force_option(self, state: Any, rng: np.random.Generator) -> bool:
-        epsilon = float(self.spec.mode.epsilon)
-        if epsilon <= 0.0 or float(rng.random()) >= epsilon:
-            return False
-        valid = self.option_library.valid_options(state, agent_id=1)
-        valid_ids = np.flatnonzero(valid)
-        if valid_ids.size == 0:
-            return False
-        choice = int(rng.choice(valid_ids))
-        self._inner.current_option = choice
-        self._inner.option_runtime = OptionRuntime(
-            option_id=choice,
-            start_pos=get_agent_pos(state, 1),
-        )
-        self._inner.elapsed = 0
-        return True
-
 
 def _gate_main(state: Any, pot_positions: tuple[tuple[int, int], ...]) -> bool:
     n_ready = any(
