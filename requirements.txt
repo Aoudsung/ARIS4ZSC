@@ -3,6 +3,7 @@ torch>=2.0
 pytest>=8
 pyyaml>=6.0
 jsonschema>=4.20
+pyarrow>=14.0
 # Optional for actual JAXMARL backend:
 # jaxmarl==0.1.0
 # chex
