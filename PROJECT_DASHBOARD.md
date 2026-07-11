@@ -61,6 +61,20 @@ The preregistration remains an inadmissible template with unfilled numeric and
 semantic-hash slots. No Path C training, data generation, instrument result, primary
 result, or scientific readout is recorded.
 
+R003 remains incomplete after a fail-closed CUDA JAX compatibility scan on GPU 5.
+All four proposal candidate layouts expose 96-dimensional public observations, but
+their option counts are 28, 28, 26 and 27 and their ordered option identifiers differ.
+Across all 23 registered JaxMARL layouts, 22 satisfy the two-agent evidence contract;
+the largest group sharing one exact observation-and-option contract has size 1, below
+the four role-isolated layouts required by the proposal. The bound Type-A artifact is
+`.codex_remote_validation/path_c_r003_all_layout_semantics_bound_fc647fb_20260711.json`
+with SHA-256
+`6268916dc37a5571e024224e919e596e3d80e1346cd3c86d74266ee8db4798a1`.
+The current single `EgoEvidenceSpecV1` vocabulary and raw numeric probe scripts would
+therefore change action meaning across roles. No split, battery or preregistration was
+falsely frozen. The single next action is to implement a cross-layout option contract:
+each layout maps local options to shared stable action slots and masks absent actions.
+
 Three modules remain deliberately `planned`. The static revision now includes a
 cross-fitted ecological return estimator that excludes the target episode outcome,
 a content-addressed secondary-profile recomputation path, a restorable OCV2 adapter,

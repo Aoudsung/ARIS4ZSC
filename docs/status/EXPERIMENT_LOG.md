@@ -41,6 +41,38 @@ and the active project line is now Path C.
 - 正式软件测试报告：从上述 JUnit 和最终模块注册表生成 101 条注册测试记录；文件为 `.codex_remote_validation/path_c_software_test_report_fc647fb_20260711.json`，SHA-256 为 `61f669b0c980f454a138eadd22ed3a846621bb94e86e8bec568023b546af8bf4`，绑定模块注册表 SHA-256 `2c22792a0a16318f63ee2efa6dc9adcd542c9a78377c65f650e8d17577e4adb7`。
 - 状态：具备完整注册测试覆盖的 21 个模块提升为 `tested`；C2、C5、D1 仍为 `planned`。预注册未冻结，E0、训练、design 选择、locked audit 与任何科学读数均未运行。
 
+### 2026-07-11 R003 布局与 option 语义兼容性扫描 — 失败关闭（Type-A，非科学结果）
+
+- 授权与范围：用户明确要求继续执行 R003；本轮只检查非数值语义接线，不读取
+  `locked_audit`，不训练，也不产生可用于研究主张的读数。
+- 执行设备：正式扫描通过
+  `experiments/overcooked_v2/scripts/with_jax_cuda12.sh` 运行，固定
+  `CUDA_VISIBLE_DEVICES=5`。GPU 5 是 NVIDIA L40，运行前显存占用 77 MiB，易失性
+  SRAM/DRAM 可纠正与不可纠正 ECC 计数均为 0；产物回读
+  `jax_default_backend=gpu`、`selected_device_kind=NVIDIA L40`。一次先行的模块路径查询
+  未固定设备并触发已知 GPU 3 ECC 错误，没有生成结果；随后全部 JAX 检查均改用上述
+  GPU 5 包装脚本。
+- 提交绑定：远端仓库的基础提交不是同步源码的提交，因此不能把远端 `git HEAD` 当作
+  代码身份。本轮逐文件核对七个实际读取的项目源码，远端 SHA-256 与本地完全一致，且
+  这些文件从 `fc647fb00255c5bfc58253a38fa145cb8864afd7` 到当前证据提交无差异；绑定产物
+  明确记录该源码提交、远端基础提交以及两个外部 JaxMARL 源文件的 SHA-256。
+- proposal 候选布局
+  `asymm_advantages`、`asymm_advantages_recipes_center`、
+  `asymm_advantages_recipes_left`、`asymm_advantages_recipes_right` 的公共观测维度均为
+  96，但 option 数分别为 28、28、26、27，option 名称与数值编号签名全部不同。
+- 全库复核：JaxMARL 登记 23 个布局；22 个双智能体布局可完成环境重置、96 维公共观测
+  构造与 option 库构造，`long_room` 因只有一个智能体而被固定双智能体证据合同拒绝。
+  22 个可用布局中，按“观测维度 + 有序 option 名称与编号”分组的最大组大小为 1，低于
+  四角色隔离所需的 4；不存在可直接复用的四布局组合。
+- 判定：R003 失败关闭并保持未完成。当前 `EgoEvidenceSpecV1` 只有一个 option 词表，
+  `ProbeScriptV1` 又直接冻结数值 option 编号；若现在填写清单，同一编号会跨角色改变动作
+  含义。没有生成伪造的 split、battery 或预注册冻结副本，R010 及后续运行继续阻塞。
+- 单一下一步：实现并测试跨布局统一 option 合同，即把每个布局的本地 option 映射到同一组
+  稳定动作槽位，同时保留缺失动作的合法性掩码；在该合同成立前不继续冻结 R003。
+- 绑定产物：远端
+  `.codex_remote_validation/path_c_r003_all_layout_semantics_bound_fc647fb_20260711.json`，
+  SHA-256 为 `6268916dc37a5571e024224e919e596e3d80e1346cd3c86d74266ee8db4798a1`。
+
 ### 2026-07-09 CUDA/JAX 远程环境体检 — PASS（Type-A，非科学结果）
 - 范围: 只修复 `zsc-customer` 上项目运行环境对 JAX/CUDA 的选择；不改系统
   `/usr/local/cuda`，不重装 JAX，不运行训练，不生成 Path C 科学读数。
