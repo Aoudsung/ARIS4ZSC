@@ -12,7 +12,7 @@ import sys
 import time
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -24,7 +24,11 @@ if __package__ in {None, ""}:  # pragma: no cover - script execution path
 
 from src.aris_bellman.factor_belief import FactorLocalBeliefModel
 from src.aris_bellman.factor_q import FactorLocalQNetwork
-from src.aris_bellman.replay import EvidenceBuffer, OptionReplayBuffer
+from src.aris_bellman.replay import (
+    EpisodeSequenceReplayBuffer,
+    EvidenceBuffer,
+    OptionReplayBuffer,
+)
 from src.aris_bellman.specs import GraphSpec, OptionTransition
 from src.aris_bellman.td import aris_td_loss
 
@@ -58,9 +62,20 @@ from experiments.overcooked_v2.path_c_config import (
     path_c_metadata,
 )
 from experiments.overcooked_v2.path_c_evaluation import PATH_C_PROBE_PROVENANCE_IDS
+from experiments.overcooked_v2.path_c_sequence import (
+    DecisionEvidenceBuffer,
+    EgoEvidenceSpecV1,
+    EpisodeBootstrapRecord,
+    EpisodeEvidenceBuffer,
+    RecurrentEnsembleQ,
+    SequenceTDBatch,
+    collate_episode_records,
+    ensemble_diversity_telemetry,
+    sequence_td_loss,
+)
 from experiments.overcooked_v2.partner_pool import PARTNER_REGISTRIES, make_training_partners
 from experiments.overcooked_v2.residual_signature import (
-    residual_signature_disagreement,
+    normalized_advantage_disagreement,
     select_probe_candidate,
 )
 from experiments.overcooked_v2.reward_design import (
@@ -77,6 +92,7 @@ from experiments.overcooked_v2.provenance import (
     stamp_graph_hash,
 )
 from experiments.overcooked_v2.state_utils import get_agent_pos
+from jaxmarl.environments.overcooked_v2.common import Actions as _OCActions
 
 METHODS = (
     "base_only",
@@ -362,58 +378,6 @@ class FlatFactorQNetwork(nn.Module):
         return _mask_q_values(q_values, option_mask)
 
 
-class GlobalGRUQNetwork(nn.Module):
-    def __init__(
-        self,
-        obs_dim: Any,
-        hidden_dim: int,
-        num_options: int,
-        num_factors: int,
-        evidence_dim: int,
-        encoder_type: str = "auto",
-        q_bound_vmax: float | None = None,
-    ):
-        super().__init__()
-        self.q_bound_vmax = _validated_q_bound_vmax(q_bound_vmax)
-        self.encoder = OCV2ObsEncoder(obs_dim, hidden_dim, encoder_type=encoder_type)
-        self.history_input_dim = max(1, int(num_factors) * int(evidence_dim))
-        self.history = nn.GRU(
-            input_size=self.history_input_dim,
-            hidden_size=hidden_dim,
-            batch_first=True,
-        )
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, num_options),
-        )
-
-    def forward(
-        self,
-        obs_feat: torch.Tensor,
-        evidence_seq: torch.Tensor,
-        option_mask: torch.Tensor | None = None,
-        **_: Any,
-    ) -> torch.Tensor:
-        encoded = self.encoder(obs_feat)
-        if evidence_seq.shape[1] == 0:
-            history_in = evidence_seq.new_zeros(
-                evidence_seq.shape[0],
-                evidence_seq.shape[2],
-                self.history_input_dim,
-            )
-        else:
-            history_in = evidence_seq.permute(0, 2, 1, 3).reshape(
-                evidence_seq.shape[0],
-                evidence_seq.shape[2],
-                -1,
-            )
-        _, hidden = self.history(history_in)
-        q_values = self.head(torch.cat([encoded, hidden[-1]], dim=-1))
-        q_values = _apply_final_q_value_bound(q_values, self.q_bound_vmax)
-        return _mask_q_values(q_values, option_mask)
-
-
 class PartnerIDQNetwork(nn.Module):
     def __init__(
         self,
@@ -515,6 +479,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     q_net = _build_q_network(args.method, obs_dim, graph, config).to(device)
     target_q_net = copy.deepcopy(q_net).to(device)
     target_q_net.eval()
+    sequence_training = _uses_sequence_q(q_net)
+    sequence_replay_contract = (
+        _validate_sequence_replay_contract(config)
+        if sequence_training
+        else None
+    )
     path_c_probe_base_q_net = _load_path_c_probe_baseline_q_net(
         config,
         obs_dim,
@@ -522,17 +492,28 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         device,
     )
     belief_model = _build_belief_model(graph, config).to(device)
-    optimizer_params = list(q_net.parameters())
-    if args.method in {"aris_bellman", "flat_factor"}:
-        optimizer_params += list(belief_model.parameters())
+    optimizer_params = [
+        parameter for parameter in q_net.parameters() if parameter.requires_grad
+    ]
+    if args.method in {"aris_bellman", "flat_factor"} and not sequence_training:
+        optimizer_params += [
+            parameter for parameter in belief_model.parameters() if parameter.requires_grad
+        ]
     optimizer = torch.optim.Adam(
         optimizer_params,
         lr=float(config["training"]["learning_rate"]),
     )
-    replay = OptionReplayBuffer(
-        capacity=int(config["training"]["replay_size"]),
-        seed=args.seed,
-    )
+    replay: OptionReplayBuffer | EpisodeSequenceReplayBuffer
+    if sequence_training:
+        replay = EpisodeSequenceReplayBuffer(
+            capacity=int(config["training"]["replay_size"]),
+            seed=args.seed,
+        )
+    else:
+        replay = OptionReplayBuffer(
+            capacity=int(config["training"]["replay_size"]),
+            seed=args.seed,
+        )
     evidence_buffer = EvidenceBuffer(
         num_factors=graph.num_factors,
         window=int(config["training"]["evidence_window"]),
@@ -541,31 +522,68 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     rng = np.random.default_rng(args.seed)
     metrics = _empty_metrics(args.method, graph, output_dir)
     metrics["path_c"] = path_c_metadata(config)
+    if sequence_training:
+        metrics["sequence_model"] = {
+            "evidence_schema_version": _sequence_spec(q_net).schema_version,
+            "evidence_spec_sha256": _sequence_spec(q_net).sha256(),
+            "replay_unit": "complete_episode",
+            "bootstrap_scope": "episode",
+            "q_trace_shape": "B,S,K,A",
+            "replay_capacity_transitions": int(
+                sequence_replay_contract["replay_capacity_transitions"]
+            ),
+            "warmup_transitions": int(
+                sequence_replay_contract["warmup_transitions"]
+            ),
+            "maximum_episode_transitions": int(
+                sequence_replay_contract["maximum_episode_transitions"]
+            ),
+            "ensemble_telemetry": (
+                "valid normalized-advantage effective rank, head correlation, "
+                "and scaled frozen-prior contribution at every greedy decision"
+            ),
+        }
     probe_cfg = ((config.get("path_c") or {}).get("probe") or {})
     metrics["path_c_probe_baseline"] = {
         "loaded": path_c_probe_base_q_net is not None,
-        "checkpoint": probe_cfg.get("base_checkpoint") or probe_cfg.get("public_baseline_checkpoint"),
+        "checkpoint": (
+            config.get("path_c_secondary_base_checkpoint")
+            or probe_cfg.get("base_checkpoint")
+            or probe_cfg.get("public_baseline_checkpoint")
+        ),
         "registered_as_trainable_module": False,
-        "gradient_source": "none_eval_only",
+        "gradient_source": "none_secondary_visualization_only",
     }
     if path_c_probe_base_q_net is not None:
         metrics["path_c"]["probe"]["public_baseline_loaded"] = True
-    seed_summary = _maybe_seed_terminal_replay(
-        env,
-        partners,
-        option_lib,
-        router,
-        graph,
-        config,
-        args.seed,
-        replay,
-        args.method,
-        q_net,
-        target_q_net,
-        belief_model,
-        optimizer,
-        device,
-    )
+    seed_summary = {}
+    if sequence_training:
+        terminal_seed_cfg = (config.get("training", {}).get("terminal_replay_seed") or {})
+        role_seed_cfg = (config.get("training", {}).get("role_replay_seed") or {})
+        if bool(terminal_seed_cfg.get("enabled", False)) or bool(
+            role_seed_cfg.get("enabled", False)
+        ):
+            seed_summary = {
+                "enabled": False,
+                "reason": "transition_curriculum_incompatible_with_full_episode_sequence_replay",
+            }
+    else:
+        seed_summary = _maybe_seed_terminal_replay(
+            env,
+            partners,
+            option_lib,
+            router,
+            graph,
+            config,
+            args.seed,
+            replay,
+            args.method,
+            q_net,
+            target_q_net,
+            belief_model,
+            optimizer,
+            device,
+        )
     if seed_summary:
         metrics["terminal_replay_seed"] = seed_summary
     checkpoint_policy = _checkpoint_policy(config)
@@ -598,6 +616,17 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         args.seed,
         router,
     )
+    sequence_episode_index = 0
+    _start_sequence_episode(
+        evidence_buffer,
+        q_net,
+        obs,
+        state,
+        option_lib,
+        config,
+        episode_id=f"train:{int(args.seed)}:{sequence_episode_index}",
+        manifest_seed=int(args.seed),
+    )
     partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
     _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device, _belief_persistence_enabled(config))
     contribution_ledger = ContributionLedger.from_config(config.get("training"))
@@ -607,7 +636,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     wall_start = time.time()
 
     while updates_done < int(config["training"]["total_updates"]):
-        if episode_options >= int(config["training"]["max_episode_options"]):
+        if (
+            not sequence_training
+            and episode_options >= int(config["training"]["max_episode_options"])
+        ):
             metrics["episode_returns"].append(float(episode_return))
             obs, state, current_partner = _reset_episode(
                 env,
@@ -640,6 +672,12 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             selection_stats=metrics,
             path_c_probe_base_q_net=path_c_probe_base_q_net,
         )
+        probe_decision = metrics.get("path_c_probe_last_decision") or {}
+        selected_probe_cost = (
+            float(probe_decision.get("realized_probe_cost", 0.0))
+            if probe_decision.get("selected") is True
+            else 0.0
+        )
         transition, done, obs = _execute_option(
             env,
             obs,
@@ -656,8 +694,24 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             method=args.method,
             belief_model=belief_model,
             device=device,
+            truncate_at_boundary=(
+                sequence_training
+                and episode_options + 1
+                >= int(config["training"]["max_episode_options"])
+            ),
+            probe_cost=selected_probe_cost,
         )
-        replay.add(transition)
+        sequence_episode = evidence_buffer.sequence_episode()
+        sequence_boundary = bool(
+            sequence_training
+            and isinstance(sequence_episode, EpisodeEvidenceBuffer)
+            and sequence_episode.closed
+        )
+        if sequence_training:
+            if sequence_boundary:
+                replay.add(sequence_episode.to_record())
+        else:
+            replay.add(transition)
         episode_return += _transition_training_return(transition, config)
         episode_options += 1
         metrics["option_durations"].append(int(transition.duration))
@@ -669,7 +723,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         )
         _update_task_progress_metrics(metrics, transition)
 
-        if done:
+        if done or sequence_boundary:
             metrics["episode_returns"].append(float(episode_return))
             obs, state, current_partner = _reset_episode(
                 env,
@@ -679,19 +733,41 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
                 args.seed,
                 router,
             )
+            sequence_episode_index += 1
+            _start_sequence_episode(
+                evidence_buffer,
+                q_net,
+                obs,
+                state,
+                option_lib,
+                config,
+                episode_id=f"train:{int(args.seed)}:{sequence_episode_index}",
+                manifest_seed=int(args.seed),
+            )
             partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, config)
             _initialise_persistent_belief(evidence_buffer, args.method, belief_model, graph, device, _belief_persistence_enabled(config))
             contribution_ledger = ContributionLedger.from_config(config.get("training"))
             episode_return = 0.0
             episode_options = 0
 
+        if (
+            sequence_training
+            and isinstance(replay, EpisodeSequenceReplayBuffer)
+            and replay.episode_count == 0
+        ):
+            continue
         if len(replay) < int(config["training"]["warmup_transitions"]):
             continue
 
         for _ in range(int(config["training"].get("updates_per_transition", 1))):
             if updates_done >= int(config["training"]["total_updates"]):
                 break
-            batch = replay.sample(int(config["training"]["batch_size"]))
+            sampled = replay.sample(int(config["training"]["batch_size"]))
+            batch = (
+                collate_episode_records(sampled)
+                if sequence_training
+                else sampled
+            )
             loss = _td_update(
                 args.method,
                 q_net,
@@ -1629,23 +1705,26 @@ def _load_path_c_probe_baseline_q_net(
     if int((path_c.get("ensemble") or {}).get("n_heads", 1)) <= 1:
         return None
     ckpt_path = (
-        probe.get("base_checkpoint")
+        config.get("path_c_secondary_base_checkpoint")
+        or probe.get("base_checkpoint")
         or probe.get("residual_baseline_checkpoint")
         or probe.get("public_baseline_checkpoint")
     )
     if ckpt_path in {None, ""}:
-        if bool(probe.get("require_residual_baseline", probe.get("require_public_residual_baseline", True))):
-            raise ValueError(
-                "path_c.probe.base_checkpoint is required for active "
-                "residual-control-signature probes."
-            )
+        # Public-baseline residuals are secondary diagnostics in Path C version
+        # 3.  The primary normalized-advantage selector has no baseline
+        # dependency, so absence of this optional checkpoint must not block the
+        # active training path.
         return None
     path = Path(str(ckpt_path))
     if not path.exists():
         raise FileNotFoundError(f"Path C public baseline checkpoint not found: {path}")
-    expected_sha256 = probe.get("base_checkpoint_sha256")
+    expected_sha256 = (
+        config.get("path_c_secondary_base_checkpoint_sha256")
+        or probe.get("base_checkpoint_sha256")
+    )
     observed_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-    if expected_sha256 in {None, ""} or observed_sha256 != str(expected_sha256):
+    if expected_sha256 not in {None, ""} and observed_sha256 != str(expected_sha256):
         raise ValueError(
             "Path C public baseline checkpoint SHA-256 does not match the frozen config."
         )
@@ -1682,11 +1761,11 @@ def _path_c_attach_probe_baseline_if_configured(
     *,
     config_path: Path | str | None = None,
 ) -> nn.Module | None:
-    """Attach the frozen public-state baseline used only by Path C probe selection.
+    """Attach an optional public-state baseline for secondary visualization.
 
     The baseline is intentionally installed with ``object.__setattr__`` instead of
-    as a registered child module: it is not part of the trainable ego and cannot
-    receive optimizer updates.
+    as a registered child module: it is not part of the trainable ego, cannot
+    receive optimizer updates, and never drives the primary probe selector.
     """
     base_q_net = _load_path_c_probe_baseline_q_net(config, obs_dim, graph, device)
     if base_q_net is None:
@@ -1704,6 +1783,218 @@ def _path_c_attach_probe_baseline_if_configured(
     return base_q_net
 
 
+_PATH_C_PROGRESS_EVENT_NAMES = (
+    "collision_or_block",
+    "delivery_event",
+    "wrong_delivery_event",
+    "ego_delivery_event",
+    "partner_delivery_event",
+    "ego_sole_correct_delivery",
+    "pot_became_full",
+    "pot_became_cooked",
+    "pot_became_ready",
+    "plate_picked",
+    "soup_picked",
+    "button_pressed",
+    "recipe_indicator_event",
+    "object_pickup_or_drop",
+)
+
+
+def _uses_sequence_q(q_net: nn.Module) -> bool:
+    return isinstance(q_net, RecurrentEnsembleQ)
+
+
+def _validate_sequence_replay_contract(
+    config: dict[str, Any],
+) -> dict[str, int]:
+    """Reject recurrent replay settings that can never reach a TD update."""
+
+    training = config.get("training") or {}
+
+    def require_integer(name: str, *, minimum: int) -> int:
+        raw = training.get(name)
+        if isinstance(raw, bool):
+            raise ValueError(f"training.{name} must be an integer.")
+        try:
+            value = int(raw)
+            numeric = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"training.{name} must be an integer.") from exc
+        if not math.isfinite(numeric) or numeric != float(value) or value < minimum:
+            raise ValueError(
+                f"training.{name} must be an integer at least {minimum}."
+            )
+        return value
+
+    replay_size = require_integer("replay_size", minimum=1)
+    warmup = require_integer("warmup_transitions", minimum=0)
+    maximum_episode = require_integer("max_episode_options", minimum=1)
+    if warmup > replay_size:
+        raise ValueError(
+            "Sequence replay can never reach training.warmup_transitions because "
+            "training.warmup_transitions exceeds training.replay_size."
+        )
+    if maximum_episode > replay_size:
+        raise ValueError(
+            "A complete sequence episode can exceed training.replay_size; refusing "
+            "a configuration that would truncate or reject recurrent history."
+        )
+    return {
+        "replay_capacity_transitions": replay_size,
+        "warmup_transitions": warmup,
+        "maximum_episode_transitions": maximum_episode,
+    }
+
+
+def _sequence_architecture_enabled(
+    method: str,
+    config: dict[str, Any],
+) -> bool:
+    if method == "global_gru":
+        return True
+    if method != "aris_bellman":
+        return False
+    path_c = config.get("path_c") or {}
+    ensemble = path_c.get("ensemble") or {}
+    evidence = path_c.get("evidence_spec") or {}
+    return (
+        str(ensemble.get("architecture", "legacy_default_off"))
+        == "recurrent_sequence_v1"
+        and bool(evidence.get("enable", False))
+    )
+
+
+def _flat_observation_dim(obs_dim: Any) -> int:
+    if isinstance(obs_dim, (int, np.integer)):
+        value = int(obs_dim)
+    else:
+        shape = tuple(int(dim) for dim in obs_dim)
+        value = int(np.prod(np.asarray(shape, dtype=np.int64)))
+    if value <= 0:
+        raise ValueError(f"Invalid observation dimension {obs_dim!r}.")
+    return value
+
+
+def _build_ego_evidence_spec(
+    obs_dim: Any,
+    graph: GraphSpec,
+    config: dict[str, Any],
+) -> EgoEvidenceSpecV1:
+    path_c = config.get("path_c") or {}
+    evidence_cfg = path_c.get("evidence_spec") or {}
+    schema_version = str(
+        evidence_cfg.get("schema_version", "ego_evidence_spec_v1")
+    )
+    if schema_version != "ego_evidence_spec_v1":
+        raise ValueError(
+            "Path C evidence schema must be ego_evidence_spec_v1; "
+            f"got {schema_version!r}."
+        )
+    max_primitive_steps = int(
+        evidence_cfg.get("max_primitive_actions_per_decision", 64)
+    )
+    if max_primitive_steps <= 0:
+        raise ValueError(
+            "path_c.evidence_spec.max_primitive_actions_per_decision must be positive."
+        )
+    if bool(evidence_cfg.get("enable", False)):
+        max_episode_decisions = int(evidence_cfg.get("max_episode_decisions", 0))
+        if max_episode_decisions <= 0:
+            raise ValueError(
+                "Active Path C requires a positive evidence_spec.max_episode_decisions."
+            )
+        if int(config.get("training", {}).get("max_episode_options", 0)) > max_episode_decisions:
+            raise ValueError(
+                "training.max_episode_options exceeds the frozen Path C episode length."
+            )
+    graph_max_steps = max((int(option.max_steps) for option in graph.options), default=0)
+    if graph_max_steps > max_primitive_steps:
+        raise ValueError(
+            "The frozen ego evidence window is shorter than an option's maximum "
+            "primitive duration; refusing to truncate observable history."
+        )
+    option_ids = [int(option.id) for option in graph.options]
+    if option_ids != list(range(graph.num_options)):
+        raise ValueError(
+            "EgoEvidenceSpecV1 requires option ids to match the frozen action order."
+        )
+    primitive_actions = (
+        ("right", _OCActions.right),
+        ("down", _OCActions.down),
+        ("left", _OCActions.left),
+        ("up", _OCActions.up),
+        ("stay", _OCActions.stay),
+        ("interact", _OCActions.interact),
+    )
+    primitive_by_id = sorted(
+        ((int(action), name) for name, action in primitive_actions),
+        key=lambda item: item[0],
+    )
+    if [item[0] for item in primitive_by_id] != list(range(len(primitive_by_id))):
+        raise ValueError("Overcooked primitive action ids are not contiguous from zero.")
+    spec = EgoEvidenceSpecV1(
+        observation_dim=_flat_observation_dim(obs_dim),
+        num_primitive_actions=len(primitive_by_id),
+        num_options=graph.num_options,
+        max_primitive_steps_per_decision=max_primitive_steps,
+        progress_event_dim=len(_PATH_C_PROGRESS_EVENT_NAMES),
+        observation_schema="ocv2_agent0_public_observation_flat_v1",
+        primitive_action_names=tuple(name for _, name in primitive_by_id),
+        option_names=tuple(str(option.name) for option in graph.options),
+        progress_event_names=_PATH_C_PROGRESS_EVENT_NAMES,
+    )
+    frozen_payload = evidence_cfg.get("frozen_spec")
+    if frozen_payload is not None:
+        if not isinstance(frozen_payload, dict):
+            raise ValueError("path_c.evidence_spec.frozen_spec must be a mapping.")
+        frozen_spec = EgoEvidenceSpecV1.from_dict(frozen_payload)
+        if frozen_spec.to_dict() != spec.to_dict():
+            raise ValueError(
+                "Environment-derived evidence dimensions or vocabulary differ "
+                "from the frozen EgoEvidenceSpecV1."
+            )
+        spec = frozen_spec
+    expected_sha256 = (path_c.get("preregistration") or {}).get(
+        "evidence_spec_sha256"
+    )
+    if expected_sha256 not in {None, ""} and str(expected_sha256) != spec.sha256():
+        raise ValueError(
+            "Runtime EgoEvidenceSpecV1 does not match the preregistered evidence hash."
+        )
+    return spec
+
+
+def _build_sequence_q_network(
+    method: str,
+    obs_dim: Any,
+    hidden_dim: int,
+    graph: GraphSpec,
+    config: dict[str, Any],
+) -> RecurrentEnsembleQ:
+    spec = _build_ego_evidence_spec(obs_dim, graph, config)
+    ensemble_cfg = ((config.get("path_c") or {}).get("ensemble") or {})
+    if method == "global_gru":
+        n_heads = 1
+        prior_scale = 0.0
+    else:
+        n_heads = int(ensemble_cfg.get("n_heads", 1))
+        prior_scale = float(ensemble_cfg.get("prior_scale", 0.0))
+    model = RecurrentEnsembleQ(
+        evidence_dim=spec.evidence_dim,
+        n_actions=graph.num_options,
+        n_heads=n_heads,
+        encoder_dim=hidden_dim,
+        recurrent_dim=hidden_dim,
+        prior_scale=prior_scale,
+        prior_seed=0,
+        evidence_spec_sha256=spec.sha256(),
+    )
+    object.__setattr__(model, "ego_evidence_spec", spec)
+    object.__setattr__(model, "sequence_method", str(method))
+    return model
+
+
 def _build_q_network(
     method: str,
     obs_dim: Any,
@@ -1718,6 +2009,8 @@ def _build_q_network(
         if bool(vb.get("enabled", False)) and bool(vb.get("apply_to_all_methods", False))
         else None
     )
+    if _sequence_architecture_enabled(method, config):
+        return _build_sequence_q_network(method, obs_dim, hidden_dim, graph, config)
     if method == "aris_bellman":
         path_c = config.get("path_c") or {}
         ensemble_cfg = path_c.get("ensemble") or {}
@@ -1768,16 +2061,8 @@ def _build_q_network(
             encoder_type,
             q_bound_vmax=non_aris_q_bound_vmax,
         )
-    if method == "global_gru":
-        return GlobalGRUQNetwork(
-            obs_dim,
-            hidden_dim,
-            graph.num_options,
-            graph.num_factors,
-            D_EVID,
-            encoder_type,
-            q_bound_vmax=non_aris_q_bound_vmax,
-        )
+    if method == "global_gru":  # guarded by _sequence_architecture_enabled
+        raise RuntimeError("global_gru must use the shared recurrent sequence core.")
     if method == "partner_id_q":
         return PartnerIDQNetwork(
             obs_dim,
@@ -1907,6 +2192,85 @@ def _run_random_policy(
     return metrics
 
 
+def _sequence_spec(q_net: nn.Module) -> EgoEvidenceSpecV1:
+    if not _uses_sequence_q(q_net):
+        raise TypeError("A recurrent sequence Q-network is required.")
+    spec = getattr(q_net, "ego_evidence_spec", None)
+    if not isinstance(spec, EgoEvidenceSpecV1):
+        raise RuntimeError("The sequence Q-network is missing EgoEvidenceSpecV1.")
+    if spec.sha256() != q_net.evidence_spec_sha256:
+        raise RuntimeError("The sequence model and attached evidence spec disagree.")
+    return spec
+
+
+def _start_sequence_episode(
+    evidence_buffer: EvidenceBuffer,
+    q_net: nn.Module,
+    obs: dict[str, np.ndarray],
+    state: Any,
+    option_lib: OCV2OptionLibrary,
+    config: dict[str, Any],
+    *,
+    episode_id: str,
+    manifest_seed: int,
+) -> EpisodeEvidenceBuffer | None:
+    if not _uses_sequence_q(q_net):
+        evidence_buffer.set_sequence_episode(None)
+        return None
+    spec = _sequence_spec(q_net)
+    ensemble_cfg = ((config.get("path_c") or {}).get("ensemble") or {})
+    bootstrap_p = (
+        float(ensemble_cfg.get("bootstrap_p", 1.0))
+        if int(q_net.n_heads) > 1
+        else 1.0
+    )
+    bootstrap = EpisodeBootstrapRecord.sample(
+        episode_id=str(episode_id),
+        n_heads=int(q_net.n_heads),
+        bootstrap_p=bootstrap_p,
+        manifest_seed=int(manifest_seed) & ((1 << 63) - 1),
+    )
+    valid_actions = np.asarray(option_lib.valid_options(state, 0), dtype=bool)
+    initial = spec.encode_decision(
+        observation=_obs_vector(obs, "agent_0"),
+        ego_primitive_actions=(),
+        partner_primitive_actions=(),
+        ego_option_id=None,
+        duration=0,
+        reward=0.0,
+        progress_events=np.zeros(spec.progress_event_dim, dtype=np.float32),
+        valid_actions=valid_actions,
+        terminated=False,
+        truncated=False,
+    )
+    episode = EpisodeEvidenceBuffer(spec, bootstrap)
+    episode.start(initial, valid_actions)
+    evidence_buffer.set_sequence_episode(episode)
+    return episode
+
+
+def _path_c_progress_event_vector(
+    event: Any,
+    spec: EgoEvidenceSpecV1,
+) -> np.ndarray:
+    if tuple(spec.progress_event_names) != _PATH_C_PROGRESS_EVENT_NAMES:
+        raise ValueError("Unexpected Path C progress-event vocabulary.")
+    return np.asarray(
+        [float(bool(getattr(event, name, False))) for name in spec.progress_event_names],
+        dtype=np.float32,
+    )
+
+
+def _sequence_step_return(step_reward: float, config: dict[str, Any]) -> float:
+    value_bound = (config.get("training", {}).get("value_bound") or {})
+    reward_scale = float(value_bound.get("reward_scale", 1.0))
+    if not math.isfinite(reward_scale) or reward_scale <= 0.0:
+        raise ValueError("training.value_bound.reward_scale must be positive and finite.")
+    step_cost = float(config["training"].get("cost_per_step", 1.0))
+    cost_coef = float(config["training"].get("cost_coef", 0.0))
+    return float((float(step_reward) - cost_coef * step_cost) / reward_scale)
+
+
 def _execute_option(
     env: OCV2Adapter,
     obs: dict[str, np.ndarray],
@@ -1924,6 +2288,8 @@ def _execute_option(
     method: str | None = None,
     belief_model: FactorLocalBeliefModel | None = None,
     device: torch.device | None = None,
+    truncate_at_boundary: bool = False,
+    probe_cost: float = 0.0,
 ) -> tuple[OptionTransition, bool, dict[str, np.ndarray]]:
     opt = option_lib.options[int(option_id)]
     runtime = OptionRuntime(
@@ -1936,12 +2302,21 @@ def _execute_option(
     belief_hidden_t = evidence_buffer.belief_window_base_snapshot()
     obs_feat_t = _obs_vector(obs, "agent_0")
     expected_cost = option_lib.expected_cost(env.state, 0, int(option_id))
-    reward_sum = 0.0
+    if not math.isfinite(float(probe_cost)) or float(probe_cost) < 0.0:
+        raise ValueError("Path C probe cost must be finite and non-negative.")
+    reward_sum = -float(probe_cost)
     realized_cost = 0.0
     duration = 0
     done = False
     termination_reason = "running"
     event_summary = _empty_event_summary()
+    event_summary["path_c_probe_cost"] = float(probe_cost)
+    sequence_episode = evidence_buffer.sequence_episode()
+    sequence_decision = (
+        DecisionEvidenceBuffer(sequence_episode.spec)
+        if isinstance(sequence_episode, EpisodeEvidenceBuffer)
+        else None
+    )
 
     _budget = option_lib.option_budget(env.state, 0, int(option_id))
     while duration < _budget:
@@ -1965,12 +2340,31 @@ def _execute_option(
         ego_contributed = False
         if contribution_ledger is not None:
             ego_contributed = contribution_ledger.query_and_reset_on_delivery(event)
-        reward_sum += _training_reward(
+        step_reward = _training_reward(
             step, config, "agent_0", event,
             ego_contributed=ego_contributed,
         )
+        reward_sum += step_reward
         realized_cost += float(config["training"].get("cost_per_step", 1.0))
         duration += 1
+        if sequence_decision is not None:
+            evidence_step_return = _sequence_step_return(step_reward, config)
+            if duration == 1 and float(probe_cost) > 0.0:
+                reward_scale = float(
+                    (config.get("training", {}).get("value_bound") or {}).get(
+                        "reward_scale", 1.0
+                    )
+                )
+                evidence_step_return -= float(probe_cost) / reward_scale
+            sequence_decision.append_primitive(
+                int(ego_action),
+                int(partner_action.primitive_action),
+                reward=evidence_step_return,
+                progress_event=_path_c_progress_event_vector(
+                    event,
+                    sequence_decision.spec,
+                ),
+            )
         x_f = router.route(
             event,
             ego_option_id=int(option_id),
@@ -2036,9 +2430,35 @@ def _execute_option(
     # the TD bootstrap must do the same for s_{t+1}. Store the next-state validity
     # inside the transition summary to avoid changing the public OptionTransition
     # schema; _td_update consumes it when the replay buffer exposes event_summary.
-    event_summary["valid_options_next"] = [
-        bool(x) for x in option_lib.valid_options(env.state, 0).tolist()
-    ]
+    valid_options_next = np.asarray(option_lib.valid_options(env.state, 0), dtype=bool)
+    event_summary["valid_options_next"] = [bool(x) for x in valid_options_next.tolist()]
+
+    sequence_truncated = bool(truncate_at_boundary and not done)
+    if sequence_decision is not None:
+        if not isinstance(sequence_episode, EpisodeEvidenceBuffer):
+            raise RuntimeError("Sequence decision has no episode buffer.")
+        next_evidence = sequence_decision.encode_boundary(
+            observation=_obs_vector(obs, "agent_0"),
+            ego_option_id=int(option_id),
+            valid_actions=valid_options_next,
+            terminated=bool(done),
+            truncated=sequence_truncated,
+        )
+        value_bound = (config.get("training", {}).get("value_bound") or {})
+        reward_scale = float(value_bound.get("reward_scale", 1.0))
+        sequence_reward = (
+            float(reward_sum)
+            - float(config["training"].get("cost_coef", 0.0)) * float(realized_cost)
+        ) / reward_scale
+        sequence_episode.append_transition(
+            action=int(option_id),
+            reward=float(sequence_reward),
+            discount=float(config["training"]["gamma"]) ** int(duration),
+            done=bool(done),
+            truncated=sequence_truncated,
+            next_evidence=next_evidence,
+            next_valid_actions=valid_options_next,
+        )
 
     return (
         OptionTransition(
@@ -2062,7 +2482,11 @@ def _execute_option(
             graph_id=f"{graph.layout_name}:{graph.metadata.get('graph_variant', 'graph')}",
             partner_id=int(getattr(partner, "partner_id", 0)),
             event_summary=event_summary,
-            bootstrap_mask=_path_c_bootstrap_mask(config, rng),
+            bootstrap_mask=(
+                None
+                if sequence_decision is not None
+                else _path_c_bootstrap_mask(config, rng)
+            ),
         ),
         done,
         obs,
@@ -2074,6 +2498,8 @@ def _path_c_bootstrap_mask(
     rng: np.random.Generator,
 ) -> np.ndarray | None:
     ensemble = (config.get("path_c") or {}).get("ensemble") or {}
+    if str(ensemble.get("architecture", "legacy_default_off")) == "recurrent_sequence_v1":
+        return None
     n_heads = int(ensemble.get("n_heads", 1))
     if n_heads <= 1:
         return None
@@ -2090,12 +2516,43 @@ def _td_update(
     target_q_net: nn.Module,
     belief_model: FactorLocalBeliefModel,
     optimizer: torch.optim.Optimizer,
-    batch: dict[str, Any],
+    batch: dict[str, Any] | SequenceTDBatch,
     graph: GraphSpec,
     config: dict[str, Any],
     device: torch.device,
 ) -> float:
     q_net.train()
+    if _uses_sequence_q(q_net):
+        if not _uses_sequence_q(target_q_net):
+            raise TypeError("Sequence training requires a recurrent target network.")
+        if not isinstance(batch, SequenceTDBatch):
+            raise TypeError("Sequence training requires a full-episode SequenceTDBatch.")
+        batch = batch.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        value_bound = config["training"].get("value_bound", {}) or {}
+        loss = sequence_td_loss(
+            q_net,
+            target_q_net,
+            batch,
+            td_loss=str(config["training"].get("td_loss", "huber")),
+            huber_delta=float(config["training"].get("huber_delta", 1.0)),
+            double_q=_as_bool(config["training"].get("double_q", True), "double_q"),
+            vmax=(
+                float(value_bound["vmax"])
+                if value_bound.get("enabled") and value_bound.get("vmax") is not None
+                else None
+            ),
+            fail_on_zero_support_head=False,
+            require_matching_prior=True,
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [parameter for parameter in q_net.parameters() if parameter.requires_grad],
+            float(config["training"]["grad_clip_norm"]),
+        )
+        optimizer.step()
+        return float(loss.detach().cpu().item())
+
     if method in {"aris_bellman", "flat_factor"}:
         belief_model.train()
 
@@ -2323,7 +2780,6 @@ def _run_greedy_validation(
     # probe-collection run. Probes are disabled here even if training used them.
     greedy_probe = greedy_config.setdefault("path_c", {}).setdefault("probe", {})
     greedy_probe["enable"] = False
-    greedy_probe["eval_enable"] = False
     rng = np.random.default_rng(seed)
     returns: list[float] = []
     option_counts: list[int] = []
@@ -2358,6 +2814,16 @@ def _run_greedy_validation(
                     int(seed) + episode_idx,
                     router,
                     partner_override=validation_partner,
+                )
+                _start_sequence_episode(
+                    evidence_buffer,
+                    q_net,
+                    obs,
+                    state,
+                    option_lib,
+                    greedy_config,
+                    episode_id=f"greedy_validation:{int(seed)}:{int(episode_idx)}",
+                    manifest_seed=int(seed),
                 )
                 partner_option_inferencer = _new_partner_option_inferencer(option_lib, state, greedy_config)
                 _initialise_persistent_belief(evidence_buffer, method, belief_model, graph, device, _belief_persistence_enabled(greedy_config))
@@ -2406,6 +2872,10 @@ def _run_greedy_validation(
                         method=method,
                         belief_model=belief_model,
                         device=device,
+                        truncate_at_boundary=(
+                            option_count + 1
+                            >= int(config["training"]["max_episode_options"])
+                        ),
                     )
                     episode_return += _transition_training_return(
                         transition,
@@ -2471,6 +2941,9 @@ def _state_repr(
     belief_hidden: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if method == "global_gru":
+        # Compatibility value for legacy belief diagnostics only.  The active
+        # global_gru model is RecurrentEnsembleQ and consumes EgoEvidenceSpecV1
+        # directly in selection and sequence TD updates.
         return evidence
     if method in {"aris_bellman", "flat_factor"}:
         hidden = belief_model.encode_history(
@@ -2532,6 +3005,55 @@ def _select_option(
 
     with torch.no_grad():
         obs_tensor = _tensor(_obs_vector(obs, "agent_0")[None, ...], device)
+        if _uses_sequence_q(q_net):
+            episode = evidence_buffer.sequence_episode()
+            if not isinstance(episode, EpisodeEvidenceBuffer):
+                raise RuntimeError(
+                    "Sequence action selection requires a started full-episode evidence buffer."
+                )
+            sequence_batch = episode.evidence_batch(device)
+            encoded_valid = sequence_batch.valid_actions[0, -1]
+            valid_tensor = torch.as_tensor(valid, dtype=torch.bool, device=device)
+            if not torch.equal(encoded_valid, valid_tensor):
+                raise RuntimeError(
+                    "Current valid actions disagree with EgoEvidenceSpecV1 history."
+                )
+            head_trace, _ = q_net.forward_sequence(sequence_batch)
+            head_values = head_trace[:, -1]
+            prior_head_values = None
+            if float(q_net.prior_scale) > 0.0:
+                prior_head_values = q_net.forward_prior_sequence(sequence_batch)[:, -1]
+            _record_path_c_ensemble_telemetry(
+                selection_stats,
+                ensemble_diversity_telemetry(
+                    head_values,
+                    valid_tensor.unsqueeze(0),
+                    prior_q_values=prior_head_values,
+                    prior_scale=float(q_net.prior_scale),
+                ),
+            )
+            q_values = head_values.mean(dim=1).squeeze(0)
+            q_values = q_values.masked_fill(~valid_tensor, -1e9)
+            probe_choice = _path_c_probe_choice(
+                q_net,
+                obs_tensor,
+                None,
+                _graph_tensors(graph, 1, device),
+                q_values,
+                valid_tensor,
+                config,
+                partner_id=partner_id,
+                device=device,
+                selection_stats=selection_stats,
+                base_q_values=None,
+                eval_mode=eval_mode,
+                probe_rng=rng,
+                head_values_override=head_values,
+            )
+            if probe_choice is not None:
+                return probe_choice
+            return int(torch.argmax(q_values).item())
+
         evidence = _tensor(evidence_buffer.snapshot()[None, ...], device)
         evidence_mask = torch.as_tensor(
             evidence_buffer.snapshot_mask()[None, ...], dtype=torch.bool, device=device
@@ -2615,11 +3137,22 @@ def _path_c_record_probe_decision(
     scalar: float | None = None,
     candidate_mean_q: float | None = None,
     rule: str | None = None,
+    candidate_scores: Sequence[float] | None = None,
+    candidate_mask: Sequence[bool] | None = None,
+    propensity: float | None = None,
+    probe_cost_per_use: float | None = None,
 ) -> None:
     if selection_stats is None:
         return
     if reason not in PATH_C_PROBE_PROVENANCE_IDS:
         raise ValueError(f"Unknown Path C probe provenance reason: {reason!r}")
+    unit_cost = (
+        float(selection_stats.get("path_c_probe_cost_per_use", 0.0))
+        if probe_cost_per_use is None
+        else float(probe_cost_per_use)
+    )
+    if not math.isfinite(unit_cost) or unit_cost < 0.0:
+        raise ValueError("Path C probe cost must be finite and non-negative.")
     record = {
         "selected": bool(selected),
         "option_id": int(option_id) if option_id is not None else -1,
@@ -2629,11 +3162,23 @@ def _path_c_record_probe_decision(
             None if candidate_mean_q is None else float(candidate_mean_q)
         ),
         "rule": "none" if rule is None else str(rule),
-        "target": "residual_control_signature_disagreement",
+        "target": "normalized_advantage_disagreement",
+        "candidate_scores": (
+            None if candidate_scores is None
+            else [float(value) for value in candidate_scores]
+        ),
+        "candidate_mask": (
+            None if candidate_mask is None
+            else [bool(value) for value in candidate_mask]
+        ),
+        "propensity": None if propensity is None else float(propensity),
+        "probe_cost_per_use": unit_cost,
+        "realized_probe_cost": unit_cost if selected else 0.0,
         "selection_count": int(selection_stats.get("option_selection_count", 0)),
     }
     selection_stats["path_c_probe_last"] = dict(record)
     selection_stats["path_c_probe_last_decision"] = dict(record)
+    selection_stats.setdefault("path_c_probe_decisions", []).append(dict(record))
 
 
 def _path_c_probe_choice(
@@ -2651,12 +3196,19 @@ def _path_c_probe_choice(
     base_q_values: torch.Tensor | None = None,
     eval_mode: bool = False,
     probe_rng: np.random.Generator | None = None,
+    head_values_override: torch.Tensor | None = None,
 ) -> int | None:
     path_c = config.get("path_c") or {}
     probe = path_c.get("probe") or {}
+    if selection_stats is not None:
+        selection_stats["path_c_probe_cost_per_use"] = float(
+            (path_c.get("preregistration") or {}).get(
+                "probe_cost_per_use", 0.0
+            )
+        )
     if not bool(probe.get("enable", False)):
         return None
-    if eval_mode and not bool(probe.get("eval_enable", False)):
+    if eval_mode:
         _path_c_record_probe_decision(selection_stats, False, "disabled")
         return None
     if selection_stats is not None:
@@ -2666,57 +3218,49 @@ def _path_c_probe_choice(
             _increment_count(selection_stats, "path_c_probe_skipped_single_head_count")
         _path_c_record_probe_decision(selection_stats, False, "disabled")
         return None
-    if base_q_values is None:
-        base_q_net = getattr(q_net, "path_c_base_q_net", None)
-        if base_q_net is not None:
-            base_q_values = base_q_net(
-                obs_tensor,
-                state_repr,
-                **_q_forward_kwargs(graph_batch),
-            )
-    if base_q_values is None:
-        if bool(probe.get("require_public_residual_baseline", True)):
-            if selection_stats is not None:
-                _increment_count(selection_stats, "path_c_probe_skipped_missing_public_baseline_count")
-            _path_c_record_probe_decision(selection_stats, False, "disabled")
-            return None
-        if selection_stats is not None:
-            _increment_count(selection_stats, "path_c_probe_skipped_missing_public_baseline_count")
+    # A separately learned public-state baseline is intentionally not part of
+    # the primary selector.  It remains available to callers for secondary
+    # visualization only.
+    del base_q_values
+    if head_values_override is None and not hasattr(q_net, "forward_heads"):
         _path_c_record_probe_decision(selection_stats, False, "disabled")
         return None
-    if not hasattr(q_net, "forward_heads"):
-        _path_c_record_probe_decision(selection_stats, False, "disabled")
-        return None
-    head_values = q_net.forward_heads(
-        obs_tensor,
-        state_repr,
-        **_q_forward_kwargs(graph_batch),
-        partner_id=_partner_id_tensor(partner_id, 1, device),
-    )
-    if base_q_values.ndim == 1:
-        base_q_values = base_q_values.unsqueeze(0)
-    disagreement = residual_signature_disagreement(
+    head_values = head_values_override
+    if head_values is None:
+        head_values = q_net.forward_heads(
+            obs_tensor,
+            state_repr,
+            **_q_forward_kwargs(graph_batch),
+            partner_id=_partner_id_tensor(partner_id, 1, device),
+        )
+    disagreement = normalized_advantage_disagreement(
         head_values,
-        base_q_values,
         option_mask=valid_tensor.unsqueeze(0) if valid_tensor.ndim == 1 else valid_tensor,
         stat=str((path_c.get("ensemble") or {}).get("disagreement_stat", "variance")),
         tie_atol=float((path_c.get("ensemble") or {}).get("tie_atol", 1.0e-6)),
     )
+    logged_candidate_scores = [
+        float(value)
+        for value in disagreement["per_option"].detach().cpu().reshape(-1).tolist()
+    ]
+    logged_candidate_mask = [
+        bool(value)
+        for value in valid_tensor.detach().cpu().reshape(-1).tolist()
+    ]
     collection_selection_mode = str(
-        probe.get("collection_selection_mode", "residual")
+        probe.get("collection_selection_mode", "normalized_advantage")
     )
     if collection_selection_mode == "random":
         if probe_rng is None:
             raise ValueError("Random-probe collection requires an explicit RNG.")
         valid_ids = np.flatnonzero(valid_tensor.detach().cpu().numpy().astype(bool))
         choice = int(probe_rng.choice(valid_ids))
-        score = float(disagreement["scalar"].detach().cpu().reshape(-1)[0])
+        score = float(
+            disagreement["per_option"].detach().cpu().reshape(-1)[choice]
+        )
         candidate_mean_q = float(q_values.reshape(-1)[choice].detach().cpu().item())
-        threshold = probe.get("disagreement_threshold")
         return_floor = probe.get("return_floor")
-        if threshold is None or score < float(threshold):
-            reason = "threshold"
-        elif return_floor is None or candidate_mean_q < float(return_floor):
+        if return_floor is None or candidate_mean_q < float(return_floor):
             reason = "return_floor"
         else:
             reason = "selected"
@@ -2726,8 +3270,9 @@ def _path_c_probe_choice(
             "option_id": choice,
             "score": score,
             "candidate_mean_q": candidate_mean_q,
+            "propensity": 1.0 / float(len(valid_ids)),
         }
-    elif collection_selection_mode == "residual":
+    elif collection_selection_mode == "normalized_advantage":
         decision = select_probe_candidate(
             disagreement["per_option"],
             q_values,
@@ -2735,9 +3280,11 @@ def _path_c_probe_choice(
             disagreement_threshold=probe.get("disagreement_threshold"),
             return_floor=probe.get("return_floor"),
         )
+        decision["propensity"] = 1.0
     else:
         raise ValueError(
-            f"Unknown Path C collection_selection_mode={collection_selection_mode!r}."
+            "Path C collection_selection_mode must be 'normalized_advantage' "
+            f"or 'random'; got {collection_selection_mode!r}."
         )
     choice = int(decision["option_id"])
     scalar = decision.get("score")
@@ -2749,8 +3296,13 @@ def _path_c_probe_choice(
             selection_stats,
             False,
             "threshold",
+            option_id=choice,
             scalar=scalar,
             candidate_mean_q=candidate_mean_q,
+            rule=str(probe.get("rule", "max_normalized_advantage_disagreement")),
+            candidate_scores=logged_candidate_scores,
+            candidate_mask=logged_candidate_mask,
+            propensity=decision.get("propensity"),
         )
         return None
     if decision["reason"] == "return_floor":
@@ -2760,8 +3312,17 @@ def _path_c_probe_choice(
             selection_stats,
             False,
             "return_floor",
+            option_id=choice,
             scalar=scalar,
             candidate_mean_q=candidate_mean_q,
+            rule=(
+                "random_probe_valid"
+                if collection_selection_mode == "random"
+                else str(probe.get("rule", "max_normalized_advantage_disagreement"))
+            ),
+            candidate_scores=logged_candidate_scores,
+            candidate_mask=logged_candidate_mask,
+            propensity=decision.get("propensity"),
         )
         return None
     if not decision["selected"]:
@@ -2779,8 +3340,11 @@ def _path_c_probe_choice(
         rule=(
             "random_probe_valid"
             if collection_selection_mode == "random"
-            else str(probe.get("rule", "max_residual_signature_disagreement"))
+            else str(probe.get("rule", "max_normalized_advantage_disagreement"))
         ),
+        candidate_scores=logged_candidate_scores,
+        candidate_mask=logged_candidate_mask,
+        propensity=decision.get("propensity"),
     )
     return choice
 
@@ -3665,7 +4229,14 @@ def _empty_metrics(method: str, graph: GraphSpec, output_dir: Path) -> dict[str,
         "output_dir": str(output_dir),
         "td_losses": [],
         "episode_returns": [],
-        "episode_return_kind": "reward_sum_minus_cost_coef_realized_cost",
+        "episode_return_kind": (
+            "reward_sum_including_selected_path_c_probe_cost_"
+            "minus_cost_coef_realized_primitive_cost"
+        ),
+        "path_c_probe_cost_accounting": (
+            "A selected probe cost is subtracted exactly once from reward_sum; "
+            "primitive-step cost is accounted for separately."
+        ),
         "option_durations": [],
         "termination_counts": {},
         "option_kind_stats": {},
@@ -3709,6 +4280,23 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     forced_noop_count = int(metrics.get("forced_noop_count", 0))
     no_valid_count = int(metrics.get("no_valid_option_count", 0))
     checkpoint_selection = metrics.get("checkpoint_selection", {}) or {}
+    ensemble_accumulator = (
+        metrics.get("path_c_ensemble_telemetry_accumulator", {}) or {}
+    )
+    ensemble_count = int(ensemble_accumulator.get("observation_count", 0))
+    correlation_count = int(
+        ensemble_accumulator.get("head_correlation_observation_count", 0)
+    )
+    return_floor_count = int(
+        metrics.get("path_c_probe_skipped_return_floor_count", 0)
+    )
+    floor_adjudication_count = sum(
+        int(metrics.get(key, 0))
+        for key in (
+            "path_c_probe_skipped_return_floor_count",
+            "path_c_probe_selected_count",
+        )
+    )
     return {
         "finite_td_loss": bool(losses.size == 0 or np.all(np.isfinite(losses))),
         "td_loss_first_window": first_mean,
@@ -3731,6 +4319,50 @@ def _metrics_summary(metrics: dict[str, Any]) -> dict[str, Any]:
         "no_valid_option_fraction": float(
             no_valid_count / max(1, selection_count)
         ),
+        "path_c_probe_floor_binding": {
+            "definition": (
+                "return-floor rejections divided by candidates that passed the "
+                "disagreement threshold and reached return-floor adjudication"
+            ),
+            "return_floor_rejection_count": return_floor_count,
+            "candidate_decision_count": floor_adjudication_count,
+            "rate": (
+                float(return_floor_count / floor_adjudication_count)
+                if floor_adjudication_count > 0
+                else None
+            ),
+        },
+        "path_c_ensemble_telemetry_summary": {
+            "definition": ensemble_accumulator.get("definition"),
+            "observation_count": ensemble_count,
+            "effective_rank_mean": (
+                float(ensemble_accumulator.get("effective_rank_sum", 0.0))
+                / float(ensemble_count)
+                if ensemble_count > 0
+                else None
+            ),
+            "head_correlation_mean": (
+                float(ensemble_accumulator.get("head_correlation_sum", 0.0))
+                / float(correlation_count)
+                if correlation_count > 0
+                else None
+            ),
+            "head_correlation_absolute_mean": (
+                float(ensemble_accumulator.get("head_correlation_absolute_sum", 0.0))
+                / float(correlation_count)
+                if correlation_count > 0
+                else None
+            ),
+            "prior_contribution_ratio_mean": (
+                float(
+                    ensemble_accumulator.get("prior_contribution_ratio_sum", 0.0)
+                )
+                / float(ensemble_count)
+                if ensemble_count > 0
+                else None
+            ),
+            "latest": ensemble_accumulator.get("latest"),
+        },
         "option_kind_stats": metrics.get("option_kind_stats", {}),
         "delivery_event_count": int(metrics.get("task_progress_counts", {}).get("delivery_event", 0)),
         "ego_delivery_event_count": int(
@@ -3833,10 +4465,17 @@ def _save_checkpoint(
                 (path_c.get("preregistration") or {}).get("sha256")
             ),
             "resolved_path_c_sha256": path_c.get("resolved_path_c_sha256"),
+            "ego_evidence_spec_sha256": (
+                _sequence_spec(q_net).sha256()
+                if q_net is not None and _uses_sequence_q(q_net)
+                else None
+            ),
         },
     }
     if q_net is not None:
         payload["q_net"] = q_net.state_dict()
+        if _uses_sequence_q(q_net):
+            payload["ego_evidence_spec"] = _sequence_spec(q_net).to_dict()
     if belief_model is not None:
         payload["belief_model"] = belief_model.state_dict()
     if optimizer is not None:
@@ -3856,6 +4495,11 @@ def _save_checkpoint(
             (path_c.get("preregistration") or {}).get("sha256")
         ),
         "resolved_path_c_sha256": path_c.get("resolved_path_c_sha256"),
+        "ego_evidence_spec_sha256": (
+            _sequence_spec(q_net).sha256()
+            if q_net is not None and _uses_sequence_q(q_net)
+            else None
+        ),
         "trainable_parameters": trainable_parameters,
         "parameter_count": int(sum(
             int(np.prod(np.asarray(shape, dtype=np.int64)))
@@ -3942,8 +4586,9 @@ def _apply_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> No
             args.path_c_preregistration
         )
     if getattr(args, "path_c_probe_base_checkpoint", None) is not None:
-        probe_cfg = config.setdefault("path_c", {}).setdefault("probe", {})
-        probe_cfg["base_checkpoint"] = str(args.path_c_probe_base_checkpoint)
+        config["path_c_secondary_base_checkpoint"] = str(
+            args.path_c_probe_base_checkpoint
+        )
     if bool(getattr(args, "allow_shared_shaping", False)):
         config["training"]["allow_shared_shaping"] = True
     for key in (
@@ -4121,6 +4766,59 @@ def _record_selection_attempt(selection_stats: dict[str, Any] | None) -> None:
     ) + 1
 
 
+def _record_path_c_ensemble_telemetry(
+    selection_stats: dict[str, Any] | None,
+    observation: dict[str, Any],
+) -> None:
+    """Accumulate auditable ensemble diagnostics without affecting selection."""
+
+    if selection_stats is None:
+        return
+    block = selection_stats.setdefault(
+        "path_c_ensemble_telemetry_accumulator",
+        {
+            "definition": observation["definition"],
+            "observation_count": 0,
+            "effective_rank_sum": 0.0,
+            "prior_contribution_ratio_sum": 0.0,
+            "head_correlation_observation_count": 0,
+            "head_correlation_sum": 0.0,
+            "head_correlation_absolute_sum": 0.0,
+            "latest": None,
+        },
+    )
+    if block.get("definition") != observation.get("definition"):
+        raise ValueError("Path C ensemble telemetry definition changed within one run.")
+    for key in ("effective_rank", "prior_contribution_ratio"):
+        value = float(observation[key])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"Path C ensemble telemetry {key} must be finite and non-negative.")
+    block["observation_count"] = int(block["observation_count"]) + 1
+    block["effective_rank_sum"] = float(block["effective_rank_sum"]) + float(
+        observation["effective_rank"]
+    )
+    block["prior_contribution_ratio_sum"] = float(
+        block["prior_contribution_ratio_sum"]
+    ) + float(observation["prior_contribution_ratio"])
+    correlation = observation.get("head_correlation_mean")
+    absolute_correlation = observation.get("head_correlation_absolute_mean")
+    if correlation is not None or absolute_correlation is not None:
+        if correlation is None or absolute_correlation is None:
+            raise ValueError("Head-correlation telemetry fields must be jointly available.")
+        correlation = float(correlation)
+        absolute_correlation = float(absolute_correlation)
+        if not math.isfinite(correlation) or not math.isfinite(absolute_correlation):
+            raise ValueError("Head-correlation telemetry must be finite.")
+        block["head_correlation_observation_count"] = int(
+            block["head_correlation_observation_count"]
+        ) + 1
+        block["head_correlation_sum"] = float(block["head_correlation_sum"]) + correlation
+        block["head_correlation_absolute_sum"] = float(
+            block["head_correlation_absolute_sum"]
+        ) + absolute_correlation
+    block["latest"] = dict(observation)
+
+
 def _record_forced_noop(selection_stats: dict[str, Any] | None) -> None:
     if selection_stats is None:
         return
@@ -4136,7 +4834,7 @@ def _noop_option_id(option_lib: OCV2OptionLibrary) -> int:
     for opt in option_lib.options:
         if opt.kind == "noop":
             return int(opt.id)
-    return 0
+    raise ValueError("The registered option library has no noop fallback option.")
 
 
 def _obs_vector(obs: dict[str, np.ndarray], agent_key: str) -> np.ndarray:
@@ -4161,9 +4859,9 @@ def _trainable_params(
     method: str,
 ) -> list[nn.Parameter]:
     params = list(q_net.parameters())
-    if method in {"aris_bellman", "flat_factor"}:
+    if method in {"aris_bellman", "flat_factor"} and not _uses_sequence_q(q_net):
         params += list(belief_model.parameters())
-    return params
+    return [parameter for parameter in params if parameter.requires_grad]
 
 
 def _mask_q_values(
@@ -4336,8 +5034,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--path_c_probe_base_checkpoint",
         default=None,
         help=(
-            "Frozen base_only checkpoint used for residual-control-signature "
-            "probe selection. Required when path_c.probe.enable=true."
+            "Optional frozen base_only checkpoint for secondary residual "
+            "visualization; it never drives Path C probe selection."
         ),
     )
     parser.add_argument("--td_loss", choices=("huber", "mse"), default=None)

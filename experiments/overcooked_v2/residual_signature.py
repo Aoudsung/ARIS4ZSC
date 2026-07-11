@@ -1,11 +1,133 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
 
 
 _NEG_INF = -1.0e9
+
+
+def normalized_advantage_signature(
+    q_values: torch.Tensor,
+    *,
+    option_mask: torch.Tensor | None = None,
+    tie_atol: float = 1.0e-6,
+) -> dict[str, torch.Tensor]:
+    """Return the primary Path C control code ``Q - max_valid(Q)``.
+
+    ``q_values`` may have any leading dimensions and must end in the action
+    dimension. A mask may omit ensemble/time dimensions as long as it broadcasts
+    after singleton dimensions are inserted immediately before the action axis.
+    Invalid actions are zeroed in the returned code and never participate in the
+    maximum. This is the primary retained decision code; it does not use a
+    separately learned public-state baseline.
+    """
+
+    if not isinstance(q_values, torch.Tensor) or q_values.ndim < 1:
+        raise ValueError("q_values must be a tensor ending in an action dimension.")
+    if not torch.is_floating_point(q_values):
+        raise TypeError("q_values must use a floating-point dtype.")
+    if q_values.shape[-1] <= 0:
+        raise ValueError("q_values must contain at least one action.")
+    if not math.isfinite(float(tie_atol)) or float(tie_atol) < 0.0:
+        raise ValueError("tie_atol must be non-negative.")
+
+    valid = _broadcast_action_mask(option_mask, q_values)
+    if not bool(torch.isfinite(q_values[valid]).all()):
+        raise ValueError("Valid-action Q values must be finite.")
+    ranked = q_values.masked_fill(~valid, -torch.inf)
+    has_valid = valid.any(dim=-1)
+    max_q = ranked.max(dim=-1, keepdim=True).values
+    safe_max = torch.where(
+        has_valid.unsqueeze(-1),
+        max_q,
+        torch.zeros_like(max_q),
+    )
+    normalized = (q_values - safe_max).masked_fill(~valid, 0.0)
+    best_option = ranked.argmax(dim=-1)
+    best_option = torch.where(has_valid, best_option, torch.zeros_like(best_option))
+    best_option_set = valid & torch.isclose(
+        ranked,
+        safe_max,
+        atol=float(tie_atol),
+        rtol=0.0,
+    )
+    return {
+        "normalized_advantage": normalized,
+        "best_option": best_option,
+        "best_option_set": best_option_set,
+        "has_valid_action": has_valid,
+    }
+
+
+def normalized_advantage_disagreement(
+    head_q_values: torch.Tensor,
+    *,
+    option_mask: torch.Tensor | None = None,
+    stat: str = "variance",
+    tie_atol: float = 1.0e-6,
+) -> dict[str, torch.Tensor]:
+    """Measure per-action ensemble disagreement over normalized advantage.
+
+    The final two dimensions of ``head_q_values`` are ``[K,A]``. The output
+    ``per_option`` has the same leading dimensions followed by ``A``. This is the
+    training-time Path C probe target; public-baseline residuals, response labels,
+    identity, and style are intentionally absent.
+    """
+
+    if not isinstance(head_q_values, torch.Tensor) or head_q_values.ndim < 2:
+        raise ValueError("head_q_values must have shape [...,K,A].")
+    if head_q_values.shape[-2] <= 0:
+        raise ValueError("head_q_values must contain at least one ensemble head.")
+    stat = str(stat).lower()
+    if stat not in {"variance", "range"}:
+        raise ValueError("stat must be either 'variance' or 'range'.")
+
+    signature = normalized_advantage_signature(
+        head_q_values,
+        option_mask=option_mask,
+        tie_atol=tie_atol,
+    )
+    normalized = signature["normalized_advantage"]
+    if stat == "range":
+        per_option = normalized.max(dim=-2).values - normalized.min(dim=-2).values
+    else:
+        per_option = normalized.var(dim=-2, unbiased=False)
+    valid = _broadcast_action_mask(option_mask, head_q_values).any(dim=-2)
+    per_option = per_option.masked_fill(~valid, 0.0)
+    scalar = per_option.max(dim=-1).values
+    return {
+        "per_option": per_option,
+        "scalar": scalar,
+        "normalized_advantage": normalized,
+        "best_option_set": signature["best_option_set"],
+    }
+
+
+def _broadcast_action_mask(
+    option_mask: torch.Tensor | None,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    if option_mask is None:
+        return torch.ones_like(reference, dtype=torch.bool)
+    valid = torch.as_tensor(option_mask, dtype=torch.bool, device=reference.device)
+    original_shape = tuple(valid.shape)
+    if valid.ndim == 0 or valid.shape[-1] != reference.shape[-1]:
+        raise ValueError(
+            "option_mask must end in the same action dimension as q_values; got "
+            f"{tuple(valid.shape)} for {tuple(reference.shape)}."
+        )
+    while valid.ndim < reference.ndim:
+        valid = valid.unsqueeze(-2)
+    try:
+        return torch.broadcast_to(valid, reference.shape)
+    except RuntimeError as exc:
+        raise ValueError(
+            f"option_mask shape {original_shape} cannot broadcast to "
+            f"q_values shape {tuple(reference.shape)}."
+        ) from exc
 
 
 def residual_control_signature(
@@ -15,16 +137,17 @@ def residual_control_signature(
     option_mask: torch.Tensor | None = None,
     tie_atol: float = 1.0e-6,
 ) -> dict[str, torch.Tensor]:
-    """Compute Path C residual control signature tensors.
+    """Compute secondary public-baseline residual diagnostics.
 
     ``q_values`` is the history/belief-conditioned Q estimate. ``base_q_values``
     is the public-context estimate from ``BaseOnlyQNetwork``. Both tensors must
-    have shape ``[B, A]``. The result is evaluation/probe-selection only and
-    never participates in a training loss.
+    have shape ``[B, A]``. The result is a secondary visualization or incremental
+    diagnostic only. It must not define the primary retained code, drive the
+    training-time probe selector, or participate in a training loss.
 
-    Invariant: every control statistic below is computed from ``q_values -
-    base_q_values``. Raw Q gaps/advantages are intentionally not exposed as
-    ``Gamma_C`` because they can be explained by the public-state baseline.
+    Invariant: every statistic below is computed from ``q_values - base_q_values``
+    and must be labeled as a residual diagnostic. The primary control code is
+    :func:`normalized_advantage_signature`.
     """
     if q_values.shape != base_q_values.shape:
         raise ValueError(
@@ -95,12 +218,14 @@ def residual_signature_disagreement(
     stat: str = "variance",
     tie_atol: float = 1.0e-6,
 ) -> dict[str, torch.Tensor]:
-    """Disagreement over the residual-control signature, not raw Q.
+    """Secondary disagreement over a public-baseline residual signature.
 
     ``head_q_values`` has shape ``[B,H,A]`` and ``base_q_values`` has shape
-    ``[B,A]``. The returned ``per_option`` tensor can drive probe selection. It
-    combines residual-advantage disagreement, best-option-set instability, and a
-    broadcast residual-gap disagreement term. No gradient is required by callers.
+    ``[B,A]``. The returned ``per_option`` tensor combines residual-advantage
+    disagreement, best-option-set instability, and a broadcast residual-gap term.
+    It is retained for secondary diagnostics and backward artifact reading only.
+    The training-time selector must use
+    :func:`normalized_advantage_disagreement`.
     """
     if head_q_values.ndim != 3:
         raise ValueError(
@@ -244,7 +369,7 @@ def compute_residual_control_signature(
     graph_kwargs: dict[str, Any],
     q_extra: dict[str, Any] | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Evaluate Γ_C from a main Q network and a public-state baseline."""
+    """Evaluate secondary public-baseline residual diagnostics."""
     kwargs = dict(graph_kwargs)
     extra = dict(q_extra or {})
     q_values = _mean_q_values(q_net, obs_feat, belief, kwargs, extra)

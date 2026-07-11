@@ -1,6 +1,8 @@
 """D1 dataset generator — held-out response-predictability diagnostic (prereg D1 §2-§3).
 
-One (partner, ego-mode) pair per invocation; writes one .npz chunk + meta.
+One partner/controller pair is collected per invocation. Version-3 Path C data
+is written as one content-addressed Parquet shard plus metadata; the historical
+NPZ output remains available only for non-Path-C diagnostics.
 Substrate diagnostic ONLY: no training loss touches the main method; rollouts ride the
 exact eval execution semantics (E._select_option / option_primitive_step / behavior-only
 inferencer), so the logged partner-event stream is the same public channel
@@ -57,8 +59,18 @@ from experiments.overcooked_v2.path_c_evaluation import (  # noqa: E402
     PATH_C_PROBE_PROVENANCE_IDS,
     PATH_C_PROBE_RULE_IDS,
     canonical_sha256,
+    load_frozen_preregistration,
     make_episode_uid,
     make_run_id,
+)
+from experiments.overcooked_v2.path_c_response_summary import (  # noqa: E402
+    ResponseSummarySpecV1,
+)
+from experiments.overcooked_v2.path_c_sequence import (  # noqa: E402
+    DecisionEvidenceBuffer,
+    EgoEvidenceSpecV1,
+    EpisodeEvidenceBuffer,
+    ensemble_diversity_telemetry,
 )
 from experiments.overcooked_v2.partner_modes import (  # noqa: E402
     ID_TO_FAMILY,
@@ -68,6 +80,8 @@ from experiments.overcooked_v2.partner_modes import (  # noqa: E402
 from experiments.overcooked_v2.partner_pool import make_training_partners  # noqa: E402
 from experiments.overcooked_v2.residual_signature import (  # noqa: E402
     compute_residual_control_signature,
+    normalized_advantage_signature,
+    residual_control_signature,
 )
 from experiments.overcooked_v2.state_utils import (  # noqa: E402
     get_cell_extra,
@@ -167,7 +181,7 @@ RV_SUPPORT_KINDS = frozenset({
     "clear_interaction_cell",
 })
 RV_BLOCK_KINDS = frozenset({"cross_bottleneck", "wait_at_bottleneck"})
-PATH_C_PROBE_VARIANT = "probe"
+PATH_C_PROBE_VARIANT = "probing_ego"
 PATH_C_Q_BASELINE_VARIANTS = (
     "global_gru",
     "base_only",
@@ -191,6 +205,10 @@ PATH_C_SIGNATURE_SCALARS = (
     "residual_q_gap",
     "best_option",
     "action_rank_score",
+    "ensemble_effective_rank",
+    "head_correlation",
+    "head_correlation_absolute",
+    "prior_contribution_ratio",
 )
 PATH_C_VALUE_ADVANTAGE_COLUMNS = (
     "heldout_value_gap_advantage",
@@ -239,6 +257,9 @@ def _surface_identity_key(partner: Any) -> str:
     spec = getattr(partner, "spec", None)
     if spec is None:
         return canonical_sha256({"partner_class": type(partner).__name__})[:24]
+    explicit = getattr(spec, "surface_identity_key", None)
+    if explicit not in {None, ""}:
+        return str(explicit)
     payload = _jsonable_dataclass(spec)
     if isinstance(payload, dict):
         payload = {
@@ -246,6 +267,86 @@ def _surface_identity_key(partner: Any) -> str:
             "base_protocol": payload.get("base_protocol"),
         }
     return canonical_sha256(payload)[:24]
+
+
+def _frozen_split_assignment(
+    config: dict[str, Any],
+    partner: Any,
+    *,
+    layout_name: str,
+    split_group_id: str | None,
+    numeric_seed: int,
+) -> dict[str, Any]:
+    """Resolve the collection role and group fields from the frozen manifest."""
+
+    if split_group_id in {None, ""}:
+        raise ValueError(
+            "Version-3 Path C collection requires --path-c-split-group-id."
+        )
+    preregistration_path = (config.get("path_c") or {}).get(
+        "preregistration_path"
+    )
+    if preregistration_path in {None, ""}:
+        raise ValueError(
+            "Version-3 Path C collection requires a frozen preregistration path."
+        )
+    preregistration = load_frozen_preregistration(preregistration_path)
+    manifest = preregistration.split_manifest
+    groups = {group.group_id: group for group in manifest.groups}
+    group_id = str(split_group_id)
+    if group_id not in groups:
+        raise ValueError(
+            f"Split group {group_id!r} is absent from the frozen split manifest."
+        )
+    group = groups[group_id]
+    manifest.validate_numeric_seed(group_id, int(numeric_seed))
+    partner_spec = getattr(partner, "spec", None)
+    mechanism = getattr(partner_spec, "value_class_id", None)
+    style_group = getattr(partner_spec, "style_id", None)
+    identity_group = _surface_identity_key(partner)
+    if mechanism in {None, ""}:
+        raise ValueError(
+            "Version-3 Path C collection partner lacks a frozen value mechanism."
+        )
+    if style_group in {None, ""}:
+        raise ValueError(
+            "Version-3 Path C collection partner lacks a frozen style group."
+        )
+    observed = {
+        "mechanism": str(mechanism),
+        "identity_group": identity_group,
+        "style_group": str(style_group),
+        "layout_group": str(layout_name),
+        "numeric_seed": int(numeric_seed),
+    }
+    expected = {
+        "mechanism": group.mechanism,
+        "identity_group": group.identity_group,
+        "style_group": group.style_group,
+        "layout_group": group.layout_group,
+        "numeric_seed": int(numeric_seed),
+    }
+    mismatches = [
+        f"{name}: expected {expected[name]!r}, observed {observed[name]!r}"
+        for name in expected
+        if observed[name] != expected[name]
+    ]
+    if mismatches:
+        raise ValueError(
+            "The selected split group does not describe the collection target; "
+            + "; ".join(mismatches)
+        )
+    return {
+        "split_manifest_sha256": manifest.sha256,
+        "split_group_id": group.group_id,
+        "collection_role": manifest.role_for(group.group_id),
+        "mechanism": group.mechanism,
+        "identity_group": group.identity_group,
+        "style_group": group.style_group,
+        "seed_group": group.seed_group,
+        "layout_group": group.layout_group,
+        "numeric_seed": int(numeric_seed),
+    }
 
 
 def _surface_action_frequency_bin(hist_kind: np.ndarray) -> int:
@@ -460,6 +561,58 @@ def _summarize_rv_value_event_window(
     }
 
 
+def _canonical_response_token_id(
+    spec: ResponseSummarySpecV1,
+    summary: dict[str, int],
+    *,
+    terminal: bool,
+    censored: bool,
+    invalid_script: bool,
+    support_violation: bool,
+) -> int:
+    # Special outcomes are absorbing and mutually exclusive by registered
+    # precedence. They cannot be combined with a regular response token.
+    if support_violation:
+        return spec.encode(support_violation=True)
+    if invalid_script:
+        return spec.encode(invalid_script=True)
+    if terminal:
+        return spec.encode(terminal=True)
+    if censored:
+        return spec.encode(censored=True)
+    delivery = int(summary["resp_rv_value_event_delivery_outcome"])
+    if delivery in {
+        RV_DELIVERY_EGO_CORRECT,
+        RV_DELIVERY_PARTNER_CORRECT,
+        RV_DELIVERY_AMBIG_CORRECT,
+    }:
+        response_class = "delivery_success"
+    elif delivery in {
+        RV_DELIVERY_EGO_WRONG,
+        RV_DELIVERY_PARTNER_WRONG,
+        RV_DELIVERY_AMBIG_WRONG,
+    }:
+        response_class = "delivery_failure"
+    elif int(summary["resp_rv_value_event_block"]):
+        response_class = "block"
+    elif int(summary["resp_rv_value_event_escalate"]):
+        response_class = "escalate"
+    elif int(summary["resp_rv_value_event_defer"]):
+        response_class = "defer"
+    elif int(summary["resp_rv_value_event_help"]):
+        response_class = "help"
+    elif int(summary["resp_rv_value_event_wait"]):
+        response_class = "wait"
+    elif int(summary["resp_rv_value_event_partner_commitment"]):
+        response_class = "commitment"
+    elif int(summary["resp_rv_value_event_target_object"]):
+        response_class = "progress"
+    else:
+        response_class = "no_response"
+    latency = max(0, int(summary["resp_rv_value_event_response_latency"]))
+    return spec.encode(response_class=response_class, latency_steps=latency)
+
+
 def _raw_value_event_sequences(
     i: int,
     n_dp: int,
@@ -515,7 +668,7 @@ def _default_rv_summary_spec() -> dict[str, object]:
 
 
 def _rv_summary_spec(config: dict[str, Any] | None = None) -> dict[str, object]:
-    """Load and validate the frozen R^V grammar.
+    """Load the structured response fields used only by secondary readouts.
 
     R^V must be an identity/seed/style-free deterministic value-event summary.
     The code refuses specs that include absolute target coordinates or other known
@@ -525,7 +678,7 @@ def _rv_summary_spec(config: dict[str, Any] | None = None) -> dict[str, object]:
     source_path = None
     if config is not None:
         path_c = config.get("path_c") or {}
-        spec_path = ((path_c.get("rv_summary_spec") or {}).get("path"))
+        spec_path = ((path_c.get("response_summary_spec") or {}).get("path"))
         prereg_path = path_c.get("preregistration_path")
         source_path = spec_path or prereg_path
         if source_path not in {None, ""}:
@@ -533,12 +686,12 @@ def _rv_summary_spec(config: dict[str, Any] | None = None) -> dict[str, object]:
             if not isinstance(payload, dict):
                 raise ValueError(f"R^V spec/preregistration file must be a YAML mapping: {source_path}")
             status = str(payload.get("status", "")).strip().lower()
-            if "rv_summary_spec" in payload and status not in {"frozen", "locked"}:
+            if "response_summary_spec" in payload and status not in {"frozen", "locked"}:
                 raise ValueError(
                     f"Path C R^V preregistration must be frozen before dataset collection; "
                     f"got status={payload.get('status')!r}."
                 )
-            loaded = payload.get("rv_summary_spec", payload)
+            loaded = payload.get("response_summary_spec", payload)
             if not isinstance(loaded, dict):
                 raise ValueError("rv_summary_spec section must be a YAML mapping.")
             spec = dict(spec)
@@ -578,11 +731,123 @@ def _rv_summary_spec(config: dict[str, Any] | None = None) -> dict[str, object]:
     return spec
 
 
+def _primary_response_summary_spec(
+    config: dict[str, Any],
+) -> tuple[ResponseSummarySpecV1, int]:
+    path_c = config.get("path_c") or {}
+    source_path = (
+        (path_c.get("response_summary_spec") or {}).get("path")
+        or path_c.get("preregistration_path")
+    )
+    if source_path in {None, ""}:
+        raise ValueError(
+            "Canonical response collection requires a frozen Path C preregistration."
+        )
+    payload = yaml.safe_load(Path(str(source_path)).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("Path C response-summary source must be a YAML mapping.")
+    if str(payload.get("status", "")).strip().lower() != "frozen":
+        raise ValueError("Canonical response-summary collection requires status: frozen.")
+    raw = payload.get("response_summary_spec")
+    if not isinstance(raw, dict):
+        raise ValueError("Frozen preregistration lacks response_summary_spec.")
+    spec = ResponseSummarySpecV1.from_mapping({
+        "schema_version": raw.get("schema_version"),
+        "response_classes": raw.get("response_classes"),
+        "latency_bin_upper_bounds": raw.get("latency_bin_upper_bounds"),
+        "structured_multilabel_role": raw.get("structured_multilabel_role"),
+    })
+    window = int(raw.get("window_decisions", 0))
+    if window <= 0:
+        raise ValueError("response_summary_spec.window_decisions must be positive.")
+    return spec, window
+
+
+def _primary_evidence_spec(config: dict[str, Any]) -> EgoEvidenceSpecV1:
+    path_c = config.get("path_c") or {}
+    runtime_spec = (path_c.get("evidence_spec") or {}).get("frozen_spec")
+    if isinstance(runtime_spec, dict):
+        return EgoEvidenceSpecV1.from_dict(runtime_spec)
+    source_path = path_c.get("preregistration_path")
+    if source_path in {None, ""}:
+        raise ValueError("EgoEvidenceSpecV1 requires a frozen preregistration.")
+    return load_frozen_preregistration(source_path).evidence_spec
+
+
+def _frozen_probe_cost_from_config(config: dict[str, Any]) -> float:
+    """Read the only admissible Path C per-probe cost from frozen metadata."""
+
+    frozen = (config.get("path_c") or {}).get("preregistration", {}).get(
+        "probe_cost_per_use"
+    )
+    if frozen is None:
+        raise ValueError(
+            "Version-3 Path C collection requires a frozen per-probe cost."
+        )
+    if isinstance(frozen, (bool, np.bool_)):
+        raise ValueError(
+            "The frozen Path C per-probe cost must be finite and non-negative."
+        )
+    try:
+        cost = float(frozen)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "The frozen Path C per-probe cost must be finite and non-negative."
+        ) from exc
+    if not np.isfinite(cost) or cost < 0.0:
+        raise ValueError(
+            "The frozen Path C per-probe cost must be finite and non-negative."
+        )
+    return cost
+
+
+def _progress_event_vector(
+    spec: EgoEvidenceSpecV1,
+    event: Any,
+) -> np.ndarray:
+    values = []
+    for name in spec.progress_event_names:
+        raw = getattr(event, name, 0.0)
+        if isinstance(raw, (bool, np.bool_)):
+            raw = float(raw)
+        value = float(raw)
+        if not np.isfinite(value):
+            raise ValueError(f"Progress event {name!r} is not finite.")
+        values.append(value)
+    return np.asarray(values, dtype=np.float32)
+
+
 def _effective_episode_count(arrays: dict[str, np.ndarray]) -> int:
     episode_ids = arrays.get("episode_id")
     if episode_ids is None or len(episode_ids) == 0:
         return 0
     return int(np.unique(episode_ids).size)
+
+
+def _backfill_held_out_episode_return(
+    rows: dict[str, list],
+    row_start: int,
+    row_stop: int,
+) -> float:
+    """Validate decision rewards and fill one ecological outcome per episode."""
+
+    start = int(row_start)
+    stop = int(row_stop)
+    if start < 0 or stop <= start:
+        raise ValueError("An ecological episode must contain at least one decision.")
+    decision_rewards = rows.get("decision_reward")
+    episode_returns = rows.get("held_out_episode_return")
+    if decision_rewards is None or episode_returns is None:
+        raise ValueError("Ecological return columns are missing from dataset rows.")
+    if len(decision_rewards) < stop or len(episode_returns) < stop:
+        raise ValueError("Ecological return columns are shorter than the episode.")
+    rewards = np.asarray(decision_rewards[start:stop], dtype=np.float64)
+    if rewards.shape != (stop - start,) or not np.isfinite(rewards).all():
+        raise ValueError("Decision rewards must be finite and aligned.")
+    held_out_return = float(np.sum(rewards, dtype=np.float64))
+    for row_index in range(start, stop):
+        episode_returns[row_index] = np.float64(held_out_return)
+    return held_out_return
 
 
 def _resolve_checkpoint(path_value: str | None) -> Path | None:
@@ -619,32 +884,16 @@ def _path_c_value_contexts(args: argparse.Namespace, anchor_ctx) -> dict[str, An
     if not requested and not require:
         return None
 
-    def validate_base_checkpoint(base_ctx) -> None:
-        expected = (
-            ((anchor_ctx.config.get("path_c") or {}).get("probe") or {}).get(
-                "base_checkpoint_sha256"
-            )
-        )
-        checkpoint_path = Path(str(base_ctx.checkpoint_path))
-        observed = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
-        if expected in {None, ""} or observed != str(expected):
-            raise ValueError(
-                "Path C BaseOnly checkpoint SHA-256 differs from the frozen runtime config."
-            )
-
     collection_variant = str(getattr(args, "path_c_collection_variant", "diagnostic_anchor"))
     if collection_variant != "diagnostic_anchor":
+        contexts: dict[str, Any] = {collection_variant: anchor_ctx}
         base_ctx = _load_path_c_context(paths["base_only"], "base_only")
         if collection_variant == "base_only":
             base_ctx = anchor_ctx
-        if base_ctx is None:
-            raise ValueError("Independent Path C collection requires a BaseOnly checkpoint.")
-        if str(base_ctx.method) != "base_only":
-            raise ValueError("Independent Path C residualization requires method='base_only'.")
-        validate_base_checkpoint(base_ctx)
-        contexts: dict[str, Any] = {"base_only": base_ctx}
-        if collection_variant != "base_only":
-            contexts[collection_variant] = anchor_ctx
+        if base_ctx is not None:
+            if str(base_ctx.method) != "base_only":
+                raise ValueError("The optional residual diagnostic requires method='base_only'.")
+            contexts["base_only"] = base_ctx
         return contexts
 
     probe_ctx = _load_path_c_context(paths[PATH_C_PROBE_VARIANT], PATH_C_PROBE_VARIANT)
@@ -659,22 +908,17 @@ def _path_c_value_contexts(args: argparse.Namespace, anchor_ctx) -> dict[str, An
     base_ctx = _load_path_c_context(paths["base_only"], "base_only")
     if base_ctx is None and str(anchor_ctx.method) == "base_only":
         base_ctx = anchor_ctx
-    if base_ctx is None:
+    if base_ctx is not None and str(base_ctx.method) != "base_only":
         raise ValueError(
-            "Path C value plumbing requires --path-c-base-checkpoint unless the "
-            "anchor checkpoint itself is method='base_only'."
-        )
-    if str(base_ctx.method) != "base_only":
-        raise ValueError(
-            "Path C public residualization requires a base_only checkpoint, got "
+            "The optional Path C residual diagnostic requires a base_only checkpoint, got "
             f"{base_ctx.method!r}."
         )
-    validate_base_checkpoint(base_ctx)
 
     contexts: dict[str, Any] = {
         PATH_C_PROBE_VARIANT: probe_ctx,
-        "base_only": base_ctx,
     }
+    if base_ctx is not None:
+        contexts["base_only"] = base_ctx
     optional_methods = {
         "global_gru": {"global_gru"},
         "partner_id": {"partner_id_q"},
@@ -707,8 +951,14 @@ def _validate_path_c_collection_args(args: argparse.Namespace, anchor: Path) -> 
     variant = str(getattr(args, "path_c_collection_variant", "diagnostic_anchor"))
     if variant == "diagnostic_anchor":
         return
+    if variant == "belief_filter":
+        raise ValueError(
+            "belief_filter is a secondary offline readout, not an independent "
+            "acting controller. Use the hash-bound formal acting-policy factory "
+            "for a belief-filter benchmark policy."
+        )
     checkpoint_args = {
-        "probe": "path_c_probing_checkpoint",
+        "probing_ego": "path_c_probing_checkpoint",
         "base_only": "path_c_base_checkpoint",
         "global_gru": "path_c_global_gru_checkpoint",
         "partner_id": "path_c_partner_id_checkpoint",
@@ -837,77 +1087,197 @@ def _path_c_signature_row(
     option_id: int,
     partner_id: int | None,
 ) -> tuple[np.ndarray, dict[str, np.float32]]:
+    """Collect the primary normalized-advantage code and secondary residuals."""
+
     device = E.torch.device("cpu")
-    obs_tensor, state_repr, graph_batch = _path_c_state_repr(
-        ctx, obs, evidence_buffer, device)
-    valid_tensor = E.torch.as_tensor(valid, dtype=E.torch.bool, device=device).unsqueeze(0)
-    graph_kwargs = E._q_forward_kwargs(graph_batch)
-    graph_kwargs["option_mask"] = graph_kwargs["option_mask"] & valid_tensor
-    q_extra = {
-        "partner_id": E._partner_id_tensor(partner_id, 1, device),
-    }
+    valid_tensor = E.torch.as_tensor(
+        valid, dtype=E.torch.bool, device=device
+    ).unsqueeze(0)
+    sequence_primary = E._uses_sequence_q(ctx.q_net)
+    obs_tensor = None
+    state_repr = None
+    graph_kwargs = None
+    q_extra = None
+    if not sequence_primary:
+        obs_tensor, state_repr, graph_batch = _path_c_state_repr(
+            ctx, obs, evidence_buffer, device
+        )
+        graph_kwargs = E._q_forward_kwargs(graph_batch)
+        graph_kwargs["option_mask"] = graph_kwargs["option_mask"] & valid_tensor
+        q_extra = {
+            "partner_id": E._partner_id_tensor(partner_id, 1, device),
+        }
     with E.torch.no_grad():
-        sig = compute_residual_control_signature(
-            ctx.q_net,
-            base_ctx.q_net,
-            obs_tensor,
-            state_repr,
-            graph_kwargs=graph_kwargs,
-            q_extra=q_extra,
+        sequence_batch = None
+        if sequence_primary:
+            episode = evidence_buffer.sequence_episode()
+            if not isinstance(episode, EpisodeEvidenceBuffer):
+                raise RuntimeError(
+                    "Path C dataset sequence readout requires a started episode history."
+                )
+            sequence_batch = episode.evidence_batch(device)
+            head_trace, _ = ctx.q_net.forward_sequence(sequence_batch)
+            head_values = head_trace[:, -1]
+            q_values = head_values.mean(dim=1)
+            prior_head_values = None
+            if float(ctx.q_net.prior_scale) > 0.0:
+                prior_head_values = ctx.q_net.forward_prior_sequence(sequence_batch)[:, -1]
+        else:
+            if hasattr(ctx.q_net, "forward_mean"):
+                q_values = ctx.q_net.forward_mean(
+                    obs_tensor, state_repr, **graph_kwargs, **q_extra
+                )
+                head_values = q_values.unsqueeze(1)
+            else:
+                raw_q_values = ctx.q_net(
+                    obs_tensor, state_repr, **graph_kwargs, **q_extra
+                )
+                if raw_q_values.ndim == 3:
+                    head_values = raw_q_values
+                    q_values = raw_q_values.mean(dim=1)
+                else:
+                    q_values = raw_q_values
+                    head_values = raw_q_values.unsqueeze(1)
+            prior_head_values = None
+        if q_values.ndim != 2:
+            raise ValueError(
+                f"Path C checkpoint {variant!r} did not return [B,A] Q values."
+            )
+        ensemble_telemetry = ensemble_diversity_telemetry(
+            head_values,
+            valid_tensor,
+            prior_q_values=prior_head_values,
+            prior_scale=float(getattr(ctx.q_net, "prior_scale", 0.0)),
         )
-        residual_q = sig["residual_q"].detach()
-        advantage = sig["advantage"].detach()
-        gap = sig["gap"].detach()
-        best_option = sig["best_option"].detach()
-        best_option_set = sig.get("best_option_set").detach()
+        primary = normalized_advantage_signature(
+            q_values, option_mask=valid_tensor
+        )
+        normalized = primary["normalized_advantage"].detach()
+        best_option = primary["best_option"].detach()
+        best_option_set = primary["best_option_set"].detach()
         valid_1d = valid_tensor.squeeze(0)
-        action = int(option_id)
-        action_advantage = advantage[0, action]
-        action_residual = residual_q[0, action]
-        valid_residual = residual_q.masked_fill(~valid_tensor, -1e9)
-        sorted_residual = E.torch.sort(valid_residual, dim=1, descending=True).values
-        residual_gap = (
-            sorted_residual[:, 0] - sorted_residual[:, 1]
-            if sorted_residual.shape[1] >= 2
-            else E.torch.zeros_like(gap)
+        ranked_q = q_values.masked_fill(~valid_tensor, -E.torch.inf)
+        sorted_q = E.torch.sort(ranked_q, dim=1, descending=True).values
+        gap = (
+            sorted_q[:, 0] - sorted_q[:, 1]
+            if int(valid_1d.sum().item()) >= 2
+            else E.torch.zeros(1, dtype=q_values.dtype, device=device)
         )
-        valid_count = valid_1d.to(dtype=advantage.dtype).sum().clamp(min=1.0)
+        action = int(option_id)
+        action_advantage = normalized[0, action]
+        valid_count = valid_1d.to(dtype=normalized.dtype).sum().clamp(min=1.0)
         rank_score = (
-            ((advantage[0] <= action_advantage) & valid_1d)
-            .to(dtype=advantage.dtype)
+            ((normalized[0] <= action_advantage) & valid_1d)
+            .to(dtype=normalized.dtype)
             .sum()
             / valid_count
         )
+
+        nan = np.float32(np.nan)
+        action_residual = nan
+        residual_best = nan
+        residual_gap = nan
+        if base_ctx is not None:
+            if E._uses_sequence_q(base_ctx.q_net):
+                if sequence_batch is None:
+                    episode = evidence_buffer.sequence_episode()
+                    if not isinstance(episode, EpisodeEvidenceBuffer):
+                        raise RuntimeError(
+                            "A recurrent base diagnostic requires a started episode history."
+                        )
+                    sequence_batch = episode.evidence_batch(device)
+                base_trace, _ = base_ctx.q_net.forward_sequence(sequence_batch)
+                base_values = base_trace[:, -1].mean(dim=1)
+                residual = residual_control_signature(
+                    q_values,
+                    base_values,
+                    option_mask=valid_tensor,
+                )
+            elif E._uses_sequence_q(ctx.q_net):
+                base_obs, base_state, base_graph_batch = _path_c_state_repr(
+                    base_ctx, obs, evidence_buffer, device
+                )
+                base_kwargs = E._q_forward_kwargs(base_graph_batch)
+                base_kwargs["option_mask"] = base_kwargs["option_mask"] & valid_tensor
+                base_values = base_ctx.q_net(base_obs, base_state, **base_kwargs)
+                if base_values.ndim == 3:
+                    base_values = base_values.mean(dim=1)
+                residual = residual_control_signature(
+                    q_values,
+                    base_values,
+                    option_mask=valid_tensor,
+                )
+            else:
+                residual = compute_residual_control_signature(
+                    ctx.q_net,
+                    base_ctx.q_net,
+                    obs_tensor,
+                    state_repr,
+                    graph_kwargs=graph_kwargs,
+                    q_extra=q_extra,
+                )
+            residual_q = residual["residual_q"].detach()
+            valid_residual = residual_q.masked_fill(~valid_tensor, -E.torch.inf)
+            sorted_residual = E.torch.sort(
+                valid_residual, dim=1, descending=True
+            ).values
+            action_residual = np.float32(residual_q[0, action].cpu().item())
+            residual_best = np.float32(
+                valid_residual.max(dim=1).values.cpu().item()
+            )
+            residual_gap = np.float32(
+                (sorted_residual[:, 0] - sorted_residual[:, 1]).cpu().item()
+                if int(valid_1d.sum().item()) >= 2
+                else 0.0
+            )
+
         repr_vec = E.torch.cat(
             [
-                residual_q.reshape(-1),
-                advantage.reshape(-1),
-                gap.reshape(1),
-                best_option_set.to(dtype=residual_q.dtype).reshape(-1),
+                normalized.reshape(-1),
+                best_option_set.to(dtype=normalized.dtype).reshape(-1),
             ],
             dim=0,
         ).cpu().numpy().astype(np.float32)
         scalars = {
-            f"gamma_c_{variant}_gap": np.float32(gap.cpu().reshape(-1)[0].item()),
-            f"gamma_c_{variant}_advantage_action": np.float32(action_advantage.cpu().item()),
-            f"gamma_c_{variant}_residual_q_action": np.float32(action_residual.cpu().item()),
-            f"gamma_c_{variant}_residual_q_best": np.float32(
-                valid_residual.max(dim=1).values.cpu().reshape(-1)[0].item()
+            f"gamma_c_{variant}_gap": np.float32(gap.cpu().item()),
+            f"gamma_c_{variant}_advantage_action": np.float32(
+                action_advantage.cpu().item()
             ),
-            f"gamma_c_{variant}_residual_q_gap": np.float32(
-                residual_gap.cpu().reshape(-1)[0].item()
+            f"gamma_c_{variant}_residual_q_action": action_residual,
+            f"gamma_c_{variant}_residual_q_best": residual_best,
+            f"gamma_c_{variant}_residual_q_gap": residual_gap,
+            f"gamma_c_{variant}_best_option": np.float32(
+                best_option.cpu().item()
             ),
-            f"gamma_c_{variant}_best_option": np.float32(best_option.cpu().reshape(-1)[0].item()),
-            f"gamma_c_{variant}_action_rank_score": np.float32(rank_score.cpu().item()),
-            f"path_c_value_gap_{variant}": np.float32(gap.cpu().reshape(-1)[0].item()),
-            f"path_c_action_rank_score_{variant}": np.float32(rank_score.cpu().item()),
-            f"path_c_residual_q_action_{variant}": np.float32(action_residual.cpu().item()),
+            f"gamma_c_{variant}_action_rank_score": np.float32(
+                rank_score.cpu().item()
+            ),
+            f"gamma_c_{variant}_ensemble_effective_rank": np.float32(
+                ensemble_telemetry["effective_rank"]
+            ),
+            f"gamma_c_{variant}_head_correlation": np.float32(
+                np.nan
+                if ensemble_telemetry["head_correlation_mean"] is None
+                else ensemble_telemetry["head_correlation_mean"]
+            ),
+            f"gamma_c_{variant}_head_correlation_absolute": np.float32(
+                np.nan
+                if ensemble_telemetry["head_correlation_absolute_mean"] is None
+                else ensemble_telemetry["head_correlation_absolute_mean"]
+            ),
+            f"gamma_c_{variant}_prior_contribution_ratio": np.float32(
+                ensemble_telemetry["prior_contribution_ratio"]
+            ),
+            f"path_c_value_gap_{variant}": np.float32(gap.cpu().item()),
+            f"path_c_action_rank_score_{variant}": np.float32(
+                rank_score.cpu().item()
+            ),
+            f"path_c_residual_q_action_{variant}": action_residual,
         }
         if variant == PATH_C_PROBE_VARIANT:
             scalars["gamma_c_gap"] = scalars[f"gamma_c_{variant}_gap"]
-            scalars["residual_q_gap"] = scalars[f"gamma_c_{variant}_residual_q_gap"]
+            scalars["residual_q_gap"] = residual_gap
     return repr_vec, scalars
-
 
 def _sigmoid_np(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(x, -30.0, 30.0)))
@@ -993,7 +1363,20 @@ def run(args: argparse.Namespace) -> None:
     ctx.qaudit = None
     ctx.scripted_fsm = None
     rv_summary_spec = _rv_summary_spec(ctx.config)
-    rv_window_decisions = int(rv_summary_spec["window_decisions"])
+    response_summary_enabled = bool(
+        ((ctx.config.get("path_c") or {}).get("response_summary_spec") or {}).get(
+            "enable", False
+        )
+    )
+    primary_response_spec = None
+    primary_evidence_spec = None
+    if response_summary_enabled:
+        primary_response_spec, rv_window_decisions = _primary_response_summary_spec(
+            ctx.config
+        )
+        primary_evidence_spec = _primary_evidence_spec(ctx.config)
+    else:
+        rv_window_decisions = int(rv_summary_spec["window_decisions"])
     if args.ego == "fullchain":
         ctx.scripted_priority = _full_priority(ctx.option_lib)
     elif args.ego == "prepchain":
@@ -1022,6 +1405,15 @@ def run(args: argparse.Namespace) -> None:
     if args.partner not in partners:
         raise KeyError(f"unknown partner {args.partner!r}; choices={sorted(partners)}")
     partner = partners[args.partner]
+    split_assignment = None
+    if response_summary_enabled:
+        split_assignment = _frozen_split_assignment(
+            ctx.config,
+            partner,
+            layout_name=str(graph.layout_name),
+            split_group_id=getattr(args, "path_c_split_group_id", None),
+            numeric_seed=int(args.seed),
+        )
     checkpoint_sha256 = hashlib.sha256(ckpt.read_bytes()).hexdigest()
     path_c_meta = path_c_metadata(ctx.config)
     resolved_path_c_sha256 = path_c_meta.get("resolved_path_c_sha256")
@@ -1046,8 +1438,12 @@ def run(args: argparse.Namespace) -> None:
         base_seed=int(args.seed),
     )
     surface_identity_key = _surface_identity_key(partner)
-    seed_group = str(args.path_c_seed_group or args.seed)
-    layout_style = str(args.path_c_layout_style or graph.layout_name)
+    seed_group = (
+        split_assignment["seed_group"]
+        if split_assignment is not None
+        else str(args.seed)
+    )
+    layout_style = str(graph.layout_name)
     matching_group_sha256 = canonical_sha256({
         "partner": str(args.partner),
         "ego": str(args.ego),
@@ -1059,6 +1455,39 @@ def run(args: argparse.Namespace) -> None:
     pot_positions = [e.pos for e in ctx.layout_graph.entities.values() if e.kind == "pot"]
     patience = int((ctx.config.get("options") or {}).get("block_patience", 0))
     path_c_value_contexts = _path_c_value_contexts(args, ctx)
+    sequence_history_context = ctx if E._uses_sequence_q(ctx.q_net) else None
+    if path_c_value_contexts is not None:
+        sequence_contexts = [
+            value_context
+            for value_context in path_c_value_contexts.values()
+            if E._uses_sequence_q(value_context.q_net)
+        ]
+        if sequence_contexts:
+            sequence_history_context = sequence_contexts[0]
+            evidence_hashes = {
+                E._sequence_spec(value_context.q_net).sha256()
+                for value_context in sequence_contexts
+            }
+            if len(evidence_hashes) != 1:
+                raise ValueError(
+                    "Path C sequence checkpoints do not share one evidence spec."
+                )
+            anchor_reward_hash = E.sha256_json(E.reward_config_payload(ctx.config))
+            if any(
+                E.sha256_json(E.reward_config_payload(value_context.config))
+                != anchor_reward_hash
+                for value_context in sequence_contexts
+            ):
+                raise ValueError(
+                    "Path C value checkpoints changed the dataset reward contract."
+                )
+    sequence_history_config = (
+        sequence_history_context.config
+        if sequence_history_context is not None
+        else ctx.config
+    )
+    if response_summary_enabled or path_c_value_contexts is not None:
+        ctx.path_c_probe_cost_per_use = _frozen_probe_cost_from_config(ctx.config)
     if path_c_value_contexts is not None:
         active_probe_collection = str(args.path_c_collection_variant) in {
             PATH_C_PROBE_VARIANT,
@@ -1070,9 +1499,8 @@ def run(args: argparse.Namespace) -> None:
         ] = (
             "random"
             if str(args.path_c_collection_variant) == "random_probe"
-            else "residual"
+            else "normalized_advantage"
         )
-        ctx.path_c_probe_base_q_net = path_c_value_contexts["base_only"].q_net
     path_c_q_variants = tuple(path_c_value_contexts or ())
     path_c_baseline_variants = tuple(
         variant for variant in path_c_q_variants if variant != PATH_C_PROBE_VARIANT
@@ -1084,19 +1512,28 @@ def run(args: argparse.Namespace) -> None:
         "ego_opt_kind", "valid_kinds", "gate_main", "gate_strict",
         "episode_id", "episode_seed", "layout_style_id", "trajectory_source_id",
         "episode_uid", "run_id", "collection_variant", "option_transition",
+        "collection_role", "split_group_id", "mechanism", "style_group",
         "surface_identity_key", "seed_group", "layout_style", "mechanism_key",
+        "seed",
+        "synthetic_registry_value_class_id", "style_id",
+        "decision_reward", "held_out_episode_return",
         "public_context_stratum",
         "surface_action_frequency_bin", "dp_index", "dp_step",
         "mode_policy_id", "mode_family_id", "mode_param", "mode_age",
         "mode_opportunity_count", "mode_last_trigger_id", "mode_fingerprint_id",
         "mode_fingerprint_control_kind_id",
         "probe_action_id", "probe_selected", "probe_skip_reason", "probe_rule_id",
+        "probe_candidate_scores", "probe_candidate_mask", "probe_propensity",
+        "probe_cost_per_use", "probe_realized_cost",
+        "probe_support_violation", "probe_invalid_script", "response_token_id",
         "resp_raw_ego_commit_count",
         "resp_raw_partner_commit_count", "resp_raw_ambig_count",
         "resp_raw_response_primitive_len",
         "resp_raw_partner_commitment_seq", "resp_raw_delivery_outcome_seq",
         *RV_COLUMNS,
     )}
+    if primary_evidence_spec is not None:
+        rows["ego_evidence_v1"] = []
     if path_c_value_contexts is not None:
         for variant in path_c_q_variants:
             rows[f"path_c_repr_{variant}"] = []
@@ -1159,6 +1596,23 @@ def run(args: argparse.Namespace) -> None:
             evidence_buffer, ctx.method, ctx.belief_model, graph,
             E.torch.device("cpu"), E._belief_persistence_enabled(ctx.config),
         )
+        E._start_sequence_episode(
+            evidence_buffer,
+            (
+                sequence_history_context.q_net
+                if sequence_history_context is not None
+                else ctx.q_net
+            ),
+            obs,
+            state0,
+            ctx.option_lib,
+            sequence_history_config,
+            episode_id=f"path-c-dataset:{run_id}:{episode_idx}",
+            manifest_seed=seed,
+        )
+        contribution_ledger = E.ContributionLedger.from_config(
+            ctx.config.get("training")
+        )
         tracker = _HistoryTracker(kind_to_id)
         selection_stats = {
             "option_selection_count": 0, "forced_noop_count": 0,
@@ -1176,6 +1630,15 @@ def run(args: argparse.Namespace) -> None:
         done = False
         option_count = 0
         primitive_steps = 0
+        previous_ego_actions: list[int] = []
+        previous_partner_actions: list[int] = []
+        previous_option_id: int | None = None
+        previous_reward = 0.0
+        previous_progress = (
+            np.zeros(primary_evidence_spec.progress_event_dim, dtype=np.float32)
+            if primary_evidence_spec is not None
+            else None
+        )
 
         while not done and option_count < args.max_episode_options:
             # ---- decision-point record (state BEFORE selecting/executing) ----
@@ -1199,6 +1662,31 @@ def run(args: argparse.Namespace) -> None:
                 sync_public_state(state)
             md = _mode_diag(partner)
 
+            if primary_evidence_spec is not None:
+                encoded_evidence = primary_evidence_spec.encode_decision(
+                    observation=E._obs_vector(obs, "agent_0"),
+                    ego_primitive_actions=previous_ego_actions,
+                    partner_primitive_actions=previous_partner_actions,
+                    ego_option_id=previous_option_id,
+                    duration=len(previous_ego_actions),
+                    reward=previous_reward,
+                    progress_events=previous_progress,
+                    valid_actions=valid,
+                    terminated=False,
+                    truncated=False,
+                )
+                sequence_episode = evidence_buffer.sequence_episode()
+                if isinstance(sequence_episode, EpisodeEvidenceBuffer):
+                    sequence_latest = sequence_episode.evidence_batch().evidence[0, -1]
+                    if not E.torch.equal(encoded_evidence, sequence_latest):
+                        raise RuntimeError(
+                            "Dataset evidence row diverges from the acting sequence history."
+                        )
+                    encoded_evidence = sequence_latest
+                rows["ego_evidence_v1"].append(
+                    encoded_evidence.cpu().numpy().astype(np.float32)
+                )
+
             option_id = E._select_option(
                 ctx, obs, state, evidence_buffer, graph, rng, random_policy,
                 partner_id=int(getattr(partner, "partner_id", 0)),
@@ -1210,7 +1698,7 @@ def run(args: argparse.Namespace) -> None:
                     repr_vec, scalar_values = _path_c_signature_row(
                         variant,
                         variant_ctx,
-                        path_c_value_contexts["base_only"],
+                        path_c_value_contexts.get("base_only"),
                         obs,
                         evidence_buffer,
                         valid,
@@ -1251,13 +1739,48 @@ def run(args: argparse.Namespace) -> None:
             rows["episode_uid"].append(make_episode_uid(run_id, args.seed, episode_idx))
             rows["run_id"].append(run_id)
             rows["collection_variant"].append(collection_variant)
+            rows["collection_role"].append(
+                split_assignment["collection_role"]
+                if split_assignment is not None
+                else "data_collection_only"
+            )
+            rows["split_group_id"].append(
+                split_assignment["split_group_id"]
+                if split_assignment is not None
+                else "legacy_unassigned"
+            )
+            rows["mechanism"].append(
+                split_assignment["mechanism"]
+                if split_assignment is not None
+                else "legacy_unassigned"
+            )
+            rows["style_group"].append(
+                split_assignment["style_group"]
+                if split_assignment is not None
+                else "legacy_unassigned"
+            )
+            rows["decision_reward"].append(np.float64(np.nan))
+            rows["held_out_episode_return"].append(np.float64(np.nan))
             rows["option_transition"].append(np.uint8(1))
             rows["surface_identity_key"].append(surface_identity_key)
             rows["seed_group"].append(seed_group)
+            rows["seed"].append(np.uint64(
+                split_assignment["numeric_seed"]
+                if split_assignment is not None
+                else int(args.seed)
+            ))
             rows["layout_style"].append(layout_style)
             rows["mechanism_key"].append(
                 f"{int(md['mode_family_id'])}:{int(md['mode_param'])}"
             )
+            partner_spec = getattr(partner, "spec", None)
+            rows["synthetic_registry_value_class_id"].append(str(
+                getattr(partner_spec, "value_class_id", None)
+                or f"{int(md['mode_family_id'])}:{int(md['mode_param'])}"
+            ))
+            rows["style_id"].append(str(
+                getattr(partner_spec, "style_id", None) or "unspecified"
+            ))
             rows["layout_style_id"].append(np.int16(_stable_small_id(graph.layout_name)))
             rows["trajectory_source_id"].append(np.int16(_stable_small_id(args.ego)))
             rows["surface_action_frequency_bin"].append(np.int16(_surface_action_frequency_bin(hk)))
@@ -1288,9 +1811,71 @@ def run(args: argparse.Namespace) -> None:
             rows["probe_action_id"].append(
                 np.int16(option_id if probe_selected else -1)
             )
+            rows["probe_support_violation"].append(
+                np.uint8(bool(probe_decision.get("support_violation", False)))
+            )
+            rows["probe_invalid_script"].append(
+                np.uint8(bool(probe_decision.get("invalid_script", False)))
+            )
             rows["probe_selected"].append(np.uint8(probe_selected))
             rows["probe_skip_reason"].append(np.int16(_probe_reason_id(probe_reason)))
             rows["probe_rule_id"].append(np.int16(_probe_rule_id(probe_rule)))
+            raw_candidate_scores = probe_decision.get("candidate_scores")
+            raw_candidate_mask = probe_decision.get("candidate_mask")
+            candidate_scores = (
+                np.full(graph.num_options, np.nan, dtype=np.float32)
+                if raw_candidate_scores is None
+                else np.asarray(raw_candidate_scores, dtype=np.float32)
+            )
+            candidate_mask = (
+                np.asarray(valid, dtype=np.uint8)
+                if raw_candidate_mask is None
+                else np.asarray(raw_candidate_mask, dtype=np.uint8)
+            )
+            if candidate_scores.shape != (graph.num_options,):
+                raise ValueError(
+                    "Path C probe candidate scores must cover every registered option."
+                )
+            if candidate_mask.shape != (graph.num_options,):
+                raise ValueError(
+                    "Path C probe candidate mask must cover every registered option."
+                )
+            propensity = probe_decision.get("propensity")
+            probe_cost_per_use = float(
+                probe_decision.get(
+                    "probe_cost_per_use",
+                    ctx.path_c_probe_cost_per_use,
+                )
+            )
+            probe_realized_cost = float(
+                probe_decision.get("realized_probe_cost", 0.0)
+            )
+            if (
+                not np.isfinite(probe_cost_per_use)
+                or probe_cost_per_use < 0.0
+                or not np.isfinite(probe_realized_cost)
+                or probe_realized_cost < 0.0
+            ):
+                raise ValueError(
+                    "Path C probe costs must be finite and non-negative."
+                )
+            expected_probe_cost = probe_cost_per_use if probe_selected else 0.0
+            if probe_realized_cost != expected_probe_cost:
+                raise ValueError(
+                    "Path C realized probe cost must equal the frozen per-use cost "
+                    "exactly when a probe is selected, and zero otherwise."
+                )
+            rows["probe_candidate_scores"].append(candidate_scores)
+            rows["probe_candidate_mask"].append(candidate_mask)
+            rows["probe_propensity"].append(
+                np.float32(np.nan if propensity is None else float(propensity))
+            )
+            rows["probe_cost_per_use"].append(
+                np.float32(probe_cost_per_use)
+            )
+            rows["probe_realized_cost"].append(
+                np.float32(probe_realized_cost)
+            )
             public_task_stage = "ready" if n_ready > 0 else ("cooking" if n_cooking > 0 else "prep")
             public_inventory_stage = (
                 f"ego_soup={int(ego_soup)}:partner_soup={int(partner_soup)}:"
@@ -1303,6 +1888,30 @@ def run(args: argparse.Namespace) -> None:
             dp_first_step.append(primitive_steps)
 
             # ---- execute the option (mirrors _execute_eval_option semantics) ----
+            current_ego_actions: list[int] = []
+            current_partner_actions: list[int] = []
+            reward_scale = float(
+                (ctx.config.get("training", {}).get("value_bound") or {}).get(
+                    "reward_scale", 1.0
+                )
+            )
+            if not np.isfinite(reward_scale) or reward_scale <= 0.0:
+                raise ValueError(
+                    "training.value_bound.reward_scale must be positive and finite."
+                )
+            current_reward = -float(probe_realized_cost) / reward_scale
+            decision_evaluation_return = -float(probe_realized_cost)
+            current_progress = (
+                np.zeros(primary_evidence_spec.progress_event_dim, dtype=np.float32)
+                if primary_evidence_spec is not None
+                else None
+            )
+            sequence_episode = evidence_buffer.sequence_episode()
+            sequence_decision = (
+                DecisionEvidenceBuffer(sequence_episode.spec)
+                if isinstance(sequence_episode, EpisodeEvidenceBuffer)
+                else None
+            )
             runtime = E.OptionRuntime(
                 option_id=int(option_id), start_pos=E.get_agent_pos(state, 0))
             budget = ctx.option_lib.option_budget(state, 0, int(option_id))
@@ -1326,6 +1935,57 @@ def run(args: argparse.Namespace) -> None:
                     partner_option_inferencer=inferencer,
                 )
                 event = ostep.event
+                current_ego_actions.append(int(ostep.ego_action))
+                current_partner_actions.append(
+                    int(ostep.partner_action.primitive_action)
+                )
+                contribution_ledger.update(event, ego_option_kind=str(opt.kind))
+                ego_contributed = contribution_ledger.query_and_reset_on_delivery(
+                    event
+                )
+                model_step_reward = E._training_reward(
+                    ostep.step,
+                    ctx.config,
+                    "agent_0",
+                    event,
+                    ego_contributed=ego_contributed,
+                    include_terminal_shaping=True,
+                )
+                evaluation_step_reward = E._training_reward(
+                    ostep.step,
+                    ctx.config,
+                    "agent_0",
+                    event,
+                    ego_contributed=ego_contributed,
+                    include_terminal_shaping=False,
+                )
+                current_reward += E._sequence_step_return(
+                    model_step_reward,
+                    ctx.config,
+                )
+                decision_evaluation_return += float(evaluation_step_reward) - float(
+                    ctx.config["training"].get("cost_coef", 0.0)
+                ) * float(ctx.config["training"].get("cost_per_step", 1.0))
+                if primary_evidence_spec is not None:
+                    current_progress += _progress_event_vector(
+                        primary_evidence_spec, event
+                    )
+                if sequence_decision is not None:
+                    evidence_step_return = E._sequence_step_return(
+                        model_step_reward,
+                        sequence_history_config,
+                    )
+                    if duration == 0 and probe_realized_cost > 0.0:
+                        evidence_step_return -= float(probe_realized_cost) / reward_scale
+                    sequence_decision.append_primitive(
+                        int(ostep.ego_action),
+                        int(ostep.partner_action.primitive_action),
+                        reward=evidence_step_return,
+                        progress_event=E._path_c_progress_event_vector(
+                            event,
+                            sequence_decision.spec,
+                        ),
+                    )
                 duration += 1
                 primitive_steps += 1
                 src = str(event.partner_option_source)
@@ -1433,10 +2093,53 @@ def run(args: argparse.Namespace) -> None:
                     E.torch.device("cpu"), x_fail,
                     E._belief_persistence_enabled(ctx.config),
                 )
+            if sequence_decision is not None:
+                if not isinstance(sequence_episode, EpisodeEvidenceBuffer):
+                    raise RuntimeError("Sequence decision has no episode buffer.")
+                valid_options_next = np.asarray(
+                    ctx.option_lib.valid_options(env.state, 0),
+                    dtype=bool,
+                )
+                sequence_truncated = bool(
+                    not done and option_count + 1 >= int(args.max_episode_options)
+                )
+                next_evidence = sequence_decision.encode_boundary(
+                    observation=E._obs_vector(obs, "agent_0"),
+                    ego_option_id=int(option_id),
+                    valid_actions=valid_options_next,
+                    terminated=bool(done),
+                    truncated=sequence_truncated,
+                )
+                sequence_episode.append_transition(
+                    action=int(option_id),
+                    reward=float(current_reward),
+                    discount=float(
+                        sequence_history_config["training"]["gamma"]
+                    ) ** int(duration),
+                    done=bool(done),
+                    truncated=sequence_truncated,
+                    next_evidence=next_evidence,
+                    next_valid_actions=valid_options_next,
+                )
+            previous_ego_actions = current_ego_actions
+            previous_partner_actions = current_partner_actions
+            previous_option_id = int(option_id)
+            previous_reward = float(current_reward)
+            rows["decision_reward"][ep_row_start + option_count] = np.float64(
+                decision_evaluation_return
+            )
+            previous_progress = current_progress
             option_count += 1
 
         # ---- labels: first correct-delivery attribution within next K decisions ----
         n_dp = len(dp_first_step)
+        if n_dp != len(rows["decision_reward"]) - ep_row_start:
+            raise RuntimeError("Decision rewards are not aligned with episode rows.")
+        _backfill_held_out_episode_return(
+            rows,
+            ep_row_start,
+            ep_row_start + n_dp,
+        )
         total_steps = len(step_deliv)
         deliv = np.asarray(step_deliv, dtype=np.int8)
         for k in K_WINDOWS:
@@ -1487,6 +2190,24 @@ def run(args: argparse.Namespace) -> None:
             )
             for col in RV_COLUMNS:
                 rows[col].append(np.int16(rv[col]))
+            if primary_response_spec is None:
+                rows["response_token_id"].append(np.int16(-1))
+            else:
+                incomplete = bool(i + rv_window_decisions > n_dp)
+                rows["response_token_id"].append(np.int16(
+                    _canonical_response_token_id(
+                        primary_response_spec,
+                        rv,
+                        terminal=bool(incomplete and done),
+                        censored=bool(incomplete and not done),
+                        invalid_script=bool(
+                            rows["probe_invalid_script"][ep_row_start + i]
+                        ),
+                        support_violation=bool(
+                            rows["probe_support_violation"][ep_row_start + i]
+                        ),
+                    )
+                ))
         if path_c_value_contexts is not None:
             _path_c_finalize_episode_value_advantages(
                 rows,
@@ -1518,9 +2239,22 @@ def run(args: argparse.Namespace) -> None:
     n = len(rows["episode_id"])
     arrays = {k: np.stack(v) if k in ("state_feat", "extra_feat", "hist_kind",
                                       "hist_dur", "hist_ago", "valid_kinds",
+                                      "probe_candidate_scores", "probe_candidate_mask",
                                       "resp_raw_partner_commitment_seq",
                                       "resp_raw_delivery_outcome_seq")
               else np.asarray(v) for k, v in rows.items()}
+    if response_summary_enabled:
+        preregistration_meta = (path_c_meta.get("preregistration") or {})
+        semantic_bindings = preregistration_meta.get("semantic_bindings") or {}
+        arrays["preregistration_sha256"] = np.asarray(
+            [str(preregistration_meta.get("sha256"))] * n
+        )
+        arrays["resolved_path_c_sha256"] = np.asarray(
+            [str(resolved_path_c_sha256)] * n
+        )
+        arrays["semantic_bindings_json"] = np.asarray(
+            [json.dumps(semantic_bindings, sort_keys=True, separators=(",", ":"))] * n
+        )
     for k, v in label_cols.items():
         arrays[k] = np.asarray(v)
     assert all(len(a) == n for a in arrays.values()), "ragged record arrays"
@@ -1530,6 +2264,19 @@ def run(args: argparse.Namespace) -> None:
 
     gm = arrays["gate_main"].astype(bool)
     lab5 = arrays["label_k5"]
+    probe_reason_ids = arrays["probe_skip_reason"].astype(np.int64)
+    candidate_reason_ids = {
+        int(PATH_C_PROBE_REASON_TO_ID[name])
+        for name in ("return_floor", "selected")
+    }
+    probe_candidate_count = int(
+        np.count_nonzero(np.isin(probe_reason_ids, list(candidate_reason_ids)))
+    )
+    return_floor_count = int(
+        np.count_nonzero(
+            probe_reason_ids == int(PATH_C_PROBE_REASON_TO_ID["return_floor"])
+        )
+    )
     effective_episodes = int(np.unique(arrays["episode_uid"].astype(str)).size)
     effective_transitions = int(np.count_nonzero(arrays["option_transition"].astype(bool)))
     meta = {
@@ -1561,7 +2308,46 @@ def run(args: argparse.Namespace) -> None:
         "collection_variant": collection_variant,
         "controller_checkpoint_key": collection_variant,
         "controller_checkpoint_sha256": checkpoint_sha256,
-        "collection_role": str(args.path_c_collection_role),
+        "collection_role": (
+            split_assignment["collection_role"]
+            if split_assignment is not None
+            else "data_collection_only"
+        ),
+        "split_manifest_sha256": (
+            split_assignment["split_manifest_sha256"]
+            if split_assignment is not None
+            else None
+        ),
+        "split_group_id": (
+            split_assignment["split_group_id"]
+            if split_assignment is not None
+            else None
+        ),
+        "mechanism": (
+            split_assignment["mechanism"]
+            if split_assignment is not None
+            else None
+        ),
+        "style_group": (
+            split_assignment["style_group"]
+            if split_assignment is not None
+            else None
+        ),
+        "split_group_ids": (
+            [split_assignment["split_group_id"]]
+            if split_assignment is not None
+            else []
+        ),
+        "mechanisms": (
+            [split_assignment["mechanism"]]
+            if split_assignment is not None
+            else []
+        ),
+        "style_groups": (
+            [split_assignment["style_group"]]
+            if split_assignment is not None
+            else []
+        ),
         "collection_mode": (
             "offline_anchor_diagnostic_only"
             if collection_variant == "diagnostic_anchor"
@@ -1583,6 +2369,45 @@ def run(args: argparse.Namespace) -> None:
             "partner_first": int(((lab5 == 2) & gm).sum()),
         },
         "selection_stats_last_episode": selection_stats,
+        "probe_selection_telemetry": {
+            "floor_binding_definition": (
+                "return-floor rejections divided by candidates that passed the "
+                "disagreement threshold and reached return-floor adjudication"
+            ),
+            "return_floor_rejection_count": return_floor_count,
+            "candidate_decision_count": probe_candidate_count,
+            "floor_binding_rate": (
+                float(return_floor_count / probe_candidate_count)
+                if probe_candidate_count > 0
+                else None
+            ),
+            "source_column": "probe_skip_reason",
+        },
+        "probe_cost_contract": {
+            "probe_cost_per_use": float(ctx.path_c_probe_cost_per_use),
+            "realized_cost_rule": (
+                "selected probes pay the frozen per-use cost exactly once; "
+                "all other decisions pay zero"
+            ),
+            "ego_evidence_reward_includes_realized_probe_cost": True,
+        },
+        "ecological_value_outcome": {
+            "decision_reward_column": "decision_reward",
+            "episode_outcome_column": "held_out_episode_return",
+            "episode_outcome_rule": "sum_decision_reward_within_episode",
+            "decision_reward_semantics": (
+                "evaluation_return_without_terminal_shaping_minus_frozen_"
+                "primitive_and_probe_cost"
+            ),
+            "probe_cost_included_exactly_once": True,
+            "value_class_assignment": (
+                "offline_out_of_fold_with_frozen_split_manifest"
+            ),
+            "synthetic_registry_label_column": (
+                "synthetic_registry_value_class_id"
+            ),
+            "synthetic_registry_label_role": "secondary_oracle_diagnostic_only",
+        },
         "opportunity_gate_def": {
             "main": "(any pot ready OR cooking) AND neither agent carries soup",
             "strict": "any pot ready AND neither agent carries soup",
@@ -1624,8 +2449,20 @@ def run(args: argparse.Namespace) -> None:
             json.dumps(rv_summary_spec, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest(),
         "frozen_rv_summary_spec_sha256": (
-            (path_c_meta.get("preregistration") or {}).get("rv_summary_spec_sha256")
+            (path_c_meta.get("preregistration") or {}).get("response_vocabulary_sha256")
         ),
+        "response_summary_spec": (
+            primary_response_spec.canonical_payload()
+            if primary_response_spec is not None
+            else None
+        ),
+        "response_vocabulary_sha256": (
+            primary_response_spec.sha256 if primary_response_spec is not None else None
+        ),
+        "response_vocabulary_q": (
+            primary_response_spec.q if primary_response_spec is not None else None
+        ),
+        "structured_response_role": "secondary_only",
         "layout_name": str(graph.layout_name),
         "probe_family": "path_c_default_off" if not (ctx.config.get("path_c") or {}).get("active_sections") else "path_c",
         "fingerprint_vocab": sorted(
@@ -1643,14 +2480,63 @@ def run(args: argparse.Namespace) -> None:
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, **arrays)
-    out.with_suffix(".meta.json").write_text(json.dumps(meta, indent=1))
+    if response_summary_enabled:
+        shard_path, shard_sha256 = _write_content_addressed_parquet_shard(
+            out, arrays
+        )
+        meta["storage"] = "content_addressed_append_only_shards"
+        meta["format"] = "parquet"
+        meta["shard_path"] = str(shard_path)
+        meta["shard_sha256"] = shard_sha256
+        meta_path = shard_path.with_suffix(".meta.json")
+    else:
+        # Historical diagnostic output only. Version-3 manifests reject this
+        # format as primary or locked-audit evidence.
+        np.savez_compressed(out, **arrays)
+        meta["storage"] = "legacy_diagnostic_single_npz"
+        meta["format"] = "npz"
+        meta_path = out.with_suffix(".meta.json")
+    meta_path.write_text(json.dumps(meta, indent=1))
     if args.golden:
         out.with_suffix(".golden.txt").write_text("\n".join(golden_lines))
     print(json.dumps({k: meta[k] for k in (
         "partner", "ego", "n_records", "n_gate_main", "n_gate_strict",
         "class_counts_k5_gate_main", "ambiguous_delivery_steps",
         "oracle_source_count")}, indent=1), flush=True)
+
+
+def _write_content_addressed_parquet_shard(
+    requested_path: Path,
+    arrays: dict[str, np.ndarray],
+) -> tuple[Path, str]:
+    if requested_path.suffix.lower() != ".parquet":
+        raise ValueError(
+            "Version-3 Path C collection requires --out ending in .parquet."
+        )
+    if requested_path.exists():
+        raise FileExistsError(
+            "Append-only Path C collection refuses to overwrite an existing shard."
+        )
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "Version-3 Path C collection requires pyarrow for Parquet shards."
+        ) from exc
+    table = pa.table({
+        name: pa.array(np.asarray(value).tolist())
+        for name, value in arrays.items()
+    })
+    pq.write_table(table, requested_path, compression="zstd")
+    digest = hashlib.sha256(requested_path.read_bytes()).hexdigest()
+    content_path = requested_path.with_name(
+        f"{requested_path.stem}.{digest[:16]}{requested_path.suffix}"
+    )
+    if content_path.exists():
+        raise FileExistsError(f"Content-addressed shard already exists: {content_path}")
+    requested_path.replace(content_path)
+    return content_path, digest
 
 
 def main() -> None:
@@ -1664,6 +2550,7 @@ def main() -> None:
                         "blind_v1",
                         "latent_v3_dev",
                         "path_c_synthetic",
+                        "path_c_overlap_posterior",
                         "path_c_fingerprint_negative",
                     ))
     ap.add_argument("--ego", required=True,
@@ -1682,15 +2569,13 @@ def main() -> None:
         help="Controller variant that generated this on-policy chunk.",
     )
     ap.add_argument(
-        "--path-c-collection-role",
-        default="data_collection_only",
-        choices=(
-            "data_collection_only", "readout_training", "readout_evaluation",
-            "calibration", "synthetic_power", "terminal_axis_null", "recovery",
+        "--path-c-split-group-id",
+        default=None,
+        help=(
+            "Frozen split-manifest group ID. Required for version-3 Path C; "
+            "the collection role and group metadata are derived from it."
         ),
     )
-    ap.add_argument("--path-c-seed-group", default=None)
-    ap.add_argument("--path-c-layout-style", default=None)
     ap.add_argument("--path-c-probing-checkpoint", default=None,
                     help="Optional aris_bellman probing ego checkpoint for frozen Path C readouts")
     ap.add_argument("--path-c-base-checkpoint", default=None,

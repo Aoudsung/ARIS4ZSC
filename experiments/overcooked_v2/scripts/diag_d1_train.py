@@ -1,4 +1,4 @@
-"""D1 supervised trainer + frozen readout (prereg D1 §4-§6; codex-review revised).
+"""D1 supervised trainer and secondary response readout.
 
 Offline models over diag_d1_dataset chunks; ZERO parameter sharing with the main method.
 
@@ -15,21 +15,19 @@ Stages (run in order; later stages refuse to peek earlier):
   readout : SINGLE-LOOK. Requires dataset_gate_report.json PASS. Loads frozen models,
             computes all splits once, writes readout_frozen.json (refuses to overwrite).
 
-Frozen primary judgment (prereg §5): K=5, gate_main, ensemble(3 seeds) probabilities.
-  AUC_ps = AUC(partner_serves vs rest);  G = AUC_ps(FULL) - AUC_ps(NOHIST)
-  R1: G_indist >= 0.10 AND bootstrap CI(Δlogloss NOHIST-FULL) lower > 0   [indist_val]
-  R2: G_blind_terminal >= 0.5 * G_indist AND bootstrap CI(G_blind) lower > 0
-  R3 visualization only: NMI(hidden clusters, behavior family/partner id), never pass-relevant.
-  K-sensitivity (prereg §8.3): independent ensembles per K; direction must agree.
+The response-area-under-the-curve gains, leakage checks, and sensitivity analyses
+below are secondary diagnostics only. They cannot replace or veto the version-3
+normalized net-return versus probe-budget primary endpoint.
 """
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import glob
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -41,10 +39,20 @@ from experiments.overcooked_v2.path_c_evaluation import (
     build_path_c_readout_features,
     empirical_kernel_distance_audit,
     assemble_path_c_measurements,
+    evaluate_path_c_decision,
     load_and_validate_path_c_inputs,
     load_frozen_preregistration,
-    pass_af_claim_rule,
     phase_b_go_no_go_rule,
+)
+from experiments.overcooked_v2.path_c_protocol import (
+    simulate_cluster_operating_characteristics,
+)
+from experiments.overcooked_v2.path_c_value_classes import (
+    ECOLOGICAL_VALUE_OUTCOME_NAME,
+    CrossFittedEcologicalValueClassesV2,
+    CrossFittedValueClassesV1,
+    cluster_stratified_permutation,
+    fit_cross_fitted_ecological_value_estimates,
 )
 
 JUDGED_K = 5
@@ -53,8 +61,8 @@ N_SEEDS = 3
 BOOT_ITERS = 10_000
 FLOOR_GATED = 5000
 FLOOR_MINCLASS = 500
-R1_GAIN_FLOOR = 0.10
-R2_RETENTION = 0.5
+RESPONSE_GAIN_FLOOR = 0.10
+BLIND_RESPONSE_RETENTION = 0.5
 LABEL_NAMES = ("no_initiation", "ego_first", "partner_first")  # D1-rev (prereg §9)
 HARD_FLOOR_SPLITS = ("indist_val", "blind_terminal")
 PATH_C_READOUT_FOLDS = 5
@@ -71,23 +79,12 @@ PATH_C_PERM_ITERS = 499
 PATH_C_DEFAULT_PREREGISTRATION = (
     Path(__file__).resolve().parents[1] / "configs" / "path_c_preregistration.yaml"
 )
-PATH_C_GO_KEYS = ("G1", "G_value", "G2", "G3", "G4")
-PATH_C_MEASUREMENT_ALIASES = {
-    "G1": ("G1", "C_resp^V", "C_resp_V"),
-    "G_value": ("G_value", "C_value", "C_value_gap"),
-    "G2": ("G2", "C_transfer"),
-    "G3": ("G3", "C_leak"),
-    "G4": ("G4", "C_null"),
-}
 PATH_C_DEFAULT_THRESHOLDS = {
-    "G1": 0.0,
-    "G_value": 0.0,
-    "G2": 0.0,
-    "G3": PATH_C_LEAK_ADVANTAGE_EQ,
-    "G4": PATH_C_NULL_EQ_GAIN,
-    "epsilon_V": 0.05,
-    "epsilon_R": 0.15,
-    "epsilon_F": 0.05,
+    "response_advantage": 0.0,
+    "value_advantage": 0.0,
+    "transfer_advantage": 0.0,
+    "conditional_leakage_max": PATH_C_LEAK_ADVANTAGE_EQ,
+    "null_equivalence_gain": PATH_C_NULL_EQ_GAIN,
     "value_label_tv_equivalence_threshold": PATH_C_EQ_LABEL_TV,
     "rv_tv_equivalence_threshold": PATH_C_EQ_RV_TV,
     "gamma_c_l1_equivalence_threshold": PATH_C_EQ_GAMMA_L1,
@@ -99,7 +96,7 @@ PATH_C_DEFAULT_THRESHOLDS = {
     "effective_episode_floor": 2000,
     "effective_transition_floor": 40000,
 }
-PATH_C_PRIMARY_VARIANT = "probe"
+PATH_C_PRIMARY_VARIANT = "probing_ego"
 PATH_C_COLLECTED_REPR_PREFIX = "path_c_repr_"
 PATH_C_HARD_BASELINE_VARIANTS = (
     "global_gru",
@@ -126,9 +123,9 @@ PATH_C_TRUE_VALUE_ADVANTAGE_STEMS = (
     "residual_q_error_advantage",
     "cross_identity_return_gain",
 )
-# Accepted G-value columns are baseline-specific: <stem>_<baseline>. A single
-# aggregate value column is intentionally not enough because proposal C_value
-# requires advantage over every required hard baseline at the same split/budget.
+# Accepted value-control columns are baseline-specific: <stem>_<baseline>. A
+# single aggregate column is intentionally insufficient because the secondary
+# readout requires advantage over every required baseline at the same split and budget.
 PATH_C_TRUE_VALUE_ADVANTAGE_COLUMNS = tuple(
     f"{stem}_{baseline}"
     for stem in PATH_C_TRUE_VALUE_ADVANTAGE_STEMS
@@ -151,6 +148,10 @@ PATH_C_REQUIRED_LEAKAGE_CHANNELS = (
     "surface_action_frequency",
     "trajectory_source",
 )
+PATH_C_VALUE_CLASS_ARTIFACT_DIR = "path_c_value_classes"
+PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN = "ecological_value_class_id"
+PATH_C_SYNTHETIC_VALUE_ORACLE_COLUMN = "synthetic_registry_value_class_id"
+PATH_C_VALIDATED_VALUE_CLASS_OBJECTS = "_validated_ecological_value_class_artifacts"
 
 
 def family_of(partner: str) -> str:
@@ -198,34 +199,17 @@ def _normalize_path_c_thresholds(payload: dict[str, Any] | None) -> dict[str, An
     absorb(payload)
     for section in (
         payload.get("thresholds"),
-        payload.get("pass_af"),
-        (payload.get("pass_af") or {}).get("thresholds"),
-        payload.get("go_no_go"),
-        (payload.get("go_no_go") or {}).get("thresholds"),
-        payload.get("margins"),
+        (payload.get("secondary_endpoints") or {}).get("thresholds"),
         payload.get("fingerprint_admission"),
         (payload.get("fingerprint_admission") or {}).get("thresholds"),
         payload.get("leakage"),
         (payload.get("leakage") or {}).get("thresholds"),
         payload.get("power_null"),
         (payload.get("power_null") or {}).get("thresholds"),
+        payload.get("power_analysis"),
         payload.get("budget"),
     ):
         absorb(section)
-    aliases = {
-        "value_label_tv_equivalence": "value_label_tv_equivalence_threshold",
-        "rv_tv_equivalence": "rv_tv_equivalence_threshold",
-        "gamma_c_l1_equivalence": "gamma_c_l1_equivalence_threshold",
-        "fingerprint_visibility_l1": "fingerprint_visibility_l1_threshold",
-        "leak_advantage_eq": "leakage_logloss_advantage_equivalence",
-        "leak_bal_acc_margin": "leakage_balanced_accuracy_margin",
-        "null_eq_gain": "null_equivalence_gain",
-        "min_effective_episodes": "effective_episode_floor",
-        "min_effective_transitions": "effective_transition_floor",
-    }
-    for source, target in aliases.items():
-        if source in flat and target not in flat:
-            flat[target] = flat[source]
     baseline_payload = payload.get("baselines") if isinstance(payload.get("baselines"), dict) else {}
     required_variants = (
         payload.get("required_baseline_variants")
@@ -240,8 +224,35 @@ def _normalize_path_c_thresholds(payload: dict[str, Any] | None) -> dict[str, An
 
 # ---------------------------------------------------------------- data loading
 
+def _load_chunk_columns(path: Path) -> dict[str, np.ndarray]:
+    """Read one immutable dataset shard without changing its stored schema."""
+
+    if path.suffix.lower() == ".npz":
+        with np.load(path, allow_pickle=False) as archive:
+            return {str(key): np.asarray(archive[key]) for key in archive.files}
+    if path.suffix.lower() != ".parquet":
+        raise ValueError(f"unsupported Path C shard format: {path}")
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError(
+            "Reading version-3 Path C shards requires pyarrow."
+        ) from exc
+    table = pq.read_table(path)
+    return {
+        str(name): np.asarray(table[name].to_pylist())
+        for name in table.column_names
+    }
+
+
 def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
-    files = sorted(glob.glob(str(Path(chunk_dir) / "*.npz")))
+    parquet_files = sorted(glob.glob(str(Path(chunk_dir) / "*.parquet")))
+    legacy_files = sorted(glob.glob(str(Path(chunk_dir) / "*.npz")))
+    if parquet_files and legacy_files:
+        raise RuntimeError(
+            "Path C refuses to mix version-3 Parquet shards with legacy NPZ diagnostics."
+        )
+    files = parquet_files or legacy_files
     if not files:
         raise FileNotFoundError(f"no chunks under {chunk_dir}")
     cols: dict[str, list] = {}
@@ -261,9 +272,9 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
             raise RuntimeError(f"duplicate chunk SHA-256 under {chunk_dir}: {chunk_sha256}")
         seen_chunk_hashes.add(chunk_sha256)
         meta = json.loads(Path(f).with_suffix(".meta.json").read_text())
-        z = np.load(f, allow_pickle=False)
+        chunk = _load_chunk_columns(Path(f))
         row_columns = tuple(sorted(
-            str(key) for key in z.files if not str(key).startswith("audit_")
+            str(key) for key in chunk if not str(key).startswith("audit_")
         ))
         columns = row_columns
         if expected_columns is None:
@@ -274,15 +285,21 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
             raise RuntimeError(
                 f"chunk schema mismatch in {f}; missing={missing}, extra={extra}"
             )
-        column_lengths = {int(np.asarray(z[key]).shape[0]) for key in row_columns}
+        column_lengths = {int(np.asarray(chunk[key]).shape[0]) for key in row_columns}
         if len(column_lengths) != 1:
             raise RuntimeError(f"chunk {f} has misaligned column lengths")
-        forbidden_rv = sorted(PATH_C_FORBIDDEN_RV_COLUMNS.intersection(set(map(str, z.files))))
+        forbidden_rv = sorted(PATH_C_FORBIDDEN_RV_COLUMNS.intersection(set(chunk)))
         if forbidden_rv:
             raise RuntimeError(
                 f"chunk {f} contains forbidden R^V nuisance coordinate columns: {forbidden_rv}"
             )
-        n = int(z["episode_id"].shape[0])
+        if Path(f).suffix.lower() == ".parquet" and "value_class_id" in chunk:
+            raise RuntimeError(
+                "Version-3 Path C shards reject ambiguous value_class_id; "
+                "registry labels must use synthetic_registry_value_class_id and "
+                "remain secondary oracle diagnostics."
+            )
+        n = int(chunk["episode_id"].shape[0])
         if column_lengths != {n}:
             raise RuntimeError(f"chunk {f} row count does not match episode_id")
         if int(meta["oracle_source_count"]) != 0:
@@ -296,18 +313,18 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
             rv_summary_spec = spec
         elif spec != rv_summary_spec:
             raise RuntimeError(f"R^V summary spec mismatch in {f}")
-        split_config = ((meta.get("path_c") or {}).get("cross_identity_split") or {})
+        split_config = ((meta.get("path_c") or {}).get("split") or {})
         if cross_identity_config is None:
             cross_identity_config = split_config
         elif split_config != cross_identity_config:
             raise RuntimeError(f"cross-identity split config mismatch in {f}")
         fingerprint_vocab.update(int(v) for v in meta.get("fingerprint_vocab", []))
-        if "episode_uid" in z.files:
-            chunk_episode_uids = set(np.asarray(z["episode_uid"]).astype(str).tolist())
+        if "episode_uid" in chunk:
+            chunk_episode_uids = set(np.asarray(chunk["episode_uid"]).astype(str).tolist())
         else:
             chunk_episode_uids = {
                 f"legacy:{meta.get('partner')}:{meta.get('ego')}:{meta.get('base_seed')}:{int(value)}"
-                for value in np.unique(z["episode_id"]).tolist()
+                for value in np.unique(chunk["episode_id"]).tolist()
             }
         overlap = seen_episode_uids.intersection(chunk_episode_uids)
         if overlap:
@@ -315,8 +332,8 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
         seen_episode_uids.update(chunk_episode_uids)
         observed_episode_uids.update(chunk_episode_uids)
         chunk_transitions = (
-            int(np.count_nonzero(np.asarray(z["option_transition"]).astype(bool)))
-            if "option_transition" in z.files
+            int(np.count_nonzero(np.asarray(chunk["option_transition"]).astype(bool)))
+            if "option_transition" in chunk
             else n
         )
         if meta.get("effective_episodes") is not None and int(meta["effective_episodes"]) != len(chunk_episode_uids):
@@ -325,7 +342,7 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
             raise RuntimeError(f"chunk {f} metadata effective_transitions disagrees with data")
         effective_transitions += chunk_transitions
         for k in row_columns:
-            cols.setdefault(k, []).append(z[k])
+            cols.setdefault(k, []).append(chunk[k])
         partners.append(np.array([meta["partner"]] * n))
         egos.append(np.array([meta["ego"]] * n))
         partner_sets.append(np.array([meta.get("partner_set", "unknown")] * n))
@@ -337,7 +354,6 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
             for key in ("geometry_profile", "base_protocol", "role", "pot_preference")
         )
         surface_profiles.append(np.array([surface_profile] * n))
-        z.close()
     data = {k: np.concatenate(v) for k, v in cols.items()}
     data["partner"] = np.concatenate(partners)
     data["ego"] = np.concatenate(egos)
@@ -411,6 +427,418 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
     # deterministic in-distribution episode split: 20% val by episode index
     data["indist_val"] = (data["episode_id"] % 5 == 4) & (data["split"] == "train")
     return data
+
+
+def _validate_ecological_return_columns(
+    data: dict[str, np.ndarray],
+    row_mask: np.ndarray,
+) -> None:
+    required = {
+        "episode_uid",
+        "decision_reward",
+        "held_out_episode_return",
+        "collection_role",
+    }
+    missing = sorted(required.difference(data))
+    if missing:
+        raise ValueError(
+            "Ecological value-class fitting is missing dataset column(s): "
+            + ", ".join(missing)
+        )
+    mask = np.asarray(row_mask, dtype=bool)
+    if mask.shape != np.asarray(data["episode_uid"]).shape:
+        raise ValueError("Ecological value-class row mask is not aligned.")
+    episodes = np.asarray(data["episode_uid"]).astype(str)
+    decision_rewards = np.asarray(data["decision_reward"], dtype=np.float64)
+    episode_returns = np.asarray(
+        data["held_out_episode_return"], dtype=np.float64
+    )
+    if not np.isfinite(decision_rewards[mask]).all() or not np.isfinite(
+        episode_returns[mask]
+    ).all():
+        raise ValueError("Ecological decision and episode returns must be finite.")
+    for episode in sorted(np.unique(episodes[mask]).tolist()):
+        episode_rows = mask & (episodes == episode)
+        outcomes = np.unique(episode_returns[episode_rows])
+        if outcomes.size != 1:
+            raise ValueError(
+                "Every episode must carry one held_out_episode_return."
+            )
+        recomputed = float(np.sum(
+            decision_rewards[episode_rows],
+            dtype=np.float64,
+        ))
+        if not np.isclose(
+            recomputed,
+            float(outcomes[0]),
+            rtol=0.0,
+            atol=1.0e-9,
+        ):
+            raise ValueError(
+                "held_out_episode_return does not equal the sum of decision_reward."
+            )
+
+
+def build_ecological_value_class_artifacts(
+    data: dict[str, np.ndarray],
+    preregistration: FrozenPathCPreregistration,
+) -> dict[str, CrossFittedEcologicalValueClassesV2]:
+    """Fit one frozen-manifest, out-of-fold ecological artifact per role."""
+
+    if not isinstance(preregistration, FrozenPathCPreregistration):
+        raise TypeError("A frozen Path C preregistration is required.")
+    if "collection_role" not in data:
+        raise ValueError("Ecological value classes require collection_role.")
+    if "split_group_id" not in data:
+        raise ValueError("Ecological value classes require split_group_id.")
+    if "seed" not in data:
+        raise ValueError("Ecological value classes require numeric seed.")
+    if "public_context_stratum" not in data:
+        raise ValueError("Ecological value classes require public_context_stratum.")
+    roles = np.asarray(data["collection_role"]).astype(str)
+    episodes = np.asarray(data.get("episode_uid", ())).astype(str)
+    group_ids = np.asarray(data["split_group_id"]).astype(str)
+    numeric_seeds = np.asarray(data["seed"])
+    if not (roles.shape == episodes.shape == group_ids.shape == numeric_seeds.shape):
+        raise ValueError(
+            "collection_role, split_group_id, episode_uid, and seed are not row-aligned."
+        )
+    manifest_groups = {
+        group.group_id: group for group in preregistration.split_manifest.groups
+    }
+    unknown_groups = sorted(set(group_ids.tolist()).difference(manifest_groups))
+    if unknown_groups:
+        raise ValueError(
+            "Ecological value-class fitting found unknown split group(s): "
+            + ", ".join(unknown_groups)
+        )
+    for group_id, role, numeric_seed in zip(
+        group_ids.tolist(),
+        roles.tolist(),
+        numeric_seeds.tolist(),
+        strict=True,
+    ):
+        if preregistration.split_manifest.role_for(group_id) != role:
+            raise ValueError(
+                "Ecological value-class role differs from the frozen split manifest."
+            )
+        preregistration.split_manifest.validate_numeric_seed(
+            group_id,
+            int(numeric_seed),
+        )
+    registered_roles = tuple(
+        role for role in preregistration.split_manifest.assignment_by_group.values()
+        if role in {"train", "design", "calibration", "locked_audit"}
+    )
+    unknown_roles = sorted(set(roles.tolist()).difference(set(registered_roles)))
+    if unknown_roles:
+        raise ValueError(
+            "Ecological value-class fitting rejects unregistered role(s): "
+            + ", ".join(unknown_roles)
+        )
+    observed_roles = tuple(sorted(
+        set(roles.tolist()).intersection(set(registered_roles))
+    ))
+    if not observed_roles:
+        raise ValueError("No frozen Path C role is available for ecological fitting.")
+    episode_roles: dict[str, set[str]] = {}
+    episode_groups: dict[str, set[str]] = {}
+    episode_seeds: dict[str, set[int]] = {}
+    for episode, role, group_id, numeric_seed in zip(
+        episodes.tolist(),
+        roles.tolist(),
+        group_ids.tolist(),
+        numeric_seeds.tolist(),
+        strict=True,
+    ):
+        if role in observed_roles:
+            episode_roles.setdefault(episode, set()).add(role)
+            episode_groups.setdefault(episode, set()).add(group_id)
+            episode_seeds.setdefault(episode, set()).add(int(numeric_seed))
+    if any(len(values) != 1 for values in episode_roles.values()):
+        raise ValueError("An episode cannot appear in more than one frozen role.")
+    if any(len(values) != 1 for values in episode_groups.values()):
+        raise ValueError("An episode cannot appear in more than one split group.")
+    if any(len(values) != 1 for values in episode_seeds.values()):
+        raise ValueError("An episode cannot use more than one numeric seed.")
+    n_classes = int(
+        preregistration.payload["synthetic_factorial"]["value_mechanisms"]
+    )
+    if n_classes < 2:
+        raise ValueError("Frozen ecological value-class count must be at least two.")
+    artifacts: dict[str, CrossFittedEcologicalValueClassesV2] = {}
+    for role in observed_roles:
+        role_mask = roles == role
+        _validate_ecological_return_columns(data, role_mask)
+        artifacts[role] = fit_cross_fitted_ecological_value_estimates(
+            np.asarray(data["held_out_episode_return"])[role_mask],
+            episodes[role_mask],
+            np.asarray(data["public_context_stratum"])[role_mask],
+            split_manifest=preregistration.split_manifest,
+            role=role,
+            n_classes=n_classes,
+        )
+    return artifacts
+
+
+def write_ecological_value_class_artifacts(
+    artifacts: Mapping[
+        str,
+        CrossFittedEcologicalValueClassesV2 | CrossFittedValueClassesV1,
+    ],
+    out_dir: Path,
+) -> list[dict[str, Any]]:
+    """Write immutable, content-addressed role artifacts for later analysis."""
+
+    if not artifacts:
+        raise ValueError("At least one ecological value-class artifact is required.")
+    artifact_dir = Path(out_dir) / PATH_C_VALUE_CLASS_ARTIFACT_DIR
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    references: list[dict[str, Any]] = []
+    for role, artifact in sorted(artifacts.items()):
+        if not isinstance(
+            artifact,
+            (CrossFittedEcologicalValueClassesV2, CrossFittedValueClassesV1),
+        ):
+            raise TypeError(
+                "Ecological value-class outputs must be "
+                "registered cross-fitted ecological artifacts."
+            )
+        if role != artifact.role:
+            raise ValueError("Value-class artifact mapping key changed its role.")
+        payload = artifact.to_mapping()
+        raw = (
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        file_sha256 = hashlib.sha256(raw).hexdigest()
+        path = artifact_dir / f"{role}.{artifact.sha256}.json"
+        if path.exists():
+            raise FileExistsError(
+                f"Ecological value-class artifact already exists: {path}"
+            )
+        path.write_bytes(raw)
+        references.append({
+            "role": role,
+            "path": str(path.resolve()),
+            "file_sha256": file_sha256,
+            "artifact_sha256": artifact.sha256,
+            "split_manifest_sha256": artifact.split_manifest_sha256,
+        })
+    return references
+
+
+def attach_validated_ecological_value_classes(
+    data: dict[str, Any],
+    references: Sequence[Mapping[str, Any]],
+    preregistration: FrozenPathCPreregistration,
+) -> dict[str, Any]:
+    """Validate role artifacts and attach their labels; no registry fallback exists."""
+
+    if not isinstance(preregistration, FrozenPathCPreregistration):
+        raise TypeError("A frozen Path C preregistration is required.")
+    expected_reference_keys = {
+        "role",
+        "path",
+        "file_sha256",
+        "artifact_sha256",
+        "split_manifest_sha256",
+    }
+    by_role: dict[str, Mapping[str, Any]] = {}
+    for reference in references:
+        if not isinstance(reference, Mapping) or set(reference) != expected_reference_keys:
+            raise ValueError("Ecological value-class reference has the wrong schema.")
+        role = str(reference["role"])
+        if role in by_role:
+            raise ValueError("Ecological value-class references repeat a role.")
+        by_role[role] = reference
+    roles = np.asarray(data.get("collection_role", ())).astype(str)
+    episodes = np.asarray(data.get("episode_uid", ())).astype(str)
+    group_ids = np.asarray(data.get("split_group_id", ())).astype(str)
+    outcomes = np.asarray(
+        data.get("held_out_episode_return", ()), dtype=np.float64
+    )
+    if not (roles.shape == episodes.shape == group_ids.shape == outcomes.shape):
+        raise ValueError("Ecological artifact inputs are not row-aligned.")
+    manifest_group_ids = {
+        group.group_id for group in preregistration.split_manifest.groups
+    }
+    if not set(group_ids.tolist()).issubset(manifest_group_ids):
+        raise ValueError("Ecological attachment found an unknown split group.")
+    if any(
+        preregistration.split_manifest.role_for(group_id) != role
+        for group_id, role in zip(
+            group_ids.tolist(), roles.tolist(), strict=True
+        )
+    ):
+        raise ValueError(
+            "Ecological attachment role differs from the frozen split manifest."
+        )
+    episode_roles: dict[str, set[str]] = {}
+    episode_groups: dict[str, set[str]] = {}
+    for episode, role, group_id in zip(
+        episodes.tolist(), roles.tolist(), group_ids.tolist(), strict=True
+    ):
+        episode_roles.setdefault(episode, set()).add(role)
+        episode_groups.setdefault(episode, set()).add(group_id)
+    if any(len(values) != 1 for values in episode_roles.values()):
+        raise ValueError("An episode cannot appear in more than one frozen role.")
+    if any(len(values) != 1 for values in episode_groups.values()):
+        raise ValueError("An episode cannot appear in more than one split group.")
+    ecological_ids = np.full(roles.shape, -1, dtype=np.int16)
+    fold_ids = np.full(roles.shape, -1, dtype=np.int16)
+    threshold_distances = np.full(roles.shape, np.nan, dtype=np.float64)
+    value_estimates = np.full(roles.shape, np.nan, dtype=np.float64)
+    value_standard_errors = np.full(roles.shape, np.nan, dtype=np.float64)
+    artifact_hashes = np.full(roles.shape, "", dtype=object)
+    validated_artifacts: dict[str, CrossFittedEcologicalValueClassesV2] = {}
+    observed_roles = sorted(set(roles.tolist()).intersection({
+        "train", "design", "calibration", "locked_audit"
+    }))
+    unknown_roles = sorted(set(roles.tolist()).difference(observed_roles))
+    if unknown_roles:
+        raise ValueError(
+            "Ecological value-class attachment rejects unregistered role(s): "
+            + ", ".join(unknown_roles)
+        )
+    if set(by_role) != set(observed_roles):
+        raise ValueError(
+            "Ecological value-class references must exactly cover observed roles."
+        )
+    for role in observed_roles:
+        reference = by_role[role]
+        path = Path(str(reference["path"]))
+        if not path.is_file():
+            raise FileNotFoundError(f"Ecological value-class artifact is missing: {path}")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != str(reference["file_sha256"]):
+            raise ValueError("Ecological value-class artifact file SHA-256 mismatch.")
+        payload = json.loads(raw.decode("utf-8"))
+        artifact = CrossFittedEcologicalValueClassesV2.from_mapping(
+            payload,
+            split_manifest=preregistration.split_manifest,
+        )
+        expected_n_classes = int(
+            preregistration.payload["synthetic_factorial"]["value_mechanisms"]
+        )
+        if (
+            artifact.role != role
+            or artifact.n_classes != expected_n_classes
+            or artifact.sha256 != str(reference["artifact_sha256"])
+            or artifact.split_manifest_sha256
+            != str(reference["split_manifest_sha256"])
+        ):
+            raise ValueError("Ecological value-class reference changed artifact content.")
+        role_mask = roles == role
+        _validate_ecological_return_columns(data, role_mask)
+        ecological_ids[role_mask] = artifact.labels_for_rows(
+            episodes[role_mask],
+            held_out_episode_return=outcomes[role_mask],
+            require_complete=True,
+        )
+        assignment_by_episode = artifact.assignment_by_episode
+        fold_ids[role_mask] = np.asarray(
+            [assignment_by_episode[item].fold_id for item in episodes[role_mask]],
+            dtype=np.int16,
+        )
+        threshold_distances[role_mask] = np.asarray(
+            [
+                assignment_by_episode[item].distance_to_nearest_threshold
+                for item in episodes[role_mask]
+            ],
+            dtype=np.float64,
+        )
+        value_estimates[role_mask] = np.asarray(
+            [assignment_by_episode[item].value_estimate for item in episodes[role_mask]],
+            dtype=np.float64,
+        )
+        value_standard_errors[role_mask] = np.asarray(
+            [
+                assignment_by_episode[item].value_standard_error
+                for item in episodes[role_mask]
+            ],
+            dtype=np.float64,
+        )
+        artifact_hashes[role_mask] = artifact.sha256
+        validated_artifacts[role] = artifact
+    if np.any(ecological_ids < 0) or np.any(fold_ids < 0):
+        raise ValueError("Ecological value-class artifacts did not label every row.")
+    data["ecological_value_class_id"] = ecological_ids
+    data["ecological_value_class_fold"] = fold_ids
+    data["ecological_value_class_threshold_distance"] = threshold_distances
+    data["ecological_value_estimate"] = value_estimates
+    data["ecological_value_standard_error"] = value_standard_errors
+    data["ecological_value_class_artifact_sha256"] = artifact_hashes.astype(str)
+    data[PATH_C_VALIDATED_VALUE_CLASS_OBJECTS] = validated_artifacts
+    return data
+
+
+def _validated_ecological_artifact_for_rows(
+    data: dict[str, Any],
+    idx: np.ndarray,
+) -> tuple[
+    str,
+    CrossFittedEcologicalValueClassesV2 | CrossFittedValueClassesV1,
+]:
+    """Recheck attached ecological labels against the validated artifact object."""
+
+    roles = np.unique(data["collection_role"][idx].astype(str))
+    if roles.size != 1:
+        raise ValueError("Ecological analysis cannot pool collection roles.")
+    role = str(roles[0])
+    artifacts = data.get(PATH_C_VALIDATED_VALUE_CLASS_OBJECTS)
+    if not isinstance(artifacts, Mapping):
+        raise ValueError(
+            "Ecological analysis requires an artifact validated in this process."
+        )
+    artifact = artifacts.get(role)
+    if not isinstance(
+        artifact,
+        (CrossFittedEcologicalValueClassesV2, CrossFittedValueClassesV1),
+    ):
+        raise ValueError("Ecological analysis lacks its validated role artifact.")
+    episodes = data["episode_uid"][idx].astype(str)
+    expected_classes = artifact.labels_for_rows(
+        episodes,
+        held_out_episode_return=data["held_out_episode_return"][idx],
+        require_complete=False,
+    )
+    if not np.array_equal(
+        expected_classes,
+        data[PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN][idx].astype(np.int16),
+    ):
+        raise ValueError("Ecological value-class labels changed after validation.")
+    assignments = artifact.assignment_by_episode
+    expected_folds = np.asarray(
+        [assignments[episode].fold_id for episode in episodes], dtype=np.int16
+    )
+    expected_distances = np.asarray(
+        [
+            assignments[episode].distance_to_nearest_threshold
+            for episode in episodes
+        ],
+        dtype=np.float64,
+    )
+    if not np.array_equal(
+        expected_folds,
+        data["ecological_value_class_fold"][idx].astype(np.int16),
+    ) or not np.allclose(
+        expected_distances,
+        data["ecological_value_class_threshold_distance"][idx],
+        rtol=0.0,
+        atol=1.0e-12,
+    ):
+        raise ValueError("Ecological fold or threshold distance changed after validation.")
+    if set(data["ecological_value_class_artifact_sha256"][idx].astype(str)) != {
+        artifact.sha256
+    }:
+        raise ValueError("Ecological artifact hash changed after validation.")
+    return role, artifact
 
 
 def ok_rows(data, k: int) -> np.ndarray:
@@ -1130,6 +1558,8 @@ def _path_c_baseline_completeness(
     missing = [variant for variant in required if variant not in features]
     return {
         "available": True,
+        "role": "legacy_secondary_readout_only",
+        "decision_eligible": False,
         "required_hard_baselines": list(required),
         "present_variants": sorted(features),
         "missing_required_hard_baselines": missing,
@@ -1215,6 +1645,7 @@ def _path_c_advantage_block(
     primary: str | None = None,
     threshold: float = 0.0,
     required_baselines: tuple[str, ...] | None = None,
+    power_cluster_keys: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if primary is None:
         primary = PATH_C_PRIMARY_VARIANT
@@ -1232,26 +1663,59 @@ def _path_c_advantage_block(
             "present_variants": sorted(row_scores),
             "pass": False,
         }
+    primary_scores = np.asarray(row_scores[primary], dtype=np.float64)
+    bootstrap_keys = np.asarray(keys).astype(str)
+    if primary_scores.ndim != 1 or bootstrap_keys.shape != primary_scores.shape:
+        raise ValueError("Path C readout scores and episode keys must be row-aligned.")
+    cluster_keys = None
+    cluster_ids: list[str] = []
+    if power_cluster_keys is not None:
+        cluster_keys = np.asarray(power_cluster_keys).astype(str)
+        if cluster_keys.shape != primary_scores.shape:
+            raise ValueError(
+                "Path C identity-group keys must be row-aligned with readout scores."
+            )
+        cluster_ids = sorted(np.unique(cluster_keys).tolist())
     advantages = {}
     passes = []
     for variant, baseline_nll in row_scores.items():
         if variant == primary:
             continue
-        delta = np.asarray(baseline_nll) - np.asarray(row_scores[primary])
-        ci = bootstrap_ci(lambda ii, d=delta: float(d[ii].mean()), keys)
+        baseline_scores = np.asarray(baseline_nll, dtype=np.float64)
+        if baseline_scores.shape != primary_scores.shape:
+            raise ValueError(
+                f"Path C baseline {variant!r} scores are not row-aligned."
+            )
+        delta = baseline_scores - primary_scores
+        if not bool(np.all(np.isfinite(delta))):
+            raise ValueError(f"Path C baseline {variant!r} effects must be finite.")
+        ci = bootstrap_ci(
+            lambda ii, d=delta: float(d[ii].mean()),
+            bootstrap_keys,
+        )
         passed = bool(float(delta.mean()) >= threshold and ci["lo"] > threshold)
         passes.append(passed)
-        advantages[variant] = {
+        advantage = {
             "value": float(delta.mean()),
             "threshold": threshold,
             "ci": ci,
             "pass": passed,
         }
+        if cluster_keys is not None:
+            advantage.update({
+                "power_cluster_unit": "identity_group",
+                "power_cluster_ids": cluster_ids,
+                "power_cluster_effects": [
+                    float(delta[cluster_keys == cluster_id].mean())
+                    for cluster_id in cluster_ids
+                ],
+            })
+        advantages[variant] = advantage
     if not advantages:
         return {"available": False, "reason": "no_baseline_variants", "pass": False}
     min_adv = min(float(item["value"]) for item in advantages.values())
     min_ci_lo = min(float(item["ci"]["lo"]) for item in advantages.values())
-    return {
+    report = {
         "available": True,
         "value": min_adv,
         "min_ci_lo": min_ci_lo,
@@ -1260,6 +1724,19 @@ def _path_c_advantage_block(
         "advantages_over_baseline": advantages,
         "required_hard_baselines": list(required_baselines),
     }
+    if cluster_keys is not None:
+        reference_baseline = min(
+            required_baselines,
+            key=lambda variant: (float(advantages[variant]["value"]), variant),
+        )
+        reference = advantages[reference_baseline]
+        report.update({
+            "power_cluster_unit": "identity_group",
+            "power_reference_baseline": reference_baseline,
+            "power_cluster_ids": list(reference["power_cluster_ids"]),
+            "power_cluster_effects": list(reference["power_cluster_effects"]),
+        })
+    return report
 
 def _path_c_rv_readout(
     data,
@@ -1282,6 +1759,21 @@ def _path_c_rv_readout(
         return {"available": False, "reason": "empty_mask", "split": split_name}
     keys = ep_keys(data, mask)
     folds = keys if fold_keys is None else np.asarray(fold_keys)[idx].astype(str)
+    identity_source = next(
+        (
+            name
+            for name in ("identity_key", "surface_identity_key", "partner")
+            if name in data
+        ),
+        None,
+    )
+    if identity_source is None:
+        return {
+            "available": False,
+            "reason": "missing_identity_group_for_power_analysis",
+            "split": split_name,
+        }
+    power_cluster_keys = np.asarray(data[identity_source])[idx].astype(str)
     features = _path_c_variant_features(
         data, idx, models, norm, partner_to_idx, device, JUDGED_K)
     variant_scores = {}
@@ -1302,14 +1794,21 @@ def _path_c_rv_readout(
         if score.get("available"):
             row_scores[variant] = score["row_nll"]
     signal = _path_c_advantage_block(
-        row_scores, keys, threshold=threshold, required_baselines=required_baselines
+        row_scores,
+        keys,
+        threshold=threshold,
+        required_baselines=required_baselines,
+        power_cluster_keys=power_cluster_keys,
     )
     return {
         "available": bool(signal.get("available")),
+        "role": "legacy_secondary_readout_only",
+        "decision_eligible": False,
         "split": split_name,
         "n": int(idx.size),
         "rv_columns": rv_cols,
         "readout_capacity": _path_c_readout_capacity(),
+        "power_cluster_source_column": identity_source,
         "variant_scores": variant_scores,
         "signal": signal,
         "measurement": {
@@ -1318,6 +1817,7 @@ def _path_c_rv_readout(
             "threshold": signal.get("threshold", threshold),
             "ci_lo": signal.get("min_ci_lo"),
             "pass": bool(signal.get("pass", False)),
+            "decision_eligible": False,
         },
     }
 
@@ -1326,47 +1826,65 @@ def _conditional_linear_dependence(
     x: np.ndarray,
     labels: np.ndarray,
     cond: np.ndarray,
-    groups: np.ndarray,
+    episode_uid: np.ndarray,
+    registered_stratum: np.ndarray,
     *,
     seed: int,
     iters: int = PATH_C_PERM_ITERS,
 ) -> dict[str, Any]:
-    labels, vocab = _encode_labels(labels)
-    if labels.size == 0 or len(vocab) < 2:
+    encoded_labels, vocab = _encode_labels(labels)
+    if encoded_labels.size == 0 or len(vocab) < 2:
         return {"available": False, "reason": "empty_or_single_class", "classes": vocab}
     x = np.asarray(x, dtype=np.float64)
-    y = _onehot(labels).astype(np.float64)
     cond = np.asarray(cond, dtype=np.float64)
-    cond_aug = np.concatenate([cond, np.ones((cond.shape[0], 1), dtype=np.float64)], axis=1)
+    if x.shape[0] != encoded_labels.size or cond.shape[0] != encoded_labels.size:
+        raise ValueError("Conditional-dependence arrays must be row-aligned.")
+    cond_aug = np.concatenate(
+        [cond, np.ones((cond.shape[0], 1), dtype=np.float64)], axis=1
+    )
     beta_x = np.linalg.pinv(cond_aug) @ x
-    beta_y = np.linalg.pinv(cond_aug) @ y
     rx = x - cond_aug @ beta_x
-    ry = y - cond_aug @ beta_y
     rx = rx - rx.mean(axis=0, keepdims=True)
-    ry = ry - ry.mean(axis=0, keepdims=True)
     denom = max(float(rx.shape[0] - 1), 1.0)
-    stat = float(np.linalg.norm((rx.T @ ry) / denom, ord="fro"))
-    rng = np.random.default_rng(seed)
-    group_text = np.asarray(groups).astype(str)
-    uniq_groups = np.unique(group_text)
-    perm_stats = np.empty(iters, dtype=np.float64)
-    for it in range(iters):
-        shuffled = ry.copy()
-        for group in uniq_groups:
-            gm = np.flatnonzero(group_text == group)
-            if gm.size > 1:
-                shuffled[gm] = shuffled[rng.permutation(gm)]
-        perm_stats[it] = float(np.linalg.norm((rx.T @ shuffled) / denom, ord="fro"))
-    p_value = float((1.0 + np.count_nonzero(perm_stats >= stat)) / (iters + 1.0))
+
+    def statistic(target_labels: np.ndarray) -> float:
+        target = _onehot(target_labels).astype(np.float64)
+        beta_y = np.linalg.pinv(cond_aug) @ target
+        residual_y = target - cond_aug @ beta_y
+        residual_y = residual_y - residual_y.mean(axis=0, keepdims=True)
+        return float(np.linalg.norm((rx.T @ residual_y) / denom, ord="fro"))
+
+    stat = statistic(encoded_labels)
+    perm_stats = np.empty(int(iters), dtype=np.float64)
+    try:
+        for iteration in range(int(iters)):
+            permuted = cluster_stratified_permutation(
+                encoded_labels,
+                episode_uid,
+                registered_stratum,
+                seed=int(seed) + iteration,
+            ).astype(np.int64)
+            perm_stats[iteration] = statistic(permuted)
+    except ValueError as exc:
+        return {
+            "available": False,
+            "reason": "episode_cluster_permutation_infeasible",
+            "detail": str(exc),
+            "classes": vocab,
+        }
+    p_value = float(
+        (1.0 + np.count_nonzero(perm_stats >= stat)) / (int(iters) + 1.0)
+    )
     return {
         "available": True,
-        "test": "linear_kernel_conditional_hsic_permutation",
+        "test": "linear_kernel_conditional_dependence_episode_cluster_permutation",
         "statistic": stat,
         "permutation_p": p_value,
         "permutation_iters": int(iters),
+        "permutation_unit": "episode_uid",
+        "permutation_scope": "within_registered_stratum",
         "classes": vocab,
     }
-
 
 def _joint_categorical_codes(data, cols: list[str], idx: np.ndarray) -> np.ndarray:
     if not cols:
@@ -1485,127 +2003,16 @@ def _path_c_public_probe_bucket(data, idx: np.ndarray) -> np.ndarray:
     return text.astype(str)
 
 
-def _legacy_path_c_kernel_distance_audit(
-    data,
-    mask: np.ndarray,
-    thresholds: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Observable K^V factorization audit from empirical R^V kernels.
-
-    Estimates joint R^V distributions inside common public-context/probe buckets.
-    Same-W comparisons are fixed mechanism, fixed bucket, different identity/surface;
-    different-W comparisons are different mechanism, fixed bucket. The reported
-    delta is an artifact-read-back confidence radius from categorical TV bounds.
-    """
-    required = {"mechanism_key", "identity_key"}
-    if not required.issubset(set(data.keys())):
-        return {"available": False, "reason": "missing_mechanism_or_identity_key", "pass": False}
-    rv_cols = _path_c_rv_columns(data)
-    if not rv_cols:
-        return {"available": False, "reason": "missing_rv_columns", "pass": False}
-    idx = np.flatnonzero(mask)
-    if idx.size == 0:
-        return {"available": False, "reason": "empty_mask", "pass": False}
-    mechanism = data["mechanism_key"].astype(str)
-    identity = data["identity_key"].astype(str)
-    rv_code = _joint_categorical_codes(data, rv_cols, idx)
-    bucket = _path_c_public_probe_bucket(data, idx)
-    row_to_pos = {int(row): pos for pos, row in enumerate(idx.tolist())}
-    eps_f = float(_path_c_threshold(thresholds, "epsilon_F", 0.05))
-    eps_r = float(_path_c_threshold(thresholds, "epsilon_R", 0.15))
-    same_pairs: list[dict[str, Any]] = []
-    diff_pairs: list[dict[str, Any]] = []
-    max_same_tv = 0.0
-    max_same_radius = 0.0
-    min_diff_tv = float("inf")
-    max_diff_radius = 0.0
-    active_buckets = sorted(np.unique(bucket).tolist())
-    active_mechanisms = sorted(np.unique(mechanism[idx]).tolist())
-    for b in active_buckets:
-        bucket_rows = idx[bucket == b]
-        for mech in active_mechanisms:
-            mech_rows = bucket_rows[mechanism[bucket_rows] == mech]
-            ids = sorted(np.unique(identity[mech_rows]).tolist())
-            for i, left_id in enumerate(ids):
-                for right_id in ids[i + 1:]:
-                    left_rows = mech_rows[identity[mech_rows] == left_id]
-                    right_rows = mech_rows[identity[mech_rows] == right_id]
-                    left_codes = rv_code[[row_to_pos[int(r)] for r in left_rows]]
-                    right_codes = rv_code[[row_to_pos[int(r)] for r in right_rows]]
-                    tv, radius = _tv_between_codes(left_codes, right_codes)
-                    max_same_tv = max(max_same_tv, tv)
-                    max_same_radius = max(max_same_radius, radius)
-                    same_pairs.append({
-                        "public_probe_bucket": str(b),
-                        "mechanism_key": str(mech),
-                        "identity_pair": [str(left_id), str(right_id)],
-                        "tv": tv,
-                        "confidence_radius": radius,
-                        "n_left": int(left_rows.size),
-                        "n_right": int(right_rows.size),
-                    })
-        bucket_mechs = sorted(np.unique(mechanism[bucket_rows]).tolist())
-        for i, left_mech in enumerate(bucket_mechs):
-            for right_mech in bucket_mechs[i + 1:]:
-                left_rows = bucket_rows[mechanism[bucket_rows] == left_mech]
-                right_rows = bucket_rows[mechanism[bucket_rows] == right_mech]
-                left_codes = rv_code[[row_to_pos[int(r)] for r in left_rows]]
-                right_codes = rv_code[[row_to_pos[int(r)] for r in right_rows]]
-                tv, radius = _tv_between_codes(left_codes, right_codes)
-                min_diff_tv = min(min_diff_tv, tv)
-                max_diff_radius = max(max_diff_radius, radius)
-                diff_pairs.append({
-                    "public_probe_bucket": str(b),
-                    "mechanism_pair": [str(left_mech), str(right_mech)],
-                    "tv": tv,
-                    "confidence_radius": radius,
-                    "n_left": int(left_rows.size),
-                    "n_right": int(right_rows.size),
-                })
-    if not same_pairs or not diff_pairs:
-        return {
-            "available": False,
-            "reason": "insufficient_same_or_different_W_pairs_inside_common_public_probe_buckets",
-            "same_pairs": same_pairs[:50],
-            "diff_pairs": diff_pairs[:50],
-            "n_public_probe_buckets": int(len(active_buckets)),
-            "pass": False,
-        }
-    delta = max(max_same_radius, max_diff_radius)
-    same_upper = max_same_tv + delta
-    diff_lower = min_diff_tv - delta
-    margin_ok = eps_f + 2.0 * delta < eps_r
-    same_pass = same_upper <= eps_f
-    diff_pass = diff_lower >= eps_r
-    return {
-        "available": True,
-        "rv_columns": rv_cols,
-        "distance": "joint_RV_total_variation_conditioned_on_public_probe_bucket",
-        "public_context_conditioning": ["state_feat_sha1_rounded", "valid_kinds", "probe_action_id", "gate_main", "gate_strict", "dp_index"],
-        "epsilon_F": eps_f,
-        "epsilon_R": eps_r,
-        "delta": delta,
-        "epsilon_margin_value": eps_f + 2.0 * delta,
-        "margin_pass": bool(margin_ok),
-        "max_same_W_tv": max_same_tv,
-        "max_same_W_upper_ci": same_upper,
-        "same_W_pass": bool(same_pass),
-        "min_diff_W_tv": min_diff_tv,
-        "min_diff_W_lower_ci": diff_lower,
-        "diff_W_pass": bool(diff_pass),
-        "same_pairs": same_pairs[:200],
-        "diff_pairs": diff_pairs[:200],
-        "n_public_probe_buckets": int(len(active_buckets)),
-        "pass": bool(margin_ok and same_pass and diff_pass),
-    }
-
-
 def _path_c_kernel_distance_audit(
     data,
     mask: np.ndarray,
     thresholds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Authoritative-form kernel audit over preregistered semantic strata."""
+    """Secondary distributional-cell diagnostic over semantic strata.
+
+    The version-3 instrument uses canonical outer-replica rows. This diagnostic
+    cannot enter instrument validity or the primary decision.
+    """
     source = None if thresholds is None else thresholds.get("_source_path")
     required = {
         "mechanism_key", "surface_identity_key", "public_context_stratum",
@@ -1636,23 +2043,36 @@ def _path_c_kernel_distance_audit(
         preregistration,
         seed=8302,
     )
-    if not audit.get("available", False):
-        return audit
-    epsilon_f = float(preregistration.thresholds["epsilon_F"])
-    epsilon_r = float(preregistration.thresholds["epsilon_R"])
-    delta = float(audit["delta"])
     audit.update({
         "rv_columns": rv_cols,
-        "epsilon_F": epsilon_f,
-        "epsilon_R": epsilon_r,
-        "margin_value": epsilon_f + 2.0 * delta,
-        "pass": bool(
-            epsilon_f + 2.0 * delta < epsilon_r
-            and float(audit["max_same_W_upper_ci"]) <= epsilon_f
-            and float(audit["min_diff_W_witness_lower_ci"]) >= epsilon_r
-        ),
+        "theorem_eligible": False,
+        "decision_eligible": False,
+        "role": "secondary_distributional_diagnostic",
     })
     return audit
+
+
+def _synthetic_registry_value_oracle_diagnostic(
+    data: dict[str, np.ndarray],
+    idx: np.ndarray,
+) -> dict[str, Any]:
+    """Expose registry labels only as a clearly non-ecological oracle diagnostic."""
+
+    if PATH_C_SYNTHETIC_VALUE_ORACLE_COLUMN not in data:
+        return {
+            "available": False,
+            "role": "secondary_oracle_diagnostic_only",
+            "decision_eligible": False,
+        }
+    labels = np.asarray(data[PATH_C_SYNTHETIC_VALUE_ORACLE_COLUMN])[idx].astype(str)
+    return {
+        "available": bool(labels.size),
+        "role": "secondary_oracle_diagnostic_only",
+        "source": PATH_C_SYNTHETIC_VALUE_ORACLE_COLUMN,
+        "classes": sorted(np.unique(labels).tolist()),
+        "decision_eligible": False,
+        "may_define_ecological_value_class": False,
+    }
 
 
 def _path_c_conditional_factorization_audit(
@@ -1664,114 +2084,168 @@ def _path_c_conditional_factorization_audit(
     device: str,
     thresholds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if "mechanism_key" not in data or "identity_key" not in data:
-        return {"available": False, "reason": "missing_mechanism_or_identity_key"}
+    """Secondary value/identity readout using validated ecological classes."""
+
     idx = np.flatnonzero(mask)
+    required = {
+        PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN,
+        "ecological_value_class_fold",
+        "ecological_value_class_artifact_sha256",
+        "ecological_value_class_threshold_distance",
+        "collection_role",
+        "held_out_episode_return",
+        PATH_C_VALIDATED_VALUE_CLASS_OBJECTS,
+        "identity_key",
+        "episode_uid",
+    }
+    missing = sorted(required.difference(data))
+    if missing:
+        return {
+            "available": False,
+            "reason": "missing_value_or_identity_fields",
+            "missing": missing,
+            "synthetic_registry_value_oracle": (
+                _synthetic_registry_value_oracle_diagnostic(data, idx)
+            ),
+        }
     if idx.size == 0:
         return {"available": False, "reason": "empty_mask"}
+    analysis_roles = np.unique(data["collection_role"][idx].astype(str))
+    if analysis_roles.size != 1:
+        return {
+            "available": False,
+            "reason": "cross_role_ecological_value_class_pooling_forbidden",
+            "roles": analysis_roles.tolist(),
+        }
+    analysis_role, _value_class_artifact = _validated_ecological_artifact_for_rows(
+        data,
+        idx,
+    )
     features_by_variant = _path_c_variant_features(
-        data, idx, models, norm, partner_to_idx, device, JUDGED_K)
+        data, idx, models, norm, partner_to_idx, device, JUDGED_K
+    )
     primary = _path_c_primary_variant(features_by_variant)
     if primary is None:
         return {"available": False, "reason": "missing_primary_variant"}
     features = features_by_variant[primary]
     context = _path_c_context_features(data, idx)
-    mechanism_labels, mechanism_vocab = _encode_labels(data["mechanism_key"][idx])
+    ecological_values = data[PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN][idx]
+    value_labels, value_vocab = _encode_labels(ecological_values)
     identity_labels, identity_vocab = _encode_labels(data["identity_key"][idx])
-    mechanism_onehot = _onehot(mechanism_labels)
+    value_onehot = _onehot(value_labels)
     keys = ep_keys(data, mask)
-    mech_context = _fit_predict_classifier(
-        context,
-        mechanism_labels,
-        keys,
-        device=device,
-        seed=8101,
+
+    value_context = _fit_predict_classifier(
+        context, value_labels, keys, device=device, seed=8101
     )
-    mech_joint = _fit_predict_classifier(
+    value_joint = _fit_predict_classifier(
         np.concatenate([context, features], axis=1),
-        mechanism_labels,
+        value_labels,
         keys,
         device=device,
         seed=8102,
     )
-    id_cond = np.concatenate([context, mechanism_onehot], axis=1)
-    id_context = _fit_predict_classifier(
-        id_cond,
-        identity_labels,
-        keys,
-        device=device,
-        seed=8201,
+    identity_condition = np.concatenate([context, value_onehot], axis=1)
+    identity_context = _fit_predict_classifier(
+        identity_condition, identity_labels, keys, device=device, seed=8201
     )
-    id_joint = _fit_predict_classifier(
-        np.concatenate([id_cond, features], axis=1),
+    identity_joint = _fit_predict_classifier(
+        np.concatenate([identity_condition, features], axis=1),
         identity_labels,
         keys,
         device=device,
         seed=8202,
     )
-    mech_adv = None
-    id_adv = None
-    if mech_context.get("available") and mech_joint.get("available"):
-        mech_adv = float(
-            logloss(mech_context["probs"], mechanism_labels)
-            - logloss(mech_joint["probs"], mechanism_labels)
+    value_advantage = None
+    identity_advantage = None
+    if value_context.get("available") and value_joint.get("available"):
+        value_advantage = float(
+            logloss(value_context["probs"], value_labels)
+            - logloss(value_joint["probs"], value_labels)
         )
-    if id_context.get("available") and id_joint.get("available"):
-        id_adv = float(
-            logloss(id_context["probs"], identity_labels)
-            - logloss(id_joint["probs"], identity_labels)
+    if identity_context.get("available") and identity_joint.get("available"):
+        identity_advantage = float(
+            logloss(identity_context["probs"], identity_labels)
+            - logloss(identity_joint["probs"], identity_labels)
         )
-    dep = _conditional_linear_dependence(
+    public_probe = _path_c_public_probe_context_codes(data, idx).astype(str)
+    registered_stratum = np.char.add(
+        ecological_values.astype(str),
+        np.char.add("|", public_probe),
+    )
+    dependence = _conditional_linear_dependence(
         features,
         data["identity_key"][idx],
-        id_cond,
-        data["mechanism_key"][idx],
+        identity_condition,
+        data["episode_uid"][idx],
+        registered_stratum,
         seed=8301,
     )
-    leak_eq = float(_path_c_threshold(
+    leakage_limit = float(_path_c_threshold(
         thresholds,
-        "leakage_logloss_advantage_equivalence",
+        "conditional_leakage_max",
         PATH_C_LEAK_ADVANTAGE_EQ,
     ))
-    kernel_audit = _path_c_kernel_distance_audit(data, mask, thresholds)
-    # Proposal C_fact is the observable K^V same-W/different-W distance audit.
-    # Conditional classifiers remain diagnostics only; they must not substitute
-    # for epsilon_F / epsilon_R / delta read-back.
-    pass_rule = bool(kernel_audit.get("pass", False))
+    mechanism_proxy = None
+    if "mechanism_key" in data:
+        mechanism_proxy = {
+            "role": "secondary_proxy_only",
+            "classes": sorted(
+                np.unique(data["mechanism_key"][idx].astype(str)).tolist()
+            ),
+        }
     return {
         "available": True,
         "primary_variant": primary,
-        "mechanism_classes": mechanism_vocab,
+        "collection_role": analysis_role,
+        "value_class_source": "validated_cross_fitted_ecological_value_class_artifact",
+        "value_class_artifact_sha256": sorted(np.unique(
+            data["ecological_value_class_artifact_sha256"][idx].astype(str)
+        ).tolist()),
+        "cross_fit_folds": sorted(np.unique(
+            data["ecological_value_class_fold"][idx].astype(int)
+        ).tolist()),
+        "value_class_uncertainty": {
+            "measure": "distance_to_nearest_out_of_fold_threshold",
+            "minimum": float(np.min(
+                data["ecological_value_class_threshold_distance"][idx]
+            )),
+            "median": float(np.median(
+                data["ecological_value_class_threshold_distance"][idx]
+            )),
+        },
+        "value_classes": value_vocab,
         "identity_classes": identity_vocab,
-        "mechanism_readout_conditioned_on_context": {
+        "value_readout_conditioned_on_public_context": {
             "logloss_context": (
-                logloss(mech_context["probs"], mechanism_labels)
-                if mech_context.get("available") else None
+                logloss(value_context["probs"], value_labels)
+                if value_context.get("available") else None
             ),
             "logloss_context_plus_representation": (
-                logloss(mech_joint["probs"], mechanism_labels)
-                if mech_joint.get("available") else None
+                logloss(value_joint["probs"], value_labels)
+                if value_joint.get("available") else None
             ),
-            "advantage": mech_adv,
+            "advantage": value_advantage,
         },
-        "identity_given_mechanism_readout": {
-            "logloss_context_mechanism": (
-                logloss(id_context["probs"], identity_labels)
-                if id_context.get("available") else None
+        "identity_given_value_readout": {
+            "logloss_context_value": (
+                logloss(identity_context["probs"], identity_labels)
+                if identity_context.get("available") else None
             ),
-            "logloss_context_mechanism_plus_representation": (
-                logloss(id_joint["probs"], identity_labels)
-                if id_joint.get("available") else None
+            "logloss_context_value_plus_representation": (
+                logloss(identity_joint["probs"], identity_labels)
+                if identity_joint.get("available") else None
             ),
-            "advantage": id_adv,
-            "equivalence_threshold": leak_eq,
+            "advantage": identity_advantage,
+            "equivalence_threshold": leakage_limit,
         },
-        "conditional_independence_test": dep,
-        "kernel_distance_audit": kernel_audit,
-        "kmeans_nmi_pass_relevant": False,
-        "pass": pass_rule,
+        "conditional_independence_test": dependence,
+        "mechanism_label": mechanism_proxy,
+        "synthetic_registry_value_oracle": (
+            _synthetic_registry_value_oracle_diagnostic(data, idx)
+        ),
+        "decision_eligible": False,
     }
-
 
 def _nearest_neighbor_leakage(
     features: np.ndarray,
@@ -1820,6 +2294,37 @@ def _path_c_leakage_battery(
     idx = np.flatnonzero(mask)
     if idx.size == 0:
         return {"available": False, "reason": "empty_mask", "pass": False}
+    required_value_fields = {
+        PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN,
+        "ecological_value_class_fold",
+        "ecological_value_class_artifact_sha256",
+        "ecological_value_class_threshold_distance",
+        "collection_role",
+        "held_out_episode_return",
+        PATH_C_VALIDATED_VALUE_CLASS_OBJECTS,
+        "episode_uid",
+    }
+    if not required_value_fields.issubset(data):
+        return {
+            "available": False,
+            "reason": "missing_validated_ecological_value_class_artifact",
+            "synthetic_registry_value_oracle": (
+                _synthetic_registry_value_oracle_diagnostic(data, idx)
+            ),
+            "pass": False,
+        }
+    analysis_roles = np.unique(data["collection_role"][idx].astype(str))
+    if analysis_roles.size != 1:
+        return {
+            "available": False,
+            "reason": "cross_role_ecological_value_class_pooling_forbidden",
+            "roles": analysis_roles.tolist(),
+            "pass": False,
+        }
+    analysis_role, _value_class_artifact = _validated_ecological_artifact_for_rows(
+        data,
+        idx,
+    )
     features_by_variant = _path_c_variant_features(
         data, idx, models, norm, partner_to_idx, device, JUDGED_K)
     primary = _path_c_primary_variant(features_by_variant)
@@ -1827,10 +2332,16 @@ def _path_c_leakage_battery(
         return {"available": False, "reason": "missing_primary_variant", "pass": False}
     features = features_by_variant[primary]
     context = _path_c_context_features(data, idx)
-    mechanism_labels, _ = _encode_labels(
-        data["mechanism_key"][idx] if "mechanism_key" in data else data["family"][idx]
+    ecological_values = data[PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN][idx]
+    value_labels, _ = _encode_labels(ecological_values)
+    cond = np.concatenate([context, _onehot(value_labels)], axis=1)
+    registered_stratum = np.char.add(
+        ecological_values.astype(str),
+        np.char.add(
+            "|",
+            _path_c_public_probe_context_codes(data, idx).astype(str),
+        ),
     )
-    cond = np.concatenate([context, _onehot(mechanism_labels)], axis=1)
     keys = ep_keys(data, mask)
     leak_eq = float(_path_c_threshold(
         thresholds,
@@ -1902,7 +2413,8 @@ def _path_c_leakage_battery(
             chan_features,
             values[active_idx],
             chan_cond,
-            data["mechanism_key"][active_idx] if "mechanism_key" in data else data["family"][active_idx],
+            data["episode_uid"][active_idx],
+            registered_stratum[pos],
             seed=9103 + offset * 17,
         )
         nn = _nearest_neighbor_leakage(chan_features, values[active_idx], chan_cond)
@@ -1924,7 +2436,11 @@ def _path_c_leakage_battery(
         channel_reports[name] = {
             "available": True,
             "classes": vocab,
-            "conditioned_on": ["mechanism_key", "public_context", "probe_action_id"],
+            "conditioned_on": [
+                PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN,
+                "public_context",
+                "probe_action_id",
+            ],
             "logloss_context": base_ll,
             "logloss_context_plus_representation": joint_ll,
             "representation_advantage": advantage,
@@ -1941,10 +2457,31 @@ def _path_c_leakage_battery(
     return {
         "available": not missing and bool(channel_reports),
         "primary_variant": primary,
+        "collection_role": analysis_role,
         "required_channels": list(nuisance_sources),
         "missing_required_channels": missing,
         "channels": channel_reports,
-        "conditioned_on": ["mechanism_key", "public_context", "probe_action_id"],
+        "conditioned_on": [
+            PATH_C_ECOLOGICAL_VALUE_CLASS_COLUMN,
+            "public_context",
+            "probe_action_id",
+        ],
+        "value_class_source": "validated_cross_fitted_ecological_value_class_artifact",
+        "value_class_artifact_sha256": sorted(np.unique(
+            data["ecological_value_class_artifact_sha256"][idx].astype(str)
+        ).tolist()),
+        "value_class_uncertainty": {
+            "measure": "distance_to_nearest_out_of_fold_threshold",
+            "minimum": float(np.min(
+                data["ecological_value_class_threshold_distance"][idx]
+            )),
+            "median": float(np.median(
+                data["ecological_value_class_threshold_distance"][idx]
+            )),
+        },
+        "synthetic_registry_value_oracle": (
+            _synthetic_registry_value_oracle_diagnostic(data, idx)
+        ),
         "calibrated_multiclass_logloss": {
             "representation_advantage": max_adv,
             "equivalence_threshold": leak_eq,
@@ -1952,7 +2489,7 @@ def _path_c_leakage_battery(
         "pass": bool(not missing and pass_items and all(pass_items)),
     }
 
-def _path_c_g_value_measurement(
+def _path_c_value_control_measurement(
     data,
     mask: np.ndarray,
     threshold: float = 0.0,
@@ -1979,19 +2516,27 @@ def _path_c_g_value_measurement(
     if missing_by_baseline:
         return {
             "available": False,
+            "role": "legacy_secondary_readout_only",
+            "decision_eligible": False,
             "reason": "missing true held-out value-control artifact columns for required baseline(s)",
             "accepted_column_patterns": [f"<stem>_<baseline>" for baseline in required_baselines],
             "metric_stems": list(PATH_C_TRUE_VALUE_ADVANTAGE_STEMS),
             "missing_by_baseline": missing_by_baseline,
             "rejected_proxy_columns_present": rejected_proxy_cols,
-            "note": "R^V-derived proxy columns and aggregate intent are not valid G-value evidence.",
+            "note": "Response-derived proxy columns and aggregate intent are not valid held-out value-control evidence.",
             "value": None,
             "threshold": threshold,
             "pass": False,
         }
     idx = np.flatnonzero(mask)
     if idx.size == 0:
-        return {"available": False, "reason": "empty_mask", "pass": False}
+        return {
+            "available": False,
+            "reason": "empty_mask",
+            "role": "legacy_secondary_readout_only",
+            "decision_eligible": False,
+            "pass": False,
+        }
     keys = ep_keys(data, mask)
     items = {}
     passes = []
@@ -2016,6 +2561,8 @@ def _path_c_g_value_measurement(
         items[col] = {"value": float(arr.mean()), "ci": ci, "threshold": threshold, "pass": passed}
     return {
         "available": True,
+        "role": "legacy_secondary_readout_only",
+        "decision_eligible": False,
         "name": "true held-out value-control advantage over every baseline",
         "value": min(values),
         "threshold": threshold,
@@ -2029,221 +2576,207 @@ def _path_c_power_null_measurement(
     res: dict[str, Any],
     thresholds: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """G4: require same-budget synthetic-positive power and terminal-axis null.
+    """C4 design readout with observed effects, intervals, TOST, and joint power."""
 
-    This gate no longer accepts legacy blind/off-axis fallback or generic mechanism
-    classifier advantage as a substitute for known-W_C recovery.  Power is counted
-    only when the R^V held-out readout passes and C_fact's empirical K^V distance
-    audit has separated different mechanisms under the preregistered margin.
-    """
-    rv = res.get("path_c_rv_readout") or {}
-    c_fact = res.get("C_fact") or {}
-    kernel = c_fact.get("kernel_distance_audit") or {}
-    diff_lower = kernel.get(
-        "min_diff_W_witness_lower_ci",
-        kernel.get("min_diff_W_lower_ci"),
-    )
-    eps_r = kernel.get("epsilon_R")
-    power = bool(
-        ((rv.get("measurement") or {}).get("pass", False))
-        and bool(kernel.get("pass", False))
-        and diff_lower is not None
-        and eps_r is not None
-        and float(diff_lower) >= float(eps_r)
-    )
+    normalized = _normalize_path_c_thresholds(dict(thresholds or {}))
     fingerprint = (
         (res.get("legacy_d1_gate_report") or {}).get("path_c_fingerprint_checks")
         or {}
     )
-    power = bool(power and fingerprint.get("admission_pass", False))
-    null_threshold = float(_path_c_threshold(
-        thresholds,
-        "null_equivalence_gain",
-        PATH_C_NULL_EQ_GAIN,
-    ))
-    null_readout = res.get("path_c_terminal_axis_null_readout") or {}
-    null_measurement = null_readout.get("measurement") or {}
-    gain = null_measurement.get("value")
-    null_ci = null_measurement.get("equivalence_ci")
-    retained_count = null_measurement.get("retained_coordinate_count")
-    null_equiv = bool(
-        isinstance(null_ci, (list, tuple))
-        and len(null_ci) == 2
-        and null_ci[0] is not None
-        and null_ci[1] is not None
-        and float(null_ci[0]) > -null_threshold
-        and float(null_ci[1]) < null_threshold
-        and retained_count == 0
+    target_keys = (
+        "minimum_positive_power",
+        "minimum_null_equivalence_power",
+        "minimum_joint_power",
     )
-    return {
-        "available": bool(gain is not None and kernel.get("available", False)),
-        "value": float(abs(gain)) if gain is not None else None,
-        "threshold": null_threshold,
-        "synthetic_power_source": "path_c_synthetic_known_W_C_RV_readout_plus_KV_distance_audit",
-        "terminal_axis_null_source": "path_c_terminal_axis_null_readout",
-        "kernel_min_diff_W_lower_ci": diff_lower,
-        "kernel_epsilon_R": eps_r,
-        "fingerprint_admission": fingerprint,
-        "power_recovered": power,
-        "terminal_null_ci": null_ci,
-        "terminal_null_retained_coordinate_count": retained_count,
-        "null_equivalent": null_equiv,
-        "pass": bool(power and null_equiv),
-    }
-
-
-def _find_measurement(measurements: dict[str, Any], key: str) -> Any:
-    for alias in PATH_C_MEASUREMENT_ALIASES[key]:
-        if alias in measurements:
-            return measurements[alias]
-    return None
-
-
-def _coerce_rule_item(item: Any, threshold: Any, *, key: str) -> dict[str, Any]:
-    direction = "upper" if key == "G3" else "lower"
-    if isinstance(item, dict):
-        value = item.get("value")
-    else:
-        value = item
-    if value is None:
-        return {"value": None, "threshold": threshold, "pass": False, "missing": True}
-    if threshold is None:
-        return {"value": value, "threshold": None, "pass": False, "missing": True}
-    val = float(value)
-    thr = float(threshold)
-    passed = val <= thr if direction == "upper" else val >= thr
-    return {"value": val, "threshold": thr, "direction": direction, "pass": bool(passed)}
-
-
-def _legacy_path_c_diagnostic_rule(
-    measurements: dict[str, Any],
-    thresholds: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Historical diagnostic only; no caller may emit this as a Path C decision."""
-    thresholds = _normalize_path_c_thresholds(dict(thresholds or {}))
-    rules: dict[str, Any] = {}
-    kernel_audit = ((measurements.get("C_fact") or {}).get("kernel_distance_audit") or {})
-    eps_f = kernel_audit.get("epsilon_F", thresholds.get("epsilon_F"))
-    eps_r = kernel_audit.get("epsilon_R", thresholds.get("epsilon_R"))
-    # delta is scientific evidence, not a configurable constant: require C_fact to
-    # read it back from the empirical K^V distance bootstrap/radius audit.
-    delta = kernel_audit.get("delta") if kernel_audit.get("available") else None
-    missing_margin = [
-        name for name, value in (
-            ("epsilon_F", eps_f),
-            ("epsilon_R", eps_r),
-            ("delta", delta),
-        )
-        if value is None
-    ]
-    if missing_margin:
-        margin_rule = {
-            "pass": False,
-            "hard_fail": True,
-            "missing": missing_margin,
-            "rule": "epsilon_F + 2*delta < epsilon_R",
-            "source": "kernel_distance_audit" if kernel_audit else "thresholds",
-        }
-    else:
-        margin_ok = float(eps_f) + 2.0 * float(delta) < float(eps_r)
-        margin_rule = {
-            "epsilon_F": float(eps_f),
-            "delta": float(delta),
-            "epsilon_R": float(eps_r),
-            "value": float(eps_f) + 2.0 * float(delta),
-            "threshold": float(eps_r),
-            "pass": bool(margin_ok),
-            "hard_fail": not bool(margin_ok),
-            "rule": "epsilon_F + 2*delta < epsilon_R",
-            "source": "kernel_distance_audit" if kernel_audit else "thresholds",
-        }
-    rules["kernel_margin"] = margin_rule
-    rules["margin"] = margin_rule  # backward-compatible alias
-    episode_floor = thresholds.get("effective_episode_floor")
-    transition_floor = thresholds.get("effective_transition_floor")
-    budget_measurement = measurements.get("budget") if isinstance(measurements.get("budget"), dict) else {}
-    effective_episodes = measurements.get("effective_episodes", budget_measurement.get("effective_episodes"))
-    effective_transitions = measurements.get("effective_transitions", budget_measurement.get("effective_transitions"))
-    budget_pass = True
-    if episode_floor is not None:
-        budget_pass = bool(
-            effective_episodes is not None
-            and int(effective_episodes) >= int(episode_floor)
-        )
-    if transition_floor is not None:
-        budget_pass = bool(
-            budget_pass
-            and effective_transitions is not None
-            and int(effective_transitions) >= int(transition_floor)
-        )
-    rules["budget"] = {
-        "effective_episodes": effective_episodes,
-        "effective_episode_floor": episode_floor,
-        "effective_transitions": effective_transitions,
-        "effective_transition_floor": transition_floor,
-        "pass": bool(budget_pass),
-        "rule": "effective episodes/transitions must meet the preregistered floor",
-    }
-    prereg_status = thresholds.get("_preregistration_status", measurements.get("_preregistration_status"))
-    rules["preregistration"] = {
-        "status": prereg_status,
-        "path": thresholds.get("_source_path"),
-        "sha256": thresholds.get("_source_sha256"),
-        "pass": bool(str(prereg_status).startswith("frozen")),
-        "rule": "Path C go/no-go thresholds must be read from a frozen preregistration artifact",
-    }
-    baseline_item = measurements.get("path_c_baseline_completeness") or {}
-    if not baseline_item:
-        baseline_item = {
-            "pass": False,
-            "reason": "missing_baseline_completeness_artifact",
-            "required_hard_baselines": list(_path_c_required_baselines(thresholds)),
-        }
-    rules["hard_baselines"] = baseline_item
-    strong_audit = measurements.get("strong_baseline_same_rule_audit") or {
+    required_settings = (
+        "positive_and_null_cluster_simulation_required",
+        "joint_operating_characteristics_required",
+        "equivalence_test",
+        "secondary_multiplicity",
+        "selection_role",
+        "primary_alpha",
+        "clusters_per_trial",
+        "simulation_repetitions",
+        "bootstrap_iterations",
+        "seed",
+        "equivalence_margin",
+        "synthetic_power_min_advantage",
+        *target_keys,
+        "cluster_unit",
+    )
+    power_targets = {key: normalized.get(key) for key in target_keys}
+    base_report = {
+        "schema_version": "path_c_positive_null_secondary_v2",
         "available": False,
+        "selection_role": normalized.get("selection_role"),
+        "secondary_multiplicity": normalized.get("secondary_multiplicity"),
+        "cluster_unit": normalized.get("cluster_unit"),
+        "effect": {"positive": None, "null": None},
+        "confidence_intervals": {"positive": None, "null": None},
+        "tost": {"available": False},
+        "positive": None,
+        "null": None,
+        "joint": None,
+        "power_targets": power_targets,
+        "power_targets_met": {
+            "positive": False,
+            "null_equivalence": False,
+            "joint": False,
+            "all": False,
+        },
+        "power_effect": None,
+        "power_confidence_interval": None,
+        "null_effect": None,
+        "null_confidence_interval": None,
+        "two_one_sided_equivalence_test": {"available": False},
+        "joint_cluster_power_simulation": None,
+        "preregistration": {
+            "status": normalized.get("_preregistration_status"),
+            "path": normalized.get("_source_path"),
+            "sha256": normalized.get("_source_sha256"),
+        },
+        "fingerprint_admission": fingerprint,
+        "decision_eligible": False,
         "pass": False,
-        "reason": "missing_strong_history_belief_same_rule_artifact",
-        "required_strong_baselines": list(PATH_C_STRONG_HISTORY_BASELINES),
     }
-    rules["strong_baseline_same_rule_audit"] = strong_audit
-    for key in PATH_C_GO_KEYS:
-        item = _find_measurement(measurements, key)
-        rules[key] = _coerce_rule_item(item, thresholds.get(key), key=key)
-    status_go = bool(
-        rules["kernel_margin"]["pass"]
-        and rules["budget"]["pass"]
-        and rules["preregistration"]["pass"]
-        and rules["hard_baselines"].get("pass", False)
-        and rules["strong_baseline_same_rule_audit"].get("pass", False)
-        and rules["G1"]["pass"]
-        and rules["G_value"]["pass"]
-        and rules["G2"]["pass"]
-        and rules["G3"]["pass"]
-        and rules["G4"]["pass"]
+    preregistration_status = normalized.get("_preregistration_status")
+    if preregistration_status != "frozen":
+        return {
+            **base_report,
+            "reason": "power_analysis_not_loaded_from_frozen_preregistration",
+            "preregistration_status": preregistration_status,
+        }
+    missing_settings = [
+        key for key in required_settings if normalized.get(key) is None
+    ]
+    if missing_settings:
+        return {
+            **base_report,
+            "reason": "missing_frozen_power_analysis_settings",
+            "missing_settings": missing_settings,
+        }
+    if normalized["cluster_unit"] != "identity_group":
+        return {
+            **base_report,
+            "reason": "power_analysis_cluster_unit_must_be_identity_group",
+        }
+    if (
+        normalized["positive_and_null_cluster_simulation_required"] is not True
+        or normalized["joint_operating_characteristics_required"] is not True
+        or normalized["equivalence_test"] != "two_one_sided_tests"
+        or normalized["secondary_multiplicity"] != "hierarchical_gatekeeping"
+        or normalized["selection_role"] != "design"
+    ):
+        return {
+            **base_report,
+            "reason": "frozen_power_analysis_contract_mismatch",
+        }
+
+    positive_signal = (res.get("path_c_rv_readout") or {}).get("signal") or {}
+    null_signal = (
+        (res.get("path_c_terminal_axis_null_readout") or {}).get("signal") or {}
     )
-    strong_baseline_passes = (
-        measurements.get("strong_baseline_passes")
-        or strong_audit.get("strong_baseline_passes")
-        or []
+    positive_effects = positive_signal.get("power_cluster_effects")
+    null_effects = null_signal.get("power_cluster_effects")
+    missing_effects = []
+    if positive_effects is None:
+        missing_effects.append("positive_identity_group_effects")
+    if null_effects is None:
+        missing_effects.append("null_identity_group_effects")
+    if missing_effects:
+        return {
+            **base_report,
+            "reason": "missing_cluster_effects",
+            "missing_effects": missing_effects,
+        }
+
+    try:
+        simulation = simulate_cluster_operating_characteristics(
+            positive_effects,
+            null_effects,
+            clusters_per_trial=normalized["clusters_per_trial"],
+            simulation_repetitions=normalized["simulation_repetitions"],
+            bootstrap_iterations=normalized["bootstrap_iterations"],
+            alpha=normalized["primary_alpha"],
+            efficacy_margin=normalized["synthetic_power_min_advantage"],
+            equivalence_margin=normalized["equivalence_margin"],
+            seed=normalized["seed"],
+        )
+        targets = {key: float(normalized[key]) for key in target_keys}
+        if any(not 0.0 < value <= 1.0 for value in targets.values()):
+            raise ValueError("Power targets must lie in (0, 1].")
+        if targets["minimum_joint_power"] > min(
+            targets["minimum_positive_power"],
+            targets["minimum_null_equivalence_power"],
+        ):
+            raise ValueError(
+                "Minimum joint power cannot exceed either component target."
+            )
+    except (TypeError, ValueError) as exc:
+        return {
+            **base_report,
+            "reason": "invalid_power_analysis_input",
+            "detail": str(exc),
+        }
+
+    positive_met = bool(
+        simulation["positive"]["power"] >= targets["minimum_positive_power"]
     )
-    status = "GO" if status_go else "NO-GO"
-    if status == "GO" and strong_baseline_passes:
-        status = "DEMOTED"
+    null_met = bool(
+        simulation["null"]["power"]
+        >= targets["minimum_null_equivalence_power"]
+    )
+    joint_met = bool(
+        simulation["joint"]["power"] >= targets["minimum_joint_power"]
+    )
+    all_targets_met = bool(positive_met and null_met and joint_met)
+    tost = {"available": True, **simulation["null"]["two_one_sided_tests"]}
+    sources = {
+        "positive_reference_baseline": positive_signal.get(
+            "power_reference_baseline"
+        ),
+        "null_reference_baseline": null_signal.get("power_reference_baseline"),
+        "positive_cluster_ids": positive_signal.get("power_cluster_ids"),
+        "null_cluster_ids": null_signal.get("power_cluster_ids"),
+    }
     return {
-        "status": status,
-        "strong_baseline_passes": list(strong_baseline_passes),
-        "rules": rules,
-        "logic": "GO iff frozen preregistration, artifact budget, epsilon margin, required hard baselines, G1, G-value, G2, G3 and G4 all pass; strong history/belief baseline pass demotes GO",
-        "fallback_rule": thresholds.get("fallback_rule"),
+        **base_report,
+        "available": True,
+        "effect": {
+            "positive": simulation["positive"]["effect"],
+            "null": simulation["null"]["effect"],
+        },
+        "confidence_intervals": {
+            "positive": simulation["positive"]["confidence_interval"],
+            "null": simulation["null"]["confidence_interval"],
+        },
+        "tost": tost,
+        "positive": simulation["positive"],
+        "null": simulation["null"],
+        "joint": simulation["joint"],
+        "power_targets": targets,
+        "power_targets_met": {
+            "positive": positive_met,
+            "null_equivalence": null_met,
+            "joint": joint_met,
+            "all": all_targets_met,
+        },
+        "power_effect": simulation["positive"]["effect"],
+        "power_confidence_interval": simulation["positive"][
+            "confidence_interval"
+        ],
+        "null_effect": simulation["null"]["effect"],
+        "null_confidence_interval": simulation["null"]["confidence_interval"],
+        "two_one_sided_equivalence_test": tost,
+        "joint_cluster_power_simulation": simulation,
+        "source": sources,
+        "pass": all_targets_met,
     }
-
-
-def path_c_go_no_go_rule(
+def path_c_decision_rule(
     measurements: dict[str, Any],
     preregistration: FrozenPathCPreregistration,
 ) -> dict[str, Any]:
-    """Compatibility name for the strict, threshold-recomputing pure rule."""
+    """Apply the strict version-3 staged decision."""
     if not isinstance(preregistration, FrozenPathCPreregistration):
         raise TypeError(
             "Path C judgment requires FrozenPathCPreregistration, not a threshold mapping."
@@ -2251,14 +2784,49 @@ def path_c_go_no_go_rule(
     return phase_b_go_no_go_rule(measurements, preregistration)
 
 
+def _legacy_cross_identity_transfer_summary(
+    transfer: Mapping[str, Any],
+    conditional_factorization: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Report old readouts without manufacturing a joint decision gate."""
+
+    measurement = transfer.get("measurement") or {}
+    return {
+        "name": "cross-identity R^V transfer and conditional factorization",
+        "value": measurement.get("value"),
+        "threshold": measurement.get("threshold", 0.0),
+        "reported_transfer_threshold_check": bool(measurement.get("pass", False)),
+        "conditional_factorization_available": bool(
+            conditional_factorization.get("available", False)
+        ),
+        "joint_boolean_gate": None,
+        "role": "legacy_secondary_readout_only",
+        "decision_eligible": False,
+    }
+
+
 # -------------------------------------------------------------------- stages
 
 def stage_gate(data, out_dir: Path, path_c_thresholds: str | None = None) -> None:
     path_c_threshold_values = _load_path_c_thresholds(path_c_thresholds)
+    value_class_references: list[dict[str, Any]] = []
+    preregistration_source = path_c_threshold_values.get("_source_path")
+    if preregistration_source not in {None, ""}:
+        preregistration = load_frozen_preregistration(preregistration_source)
+        value_class_references = write_ecological_value_class_artifacts(
+            build_ecological_value_class_artifacts(data, preregistration),
+            out_dir,
+        )
     rep: dict = {"floors": {"gated_rows": FLOOR_GATED, "min_class": FLOOR_MINCLASS,
                             "hard_floor_splits": list(HARD_FLOOR_SPLITS)},
                  "splits": {}, "per_partner": {},
-                 "path_c_thresholds": path_c_threshold_values}
+                 "path_c_thresholds": path_c_threshold_values,
+                 "path_c_ecological_value_class_artifacts": value_class_references,
+                 "path_c_ecological_value_class_preregistration": (
+                     str(preregistration_source)
+                     if preregistration_source not in {None, ""}
+                     else None
+                 )}
     lab = data[f"label_k{JUDGED_K}"]
     gm = data["gate_main"].astype(bool) & ok_rows(data, JUDGED_K)
     named = {
@@ -2479,6 +3047,25 @@ def _load_path_c_thresholds(path: str | None) -> dict[str, Any]:
     thresholds["required_baseline_variants"] = preregistration.required_baselines
     thresholds["effective_episode_floor"] = payload["budget"]["effective_episode_floor"]
     thresholds["effective_transition_floor"] = payload["budget"]["effective_transition_floor"]
+    power_analysis = payload["power_analysis"]
+    for key in (
+        "positive_and_null_cluster_simulation_required",
+        "joint_operating_characteristics_required",
+        "equivalence_test",
+        "secondary_multiplicity",
+        "selection_role",
+        "primary_alpha",
+        "cluster_unit",
+        "clusters_per_trial",
+        "simulation_repetitions",
+        "bootstrap_iterations",
+        "seed",
+        "equivalence_margin",
+        "minimum_positive_power",
+        "minimum_null_equivalence_power",
+        "minimum_joint_power",
+    ):
+        thresholds[key] = power_analysis[key]
     thresholds["_source_path"] = str(preregistration.path)
     thresholds["_source_sha256"] = preregistration.sha256
     thresholds["_preregistration_status"] = "frozen"
@@ -2502,14 +3089,18 @@ def _stage_path_c_readout(
         artifact_manifest_path,
     )
     measurements = assemble_path_c_measurements(inputs)
-    phase_b = phase_b_go_no_go_rule(measurements, inputs.preregistration)
-    pass_af = pass_af_claim_rule(measurements, inputs.preregistration)
+    decision = evaluate_path_c_decision(measurements, inputs.preregistration)
     result = {
-        "schema_version": "path_c_readout_v1",
+        "schema_version": "path_c_readout_v3",
         "decision_scope": {
-            "phase_b": "execution_continuation_gate",
-            "pass_af": "claim_readiness_gate",
-            "proposal_passed": False,
+            "order": [
+                "software_conformance",
+                "instrument_validity",
+                "design_and_calibration_freeze",
+                "locked_primary_efficacy",
+                "secondary_mechanisms",
+            ],
+            "type_b_review_required": True,
         },
         "preregistration": {
             "path": str(inputs.preregistration.path),
@@ -2523,15 +3114,14 @@ def _stage_path_c_readout(
             "resolved_path_c_sha256": inputs.manifest.resolved_path_c_sha256,
         },
         "validated_evidence_contract": measurements["artifact_contract"],
-        "phase_b_go_no_go": phase_b,
-        "pass_af_claim_readiness": pass_af,
+        "path_c_decision": asdict(decision),
         "artifact_read_back_only": True,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps({
-        "phase_b_status": phase_b["status"],
-        "pass_af_status": pass_af["status"],
+        "path_c_status": decision.status,
+        "allowed_claim": decision.allowed_claim,
     }, indent=2), flush=True)
 
 
@@ -2546,7 +3136,7 @@ def stage_readout(
     if path_c_mode:
         if not path_c_thresholds or not path_c_artifact_manifest:
             raise ValueError(
-                "Path C readout requires both --path-c-thresholds and "
+                "Path C readout requires both --path-c-preregistration and "
                 "--path-c-artifact-manifest."
             )
         _stage_path_c_readout(
@@ -2567,6 +3157,22 @@ def stage_readout(
         raise RuntimeError(
             "sufficiency gate FAILED — no readout permitted on insufficient samples "
             f"(prereg §5); gate says: { {s: gate['splits'][s] for s in HARD_FLOOR_SPLITS} }")
+    value_class_references = gate.get(
+        "path_c_ecological_value_class_artifacts", []
+    )
+    if value_class_references:
+        preregistration_source = gate.get(
+            "path_c_ecological_value_class_preregistration"
+        )
+        if preregistration_source in {None, ""}:
+            raise RuntimeError(
+                "Ecological value-class artifacts lack their frozen preregistration."
+            )
+        attach_validated_ecological_value_classes(
+            data,
+            value_class_references,
+            load_frozen_preregistration(preregistration_source),
+        )
 
     models, norm, partner_to_idx, shas = _load_models(out_dir, device, JUDGED_K)
     ok5 = ok_rows(data, JUDGED_K)
@@ -2589,6 +3195,7 @@ def stage_readout(
         ),
         "path_c_thresholds": path_c_threshold_values,
         "path_c_thresholds_path": str(path_c_threshold_source) if path_c_threshold_source else None,
+        "path_c_ecological_value_class_artifacts": value_class_references,
         "splits": {},
     }
 
@@ -2637,7 +3244,9 @@ def stage_readout(
     for k in K_SET:
         if k == JUDGED_K:
             res["k_sensitivity"][f"k{k}"] = {
-                "G_indist": iv["gain"], "G_blind_terminal": bt["gain"]}
+                "indistinguishable_value_gain": iv["gain"],
+                "blind_terminal_gain": bt["gain"],
+            }
             continue
         mk, nk, pk, _ = _load_models(out_dir, device, k)
         okk = ok_rows(data, k)
@@ -2648,15 +3257,21 @@ def stage_readout(
             data, gmk & (data["split"] == "blind") & (data["family"] != "offaxis"),
             mk, nk, pk, device, k)
         res["k_sensitivity"][f"k{k}"] = {
-            "G_indist": (auc_binary(pr_i["full"][:, 2], lab_i == 2)
+            "indistinguishable_value_gain": (auc_binary(pr_i["full"][:, 2], lab_i == 2)
                          - auc_binary(pr_i["nohist"][:, 2], lab_i == 2))
             if lab_i.size else float("nan"),
-            "G_blind_terminal": (auc_binary(pr_b["full"][:, 2], lab_b == 2)
+            "blind_terminal_gain": (auc_binary(pr_b["full"][:, 2], lab_b == 2)
                                  - auc_binary(pr_b["nohist"][:, 2], lab_b == 2))
             if lab_b.size else float("nan"),
         }
-    signs_i = {np.sign(v["G_indist"]) for v in res["k_sensitivity"].values()}
-    signs_b = {np.sign(v["G_blind_terminal"]) for v in res["k_sensitivity"].values()}
+    signs_i = {
+        np.sign(v["indistinguishable_value_gain"])
+        for v in res["k_sensitivity"].values()
+    }
+    signs_b = {
+        np.sign(v["blind_terminal_gain"])
+        for v in res["k_sensitivity"].values()
+    }
     res["k_sensitivity"]["direction_consistent"] = bool(
         len(signs_i) == 1 and len(signs_b) == 1)
 
@@ -2703,12 +3318,15 @@ def stage_readout(
         partner_to_idx,
         device,
         split_name="episode_crossfit",
-        threshold=float(_path_c_threshold(path_c_threshold_values, "G1", 0.0)),
+        threshold=float(_path_c_threshold(
+            path_c_threshold_values, "response_advantage", 0.0
+        )),
         required_baselines=required_baselines,
     )
     res["path_c_rv_readout"] = rv_readout
-    res["G1"] = rv_readout.get("measurement", {"pass": False})
-    res["C_resp^V"] = res["G1"]
+    res["response_readout_secondary"] = rv_readout.get(
+        "measurement", {"pass": False}
+    )
     transfer_mask = path_c_mask
     if "mode_fingerprint_id" in data:
         transfer_mask = transfer_mask & (data["mode_fingerprint_id"].astype(int) >= 0)
@@ -2721,7 +3339,9 @@ def stage_readout(
         device,
         split_name="cross_identity",
         fold_keys=data["identity_key"] if "identity_key" in data else data["partner"],
-        threshold=float(_path_c_threshold(path_c_threshold_values, "G2", 0.0)),
+        threshold=float(_path_c_threshold(
+            path_c_threshold_values, "transfer_advantage", 0.0
+        )),
         required_baselines=required_baselines,
     )
     res["path_c_transfer_readout"] = transfer
@@ -2751,17 +3371,10 @@ def stage_readout(
         device,
         path_c_threshold_values,
     )
-    res["C_fact"] = c_fact
-    g2_transfer = transfer.get("measurement", {"pass": False})
-    res["C_transfer"] = g2_transfer
-    res["G2"] = {
-        "name": "cross-identity R^V transfer plus conditional factorization",
-        "value": g2_transfer.get("value"),
-        "threshold": g2_transfer.get("threshold", 0.0),
-        "transfer_pass": bool(g2_transfer.get("pass", False)),
-        "conditional_factorization_pass": bool(c_fact.get("pass", False)),
-        "pass": bool(g2_transfer.get("pass", False) and c_fact.get("pass", False)),
-    }
+    res["conditional_factorization_secondary"] = c_fact
+    res["cross_identity_transfer_secondary"] = (
+        _legacy_cross_identity_transfer_summary(transfer, c_fact)
+    )
     leakage = _path_c_leakage_battery(
         data,
         transfer_mask,
@@ -2772,7 +3385,7 @@ def stage_readout(
         path_c_threshold_values,
     )
     res["path_c_leakage_battery"] = leakage
-    res["G3"] = {
+    res["conditioned_leakage_secondary"] = {
         "name": "conditioned nuisance leakage exclusion",
         "value": (
             (leakage.get("calibrated_multiclass_logloss") or {}).get(
@@ -2788,28 +3401,43 @@ def stage_readout(
         "direction": "upper",
         "pass": bool(leakage.get("pass", False)),
     }
-    res["G_value"] = _path_c_g_value_measurement(
+    res["value_control_secondary"] = _path_c_value_control_measurement(
         data,
         path_c_mask,
-        threshold=float(_path_c_threshold(path_c_threshold_values, "G_value", 0.0)),
+        threshold=float(_path_c_threshold(
+            path_c_threshold_values, "value_advantage", 0.0
+        )),
         required_baselines=required_baselines,
     )
-    res["C_value"] = res["G_value"]
-    res["G4"] = _path_c_power_null_measurement(res, path_c_threshold_values)
-    res["C_leak"] = res["G3"]
-    res["C_null"] = res["G4"]
+    res["power_and_null_secondary"] = _path_c_power_null_measurement(
+        res, path_c_threshold_values
+    )
+    res["path_c_joint_power_simulation"] = res["power_and_null_secondary"].get(
+        "joint_cluster_power_simulation"
+    )
 
     g_ind, g_bld = iv["gain"], bt["gain"]
-    res["criteria"] = {
-        "G_indist": g_ind,
-        "G_blind_terminal": g_bld,
-        "R1_pass": bool(g_ind >= R1_GAIN_FLOOR and iv["dlogloss_ci"]["lo"] > 0),
-        "R2_pass": bool(g_bld >= R2_RETENTION * g_ind and bt["gain_ci"]["lo"] > 0),
+    res["legacy_response_diagnostics_secondary"] = {
+        "indistinguishable_value_gain": g_ind,
+        "blind_terminal_gain": g_bld,
+        "indistinguishable_value_gain_check": bool(
+            g_ind >= RESPONSE_GAIN_FLOOR and iv["dlogloss_ci"]["lo"] > 0
+        ),
+        "blind_terminal_retention_check": bool(
+            g_bld >= BLIND_RESPONSE_RETENTION * g_ind and bt["gain_ci"]["lo"] > 0
+        ),
         "k_direction_consistent": res["k_sensitivity"]["direction_consistent"],
-        "thresholds": {"R1_gain_floor": R1_GAIN_FLOOR, "R2_retention": R2_RETENTION},
+        "thresholds": {
+            "response_gain_floor": RESPONSE_GAIN_FLOOR,
+            "blind_response_retention": BLIND_RESPONSE_RETENTION,
+        },
+        "decision_eligible": False,
     }
     out_path.write_text(json.dumps(res, indent=1))
-    print(json.dumps(res["criteria"], indent=1), flush=True)
+    print(
+        json.dumps(res["legacy_response_diagnostics_secondary"], indent=1),
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -2820,8 +3448,6 @@ def main() -> None:
     ap.add_argument("--device", default="cpu")
     ap.add_argument(
         "--path-c-preregistration",
-        "--path-c-thresholds",
-        dest="path_c_thresholds",
         default=None,
         help="Frozen Path C preregistration; thresholds are never accepted separately.",
     )
@@ -2830,14 +3456,14 @@ def main() -> None:
     out_dir = Path(args.out)
     strict_path_c_readout = bool(
         args.stage == "readout"
-        and (args.path_c_thresholds or args.path_c_artifact_manifest)
+        and (args.path_c_preregistration or args.path_c_artifact_manifest)
     )
     if strict_path_c_readout:
         stage_readout(
             None,
             out_dir,
             args.device,
-            args.path_c_thresholds,
+            args.path_c_preregistration,
             args.path_c_artifact_manifest,
         )
         return
@@ -2845,7 +3471,7 @@ def main() -> None:
         raise ValueError("--chunks is required for legacy gate, tune, and readout stages.")
     data = load_chunks(args.chunks)
     if args.stage == "gate":
-        stage_gate(data, out_dir, args.path_c_thresholds)
+        stage_gate(data, out_dir, args.path_c_preregistration)
     elif args.stage == "tune":
         stage_tune(data, out_dir, args.device)
     else:
@@ -2853,7 +3479,7 @@ def main() -> None:
             data,
             out_dir,
             args.device,
-            args.path_c_thresholds,
+            args.path_c_preregistration,
             args.path_c_artifact_manifest,
         )
 

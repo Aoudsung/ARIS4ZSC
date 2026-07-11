@@ -31,6 +31,10 @@ class EvidenceBuffer:
         self._belief_hidden: np.ndarray | None = None
         self._belief_window_bases: np.ndarray | None = None
         self._last_write_idx: int | None = None
+        # Optional full-episode Path C sequence.  The generic replay module keeps
+        # this value opaque so the core ARIS package does not depend on an
+        # experiment-specific evidence schema.
+        self._sequence_episode: Any | None = None
 
     def append(self, x_f: np.ndarray) -> None:
         evidence = np.asarray(x_f, dtype=self.dtype)
@@ -149,6 +153,13 @@ class EvidenceBuffer:
         self._belief_hidden = None
         self._belief_window_bases = None
         self._last_write_idx = None
+        self._sequence_episode = None
+
+    def set_sequence_episode(self, episode: Any | None) -> None:
+        self._sequence_episode = episode
+
+    def sequence_episode(self) -> Any | None:
+        return self._sequence_episode
 
     @property
     def count(self) -> int:
@@ -191,6 +202,54 @@ class OptionReplayBuffer:
 
     def __len__(self) -> int:
         return len(self._storage)
+
+
+class EpisodeSequenceReplayBuffer:
+    """Replay complete ordered episodes while bounding stored transitions.
+
+    Sampling returns episode records, never independently sampled transitions.
+    This keeps recurrent hidden-state reconstruction and the episode-level
+    bootstrap assignment intact.
+    """
+
+    def __init__(self, capacity: int, seed: int | None = None):
+        if capacity <= 0:
+            raise ValueError("capacity must be positive.")
+        self.capacity = int(capacity)
+        self._storage: list[Any] = []
+        self._transition_count = 0
+        self._rng = np.random.default_rng(seed)
+
+    def add(self, episode: Any) -> None:
+        length = int(getattr(episode, "transition_length", 0))
+        if length <= 0:
+            raise ValueError("Sequence replay accepts only non-empty episode records.")
+        if length > self.capacity:
+            raise ValueError(
+                "One episode exceeds the sequence replay transition capacity; "
+                "refusing to truncate the recurrent trace."
+            )
+        self._storage.append(episode)
+        self._transition_count += length
+        while self._transition_count > self.capacity:
+            removed = self._storage.pop(0)
+            self._transition_count -= int(removed.transition_length)
+
+    def sample(self, batch_size: int) -> list[Any]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if not self._storage:
+            raise ValueError("Cannot sample from an empty EpisodeSequenceReplayBuffer.")
+        replace = batch_size > len(self._storage)
+        indices = self._rng.choice(len(self._storage), size=batch_size, replace=replace)
+        return [self._storage[int(index)] for index in indices]
+
+    @property
+    def episode_count(self) -> int:
+        return len(self._storage)
+
+    def __len__(self) -> int:
+        return int(self._transition_count)
 
 
 def _stack_transitions(rows: list[OptionTransition]) -> dict[str, Any]:
