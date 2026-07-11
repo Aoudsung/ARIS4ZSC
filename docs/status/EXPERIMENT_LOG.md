@@ -38,6 +38,7 @@ and the active project line is now Path C.
 - 提交绑定的 CPU 诊断：290 项通过、0 项跳过；只用于确认工具链故障不是代码断言失败，不能替代 CUDA 验收。
 - CUDA 工具链事故：首次直接调用系统 CUDA 11.8 `ptxas`，因不支持 JAX 生成的 PTX 8.3 在收集阶段失败；切换到虚拟环境 CUDA 12.9 后，GPU 3 又报告不可纠正 ECC 错误，因此该卡被排除。
 - 提交绑定的正式 CUDA 验收：GPU 5 的不可纠正 ECC 计数为 0；JAX 0.4.38 / jaxlib 0.4.38 在 GPU backend 完成实际编译计算，随后完整套件 290 项通过、0 项跳过、0 项失败，耗时 423.81 秒。日志为 `.codex_remote_validation/path_c_r002_bound_fc647fb_cuda_gpu5_20260711.log`，SHA-256 为 `6b30b0cd623ebe650f3ea084de2dafb8cea64aef7bb8413587ab70c6b17fbc85`；JUnit 逐测试报告为 `.codex_remote_validation/path_c_r002_bound_fc647fb_cuda_gpu5_20260711.xml`，SHA-256 为 `d40b43bc7084c8ce916bbc537fd7a6919da28b8b3a760ef552b197b3199f97ab`。
+- 正式软件测试报告：从上述 JUnit 和最终模块注册表生成 101 条注册测试记录；文件为 `.codex_remote_validation/path_c_software_test_report_fc647fb_20260711.json`，SHA-256 为 `61f669b0c980f454a138eadd22ed3a846621bb94e86e8bec568023b546af8bf4`，绑定模块注册表 SHA-256 `2c22792a0a16318f63ee2efa6dc9adcd542c9a78377c65f650e8d17577e4adb7`。
 - 状态：具备完整注册测试覆盖的 21 个模块提升为 `tested`；C2、C5、D1 仍为 `planned`。预注册未冻结，E0、训练、design 选择、locked audit 与任何科学读数均未运行。
 
 ### 2026-07-09 CUDA/JAX 远程环境体检 — PASS（Type-A，非科学结果）

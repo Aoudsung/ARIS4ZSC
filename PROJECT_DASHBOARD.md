@@ -53,6 +53,10 @@ passes 290 tests with no skips; the log SHA-256 is
 `6b30b0cd623ebe650f3ea084de2dafb8cea64aef7bb8413587ab70c6b17fbc85` and the
 JUnit report SHA-256 is
 `d40b43bc7084c8ce916bbc537fd7a6919da28b8b3a760ef552b197b3199f97ab`.
+The formal 101-row module-registry software report SHA-256 is
+`61f669b0c980f454a138eadd22ed3a846621bb94e86e8bec568023b546af8bf4` and it
+binds module-registry SHA-256
+`2c22792a0a16318f63ee2efa6dc9adcd542c9a78377c65f650e8d17577e4adb7`.
 The preregistration remains an inadmissible template with unfilled numeric and
 semantic-hash slots. No Path C training, data generation, instrument result, primary
 result, or scientific readout is recorded.
