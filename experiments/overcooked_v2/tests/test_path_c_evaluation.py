@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
+import numpy as np
 import pytest
+import torch
 import yaml
 
 from experiments.overcooked_v2.path_c_audit_battery import (
@@ -33,12 +34,20 @@ from experiments.overcooked_v2.path_c_evaluation import (
     PATH_C_DECISION_SCHEMA,
     PATH_C_MEASUREMENT_SCHEMA,
     canonical_sha256,
+    assign_group_disjoint_folds,
+    build_path_c_readout_features,
     build_secondary_profile_v1,
     assemble_path_c_measurements,
+    empirical_kernel_distance_audit,
     evaluate_path_c_decision,
+    fingerprint_admission_measurement,
+    load_and_validate_path_c_inputs,
     load_frozen_preregistration,
     pass_af_claim_rule,
     phase_b_go_no_go_rule,
+    probe_support_measurement,
+    require_formal_benchmark_artifact,
+    validate_cross_identity_folds,
     validate_runtime_path_c_config,
     _EXPECTED_VARIANT_INPUT_CONTRACTS,
     _runtime_contract,
@@ -62,6 +71,7 @@ from experiments.overcooked_v2.path_c_return_artifacts import (
     ReturnPointLedgerV1,
 )
 from experiments.overcooked_v2.path_c_response_summary import ResponseSummarySpecV1
+from experiments.overcooked_v2.path_c_seed import derive_ocv2_execution_seed
 from experiments.overcooked_v2.path_c_sequence import EgoEvidenceSpecV1
 from experiments.overcooked_v2.path_c_split import SplitGroupV1, SplitManifestV1
 
@@ -103,21 +113,26 @@ def _write_parquet_reference(
     path: Path,
     columns: dict[str, list],
 ) -> dict[str, str]:
-    pa = pytest.importorskip("pyarrow")
-    pq = pytest.importorskip("pyarrow.parquet")
-    arrow_columns = {
-        name: (
-            pa.array(values, type=pa.uint64())
-            if name == "seed"
-            else values
+    pytest.importorskip("pyarrow")
+    from experiments.overcooked_v2.scripts.diag_d1_dataset import (
+        _write_content_addressed_parquet_shard,
+    )
+
+    arrays = {
+        name: np.asarray(
+            values,
+            dtype=(
+                np.uint64
+                if name in {"seed", "episode_seed"}
+                else np.uint32 if name == "execution_seed" else None
+            ),
         )
         for name, values in columns.items()
     }
-    pq.write_table(pa.table(arrow_columns), path, compression="zstd")
-    payload = path.read_bytes()
+    content_path, digest = _write_content_addressed_parquet_shard(path, arrays)
     return {
-        "path": path.name,
-        "sha256": hashlib.sha256(payload).hexdigest(),
+        "path": content_path.name,
+        "sha256": digest,
     }
 
 
@@ -302,7 +317,7 @@ def _return_ledgers_and_selection(
         for probe_budget in budgets:
             episode_uid = (
                 f"{split_role}:{policy_name}:{split_group.identity_group}:"
-                f"{split_group.seed_group}:budget-{probe_budget}"
+                f"{split_group.seed_group}:seed-{seed}:budget-{probe_budget}"
             )
             budget_state = ProbeBudgetState(
                 budget=probe_budget,
@@ -388,13 +403,14 @@ def _return_ledgers_and_selection(
     )
     for candidate_index, policy_name in enumerate(design_policies):
         for identity_index, split_group in enumerate(design_groups):
-            add_curve(
-                split_role="design",
-                policy_name=policy_name,
-                split_group=split_group,
-                seed=split_manifest.numeric_seeds_for_group(split_group.group_id)[0],
-                normalized_net_return=0.8 - 0.05 * candidate_index,
-            )
+            for seed in split_manifest.numeric_seeds_for_group(split_group.group_id):
+                add_curve(
+                    split_role="design",
+                    policy_name=policy_name,
+                    split_group=split_group,
+                    seed=seed,
+                    normalized_net_return=0.8 - 0.05 * candidate_index,
+                )
 
     selected_baseline = candidates[0]
     locked_baselines = tuple(map(
@@ -402,24 +418,25 @@ def _return_ledgers_and_selection(
         payload["baselines"]["deployable_required"],
     ))
     for identity_index, split_group in enumerate(locked_groups):
-        common = {
-            "split_role": "locked_audit",
-            "split_group": split_group,
-            "seed": split_manifest.numeric_seeds_for_group(split_group.group_id)[0],
-        }
-        for baseline_name in locked_baselines:
+        for seed in split_manifest.numeric_seeds_for_group(split_group.group_id):
+            common = {
+                "split_role": "locked_audit",
+                "split_group": split_group,
+                "seed": seed,
+            }
+            for baseline_name in locked_baselines:
+                add_curve(
+                    **common,
+                    policy_name=baseline_name,
+                    normalized_net_return=(
+                        0.4 if baseline_name == selected_baseline else 0.3
+                    ),
+                )
             add_curve(
                 **common,
-                policy_name=baseline_name,
-                normalized_net_return=(
-                    0.4 if baseline_name == selected_baseline else 0.3
-                ),
+                policy_name="probing_ego",
+                normalized_net_return=0.4 + locked_effect,
             )
-        add_curve(
-            **common,
-            policy_name="probing_ego",
-            normalized_net_return=0.4 + locked_effect,
-        )
 
     design_ledger = ReturnPointLedgerV1(
         points=tuple(records["design"]),
@@ -914,6 +931,7 @@ def _valid_measurements(
             "schema_version": "path_c_artifacts_v3",
             "valid": True,
             "semantic_bindings_valid": True,
+            "active_stage": "secondary_mechanisms",
         },
         "audit_cost_estimate": audit_cost_estimate,
         "policy_metrics": {
@@ -949,15 +967,32 @@ def _valid_dataset_shards(tmp_path: Path, preregistration) -> dict:
     for role in ("train", "design", "calibration", "locked_audit"):
         claim_scale = role in {"train", "locked_audit"}
         groups = preregistration.split_manifest.groups_for_role(role)
-        episodes = 2000 if claim_scale else len(groups)
-        transitions = 40000 if claim_scale else len(groups)
-        episode_indexes = [index % episodes for index in range(transitions)]
-        row_groups = [groups[index % len(groups)] for index in episode_indexes]
-        seed_by_group_id = {
-            group.group_id: preregistration.split_manifest.numeric_seeds_for_group(
-                group.group_id
-            )[0]
+        group_seed_cells = [
+            (group, int(seed))
             for group in groups
+            for seed in preregistration.split_manifest.numeric_seeds_for_group(
+                group.group_id
+            )
+        ]
+        episodes = 2000 if claim_scale else len(group_seed_cells)
+        transitions = 40000 if claim_scale else len(group_seed_cells)
+        episode_indexes = [index % episodes for index in range(transitions)]
+        row_cells = [
+            group_seed_cells[index % len(group_seed_cells)]
+            for index in episode_indexes
+        ]
+        row_groups = [cell[0] for cell in row_cells]
+        episode_seed_by_index = {
+            episode_index: int(
+                hashlib.sha256(
+                    (
+                        f"{group_seed_cells[episode_index % len(group_seed_cells)][1]}:"
+                        f"{episode_index}"
+                    ).encode("ascii")
+                ).hexdigest()[:16],
+                16,
+            )
+            for episode_index in set(episode_indexes)
         }
         chunk_ref = _write_parquet_reference(
             tmp_path / f"{role}.parquet",
@@ -975,8 +1010,14 @@ def _valid_dataset_shards(tmp_path: Path, preregistration) -> dict:
                 ],
                 "seed_group": [group.seed_group for group in row_groups],
                 "seed": [
-                    seed_by_group_id[group.group_id]
-                    for group in row_groups
+                    cell[1] for cell in row_cells
+                ],
+                "episode_seed": [
+                    episode_seed_by_index[index] for index in episode_indexes
+                ],
+                "execution_seed": [
+                    derive_ocv2_execution_seed(episode_seed_by_index[index])
+                    for index in episode_indexes
                 ],
                 "layout_style": [group.layout_group for group in row_groups],
                 "probe_selected": [0] * transitions,
@@ -1083,6 +1124,119 @@ def _valid_policy_artifacts(tmp_path: Path, preregistration) -> dict:
             ),
         }
     return policies
+
+
+def _write_bound_measurement_reference(
+    tmp_path: Path,
+    name: str,
+    measurement: dict,
+    preregistration,
+) -> dict[str, str]:
+    payload = copy.deepcopy(measurement)
+    payload.update(
+        {
+            "measurement_schema_version": PATH_C_MEASUREMENT_SCHEMA,
+            "preregistration_sha256": preregistration.sha256,
+            "resolved_path_c_sha256": preregistration.runtime_contract_sha256,
+            "semantic_bindings": copy.deepcopy(
+                preregistration.semantic_bindings
+            ),
+        }
+    )
+    path = tmp_path / f"measurement-{name}.json"
+    return _write_file_reference(
+        path,
+        json.dumps(payload, sort_keys=True).encode("utf-8"),
+    )
+
+
+def _write_stage_manifest_fixture(tmp_path: Path):
+    prereg_path, preregistration = _write_frozen_preregistration(tmp_path)
+    measurements = _valid_measurements(preregistration)
+    datasets = _valid_dataset_shards(tmp_path, preregistration)
+    policies = _valid_policy_artifacts(tmp_path, preregistration)
+    measurement_refs = {
+        name: _write_bound_measurement_reference(
+            tmp_path,
+            name,
+            measurement,
+            preregistration,
+        )
+        for name, measurement in measurements.items()
+        if name != "artifact_contract"
+    }
+
+    stage_names = {
+        "instrument_validity": {
+            "software_conformance",
+            "software_test_report",
+            "policy_metrics",
+            "audit_cost_estimate",
+            "instrument_evidence",
+            "instrument_measurement",
+        },
+        "design_and_calibration_freeze": {
+            "software_conformance",
+            "software_test_report",
+            "policy_metrics",
+            "audit_cost_estimate",
+            "instrument_evidence",
+            "instrument_measurement",
+            "design_return_point_ledger",
+            "baseline_selection",
+        },
+        "locked_primary_efficacy": {
+            "software_conformance",
+            "software_test_report",
+            "policy_metrics",
+            "audit_cost_estimate",
+            "instrument_evidence",
+            "instrument_measurement",
+            "design_return_point_ledger",
+            "baseline_selection",
+            "primary_endpoint",
+        },
+    }
+    role_by_stage = {
+        "instrument_validity": "calibration",
+        "design_and_calibration_freeze": "design",
+        "locked_primary_efficacy": "locked_audit",
+    }
+    paths = {}
+    for stage, names in stage_names.items():
+        refs = {name: copy.deepcopy(measurement_refs[name]) for name in names}
+        if stage == "locked_primary_efficacy":
+            primary_not_run = {
+                "schema_version": "path_c_primary_endpoint_v1",
+                "available": False,
+            }
+            refs["primary_endpoint"] = _write_bound_measurement_reference(
+                tmp_path,
+                "primary-endpoint-not-run",
+                primary_not_run,
+                preregistration,
+            )
+        role = role_by_stage[stage]
+        payload = {
+            "schema_version": "path_c_artifacts_v3",
+            "active_stage": stage,
+            "preregistration": {
+                "sha256": preregistration.sha256,
+                "version": preregistration.payload["version"],
+                "schema_version": preregistration.payload["schema_version"],
+            },
+            "resolved_path_c_sha256": preregistration.runtime_contract_sha256,
+            "semantic_bindings": copy.deepcopy(
+                preregistration.semantic_bindings
+            ),
+            "dataset_shards": {role: copy.deepcopy(datasets[role])},
+            "policy_artifacts": copy.deepcopy(policies),
+            "measurement_artifacts": refs,
+        }
+        path = tmp_path / f"manifest-{stage}.json"
+        path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        paths[stage] = path
+    return prereg_path, preregistration, paths
 
 
 def test_frozen_v3_preregistration_binds_all_semantic_hashes(tmp_path):
@@ -1493,7 +1647,8 @@ def test_non_audit_dataset_roles_require_an_explicit_null_snapshot_manifest(tmp_
     with pytest.raises(ValueError, match="must be null outside locked_audit"):
         _validate_v3_dataset_shards(datasets, preregistration, tmp_path)
 
-    legacy_boolean = _valid_dataset_shards(tmp_path, preregistration)
+    legacy_boolean = copy.deepcopy(datasets)
+    legacy_boolean["train"]["audit_snapshot_manifest"] = None
     locked = legacy_boolean["locked_audit"]
     del locked["audit_snapshot_manifest"]
     locked["audit_snapshot_references"] = True
@@ -1550,6 +1705,8 @@ def test_dataset_row_split_metadata_must_match_frozen_group(tmp_path):
                     group.group_id
                 )[0]
             ],
+            "episode_seed": [17],
+            "execution_seed": [derive_ocv2_execution_seed(17)],
             "layout_style": [group.layout_group],
             "probe_selected": [0],
             "probe_cost_per_use": [
@@ -1592,6 +1749,8 @@ def test_dataset_probe_cost_is_recomputed_from_parquet_rows(tmp_path):
                     group.group_id
                 )[0]
             ],
+            "episode_seed": [19],
+            "execution_seed": [derive_ocv2_execution_seed(19)],
             "layout_style": [group.layout_group],
             "probe_selected": [0],
             "probe_cost_per_use": [wrong_cost],
@@ -1773,30 +1932,24 @@ def test_decision_precedence_is_software_then_instrument_then_primary(tmp_path):
     assert decision.requires_type_b_review is True
 
 
-def test_primary_not_run_manifest_assembly_does_not_require_locked_ledger(tmp_path):
-    _path, preregistration = _write_frozen_preregistration(tmp_path)
-    measurements = _valid_measurements(preregistration)
-    measurements["primary_endpoint"] = {
-        "schema_version": "path_c_primary_endpoint_v1",
-        "available": False,
+def test_real_stage_manifests_reach_the_official_decision_path(tmp_path):
+    prereg_path, _preregistration, manifest_paths = _write_stage_manifest_fixture(
+        tmp_path
+    )
+    expected_status = {
+        "instrument_validity": "INSTRUMENT_VALID",
+        "design_and_calibration_freeze": "DESIGN_FROZEN_PRIMARY_NOT_RUN",
+        "locked_primary_efficacy": "PRIMARY_NOT_RUN",
     }
-    measurements.pop("locked_return_point_ledger")
-    measurements.pop("secondary_profile")
-    manifest = SimpleNamespace(
-        active_stage="software_conformance",
-        dataset_shards={},
-        policy_artifacts={},
-        semantic_bindings=dict(preregistration.semantic_bindings),
-        resolved_path_c_sha256=preregistration.runtime_contract_sha256,
-    )
-    assembled = assemble_path_c_measurements(
-        SimpleNamespace(
-            preregistration=preregistration,
-            manifest=manifest,
-            measurements=measurements,
+    for stage, manifest_path in manifest_paths.items():
+        inputs = load_and_validate_path_c_inputs(prereg_path, manifest_path)
+        assembled = assemble_path_c_measurements(inputs)
+        decision = evaluate_path_c_decision(
+            assembled,
+            inputs.preregistration,
         )
-    )
-    assert "locked_return_point_ledger" not in assembled
+        assert decision.status == expected_status[stage]
+        assert decision.primary_effective is None
 
 
 def test_instrument_summary_is_recomputed_and_validity_uses_raw_cells(tmp_path):
@@ -2038,3 +2191,291 @@ def test_historical_go_and_pass_entry_points_cannot_restore_v2_semantics(tmp_pat
     assert compatibility["status"] != "GO"
     with pytest.raises(ValueError, match="removed in Path C version 3"):
         pass_af_claim_rule(measurements, preregistration)
+
+
+def test_production_parquet_writer_preserves_unsigned_seed_identity(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    from experiments.overcooked_v2.scripts.diag_d1_dataset import (
+        _write_content_addressed_parquet_shard,
+    )
+
+    canonical_seed = (1 << 63) + 17
+    path, _sha256 = _write_content_addressed_parquet_shard(
+        tmp_path / "seed-round-trip.parquet",
+        {
+            "seed": np.asarray([canonical_seed], dtype=np.uint64),
+            "episode_seed": np.asarray([canonical_seed + 1], dtype=np.uint64),
+        },
+    )
+    table = pq.read_table(path)
+    assert table.schema.field("seed").type == pa.uint64()
+    assert table.schema.field("episode_seed").type == pa.uint64()
+    assert table.column("seed").to_pylist() == [canonical_seed]
+    assert table.column("episode_seed").to_pylist() == [canonical_seed + 1]
+
+
+def test_training_loader_keeps_unsigned_seed_shards_exact(tmp_path):
+    from experiments.overcooked_v2.scripts.diag_d1_dataset import (
+        _write_content_addressed_parquet_shard,
+    )
+    from experiments.overcooked_v2.scripts.diag_d1_train import (
+        _load_chunk_columns,
+    )
+
+    seeds = ((1 << 63) + 5, (1 << 63) + 9)
+    loaded = []
+    for index, seed in enumerate(seeds):
+        path, _digest_value = _write_content_addressed_parquet_shard(
+            tmp_path / f"seed-shard-{index}.parquet",
+            {
+                "seed": np.asarray([seed], dtype=np.uint64),
+                "episode_seed": np.asarray([seed + 1], dtype=np.uint64),
+                "execution_seed": np.asarray(
+                    [derive_ocv2_execution_seed(seed + 1)],
+                    dtype=np.uint32,
+                ),
+            },
+        )
+        loaded.append(_load_chunk_columns(path))
+    combined = np.concatenate([item["seed"] for item in loaded])
+    assert combined.dtype == np.uint64
+    assert combined.tolist() == list(seeds)
+
+
+def test_high_seed_bits_change_the_ocv2_execution_identity():
+    from experiments.overcooked_v2.path_c_seed import (
+        derive_ocv2_execution_seed,
+    )
+
+    low_seed = 7
+    high_seed = (1 << 32) + low_seed
+    assert (low_seed & 0xFFFFFFFF) == (high_seed & 0xFFFFFFFF)
+    assert derive_ocv2_execution_seed(low_seed) != derive_ocv2_execution_seed(
+        high_seed
+    )
+
+
+def test_return_ledger_rejects_missing_registered_group_seed_cells(tmp_path):
+    _path, preregistration = _write_frozen_preregistration(tmp_path)
+    design, _locked, _selection = _return_ledgers_and_selection(
+        preregistration.payload,
+        preregistration.split_manifest,
+    )
+    target_group = preregistration.split_manifest.groups_for_role("design")[0]
+    missing_seed = preregistration.split_manifest.numeric_seeds_for_group(
+        target_group.group_id
+    )[-1]
+    incomplete = replace(
+        design,
+        points=tuple(
+            record
+            for record in design.points
+            if not (
+                record.point.split_group_id == target_group.group_id
+                and int(record.point.seed) == int(missing_seed)
+            )
+        ),
+    )
+    with pytest.raises(ValueError, match="group.*seed.*missing"):
+        incomplete.validate_split_manifest(preregistration.split_manifest)
+
+
+def test_dataset_rejects_missing_group_seed_cell_and_episode_seed_drift(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    _path, preregistration = _write_frozen_preregistration(tmp_path)
+    datasets = _valid_dataset_shards(tmp_path, preregistration)
+    design = datasets["design"]
+    source_path = tmp_path / design["chunks"][0]["path"]
+    columns = pq.read_table(source_path).to_pydict()
+
+    target_group = str(columns["split_group_id"][0])
+    target_seed = int(columns["seed"][0])
+    keep = [
+        not (
+            str(group_id) == target_group and int(seed) == target_seed
+        )
+        for group_id, seed in zip(
+            columns["split_group_id"],
+            columns["seed"],
+            strict=True,
+        )
+    ]
+    missing_columns = {
+        name: [value for value, retain in zip(values, keep, strict=True) if retain]
+        for name, values in columns.items()
+    }
+    missing_ref = _write_parquet_reference(
+        tmp_path / "design-missing-seed.parquet",
+        missing_columns,
+    )
+    missing = copy.deepcopy(datasets)
+    missing["design"]["chunks"] = [
+        {**missing_ref, "rows": len(missing_columns["episode_uid"])}
+    ]
+    missing["design"]["effective_episodes"] = len(
+        set(missing_columns["episode_uid"])
+    )
+    missing["design"]["effective_transitions"] = len(
+        missing_columns["episode_uid"]
+    )
+    with pytest.raises(ValueError, match="group and seed schedule is incomplete"):
+        _validate_v3_dataset_shards(missing, preregistration, tmp_path)
+
+    drift_columns = copy.deepcopy(columns)
+    same_group_indexes = [
+        index
+        for index, group_id in enumerate(drift_columns["split_group_id"])
+        if str(group_id) == target_group
+    ]
+    first, second = same_group_indexes[:2]
+    assert int(drift_columns["seed"][first]) != int(
+        drift_columns["seed"][second]
+    )
+    drift_columns["episode_uid"][second] = drift_columns["episode_uid"][first]
+    drift_ref = _write_parquet_reference(
+        tmp_path / "design-seed-drift.parquet",
+        drift_columns,
+    )
+    drift = copy.deepcopy(datasets)
+    drift["design"]["chunks"] = [
+        {**drift_ref, "rows": len(drift_columns["episode_uid"])}
+    ]
+    with pytest.raises(ValueError, match="episode_uid cannot change its numeric"):
+        _validate_v3_dataset_shards(drift, preregistration, tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("disagreement_threshold", -1.0, "disagreement_threshold.*non-negative"),
+        ("min_selected_probes", -10, "min_selected_probes.*positive integer"),
+        ("min_probe_opportunities", 0, "min_probe_opportunities.*positive integer"),
+        ("min_context_coverage", -0.5, "min_context_coverage.*\[0, 1\]"),
+        ("min_action_coverage", 1.5, "min_action_coverage.*\[0, 1\]"),
+    ],
+)
+def test_frozen_probe_numeric_domains_fail_closed(
+    tmp_path,
+    field,
+    value,
+    message,
+):
+    payload = _frozen_payload(tmp_path)
+    payload["probe"][field] = value
+    payload["semantic_bindings"]["resolved_config_sha256"] = canonical_sha256(
+        _runtime_contract(payload)
+    )
+    path = tmp_path / f"invalid-probe-{field}.yaml"
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match=message):
+        load_frozen_preregistration(path)
+
+
+def test_live_readout_split_fingerprint_probe_and_benchmark_guards(tmp_path):
+    _path, preregistration = _write_frozen_preregistration(tmp_path)
+    context = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+    features = build_path_c_readout_features(
+        context,
+        {"probe": np.ones((2, 1), dtype=np.float32)},
+    )
+    assert np.array_equal(features["base_only"], context)
+    assert features["probe"].shape == (2, 3)
+
+    surface = np.asarray(["a", "a", "b", "b", "c", "c"])
+    seed_group = np.asarray(["s0", "s0", "s1", "s1", "s2", "s2"])
+    layout = np.asarray(["l0", "l0", "l1", "l1", "l2", "l2"])
+    mechanism = np.asarray(["m0", "m1", "m0", "m1", "m0", "m1"])
+    folds = assign_group_disjoint_folds(
+        surface,
+        seed_group,
+        layout,
+        n_folds=3,
+    )
+    assert validate_cross_identity_folds(
+        folds,
+        surface,
+        seed_group,
+        layout,
+        mechanism,
+    )["valid"] is True
+
+    fingerprint = fingerprint_admission_measurement(
+        control_kind="metadata_only",
+        mechanism=["m0", "m0", "m1", "m1", "m2", "m2"],
+        fingerprint_id=[0, 1, 0, 1, 0, 1],
+        visibility_ci_lo=0.9,
+        chance_accuracy=0.5,
+        value_null_ci=[-0.001, 0.001],
+        joint_rv_null_ci=[-0.001, 0.001],
+        normalized_advantage_null_ci=[-0.001, 0.001],
+        preregistration=preregistration,
+    )
+    assert fingerprint["available_for_synthetic_power"] is False
+
+    support = probe_support_measurement(
+        [False, False],
+        [True, True],
+        ["c0", "c1"],
+        [0, 1],
+    )
+    assert support["selected"] == 0
+    assert support["context_coverage"] == 0.0
+    assert support["action_coverage"] == 0.0
+
+    with pytest.raises(ValueError, match="Data-collection"):
+        require_formal_benchmark_artifact(
+            {
+                "evaluation_kind": "data_collection_only",
+                "collection_role": "data_collection_only",
+                "active_probe_collection": True,
+                "benchmark_return_eligible": False,
+            }
+        )
+
+
+def test_ecological_kernel_fallback_cannot_gate_instrument_validity(tmp_path):
+    _path, preregistration = _write_frozen_preregistration(tmp_path)
+    audit = empirical_kernel_distance_audit(
+        [[0], [1]],
+        ["m0", "m1"],
+        ["i0", "i1"],
+        ["c0", "c1"],
+        ["e0", "e1"],
+        preregistration,
+    )
+    assert audit["available"] is True
+    assert audit["theorem_eligible"] is False
+    assert audit["decision_eligible"] is False
+
+
+def test_response_readout_retains_ordered_joint_likelihood(monkeypatch):
+    from experiments.overcooked_v2.scripts import diag_d1_train as d1
+
+    feature_dims = []
+
+    def fake_fit(features, labels, fold_keys, **_kwargs):
+        del fold_keys
+        feature_dims.append(features.shape[1])
+        n_classes = int(np.max(labels)) + 1
+        probabilities = np.full((labels.size, n_classes), 0.1)
+        probabilities[np.arange(labels.size), labels] = 0.9
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        return {"available": True, "probs": probabilities}
+
+    monkeypatch.setattr(d1, "_fit_predict_classifier", fake_fit)
+    score = d1._readout_score_for_columns(
+        np.ones((4, 2), dtype=np.float32),
+        {
+            "rv_first": np.asarray([0, 1, 0, 1]),
+            "rv_second": np.asarray([1, 1, 0, 0]),
+        },
+        np.arange(4),
+        ["rv_first", "rv_second"],
+        np.asarray(["e0", "e1", "e2", "e3"]),
+        device="cpu",
+        seed=0,
+    )
+    assert score["likelihood"] == "autoregressive_joint"
+    assert score["factor_order"] == ["rv_first", "rv_second"]
+    assert feature_dims == [2, 4]

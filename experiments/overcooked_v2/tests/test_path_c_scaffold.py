@@ -129,6 +129,113 @@ def test_belief_audit_config_separates_exact_and_bounded_approximate_modes():
         )
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("disagreement_threshold", -1.0, "disagreement_threshold.*non-negative"),
+        ("min_selected_probes", -10, "min_selected_probes.*positive integer"),
+        ("min_probe_opportunities", 0, "min_probe_opportunities.*positive integer"),
+        ("min_context_coverage", -0.5, r"min_context_coverage.*\[0, 1\]"),
+        ("min_action_coverage", 1.5, r"min_action_coverage.*\[0, 1\]"),
+    ],
+)
+def test_runtime_probe_numeric_domains_fail_closed(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        normalize_path_c_config({"path_c": {"probe": {field: value}}})
+
+
+def test_probe_choice_disabled_and_single_head_paths_do_not_inspect_heads():
+    pytest.importorskip("jaxmarl")
+    from experiments.overcooked_v2.train_aris import _path_c_probe_choice
+
+    class RaisingQ(torch.nn.Module):
+        def forward_heads(self, *args, **kwargs):
+            raise AssertionError("disabled probe path must not inspect ensemble heads")
+
+    common = {
+        "q_net": RaisingQ(),
+        "obs_tensor": torch.zeros(1, 2),
+        "state_repr": torch.zeros(1, 1, 1),
+        "graph_batch": {},
+        "q_values": torch.zeros(3),
+        "valid_tensor": torch.ones(3, dtype=torch.bool),
+        "partner_id": None,
+        "device": torch.device("cpu"),
+    }
+    assert _path_c_probe_choice(
+        **common,
+        config={"path_c": {"probe": {"enable": False}}},
+        selection_stats={},
+    ) is None
+
+    stats = {}
+    assert _path_c_probe_choice(
+        **common,
+        config={
+            "path_c": {
+                "probe": {"enable": True},
+                "ensemble": {"n_heads": 1},
+            }
+        },
+        selection_stats=stats,
+    ) is None
+    assert stats["path_c_probe_skipped_single_head_count"] == 1
+    assert stats["path_c_probe_last_decision"]["reason"] == "disabled"
+
+
+def test_probe_choice_logs_return_floor_and_selected_target():
+    pytest.importorskip("jaxmarl")
+    from experiments.overcooked_v2.train_aris import _path_c_probe_choice
+
+    heads = torch.tensor([[[2.0, 0.0], [2.0, -4.0]]])
+    config = {
+        "path_c": {
+            "probe": {
+                "enable": True,
+                "rule": "max_normalized_advantage_disagreement",
+                "collection_selection_mode": "normalized_advantage",
+                "disagreement_threshold": 0.0,
+                "return_floor": 0.0,
+            },
+            "ensemble": {
+                "n_heads": 2,
+                "disagreement_stat": "variance",
+                "tie_atol": 1.0e-6,
+            },
+        }
+    }
+    common = {
+        "q_net": torch.nn.Identity(),
+        "obs_tensor": torch.zeros(1, 2),
+        "state_repr": torch.zeros(1, 1, 1),
+        "graph_batch": {},
+        "valid_tensor": torch.ones(2, dtype=torch.bool),
+        "config": config,
+        "partner_id": None,
+        "device": torch.device("cpu"),
+        "head_values_override": heads,
+    }
+    floor_stats = {}
+    assert _path_c_probe_choice(
+        **common,
+        q_values=torch.tensor([10.0, -1.0]),
+        selection_stats=floor_stats,
+    ) is None
+    assert floor_stats["path_c_probe_last_decision"]["reason"] == "return_floor"
+    assert floor_stats["path_c_probe_last_decision"]["option_id"] == 1
+
+    selected_stats = {}
+    assert _path_c_probe_choice(
+        **common,
+        q_values=torch.tensor([10.0, 1.0]),
+        selection_stats=selected_stats,
+    ) == 1
+    assert selected_stats["path_c_probe_last_decision"]["selected"] is True
+    assert selected_stats["path_c_probe_last_decision"]["rule"] == (
+        "max_normalized_advantage_disagreement"
+    )
+
+
 def test_normalized_advantage_is_the_primary_offset_invariant_code():
     q_values = torch.tensor(
         [

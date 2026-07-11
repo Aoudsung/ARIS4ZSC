@@ -9,6 +9,9 @@ from typing import Any, Iterable, Mapping
 
 import yaml
 
+from experiments.overcooked_v2.path_c_probe_contract import (
+    normalized_probe_numeric_fields,
+)
 from experiments.overcooked_v2.path_c_evaluation import (
     load_frozen_preregistration,
     validate_runtime_path_c_config,
@@ -370,12 +373,9 @@ def _normalize_section(section: dict[str, Any]) -> None:
         probe[key] = _as_bool(probe[key], f"path_c.probe.{key}")
     if probe["rule"] != "max_normalized_advantage_disagreement":
         raise ValueError("Path C probe.rule must use normalized-advantage disagreement.")
-    for key in ("disagreement_threshold", "return_floor"):
-        probe[key] = None if probe[key] is None else float(probe[key])
-    for key in ("min_selected_probes", "min_probe_opportunities"):
-        probe[key] = None if probe[key] is None else int(probe[key])
-    for key in ("min_context_coverage", "min_action_coverage"):
-        probe[key] = None if probe[key] is None else float(probe[key])
+    probe.update(
+        normalized_probe_numeric_fields(probe, prefix="path_c.probe")
+    )
 
     for key in (
         "response_summary_spec",

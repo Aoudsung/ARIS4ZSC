@@ -66,6 +66,11 @@ from experiments.overcooked_v2.path_c_evaluation import (  # noqa: E402
 from experiments.overcooked_v2.path_c_response_summary import (  # noqa: E402
     ResponseSummarySpecV1,
 )
+from experiments.overcooked_v2.path_c_seed import (  # noqa: E402
+    OCV2_EXECUTION_SEED_VERSION,
+    canonical_uint64_seed,
+    validate_unique_execution_seed_mapping,
+)
 from experiments.overcooked_v2.path_c_sequence import (  # noqa: E402
     DecisionEvidenceBuffer,
     EgoEvidenceSpecV1,
@@ -1506,7 +1511,22 @@ def run(args: argparse.Namespace) -> None:
         variant for variant in path_c_q_variants if variant != PATH_C_PROBE_VARIANT
     )
 
-    rng = np.random.default_rng(args.seed)
+    canonical_base_seed = canonical_uint64_seed(
+        int(args.seed),
+        name="dataset base seed",
+    )
+    canonical_episode_seeds = tuple(
+        canonical_uint64_seed(
+            canonical_base_seed + episode_index,
+            name="dataset episode seed",
+        )
+        for episode_index in range(int(args.episodes))
+    )
+    execution_seed_by_episode_seed = validate_unique_execution_seed_mapping(
+        canonical_episode_seeds,
+        name="dataset episode seed schedule",
+    )
+    rng = np.random.default_rng(canonical_base_seed)
     rows: dict[str, list] = {k: [] for k in (
         "state_feat", "extra_feat", "hist_kind", "hist_dur", "hist_ago", "hist_len",
         "ego_opt_kind", "valid_kinds", "gate_main", "gate_strict",
@@ -1514,7 +1534,7 @@ def run(args: argparse.Namespace) -> None:
         "episode_uid", "run_id", "collection_variant", "option_transition",
         "collection_role", "split_group_id", "mechanism", "style_group",
         "surface_identity_key", "seed_group", "layout_style", "mechanism_key",
-        "seed",
+        "seed", "execution_seed",
         "synthetic_registry_value_class_id", "style_id",
         "decision_reward", "held_out_episode_return",
         "public_context_stratum",
@@ -1563,7 +1583,8 @@ def run(args: argparse.Namespace) -> None:
     golden_lines: list[str] = []
 
     for episode_idx in range(args.episodes):
-        seed = args.seed + episode_idx
+        seed = canonical_episode_seeds[episode_idx]
+        execution_seed = execution_seed_by_episode_seed[seed]
         evidence_buffer = E.EvidenceBuffer(
             num_factors=graph.num_factors,
             window=int(ctx.config["training"]["evidence_window"]),
@@ -1735,7 +1756,7 @@ def run(args: argparse.Namespace) -> None:
             rows["gate_main"].append(np.uint8(gate_main))
             rows["gate_strict"].append(np.uint8(gate_strict))
             rows["episode_id"].append(np.int32(episode_idx))
-            rows["episode_seed"].append(np.int32(seed))
+            rows["episode_seed"].append(np.uint64(seed))
             rows["episode_uid"].append(make_episode_uid(run_id, args.seed, episode_idx))
             rows["run_id"].append(run_id)
             rows["collection_variant"].append(collection_variant)
@@ -1767,8 +1788,9 @@ def run(args: argparse.Namespace) -> None:
             rows["seed"].append(np.uint64(
                 split_assignment["numeric_seed"]
                 if split_assignment is not None
-                else int(args.seed)
+                else canonical_base_seed
             ))
+            rows["execution_seed"].append(np.uint32(execution_seed))
             rows["layout_style"].append(layout_style)
             rows["mechanism_key"].append(
                 f"{int(md['mode_family_id'])}:{int(md['mode_param'])}"
@@ -2286,6 +2308,17 @@ def run(args: argparse.Namespace) -> None:
         "ego": args.ego,
         "episodes": int(args.episodes),
         "base_seed": int(args.seed),
+        "ocv2_execution_seed_version": OCV2_EXECUTION_SEED_VERSION,
+        "episode_seed_mapping": [
+            {
+                "episode_id": episode_index,
+                "episode_seed": int(episode_seed),
+                "execution_seed": int(
+                    execution_seed_by_episode_seed[episode_seed]
+                ),
+            }
+            for episode_index, episode_seed in enumerate(canonical_episode_seeds)
+        ],
         "max_episode_options": int(args.max_episode_options),
         "hist_window": int(args.hist_window),
         "k_windows": list(K_WINDOWS),
@@ -2524,8 +2557,17 @@ def _write_content_addressed_parquet_shard(
         raise RuntimeError(
             "Version-3 Path C collection requires pyarrow for Parquet shards."
         ) from exc
+    unsigned_types = {
+        "seed": pa.uint64(),
+        "episode_seed": pa.uint64(),
+        "execution_seed": pa.uint32(),
+    }
     table = pa.table({
-        name: pa.array(np.asarray(value).tolist())
+        name: (
+            pa.array(np.asarray(value), type=unsigned_types[name])
+            if name in unsigned_types
+            else pa.array(np.asarray(value).tolist())
+        )
         for name, value in arrays.items()
     })
     pq.write_table(table, requested_path, compression="zstd")

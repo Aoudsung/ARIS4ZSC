@@ -233,16 +233,40 @@ def _load_chunk_columns(path: Path) -> dict[str, np.ndarray]:
     if path.suffix.lower() != ".parquet":
         raise ValueError(f"unsupported Path C shard format: {path}")
     try:
+        import pyarrow as pa
         import pyarrow.parquet as pq
     except ImportError as exc:
         raise RuntimeError(
             "Reading version-3 Path C shards requires pyarrow."
         ) from exc
     table = pq.read_table(path)
-    return {
-        str(name): np.asarray(table[name].to_pylist())
-        for name in table.column_names
+    required_seed_types = {
+        "seed": pa.uint64(),
+        "episode_seed": pa.uint64(),
+        "execution_seed": pa.uint32(),
     }
+    result: dict[str, np.ndarray] = {}
+    for name in table.column_names:
+        field = table.schema.field(name)
+        expected_type = required_seed_types.get(str(name))
+        if expected_type is not None and field.type != expected_type:
+            raise RuntimeError(
+                f"Path C Parquet column {name!r} must use Arrow "
+                f"{expected_type}; observed {field.type}."
+            )
+        if expected_type == pa.uint64():
+            result[str(name)] = np.asarray(
+                table[name].to_pylist(),
+                dtype=np.uint64,
+            )
+        elif expected_type == pa.uint32():
+            result[str(name)] = np.asarray(
+                table[name].to_pylist(),
+                dtype=np.uint32,
+            )
+        else:
+            result[str(name)] = np.asarray(table[name].to_pylist())
+    return result
 
 
 def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
@@ -342,7 +366,24 @@ def load_chunks(chunk_dir: str) -> dict[str, np.ndarray]:
             raise RuntimeError(f"chunk {f} metadata effective_transitions disagrees with data")
         effective_transitions += chunk_transitions
         for k in row_columns:
-            cols.setdefault(k, []).append(chunk[k])
+            values = np.asarray(chunk[k])
+            if k in {"seed", "episode_seed"}:
+                if values.dtype.kind not in {"u", "i"} or np.any(values < 0):
+                    raise RuntimeError(
+                        f"chunk {f} column {k!r} must contain unsigned integers"
+                    )
+                values = values.astype(np.uint64, copy=False)
+            elif k == "execution_seed":
+                if values.dtype.kind not in {"u", "i"} or np.any(values < 0):
+                    raise RuntimeError(
+                        f"chunk {f} column execution_seed must contain unsigned integers"
+                    )
+                if np.any(values.astype(np.uint64) > np.iinfo(np.uint32).max):
+                    raise RuntimeError(
+                        f"chunk {f} column execution_seed exceeds unsigned 32-bit range"
+                    )
+                values = values.astype(np.uint32, copy=False)
+            cols.setdefault(k, []).append(values)
         partners.append(np.array([meta["partner"]] * n))
         egos.append(np.array([meta["ego"]] * n))
         partner_sets.append(np.array([meta.get("partner_set", "unknown")] * n))

@@ -185,6 +185,16 @@ def test_numeric_seed_schedule_is_frozen_unique_and_group_specific():
     assert len(all_seeds) == len(set(all_seeds))
     assert len(all_seeds) == 3 * len(manifest.groups)
     assert len(manifest.numeric_seed_schedule_sha256) == 64
+    payload = manifest.numeric_seed_schedule_payload()
+    execution_seeds = [
+        seed
+        for entry in payload["entries"]
+        for seed in entry["ocv2_execution_seeds"]
+    ]
+    assert len(execution_seeds) == len(set(execution_seeds))
+    assert payload["ocv2_execution_seed_version"] == (
+        "path_c_ocv2_execution_seed_v1"
+    )
     group = manifest.groups[0]
     manifest.validate_numeric_seed(
         group.group_id,
@@ -192,6 +202,19 @@ def test_numeric_seed_schedule_is_frozen_unique_and_group_specific():
     )
     with pytest.raises(ValueError, match="not registered"):
         manifest.validate_numeric_seed(group.group_id, -1)
+
+
+def test_numeric_seed_schedule_rejects_execution_seed_collisions(monkeypatch):
+    from experiments.overcooked_v2 import path_c_seed
+
+    monkeypatch.setattr(path_c_seed, "derive_ocv2_execution_seed", lambda _seed: 7)
+    manifest = SplitManifestV1.build(
+        _groups(("m0",)),
+        manifest_seed=31,
+        evaluation_seeds_per_group=2,
+    )
+    with pytest.raises(ValueError, match="execution-seed collision"):
+        manifest.numeric_seed_schedule_payload()
 
 
 def test_split_manifest_round_trip_recomputes_assignments_and_hashes():

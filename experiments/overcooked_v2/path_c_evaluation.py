@@ -20,8 +20,15 @@ from experiments.overcooked_v2.path_c_protocol import (
     matched_policy_metrics,
     select_strongest_baseline_on_design,
 )
+from experiments.overcooked_v2.path_c_probe_contract import (
+    normalized_probe_numeric_fields,
+)
 from experiments.overcooked_v2.path_c_return_artifacts import ReturnPointLedgerV1
 from experiments.overcooked_v2.path_c_response_summary import ResponseSummarySpecV1
+from experiments.overcooked_v2.path_c_seed import (
+    canonical_uint64_seed,
+    derive_ocv2_execution_seed,
+)
 from experiments.overcooked_v2.path_c_sequence import EgoEvidenceSpecV1
 from experiments.overcooked_v2.path_c_split import SplitManifestV1
 
@@ -935,6 +942,7 @@ def load_frozen_preregistration(path: str | Path) -> FrozenPathCPreregistration:
         raise ValueError("Adaptive probes must remain disabled in locked audit.")
     if probe.get("rule") != "max_normalized_advantage_disagreement":
         raise ValueError("Frozen probe rule has the wrong primary target.")
+    normalized_probe_numeric_fields(probe, prefix="probe")
     for key in (
         "record_candidate_mask",
         "record_all_scores",
@@ -1554,14 +1562,16 @@ def load_and_validate_path_c_inputs(
             "instrument_measurement",
             "design_return_point_ledger",
             "baseline_selection",
-            "locked_return_point_ledger",
             "primary_endpoint",
         },
         "secondary_mechanisms": set(all_measurements),
     }
     expected_measurements = stage_measurements[active_stage]
+    allowed_measurements = set(expected_measurements)
+    if active_stage == "locked_primary_efficacy":
+        allowed_measurements.add("locked_return_point_ledger")
     missing = sorted(expected_measurements.difference(refs))
-    unknown = sorted(set(refs).difference(expected_measurements))
+    unknown = sorted(set(refs).difference(allowed_measurements))
     if missing or unknown:
         raise ValueError(
             f"Manifest measurement artifacts mismatch; missing={missing}, unknown={unknown}."
@@ -1579,6 +1589,22 @@ def load_and_validate_path_c_inputs(
             resolved_path_c_sha256=resolved_sha,
         )
         measurements[name] = measurement
+
+    if active_stage == "locked_primary_efficacy":
+        primary_available = measurements["primary_endpoint"].get("available")
+        locked_ledger_present = "locked_return_point_ledger" in measurements
+        if primary_available is True and not locked_ledger_present:
+            raise ValueError(
+                "A completed locked-primary result requires its return-point ledger."
+            )
+        if primary_available is False and locked_ledger_present:
+            raise ValueError(
+                "PRIMARY_NOT_RUN must not reference a locked-audit return ledger."
+            )
+        if not isinstance(primary_available, bool):
+            raise ValueError(
+                "locked-primary primary_endpoint.available must be boolean."
+            )
 
     stage_dataset_roles = {
         "software_conformance": {"train"},
@@ -2225,6 +2251,20 @@ def evaluate_path_c_decision(
 ) -> PathCDecision:
     """Apply software -> instrument -> design freeze -> primary -> secondary."""
 
+    artifact_contract = _mapping(
+        measurements.get("artifact_contract"), "artifact_contract"
+    )
+    active_stage = str(artifact_contract.get("active_stage", ""))
+    stage_order = (
+        "software_conformance",
+        "instrument_validity",
+        "design_and_calibration_freeze",
+        "locked_primary_efficacy",
+        "secondary_mechanisms",
+    )
+    if active_stage not in stage_order:
+        raise ValueError("artifact_contract active_stage is not registered.")
+
     software = _mapping(
         measurements.get("software_conformance"), "software_conformance"
     )
@@ -2259,9 +2299,8 @@ def evaluate_path_c_decision(
         and cost_conformant
         and software_test_report_conformant
         and validated_policy_metrics is not None
-        and isinstance(measurements.get("artifact_contract"), Mapping)
-        and measurements["artifact_contract"].get("valid") is True
-        and measurements["artifact_contract"].get("semantic_bindings_valid") is True
+        and artifact_contract.get("valid") is True
+        and artifact_contract.get("semantic_bindings_valid") is True
     )
     if not software_conformant:
         return PathCDecision(
@@ -2278,6 +2317,19 @@ def evaluate_path_c_decision(
         )
     if validated_policy_metrics is None:
         raise RuntimeError("Policy-metric validation result was lost after conformance.")
+    if active_stage == "software_conformance":
+        return PathCDecision(
+            schema_version=PATH_C_DECISION_SCHEMA,
+            software_conformant=True,
+            instrument_valid=False,
+            primary_effective=None,
+            primary_estimate=None,
+            primary_ci=None,
+            secondary={},
+            allowed_claim="software_conformance_only",
+            status="SOFTWARE_CONFORMANT_PENDING_INSTRUMENT",
+            requires_type_b_review=True,
+        )
 
     instrument_evidence = _mapping(
         measurements.get("instrument_evidence"), "instrument_evidence"
@@ -2520,6 +2572,19 @@ def evaluate_path_c_decision(
             status="INSTRUMENT_INVALID",
             requires_type_b_review=True,
         )
+    if active_stage == "instrument_validity":
+        return PathCDecision(
+            schema_version=PATH_C_DECISION_SCHEMA,
+            software_conformant=True,
+            instrument_valid=True,
+            primary_effective=None,
+            primary_estimate=None,
+            primary_ci=None,
+            secondary={},
+            allowed_claim="instrument_valid_only",
+            status="INSTRUMENT_VALID",
+            requires_type_b_review=True,
+        )
 
     design_return_point_ledger = _validated_return_point_ledger(
         measurements.get("design_return_point_ledger"),
@@ -2581,6 +2646,19 @@ def evaluate_path_c_decision(
             "Locked primary uses different baseline-selection content."
         )
     selected_baseline = recomputed_selection.selected_baseline
+    if active_stage == "design_and_calibration_freeze":
+        return PathCDecision(
+            schema_version=PATH_C_DECISION_SCHEMA,
+            software_conformant=True,
+            instrument_valid=True,
+            primary_effective=None,
+            primary_estimate=None,
+            primary_ci=None,
+            secondary={},
+            allowed_claim="instrument_valid_only",
+            status="DESIGN_FROZEN_PRIMARY_NOT_RUN",
+            requires_type_b_review=True,
+        )
     primary = _mapping(measurements.get("primary_endpoint"), "primary_endpoint")
     if primary.get("schema_version") != "path_c_primary_endpoint_v1":
         raise ValueError("primary_endpoint has the wrong schema version.")
@@ -2736,6 +2814,20 @@ def evaluate_path_c_decision(
             secondary={},
             allowed_claim="active_probing_budget_advantage_not_shown",
             status="PRIMARY_NOT_EFFECTIVE",
+            requires_type_b_review=True,
+        )
+
+    if active_stage == "locked_primary_efficacy":
+        return PathCDecision(
+            schema_version=PATH_C_DECISION_SCHEMA,
+            software_conformant=True,
+            instrument_valid=True,
+            primary_effective=True,
+            primary_estimate=primary_estimate,
+            primary_ci=primary_ci,
+            secondary={},
+            allowed_claim="primary_budget_advantage_pending_type_b_review",
+            status="PRIMARY_EFFECTIVE_PENDING_TYPE_B_REVIEW",
             requires_type_b_review=True,
         )
 
@@ -3302,6 +3394,18 @@ def _validate_v3_dataset_shards(
                 f"dataset_shards.{name} declares group(s) assigned to another role: "
                 + ", ".join(wrong_role_groups)
             )
+        expected_role_group_ids = {
+            group.group_id
+            for group in preregistration.split_manifest.groups_for_role(role)
+        }
+        if set(declared_group_ids) != expected_role_group_ids:
+            raise ValueError(
+                f"dataset_shards.{name} must declare every frozen group for role "
+                f"{role!r}; missing="
+                f"{sorted(expected_role_group_ids.difference(declared_group_ids))}, "
+                f"unknown="
+                f"{sorted(set(declared_group_ids).difference(expected_role_group_ids))}."
+            )
         expected_mechanisms = {
             split_groups[group_id].mechanism for group_id in declared_group_ids
         }
@@ -3357,7 +3461,10 @@ def _validate_v3_dataset_shards(
         observed_group_ids: set[str] = set()
         observed_mechanisms: set[str] = set()
         observed_style_groups: set[str] = set()
+        observed_group_seed_pairs: set[tuple[str, int]] = set()
         episode_group: dict[str, str] = {}
+        episode_seed_identity: dict[str, tuple[int, int]] = {}
+        episode_seed_by_execution_seed: dict[int, int] = {}
         validated_group_seed_pairs: set[tuple[str, int]] = set()
         for index, raw_ref in enumerate(chunks):
             ref = _mapping(raw_ref, f"dataset_shards.{name}.chunks[{index}]")
@@ -3376,6 +3483,7 @@ def _validate_v3_dataset_shards(
             if rows is None or rows <= 0:
                 raise ValueError(f"dataset_shards.{name} chunk rows must be positive.")
             try:
+                import pyarrow as pa
                 import pyarrow.parquet as pq
             except ImportError as exc:
                 raise RuntimeError(
@@ -3391,6 +3499,8 @@ def _validate_v3_dataset_shards(
                 "surface_identity_key",
                 "seed_group",
                 "seed",
+                "episode_seed",
+                "execution_seed",
                 "layout_style",
                 "probe_selected",
                 "probe_cost_per_use",
@@ -3408,6 +3518,19 @@ def _validate_v3_dataset_shards(
                     f"dataset_shards.{name}.chunks[{index}] declared rows do not "
                     "match the Parquet row count."
                 )
+            required_arrow_types = {
+                "seed": pa.uint64(),
+                "episode_seed": pa.uint64(),
+                "execution_seed": pa.uint32(),
+            }
+            for column_name, expected_type in required_arrow_types.items():
+                observed_type = table.schema.field(column_name).type
+                if observed_type != expected_type:
+                    raise ValueError(
+                        f"dataset_shards.{name}.chunks[{index}]."
+                        f"{column_name} must use Arrow {expected_type}; observed "
+                        f"{observed_type}."
+                    )
             columns = table.to_pydict()
             for row_index in range(rows):
                 row_name = (
@@ -3479,6 +3602,40 @@ def _validate_v3_dataset_shards(
                         *group_seed_pair,
                     )
                     validated_group_seed_pairs.add(group_seed_pair)
+                observed_group_seed_pairs.add(group_seed_pair)
+                episode_seed = canonical_uint64_seed(
+                    columns["episode_seed"][row_index],
+                    name=f"{row_name}.episode_seed",
+                )
+                execution_seed = columns["execution_seed"][row_index]
+                if isinstance(execution_seed, bool) or not isinstance(
+                    execution_seed, (int, np.integer)
+                ):
+                    raise TypeError(f"{row_name}.execution_seed must be an integer.")
+                expected_execution_seed = derive_ocv2_execution_seed(episode_seed)
+                if int(execution_seed) != expected_execution_seed:
+                    raise ValueError(
+                        f"{row_name}.execution_seed does not match its canonical "
+                        "episode seed."
+                    )
+                previous_episode_seed = episode_seed_by_execution_seed.setdefault(
+                    int(execution_seed),
+                    episode_seed,
+                )
+                if previous_episode_seed != episode_seed:
+                    raise ValueError(
+                        "Dataset contains an OCV2 execution-seed collision between "
+                        "different canonical episode seeds."
+                    )
+                previous_seed_identity = episode_seed_identity.setdefault(
+                    episode_uid,
+                    (int(numeric_seed), episode_seed),
+                )
+                if previous_seed_identity != (int(numeric_seed), episode_seed):
+                    raise ValueError(
+                        f"{row_name}.episode_uid cannot change its numeric or "
+                        "episode seed."
+                    )
                 if string_values["layout_style"] != group.layout_group:
                     raise ValueError(
                         f"{row_name}.layout_style differs from the frozen split group."
@@ -3572,6 +3729,21 @@ def _validate_v3_dataset_shards(
         if observed_style_groups != set(declared_style_groups):
             raise ValueError(
                 f"dataset_shards.{name} style-group declarations differ from its rows."
+            )
+        expected_group_seed_pairs = {
+            (group_id, int(seed))
+            for group_id in expected_role_group_ids
+            for seed in preregistration.split_manifest.numeric_seeds_for_group(
+                group_id
+            )
+        }
+        if observed_group_seed_pairs != expected_group_seed_pairs:
+            raise ValueError(
+                f"dataset_shards.{name} group and seed schedule is incomplete; "
+                f"missing="
+                f"{sorted(expected_group_seed_pairs.difference(observed_group_seed_pairs))}, "
+                f"unknown="
+                f"{sorted(observed_group_seed_pairs.difference(expected_group_seed_pairs))}."
             )
         observed_split_group_ids.update(observed_group_ids)
     missing_roles = sorted(required_role_set.difference(observed_roles))

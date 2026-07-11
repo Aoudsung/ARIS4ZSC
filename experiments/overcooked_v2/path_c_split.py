@@ -6,11 +6,16 @@ import json
 from numbers import Integral
 from typing import Any, ClassVar, Iterable, Mapping
 
+from experiments.overcooked_v2.path_c_seed import (
+    OCV2_EXECUTION_SEED_VERSION,
+    validate_unique_execution_seed_mapping,
+)
+
 
 SPLIT_MANIFEST_SCHEMA_VERSION = "path_c_split_manifest_v2"
 SPLIT_GROUP_SCHEMA_VERSION = "path_c_split_group_v1"
 CROSS_FIT_SCHEMA_VERSION = "path_c_role_cross_fit_v1"
-NUMERIC_SEED_SCHEDULE_SCHEMA_VERSION = "path_c_numeric_seed_schedule_v1"
+NUMERIC_SEED_SCHEDULE_SCHEMA_VERSION = "path_c_numeric_seed_schedule_v2"
 SPLIT_ROLES = ("train", "design", "calibration", "locked_audit")
 MIN_GROUPS_PER_MECHANISM = 4
 PREFERRED_GROUPS_PER_MECHANISM = 5
@@ -451,12 +456,27 @@ class SplitManifestV1:
                     collision_index += 1
                 used.add(numeric_seed)
                 seeds.append(numeric_seed)
+            execution_seed_by_canonical = validate_unique_execution_seed_mapping(
+                seeds,
+                name=f"numeric seed schedule for group {group.group_id!r}",
+            )
             entries.append({
                 "group_id": group.group_id,
                 "role": self.role_for(group.group_id),
                 "seed_group": group.seed_group,
                 "numeric_seeds": seeds,
+                "ocv2_execution_seeds": [
+                    execution_seed_by_canonical[seed] for seed in seeds
+                ],
             })
+        validate_unique_execution_seed_mapping(
+            (
+                seed
+                for entry in entries
+                for seed in entry["numeric_seeds"]
+            ),
+            name="complete numeric seed schedule",
+        )
         return {
             "schema_version": NUMERIC_SEED_SCHEDULE_SCHEMA_VERSION,
             "derivation": (
@@ -464,6 +484,7 @@ class SplitManifestV1:
                 "collision_index) first_unsigned_64_bits"
             ),
             "seeds_per_group": int(self.evaluation_seeds_per_group),
+            "ocv2_execution_seed_version": OCV2_EXECUTION_SEED_VERSION,
             "entries": entries,
         }
 

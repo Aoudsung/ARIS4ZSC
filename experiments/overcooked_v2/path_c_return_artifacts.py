@@ -481,6 +481,7 @@ class ReturnPointLedgerV1:
         groups = {group.group_id: group for group in manifest.groups}
         assignments = manifest.assignment_by_group
         observed_group_ids: set[str] = set()
+        observed_cells: set[tuple[str, str, int, int]] = set()
         for record in self.points:
             spec = record.source_episode_log.spec
             group = groups.get(spec.split_group_id)
@@ -510,6 +511,17 @@ class ReturnPointLedgerV1:
                     "Return episode grouping fields disagree with its split-manifest group."
                 )
             manifest.validate_numeric_seed(group.group_id, spec.seed)
+            cell = (
+                str(record.point.policy_name),
+                str(group.group_id),
+                int(spec.seed),
+                int(spec.probe_budget),
+            )
+            if cell in observed_cells:
+                raise ValueError(
+                    "Return-point ledger repeats a policy/group/seed/budget cell."
+                )
+            observed_cells.add(cell)
         expected_group_ids = {
             str(group_id)
             for group_id, role in assignments.items()
@@ -521,6 +533,20 @@ class ReturnPointLedgerV1:
             raise ValueError(
                 "Return-point ledger must cover every frozen split group for its role; "
                 f"missing={missing}, unknown={unknown}."
+            )
+        expected_cells = {
+            (policy_name, group_id, int(seed), int(probe_budget))
+            for policy_name in self.policy_artifact_sha256_by_name
+            for group_id in expected_group_ids
+            for seed in manifest.numeric_seeds_for_group(group_id)
+            for probe_budget in self.probe_budget_grid
+        }
+        if observed_cells != expected_cells:
+            missing_cells = sorted(expected_cells.difference(observed_cells))
+            unknown_cells = sorted(observed_cells.difference(expected_cells))
+            raise ValueError(
+                "Return-point ledger group and seed schedule is incomplete; "
+                f"missing={missing_cells}, unknown={unknown_cells}."
             )
 
     def curves(

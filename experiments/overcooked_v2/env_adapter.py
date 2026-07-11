@@ -6,6 +6,11 @@ from typing import Any
 
 import numpy as np
 
+from experiments.overcooked_v2.path_c_seed import (
+    canonical_uint64_seed,
+    derive_ocv2_execution_seed,
+)
+
 try:
     import jax
     import jax.numpy as jnp
@@ -89,6 +94,8 @@ class OCV2Adapter:
         self._jit_reset = jax.jit(self.env.reset)
         self._jit_step = jax.jit(self.env.step_env)
         self.key = None
+        self.canonical_seed: int | None = None
+        self.execution_seed: int | None = None
         self.state = None
         self.raw_obs: dict[str, np.ndarray] | None = None
         self.obs: dict[str, np.ndarray] | None = None
@@ -104,7 +111,9 @@ class OCV2Adapter:
         self.featurizer = featurizer
 
     def reset(self, seed: int) -> tuple[dict[str, np.ndarray], Any]:
-        self.key = jax.random.PRNGKey(seed)
+        self.canonical_seed = canonical_uint64_seed(seed, name="OCV2 reset seed")
+        self.execution_seed = derive_ocv2_execution_seed(self.canonical_seed)
+        self.key = jax.random.PRNGKey(self.execution_seed)
         self.key, subkey = jax.random.split(self.key)
         raw_obs, state = self._jit_reset(subkey)
         # PERF (2026-07-06, profile-driven; semantics unchanged): materialize the
