@@ -29,7 +29,7 @@ def _groups(
                     identity_group=f"identity-{prefix}",
                     style_group=f"style-{prefix}",
                     seed_group=f"seed-{prefix}",
-                    layout_group=f"layout-template-{prefix}",
+                    layout_group="asymm_advantages",
                     layout_stratum="layout_control",
                 )
             )
@@ -42,7 +42,7 @@ def _groups(
                     identity_group=f"identity-{prefix}",
                     style_group=f"style-{prefix}",
                     seed_group=f"seed-{prefix}",
-                    layout_group=f"layout-template-{prefix}",
+                    layout_group="asymm_advantages_recipes_center",
                     layout_stratum="layout_shift",
                 )
             )
@@ -58,7 +58,7 @@ def test_split_manifest_is_deterministic_and_input_order_independent():
     assert left.sha256 == right.sha256
 
 
-def test_split_manifest_covers_four_roles_per_mechanism_and_isolates_groups():
+def test_split_manifest_covers_four_roles_with_one_primary_layout():
     manifest = SplitManifestV1.build(_groups(), manifest_seed=3)
     assignments = manifest.assignment_by_group
     for mechanism in ("m0", "m1"):
@@ -74,7 +74,6 @@ def test_split_manifest_covers_four_roles_per_mechanism_and_isolates_groups():
         "identity_group",
         "style_group",
         "seed_group",
-        "layout_group",
     ):
         roles_by_value: dict[str, set[str]] = {}
         for group in manifest.groups:
@@ -82,6 +81,14 @@ def test_split_manifest_covers_four_roles_per_mechanism_and_isolates_groups():
                 assignments[group.group_id]
             )
         assert all(len(roles) == 1 for roles in roles_by_value.values())
+
+    primary_groups = [
+        group for group in manifest.groups if group.layout_stratum == "layout_control"
+    ]
+    assert {group.layout_group for group in primary_groups} == {"asymm_advantages"}
+    assert {
+        assignments[group.group_id] for group in primary_groups
+    } == set(SPLIT_ROLES)
 
 
 def test_split_manifest_fails_closed_below_four_independent_groups():
@@ -120,7 +127,23 @@ def test_primary_identity_shift_requires_a_shared_layout_control_stratum():
                 layout_stratum=f"different-layout-stratum-{index}",
             )
         )
-    with pytest.raises(ValueError, match="shared layout_stratum"):
+    with pytest.raises(ValueError, match="shared concrete layout_group"):
+        SplitManifestV1.build(groups)
+
+
+def test_primary_identity_shift_rejects_multiple_concrete_layouts_in_one_stratum():
+    groups = list(_groups(("m0",), include_spare_layout=False))
+    original = groups[-1]
+    groups[-1] = SplitGroupV1(
+        group_id=original.group_id,
+        mechanism=original.mechanism,
+        identity_group=original.identity_group,
+        style_group=original.style_group,
+        seed_group=original.seed_group,
+        layout_group="asymm_advantages_recipes_center",
+        layout_stratum=original.layout_stratum,
+    )
+    with pytest.raises(ValueError, match="shared concrete layout_group"):
         SplitManifestV1.build(groups)
 
 
@@ -144,7 +167,13 @@ def test_primary_identity_and_secondary_layout_views_are_separate():
     secondary = payload["secondary_layout_shift"]
     assert primary["priority"] == "primary"
     assert primary["layout_shift_must_not_be_pooled"] is True
-    assert primary["condition_on"] == ["mechanism", "layout_stratum"]
+    assert primary["condition_on"] == [
+        "mechanism",
+        "layout_group",
+        "layout_stratum",
+    ]
+    assert primary["layout_template_is_role_isolated"] is False
+    assert primary["layout_group_by_mechanism"]["m0"] == "asymm_advantages"
     assert secondary["priority"] == "secondary"
     assert secondary["may_replace_primary_identity_shift"] is False
     assert secondary["available_by_mechanism"]["m0"] is True

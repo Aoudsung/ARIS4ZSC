@@ -12,7 +12,7 @@ from experiments.overcooked_v2.path_c_seed import (
 )
 
 
-SPLIT_MANIFEST_SCHEMA_VERSION = "path_c_split_manifest_v2"
+SPLIT_MANIFEST_SCHEMA_VERSION = "path_c_split_manifest_v3"
 SPLIT_GROUP_SCHEMA_VERSION = "path_c_split_group_v1"
 CROSS_FIT_SCHEMA_VERSION = "path_c_role_cross_fit_v1"
 NUMERIC_SEED_SCHEDULE_SCHEMA_VERSION = "path_c_numeric_seed_schedule_v2"
@@ -24,7 +24,6 @@ _ISOLATION_FIELDS = (
     "identity_group",
     "style_group",
     "seed_group",
-    "layout_group",
 )
 
 
@@ -61,11 +60,11 @@ def _require_exact_keys(
 class SplitGroupV1:
     """One indivisible scientific group before role assignment.
 
-    layout_group identifies a concrete layout template and is role-isolated.
-    layout_stratum is a preregistered control stratum that may be represented by
-    different layout templates in different roles. This distinction lets the
-    primary identity shift condition on layout while a separate secondary view
-    measures layout shift.
+    ``layout_group`` identifies a concrete layout template. The primary identity
+    comparison deliberately reuses one concrete layout across all four roles so
+    layout does not become a second shift axis. Identity, style and seed groups
+    remain role-isolated. A different ``layout_stratum`` is reserved for the
+    separate secondary layout-shift analysis.
     """
 
     group_id: str
@@ -99,6 +98,7 @@ class SplitGroupV1:
             "group_id",
             "mechanism",
             *_ISOLATION_FIELDS,
+            "layout_group",
             "layout_stratum",
         ):
             value = getattr(self, field_name)
@@ -509,6 +509,10 @@ class SplitManifestV1:
     def canonical_payload(self) -> dict[str, Any]:
         primary = dict(self.primary_layout_strata)
         secondary = dict(self.secondary_layout_strata)
+        primary_layout_groups = _primary_layout_groups(
+            self.groups,
+            self.primary_layout_strata,
+        )
         return {
             "schema_version": self.schema_version,
             "roles": list(SPLIT_ROLES),
@@ -541,8 +545,9 @@ class SplitManifestV1:
                     "style_group",
                     "seed_group",
                 ],
-                "condition_on": ["mechanism", "layout_stratum"],
-                "layout_template_is_role_isolated": True,
+                "condition_on": ["mechanism", "layout_group", "layout_stratum"],
+                "layout_template_is_role_isolated": False,
+                "layout_group_by_mechanism": primary_layout_groups,
                 "layout_shift_must_not_be_pooled": True,
                 "layout_stratum_by_mechanism": primary,
             },
@@ -677,12 +682,24 @@ def _select_layout_strata(
             if candidate_mechanism == mechanism
         ]
         primary_candidates = [
-            item for item in candidates if item[1] >= MIN_GROUPS_PER_MECHANISM
+            item
+            for item in candidates
+            if item[1] >= MIN_GROUPS_PER_MECHANISM
+            and len(
+                {
+                    group.layout_group
+                    for group in groups
+                    if group.mechanism == mechanism
+                    and group.layout_stratum == item[0]
+                }
+            )
+            == 1
         ]
         if not primary_candidates:
             raise ValueError(
                 "Primary identity shift requires at least four independent groups "
-                "for one shared layout_stratum per mechanism; "
+                "for one shared concrete layout_group and layout_stratum per "
+                "mechanism; "
                 f"mechanism {mechanism!r} has none."
             )
         primary_stratum = sorted(
@@ -703,6 +720,27 @@ def _select_layout_strata(
         )
         secondary.append((mechanism, secondary_stratum))
     return tuple(primary), tuple(secondary)
+
+
+def _primary_layout_groups(
+    groups: tuple[SplitGroupV1, ...],
+    primary_layout_strata: tuple[tuple[str, str], ...],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for mechanism, layout_stratum in primary_layout_strata:
+        layout_groups = {
+            group.layout_group
+            for group in groups
+            if group.mechanism == mechanism
+            and group.layout_stratum == layout_stratum
+        }
+        if len(layout_groups) != 1:
+            raise ValueError(
+                "Primary identity shift must use one concrete layout_group for "
+                f"mechanism {mechanism!r}."
+            )
+        result[mechanism] = next(iter(layout_groups))
+    return result
 
 
 def _component_matches(
@@ -922,7 +960,7 @@ def _validate_manifest(manifest: SplitManifestV1) -> None:
         roles = {assignments[group_id] for group_id in component.group_ids}
         if len(roles) != 1:
             raise ValueError(
-                "Identity/style/seed/layout-linked groups cannot cross split roles."
+                "Identity/style/seed-linked groups cannot cross split roles."
             )
     for field_name in _ISOLATION_FIELDS:
         roles_by_value: dict[str, set[str]] = {}
@@ -963,6 +1001,17 @@ def _validate_manifest(manifest: SplitManifestV1) -> None:
         )
     for mechanism in mechanisms:
         primary_stratum = primary[mechanism]
+        primary_layout_groups = {
+            group.layout_group
+            for group in manifest.groups
+            if group.mechanism == mechanism
+            and group.layout_stratum == primary_stratum
+        }
+        if len(primary_layout_groups) != 1:
+            raise ValueError(
+                "Primary identity shift must use one concrete layout_group for "
+                f"mechanism {mechanism!r}."
+            )
         primary_roles = {
             assignments[group.group_id]
             for group in manifest.groups

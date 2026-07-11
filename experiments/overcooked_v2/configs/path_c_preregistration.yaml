@@ -157,7 +157,7 @@ synthetic_factorial:
   admission_value_source: exact_oracle_or_strict_equivalence_confidence_interval
 
 split:
-  schema_version: path_c_split_manifest_v2
+  schema_version: path_c_split_manifest_v3
   enable: true
   manifest_sha256:
   roles: [train, design, calibration, locked_audit]

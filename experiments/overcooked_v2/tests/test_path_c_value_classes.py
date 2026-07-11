@@ -71,7 +71,7 @@ def _manifest(*, n_folds: int = 3) -> SplitManifestV1:
                 identity_group=f"identity-{index}",
                 style_group=f"style-{index}",
                 seed_group=f"seed-{index}",
-                layout_group=f"layout-{index}",
+                layout_group="asymm_advantages",
                 layout_stratum="layout-control",
             )
             for index in range(MIN_GROUPS_PER_MECHANISM)

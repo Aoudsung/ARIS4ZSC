@@ -357,7 +357,8 @@
         "experiments/overcooked_v2/path_c_evaluation.py"
       ],
       "test_ids": [
-        "experiments/overcooked_v2/tests/test_path_c_split.py::test_split_manifest_covers_four_roles_per_mechanism_and_isolates_groups",
+        "experiments/overcooked_v2/tests/test_path_c_split.py::test_split_manifest_covers_four_roles_with_one_primary_layout",
+        "experiments/overcooked_v2/tests/test_path_c_split.py::test_primary_identity_shift_rejects_multiple_concrete_layouts_in_one_stratum",
         "experiments/overcooked_v2/tests/test_path_c_split.py::test_primary_identity_and_secondary_layout_views_are_separate",
         "experiments/overcooked_v2/tests/test_path_c_split.py::test_role_local_cross_fitting_has_a_bound_description_and_hash",
         "experiments/overcooked_v2/tests/test_path_c_split.py::test_numeric_seed_schedule_is_frozen_unique_and_group_specific",

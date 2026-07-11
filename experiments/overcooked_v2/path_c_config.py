@@ -101,7 +101,7 @@ def default_path_c_config() -> dict[str, Any]:
         },
         "split": {
             "enable": False,
-            "schema_version": "path_c_split_manifest_v2",
+            "schema_version": "path_c_split_manifest_v3",
             "manifest_path": None,
             "roles": ["train", "design", "calibration", "locked_audit"],
             "minimum_groups_per_mechanism": 4,

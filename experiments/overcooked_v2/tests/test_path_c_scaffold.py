@@ -39,7 +39,7 @@ def _independent_groups(count: int = 4) -> tuple[SplitGroupV1, ...]:
             identity_group=f"identity-{index}",
             style_group=f"style-{index}",
             seed_group=f"seed-{index}",
-            layout_group=f"layout-template-{index}",
+            layout_group="asymm_advantages",
             layout_stratum="shared-layout-control",
         )
         for index in range(count)

@@ -540,7 +540,7 @@ def _frozen_payload(
                 identity_group=f"identity-{index}",
                 style_group=f"style-{index}",
                 seed_group=f"seed-{index}",
-                layout_group=f"layout-{index}",
+                layout_group="asymm_advantages",
                 layout_stratum="layout-control",
             )
             for index in range(20)

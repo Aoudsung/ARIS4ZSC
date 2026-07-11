@@ -61,7 +61,7 @@ The preregistration remains an inadmissible template with unfilled numeric and
 semantic-hash slots. No Path C training, data generation, instrument result, primary
 result, or scientific readout is recorded.
 
-R003 remains incomplete after a fail-closed CUDA JAX compatibility scan on GPU 5.
+R003 remains in progress after a fail-closed CUDA JAX compatibility scan on GPU 5.
 All four proposal candidate layouts expose 96-dimensional public observations, but
 their option counts are 28, 28, 26 and 27 and their ordered option identifiers differ.
 Across all 23 registered JaxMARL layouts, 22 satisfy the two-agent evidence contract;
@@ -71,9 +71,12 @@ the four role-isolated layouts required by the proposal. The bound Type-A artifa
 with SHA-256
 `6268916dc37a5571e024224e919e596e3d80e1346cd3c86d74266ee8db4798a1`.
 The current single `EgoEvidenceSpecV1` vocabulary and raw numeric probe scripts would
-therefore change action meaning across roles. No split, battery or preregistration was
-falsely frozen. The single next action is to implement a cross-layout option contract:
-each layout maps local options to shared stable action slots and masks absent actions.
+therefore change action meaning across layouts. The project does not add a cross-layout
+action layer: it was not required by the primary scientific question and would add
+method complexity. The primary identity experiment now fixes `asymm_advantages` across
+all four roles while isolating identity, style and seed groups; layout shift remains a
+separate secondary analysis. Final battery size, group count and numeric seeds remain
+calibration outputs rather than premature R003 bindings.
 
 Three modules remain deliberately `planned`. The static revision now includes a
 cross-fitted ecological return estimator that excludes the target episode outcome,

@@ -64,11 +64,13 @@ and the active project line is now Path C.
   构造与 option 库构造，`long_room` 因只有一个智能体而被固定双智能体证据合同拒绝。
   22 个可用布局中，按“观测维度 + 有序 option 名称与编号”分组的最大组大小为 1，低于
   四角色隔离所需的 4；不存在可直接复用的四布局组合。
-- 判定：R003 失败关闭并保持未完成。当前 `EgoEvidenceSpecV1` 只有一个 option 词表，
-  `ProbeScriptV1` 又直接冻结数值 option 编号；若现在填写清单，同一编号会跨角色改变动作
-  含义。没有生成伪造的 split、battery 或预注册冻结副本，R010 及后续运行继续阻塞。
-- 单一下一步：实现并测试跨布局统一 option 合同，即把每个布局的本地 option 映射到同一组
-  稳定动作槽位，同时保留缺失动作的合法性掩码；在该合同成立前不继续冻结 R003。
+- 判定：不能让四个不同布局共用当前单一 `EgoEvidenceSpecV1` 和裸 option 编号电池。用户随后
+  明确要求删除非科研必需的绑定与门控；因此不实现跨布局动作映射层。主 identity 实验改为
+  四角色固定同一 `asymm_advantages` 布局，只隔离 identity、style 与 seed group；layout
+  shift 使用另一布局单列为 secondary。这也避免把 layout 与 identity 同时移出分布。
+- R003 保持进行中而非失败：split manifest 第三版已删除跨角色 layout 隔离，同时要求主
+  identity stratum 使用一个具体布局。最终 battery 数量、身份组数与数值 seed 仍由后续
+  calibration 决定，不提前制造哈希闭包。
 - 绑定产物：远端
   `.codex_remote_validation/path_c_r003_all_layout_semantics_bound_fc647fb_20260711.json`，
   SHA-256 为 `6268916dc37a5571e024224e919e596e3d80e1346cd3c86d74266ee8db4798a1`。
