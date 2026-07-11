@@ -29,6 +29,17 @@ and the active project line is now Path C.
 - 日志：远端 `.codex_remote_validation/path_c_full_20260711_final_all.log`；SHA-256 为 `637f3c6c9e21926578558bcc6a87cca6b7b9a65d39f6f2139fd80cd8dd64dba6`。
 - 状态限制：测试对象是基于 `07fa7a63f3a61a95616f4748fd11eb634afd3c5b` 的未提交修订。模块注册表因此只把全套件执行状态改为 `passed`，不把任何模块提升为 `tested` 或 `frozen`；提升仍需最终提交并绑定逐测试通过记录。
 
+### 2026-07-11 Path C P1–P5 代码评审修订验证 — PASS（Type-A，非科学结果）
+- 评审来源：`review_bundles/path_c_v3_code_review_20260711/FINDINGS.md`。修订覆盖阶段化判定、64 位 seed 身份链、完整 group×seed 排程、探针数值域和被弱化的生产路径测试。
+- 可见性证明：先只恢复测试，远端出现 13 个预期失败；日志为 `.codex_remote_validation/path_c_findings_p1_p5_red_20260711.log`。
+- 目标回归：23 项新增或恢复测试全部通过；日志为 `.codex_remote_validation/path_c_findings_p1_p5_target_green_20260711.log`。
+- 完整回归：退出码 0；290 项全部通过、0 项跳过、0 项失败；日志为 `.codex_remote_validation/path_c_findings_p1_p5_full_20260711.log`。
+- 代码绑定：P1–P5 修订已提交为 `fc647fb00255c5bfc58253a38fa145cb8864afd7`。
+- 提交绑定的 CPU 诊断：290 项通过、0 项跳过；只用于确认工具链故障不是代码断言失败，不能替代 CUDA 验收。
+- CUDA 工具链事故：首次直接调用系统 CUDA 11.8 `ptxas`，因不支持 JAX 生成的 PTX 8.3 在收集阶段失败；切换到虚拟环境 CUDA 12.9 后，GPU 3 又报告不可纠正 ECC 错误，因此该卡被排除。
+- 提交绑定的正式 CUDA 验收：GPU 5 的不可纠正 ECC 计数为 0；JAX 0.4.38 / jaxlib 0.4.38 在 GPU backend 完成实际编译计算，随后完整套件 290 项通过、0 项跳过、0 项失败，耗时 423.81 秒。日志为 `.codex_remote_validation/path_c_r002_bound_fc647fb_cuda_gpu5_20260711.log`，SHA-256 为 `6b30b0cd623ebe650f3ea084de2dafb8cea64aef7bb8413587ab70c6b17fbc85`；JUnit 逐测试报告为 `.codex_remote_validation/path_c_r002_bound_fc647fb_cuda_gpu5_20260711.xml`，SHA-256 为 `d40b43bc7084c8ce916bbc537fd7a6919da28b8b3a760ef552b197b3199f97ab`。
+- 状态：具备完整注册测试覆盖的 21 个模块提升为 `tested`；C2、C5、D1 仍为 `planned`。预注册未冻结，E0、训练、design 选择、locked audit 与任何科学读数均未运行。
+
 ### 2026-07-09 CUDA/JAX 远程环境体检 — PASS（Type-A，非科学结果）
 - 范围: 只修复 `zsc-customer` 上项目运行环境对 JAX/CUDA 的选择；不改系统
   `/usr/local/cuda`，不重装 JAX，不运行训练，不生成 Path C 科学读数。

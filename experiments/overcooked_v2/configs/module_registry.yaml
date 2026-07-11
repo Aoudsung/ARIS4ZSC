@@ -1,8 +1,8 @@
 {
   "schema_version": "path_c_module_registry_v1",
   "registry_version": "path_c_v3_review_remediation_2026_07_10",
-  "source_git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
-  "worktree_binding": "uncommitted_revision_on_source_git_sha; remote 269-test full-suite exit 0 with no skips on 2026-07-11 and log SHA-256 637f3c6c9e21926578558bcc6a87cca6b7b9a65d39f6f2139fd80cd8dd64dba6; replace with the final commit before tested or frozen status",
+  "source_git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
+  "worktree_binding": "code commit fc647fb00255c5bfc58253a38fa145cb8864afd7; remote CUDA JAX full suite on GPU 5 passed 290 tests with no skips on 2026-07-11; log SHA-256 6b30b0cd623ebe650f3ea084de2dafb8cea64aef7bb8413587ab70c6b17fbc85; JUnit report SHA-256 d40b43bc7084c8ce916bbc537fd7a6919da28b8b3a760ef552b197b3199f97ab; CUDA validation log .codex_remote_validation/path_c_cuda_jax_fc647fb_20260711.log",
   "allowed_statuses": ["planned", "implemented", "tested", "frozen"],
   "test_execution_status": "passed",
   "status_meaning": {
@@ -14,8 +14,8 @@
   "modules": [
     {
       "id": "A1_CONFIG_BINDING",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_config.py",
         "experiments/overcooked_v2/path_c_evaluation.py",
@@ -28,8 +28,8 @@
     },
     {
       "id": "A2_PRIME_RECURRENT_SEQUENCE",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_sequence.py",
         "experiments/overcooked_v2/train_aris.py",
@@ -44,8 +44,8 @@
     },
     {
       "id": "A3_SEQUENCE_TEMPORAL_DIFFERENCE",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_sequence.py",
         "experiments/overcooked_v2/train_aris.py",
@@ -60,8 +60,8 @@
     },
     {
       "id": "A4_NORMALIZED_ADVANTAGE_PROBE",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/residual_signature.py",
         "experiments/overcooked_v2/train_aris.py",
@@ -76,8 +76,8 @@
     },
     {
       "id": "A5_BASE_RESIDUAL_SECONDARY",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/residual_signature.py",
         "experiments/overcooked_v2/scripts/diag_d1_dataset.py",
@@ -89,8 +89,8 @@
     },
     {
       "id": "B1_SYNTHETIC_FACTORIAL",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/partner_modes.py",
         "experiments/overcooked_v2/partner_pool.py",
@@ -103,10 +103,11 @@
     },
     {
       "id": "B2_RESPONSE_AND_STORAGE",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_response_summary.py",
+        "experiments/overcooked_v2/path_c_seed.py",
         "experiments/overcooked_v2/scripts/diag_d1_dataset.py",
         "experiments/overcooked_v2/path_c_evaluation.py"
       ],
@@ -114,13 +115,15 @@
         "experiments/overcooked_v2/tests/test_path_c_response_summary.py::test_response_summary_has_stable_finite_vocabulary_and_hash",
         "experiments/overcooked_v2/tests/test_path_c_response_summary.py::test_response_summary_special_outcomes_have_explicit_token_ids",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_counts_are_recomputed_from_parquet_rows",
-        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_probe_cost_is_recomputed_from_parquet_rows"
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_probe_cost_is_recomputed_from_parquet_rows",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_production_parquet_writer_preserves_unsigned_seed_identity",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_training_loader_keeps_unsigned_seed_shards_exact"
       ]
     },
     {
       "id": "B3_ECOLOGICAL_VALUE_CLASSES",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_value_classes.py",
         "experiments/overcooked_v2/scripts/diag_d1_dataset.py",
@@ -136,8 +139,8 @@
     },
     {
       "id": "C1_RESPONSE_READOUT_SECONDARY",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/scripts/diag_d1_train.py",
         "experiments/overcooked_v2/path_c_evaluation.py"
@@ -151,7 +154,7 @@
     {
       "id": "C2_PRIMARY_RETURN_BUDGET_AUC",
       "status": "planned",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_protocol.py",
         "experiments/overcooked_v2/path_c_return_artifacts.py",
@@ -162,13 +165,14 @@
         "experiments/overcooked_v2/tests/test_path_c_protocol.py::test_strongest_baseline_is_selected_once_on_design_only",
         "experiments/overcooked_v2/tests/test_path_c_protocol.py::test_locked_primary_is_paired_by_held_out_identity_cluster",
         "experiments/overcooked_v2/tests/test_path_c_return_artifacts.py::test_return_point_ledger_rejects_duplicate_numeric_seed_cells",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_return_ledger_rejects_missing_registered_group_seed_cells",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_design_and_locked_results_are_recomputed_from_separate_raw_ledgers"
       ]
     },
     {
       "id": "C3_RETAINED_DECISION_CODE",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/residual_signature.py",
         "experiments/overcooked_v2/scripts/diag_d1_dataset.py",
@@ -181,8 +185,8 @@
     },
     {
       "id": "C4_POWER_AND_SECONDARY_REPORT",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_protocol.py",
         "experiments/overcooked_v2/scripts/diag_d1_train.py",
@@ -197,7 +201,7 @@
     {
       "id": "C5_ACTING_BASELINE_BENCHMARK",
       "status": "planned",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_protocol.py",
         "experiments/overcooked_v2/path_c_return_artifacts.py",
@@ -213,24 +217,25 @@
     },
     {
       "id": "C6_TWO_STAGE_DECISION",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_evaluation.py",
         "experiments/overcooked_v2/scripts/path_c_pass_rule.py"
       ],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_decision_precedence_is_software_then_instrument_then_primary",
-        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_primary_not_run_manifest_assembly_does_not_require_locked_ledger",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_real_stage_manifests_reach_the_official_decision_path",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_historical_go_and_pass_entry_points_cannot_restore_v2_semantics"
       ]
     },
     {
       "id": "I1_IMMUTABLE_OCV2_SNAPSHOT",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/env_adapter.py",
+        "experiments/overcooked_v2/path_c_seed.py",
         "experiments/overcooked_v2/path_c_belief_audit.py",
         "experiments/overcooked_v2/path_c_ocv2_audit_bridge.py"
       ],
@@ -238,14 +243,15 @@
         "experiments/overcooked_v2/tests/test_ocv2_p0_p1_fixes.py::test_ocv2_adapter_snapshot_restore_and_pure_step_are_detached",
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_snapshot_is_immutable_and_binds_original_replay_keys",
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_jax_key_words_preserve_all_frozen_64_bit_seed_material",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_high_seed_bits_change_the_ocv2_execution_identity",
         "experiments/overcooked_v2/tests/test_path_c_ocv2_audit_bridge.py::test_audit_capture_is_content_addressed_and_cannot_claim_training_provenance",
         "experiments/overcooked_v2/tests/test_path_c_ocv2_audit_bridge.py::test_native_ocv2_hooks_restore_adapter_and_controller_state"
       ]
     },
     {
       "id": "I2_EXACT_SHARED_POSTERIOR",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_belief_audit.py",
         "experiments/overcooked_v2/path_c_ocv2_audit_bridge.py",
@@ -265,8 +271,8 @@
     },
     {
       "id": "I3_FULL_STATE_OUTER_SAMPLING",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": ["experiments/overcooked_v2/path_c_belief_audit.py"],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_full_state_sampler_draws_complete_outer_states_with_replacement",
@@ -278,8 +284,8 @@
     },
     {
       "id": "I4_EXACT_HISTORY_MATCHING",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": ["experiments/overcooked_v2/path_c_belief_audit.py"],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_exact_history_key_uses_raw_discrete_bytes_and_joint_actions",
@@ -289,8 +295,8 @@
     },
     {
       "id": "I5_FROZEN_AUDIT_BATTERY",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_audit_battery.py",
         "experiments/overcooked_v2/path_c_protocol.py",
@@ -305,8 +311,8 @@
     },
     {
       "id": "I6_SIMULTANEOUS_KERNEL_BOUNDS",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_belief_audit.py",
         "experiments/overcooked_v2/path_c_evaluation.py"
@@ -321,26 +327,31 @@
     },
     {
       "id": "I7_VALIDITY_CONTROLS",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_belief_audit.py",
         "experiments/overcooked_v2/path_c_audit_battery.py",
+        "experiments/overcooked_v2/path_c_probe_contract.py",
+        "experiments/overcooked_v2/path_c_config.py",
         "experiments/overcooked_v2/path_c_evaluation.py"
       ],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_full_state_outer_sampling_converges_while_naive_single_state_is_biased",
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_tier_agreement_is_an_interval_equivalence_test_not_point_equality",
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_support_violation_cannot_enter_an_ordinary_response_cell",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_frozen_probe_numeric_domains_fail_closed",
+        "experiments/overcooked_v2/tests/test_path_c_scaffold.py::test_runtime_probe_numeric_domains_fail_closed",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_software_conformance_requires_archived_registry_test_rows"
       ]
     },
     {
       "id": "I8_SPLIT_AND_CROSS_FITTING",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_split.py",
+        "experiments/overcooked_v2/path_c_seed.py",
         "experiments/overcooked_v2/path_c_value_classes.py",
         "experiments/overcooked_v2/scripts/diag_d1_dataset.py",
         "experiments/overcooked_v2/path_c_evaluation.py"
@@ -350,14 +361,16 @@
         "experiments/overcooked_v2/tests/test_path_c_split.py::test_primary_identity_and_secondary_layout_views_are_separate",
         "experiments/overcooked_v2/tests/test_path_c_split.py::test_role_local_cross_fitting_has_a_bound_description_and_hash",
         "experiments/overcooked_v2/tests/test_path_c_split.py::test_numeric_seed_schedule_is_frozen_unique_and_group_specific",
+        "experiments/overcooked_v2/tests/test_path_c_split.py::test_numeric_seed_schedule_rejects_execution_seed_collisions",
         "experiments/overcooked_v2/tests/test_path_c_value_classes.py::test_frozen_split_assignment_binds_and_returns_numeric_seed",
-        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_row_split_metadata_must_match_frozen_group"
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_row_split_metadata_must_match_frozen_group",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_rejects_missing_group_seed_cell_and_episode_seed_drift"
       ]
     },
     {
       "id": "D1_ARTIFACT_CONTRACT",
       "status": "planned",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/path_c_evaluation.py",
         "experiments/overcooked_v2/path_c_return_artifacts.py",
@@ -368,14 +381,15 @@
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_frozen_v3_preregistration_binds_all_semantic_hashes",
         "experiments/overcooked_v2/tests/test_path_c_return_artifacts.py::test_return_point_ledgers_round_trip_without_cross_role_access",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_real_stage_manifests_reach_the_official_decision_path",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_dataset_validator_rejects_roles_exposed_before_active_stage",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_policy_fairness_is_recomputed_from_raw_policy_metrics"
       ]
     },
     {
       "id": "D2_CONFORMANCE_TEST_DEFINITIONS",
-      "status": "implemented",
-      "git_sha": "07fa7a63f3a61a95616f4748fd11eb634afd3c5b",
+      "status": "tested",
+      "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
       "implementation_files": [
         "experiments/overcooked_v2/tests/test_path_c_sequence.py",
         "experiments/overcooked_v2/tests/test_path_c_response_summary.py",
@@ -387,6 +401,7 @@
         "experiments/overcooked_v2/tests/test_path_c_protocol.py",
         "experiments/overcooked_v2/tests/test_path_c_return_artifacts.py",
         "experiments/overcooked_v2/tests/test_path_c_acting_baseline.py",
+        "experiments/overcooked_v2/tests/test_path_c_scaffold.py",
         "experiments/overcooked_v2/tests/test_path_c_evaluation.py"
       ],
       "test_ids": [
@@ -394,7 +409,11 @@
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_sparse_forward_recursion_matches_tiny_horizon_brute_force",
         "experiments/overcooked_v2/tests/test_path_c_ocv2_audit_bridge.py::test_ocv2_runner_separates_replay_and_fork_keys_and_replaces_full_hidden_state",
         "experiments/overcooked_v2/tests/test_path_c_protocol.py::test_primary_curve_is_normalized_net_return_over_probe_budget",
-        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_decision_precedence_is_software_then_instrument_then_primary"
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_decision_precedence_is_software_then_instrument_then_primary",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_live_readout_split_fingerprint_probe_and_benchmark_guards",
+        "experiments/overcooked_v2/tests/test_path_c_evaluation.py::test_response_readout_retains_ordered_joint_likelihood",
+        "experiments/overcooked_v2/tests/test_path_c_scaffold.py::test_probe_choice_disabled_and_single_head_paths_do_not_inspect_heads",
+        "experiments/overcooked_v2/tests/test_path_c_scaffold.py::test_probe_choice_logs_return_floor_and_selected_target"
       ]
     }
   ]

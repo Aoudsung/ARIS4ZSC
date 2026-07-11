@@ -1,7 +1,7 @@
 # PROJECT_DASHBOARD.md
 
 **ARIS-Bellman for Zero-Shot Coordination — pipeline status & decisive-results tracker.**
-Last updated: 2026-07-10 · Read this first for "where am I" (30 seconds).
+Last updated: 2026-07-11 · Read this first for "where am I" (30 seconds).
 
 > Required entrypoint per [CLAUDE.md](CLAUDE.md). Execution rules live in
 > [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md); this file is *status*, not *permission*.
@@ -30,7 +30,7 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 | **Thesis** | The agent should recover only the residual partner abstraction that changes control beyond public state, and should do so through value-driven probes while still training the ego representation only with temporal-difference value loss. |
 | **Benchmark** | JaxMARL **OvercookedV2** (test-time protocol formation) + toy_factor_game (regression) |
 | **Target tier** | ICLR / NeurIPS / ICML class |
-| **Compute budget** | 2,200–4,500 GPU-hours (pilot: 500–1,000). Path C has no recorded run yet in this tracker; historical remote runs are logged in [docs/status/EXPERIMENT_LOG.md](docs/status/EXPERIMENT_LOG.md). |
+| **Compute budget** | 尚未冻结。训练步数、梯度更新数、独立身份组数、外层样本数和审计步数仍为空；在 calibration 吞吐与功效结果产生前不填写 GPU-hour。Path C 当前只有软件 Type-A 运行，没有科学实验结果。 |
 
 ---
 
@@ -46,10 +46,16 @@ state, so waiting and reacting captured nearly all oracle value. Those results
 are evidence for redirecting the project, not positive support for the original
 ARIS-Bellman claims.
 
-Path C is now the active line. The static third-version interfaces have been revised,
-but tests have not been run and the preregistration remains an inadmissible template
-with unfilled numeric and semantic-hash slots. No Path C training, data generation,
-instrument result, primary result, or scientific readout is recorded.
+Path C is now the active line. The third-version interfaces and the P1–P5 code-review
+findings have been revised and bound to code commit
+`fc647fb00255c5bfc58253a38fa145cb8864afd7`. On GPU 5, the remote CUDA JAX suite
+passes 290 tests with no skips; the log SHA-256 is
+`6b30b0cd623ebe650f3ea084de2dafb8cea64aef7bb8413587ab70c6b17fbc85` and the
+JUnit report SHA-256 is
+`d40b43bc7084c8ce916bbc537fd7a6919da28b8b3a760ef552b197b3199f97ab`.
+The preregistration remains an inadmissible template with unfilled numeric and
+semantic-hash slots. No Path C training, data generation, instrument result, primary
+result, or scientific readout is recorded.
 
 Three modules remain deliberately `planned`. The static revision now includes a
 cross-fitted ecological return estimator that excludes the target episode outcome,
@@ -98,7 +104,7 @@ All claim-level readouts are Type-B (cross-model + human acquittal required; see
 
 | Required result | Question | Status |
 |---|---|---|
-| Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | ⬜ TESTS DEFINED, NOT RUN |
+| Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | 🟢 CODE COMMIT + CUDA JAX 290-TEST REPORT BOUND; FROZEN PREREGISTRATION STILL MISSING |
 | Instrument validity | Do the preregistered checks pass and does `beta_lower > alpha_upper` using cell-specific simultaneous bounds? | ⬜ NOT RUN |
 | Design/calibration freeze | Were summary, battery, strongest deployable baseline, margins and sample sizes fixed without locked-audit access? | ⬜ NOT FROZEN |
 | Locked primary efficacy | Is the lower confidence bound of cross-identity normalized net-return versus probe-budget area-under-the-curve difference greater than the frozen margin? | ⬜ NOT RUN |
@@ -202,38 +208,40 @@ find these. Decide: move, or symlink, or pin the path in `.aris/config.json`.
 ### Path C module traceability
 
 The machine-readable source is `experiments/overcooked_v2/configs/module_registry.yaml`.
-`implemented` means that static source exists. The remote full suite passed on
-2026-07-11 with 269 passed and no skipped tests, but no entry is promoted to
-`tested`: the run used an uncommitted revision and no per-test passing-row report
-is bound to a final commit. Nothing is frozen.
+The P1–P5 code object is bound to commit
+`fc647fb00255c5bfc58253a38fa145cb8864afd7`; its remote CUDA JAX run passed 290
+tests with no skips and archived a JUnit report hash. Modules with complete registered
+test coverage are therefore `tested`. C2, C5 and D1 remain `planned` because they
+require training, design selection and frozen semantic/numeric bindings. Nothing is
+`frozen`.
 
 <!-- PATH_C_MODULE_TRACEABILITY:BEGIN -->
 | Module ID | Status |
 |---|---|
-| A1_CONFIG_BINDING | implemented |
-| A2_PRIME_RECURRENT_SEQUENCE | implemented |
-| A3_SEQUENCE_TEMPORAL_DIFFERENCE | implemented |
-| A4_NORMALIZED_ADVANTAGE_PROBE | implemented |
-| A5_BASE_RESIDUAL_SECONDARY | implemented |
-| B1_SYNTHETIC_FACTORIAL | implemented |
-| B2_RESPONSE_AND_STORAGE | implemented |
-| B3_ECOLOGICAL_VALUE_CLASSES | implemented |
-| C1_RESPONSE_READOUT_SECONDARY | implemented |
+| A1_CONFIG_BINDING | tested |
+| A2_PRIME_RECURRENT_SEQUENCE | tested |
+| A3_SEQUENCE_TEMPORAL_DIFFERENCE | tested |
+| A4_NORMALIZED_ADVANTAGE_PROBE | tested |
+| A5_BASE_RESIDUAL_SECONDARY | tested |
+| B1_SYNTHETIC_FACTORIAL | tested |
+| B2_RESPONSE_AND_STORAGE | tested |
+| B3_ECOLOGICAL_VALUE_CLASSES | tested |
+| C1_RESPONSE_READOUT_SECONDARY | tested |
 | C2_PRIMARY_RETURN_BUDGET_AUC | planned |
-| C3_RETAINED_DECISION_CODE | implemented |
-| C4_POWER_AND_SECONDARY_REPORT | implemented |
+| C3_RETAINED_DECISION_CODE | tested |
+| C4_POWER_AND_SECONDARY_REPORT | tested |
 | C5_ACTING_BASELINE_BENCHMARK | planned |
-| C6_TWO_STAGE_DECISION | implemented |
-| I1_IMMUTABLE_OCV2_SNAPSHOT | implemented |
-| I2_EXACT_SHARED_POSTERIOR | implemented |
-| I3_FULL_STATE_OUTER_SAMPLING | implemented |
-| I4_EXACT_HISTORY_MATCHING | implemented |
-| I5_FROZEN_AUDIT_BATTERY | implemented |
-| I6_SIMULTANEOUS_KERNEL_BOUNDS | implemented |
-| I7_VALIDITY_CONTROLS | implemented |
-| I8_SPLIT_AND_CROSS_FITTING | implemented |
+| C6_TWO_STAGE_DECISION | tested |
+| I1_IMMUTABLE_OCV2_SNAPSHOT | tested |
+| I2_EXACT_SHARED_POSTERIOR | tested |
+| I3_FULL_STATE_OUTER_SAMPLING | tested |
+| I4_EXACT_HISTORY_MATCHING | tested |
+| I5_FROZEN_AUDIT_BATTERY | tested |
+| I6_SIMULTANEOUS_KERNEL_BOUNDS | tested |
+| I7_VALIDITY_CONTROLS | tested |
+| I8_SPLIT_AND_CROSS_FITTING | tested |
 | D1_ARTIFACT_CONTRACT | planned |
-| D2_CONFORMANCE_TEST_DEFINITIONS | implemented |
+| D2_CONFORMANCE_TEST_DEFINITIONS | tested |
 <!-- PATH_C_MODULE_TRACEABILITY:END -->
 
 ---
