@@ -21,6 +21,14 @@ and the active project line is now Path C.
 - **下一条可记录事件。** Path C 预注册冻结或 Phase A 静态核验完成；不得把任何小批量接线
   检查读成科学结论。
 
+### 2026-07-11 Path C 远端完整软件测试 — PASS（Type-A，非科学结果）
+- 范围：只验证 `experiments/overcooked_v2/tests`；本地未运行项目代码、训练或实验。
+- 远端：`zsc-customer` 的 `/apps/users/cxw/Document/CodeSpace/Selfs/CPR_REPO`，GPU5，项目虚拟环境与 CUDA 12 包装脚本。
+- 依赖修订：完整运行首次发现 `pyarrow` 未声明，导致九项 Parquet 测试跳过；现已将 `pyarrow>=14.0` 加入项目依赖，远端安装版本为 25.0.0。启用后修复了无符号 64 位 seed 写入溢出，并把重复的分组 seed 校验缓存为每个唯一分组与 seed 组合只校验一次。
+- 最终结果：退出码 0；269 项全部通过、0 项跳过、0 项失败。
+- 日志：远端 `.codex_remote_validation/path_c_full_20260711_final_all.log`；SHA-256 为 `637f3c6c9e21926578558bcc6a87cca6b7b9a65d39f6f2139fd80cd8dd64dba6`。
+- 状态限制：测试对象是基于 `07fa7a63f3a61a95616f4748fd11eb634afd3c5b` 的未提交修订。模块注册表因此只把全套件执行状态改为 `passed`，不把任何模块提升为 `tested` 或 `frozen`；提升仍需最终提交并绑定逐测试通过记录。
+
 ### 2026-07-09 CUDA/JAX 远程环境体检 — PASS（Type-A，非科学结果）
 - 范围: 只修复 `zsc-customer` 上项目运行环境对 JAX/CUDA 的选择；不改系统
   `/usr/local/cuda`，不重装 JAX，不运行训练，不生成 Path C 科学读数。

@@ -26,7 +26,7 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 |---|---|
 | **Title** | Zero-Shot Coordination via Bellman Control over Value-Sufficient Interaction Factor Beliefs |
 | **Current line** | Path C = active value probing for value-sufficient residual partner abstractions. It is the active replacement line after the earlier asymmetric-layout + role-conditioned v2 partner line and Link-A substrate certificates failed to produce a publishable positive claim. |
-| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md) (V2, belief-resampled audit §4.5), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md) (supersedes removed PATH_C_T1_PROOF.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md) |
+| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md)；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
 | **Thesis** | The agent should recover only the residual partner abstraction that changes control beyond public state, and should do so through value-driven probes while still training the ego representation only with temporal-difference value loss. |
 | **Benchmark** | JaxMARL **OvercookedV2** (test-time protocol formation) + toy_factor_game (regression) |
 | **Target tier** | ICLR / NeurIPS / ICML class |
@@ -36,8 +36,7 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 
 ## 2. Pipeline status — CURRENT STAGE
 
-**Stage: Path C Phase A — static takeover, implementation audit, and
-preregistration freeze.**
+**Stage: Path C third-version static implementation review.**
 
 The earlier asymmetric-layout + role-conditioned v2 partner line reached a
 negative blind-test readout, and the Link-A substrate certificates reached a
@@ -47,23 +46,39 @@ state, so waiting and reacting captured nearly all oracle value. Those results
 are evidence for redirecting the project, not positive support for the original
 ARIS-Bellman claims.
 
-Path C is now the active line. The immediate work is static: make the Path C code
-path default-off, verify the planned readouts and hard baselines, and freeze the
-go/no-go preregistration. No Path C training, data generation, or scientific
-readout is recorded yet. Phase B execution remains locked until the
-preregistration is frozen and the user explicitly authorizes remote execution.
+Path C is now the active line. The static third-version interfaces have been revised,
+but tests have not been run and the preregistration remains an inadmissible template
+with unfilled numeric and semantic-hash slots. No Path C training, data generation,
+instrument result, primary result, or scientific readout is recorded.
 
-2026-07-10 instrument correction (three external review rounds): forking one saved
-simulator checkpoint only estimates the response law of the *realized* hidden state,
-not the belief-averaged kernel the certificate needs. Kernel readouts must use
-belief-resampled posterior-state replicas — Tier 1 = exact enumeration + forward
-replay over the finite partner registry; Tier 2 = grouping full-state snapshots by
-exact ego-observable history. Spec: [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md)
-§4.5 + [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md) §7–§8; freeze items in
-[PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md) §J and
-`configs/path_c_preregistration.yaml` (`belief_kernel_audit`). E0 must build this
-instrument before any kernel readout; the existing pooled-cell kernel audit in
-`path_c_evaluation.py` is the coarse distributional fallback, not the estimator.
+Three modules remain deliberately `planned`. The static revision now includes a
+cross-fitted ecological return estimator that excludes the target episode outcome,
+a content-addressed secondary-profile recomputation path, a restorable OCV2 adapter,
+restorable partner controllers, and a split-manifest-bound numeric seed chain from
+collection through evaluation. Exact posterior inference now binds the registered
+generation controllers, enumerates hidden option choices over the complete primitive
+action and public-state path, and uses the same option distribution as generation. The
+unresolved work is producing admissible trained acting baseline artifacts, completing
+the return-budget primary dependency chain, and freezing the final claim-critical
+artifact contract against a real commit. Weak or missing acting artifacts fail closed,
+locked-audit ledgers are inaccessible while the primary result is marked not run, and
+secondary mappings cannot create or veto a decision. This project is therefore not
+benchmark-ready.
+
+The instrument correction is binding: a single saved simulator state estimates only
+the response law conditional on that realized hidden state. Every outer replicate must
+instead draw the complete hidden state `U=(theta, execution_state)` independently from
+the posterior given the registered history. `M` counts those complete-state draws;
+`L_inner` only estimates future continuation noise. Exact enumeration supplies the
+posterior from which complete states are sampled; an analytically weighted mixture is
+secondary unless it receives a matching concentration proof. Exact mode cannot prune
+positive posterior mass.
+
+The response kernel uses the finite vocabulary from `ResponseSummarySpecV1`; all
+history-based agents share `EgoEvidenceSpecV1`; and train, design, calibration and
+locked-audit roles are group-disjoint. Replay uses original random keys, while audit
+forks use fresh named random streams. An identical immutable snapshot and fork
+coordinate must reproduce the same output without mutating the source snapshot.
 
 ---
 
@@ -74,18 +89,20 @@ but none of its claims has recorded support suitable for paper writing.
 
 Path C's key object is `W_C`: the public-context residual value quotient, meaning
 the smallest partner abstraction that changes control after public state is
-already known. `F_C` means a value-irrelevant identity or style fingerprint that
-may predict raw behavior but must not explain the retained value representation.
+already known. The primary retained code is the normalized advantage decision code;
+subtracting a learned public-state baseline is only a secondary diagnostic. `F_C`
+means a value-irrelevant identity or style fingerprint that may predict raw behavior
+but must not explain the retained value representation.
 All claim-level readouts are Type-B (cross-model + human acquittal required; see
 [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md) §4).
 
-| Check | Question | Status |
+| Required result | Question | Status |
 |---|---|---|
-| Signal over hard baselines | Does the Path C representation predict the value-relevant probe response better than public-state, full-history recurrent, identity, and Bayesian/HMM belief-filter baselines at matched budget? | ⬜ NOT RUN |
-| Cross-identity transfer | Does the same signal survive when identity, surface style, seed, and layout style are disjoint but the mechanism is the same? | ⬜ NOT RUN |
-| Fingerprint exclusion | Is the retained representation unable to rely on `F_C`? | ⬜ NOT RUN |
-| Power and null | Does the measurement recover known `W_C` on the synthetic positive and return empty on a terminal-axis null at the same budget? | ⬜ NOT RUN |
-| Go/no-go | Do the frozen Path C checks jointly pass before any wider experiment is started? | ⬜ BLOCKED ON PREREGISTRATION + AUTHORIZATION |
+| Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | ⬜ TESTS DEFINED, NOT RUN |
+| Instrument validity | Do the preregistered checks pass and does `beta_lower > alpha_upper` using cell-specific simultaneous bounds? | ⬜ NOT RUN |
+| Design/calibration freeze | Were summary, battery, strongest deployable baseline, margins and sample sizes fixed without locked-audit access? | ⬜ NOT FROZEN |
+| Locked primary efficacy | Is the lower confidence bound of cross-identity normalized net-return versus probe-budget area-under-the-curve difference greater than the frozen margin? | ⬜ NOT RUN |
+| Secondary mechanisms | Do finite-token response, normalized-advantage representation, fingerprint leakage, power/null and ecological cross-fitted value-bin analyses support the scoped interpretation? | ⬜ NOT RUN |
 
 Source of truth for run status: [EXPERIMENT_TRACKER.md](idea-stage/refine-logs/EXPERIMENT_TRACKER.md)
 (execution checklist) + `docs/status/EXPERIMENT_LOG.md` (results record — active;
@@ -98,8 +115,9 @@ ARIS convention, see §6).
 | Phase / skill | Locked until… |
 |---------------|---------------|
 | Path C Phase A — static build and audit | Unlocked for static maintenance only: file edits, code inspection, configuration drafting, and preregistration drafting. No local tests or runs. |
-| Path C Phase B — go/no-go execution | Path C preregistration frozen, static checks reviewed, and explicit user authorization for remote execution. Each run must read back effective data budget from artifacts. |
-| Path C Phase C — full paper-facing evaluation | Phase B returns GO under the frozen rule and Type-B readout agrees that continuing is justified. |
+| Path C software and instrument validation | Static implementation reviewed, tests authorized and actually passed, preregistration fully frozen, static cost estimate accepted, and explicit remote-run authorization recorded. Each run must read back effective data budget from artifacts. |
+| Path C locked primary evaluation | Software conformance and instrument validity have recorded evidence; design/calibration choices and hashes are frozen before locked-audit access. |
+| Path C secondary mechanism evaluation | The locked primary confidence-interval lower bound strictly exceeds the preregistered margin, and Type-B review agrees the scoped continuation is justified. |
 | `/auto-review-loop` (W2) | ≥1 decisive result supported by cross-model verdict |
 | `/paper-writing` (W3) | `NARRATIVE_REPORT.md` exists + main claims supported |
 
@@ -115,10 +133,35 @@ science, not just the run. Full lists: [OvercookedV2_plan.md](artifacts/Overcook
 
 Core set — checked mechanically by [`.aris/tools/aris_bellman_fidelity_gate.py`](.aris/tools/aris_bellman_fidelity_gate.py) (checks I1–I9; static, runs in-boundary; ✅ green on current tree). Per [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md) §7 this gate is a **pre-claim / pre-deploy audit**: require it green before reading a claim or deploying changed method code, not before every run start.
 
-- **No G-TVOI / MI selector** in the deployed method. `Δ_info` and MI are *post-hoc
-  diagnostics only*. Action selection is pure Bellman `argmax_ω Q(s,b,ω)`.
+- **No mutual-information training objective.** Path C training probes may use
+  preregistered normalized-advantage ensemble disagreement, with propensity, support,
+  budget and cost logged. It does not add an information-gain loss. Ordinary
+  exploitation remains Bellman action-value maximization; direct-information probing
+  is a design-only diagnostic baseline.
 - **Single TD loss.** No response-prediction / calibration / sparsity / supervised
   factor-label / probe-selection losses in the main method.
+- **Shared history contract.** Main and deployable history baselines receive the same
+  `EgoEvidenceSpecV1`; identity, mechanism and style never enter it.
+- **Primary endpoint first.** The decisive comparison is cross-identity normalized
+  net-return versus probe-budget area under the curve against the strongest baseline
+  selected on the design split. Response prediction is secondary.
+- **Complete-state outer draws.** Each belief-kernel outer replicate independently
+  samples the complete hidden state. Inner continuations do not increase the outer
+  sample count.
+- **Finite canonical response.** The theorem-level kernel uses one token from the
+  frozen `ResponseSummarySpecV1`; structured multi-label outputs are secondary.
+- **Cost must pass before launch.** The static audit-cost artifact reads all dimensions
+  and the maximum primitive-step budget from the frozen preregistration. A cost above
+  that budget fails before any rollout starts.
+- **Decision order is fixed.** Software conformance and the cost artifact are checked
+  first, followed by instrument validity, the frozen design baseline, locked primary
+  efficacy, and only then secondary mechanism analyses.
+- **Summaries are recomputed.** Software conformance binds archived module-registry
+  test rows; instrument alpha/beta is rebuilt from outer-cluster token cells; design
+  and locked primary statistics are rebuilt from separate complete episode ledgers.
+- **Dataset roles are derived.** Version-3 collection accepts a frozen split group,
+  derives its role from `SplitManifestV1`, and the evaluator parses Parquet rows to
+  recompute episode, transition and group coverage rather than trusting manifest totals.
 - **CE is preprocessing.** Never estimate CE inside the training loop.
 - **Reward-scale consistency** across preflight, CE local returns, and training target.
 - **Articulation-point bottlenecks**, not `degree ≤ 2`. This is a pre-claim audit for
@@ -126,8 +169,10 @@ Core set — checked mechanically by [`.aris/tools/aris_bellman_fidelity_gate.py
 - **Factor deletion removes 3 things**: latent state + evidence route + action
   relevance. This is a pre-ablation audit — run it before the Exp-3 value-sufficiency
   ablation and before reading its claim, not as a start gate.
-- **No true-factor oracle and no factor-accuracy as a main V2 metric.** Use
-  control-grounded reference-gap closure.
+- **No oracle labels in deployable agents.** Identity, mechanism, style and true value
+  classes never enter deployable evidence or training. Synthetic registry truth is
+  allowed only for instrument controls, value-class labels and explicitly separated
+  oracle diagnostics; it is not a deployable benchmark input.
 
 Preflight is the one hard *start* gate; it now lives with the Formal Exp 1–5 gate in
 §4 (see [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md) §2 for `--preflight_path`).
@@ -144,15 +189,52 @@ Preflight is the one hard *start* gate; it now lives with the Formal Exp 1–5 g
 | Experiment log (results) | `docs/status/EXPERIMENT_LOG.md` | ✅ active |
 | Path C proposal | `idea-stage/refine-logs/PATH_C_PROPOSAL.md` | ✅ active current line |
 | Path C execution plan | `idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md` | ✅ active current plan |
-| Path C preregistration | `idea-stage/refine-logs/PATH_C_PREREGISTRATION.md` | 🟡 draft, numeric fields pending freeze |
-| Path C module design | `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md` | 🟡 draft / static build map |
-| Findings log | `findings.md` | ⬜ missing — ARIS convention for debug/decision log |
+| Path C preregistration | `idea-stage/refine-logs/PATH_C_PREREGISTRATION.md` | 🟡 third-version template; numeric and semantic hashes not frozen |
+| Path C module design | `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md` | ✅ third-version static map; remote full suite passed |
+| Path C module registry | `experiments/overcooked_v2/configs/module_registry.yaml` | ✅ remote suite exit 0; entries remain implemented or planned until a final commit and per-test archived rows exist |
 | Migration plan | `artifacts/OvercookedV2_plan.md` | ✅ |
 
 **Divergence to reconcile (low priority):** ARIS convention is `refine-logs/` at
 project root (sibling of `idea-stage/`); this project nests it as
 `idea-stage/refine-logs/`. Downstream skills that hardcode `refine-logs/…` may not
 find these. Decide: move, or symlink, or pin the path in `.aris/config.json`.
+
+### Path C module traceability
+
+The machine-readable source is `experiments/overcooked_v2/configs/module_registry.yaml`.
+`implemented` means that static source exists. The remote full suite passed on
+2026-07-11 with 269 passed and no skipped tests, but no entry is promoted to
+`tested`: the run used an uncommitted revision and no per-test passing-row report
+is bound to a final commit. Nothing is frozen.
+
+<!-- PATH_C_MODULE_TRACEABILITY:BEGIN -->
+| Module ID | Status |
+|---|---|
+| A1_CONFIG_BINDING | implemented |
+| A2_PRIME_RECURRENT_SEQUENCE | implemented |
+| A3_SEQUENCE_TEMPORAL_DIFFERENCE | implemented |
+| A4_NORMALIZED_ADVANTAGE_PROBE | implemented |
+| A5_BASE_RESIDUAL_SECONDARY | implemented |
+| B1_SYNTHETIC_FACTORIAL | implemented |
+| B2_RESPONSE_AND_STORAGE | implemented |
+| B3_ECOLOGICAL_VALUE_CLASSES | implemented |
+| C1_RESPONSE_READOUT_SECONDARY | implemented |
+| C2_PRIMARY_RETURN_BUDGET_AUC | planned |
+| C3_RETAINED_DECISION_CODE | implemented |
+| C4_POWER_AND_SECONDARY_REPORT | implemented |
+| C5_ACTING_BASELINE_BENCHMARK | planned |
+| C6_TWO_STAGE_DECISION | implemented |
+| I1_IMMUTABLE_OCV2_SNAPSHOT | implemented |
+| I2_EXACT_SHARED_POSTERIOR | implemented |
+| I3_FULL_STATE_OUTER_SAMPLING | implemented |
+| I4_EXACT_HISTORY_MATCHING | implemented |
+| I5_FROZEN_AUDIT_BATTERY | implemented |
+| I6_SIMULTANEOUS_KERNEL_BOUNDS | implemented |
+| I7_VALIDITY_CONTROLS | implemented |
+| I8_SPLIT_AND_CROSS_FITTING | implemented |
+| D1_ARTIFACT_CONTRACT | planned |
+| D2_CONFORMANCE_TEST_DEFINITIONS | implemented |
+<!-- PATH_C_MODULE_TRACEABILITY:END -->
 
 ---
 
