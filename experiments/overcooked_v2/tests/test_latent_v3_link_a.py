@@ -32,6 +32,22 @@ def _finish_opportunity(runtime: LatentModeRuntime, *, ego: bool = False) -> Non
     )
 
 
+def test_latent_mode_runtime_state_round_trip_restores_all_counters():
+    runtime = LatentModeRuntime(
+        LatentModeSpec("tit_for_tat", param=1, epsilon=0.0)
+    )
+    runtime.observe_option_boundary()
+    runtime.observe_public_transition(
+        gate_main=True,
+        ego_initiated=False,
+        partner_initiated=True,
+    )
+    frozen = runtime.get_state()
+    runtime.reset()
+    runtime.set_state(frozen)
+    assert runtime.get_state() == frozen
+
+
 def test_patience_yields_then_claims_after_cutoff():
     runtime = LatentModeRuntime(LatentModeSpec("patience", param=2, epsilon=0.0))
     runtime.reset(0)
@@ -164,4 +180,3 @@ def test_yield_abort_replaces_terminal_interact_and_claim_passes_through():
     ctrl._inner.current_option = 1
     out3 = ctrl._maybe_yield_abort(_interact_action(), state=object())
     assert int(out3.primitive_action) == int(_OCActions.interact)
-

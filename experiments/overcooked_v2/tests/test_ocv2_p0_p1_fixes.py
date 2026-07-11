@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import jax
 from jaxmarl.environments.overcooked_v2.common import Actions, DynamicObject, StaticObject
 
 from src.aris_bellman.factor_q import FactorLocalQNetwork
@@ -509,6 +510,43 @@ def test_ocv2_adapter_applies_optional_featurizer_only_when_present():
     featurized = adapter._apply_featurizer(raw, object())
     assert featurized["agent_0"].shape == (96,)
     assert featurized["agent_0"].dtype == np.float32
+
+
+def test_ocv2_adapter_snapshot_restore_and_pure_step_are_detached():
+    adapter = OCV2Adapter.__new__(OCV2Adapter)
+    adapter.layout_name = "test-layout"
+    adapter.max_steps = 10
+    adapter.featurizer = None
+    adapter.key = jax.random.PRNGKey(7)
+    adapter.state = {"counter": np.asarray(2, dtype=np.int32)}
+    adapter.raw_obs = {
+        "agent_0": np.asarray([2], dtype=np.int32),
+        "agent_1": np.asarray([3], dtype=np.int32),
+    }
+    adapter.obs = adapter._to_numpy_obs(adapter.raw_obs)
+
+    def fake_step(_key, state, _actions):
+        counter = np.asarray(state["counter"] + 1, dtype=np.int32)
+        return (
+            {"agent_0": counter[None], "agent_1": (counter + 1)[None]},
+            {"counter": counter},
+            {"agent_0": np.asarray(1.0), "agent_1": np.asarray(0.0)},
+            {"agent_0": np.asarray(False), "agent_1": np.asarray(False)},
+            {"counter": counter},
+        )
+
+    adapter._jit_step = fake_step
+    source = adapter.capture_state()
+    result = adapter.step_from_state(source, ego_action=0, partner_action=1)
+    assert int(adapter.state["counter"]) == 2
+    assert int(source.state["counter"]) == 2
+    assert int(result.snapshot.state["counter"]) == 3
+
+    adapter.state["counter"][...] = 99
+    adapter.restore_state(source)
+    assert int(adapter.state["counter"]) == 2
+    adapter.state["counter"][...] = 5
+    assert int(source.state["counter"]) == 2
 
 
 def test_train_eval_and_preflight_use_default_env_without_path_planning():
