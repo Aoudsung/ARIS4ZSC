@@ -61,7 +61,8 @@ The preregistration remains an inadmissible template with unfilled numeric and
 semantic-hash slots. No Path C training, data generation, instrument result, primary
 result, or scientific readout is recorded.
 
-R003 remains in progress after a fail-closed CUDA JAX compatibility scan on GPU 5.
+R003's minimal research semantics are complete after a fail-closed CUDA JAX
+compatibility scan on GPU 5.
 All four proposal candidate layouts expose 96-dimensional public observations, but
 their option counts are 28, 28, 26 and 27 and their ordered option identifiers differ.
 Across all 23 registered JaxMARL layouts, 22 satisfy the two-agent evidence contract;
@@ -77,6 +78,18 @@ method complexity. The primary identity experiment now fixes `asymm_advantages` 
 all four roles while isolating identity, style and seed groups; layout shift remains a
 separate secondary analysis. Final battery size, group count and numeric seeds remain
 calibration outputs rather than premature R003 bindings.
+
+The resulting code object is commit
+`b6f32578837dd3b5146c355500b911400cb42f78`. GPU 5 then passed 108 targeted tests
+and the broader 339-test suite with zero failures and zero skips. The broader JUnit
+report SHA-256 is
+`89116841aad9d63a2c1e7f4a6641b0f17f7b44e27979fc967ce2ebfa9a3e3390`.
+The minimal R010 input fixes `asymm_advantages`, a 96-dimensional public observation,
+28 options, the 30-theta `path_c_synthetic` partner registry and the existing random-key
+schedule. Its remote artifact SHA-256 is
+`1a548d0800d4052b45920cc746184af3de280004fff686c96af52b07ce9c2406`.
+Response bins, probe scripts and all sample-size or seed counts remain owned by design
+or calibration. R010 is ready but has not been run; no locked data was accessed.
 
 Three modules remain deliberately `planned`. The static revision now includes a
 cross-fitted ecological return estimator that excludes the target episode outcome,

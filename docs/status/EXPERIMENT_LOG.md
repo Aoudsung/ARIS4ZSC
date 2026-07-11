@@ -41,7 +41,7 @@ and the active project line is now Path C.
 - 正式软件测试报告：从上述 JUnit 和最终模块注册表生成 101 条注册测试记录；文件为 `.codex_remote_validation/path_c_software_test_report_fc647fb_20260711.json`，SHA-256 为 `61f669b0c980f454a138eadd22ed3a846621bb94e86e8bec568023b546af8bf4`，绑定模块注册表 SHA-256 `2c22792a0a16318f63ee2efa6dc9adcd542c9a78377c65f650e8d17577e4adb7`。
 - 状态：具备完整注册测试覆盖的 21 个模块提升为 `tested`；C2、C5、D1 仍为 `planned`。预注册未冻结，E0、训练、design 选择、locked audit 与任何科学读数均未运行。
 
-### 2026-07-11 R003 布局与 option 语义兼容性扫描 — 失败关闭（Type-A，非科学结果）
+### 2026-07-11 R003 最小语义方案 — 完成（Type-A，非科学结果）
 
 - 授权与范围：用户明确要求继续执行 R003；本轮只检查非数值语义接线，不读取
   `locked_audit`，不训练，也不产生可用于研究主张的读数。
@@ -74,6 +74,32 @@ and the active project line is now Path C.
 - 绑定产物：远端
   `.codex_remote_validation/path_c_r003_all_layout_semantics_bound_fc647fb_20260711.json`，
   SHA-256 为 `6268916dc37a5571e024224e919e596e3d80e1346cd3c86d74266ee8db4798a1`。
+- 最小代码修订提交：`b6f32578837dd3b5146c355500b911400cb42f78`。split manifest
+  升级为第三版，只隔离 identity、style 与 seed group；主 identity stratum 要求四角色共享
+  一个具体布局，另一个布局只进入 secondary layout shift。没有增加跨布局动作映射、额外
+  option policy 解析门或 locked 数据门。
+- 远端 CUDA JAX 回归：先固定 GPU 5 并确认 CUDA 12.9、JAX/JAXlib 0.4.38、GPU backend
+  和实算 `compile_sum=6.0`。定向回归 108 项通过、0 失败、0 跳过；日志 SHA-256
+  `ef76ab2a22c8192875bd5b4451182892cf3bed4034eb5b3314cbf7e1b309efe8`，JUnit SHA-256
+  `eabb4ceba0eaec6794b530f0cf9bdf4161022df4379fee988a1f18be9e185bdc`。随后完整回归
+  339 项通过、0 失败、0 跳过，耗时 543.975 秒；日志 SHA-256
+  `9ed6912cc96afcf21c7552db303e67d23018c094930cbefe72ce4a8c0439d928`，JUnit SHA-256
+  `89116841aad9d63a2c1e7f4a6641b0f17f7b44e27979fc967ce2ebfa9a3e3390`。
+- R003 最小语义输入固定：主布局 `asymm_advantages`，公共观测 96 维，28 个 option；
+  `EgoEvidenceSpecV1` SHA-256 为
+  `915829beae6d04ad0eea46404093a09b142e01b6b03d3eeb3598752b13f9e614`；
+  `path_c_synthetic` 伙伴注册表含 30 个 theta，SHA-256 为
+  `e9ae6b137a305e77bea89c3d731116ea6db3886d2c416a9ad973ee4e7a51f662`；随机数键调度继续使用
+  `path_c_rng_key_schedule_v1`。
+- 最小语义产物：远端
+  `.codex_remote_validation/path_c_r003_minimal_semantics_b6f3257_gpu5_20260711_v2.json`，
+  SHA-256 为 `1a548d0800d4052b45920cc746184af3de280004fff686c96af52b07ce9c2406`。
+  第一版产物只误展开了短提交号，第二版显式记录 supersedes 关系；运行结果和语义字段未变。
+- 有意延后：response class 与 latency bin、probe scripts、`M`、`L_inner`、`T_probe`、身份组数、
+  cross-fit folds、每组数值 seed 和 secondary layout 分别由 design 或 calibration 决定。本轮未
+  创建 frozen preregistration、final split manifest、final audit battery 或 locked 输入。旧的
+  module registry 正式报告仍绑定 R002 的 `fc647fb...`；R003 Type-A smoke 不为此额外重做一套
+  registry 报告，最终 claim-bearing freeze 前再统一重绑定。
 
 ### 2026-07-09 CUDA/JAX 远程环境体检 — PASS（Type-A，非科学结果）
 - 范围: 只修复 `zsc-customer` 上项目运行环境对 JAX/CUDA 的选择；不改系统
