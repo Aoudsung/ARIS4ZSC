@@ -7,7 +7,7 @@ and the active project line is now Path C.
 每条 claim 读数必须引用对应预注册或冻结判读规则，禁止事后重解释。NEW-4 隔离材料
 （CODEX_IMPL_SPEC v1–v4 数字）永不入此文件。
 
-## 当前状态快照 — 2026-07-11
+## 当前状态快照 — 2026-07-12
 
 - **旧不对称布局 + role-conditioned v2 伙伴路线已关闭为正向论文路径。** 32 局训练量上的负面诊断已被
   2000 局基底推翻，随后正式盲测又显示 dev-heldout 的伙伴条件化没有迁移到新盲测伙伴；
@@ -17,10 +17,142 @@ and the active project line is now Path C.
   反应付出真实代价。
 - **当前活跃线是 Path C。** Path C 指 active value probing for value-sufficient residual
   partner abstractions，即用价值驱动探针恢复公共状态之外仍改变控制的最小伙伴抽象。Path C
-  标准协议并行路径已通过 R010 远端接线检查，预注册仍是草案；本文件尚无 Path C 科学结果。
-- **下一条可记录事件。** 远端重跑针对性回归与 R010 级 smoke，把软件证据重新绑定到评审
-  修复后的代码；随后是正式训练配置冻结或 R020 启动。不得把 R010 小批量接线数字读成
-  科学结论。
+  标准协议并行路径已通过 R010 远端接线检查，R020 的第一个正式训练 seed 已完成；预注册
+  仍是草案，本文件尚无 Path C 科学结果。
+- **seed 101 的最终模型校准没有显示基本自博弈能力。** 500 个 400 步 episode 的原始回报
+  全部为 0，两个位置的探针次数也全部为 0；参数与固定先验均为有限值，因此这不是 checkpoint
+  损坏或数值崩溃。该诊断不能替代 10 seed 正式评估，也不支持方法结论。
+- **下一条可记录事件。** 只用现有最终模型与同一次训练产生的四个伙伴快照做双位置原始回报
+  检查，区分“最终模型只是不与自身协调”和“对训练伙伴也没有任务能力”。该追加运行尚未授权；
+  其余 seed 仍未授权。
+
+### 2026-07-12 seed 101 训练记录补强与原始回报校准 — 执行完成（非科学结果）
+
+- 代码修改：标准训练器现按固定环境步窗口记录损失、各集成头损失、原始 step reward、完整
+  episode 原始回报、梯度范数、参数组健康、探索率与探针数，并生成曲线图。正式配置每
+  100,000 步一行，完整 30M 训练应产生 300 行；R010 冒烟配置每阶段一行。该记录路径不调用
+  随机数，也不改变动作、回放采样或优化器更新。现有 seed 101 不重训，历史曲线明确不可恢复。
+- 软件验证：远端 GPU 0、CUDA JAX；targeted regression 为 66 项通过、0 失败、0 错误、
+  0 跳过，最终复核运行耗时 21.313 秒；新增测试同时确认指标汇总不改变 NumPy 或 PyTorch
+  随机数状态。日志 SHA-256 为
+  `0f0eff6d731e02e301f667d600aec7d1f18a73a49e8da967cb057bffed6d01a8`，JUnit SHA-256 为
+  `d1bcfb9214717ff448f345586162ecd768de09dc93f35a436e95d8e1b5eb070d`。
+- R010 接线复核：seed 1001/1002 均生成自博弈与 Path C 各一行指标及曲线图；manifest 回读
+  JAX 后端为 `gpu`、设备为 `cuda:0`。8 行评估原始回报 SHA-256 仍为
+  `4d9affe6a4f3d2db64e029511ca39181cb373b0e3d2dfabacc71a3316d8fea26`，与修改前完全相同，
+  支持“记录逻辑没有改变该固定冒烟运行的评估行为”。冒烟日志 SHA-256 为
+  `43b2d0a4e42ef99edcef64711ac01cfe8aebb19ce173ff2443f4e1b41d75c5f6`。
+- 校准输入：保持原正式模型不变；`path_c_final.pt` SHA-256 仍为
+  `3cff07be10f8a457d20449f78a18e250e0e98716be50d67d87558873115a0097`。校准配置 SHA-256 为
+  `f62d54129e627d8adf2bcc6470d71b023dae8dceb785eb8e584710f407b927b3`；GPU 0 无不可纠正错误，
+  使用 CUDA 12 JAX 包装脚本执行。
+- 校准预算与读数：最终模型与自身配对 500 局，每局 400 步，共 200,000 个评估环境步；探索率
+  为 0，保留探针阈值 0.02。500 行完整、episode 索引 0–499 无重复、回报均有限，summary
+  可由原始行精确重算。原始回报的均值、标准差、最小值、最大值及 10/50/90 分位数均为 0；
+  零回报比例为 1.0，两个位置的探针总数均为 0。
+- checkpoint 健康：四个自博弈快照与最终模型的所有参数均有限，固定先验 SHA 在五个文件中
+  一致。自博弈模型参数总二范数依次为 42.9463、47.5796、48.9754、49.7776；相邻快照参数
+  变化二范数依次为 16.3142、7.5283、4.5864。最终 Path C 模型参数总二范数为 53.1778；
+  这些数只说明权重存在且发生过更新，不证明策略能力，也不把 fresh 初始化的 Path C 模型
+  与自博弈轨迹错误连线。
+- 产物：远端及本地忽略目录
+  `results/path_c_standard_calibration_simple/seed_101/`。原始 500 行 SHA-256 为
+  `ffc60eeb2267f51d2ea0f070084c7b40c723414a5bcb14278488df47efc45a10`；summary 为
+  `6926c000d787191716e280520133d02e15a48b86aa67d5f7ad194f1788bef807`；checkpoint 健康 JSON 为
+  `7eb3dc54aff3accb220c19d1d7a2431ed172663ff3e3e3aa341066d4361dac25`；校准日志为
+  `daa02805cebcbdd590fcde2b5bb8d9593b8135cc16f6a1d7aae29662799778a5`。
+- 判读边界：这是单 checkpoint 自博弈校准，不是正式多 seed 性能结果。它确实表明该模型没有在
+  这 500 局中展示任务回报；在检查训练伙伴配对之前，不能把原因归结为 Path C 方法本身，也
+  不应直接扩展其余 seed。
+
+### 2026-07-12 R020 先批：Test Time Simple seed 101 — 训练完成（尚无性能结论）
+
+- 用户授权：`test_time_simple`、seed 101、单 run、30,000,000 环境步；本条授权不扩展到
+  其余 9 个 simple seed 或 10 个 wide seed。
+- 代码与配置：标准路径代码提交
+  `c70bf03b634ae6cb0052d7da3cd8e7a228cdd0e8`；冻结配置
+  `experiments/overcooked_v2/configs/path_c_standard_formal_simple.yaml` 的本地/远端
+  SHA-256 均为 `8557c064b42dbe13b89efe5a40521894a43d933c266204e4a3dc4fc4ed750b47`。
+- 有效数据预算已经从最终 manifest 回读：总计 30,000,000 个联合环境转移和 75,000 个联合
+  episode；其中自博弈伙伴池 10,000,000 步、25,000 局，Path C 主策略 20,000,000 步、
+  50,000 局。两个阶段丢弃的未完成轨迹均为 0。实际完成 119,202 次梯度更新，伙伴池大小为 4。
+- 远端预检：`zsc-customer` GPU 0，启动前显存 105 MiB / 46,068 MiB、不可纠正 ECC 错误
+  为 0，输出目录此前不存在。启动命令通过 CUDA 12 JAX 包装脚本固定 GPU 0。
+- 运行身份：远端 Python PID 2866846；日志
+  `.codex_remote_validation/path_c_r020_simple_seed101_c70bf03_20260712.log`；产物目录
+  `results/path_c_standard_formal_simple/seed_101`。运行从 01:49:01 到 05:57:29，共约 4 小时
+  8 分 27 秒，即约 4.14 个 GPU 小时；平均吞吐约 2,012 个联合环境步/秒。启动后实测 GPU 0
+  显存约 35.0 GiB，最终日志无 traceback、错误、非数值损失或显存不足记录。
+- 完整性：2.5M、5M、7.5M、10M 四个自博弈伙伴快照均存在，最终模型
+  `path_c_final.pt` 的 SHA-256 为
+  `3cff07be10f8a457d20449f78a18e250e0e98716be50d67d87558873115a0097`；最终 manifest 的
+  SHA-256 为 `13cbb08bf1fcb57b41c5c1aab2b21c432461155cae8e020ebe681c6bf342fae5`；日志的
+  SHA-256 为 `c60487cdc5b86fb0758335476cafede7d0cb448e5a16a3a848dbd3db994fab50`。
+- 训练器汇总的平均时序差分损失为：自博弈阶段 `0.0005847712440436475`，Path C 阶段
+  `0.00019009943194381453`；Path C 阶段触发探针 2,364 次。这些数值均有限，只能排除明显的
+  数值崩溃，不能证明策略学会任务。
+- 判读边界：该运行没有保存按时间分段的损失或 episode 原始回报，因此原计划中的“晚期曲线
+  稳定性”无法从现有产物确认；也尚未进行 10 seed 的配对评估。manifest 中的
+  `scientific_readout_allowed=true` 只表示该正式 checkpoint 可以进入后续评估，不表示单个
+  seed 已形成科学结果。其余 9 个 simple seed 与 10 个 wide seed 仍未授权。
+
+### 2026-07-12 R020 正式训练配置冻结 — 静态完成（未运行）
+
+- 冻结载体：`experiments/overcooked_v2/configs/path_c_standard_formal_simple.yaml`
+  （观测 5×5×39）与 `path_c_standard_formal_wide.yaml`（观测 5×5×43）；冻结值与逐项
+  理由记录于 `idea-stage/refine-logs/EXPERIMENT_PLAN.md` §10。2026-07-12 在不改变方法或
+  数据预算的前提下增加每 100,000 步一次的观察性训练记录；后续逐 seed 副本只修改 seed
+  与输出目录。seed 101 的已完成运行早于该记录字段，因此不具有可追溯的历史曲线。
+- 核心冻结值：每 seed 30,000,000 环境步 = 自博弈伙伴池 10,000,000 + Path C 主策略
+  20,000,000（两阶段都计入，每 seed 总步数不超过官方单 run 口径）；伙伴池四个等距
+  快照（2.5M/5M/7.5M/10M）；主策略从零初始化（从自博弈终点热启动会先锁死单一约定）；
+  探针开启、分歧阈值 0.02、回报下限 0.0；批量 250 个并行环境（整除全部阶段、快照与
+  评估边界）；学习率 2.5e-4、目标网络每 100,000 步同步、回放 1024 episode、集成头 5、
+  固定先验缩放 0.1；后续训练每 100,000 步写一条损失、原始回报和参数健康记录。
+- 数据充分性预核：主策略阶段每 seed 推算 50,000 个联合 episode，远高于 ≥2000 局
+  下限；正式读数仍须运行后从 manifest 实际计数回读。
+- 后续状态：simple seed 101 已完成训练和 500 局自博弈校准；校准回报全部为 0。现有模型
+  保留，下一步只检查它与本次训练四个伙伴快照的双位置原始回报；其余 seed 未授权。
+
+### 2026-07-12 R010 评审修复后远端证据重绑定 — PASS（Type-A，非科学结果）
+
+- 代码身份：本地提交
+  `c70bf03b634ae6cb0052d7da3cd8e7a228cdd0e8`；同步后的九个核心源文件、配置、启动脚本和
+  targeted test 文件逐项 SHA-256 与本地一致。smoke 配置 SHA-256 为
+  `27c69076d9ad391ea8e0208d51843d737a0ad60e2dbedf7c768d55b74accdfd8`，其中探针开启且
+  `disagreement_threshold=0.02`，满足严格正阈值要求。
+- 运行环境：`zsc-customer` GPU 0，启动前显存占用 105 MiB、不可纠正 ECC 错误为 0；
+  CUDA 12 包装脚本运行，R010 manifest 回读 JAX 后端 `gpu`、设备 `cuda:0`、实际编译和
+  `compile_sum=6.0`。
+- Targeted regression：63 项通过、0 失败、0 错误、0 跳过，耗时 32.965 秒。JUnit 明确包含
+  `test_step_unroll_matches_sequence_forward_on_one_episode_rows`（逐步循环与整段前向等价）和
+  `test_partner_sub_batching_matches_full_batch_forwarding`（伙伴子批与原全批实现等价）。日志
+  `.codex_remote_validation/path_c_r010_rebind_targeted_c70bf03_20260712.log`，SHA-256
+  `22385660c0b2ad4e9d5e61301f504964043f5aa2b99184c88d4df3c71e9b7127`；JUnit SHA-256
+  `1980c4f07f158b5ef302ffc8d3860dc10fc7594157b32977e3168cdc4a7793f0`。
+- R010 级 smoke：seed 1001/1002 各实现 1,600 环境步，其中自博弈伙伴池 800 步、Path C
+  训练 800 步；每个 seed 4 个联合环境 episode、2 次梯度更新、阶段边界丢弃 0 条智能体
+  转移。评估完成 2 个 SP 配对与 2 个有向 XP 配对，每配对 2 局、每局 400 步，共 8 行
+  原始回报和 3,200 个评估环境步。主产物继续明确
+  `scientific_readout_allowed=false`。
+- 新证据：smoke 日志
+  `.codex_remote_validation/path_c_r010_rebind_smoke_c70bf03_20260712.log`，SHA-256
+  `8288797fc6f971cbc99b3e3fdf26e41d16bb74c3cdb0307e3d3498146dc4d8c2`；主 manifest
+  SHA-256 `a18c77d20d100d19757c530388d06dfec72dda3801eca82945ff82630f1bfa08`；评估 summary
+  SHA-256 `92fdf7714112ffdbdbbf3996bb56be57b3a814b578f65bb26b71f3a1195c9217`；8 行原始回报
+  SHA-256 `4d9affe6a4f3d2db64e029511ca39181cb373b0e3d2dfabacc71a3316d8fea26`；两个训练 manifest
+  SHA-256 分别为 `af530dfdfd1ae730f9bbb7249a41f315acb535f0e26e2a40d043186a4cd87389` 与
+  `4e591212fe5fcfd99d2549c2ecb267be6c9d7b09027812f623f1dfca2f8ce2fb`。
+- 与旧 smoke 的关系：8 行原始回报哈希保持相同，而非预期中的位级变化。原因是本 smoke
+  伙伴池只有一步 800 的单个快照，伙伴子批在该配置下就是完整批次，随机数消费顺序没有
+  改变；评估又使用 `epsilon=0`。多伙伴子批语义由上述四行、两个伙伴的等价性测试实际
+  覆盖。因此哈希相同不是旧代码误用，也不影响证据重绑定。
+- 非阻塞警告：smoke 日志有一次 PyTorch 关于只读 NumPy `episode_starts` 的提示；该 tensor
+  在策略中只读，运行完成且不影响 Type-A 判定。Targeted regression 仅有外部 `jaxopt`
+  停止维护提示。
+- 结论与边界：评审修复后的 targeted regression 与 R010 均通过，软件证据已重新绑定；
+  R020 配置冻结现已解锁。R010 数字仍不得解释为性能或方法证据，R020 的 10-seed 训练仍需
+  单独运行授权。
 
 ### 2026-07-11 标准路径代码评审与修复 — 静态完成（未执行任何测试）
 
@@ -47,9 +179,8 @@ and the active project line is now Path C.
   为从两阶段实际计数求和回读，并与配置预算强校验，episode 计数单位写入 manifest。
 - 新增测试：单步展开与整段前向数值等价、伙伴子批与全批前向等价、探针配置失效关闭、
   共享回报断言、uint32 种子范围、评估批量整除规则。
-- 执行边界：本轮只有静态编辑与纯语法解析（py_compile 只解析源码文本，不导入也不运行
-  项目代码），未运行任何测试。R010 的 PASS 绑定的是修复前代码；R020 启动前须在远端
-  重跑针对性回归与 R010 级 smoke，把软件证据重新绑定到修复后的代码。
+- 后续状态：2026-07-12 的 63 项远端 targeted regression 与 R010 级 smoke 已把软件证据
+  重新绑定到修复后的提交 `c70bf03...`。
 
 ### 2026-07-11 R010 标准协议远端接线检查 — PASS（Type-A，非科学结果）
 

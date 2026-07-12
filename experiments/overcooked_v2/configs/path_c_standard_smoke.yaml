@@ -33,6 +33,8 @@ training:
   learning_starts_episodes: 2
   updates_per_vector_step: 1
   target_update_environment_steps: 400
+  # One row per complete 400-step, two-environment smoke phase.
+  metrics_interval_environment_steps: 800
   gamma: 0.99
   learning_rate: 0.00025
   gradient_clip_norm: 10.0

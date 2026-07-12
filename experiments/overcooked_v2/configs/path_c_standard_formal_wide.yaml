@@ -1,0 +1,48 @@
+schema_version: path_c_standard_training_v1
+run_kind: formal
+scientific_readout_allowed: true
+# 冻结基准 seed。R020 授权时按本文件冲压 10 份逐 seed 副本（201–210），
+# 只允许改 seed 与 output_dir 两个字段；其余任何字段变更都要求重新冻结。
+seed: 201
+device: cuda
+environment_config: ocv2_test_time_wide_standard.yaml
+output_dir: ../../../results/path_c_standard_formal_wide/seed_201
+model:
+  # test_time_wide 的官方局部观测是 5x5x43（远端 R010 实测回读）。
+  observation_shape: [5, 5, 43]
+  n_heads: 5
+  visual_embedding_dim: 128
+  encoder_dim: 128
+  recurrent_dim: 128
+  conv_channels: [32, 32, 16]
+  prior_scale: 0.1
+  prior_seed: 31
+# 分歧统计非负，阈值必须严格为正；0.02 与既有预注册约定一致，
+# R040 消融负责阈值敏感性检查。
+probe:
+  enabled: true
+  disagreement_threshold: 0.02
+  return_floor: 0.0
+  disagreement_stat: variance
+training:
+  # 与 simple 布局逐字段一致；仅观测通道数与输出目录不同。
+  total_environment_steps: 30000000
+  self_play_environment_steps: 10000000
+  path_c_environment_steps: 20000000
+  batch_size_envs: 250
+  partner_pool_snapshot_steps: [2500000, 5000000, 7500000, 10000000]
+  ego_initialization: fresh
+  replay_capacity_episodes: 1024
+  minibatch_episodes: 8
+  learning_starts_episodes: 128
+  updates_per_vector_step: 1
+  target_update_environment_steps: 100000
+  # 100k steps = 250 complete 400-step episodes, producing 300 rows over 30M.
+  metrics_interval_environment_steps: 100000
+  gamma: 0.99
+  learning_rate: 0.00025
+  gradient_clip_norm: 10.0
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_environment_steps: 2500000
+  bootstrap_p: 0.5

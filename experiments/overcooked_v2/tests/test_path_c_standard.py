@@ -30,7 +30,14 @@ from experiments.overcooked_v2.path_c_standard_evaluation import (
     StandardEpisodeReturn,
     StandardEvaluationSpec,
     build_standard_pairings,
+    summarize_standard_calibration_rows,
     summarize_standard_rows,
+)
+from experiments.overcooked_v2.path_c_standard_diagnostics import (
+    TRAINING_METRICS_SCHEMA_VERSION,
+    TrainingWindowAccumulator,
+    model_parameter_health,
+    snapshot_trainable_parameters,
 )
 from experiments.overcooked_v2.path_c_standard_training import (
     PrimitiveEpisodeBuilder,
@@ -413,6 +420,162 @@ def test_training_spec_separates_smoke_from_formal_data_budget(tmp_path):
     formal = {**base, "run_kind": "formal", "scientific_readout_allowed": True}
     with pytest.raises(ValueError, match="30,000,000"):
         StandardTrainingSpec.from_mapping(formal)
+
+
+def test_training_window_records_loss_reward_return_and_parameter_health():
+    torch.manual_seed(29)
+    model = PrimitiveRecurrentEnsembleQ(
+        [5, 5, 7],
+        n_heads=2,
+        visual_embedding_dim=10,
+        encoder_dim=8,
+        recurrent_dim=6,
+        conv_channels=[4, 4, 4],
+        prior_scale=0.1,
+        prior_seed=3,
+    )
+    reference = snapshot_trainable_parameters(model)
+    with torch.no_grad():
+        next(parameter for parameter in model.parameters() if parameter.requires_grad).add_(0.5)
+    torch_rng_before = torch.random.get_rng_state().clone()
+    numpy_rng_before = np.random.get_state()
+    accumulator = TrainingWindowAccumulator(
+        batch_size=2,
+        n_heads=2,
+        gradient_clip_norm=1.0,
+        reference=reference,
+    )
+    accumulator.record_environment_batch(
+        np.asarray([1.0, -1.0]),
+        np.asarray([False, False]),
+        probe_count=1,
+    )
+    accumulator.record_environment_batch(
+        np.asarray([0.0, 2.0]),
+        np.asarray([True, True]),
+        probe_count=2,
+    )
+    accumulator.record_update(
+        loss=0.25,
+        per_head_loss=(0.2, 0.3),
+        per_head_support=(4, 5),
+        gradient_norm=2.0,
+    )
+    row = accumulator.build_row(
+        seed=101,
+        layout="test_time_simple",
+        phase="path_c",
+        phase_environment_steps=4,
+        total_environment_steps=10_000_004,
+        cumulative_episodes=2,
+        gradient_updates=1,
+        epsilon=0.05,
+        cumulative_probe_count=3,
+        model=model,
+    )
+    assert row["schema_version"] == TRAINING_METRICS_SCHEMA_VERSION
+    assert row["window_environment_steps"] == 4
+    assert row["td_loss"]["mean"] == pytest.approx(0.25)
+    assert row["raw_step_reward"] == {
+        "sum": 2.0,
+        "mean_per_environment_step": 0.5,
+        "positive_event_count": 2,
+        "negative_event_count": 1,
+        "zero_event_count": 1,
+    }
+    assert row["raw_episode_return"]["count"] == 2
+    assert row["raw_episode_return"]["mean"] == pytest.approx(1.0)
+    assert row["gradient_l2_norm_before_clipping"]["clipped_fraction"] == 1.0
+    assert (
+        row["model_parameter_health"]["learned"]["delta_l2_from_reference"]
+        > 0.0
+    )
+    assert row["model_parameter_health"]["fixed_prior"]["nonfinite_count"] == 0
+    assert torch.equal(torch.random.get_rng_state(), torch_rng_before)
+    numpy_rng_after = np.random.get_state()
+    assert numpy_rng_after[0] == numpy_rng_before[0]
+    assert np.array_equal(numpy_rng_after[1], numpy_rng_before[1])
+    assert numpy_rng_after[2:] == numpy_rng_before[2:]
+
+
+def test_parameter_health_covers_every_standard_model_group():
+    model = PrimitiveRecurrentEnsembleQ(
+        [5, 5, 7],
+        n_heads=2,
+        visual_embedding_dim=10,
+        encoder_dim=8,
+        recurrent_dim=6,
+        conv_channels=[4, 4, 4],
+        prior_scale=0.1,
+        prior_seed=3,
+    )
+    health = model_parameter_health(model)
+    assert set(health["groups"]) == {
+        "observation_encoder",
+        "shared_encoder",
+        "recurrent_heads",
+        "value_heads",
+        "advantage_heads",
+    }
+    assert all(item["parameter_count"] > 0 for item in health["groups"].values())
+    assert health["learned"]["nonfinite_count"] == 0
+    assert health["fixed_prior_state_sha256"] == model.prior_state_sha256()
+
+
+def test_calibration_spec_accepts_one_formal_checkpoint_and_five_diagnostics(tmp_path):
+    payload = {
+        "run_kind": "calibration",
+        "scientific_readout_allowed": False,
+        "evaluation_seed": 9101,
+        "output_dir": str(tmp_path / "calibration"),
+        "checkpoint_paths": [str(tmp_path / "path_c_final.pt")],
+        "diagnostic_checkpoint_paths": [
+            str(tmp_path / f"checkpoint_{index}.pt") for index in range(5)
+        ],
+        "evaluation": {
+            "episodes_per_pairing": 500,
+            "evaluation_batch_size": 250,
+            "expected_policy_count": 1,
+            "standard_deviation_ddof": 0,
+            "bootstrap_replicates": 100,
+            "bootstrap_confidence": 0.95,
+        },
+    }
+    spec = StandardEvaluationSpec.from_mapping(payload)
+    assert spec.run_kind == "calibration"
+    assert spec.episodes_per_pairing == 500
+    assert len(spec.checkpoint_paths) == 1
+    assert len(spec.diagnostic_checkpoint_paths) == 5
+
+
+def test_calibration_summary_uses_raw_self_play_returns_only():
+    rows = [
+        StandardEpisodeReturn(
+            schema_version="path_c_standard_episode_return_v1",
+            layout="test_time_simple",
+            split="sp",
+            policy_0_seed=101,
+            policy_1_seed=101,
+            episode_index=index,
+            canonical_episode_seed=1000 + index,
+            raw_episode_return=value,
+            environment_steps=400,
+            policy_0_probe_count=index,
+            policy_1_probe_count=index + 1,
+        )
+        for index, value in enumerate((0.0, 20.0))
+    ]
+    summary = summarize_standard_calibration_rows(
+        rows,
+        policy_seed=101,
+        episodes_per_pairing=2,
+    )
+    assert summary["raw_return_mean"] == pytest.approx(10.0)
+    assert summary["zero_return_fraction"] == pytest.approx(0.5)
+    assert summary["positive_return_fraction"] == pytest.approx(0.5)
+    assert summary["return_definition"] == (
+        "sum_of_raw_rewards_agent_0_over_400_steps"
+    )
 
 
 def test_pairing_matrix_has_ten_sp_and_ninety_directed_xp_pairings():

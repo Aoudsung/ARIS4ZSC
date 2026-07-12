@@ -1,7 +1,7 @@
 # PROJECT_DASHBOARD.md
 
 **ARIS-Bellman for Zero-Shot Coordination — pipeline status & decisive-results tracker.**
-Last updated: 2026-07-11 · Read this first for "where am I" (30 seconds).
+Last updated: 2026-07-12 · Read this first for "where am I" (30 seconds).
 
 > Required entrypoint per [CLAUDE.md](CLAUDE.md). Execution rules live in
 > [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md); this file is *status*, not *permission*.
@@ -32,13 +32,13 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 | **Thesis** | The agent should recover only the residual partner abstraction that changes control beyond public state, and should do so through value-driven probes while still training the ego representation only with temporal-difference value loss. |
 | **Benchmark** | JaxMARL **OvercookedV2** (test-time protocol formation) + toy_factor_game (regression) |
 | **Target tier** | ICLR / NeurIPS / ICML class |
-| **Compute budget** | 尚未冻结。训练步数、梯度更新数、独立身份组数、外层样本数和审计步数仍为空；在 calibration 吞吐与功效结果产生前不填写 GPU-hour。Path C 当前只有软件 Type-A 运行，没有科学实验结果。 |
+| **Compute budget** | R020 每 seed 的训练预算已冻结为 30M 联合环境步。Simple seed 101 实测耗时约 4.14 个 GPU 小时、平均约 2,012 步/秒；另完成 200,000 步单模型校准。Wide 尚未实测，其余 seed 未授权。当前仍没有 Path C 科学结果。 |
 
 ---
 
 ## 2. Pipeline status — CURRENT STAGE
 
-**Stage: Path C public-benchmark migration; R010 smoke passed, then a static code review fixed the probe gate and hot paths — remote evidence re-binding pending before R020 configuration freeze.**
+**Stage: seed 101 completed 30M training, but its 500-episode self-play calibration returned zero in every episode; partner-snapshot diagnosis is next.**
 
 The earlier asymmetric-layout + role-conditioned v2 partner line reached a
 negative blind-test readout, and the Link-A substrate certificates reached a
@@ -60,8 +60,8 @@ The formal 101-row module-registry software report SHA-256 is
 binds module-registry SHA-256
 `2c22792a0a16318f63ee2efa6dc9adcd542c9a78377c65f650e8d17577e4adb7`.
 The preregistration remains an inadmissible template with unfilled numeric and
-semantic-hash slots. No Path C training, data generation, instrument result, primary
-result, or scientific readout is recorded.
+semantic-hash slots. One Path C formal training seed now exists, but no multi-seed
+pairing evaluation, primary result, or scientific readout is recorded.
 
 R003's minimal software semantics are complete after a fail-closed CUDA JAX
 compatibility scan on GPU 5.
@@ -143,6 +143,57 @@ assumption: with the delivery indicator enabled, Simple observations are 5×5×3
 Wide observations are 5×5×43. The final smoke remains ineligible for scientific
 readout; its zero returns are not evidence about performance.
 
+After the same-day static review fixed the probe gate and batch hot paths, the evidence
+was re-bound remotely on 2026-07-12 to commit `c70bf03...`. The expanded targeted suite
+passes 63 tests, including step-unroll versus sequence-forward equivalence and partner
+sub-batching versus the full-batch reference. A fresh R010 smoke again completed two
+training seeds and all 8 evaluation rows under CUDA JAX. This closes the software
+re-binding item.
+
+The R020 formal configuration was frozen statically on 2026-07-12 (no runs): per seed
+30,000,000 environment steps split as a 10M self-play partner-pool phase plus a 20M
+Path C phase (both counted, so the per-seed total stays within the official per-run
+budget); four equally spaced pool snapshots; the deliverable policy trains from scratch
+against the pool (warm-starting from the self-play endpoint would lock in a single
+convention — the failure mode this benchmark measures); probe enabled at disagreement
+threshold 0.02; 250 parallel environments (divides every phase, snapshot and evaluation
+boundary); value-method defaults for optimizer, replay and target-network cadence.
+Carriers: `configs/path_c_standard_formal_{simple,wide}.yaml` (5×5×39 and 5×5×43
+observations); rationale in `EXPERIMENT_PLAN.md` §10. Launch is two-batch: the first
+authorized run is `test_time_simple` seed 101 alone, whose read-back fills the
+GPU-hour budget row and checks late-curve stability (Type-A only) before the remaining
+9 simple and 10 wide seeds are authorized.
+
+The user authorized only the first R020 run on 2026-07-12. Test Time Simple seed 101
+completed on remote GPU 0 with config SHA-256 `8557c064...750b47`, code commit
+`c70bf03...`, former PID 2866846 and log
+`.codex_remote_validation/path_c_r020_simple_seed101_c70bf03_20260712.log`.
+The final manifest confirms 30M joint environment steps and 75,000 joint 400-step
+episodes: 10M/25,000 for self-play-pool formation and 20M/50,000 for Path C. All four
+partner snapshots and the final checkpoint exist; no partial trajectories were discarded.
+Elapsed time was about 4.14 GPU hours at about 2,012 joint environment steps per second.
+The aggregate losses are finite and the log contains no runtime error, but the trainer did
+not persist a time-resolved loss curve or raw episode return. Therefore this run establishes
+completion and throughput, not late-training stability, learned task competence, or a
+scientific result. No other seed is authorized.
+
+The existing seed-101 checkpoint was retained and evaluated directly on 2026-07-12; it was
+not retrained or overwritten. In 500 self-play episodes of 400 steps each, every raw episode
+return was exactly zero and neither player position triggered a probe. This is a complete
+single-checkpoint calibration readout, not the published ten-seed result. Checkpoint health
+inspection found no non-finite parameters, and all four partner snapshots plus the final
+model share the same fixed-prior state. The zero returns therefore cannot be dismissed as a
+corrupt checkpoint or numerical failure, but self-play alone cannot distinguish a convention
+mismatch from failure to coordinate with the partners used during training.
+
+The standard trainer now records one observation-only metric row every 100,000 environment
+steps for future formal seeds: temporal-difference losses, raw step rewards, completed-episode
+returns, gradient norms, parameter-group health, exploration and probes. The remote CUDA JAX
+regression passes 66 tests, and a fresh R010 smoke produced two metric rows per seed plus
+plots. Its eight evaluation rows retained the exact pre-change SHA-256, confirming that the
+recording path did not change that fixed smoke behavior. Seed 101's historical curves remain
+unrecoverable and are not fabricated.
+
 Three legacy modules remain deliberately `planned`. The static revision now includes a
 cross-fitted ecological return estimator that excludes the target episode outcome,
 a content-addressed secondary-profile recomputation path, a restorable OCV2 adapter,
@@ -150,10 +201,11 @@ restorable partner controllers, and a split-manifest-bound numeric seed chain fr
 collection through evaluation. Exact posterior inference now binds the registered
 generation controllers, enumerates hidden option choices over the complete primitive
 action and public-state path, and uses the same option distribution as generation. The
-current unresolved work is different from the old registry wording: freeze the still-open
-formal training numbers and layout-specific model configurations before R020. Only Path C itself must be trained
-for the main table; the internal recurrent and belief systems are ablations. This project
-is therefore not yet benchmark-ready.
+current unresolved work is different from the old registry wording: evaluate the existing
+final policy against its four within-run partner snapshots in both player positions, using
+raw returns, before spending compute on additional seeds. Only Path C itself must be trained
+for the main table; the internal recurrent and belief systems are ablations. This project is
+therefore not yet benchmark-ready.
 
 The instrument correction is binding: a single saved simulator state estimates only
 the response law conditional on that realized hidden state. Every outer replicate must
@@ -189,7 +241,7 @@ All claim-level readouts are Type-B (cross-model + human acquittal required; see
 | Required result | Question | Status |
 |---|---|---|
 | Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | 🟢 CODE COMMIT + CUDA JAX 290-TEST REPORT BOUND; FROZEN PREREGISTRATION STILL MISSING |
-| Published-protocol compatibility | Can Path C produce 10 independent policies and the official `test_time_simple`/`test_time_wide` SP/XP, all-pairing and role-swapped records? | 🟡 R010 CUDA JAX SMOKE PASS 2026-07-11 (small-scale SP/XP and role-swap wiring verified), then same-day static review confirmed all eight protocol clauses but fixed a degenerate probe-gate default and hot-path waste; remote regression + smoke must re-bind evidence to the fixed code before R020 |
+| Published-protocol compatibility | Can Path C produce 10 independent policies and the official `test_time_simple`/`test_time_wide` SP/XP, all-pairing and role-swapped records? | 🟡 POST-REVIEW R010 RE-BIND PASS 2026-07-12: 63 TARGETED TESTS + FRESH CUDA JAX SMOKE; FORMAL SCALE NOT RUN |
 | Standard benchmark performance | What are Path C's mean XP episode returns on both Test Time layouts relative to the published FCP references `6±29` and `23±40`? | ⬜ NOT RUN |
 | Probe ablation | Under the same Path C checkpoint and interaction cost, does value-directed probing outperform random and no probe? | ⬜ NOT RUN |
 | Instrument and mechanism validity | Do the belief-kernel, positive/null and fingerprint checks support the scoped representation interpretation? | ⬜ NOT RUN; DOES NOT BLOCK STANDARD XP PERFORMANCE |
@@ -205,7 +257,7 @@ ARIS convention, see §6).
 | Phase / skill | Locked until… |
 |---------------|---------------|
 | Path C Phase A — static build and audit | Unlocked for static maintenance only: file edits, code inspection, configuration drafting, and preregistration drafting. No local tests or runs. |
-| Path C standard benchmark smoke | ✅ R010 passed remotely on CUDA JAX; smoke artifacts are Type-A only. |
+| Path C standard benchmark smoke | ✅ R010 passed remotely and post-review evidence was re-bound to `c70bf03...` on 2026-07-12; smoke artifacts are Type-A only. |
 | Path C main training and XP evaluation | Standard smoke passes; official Test Time configuration and 10-seed/30M-step/500-episode schedule are fixed; explicit remote-run authorization recorded. Each run reads back its effective data budget. Instrument validity is not a start condition. |
 | Path C mechanism evaluation | The relevant posterior/reset and instrument checks have recorded evidence. These checks gate mechanism wording only. |
 | `/auto-review-loop` (W2) | ≥1 decisive result supported by cross-model verdict |

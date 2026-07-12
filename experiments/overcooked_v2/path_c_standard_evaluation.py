@@ -27,6 +27,10 @@ from experiments.overcooked_v2.path_c_standard import (
     single_step_batch,
     validate_probe_config,
 )
+from experiments.overcooked_v2.path_c_standard_diagnostics import (
+    inspect_standard_checkpoints,
+    write_return_distribution,
+)
 from experiments.overcooked_v2.path_c_standard_training import derive_standard_seed
 
 
@@ -268,6 +272,60 @@ def summarize_standard_rows(
     }
 
 
+def summarize_standard_calibration_rows(
+    rows: Sequence[StandardEpisodeReturn],
+    *,
+    policy_seed: int,
+    episodes_per_pairing: int,
+) -> dict[str, Any]:
+    expected_pairing = StandardPairing(int(policy_seed), int(policy_seed))
+    observed_pairings = {
+        StandardPairing(row.policy_0_seed, row.policy_1_seed) for row in rows
+    }
+    if observed_pairings != {expected_pairing}:
+        raise ValueError("Calibration rows must contain exactly one self-play pairing.")
+    _pairing_means(rows, expected_episodes_per_pairing=episodes_per_pairing)
+    values = np.asarray([row.raw_episode_return for row in rows], dtype=np.float64)
+    if values.size != int(episodes_per_pairing) or not bool(np.isfinite(values).all()):
+        raise ValueError("Calibration requires the complete finite return schedule.")
+    policy_0_probes = np.asarray(
+        [row.policy_0_probe_count for row in rows],
+        dtype=np.float64,
+    )
+    policy_1_probes = np.asarray(
+        [row.policy_1_probe_count for row in rows],
+        dtype=np.float64,
+    )
+    return {
+        "schema_version": "path_c_standard_calibration_summary_v1",
+        "calibration_only": True,
+        "scientific_readout_allowed": False,
+        "layout": rows[0].layout,
+        "policy_seed": int(policy_seed),
+        "episodes": int(values.size),
+        "episode_environment_steps": 400,
+        "raw_episode_row_count": int(values.size),
+        "raw_return_mean": float(values.mean()),
+        "raw_return_std": float(values.std(ddof=0)),
+        "raw_return_min": float(values.min()),
+        "raw_return_max": float(values.max()),
+        "raw_return_p10": float(np.quantile(values, 0.10)),
+        "raw_return_median": float(np.quantile(values, 0.50)),
+        "raw_return_p90": float(np.quantile(values, 0.90)),
+        "negative_return_fraction": float(np.mean(values < 0.0)),
+        "zero_return_fraction": float(np.mean(values == 0.0)),
+        "positive_return_fraction": float(np.mean(values > 0.0)),
+        "policy_0_probe_count_mean": float(policy_0_probes.mean()),
+        "policy_1_probe_count_mean": float(policy_1_probes.mean()),
+        "policy_0_probe_count_total": int(policy_0_probes.sum()),
+        "policy_1_probe_count_total": int(policy_1_probes.sum()),
+        "return_definition": "sum_of_raw_rewards_agent_0_over_400_steps",
+        "interpretation_boundary": (
+            "Single-checkpoint self-play calibration; not a multi-seed scientific result."
+        ),
+    }
+
+
 @dataclass(frozen=True)
 class StandardEvaluationSpec:
     run_kind: str
@@ -281,6 +339,7 @@ class StandardEvaluationSpec:
     bootstrap_confidence: float
     output_dir: Path
     checkpoint_paths: tuple[Path, ...]
+    diagnostic_checkpoint_paths: tuple[Path, ...]
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "StandardEvaluationSpec":
@@ -288,20 +347,41 @@ class StandardEvaluationSpec:
         if not isinstance(evaluation, Mapping):
             raise TypeError("Standard evaluation config requires an evaluation mapping.")
         run_kind = str(payload.get("run_kind", "smoke"))
-        if run_kind not in {"smoke", "formal"}:
-            raise ValueError("run_kind must be 'smoke' or 'formal'.")
+        if run_kind not in {"smoke", "formal", "calibration"}:
+            raise ValueError("run_kind must be 'smoke', 'formal', or 'calibration'.")
         scientific = bool(payload.get("scientific_readout_allowed", False))
         if run_kind == "smoke" and scientific:
             raise ValueError("Smoke evaluation cannot permit scientific readout.")
+        if run_kind == "calibration" and scientific:
+            raise ValueError("Calibration cannot permit scientific readout.")
         episodes = int(evaluation["episodes_per_pairing"])
         expected = int(evaluation["expected_policy_count"])
-        if episodes <= 0 or expected <= 1:
-            raise ValueError("Evaluation requires episodes and at least two policies.")
+        if episodes <= 0 or expected <= 0:
+            raise ValueError("Evaluation requires positive episode and policy counts.")
+        if run_kind != "calibration" and expected <= 1:
+            raise ValueError("SP/XP evaluation requires at least two policies.")
         if run_kind == "formal" and (episodes != 500 or expected != 10):
             raise ValueError("Formal evaluation requires 10 policies and 500 episodes per pairing.")
+        if run_kind == "calibration" and (episodes != 500 or expected != 1):
+            raise ValueError(
+                "Calibration requires one policy and 500 self-play episodes."
+            )
         paths = tuple(Path(item) for item in payload["checkpoint_paths"])
         if len(paths) != expected or len(set(paths)) != len(paths):
             raise ValueError("checkpoint_paths must match expected_policy_count without repeats.")
+        diagnostic_paths = tuple(
+            Path(item) for item in payload.get("diagnostic_checkpoint_paths", ())
+        )
+        if run_kind == "calibration" and (
+            len(diagnostic_paths) != 5 or len(set(diagnostic_paths)) != 5
+        ):
+            raise ValueError(
+                "Calibration requires four partner snapshots and one final diagnostic checkpoint."
+            )
+        if run_kind != "calibration" and diagnostic_paths:
+            raise ValueError(
+                "diagnostic_checkpoint_paths are calibration-only."
+            )
         confidence = float(evaluation.get("bootstrap_confidence", 0.95))
         if not 0.0 < confidence < 1.0:
             raise ValueError("bootstrap_confidence must lie in (0,1).")
@@ -330,6 +410,7 @@ class StandardEvaluationSpec:
             bootstrap_confidence=confidence,
             output_dir=Path(payload["output_dir"]),
             checkpoint_paths=paths,
+            diagnostic_checkpoint_paths=diagnostic_paths,
         )
 
 
@@ -352,6 +433,13 @@ def load_standard_evaluation_config(path: str | Path) -> dict[str, Any]:
             checkpoint = (config_path.parent / checkpoint).resolve()
         resolved_checkpoints.append(str(checkpoint))
     config["checkpoint_paths"] = resolved_checkpoints
+    resolved_diagnostic_checkpoints = []
+    for raw_path in config.get("diagnostic_checkpoint_paths", ()):
+        checkpoint = Path(raw_path)
+        if not checkpoint.is_absolute():
+            checkpoint = (config_path.parent / checkpoint).resolve()
+        resolved_diagnostic_checkpoints.append(str(checkpoint))
+    config["diagnostic_checkpoint_paths"] = resolved_diagnostic_checkpoints
     output_dir = Path(config["output_dir"])
     if not output_dir.is_absolute():
         config["output_dir"] = str((config_path.parent / output_dir).resolve())
@@ -387,16 +475,16 @@ class StandardPairingEvaluator:
                 raise ValueError(
                     "Checkpoint environment semantics differ from evaluation semantics."
                 )
-            if self.spec.run_kind == "formal":
+            if self.spec.run_kind in {"formal", "calibration"}:
                 if metadata.get("run_kind") != "formal" or not bool(
                     metadata.get("scientific_readout_allowed", False)
                 ):
                     raise ValueError(
-                        "Formal evaluation requires formal scientific checkpoints."
+                        "Formal evaluation and calibration require a completed formal checkpoint."
                     )
                 if int(metadata.get("environment_steps", -1)) != 30_000_000:
                     raise ValueError(
-                        "Formal evaluation requires 30,000,000-step checkpoints."
+                        "Formal evaluation and calibration require 30,000,000-step checkpoints."
                     )
             self.checkpoints.append(PolicyCheckpoint(seed=seed, path=path))
             self.models[seed] = model
@@ -461,15 +549,46 @@ class StandardPairingEvaluator:
                         (row.policy_0_seed, row.policy_1_seed, row.episode_index)
                     )
         rows = load_episode_rows(self.rows_path)
-        summary = summarize_standard_rows(
-            rows,
-            policy_seeds=policy_seeds,
-            episodes_per_pairing=self.spec.episodes_per_pairing,
-            standard_deviation_ddof=self.spec.standard_deviation_ddof,
-            bootstrap_replicates=self.spec.bootstrap_replicates,
-            bootstrap_confidence=self.spec.bootstrap_confidence,
-            bootstrap_seed=self.spec.evaluation_seed,
-        )
+        if self.spec.run_kind == "calibration":
+            summary = summarize_standard_calibration_rows(
+                rows,
+                policy_seed=policy_seeds[0],
+                episodes_per_pairing=self.spec.episodes_per_pairing,
+            )
+            health = inspect_standard_checkpoints(
+                self.spec.diagnostic_checkpoint_paths,
+                output_dir=self.output_dir,
+                device=self.device,
+            )
+            distribution_path = self.output_dir / "return_distribution.png"
+            write_return_distribution(
+                [row.raw_episode_return for row in rows],
+                distribution_path,
+            )
+            summary.update(
+                {
+                    "checkpoint_health_path": str(
+                        self.output_dir / "checkpoint_health.json"
+                    ),
+                    "checkpoint_parameter_health_plot": str(
+                        self.output_dir / "checkpoint_parameter_health.png"
+                    ),
+                    "return_distribution_plot": str(distribution_path),
+                    "fixed_prior_consistent_across_checkpoints": bool(
+                        health["fixed_prior_consistent"]
+                    ),
+                }
+            )
+        else:
+            summary = summarize_standard_rows(
+                rows,
+                policy_seeds=policy_seeds,
+                episodes_per_pairing=self.spec.episodes_per_pairing,
+                standard_deviation_ddof=self.spec.standard_deviation_ddof,
+                bootstrap_replicates=self.spec.bootstrap_replicates,
+                bootstrap_confidence=self.spec.bootstrap_confidence,
+                bootstrap_seed=self.spec.evaluation_seed,
+            )
         summary.update(
             {
                 "run_kind": self.spec.run_kind,

@@ -30,6 +30,12 @@ from experiments.overcooked_v2.path_c_sequence import (
     per_head_masked_mean,
     sequence_td_core,
 )
+from experiments.overcooked_v2.path_c_standard_diagnostics import (
+    TRAINING_METRICS_SCHEMA_VERSION,
+    TrainingWindowAccumulator,
+    snapshot_trainable_parameters,
+    write_training_curves,
+)
 from experiments.overcooked_v2.path_c_standard import (
     PrimitiveObservationBatch,
     PrimitivePolicyState,
@@ -380,6 +386,14 @@ class PrimitiveTDLossOutput:
     head_support: torch.Tensor
 
 
+@dataclass(frozen=True)
+class PrimitiveTDUpdateMetrics:
+    loss: float
+    per_head_loss: tuple[float, ...]
+    per_head_support: tuple[int, ...]
+    gradient_norm: float
+
+
 def primitive_sequence_td_loss(
     online: PrimitiveRecurrentEnsembleQ,
     target: PrimitiveRecurrentEnsembleQ,
@@ -522,6 +536,7 @@ class StandardTrainingSpec:
     learning_starts_episodes: int
     updates_per_vector_step: int
     target_update_environment_steps: int
+    metrics_interval_environment_steps: int
     gamma: float
     learning_rate: float
     gradient_clip_norm: float
@@ -599,6 +614,23 @@ class StandardTrainingSpec:
         )
         if bootstrap_p <= 0.0:
             raise ValueError("training.bootstrap_p must lie in (0,1].")
+        target_update_steps = _positive_int(
+            training["target_update_environment_steps"],
+            name="training.target_update_environment_steps",
+        )
+        metrics_interval_steps = _positive_int(
+            training.get("metrics_interval_environment_steps", target_update_steps),
+            name="training.metrics_interval_environment_steps",
+        )
+        if metrics_interval_steps % batch_size:
+            raise ValueError(
+                "training.metrics_interval_environment_steps must lie on a "
+                "vector-step boundary."
+            )
+        if self_play % metrics_interval_steps or path_c % metrics_interval_steps:
+            raise ValueError(
+                "Each training phase must be divisible by the metrics interval."
+            )
         return cls(
             run_kind=run_kind,
             scientific_readout_allowed=scientific_readout_allowed,
@@ -625,10 +657,8 @@ class StandardTrainingSpec:
                 training["updates_per_vector_step"],
                 name="training.updates_per_vector_step",
             ),
-            target_update_environment_steps=_positive_int(
-                training["target_update_environment_steps"],
-                name="training.target_update_environment_steps",
-            ),
+            target_update_environment_steps=target_update_steps,
+            metrics_interval_environment_steps=metrics_interval_steps,
             gamma=gamma,
             learning_rate=learning_rate,
             gradient_clip_norm=gradient_clip,
@@ -704,6 +734,8 @@ class StandardPathCTrainer:
         self.probe_config = validate_probe_config(config.get("probe"))
         self.output_dir = self.spec.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.metrics_path = self.output_dir / "training_metrics.jsonl"
+        self.metrics_rows = 0
         self.adapter = self.env_config.make_adapter()
         self.pool = BatchedEnvPool(self.adapter.env, self.spec.batch_size_envs)
         if "observation_shape" not in self.model_config:
@@ -732,6 +764,8 @@ class StandardPathCTrainer:
         self.probe_count = 0
 
     def run(self) -> dict[str, Any]:
+        self.metrics_path.write_text("", encoding="utf-8")
+        self.metrics_rows = 0
         self_play_model = build_standard_model(self.model_config).to(self.device)
         partner_pool, self_play_metrics = self._run_self_play(self_play_model)
         if self.spec.ego_initialization == "self_play_final":
@@ -740,6 +774,15 @@ class StandardPathCTrainer:
         else:
             ego_model = build_standard_model(self.model_config).to(self.device)
         path_c_metrics = self._run_path_c(ego_model, partner_pool)
+        expected_metric_rows = (
+            self.spec.self_play_environment_steps
+            + self.spec.path_c_environment_steps
+        ) // self.spec.metrics_interval_environment_steps
+        if self.metrics_rows != expected_metric_rows:
+            raise RuntimeError(
+                "Training metric row count differs from the configured schedule: "
+                f"{self.metrics_rows} vs {expected_metric_rows}."
+            )
         # Read the budget back from the realized per-phase counters instead of
         # echoing configuration intent; spec validation makes them equal on any
         # completed run, and a mismatch must fail loudly.
@@ -770,8 +813,14 @@ class StandardPathCTrainer:
                     self.spec.partner_pool_snapshot_steps
                 ),
                 "ego_initialization": self.spec.ego_initialization,
+                "training_metrics_schema_version": TRAINING_METRICS_SCHEMA_VERSION,
+                "metrics_interval_environment_steps": (
+                    self.spec.metrics_interval_environment_steps
+                ),
             },
         )
+        curves_path = self.output_dir / "training_curves.png"
+        write_training_curves(self.metrics_path, curves_path)
         manifest = {
             "schema_version": "path_c_standard_training_artifact_v1",
             "run_kind": self.spec.run_kind,
@@ -789,6 +838,15 @@ class StandardPathCTrainer:
             "self_play": self_play_metrics,
             "path_c": path_c_metrics,
             "checkpoint": str(final_path),
+            "training_metrics": {
+                "schema_version": TRAINING_METRICS_SCHEMA_VERSION,
+                "path": str(self.metrics_path),
+                "row_count": int(self.metrics_rows),
+                "interval_environment_steps": int(
+                    self.spec.metrics_interval_environment_steps
+                ),
+                "curve_path": str(curves_path),
+            },
             "environment": self.env_config.to_mapping(),
             "architecture": ego_model.architecture_manifest(),
         }
@@ -797,6 +855,19 @@ class StandardPathCTrainer:
             encoding="utf-8",
         )
         return manifest
+
+    def _append_metric_row(self, row: Mapping[str, Any]) -> None:
+        if row.get("schema_version") != TRAINING_METRICS_SCHEMA_VERSION:
+            raise ValueError("Training metric row uses an unexpected schema.")
+        with self.metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(dict(row), sort_keys=True, allow_nan=False) + "\n")
+            handle.flush()
+        self.metrics_rows += 1
+        health = row["model_parameter_health"]
+        if int(health["learned"]["nonfinite_count"]) or int(
+            health["fixed_prior"]["nonfinite_count"]
+        ):
+            raise RuntimeError("Training model contains non-finite parameters.")
 
     def _initial_pool_state(self, phase: str) -> tuple[dict[str, np.ndarray], np.ndarray]:
         seeds = np.asarray(
@@ -841,7 +912,7 @@ class StandardPathCTrainer:
         target: PrimitiveRecurrentEnsembleQ,
         optimizer: torch.optim.Optimizer,
         replay: PrimitiveEpisodeReplay,
-    ) -> float | None:
+    ) -> PrimitiveTDUpdateMetrics | None:
         if len(replay) < max(
             self.spec.learning_starts_episodes,
             self.spec.minibatch_episodes,
@@ -860,14 +931,26 @@ class StandardPathCTrainer:
         target.eval()
         optimizer.zero_grad(set_to_none=True)
         output = primitive_sequence_td_loss(model, target, batch)
+        if not bool(torch.isfinite(output.loss)):
+            raise RuntimeError("Standard Path C TD loss became non-finite.")
         output.loss.backward()
-        torch.nn.utils.clip_grad_norm_(
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
             [parameter for parameter in model.parameters() if parameter.requires_grad],
             self.spec.gradient_clip_norm,
+            error_if_nonfinite=True,
         )
         optimizer.step()
         self.gradient_updates += 1
-        return float(output.loss.detach().cpu().item())
+        return PrimitiveTDUpdateMetrics(
+            loss=float(output.loss.detach().cpu().item()),
+            per_head_loss=tuple(
+                float(value) for value in output.per_head_loss.detach().cpu().tolist()
+            ),
+            per_head_support=tuple(
+                int(value) for value in output.head_support.detach().cpu().tolist()
+            ),
+            gradient_norm=float(gradient_norm.detach().cpu().item()),
+        )
 
     def _phase_training_setup(
         self,
@@ -920,11 +1003,18 @@ class StandardPathCTrainer:
         optimizer: torch.optim.Optimizer,
         replay: PrimitiveEpisodeReplay,
         losses: list[float],
+        diagnostics: TrainingWindowAccumulator,
     ) -> None:
         for _ in range(self.spec.updates_per_vector_step):
-            loss = self._update_model(model, target, optimizer, replay)
-            if loss is not None:
-                losses.append(loss)
+            update = self._update_model(model, target, optimizer, replay)
+            if update is not None:
+                losses.append(update.loss)
+                diagnostics.record_update(
+                    loss=update.loss,
+                    per_head_loss=update.per_head_loss,
+                    per_head_support=update.per_head_support,
+                    gradient_norm=update.gradient_norm,
+                )
 
     def _advance_target(
         self,
@@ -975,6 +1065,12 @@ class StandardPathCTrainer:
         }
         partner_pool: list[PrimitiveRecurrentEnsembleQ] = []
         losses: list[float] = []
+        diagnostics = TrainingWindowAccumulator(
+            batch_size=self.spec.batch_size_envs,
+            n_heads=model.n_heads,
+            gradient_clip_norm=self.spec.gradient_clip_norm,
+            reference=snapshot_trainable_parameters(model),
+        )
         phase_steps = 0
         next_target_update = self.spec.target_update_environment_steps
         snapshot_set = set(self.spec.partner_pool_snapshot_steps)
@@ -1009,6 +1105,7 @@ class StandardPathCTrainer:
             next_obs = {key: np.asarray(value) for key, value in next_obs_device.items()}
             rewards = shared_team_reward(rewards_device)
             dones = np.asarray(dones_device["__all__"], dtype=bool)
+            diagnostics.record_environment_batch(rewards, dones, probe_count=0)
             for index in range(self.spec.batch_size_envs):
                 for slot in (0, 1):
                     builders[slot][index].append(
@@ -1053,13 +1150,35 @@ class StandardPathCTrainer:
             episode_starts = dones.copy()
             obs = next_obs
             phase_steps += self.spec.batch_size_envs
-            self._drain_updates(model, target, optimizer, replay, losses)
+            self._drain_updates(
+                model,
+                target,
+                optimizer,
+                replay,
+                losses,
+                diagnostics,
+            )
             next_target_update = self._advance_target(
                 model,
                 target,
                 phase_steps,
                 next_target_update,
             )
+            if phase_steps % self.spec.metrics_interval_environment_steps == 0:
+                self._append_metric_row(
+                    diagnostics.build_row(
+                        seed=self.spec.seed,
+                        layout=self.env_config.layout,
+                        phase="self_play",
+                        phase_environment_steps=phase_steps,
+                        total_environment_steps=phase_steps,
+                        cumulative_episodes=self.episode_counter,
+                        gradient_updates=self.gradient_updates,
+                        epsilon=self.spec.epsilon(phase_steps),
+                        cumulative_probe_count=self.probe_count,
+                        model=model,
+                    )
+                )
             if phase_steps in snapshot_set:
                 snapshot = copy.deepcopy(model).to(self.device).eval()
                 snapshot.compact_recurrent_parameters()
@@ -1171,6 +1290,12 @@ class StandardPathCTrainer:
             for index in range(self.spec.batch_size_envs)
         ]
         losses: list[float] = []
+        diagnostics = TrainingWindowAccumulator(
+            batch_size=self.spec.batch_size_envs,
+            n_heads=model.n_heads,
+            gradient_clip_norm=self.spec.gradient_clip_norm,
+            reference=snapshot_trainable_parameters(model),
+        )
         phase_steps = 0
         next_target_update = self.spec.target_update_environment_steps
         probe_enabled = self.probe_config["enabled"]
@@ -1215,6 +1340,11 @@ class StandardPathCTrainer:
             next_obs = {key: np.asarray(value) for key, value in next_obs_device.items()}
             rewards = shared_team_reward(rewards_device)
             dones = np.asarray(dones_device["__all__"], dtype=bool)
+            diagnostics.record_environment_batch(
+                rewards,
+                dones,
+                probe_count=int(ego_decision.is_probe.sum()),
+            )
             next_ego_obs = _slot_observation(ego_slots, next_obs)
             for index in range(self.spec.batch_size_envs):
                 builders[index].append(
@@ -1273,13 +1403,37 @@ class StandardPathCTrainer:
             ego_obs = next_ego_obs
             partner_obs = next_partner_obs
             phase_steps += self.spec.batch_size_envs
-            self._drain_updates(model, target, optimizer, replay, losses)
+            self._drain_updates(
+                model,
+                target,
+                optimizer,
+                replay,
+                losses,
+                diagnostics,
+            )
             next_target_update = self._advance_target(
                 model,
                 target,
                 phase_steps,
                 next_target_update,
             )
+            if phase_steps % self.spec.metrics_interval_environment_steps == 0:
+                self._append_metric_row(
+                    diagnostics.build_row(
+                        seed=self.spec.seed,
+                        layout=self.env_config.layout,
+                        phase="path_c",
+                        phase_environment_steps=phase_steps,
+                        total_environment_steps=(
+                            self.spec.self_play_environment_steps + phase_steps
+                        ),
+                        cumulative_episodes=self.episode_counter,
+                        gradient_updates=self.gradient_updates,
+                        epsilon=self.spec.epsilon(phase_steps),
+                        cumulative_probe_count=self.probe_count,
+                        model=model,
+                    )
+                )
         return {
             "effective_environment_steps": phase_steps,
             "completed_episodes": self.episode_counter - phase_start_episodes,

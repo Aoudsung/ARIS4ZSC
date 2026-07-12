@@ -1,0 +1,29 @@
+schema_version: path_c_standard_evaluation_v1
+run_kind: calibration
+scientific_readout_allowed: false
+evaluation_seed: 9101
+device: cuda
+environment_config: ocv2_test_time_simple_standard.yaml
+checkpoint_paths:
+  - ../../../results/path_c_standard_formal_simple/seed_101/path_c_final.pt
+diagnostic_checkpoint_paths:
+  - ../../../results/path_c_standard_formal_simple/seed_101/partner_pool/step_2500000.pt
+  - ../../../results/path_c_standard_formal_simple/seed_101/partner_pool/step_5000000.pt
+  - ../../../results/path_c_standard_formal_simple/seed_101/partner_pool/step_7500000.pt
+  - ../../../results/path_c_standard_formal_simple/seed_101/partner_pool/step_10000000.pt
+  - ../../../results/path_c_standard_formal_simple/seed_101/path_c_final.pt
+output_dir: ../../../results/path_c_standard_calibration_simple/seed_101
+probe:
+  enabled: true
+  disagreement_threshold: 0.02
+  return_floor: 0.0
+  disagreement_stat: variance
+evaluation:
+  episodes_per_pairing: 500
+  evaluation_batch_size: 250
+  expected_policy_count: 1
+  standard_deviation_ddof: 0
+  # The calibration summary does not bootstrap; these fields remain present so
+  # the shared evaluation schema stays compatible with the formal evaluator.
+  bootstrap_replicates: 100
+  bootstrap_confidence: 0.95
