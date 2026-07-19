@@ -1,7 +1,7 @@
 # OPERATING_CONSTRAINTS.md
 
 **Authoritative execution boundary for the ARIS4ZSC project.**
-Last updated: 2026-07-08 · Owner: project lead
+Last updated: 2026-07-19 · Owner: project lead
 
 > 治理精简 2026-07-08：本文件的门已按 docs/status/GOVERNANCE_CUTLIST.md 处置；加/减门须过 OPERATING_CONSTRAINTS.md §7 退休阀门。
 
@@ -179,6 +179,26 @@ rounds, multiple mechanism hypotheses chased.
 5. When a result looks like a method failure, **check the data budget before
    hypothesizing mechanisms** — "how many episodes did this model actually
    experience?" is the first diagnostic question, not the last.
+6. **自写训练器在承担正式计算花销前必须复现对应方法的参照曲线。** 本规则防止的已记录
+   失败是 2026-07-14 根因裁决：本项目手写的 PyTorch 训练器在相同 3000 万环境步预算下
+   只达到约 19 分并发生能力消退，而官方 JaxMARL Independent Proximal Policy
+   Optimization 基线达到约 130 分。该旧曲线只证明任务与训练链能够学习；它不再定义正式
+   网络身份。R015 正式网络的唯一参照是 `overcooked_v2_experiments` 0.0.1
+   `ActorCriticRNN`。正式花销前以独立 `rnn-sp` seed 999 运行同一官方日程：最终四分之一的
+   官方原始回报均值须不低于 100，且不低于四个固定区间最高均值的 0.9；两项同时满足才可
+   承担正式生产。名义 `TOTAL_TIMESTEPS` 为 3000 万，实际预算必须按整数更新日程回读：
+   `rnn-sp` 29,949,952、`rnn-op` 29,999,104 个有效环境步。
+   当项目不再维护自写训练器、全部正式生产都使用已经验证的外部训练器时，本规则归档。
+7. **开发诊断运行（`run_kind: development`）是 smoke 与正式运行之间的第三类运行。** 本条
+   服务 2026-07-19 用户裁决的完整模型优先开发模式——先按提案实现完整模型，再通过实验
+   迭代优化（PATH_C_MODULE_DESIGN.md §7）。本条防止的已记录失败：此前运行分类只有
+   smoke（只许查接线、不许读数）与正式（须先完成确认性冻结）两类，任何开发期训练都被迫
+   二选一，迭代读数要么被禁止、要么被要求先冻结，开发因此不断被在架条款拦回文档工作。
+   规则：只在远端执行；逐次或成批取得用户授权；必须按第 1 条从产物回读并记录有效数据
+   预算；在 EXPERIMENT_LOG 标注 `run_kind: development`。其读数用于设计迭代，永不进入
+   主张表、比较或正式读数。本条不新设启动门：充分性下限（第 3 条）与参照曲线要求
+   （第 6 条）只门正式计算，不门开发运行；除执行边界（§1–§2）外，开发运行没有额外前置
+   条件。当项目进入正式十单元实验阶段并不再有开发运行时，本条归档。
 
 ---
 
@@ -206,6 +226,8 @@ recorded failure. This section is the ratchet's retirement valve.
    identity checks) runs as a **pre-claim / pre-deploy audit**, not a per-launch
    hoop. The fidelity gate is one fast static command; require it green *before
    reading a claim or changing method code*, not before every run.
+   “已经花掉的计算无法追回”本身不构成本款例外；只要失败能在运行后的产物中识别，相关
+   检查就属于项目排序或读数前审计，而不是启动条件。
 3. **One home per rule.** A rule lives in exactly one file; everywhere else links
    to it. Do not restate the same gate in CLAUDE.md + this file + AGENTS.md +
    the dashboard + the ledger.
