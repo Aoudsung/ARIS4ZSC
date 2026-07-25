@@ -68,6 +68,7 @@ def main() -> None:
             "standard_deviation_ddof": 0,
             "bootstrap_replicates": 100,
             "bootstrap_confidence": 0.95,
+            "probe_cost_per_use": 0.05,
         },
     }
     summary = StandardPairingEvaluator(evaluation_config).run()

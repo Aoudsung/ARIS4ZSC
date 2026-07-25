@@ -1,7 +1,10 @@
-"""Two-stage, seed-contained training for the standard primitive-action path.
+"""Seed-contained training for the standard primitive-action path.
 
-The implementation uses vectorized JAX environments and PyTorch recurrent TD
-updates.  It never calls the legacy option graph, conditional-entropy matrix,
+The main method uses two stages.  A separate registered mode stops after the
+self-play stage to produce Q-learning partner candidates for the R015
+opportunity audit.  Both modes
+use vectorized JAX environments and PyTorch recurrent temporal-difference
+updates.  Neither calls the legacy option graph, conditional-entropy matrix,
 global-state featurizer, reward shaper, or scripted partner registry.
 """
 
@@ -33,10 +36,12 @@ from experiments.overcooked_v2.path_c_sequence import (
 from experiments.overcooked_v2.path_c_standard_diagnostics import (
     TRAINING_METRICS_SCHEMA_VERSION,
     TrainingWindowAccumulator,
+    decompose_raw_reward_events,
     snapshot_trainable_parameters,
     write_training_curves,
 )
 from experiments.overcooked_v2.path_c_standard import (
+    PRIMITIVE_ACTION_NAMES,
     PrimitiveObservationBatch,
     PrimitivePolicyState,
     PrimitiveRecurrentEnsembleQ,
@@ -52,6 +57,171 @@ from experiments.overcooked_v2.path_c_standard import (
 
 
 STANDARD_TRAINING_SCHEMA_VERSION = "path_c_standard_training_v1"
+SELF_PLAY_ONLY_TRAINING_MODE = "self_play_only"
+TWO_STAGE_TRAINING_MODE = "two_stage"
+SOURCE_DEPENDENCY_CLOSURE_SCHEMA_VERSION = (
+    "path_c_repository_source_dependency_closure_v1"
+)
+
+# These are the repository files whose executable semantics determine the
+# registered Q-family training run.  The aggregate digest is computed from the
+# path and content digest of every entry.  The admission evaluator imports this
+# exact tuple and the same hashing function instead of maintaining a second
+# approximation of the training dependency closure.
+Q_PARTNER_TRAINING_DEPENDENCIES = (
+    "experiments/overcooked_v2/batched_rollout.py",
+    "experiments/overcooked_v2/env_adapter.py",
+    "experiments/overcooked_v2/path_c_seed.py",
+    "experiments/overcooked_v2/path_c_sequence.py",
+    "experiments/overcooked_v2/path_c_standard.py",
+    "experiments/overcooked_v2/path_c_standard_diagnostics.py",
+    "experiments/overcooked_v2/path_c_standard_training.py",
+    "experiments/overcooked_v2/residual_signature.py",
+)
+
+# This definition is deliberately data rather than prose in a planning file.  A
+# checkpoint can therefore prove which training algorithm, objective, reward,
+# observation, action and convention-generation mechanism produced it.
+Q_PARTNER_FAMILY_DEFINITION: dict[str, str] = {
+    "family_id": "recurrent_ensemble_q_self_play_v1",
+    "training_algorithm": "recurrent_ensemble_double_q_learning",
+    "training_objective": "bootstrap_head_huber_temporal_difference",
+    "reward_objective": (
+        "raw_team_reward_plus_environment_native_per_agent_shaping_"
+        "linear_to_zero_by_5000000_steps"
+    ),
+    "convention_generation": "parameter_shared_two_agent_epsilon_greedy_self_play",
+    "observation_contract": "official_local_5x5",
+    "action_space": "six_primitive_actions",
+    "model_class": "PrimitiveRecurrentEnsembleQ",
+    "checkpoint_phase": "self_play_partner_snapshot",
+    "action_rule": "greedy_mean_q",
+}
+
+
+def canonical_mapping_sha256(payload: Mapping[str, Any]) -> str:
+    """Hash a JSON-compatible mapping with stable key and separator rules."""
+
+    encoded = json.dumps(
+        dict(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def repository_source_dependency_closure(
+    relative_paths: Sequence[str],
+) -> dict[str, Any]:
+    """Bind an explicit repository-source dependency closure by content.
+
+    Only repository-relative regular files are accepted.  This deliberately
+    records a local source closure rather than pretending to hash third-party
+    packages or the Python runtime.
+    """
+
+    repository_root = Path(__file__).resolve().parents[2]
+    normalized = tuple(sorted(str(item) for item in relative_paths))
+    if not normalized or len(set(normalized)) != len(normalized):
+        raise ValueError("Source dependency closure must be non-empty and unique.")
+    files: dict[str, str] = {}
+    for relative in normalized:
+        declared = Path(relative)
+        if declared.is_absolute() or ".." in declared.parts:
+            raise ValueError(
+                "Source dependency closure accepts repository-relative paths only."
+            )
+        target = (repository_root / declared).resolve()
+        try:
+            target.relative_to(repository_root)
+        except ValueError as error:
+            raise ValueError("Source dependency escaped the repository root.") from error
+        if not target.is_file():
+            raise FileNotFoundError(f"Source dependency is missing: {target}")
+        files[declared.as_posix()] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return {
+        "schema_version": SOURCE_DEPENDENCY_CLOSURE_SCHEMA_VERSION,
+        "files": files,
+    }
+
+
+def repository_source_dependency_closure_sha256(
+    relative_paths: Sequence[str],
+) -> str:
+    """Return the canonical digest of an explicit source dependency closure."""
+
+    return canonical_mapping_sha256(
+        repository_source_dependency_closure(relative_paths)
+    )
+
+
+def q_partner_architecture_from_config(
+    model_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Normalize the registered Q-family model config to checkpoint form."""
+
+    required = {
+        "observation_shape",
+        "n_heads",
+        "visual_embedding_dim",
+        "encoder_dim",
+        "recurrent_dim",
+        "conv_channels",
+        "encoder_spatial_mode",
+        "prior_scale",
+        "prior_seed",
+    }
+    if set(model_config) != required:
+        raise ValueError(
+            "Registered Q-family model config must state exactly its frozen "
+            "architecture fields."
+        )
+    return {
+        "model_class": "PrimitiveRecurrentEnsembleQ",
+        "observation_shape": [int(item) for item in model_config["observation_shape"]],
+        "primitive_action_names": list(PRIMITIVE_ACTION_NAMES),
+        "n_actions": 6,
+        "n_heads": int(model_config["n_heads"]),
+        "visual_embedding_dim": int(model_config["visual_embedding_dim"]),
+        "encoder_dim": int(model_config["encoder_dim"]),
+        "recurrent_dim": int(model_config["recurrent_dim"]),
+        "conv_channels": [int(item) for item in model_config["conv_channels"]],
+        "encoder_spatial_mode": str(model_config["encoder_spatial_mode"]),
+        "prior_scale": float(model_config["prior_scale"]),
+        "prior_seed": int(model_config["prior_seed"]),
+        "input_contract": (
+            "own_default_local_observation+own_previous_action+"
+            "own_previous_raw_reward+episode_start"
+        ),
+    }
+
+
+Q_PARTNER_FAMILY_SPEC_SHA256 = canonical_mapping_sha256(
+    Q_PARTNER_FAMILY_DEFINITION
+)
+
+
+def partner_training_run_id(
+    *,
+    family_spec_sha256: str,
+    training_seed: int,
+    training_config_sha256: str,
+    environment_config_sha256: str,
+    training_implementation_sha256: str,
+) -> str:
+    """Bind one independent training run to all files that define it."""
+
+    return canonical_mapping_sha256(
+        {
+            "family_spec_sha256": family_spec_sha256,
+            "training_seed": int(training_seed),
+            "training_config_sha256": training_config_sha256,
+            "environment_config_sha256": environment_config_sha256,
+            "training_implementation_sha256": training_implementation_sha256,
+        }
+    )
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -60,6 +230,15 @@ def _positive_int(value: Any, *, name: str) -> int:
     result = int(value)
     if result <= 0:
         raise ValueError(f"{name} must be positive.")
+    return result
+
+
+def _nonnegative_int(value: Any, *, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer.")
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{name} must be non-negative.")
     return result
 
 
@@ -78,6 +257,50 @@ def derive_standard_seed(base_seed: int, *parts: object) -> int:
     base = canonical_uint64_seed(base_seed, name="standard training seed")
     payload = ":".join(["path_c_standard_seed_v1", str(base), *(str(p) for p in parts)])
     return int.from_bytes(hashlib.sha256(payload.encode("utf-8")).digest()[:8], "big")
+
+
+def phase_shaping_anneal_factor(
+    phase_environment_steps: int,
+    phase_total_environment_steps: int,
+) -> float:
+    """Linearly remove native reward shaping over the first half of one phase."""
+
+    phase_total = _positive_int(
+        phase_total_environment_steps,
+        name="phase_total_environment_steps",
+    )
+    steps = int(phase_environment_steps)
+    if steps < 0:
+        raise ValueError("phase_environment_steps must be non-negative.")
+    horizon = float(phase_total) / 2.0
+    return max(0.0, 1.0 - float(steps) / horizon)
+
+
+def shaped_rewards_by_agent(
+    info: Mapping[str, Any],
+    *,
+    batch_size: int,
+) -> dict[int, np.ndarray]:
+    """Read the environment-native per-agent shaped reward without changing it."""
+
+    shaped = info.get("shaped_reward")
+    if not isinstance(shaped, Mapping):
+        raise ValueError("Environment info is missing per-agent shaped_reward.")
+    result: dict[int, np.ndarray] = {}
+    for slot in (0, 1):
+        key = f"agent_{slot}"
+        if key not in shaped:
+            raise ValueError(f"Environment shaped_reward is missing {key!r}.")
+        value = np.asarray(shaped[key], dtype=np.float32)
+        if value.shape != (int(batch_size),):
+            raise ValueError(
+                f"Environment shaped_reward for {key!r} has shape {value.shape}, "
+                f"expected {(int(batch_size),)}."
+            )
+        if not bool(np.isfinite(value).all()):
+            raise ValueError("Environment shaped_reward must be finite.")
+        result[slot] = value.copy()
+    return result
 
 
 @dataclass(frozen=True)
@@ -128,8 +351,10 @@ class PrimitiveEpisode:
             raise ValueError("PrimitiveEpisode bootstrap mask is empty or misaligned.")
         if bool((self.actions < 0).any()) or bool((self.actions >= n_actions).any()):
             raise ValueError("PrimitiveEpisode contains an invalid primitive action.")
-        if not bool(np.isfinite(self.observations).all()) or not bool(
-            np.isfinite(self.rewards).all()
+        if (
+            not bool(np.isfinite(self.observations).all())
+            or not bool(np.isfinite(self.previous_rewards).all())
+            or not bool(np.isfinite(self.rewards).all())
         ):
             raise ValueError("PrimitiveEpisode contains non-finite data.")
         if not bool(self.episode_starts[0]) or bool(self.episode_starts[1:].any()):
@@ -173,24 +398,26 @@ class PrimitiveEpisodeBuilder:
         self,
         *,
         action: int,
-        reward: float,
+        training_reward: float,
+        previous_raw_reward: float,
         done: bool,
         next_observation: np.ndarray,
     ) -> None:
         action = int(action)
         if not 0 <= action < self.n_actions:
             raise ValueError("Primitive action lies outside the six-action space.")
-        reward = float(reward)
-        if not math.isfinite(reward):
-            raise ValueError("Primitive reward must be finite.")
+        training_reward = float(training_reward)
+        previous_raw_reward = float(previous_raw_reward)
+        if not math.isfinite(training_reward) or not math.isfinite(previous_raw_reward):
+            raise ValueError("Primitive training and raw rewards must be finite.")
         self.actions.append(action)
-        self.rewards.append(reward)
+        self.rewards.append(training_reward)
         self.dones.append(bool(done))
         self.observations.append(
             np.asarray(next_observation, dtype=np.float32).copy()
         )
         self.previous_actions.append(action)
-        self.previous_rewards.append(reward)
+        self.previous_rewards.append(previous_raw_reward)
         self.episode_starts.append(False)
 
     def finish(self, *, observation_shape: Sequence[int]) -> PrimitiveEpisode:
@@ -523,6 +750,7 @@ class PrimitiveEpisodeReplay:
 @dataclass(frozen=True)
 class StandardTrainingSpec:
     run_kind: str
+    training_mode: str
     scientific_readout_allowed: bool
     seed: int
     total_environment_steps: int
@@ -537,6 +765,7 @@ class StandardTrainingSpec:
     updates_per_vector_step: int
     target_update_environment_steps: int
     metrics_interval_environment_steps: int
+    stop_if_no_path_c_delivery_by_environment_steps: int | None
     gamma: float
     learning_rate: float
     gradient_clip_norm: float
@@ -544,6 +773,13 @@ class StandardTrainingSpec:
     epsilon_end: float
     epsilon_decay_environment_steps: int
     bootstrap_p: float
+    partner_family_definition: Mapping[str, str] | None
+    partner_family_spec_sha256: str | None
+    training_config_sha256: str
+    environment_config_sha256: str
+    training_implementation_sha256: str
+    training_implementation_dependencies: Mapping[str, Any]
+    training_run_id: str | None
     output_dir: Path
 
     @classmethod
@@ -552,13 +788,40 @@ class StandardTrainingSpec:
         if not isinstance(training, Mapping):
             raise TypeError("Standard training config requires a training mapping.")
         run_kind = str(payload.get("run_kind", "smoke"))
-        if run_kind not in {"smoke", "formal"}:
-            raise ValueError("run_kind must be 'smoke' or 'formal'.")
+        if run_kind not in {"smoke", "formal", "partner_family"}:
+            raise ValueError(
+                "run_kind must be 'smoke', 'formal', or 'partner_family'."
+            )
+        training_mode = str(
+            payload.get(
+                "training_mode",
+                (
+                    SELF_PLAY_ONLY_TRAINING_MODE
+                    if run_kind == "partner_family"
+                    else TWO_STAGE_TRAINING_MODE
+                ),
+            )
+        )
+        if training_mode not in {
+            SELF_PLAY_ONLY_TRAINING_MODE,
+            TWO_STAGE_TRAINING_MODE,
+        }:
+            raise ValueError("Unsupported standard training_mode.")
+        if (run_kind == "partner_family") != (
+            training_mode == SELF_PLAY_ONLY_TRAINING_MODE
+        ):
+            raise ValueError(
+                "Only partner_family runs may use the self_play_only mode."
+            )
         scientific_readout_allowed = bool(
             payload.get("scientific_readout_allowed", False)
         )
         if run_kind == "smoke" and scientific_readout_allowed:
             raise ValueError("Smoke configuration cannot permit scientific readout.")
+        if run_kind == "partner_family" and scientific_readout_allowed:
+            raise ValueError(
+                "Partner-family formation is not a scientific result."
+            )
         total = _positive_int(
             training["total_environment_steps"],
             name="training.total_environment_steps",
@@ -567,7 +830,7 @@ class StandardTrainingSpec:
             training["self_play_environment_steps"],
             name="training.self_play_environment_steps",
         )
-        path_c = _positive_int(
+        path_c = _nonnegative_int(
             training["path_c_environment_steps"],
             name="training.path_c_environment_steps",
         )
@@ -575,11 +838,19 @@ class StandardTrainingSpec:
             raise ValueError("The two training phases must sum to the total environment steps.")
         if run_kind == "formal" and total != 30_000_000:
             raise ValueError("Formal Test Time training uses 30,000,000 environment steps.")
+        if training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+            if total != 10_000_000 or self_play != total or path_c != 0:
+                raise ValueError(
+                    "The registered Q partner family uses exactly 10M self-play "
+                    "steps and no Path C phase."
+                )
+        elif path_c <= 0:
+            raise ValueError("Two-stage training requires positive Path C steps.")
         batch_size = _positive_int(
             training["batch_size_envs"],
             name="training.batch_size_envs",
         )
-        if self_play % batch_size or path_c % batch_size:
+        if self_play % batch_size or (path_c and path_c % batch_size):
             raise ValueError("Each phase budget must be divisible by batch_size_envs.")
         snapshots = tuple(int(item) for item in training["partner_pool_snapshot_steps"])
         if not snapshots or tuple(sorted(set(snapshots))) != snapshots:
@@ -588,9 +859,23 @@ class StandardTrainingSpec:
             raise ValueError("Partner snapshots must lie on self-play vector-step boundaries.")
         if snapshots[-1] != self_play:
             raise ValueError("The self-play final checkpoint must be in the partner pool.")
-        initialization = str(training["ego_initialization"])
-        if initialization not in {"fresh", "self_play_final"}:
-            raise ValueError("ego_initialization must be 'fresh' or 'self_play_final'.")
+        if training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+            if snapshots != (2_500_000, 5_000_000, 7_500_000, 10_000_000):
+                raise ValueError(
+                    "The registered Q family snapshots must be 2.5M, 5M, 7.5M "
+                    "and 10M steps."
+                )
+            if training.get("ego_initialization") not in {None, "not_applicable"}:
+                raise ValueError(
+                    "Self-play-only partner formation has no ego initialization."
+                )
+            initialization = "not_applicable"
+        else:
+            initialization = str(training["ego_initialization"])
+            if initialization not in {"fresh", "self_play_final"}:
+                raise ValueError(
+                    "ego_initialization must be 'fresh' or 'self_play_final'."
+                )
         gamma = float(training.get("gamma", 0.99))
         if not math.isfinite(gamma) or not 0.0 <= gamma <= 1.0:
             raise ValueError("training.gamma must lie in [0,1].")
@@ -627,12 +912,148 @@ class StandardTrainingSpec:
                 "training.metrics_interval_environment_steps must lie on a "
                 "vector-step boundary."
             )
-        if self_play % metrics_interval_steps or path_c % metrics_interval_steps:
+        if self_play % metrics_interval_steps or (
+            path_c and path_c % metrics_interval_steps
+        ):
             raise ValueError(
                 "Each training phase must be divisible by the metrics interval."
             )
+        raw_stop_step = training.get(
+            "stop_if_no_path_c_delivery_by_environment_steps"
+        )
+        stop_step = None
+        if raw_stop_step is not None:
+            if training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+                raise ValueError(
+                    "Self-play-only partner formation has no Path C stop rule."
+                )
+            stop_step = _positive_int(
+                raw_stop_step,
+                name=(
+                    "training."
+                    "stop_if_no_path_c_delivery_by_environment_steps"
+                ),
+            )
+            if stop_step > path_c:
+                raise ValueError(
+                    "The no-delivery stop step must lie within the Path C phase."
+                )
+            if stop_step % metrics_interval_steps:
+                raise ValueError(
+                    "The no-delivery stop step must coincide with a metrics window."
+                )
+        family_definition: Mapping[str, str] | None = None
+        family_spec_sha256: str | None = None
+        if training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+            raw_family = payload.get("partner_family")
+            if not isinstance(raw_family, Mapping):
+                raise TypeError(
+                    "Self-play-only training requires a partner_family mapping."
+                )
+            family_definition = {
+                str(key): str(value) for key, value in raw_family.items()
+            }
+            if family_definition != Q_PARTNER_FAMILY_DEFINITION:
+                raise ValueError(
+                    "The Q partner-family definition differs from its registered semantics."
+                )
+            raw_model = payload.get("model")
+            if not isinstance(raw_model, Mapping):
+                raise TypeError(
+                    "Q partner-family training requires a model architecture mapping."
+                )
+            q_partner_architecture_from_config(raw_model)
+            family_spec_sha256 = canonical_mapping_sha256(family_definition)
+        elif payload.get("partner_family") is not None:
+            raise ValueError(
+                "Two-stage training must not claim a partner-family definition."
+            )
+        config_sha256 = str(payload.get("_source_config_sha256", ""))
+        if not config_sha256:
+            hash_payload = {
+                str(key): value
+                for key, value in payload.items()
+                if not str(key).startswith("_")
+            }
+            config_sha256 = canonical_mapping_sha256(hash_payload)
+        if len(config_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in config_sha256
+        ):
+            raise ValueError("Training configuration SHA-256 is malformed.")
+        environment_config_sha256 = str(
+            payload.get(
+                "_environment_config_sha256",
+                canonical_mapping_sha256(
+                    payload.get("environment")
+                    if isinstance(payload.get("environment"), Mapping)
+                    else {}
+                ),
+            )
+        )
+        current_implementation_dependencies = repository_source_dependency_closure(
+            Q_PARTNER_TRAINING_DEPENDENCIES
+        )
+        raw_implementation_dependencies = payload.get(
+            "_training_implementation_dependencies",
+            current_implementation_dependencies,
+        )
+        if not isinstance(raw_implementation_dependencies, Mapping) or dict(
+            raw_implementation_dependencies
+        ) != current_implementation_dependencies:
+            raise ValueError(
+                "Training implementation dependency closure differs from the "
+                "registered repository sources."
+            )
+        training_implementation_dependencies = dict(
+            current_implementation_dependencies
+        )
+        expected_implementation_sha256 = canonical_mapping_sha256(
+            training_implementation_dependencies
+        )
+        training_implementation_sha256 = str(
+            payload.get(
+                "_training_implementation_sha256",
+                expected_implementation_sha256,
+            )
+        )
+        if training_implementation_sha256 != expected_implementation_sha256:
+            raise ValueError(
+                "Training implementation hash does not match its dependency closure."
+            )
+        for name, value in (
+            ("environment configuration", environment_config_sha256),
+            ("training implementation", training_implementation_sha256),
+        ):
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise ValueError(f"{name} SHA-256 is malformed.")
+        training_run_identity: str | None = None
+        if training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+            if any(
+                key not in payload
+                for key in (
+                    "_source_config_sha256",
+                    "_environment_config_sha256",
+                    "_training_implementation_sha256",
+                    "_training_implementation_dependencies",
+                )
+            ):
+                raise ValueError(
+                    "Partner-family training must be loaded from its bound config file."
+                )
+            if family_spec_sha256 is None:
+                raise RuntimeError("Partner-family hash was not constructed.")
+            training_run_identity = partner_training_run_id(
+                family_spec_sha256=family_spec_sha256,
+                training_seed=int(payload["seed"]),
+                training_config_sha256=config_sha256,
+                environment_config_sha256=environment_config_sha256,
+                training_implementation_sha256=training_implementation_sha256,
+            )
         return cls(
             run_kind=run_kind,
+            training_mode=training_mode,
             scientific_readout_allowed=scientific_readout_allowed,
             seed=canonical_uint64_seed(int(payload["seed"]), name="training seed"),
             total_environment_steps=total,
@@ -659,6 +1080,7 @@ class StandardTrainingSpec:
             ),
             target_update_environment_steps=target_update_steps,
             metrics_interval_environment_steps=metrics_interval_steps,
+            stop_if_no_path_c_delivery_by_environment_steps=stop_step,
             gamma=gamma,
             learning_rate=learning_rate,
             gradient_clip_norm=gradient_clip,
@@ -669,6 +1091,15 @@ class StandardTrainingSpec:
                 name="training.epsilon_decay_environment_steps",
             ),
             bootstrap_p=bootstrap_p,
+            partner_family_definition=family_definition,
+            partner_family_spec_sha256=family_spec_sha256,
+            training_config_sha256=config_sha256,
+            environment_config_sha256=environment_config_sha256,
+            training_implementation_sha256=training_implementation_sha256,
+            training_implementation_dependencies=(
+                training_implementation_dependencies
+            ),
+            training_run_id=training_run_identity,
             output_dir=Path(payload["output_dir"]),
         )
 
@@ -682,7 +1113,8 @@ class StandardTrainingSpec:
 
 def load_standard_training_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path)
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    source_bytes = config_path.read_bytes()
+    payload = yaml.safe_load(source_bytes.decode("utf-8"))
     if not isinstance(payload, Mapping):
         raise TypeError("Standard training config must contain a mapping.")
     config = dict(payload)
@@ -694,12 +1126,25 @@ def load_standard_training_config(path: str | Path) -> dict[str, Any]:
     resolved_env_path = Path(env_path)
     if not resolved_env_path.is_absolute():
         resolved_env_path = (config_path.parent / resolved_env_path).resolve()
-    env_payload = yaml.safe_load(resolved_env_path.read_text(encoding="utf-8"))
+    environment_bytes = resolved_env_path.read_bytes()
+    env_payload = yaml.safe_load(environment_bytes.decode("utf-8"))
     config["environment"] = env_payload
     config["environment_config_resolved"] = str(resolved_env_path)
     output_dir = Path(config["output_dir"])
     if not output_dir.is_absolute():
         config["output_dir"] = str((config_path.parent / output_dir).resolve())
+    config["_source_config_sha256"] = hashlib.sha256(source_bytes).hexdigest()
+    config["_source_config_path"] = str(config_path.resolve())
+    config["_environment_config_sha256"] = hashlib.sha256(
+        environment_bytes
+    ).hexdigest()
+    implementation_dependencies = repository_source_dependency_closure(
+        Q_PARTNER_TRAINING_DEPENDENCIES
+    )
+    config["_training_implementation_dependencies"] = implementation_dependencies
+    config["_training_implementation_sha256"] = canonical_mapping_sha256(
+        implementation_dependencies
+    )
     return config
 
 
@@ -717,6 +1162,9 @@ def build_standard_model(model_config: Mapping[str, Any]) -> PrimitiveRecurrentE
         encoder_dim=int(model_config.get("encoder_dim", 128)),
         recurrent_dim=int(model_config.get("recurrent_dim", 128)),
         conv_channels=model_config.get("conv_channels", [32, 32, 16]),
+        encoder_spatial_mode=str(
+            model_config.get("encoder_spatial_mode", "flatten")
+        ),
         prior_scale=float(model_config.get("prior_scale", 0.0)),
         prior_seed=int(model_config.get("prior_seed", 0)),
     )
@@ -732,6 +1180,13 @@ class StandardPathCTrainer:
         torch.manual_seed(derive_ocv2_execution_seed(self.spec.seed))
         self.model_config = dict(config.get("model") or {})
         self.probe_config = validate_probe_config(config.get("probe"))
+        if (
+            self.spec.training_mode == SELF_PLAY_ONLY_TRAINING_MODE
+            and self.probe_config["enabled"]
+        ):
+            raise ValueError(
+                "Registered Q partner-family formation must keep probing disabled."
+            )
         self.output_dir = self.spec.output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.metrics_path = self.output_dir / "training_metrics.jsonl"
@@ -767,41 +1222,58 @@ class StandardPathCTrainer:
         self.metrics_path.write_text("", encoding="utf-8")
         self.metrics_rows = 0
         self_play_model = build_standard_model(self.model_config).to(self.device)
+        if self.spec.training_mode == SELF_PLAY_ONLY_TRAINING_MODE and (
+            self_play_model.architecture_manifest()
+            != q_partner_architecture_from_config(self.model_config)
+        ):
+            raise RuntimeError(
+                "Q partner model differs from its registered architecture config."
+            )
         partner_pool, self_play_metrics = self._run_self_play(self_play_model)
+        if self.spec.training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+            return self._finish_partner_family_run(
+                self_play_model,
+                partner_pool,
+                self_play_metrics,
+            )
         if self.spec.ego_initialization == "self_play_final":
             ego_model = copy.deepcopy(self_play_model)
             ego_model.compact_recurrent_parameters()
         else:
             ego_model = build_standard_model(self.model_config).to(self.device)
         path_c_metrics = self._run_path_c(ego_model, partner_pool)
+        stopped_early = bool(path_c_metrics.get("stopped_early", False))
+        realized_environment_steps = int(
+            self_play_metrics["effective_environment_steps"]
+        ) + int(path_c_metrics["effective_environment_steps"])
         expected_metric_rows = (
-            self.spec.self_play_environment_steps
-            + self.spec.path_c_environment_steps
-        ) // self.spec.metrics_interval_environment_steps
+            realized_environment_steps
+            // self.spec.metrics_interval_environment_steps
+        )
         if self.metrics_rows != expected_metric_rows:
             raise RuntimeError(
                 "Training metric row count differs from the configured schedule: "
                 f"{self.metrics_rows} vs {expected_metric_rows}."
             )
-        # Read the budget back from the realized per-phase counters instead of
-        # echoing configuration intent; spec validation makes them equal on any
-        # completed run, and a mismatch must fail loudly.
-        realized_environment_steps = int(
-            self_play_metrics["effective_environment_steps"]
-        ) + int(path_c_metrics["effective_environment_steps"])
-        if realized_environment_steps != self.spec.total_environment_steps:
+        # Read the budget from realized phase counters. Only the preregistered
+        # no-delivery rule may produce a shorter, explicitly labelled run.
+        if not stopped_early and (
+            realized_environment_steps != self.spec.total_environment_steps
+        ):
             raise RuntimeError(
                 "Realized environment steps differ from the configured budget: "
                 f"{realized_environment_steps} vs {self.spec.total_environment_steps}."
             )
-        final_path = self.output_dir / "path_c_final.pt"
+        checkpoint_path = self.output_dir / (
+            "path_c_stopped_no_delivery.pt" if stopped_early else "path_c_final.pt"
+        )
         save_standard_checkpoint(
-            final_path,
+            checkpoint_path,
             ego_model,
             seed=self.spec.seed,
             environment_steps=realized_environment_steps,
             episodes=self.episode_counter,
-            phase="path_c_final",
+            phase=("path_c_stopped_no_delivery" if stopped_early else "path_c_final"),
             extra_metadata={
                 "run_kind": self.spec.run_kind,
                 "scientific_readout_allowed": self.spec.scientific_readout_allowed,
@@ -817,6 +1289,13 @@ class StandardPathCTrainer:
                 "metrics_interval_environment_steps": (
                     self.spec.metrics_interval_environment_steps
                 ),
+                "run_status": (
+                    "stopped_no_delivery" if stopped_early else "completed"
+                ),
+                "training_reward_contract": (
+                    "TD target uses raw team reward plus annealed environment-native "
+                    "per-agent shaped reward; recurrent previous reward remains raw"
+                ),
             },
         )
         curves_path = self.output_dir / "training_curves.png"
@@ -827,6 +1306,9 @@ class StandardPathCTrainer:
             "scientific_readout_allowed": self.spec.scientific_readout_allowed,
             "seed": self.spec.seed,
             "layout": self.env_config.layout,
+            "run_status": (
+                "stopped_no_delivery" if stopped_early else "completed"
+            ),
             "effective_environment_steps": realized_environment_steps,
             "effective_episodes": self.episode_counter,
             "episode_counter_unit": (
@@ -837,7 +1319,19 @@ class StandardPathCTrainer:
             "probe_count": self.probe_count,
             "self_play": self_play_metrics,
             "path_c": path_c_metrics,
-            "checkpoint": str(final_path),
+            "checkpoint": str(checkpoint_path),
+            "training_reward_contract": {
+                "td_target": (
+                    "raw team reward plus phase-annealed environment-native "
+                    "per-agent shaped reward"
+                ),
+                "recurrent_previous_reward": "raw team reward",
+                "evaluation_reward": "raw team reward",
+                "anneal_horizon": "first half of each training phase",
+            },
+            "stop_if_no_path_c_delivery_by_environment_steps": (
+                self.spec.stop_if_no_path_c_delivery_by_environment_steps
+            ),
             "training_metrics": {
                 "schema_version": TRAINING_METRICS_SCHEMA_VERSION,
                 "path": str(self.metrics_path),
@@ -849,6 +1343,97 @@ class StandardPathCTrainer:
             },
             "environment": self.env_config.to_mapping(),
             "architecture": ego_model.architecture_manifest(),
+        }
+        (self.output_dir / "training_manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return manifest
+
+    def _finish_partner_family_run(
+        self,
+        model: PrimitiveRecurrentEnsembleQ,
+        partner_pool: Sequence[PrimitiveRecurrentEnsembleQ],
+        self_play_metrics: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Close a candidate-producing run without claiming support admission."""
+
+        realized_environment_steps = int(
+            self_play_metrics["effective_environment_steps"]
+        )
+        if realized_environment_steps != self.spec.total_environment_steps:
+            raise RuntimeError(
+                "Q partner-family formation did not realize its frozen 10M budget."
+            )
+        if len(partner_pool) != len(self.spec.partner_pool_snapshot_steps):
+            raise RuntimeError(
+                "Q partner-family formation did not produce every frozen snapshot."
+            )
+        expected_metric_rows = (
+            realized_environment_steps
+            // self.spec.metrics_interval_environment_steps
+        )
+        if self.metrics_rows != expected_metric_rows:
+            raise RuntimeError(
+                "Partner-family metric row count differs from the frozen schedule."
+            )
+        if self.spec.partner_family_definition is None or (
+            self.spec.partner_family_spec_sha256 is None
+        ) or self.spec.training_run_id is None:
+            raise RuntimeError("Partner-family semantics were not bound to the run.")
+        final_checkpoint = (
+            self.output_dir
+            / "partner_pool"
+            / f"step_{self.spec.self_play_environment_steps}.pt"
+        )
+        curves_path = self.output_dir / "training_curves.png"
+        write_training_curves(self.metrics_path, curves_path)
+        manifest = {
+            "schema_version": "path_c_partner_family_training_artifact_v2",
+            "run_kind": self.spec.run_kind,
+            "training_mode": self.spec.training_mode,
+            "scientific_readout_allowed": False,
+            "support_status": "candidate_only",
+            "seed": self.spec.seed,
+            "layout": self.env_config.layout,
+            "run_status": "completed",
+            "effective_environment_steps": realized_environment_steps,
+            "effective_episodes": self.episode_counter,
+            "gradient_updates": self.gradient_updates,
+            "probe_count": self.probe_count,
+            "self_play": dict(self_play_metrics),
+            "candidate_checkpoints": [
+                str(self.output_dir / "partner_pool" / f"step_{step}.pt")
+                for step in self.spec.partner_pool_snapshot_steps
+            ],
+            "candidate_checkpoint_bindings": list(
+                self_play_metrics["candidate_checkpoint_bindings"]
+            ),
+            "final_candidate_checkpoint": str(final_checkpoint),
+            "partner_family": dict(self.spec.partner_family_definition),
+            "partner_family_spec_sha256": (
+                self.spec.partner_family_spec_sha256
+            ),
+            "training_config_sha256": self.spec.training_config_sha256,
+            "environment_config_sha256": self.spec.environment_config_sha256,
+            "training_implementation_sha256": (
+                self.spec.training_implementation_sha256
+            ),
+            "training_implementation_dependencies": dict(
+                self.spec.training_implementation_dependencies
+            ),
+            "training_run_id": self.spec.training_run_id,
+            "training_metrics": {
+                "schema_version": TRAINING_METRICS_SCHEMA_VERSION,
+                "path": str(self.metrics_path),
+                "row_count": int(self.metrics_rows),
+                "interval_environment_steps": int(
+                    self.spec.metrics_interval_environment_steps
+                ),
+                "curve_path": str(curves_path),
+            },
+            "environment": self.env_config.to_mapping(),
+            "architecture": model.architecture_manifest(),
         }
         (self.output_dir / "training_manifest.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True),
@@ -1064,6 +1649,7 @@ class StandardPathCTrainer:
             for slot in (0, 1)
         }
         partner_pool: list[PrimitiveRecurrentEnsembleQ] = []
+        partner_checkpoint_bindings: list[dict[str, Any]] = []
         losses: list[float] = []
         diagnostics = TrainingWindowAccumulator(
             batch_size=self.spec.batch_size_envs,
@@ -1098,19 +1684,52 @@ class StandardPathCTrainer:
                     epsilon=self.spec.epsilon(phase_steps),
                     probe_enabled=False,
                 ).actions
-            next_obs_device, _, rewards_device, dones_device, _ = self.pool.step_joint(
-                actions[0],
-                actions[1],
-            )
+            (
+                next_obs_device,
+                _,
+                rewards_device,
+                dones_device,
+                info_device,
+            ) = self.pool.step_joint(actions[0], actions[1])
             next_obs = {key: np.asarray(value) for key, value in next_obs_device.items()}
             rewards = shared_team_reward(rewards_device)
+            shaped_by_slot = shaped_rewards_by_agent(
+                info_device,
+                batch_size=self.spec.batch_size_envs,
+            )
+            anneal_factor = phase_shaping_anneal_factor(
+                phase_steps,
+                self.spec.self_play_environment_steps,
+            )
+            annealed_shaped_by_slot = {
+                slot: anneal_factor * shaped_by_slot[slot] for slot in (0, 1)
+            }
+            training_rewards_by_slot = {
+                slot: rewards + annealed_shaped_by_slot[slot] for slot in (0, 1)
+            }
             dones = np.asarray(dones_device["__all__"], dtype=bool)
-            diagnostics.record_environment_batch(rewards, dones, probe_count=0)
+            diagnostics.record_environment_batch(
+                rewards,
+                dones,
+                probe_count=0,
+                training_rewards=np.concatenate(
+                    (training_rewards_by_slot[0], training_rewards_by_slot[1])
+                ),
+                training_shaped_rewards=np.concatenate(
+                    (annealed_shaped_by_slot[0], annealed_shaped_by_slot[1])
+                ),
+                shaped_rewards_by_slot={
+                    "agent_0": shaped_by_slot[0],
+                    "agent_1": shaped_by_slot[1],
+                },
+                anneal_factor=anneal_factor,
+            )
             for index in range(self.spec.batch_size_envs):
                 for slot in (0, 1):
                     builders[slot][index].append(
                         action=int(actions[slot][index]),
-                        reward=float(rewards[index]),
+                        training_reward=float(training_rewards_by_slot[slot][index]),
+                        previous_raw_reward=float(rewards[index]),
                         done=bool(dones[index]),
                         next_observation=next_obs[f"agent_{slot}"][index],
                     )
@@ -1185,15 +1804,55 @@ class StandardPathCTrainer:
                 for parameter in snapshot.parameters():
                     parameter.requires_grad_(False)
                 partner_pool.append(snapshot)
-                save_standard_checkpoint(
+                snapshot_metadata: dict[str, Any] = {
+                    "layout": self.env_config.layout,
+                }
+                if self.spec.training_mode == SELF_PLAY_ONLY_TRAINING_MODE:
+                    if self.spec.partner_family_definition is None or (
+                        self.spec.partner_family_spec_sha256 is None
+                    ) or self.spec.training_run_id is None:
+                        raise RuntimeError(
+                            "Partner-family checkpoint lacks frozen family semantics."
+                        )
+                    snapshot_metadata.update(
+                        {
+                            "partner_family": dict(
+                                self.spec.partner_family_definition
+                            ),
+                            "partner_family_id": self.spec.partner_family_definition[
+                                "family_id"
+                            ],
+                            "partner_family_spec_sha256": (
+                                self.spec.partner_family_spec_sha256
+                            ),
+                            "training_config_sha256": (
+                                self.spec.training_config_sha256
+                            ),
+                            "environment_config_sha256": (
+                                self.spec.environment_config_sha256
+                            ),
+                            "training_implementation_sha256": (
+                                self.spec.training_implementation_sha256
+                            ),
+                            "training_implementation_dependencies": dict(
+                                self.spec.training_implementation_dependencies
+                            ),
+                            "training_run_id": self.spec.training_run_id,
+                            "training_mode": self.spec.training_mode,
+                            "scientific_readout_allowed": False,
+                            "support_status": "candidate_only",
+                        }
+                    )
+                checkpoint_binding = save_standard_checkpoint(
                     self.output_dir / "partner_pool" / f"step_{phase_steps}.pt",
                     snapshot,
                     seed=self.spec.seed,
                     environment_steps=phase_steps,
                     episodes=self.episode_counter,
                     phase="self_play_partner_snapshot",
-                    extra_metadata={"layout": self.env_config.layout},
+                    extra_metadata=snapshot_metadata,
                 )
+                partner_checkpoint_bindings.append(checkpoint_binding)
         return partner_pool, {
             "effective_environment_steps": phase_steps,
             "completed_episodes": self.episode_counter - phase_start_episodes,
@@ -1205,6 +1864,7 @@ class StandardPathCTrainer:
                 )
             ),
             "partner_pool_size": len(partner_pool),
+            "candidate_checkpoint_bindings": partner_checkpoint_bindings,
             "mean_td_loss": None if not losses else float(np.mean(losses)),
         }
 
@@ -1263,6 +1923,8 @@ class StandardPathCTrainer:
         ego_previous_rewards = np.zeros(self.spec.batch_size_envs, dtype=np.float32)
         partner_previous_rewards = np.zeros_like(ego_previous_rewards)
         episode_starts = np.ones(self.spec.batch_size_envs, dtype=bool)
+        episode_step_indices = np.zeros(self.spec.batch_size_envs, dtype=np.int64)
+        episode_probe_counts = np.zeros(self.spec.batch_size_envs, dtype=np.int64)
 
         row_range = np.arange(self.spec.batch_size_envs)
 
@@ -1297,6 +1959,7 @@ class StandardPathCTrainer:
             reference=snapshot_trainable_parameters(model),
         )
         phase_steps = 0
+        correct_delivery_event_count = 0
         next_target_update = self.spec.target_update_environment_steps
         probe_enabled = self.probe_config["enabled"]
         while phase_steps < self.spec.path_c_environment_steps:
@@ -1318,10 +1981,18 @@ class StandardPathCTrainer:
                 epsilon=self.spec.epsilon(phase_steps),
                 probe_enabled=probe_enabled,
                 disagreement_threshold=self.probe_config["disagreement_threshold"],
-                return_floor=self.probe_config["return_floor"],
+                max_probe_regret=self.probe_config["max_probe_regret"],
+                probe_allowed=(
+                    (episode_probe_counts < self.probe_config["probe_budget_per_episode"])
+                    & (
+                        episode_step_indices
+                        < self.probe_config["probe_window_environment_steps"]
+                    )
+                ) if probe_enabled else None,
                 disagreement_stat=self.probe_config["disagreement_stat"],
             )
             self.probe_count += int(ego_decision.is_probe.sum())
+            episode_probe_counts += ego_decision.is_probe.astype(np.int64)
             partner_actions, partner_states = self._partner_actions(
                 partner_pool,
                 partner_states,
@@ -1333,23 +2004,72 @@ class StandardPathCTrainer:
             )
             actions_0 = np.where(ego_slots == 0, ego_decision.actions, partner_actions)
             actions_1 = np.where(ego_slots == 1, ego_decision.actions, partner_actions)
-            next_obs_device, _, rewards_device, dones_device, _ = self.pool.step_joint(
-                actions_0,
-                actions_1,
-            )
+            (
+                next_obs_device,
+                _,
+                rewards_device,
+                dones_device,
+                info_device,
+            ) = self.pool.step_joint(actions_0, actions_1)
             next_obs = {key: np.asarray(value) for key, value in next_obs_device.items()}
             rewards = shared_team_reward(rewards_device)
+            shaped_by_slot = shaped_rewards_by_agent(
+                info_device,
+                batch_size=self.spec.batch_size_envs,
+            )
+            ego_shaped_rewards = np.where(
+                ego_slots == 0,
+                shaped_by_slot[0],
+                shaped_by_slot[1],
+            )
+            anneal_factor = phase_shaping_anneal_factor(
+                phase_steps,
+                self.spec.path_c_environment_steps,
+            )
+            annealed_ego_shaped_rewards = anneal_factor * ego_shaped_rewards
+            training_rewards = rewards + annealed_ego_shaped_rewards
             dones = np.asarray(dones_device["__all__"], dtype=bool)
+            correct_delivery_event_count += (
+                decompose_raw_reward_events(rewards).correct_delivery_count
+            )
+            probe_diagnostic_arguments: dict[str, np.ndarray] = {}
+            if probe_enabled:
+                probe_diagnostic_arguments = {
+                    "probe_candidate_disagreement": (
+                        ego_decision.probe_candidate_disagreement
+                    ),
+                    "probe_candidate_q": ego_decision.probe_candidate_q,
+                    "probe_candidate_regret": ego_decision.probe_candidate_regret,
+                    "probe_candidate_equals_greedy": (
+                        ego_decision.probe_candidate_equals_greedy
+                    ),
+                    "probe_disagreement_pass": (
+                        ego_decision.probe_disagreement_pass
+                    ),
+                    "probe_regret_pass": ego_decision.probe_regret_pass,
+                    "probe_budget_pass": (
+                        ego_decision.probe_budget_pass
+                    ),
+                }
             diagnostics.record_environment_batch(
                 rewards,
                 dones,
                 probe_count=int(ego_decision.is_probe.sum()),
+                training_rewards=training_rewards,
+                training_shaped_rewards=annealed_ego_shaped_rewards,
+                shaped_rewards_by_slot={
+                    "agent_0": shaped_by_slot[0],
+                    "agent_1": shaped_by_slot[1],
+                },
+                anneal_factor=anneal_factor,
+                **probe_diagnostic_arguments,
             )
             next_ego_obs = _slot_observation(ego_slots, next_obs)
             for index in range(self.spec.batch_size_envs):
                 builders[index].append(
                     action=int(ego_decision.actions[index]),
-                    reward=float(rewards[index]),
+                    training_reward=float(training_rewards[index]),
+                    previous_raw_reward=float(rewards[index]),
                     done=bool(dones[index]),
                     next_observation=next_ego_obs[index],
                 )
@@ -1396,6 +2116,9 @@ class StandardPathCTrainer:
             ego_previous_rewards = rewards.copy()
             partner_previous_rewards = rewards.copy()
             episode_starts = dones.copy()
+            episode_step_indices += 1
+            episode_step_indices[dones] = 0
+            episode_probe_counts[dones] = 0
             ego_previous_actions[dones] = self.n_actions
             partner_previous_actions[dones] = self.n_actions
             ego_previous_rewards[dones] = 0.0
@@ -1434,6 +2157,33 @@ class StandardPathCTrainer:
                         model=model,
                     )
                 )
+            if (
+                self.spec.stop_if_no_path_c_delivery_by_environment_steps
+                is not None
+                and phase_steps
+                == self.spec.stop_if_no_path_c_delivery_by_environment_steps
+                and correct_delivery_event_count == 0
+            ):
+                return {
+                    "effective_environment_steps": phase_steps,
+                    "completed_episodes": (
+                        self.episode_counter - phase_start_episodes
+                    ),
+                    "discarded_partial_agent_transitions": int(
+                        sum(len(builder.actions) for builder in builders)
+                    ),
+                    "probe_count": self.probe_count - phase_start_probes,
+                    "mean_td_loss": (
+                        None if not losses else float(np.mean(losses))
+                    ),
+                    "ego_slot_assignment": "uniform_per_episode",
+                    "correct_delivery_event_count": 0,
+                    "stopped_early": True,
+                    "stop_reason": (
+                        "no positive raw delivery reward by the preregistered "
+                        f"{phase_steps}-step Path C checkpoint"
+                    ),
+                }
         return {
             "effective_environment_steps": phase_steps,
             "completed_episodes": self.episode_counter - phase_start_episodes,
@@ -1443,6 +2193,8 @@ class StandardPathCTrainer:
             "probe_count": self.probe_count - phase_start_probes,
             "mean_td_loss": None if not losses else float(np.mean(losses)),
             "ego_slot_assignment": "uniform_per_episode",
+            "correct_delivery_event_count": int(correct_delivery_event_count),
+            "stopped_early": False,
         }
 
 

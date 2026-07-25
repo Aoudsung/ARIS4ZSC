@@ -1,0 +1,49 @@
+schema_version: path_c_adaptation_v1
+run_kind: diagnostic
+scientific_readout_allowed: false
+training_mode: response_only
+seed: 101
+device: cuda
+environment_config: ocv2_test_time_simple_standard.yaml
+output_dir: ../../../results/path_c_auxiliary_prefit_simple_v1/seed_101
+backbone_checkpoint: ../../../results/path_c_backbone_simple/seed_101/backbone_final.pt
+partner_pool_admission_report: ../../../results/path_c_pool_admission_diverse_simple/seed_101_102/pool_admission_report.json
+initialization: backbone
+evidence:
+  partner_action_channel: false
+model:
+  n_critic_heads: 5
+probe:
+  controller: "off"
+  enabled: false
+  response_model_mode: partner_conditioned
+  # 关闭探针时该阈值不参与动作选择；正式值由后续 500 局校准生成。
+  response_disagreement_threshold: 1.0
+  advantage_disagreement_threshold: 0.02
+  max_probe_regret: 1.0
+  probe_budget_per_episode: 20
+  probe_window_environment_steps: 100
+  response_ensemble_size: 2
+  response_hidden_dim: 64
+  partner_value_hidden_dim: 64
+  response_route: use_registered_response
+  belief_probability_floor: 1.0e-6
+  bootstrap_seed: 51
+  critic_bootstrap_p: 0.5
+training:
+  # 仅拟合回应头和伙伴条件原始回报头；骨干、critic 和 actor 均不更新。
+  total_environment_steps: 1000000
+  shaping_horizon_environment_steps: 500000
+  stop_if_no_delivery_by_environment_steps: 500000
+  batch_size_envs: 250
+  rollout_steps: 400
+  metrics_interval_environment_steps: 100000
+  target_update_environment_steps: 100000
+  actor_update_epochs: 1
+  trunk_learning_rate: 0.0001
+  actor_learning_rate: 0.00025
+  response_learning_rate: 0.00025
+  entropy_coefficient: 0.01
+  ppo_clip: 0.2
+  gamma: 0.99
+  gradient_clip_norm: 0.25

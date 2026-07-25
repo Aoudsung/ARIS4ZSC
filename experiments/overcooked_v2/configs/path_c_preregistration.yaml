@@ -1,13 +1,147 @@
-# Path C version-3 preregistration template.
-# This template is deliberately inadmissible for a run. A claim-bearing copy must
-# fill every null freeze slot, set status to frozen before execution, and bind all
-# semantic hashes below. Locked-audit results may not change any frozen choice.
+# Path C machine-readable preregistration template.
+# The historical response-information/AUC fields remain below for audit.  The
+# family-pool revision records the 2026-07-24 formal implementation, but the
+# document remains inadmissible for automatic claim decisions until the empty
+# semantic hashes and final human freeze are completed.
 
 schema_version: path_c_preregistration_schema_v3
 version: path_c_preregistration_v3_template
 measurement_schema_version: path_c_measurement_v3
 status: template_not_valid_for_runs
 freeze_timestamp:
+
+formal_family_pool_revision_v1:
+  revision_date: "2026-07-24"
+  revision_trigger: old_partner_pool_test_time_simple_design_diagnostic
+  revised_simple_claim_status: post_result_design_revision_not_original_confirmation
+  wide_role: frozen_code_layout_replication
+  config_schema_version: path_c_model_v3
+  outer_units_schema_version: path_c_outer_units_v2
+  seed_root: 2026072302
+  layouts: [test_time_simple, test_time_wide]
+  outer_training_units_per_layout: 10
+  official_runs_per_outer_unit:
+    own_self_play_backbone: 1
+    foreign_self_play: 2
+    other_play: 2
+  official_checkpoint_history:
+    checkpoints_per_run: 3
+    selection_rule: mechanical_official_update_schedule_v1
+    return_based_selection_forbidden: true
+    final_checkpoint_ability_admission_required: true
+    failed_admission_action: stop_unit_without_seed_replacement
+  family_prototypes:
+    ids:
+      - adapted_ego_family
+      - own_backbone_history_family
+      - foreign_self_play_history_family
+      - other_play_history_family
+    weights: [0.25, 0.25, 0.25, 0.25]
+    selection_order: family_first_then_uniform_member
+    member_counts: [1, 3, 6, 6]
+    schedule: balanced_condition_independent_episode_v1
+    current_policy_snapshot: freeze_complete_policy_at_400_step_rollout_start
+    member_identity_enters_model_or_belief: false
+  stages:
+    order:
+      - pool_check
+      - prefit
+      - training_calibration
+      - adaptation
+      - deployment_calibration
+    prefit_environment_steps_per_outer_unit: 1000000
+    training_calibration_episodes_per_outer_unit: 500
+    adaptation_environment_steps_per_condition_and_outer_unit: 10000000
+    deployment_calibration_episodes_per_condition_and_outer_unit: 500
+    training_calibration_shared_within_outer_unit: true
+    deployment_calibration_condition_specific: true
+    evaluation_reads_deployment_calibration_only: true
+  threshold:
+    decision_rule: maximum_of_zero_and_calibration_null_quantile
+    decision_null_quantile: 0.95
+    decision_comparison: strict_greater_than
+    information_quantile: 0.80
+    random_safe_probability: strict_decision_null_exceedance_fraction
+  standard_evaluation:
+    policy_groups:
+      - pre_adaptation_backbone
+      - decision_focused
+      - no_probe
+      - random_safe_probe
+      - generic_response_information
+    self_play_pairings_per_group: 10
+    directed_cross_play_pairings_per_group: 90
+    episodes_per_pairing: 500
+    episode_steps: 400
+    training_partners_or_history_allowed: false
+    official_summary: [sp_mean, sp_pairing_standard_deviation, xp_mean, xp_pairing_standard_deviation, sp_minus_xp]
+  response_masking_contrast:
+    population: decision_focused
+    split: directed_cross_play_only
+    pairings: 90
+    matched_episode_blocks_per_pairing: 500
+    branches: [A1, A2-mask, A2-use]
+    effects:
+      delta_response: A2-use_minus_A2-mask
+      delta_cost: A1_minus_A2-mask
+      delta_net: A2-use_minus_A1
+    identity: delta_net_equals_delta_response_minus_delta_cost
+    reported_separately_from_standard_matrix: true
+  execution:
+    allowed_gpus: [4, 6, 7]
+    forbidden_gpu: 5
+    maximum_training_jobs_per_gpu: 1
+    scientific_readout_allowed: false
+
+method_contract_v2:
+  backbone:
+    algorithm: recurrent_parameter_shared_ippo
+    policy_action_selection: stochastic_temperature_1
+    environment_steps: 30000000
+    shaping_horizon_environment_steps: 15000000
+    pool_snapshot_environment_steps: [7500000, 15000000, 22500000, 30000000]
+    budget_reporting: separate_pool_formation_cost
+    partner_pool_training_seeds: at_least_two_independent_runs
+    active_snapshots_per_training_seed: 1
+  adaptation:
+    environment_steps: 10000000
+    policy_action_selection: stochastic_temperature_1
+    trunk_gradient_source: critic_td_only
+    actor_input_gradient_boundary: detached_trunk_features
+    response_model_input_gradient_boundary: detached_trunk_features
+    shaping_horizon_environment_steps: 5000000
+    response_prefit_environment_steps: 1000000
+    response_prefit_updates: response_heads_only
+    response_prefit_scientific_readout_allowed: false
+  partner_pool:
+    minimum_independent_training_seeds: 2
+    active_snapshots_per_training_seed: 1
+    partner_head_assignment: one_head_per_active_partner
+  response_probe:
+    controller: response_voi
+    partner_belief_initialization: uniform
+    partner_belief_update: observable_response_likelihood
+    information_statistic: weighted_generalized_jensen_shannon_divergence
+    calibration_episodes: 500
+    calibration_probe_execution: false
+    decision_threshold_rule: maximum_of_zero_and_calibration_null_quantile
+    decision_null_quantile: 0.95
+    decision_threshold_comparison: strict_greater_than
+    information_quantile: 0.80
+    random_safe_probability_rule: strict_decision_null_exceedance_fraction
+    threshold_candidate_rule: safe_non_greedy_action_changing
+    no_op_probe_rule: candidate_must_differ_from_sampled_actor_action
+  forbidden_inputs:
+    - partner_identity
+    - mechanism_label
+    - style_label
+    - privileged_global_state
+  primary_evaluation_metric: raw_episode_return
+  raw_reward_decomposition:
+    constants: {correct_delivery: 20, wrong_delivery: -20, indicator_activation: -5}
+    pure_event_fast_path: true
+    correct_delivery_count_interpretation: observable_lower_bound_when_mixed_totals_are_ambiguous
+    repeated_indicator_example: a_raw_reward_of_minus_10_counts_as_two_indicator_activations
 
 semantic_bindings:
   code_commit:

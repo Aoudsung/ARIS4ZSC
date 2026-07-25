@@ -16,7 +16,9 @@ output_dir: ../../../results/path_c_standard_calibration_simple/seed_101
 probe:
   enabled: true
   disagreement_threshold: 0.02
-  return_floor: 0.0
+  max_probe_regret: 1.0
+  probe_budget_per_episode: 20
+  probe_window_environment_steps: 100
   disagreement_stat: variance
 evaluation:
   episodes_per_pairing: 500
@@ -27,3 +29,5 @@ evaluation:
   # the shared evaluation schema stays compatible with the formal evaluator.
   bootstrap_replicates: 100
   bootstrap_confidence: 0.95
+  # 数字槽：下一次评估授权前冻结；只影响支持列，不改变原始回报。
+  probe_cost_per_use: 0.05

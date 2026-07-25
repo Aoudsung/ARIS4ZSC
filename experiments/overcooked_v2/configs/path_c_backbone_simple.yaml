@@ -1,0 +1,40 @@
+schema_version: path_c_backbone_ppo_v1
+seed: 101
+device: cuda
+environment_config: ocv2_test_time_simple_standard.yaml
+output_dir: ../../../results/path_c_backbone_simple/seed_101
+partner_family:
+  family_id: recurrent_ippo_self_play_v1
+  training_algorithm: recurrent_independent_proximal_policy_optimization
+  training_objective: clipped_policy_and_value_objective_with_entropy
+  convention_generation: parameter_shared_two_agent_self_play
+  model_class: RecurrentIPPOBackbone
+  checkpoint_phase: backbone_snapshot
+  action_rule: categorical_actor_logits
+  observation_contract: official_local_5x5
+  action_space: six_primitive_actions
+  reward_objective: raw_team_reward_plus_environment_native_per_agent_shaping_linear_to_zero_by_15000000_steps
+model:
+  observation_shape: [5, 5, 39]
+  visual_embedding_dim: 128
+  recurrent_dim: 128
+  conv_channels: [32, 32, 16]
+  encoder_spatial_mode: flatten
+training:
+  total_environment_steps: 30000000
+  batch_size_envs: 250
+  rollout_steps: 128
+  update_epochs: 4
+  num_minibatches: 4
+  snapshot_steps: [7500000, 15000000, 22500000, 30000000]
+  metrics_interval_environment_steps: 100000
+  stop_if_no_delivery_by_environment_steps: 15000000
+  learning_rate: 0.00025 # 数字槽，运行授权前冻结。
+  warmup_fraction: 0.05
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coefficient: 0.2
+  entropy_coefficient: 0.01
+  value_coefficient: 0.5
+  gradient_clip_norm: 0.25
+  shaping_horizon_environment_steps: 15000000

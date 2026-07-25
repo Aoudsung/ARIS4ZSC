@@ -1,0 +1,321 @@
+schema_version: path_c_r015_design_data_protocol_v2
+status: static_registered_not_frozen
+scientific_readout_allowed: false
+
+# 设计数据只选择过滤器数值和规划分支数，不计算 R015 的配对效应。
+experiment_id: R015
+design_role: filter_and_planning_numeric_selection_only
+environment:
+  layout: test_time_simple
+  max_steps: 400
+  ego_agent_id: agent_1
+  ego_role: cook
+  partner_agent_id: agent_0
+  partner_role: signaler
+  # A1 表示不把当前探查回应送入专用信念更新支路的回应屏蔽参照；设计回合不执行探查。
+  probe_execution: disabled_a1_passive_path
+  history_collection_action_rule: ego_seed100_official_categorical_no_probe_v1
+
+support:
+  ego_training_seed: 100
+  ego_training_config: path_c_official_sp_simple_seed100.yaml
+  ego_candidate:
+    candidate_id: official_rnn_sp_ippo_v1_seed100_step29949952
+    family_id: official_rnn_sp_ippo_v1
+    training_seed: 100
+    expected_environment_steps: 29949952
+    checkpoint_path: ../../../results/path_c_official_sp_simple/seed_100/run_0/ckpt_final
+    training_config_path: path_c_official_sp_simple_seed100.yaml
+    training_manifest_path: ../../../results/path_c_official_sp_simple/seed_100/official_artifact_manifest.json
+  partner_support_registration: path_c_r015_partner_support_simple.yaml
+  partner_support_report: ../../../review_bundles/r015_official_partner_production_20260714/results/path_c_r015_partner_support_simple/partner_support_report.json
+  partner_support_episode_evidence: ../../../review_bundles/r015_official_partner_production_20260714/results/path_c_r015_partner_support_simple/episode_returns.jsonl
+  partner_prototype_ids:
+    - official_rnn_sp_ippo_v1_seed101_step29949952
+    - official_rnn_sp_ippo_v1_seed102_step29949952
+    - official_rnn_op_other_play_v1_seed201_step29999104
+    - official_rnn_op_other_play_v1_seed202_step29999104
+  design_episodes_per_prototype: 20
+  total_design_episodes: 80
+  superseded_v1_design:
+    role: revision_trigger_and_wiring_diagnostic_only
+    history_sha256: 55bae9cd26b079cc628b0b18537f4fa7e9172fb880b5108f4c952bd38a180232
+    selection_report_path: ../../../review_bundles/r015_design_freeze_pilot_20260715/design_results/design_selection_report.json
+    selection_report_sha256: 158a88a7223a4169577e40e7bf5c0dbcd929db53f7698042df60b3214d31da5a
+    status: filter_design_precision_infeasible
+    allowed_as_v2_selection_input: false
+
+role_isolation:
+  contract_id: r015_design_role_isolation_v2
+  design_episode_namespace: r015_design_episode_20260718_v2
+  design_root_seed: 18071801
+  filter_repeat_namespaces:
+    - r015_filter_repeat_0_20260718_v2
+    - r015_filter_repeat_1_20260718_v2
+  pilot_episode_namespace: r015_pilot_episode_20260715_v1
+  pilot_root_seed: 15071502
+  formal_episode_namespace: r015_formal_episode_v4
+  admission_evaluation_seed_root: 8115
+  seed_derivation: sha256_canonical_json_low_32_bits_v1
+  design_episode_coordinates: [design_episode_namespace, partner_prototype_id, episode_index]
+  filter_key_contract: r015_filter_device_fold_in_keys_v2
+  # 初始化根键只绑定过滤重放流和全局设计序号。原型、接受提议序号和逐步用途在设备内折入。
+  filter_initialization_coordinates:
+    - filter_repeat_namespace
+    - design_sequence_index
+  filter_initialization_excludes:
+    - particles_per_prototype
+    - resampling_timing
+    - episode_seed
+    - true_partner_identity
+    - complete_hidden_state
+  filter_device_fold_in_coordinates:
+    - partner_prototype_id
+    - accepted_proposal_index
+    - environment_step
+    - purpose
+    - action_or_environment_outcome
+    - resampling_child_slot
+  shared_conditioned_proposal_prefix_across_particle_counts: true
+  shared_innovations_before_resampling_timings_diverge: true
+  require_realized_seed_sets_pairwise_disjoint: true
+  require_disjoint_from_superseded_v1_design: true
+  admission_returns_allowed_as_selection_input: false
+  pilot_or_formal_data_allowed_as_selection_input: false
+
+filter_selection:
+  selection_rule_id: r015_filter_s1_s2_s3_first_pass_v2
+  mode: official_history_fully_adapted_particle_filter_v2
+  registered_prototype_prior:
+    official_rnn_sp_ippo_v1_seed101_step29949952: 0.25
+    official_rnn_sp_ippo_v1_seed102_step29949952: 0.25
+    official_rnn_op_other_play_v1_seed201_step29999104: 0.25
+    official_rnn_op_other_play_v1_seed202_step29999104: 0.25
+  particles_per_prototype: [64, 128, 256]
+  initialization:
+    rule: independent_prior_draws_conditioned_on_opening_official_observation_v1
+    accepted_particles_per_prototype: particles_per_prototype
+    rejected_proposals_count_as_particle_slots: false
+    copy_accepted_particles_to_fill_slots_allowed: false
+    record_proposal_key_and_state_sha256_per_accepted_slot: true
+    conditioned_opening_prefix_cache:
+      schema: path_c_r015_conditioned_opening_particle_prefix_cache_v1
+      contract_id: r015_shared_conditioned_opening_256_particle_prefix_v1
+      canonical_materialization_order: particles_64_then_increment_to_128_then_increment_to_256
+      accepted_slot_generated_at_most_once: true
+      lower_particle_counts_use_canonical_prefix: true
+      shared_across_resampling_timings: conditioned_opening_only
+      scan_or_post_resampling_state_cache_allowed: false
+      bindings:
+        - design_protocol_sha256
+        - source_closure_sha256
+        - design_history_sha256
+        - initialization_root_key
+      trust_unbound_disk_cache_after_crash: false
+  transition_update:
+    rule: exact_six_action_marginal_then_conditional_successor_v1
+    partner_network_forwards_per_parent_step: 1
+    partner_actions_marginalized: [up, down, right, left, stay, interact]
+    environment_outcomes_affecting_official_match_marginalized: true
+    official_match_fields:
+      - next_official_local_observation
+      - raw_team_reward
+      - episode_boundary
+    parent_predictive_likelihood: sum_action_and_environment_outcome_probability_over_official_matches
+    successor_rule: sample_one_action_and_environment_outcome_conditional_on_official_match
+    single_sample_then_hard_reject_allowed: false
+  ess:
+    rule: pre_resample_parent_predictive_weight_ess_v1
+    formula: 1/sum(normalized_parent_predictive_weight_squared)
+    denominator: particles_per_prototype
+    action_branches_change_denominator: false
+    prototype_total_changes_denominator: false
+    accepted_opening_count_changes_denominator: false
+    post_resample_copies_allowed_as_ess_evidence: false
+  zero_support:
+    status_id: finite_particle_cloud_zero_support
+    condition: sum_parent_weight_times_predictive_likelihood_equals_zero
+    implies_prototype_model_zero_probability: false
+    action: invalidate_and_replace_whole_block
+  resampling_algorithm: strict_systematic_per_prototype_v2
+  resampling_parent_lookup:
+    comparison: cdf_less_than_position
+    selected_parent: first_cdf_greater_than_or_equal_to_position
+    comparisons_per_child: ceil_log2_particles_per_prototype
+    lookup_complexity_per_child: O_log_P
+    p_by_p_selection_matrix_allowed: false
+    preserve_ancestor_indices: true
+  resampling_timings:
+    - adaptive_ess_below_half_v1
+    - every_environment_step_v1
+  # ESS（effective sample size）表示有效样本量；这里按每个原型单独计算。
+  adaptive_trigger: ESS_stratum_less_than_0.5_times_current_particle_count
+  consultation_steps: [1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56, 61, 66, 71, 76, 81, 86, 91, 96]
+  percentile_rule_id: nearest_rank_empirical_percentile_v1
+  s1:
+    quantity: episode_fraction_closed_when_any_prototype_has_zero_compatible_support
+    closure_status_id: finite_particle_cloud_zero_support
+    interpreted_as_prototype_model_zero_probability: false
+    pass_if_at_most: 0.02
+  s2:
+    quantity: paired_repeat_prototype_posterior_total_variation_p90
+    pass_if_at_most: 0.05
+  s3:
+    quantity: pre_resample_per_prototype_ESS_over_current_particle_count_p10
+    pass_if_at_least: 0.2
+  candidate_order: particles_ascending_then_adaptive_before_every_step
+  candidate_execution: lazy_candidate_order_with_atomic_evidence_v2
+  selection: first_candidate_passing_s1_s2_s3_then_do_not_run_higher_candidates
+  irreversible_s1_failure:
+    fixed_episode_denominator: 80
+    stop_candidate_at_closed_episode_count: 2
+    resulting_minimum_close_fraction: 0.025
+    s2_or_s3_may_be_read_to_override_failure: false
+  all_fail_status: filter_design_precision_infeasible
+  all_fail_action: stop_and_return_to_type_b_without_grid_expansion
+  device_execution:
+    implementation_id: r015_filter_jit_scan_vmap_v2
+    key_contract: r015_filter_device_fold_in_keys_v2
+    microbatch_schedule_id: fixed_4096_parent_particle_slots_v1
+    parent_particle_slot_target_per_microbatch: 4096
+    prototype_groups_per_microbatch: 4
+    parent_particle_slots_per_prototype_group: 1024
+    lanes_per_microbatch_by_particles_per_prototype:
+      64: 16
+      128: 8
+      256: 4
+    group_partner_network_by_prototype: true
+    each_checkpoint_processes_only_its_prototype_group: true
+    continuation_member_forwards_in_filter_candidate_stage: 0
+    continuation_member_states_initialized_in_filter_candidate_stage: false
+    merge_order: global_lane_index
+    merge_counts: sum
+    throughput_formula: total_real_transitions/total_wall_seconds
+
+planning_selection:
+  selection_rule_id: r015_r_vs_2r_exact_decision_agreement_v1
+  branch_counts: [2, 4, 8]
+  doubled_branch_counts: [4, 8, 16]
+  consultation_point_sampling:
+    # v2（数据前修订，Fable 复核 2026-07-15）：按回合序号在四个伙伴间轮换排序，
+    # 避免"最前 200 点"全部来自字典序第一个伙伴、把规划稳定性只测在单一原型的信念域上。
+    rule_id: first_200_design_consultations_partner_interleaved_v2
+    source: completed_design_histories_under_selected_filter
+    order: episode_index_then_partner_prototype_id_then_environment_step
+    take_first: 200
+    minimum_points: 200
+    # 第一条过滤随机流固定用于规划；第二条只检查重复运行稳定性，不能在看过结果后择优。
+    planning_filter_stream_id: r015_filter_repeat_0_20260718_v2
+    second_filter_stream_role: posterior_repeat_stability_only
+  common_random_numbers: true
+  branch_sampling: sampled_hidden_state_branches_v1
+  branch_belief: frozen_belief_branch_continuation_v1
+  grid_evaluation: lazy_ascending_first_pass
+  nested_branch_counts: [2, 4, 8, 16]
+  reuse_verified_lower_grid_evidence: true
+  branch_random_evidence:
+    # 正式证据只保存可重建承诺，不逐环境步展开未来随机键。
+    required_fields:
+      - future_random_root_key
+      - future_random_derivation_contract_id
+      - future_random_step_count
+      - future_random_sequence_sha256
+    full_sequence_order: environment_step_ascending
+    full_sequence_sha256_serialization: sha256_canonical_json_v1
+    verifier_reconstructs_full_sequence: true
+    compact_evidence_changes_random_stream: false
+    store_future_random_keys_stepwise: false
+  planning_scope:
+    registered_probe_scripts: 6
+    include_base_action: true
+    registered_prototypes: 4
+    horizon: full_remaining_episode_to_step_400
+    continuation_controller: map_prototype_committed_cook_v1
+    planning_routing_frequency: commit_once_at_branch_head
+    execution_routing_frequency: update_online_each_environment_step
+    shared_member_selection_rule: unique_exact_map_else_ego_seed100
+  exact_match_tuple: [masked_reference_action, probe_decision_candidate_id_or_no_probe]
+  pass_if_exact_agreement_at_least: 0.95
+  selection: first_branch_count_passing_in_ascending_order
+  all_fail_status: planning_design_precision_infeasible
+  all_fail_action: stop_and_return_to_type_b
+  cost_accounting:
+    per_consultation_semantic_costs:
+      required_fields:
+        - real_environment_transitions
+        - paired_suffix_batched_lane_time_steps
+        - branch_head_particle_transitions
+      record_real_environment_transitions: true
+      record_paired_suffix_batched_lane_time_steps: true
+      record_branch_head_particle_transitions: true
+    per_planning_candidate_device_execution:
+      record_scope: planning_candidate_top_level
+      # 长度桶表示剩余规划步数相同的咨询点集合。
+      group_by: [remaining_horizon_length, device_batch_index]
+      required_fields:
+        - remaining_horizon_length
+        - device_batch_index
+        - compiled_batch_calls
+        - active_batch_size
+        - wall_seconds
+        - throughput
+      record_compiled_batch_calls: true
+      record_active_batch_size: true
+      record_wall_seconds: true
+      record_real_transition_throughput: true
+      record_host_sync_inside_environment_loop: true
+      candidate_throughput_formula: candidate_total_real_environment_transitions/candidate_total_wall_seconds
+    per_consultation_device_metric_allocation_allowed: false
+    cross_consultation_vmap_pseudo_allocation_allowed: false
+    device_execution_metrics_allowed_as_planning_selection_input: false
+
+outputs:
+  filter_evidence_schema: path_c_r015_filter_design_evidence_v2
+  filter_evidence_required_summaries:
+    - accepted_and_rejected_opening_proposal_counts
+    - accepted_particle_source_sha256
+    - six_action_compatibility_and_parent_predictive_likelihood
+    - pre_resample_parent_weight_summary_and_ess
+    - conditional_successor_key_and_ancestor_index
+    - finite_particle_cloud_zero_support_basis
+    - parent_particle_steps_and_real_environment_transitions
+    - microbatch_calls_active_parent_slots_wall_seconds_and_throughput
+  filter_evidence_forbidden_payloads:
+    - full_particle_states
+    - full_particle_weight_traces
+    - full_particle_action_traces
+  planning_evidence_schema: path_c_r015_planning_design_evidence_v2
+  planning_candidate_result_schema: path_c_r015_planning_candidate_result_v2
+  planning_selection_schema: path_c_r015_planning_selection_v2
+  selection_report_schema: path_c_r015_design_selection_report_v2
+  selection_report_path: pending_design_run
+  planning_evidence_required_summaries:
+    - per_consultation_semantic_costs
+    - candidate_top_level_length_bucket_and_device_batch_metrics
+    - branch_random_root_key_derivation_contract_id_step_count_and_full_sequence_sha256
+  planning_evidence_forbidden_payloads:
+    - future_random_keys
+    - per_step_future_random_keys
+    - per_consultation_compiled_batch_calls
+    - per_consultation_active_batch_size
+    - per_consultation_wall_seconds
+    - per_consultation_throughput
+    - per_consultation_real_transition_throughput
+  effect_quantities_forbidden:
+    - Delta_net
+    - Delta_response
+    - Delta_cost
+    - formal_effect_interval
+
+response_summary:
+  implementation_constant: REGISTERED_LOCAL_RESPONSE_SPEC
+  response_classes: [visible, unseen, local_non_agent_change]
+  latency_bin_upper_bounds: [1]
+  source_fields: adjacent_official_local_observations_only
+  evaluator_partner_action_allowed: false
+
+execution_boundary:
+  gpu_hour_estimate: 1.5
+  current_execution_authorized: false
+  gpu_hour_estimate_is_not_a_stop_limit: true
+  formal_audit_included: false

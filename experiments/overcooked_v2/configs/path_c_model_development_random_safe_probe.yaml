@@ -1,0 +1,95 @@
+schema_version: path_c_model_v1
+run_kind: development
+scientific_readout_allowed: false
+condition_id: random_safe_probe
+controller: registered_random_safe_probe_v1
+
+environment:
+  layout: test_time_simple
+  agent_view_size: 2
+  indicate_successful_delivery: true
+  episode_steps: 400
+  num_envs: 32
+
+backbone_init:
+  checkpoint_path: ../../../results/path_c_official_sp_simple/seed_100/run_0/ckpt_final
+  flax_weights_sha256: 5a5346221a74903bd1ef3f36e228bace486f0f8b80161d837764736749045f7e
+  training_run_id: 05834fb2f550300ab4e05c5e593b3d89439b01a8a0aceffbd74326ec998cc5cc
+
+partner_pool:
+  members:
+    - checkpoint_path: ../../../results/path_c_official_sp_simple/seed_101/run_0/ckpt_final
+      flax_weights_sha256: 8c4b37146a694ff97b56e6772460c4e7623621466993d11559853ecca74fa838
+      training_run_id: 1a45685f76499c35bee9d967bbda1982d3c039c88e778ac2a83a07395672a28a
+      family_id: official_rnn_sp_ippo_v1
+    - checkpoint_path: ../../../results/path_c_official_sp_simple/seed_102/run_0/ckpt_final
+      flax_weights_sha256: 40206d91269d045d945592b4d8f61c6bf607779743ef4102e23bf328b1ab79e5
+      training_run_id: bc3601de469fe7897a4f68b3cd1a25448d4a3a2cde906fc7c677896f460abeb9
+      family_id: official_rnn_sp_ippo_v1
+    - checkpoint_path: ../../../results/path_c_official_op_simple/seed_201/run_0/ckpt_final
+      flax_weights_sha256: 87a77b5d693b8277af69480d3852940273b2c245d6e25cb276942ba40d2458b4
+      training_run_id: 6181d5952042eca76ebc2d39b356b3f593554b0535e4bbbc76c9ebda46f0cb06
+      family_id: official_rnn_op_other_play_v1
+    - checkpoint_path: ../../../results/path_c_official_op_simple/seed_202/run_0/ckpt_final
+      flax_weights_sha256: 26ffdb244cf016f41231e00c8fe63b19e52d493ac1db72239410376bb6f4c215
+      training_run_id: 28c4827863464a23597f78e8d8628635b9e94282278e6173b9bd0ce936b51139
+      family_id: official_rnn_op_other_play_v1
+
+model:
+  encoder_dim: null
+  gru_hidden_dim: null
+  response_hidden_dim: 128
+  value_hidden_dim: 128
+  transition_hidden_dim: 128
+  next_feature_summary_dim: null
+
+probe:
+  candidate_window: 100
+  budget_per_episode: 20
+  safety:
+    rule: block_interact_facing_visible_goal_v1
+  threshold:
+    source: calibration
+    decision_null_quantile: 0.95
+    information_quantile: 0.80
+  belief_probability_floor: 1.0e-8
+
+stages:
+  prefit:
+    env_steps: 204800
+    learning_rate: 0.00025
+    batch_size: 12800
+    loss_weights:
+      response: 1.0
+      prototype_value: 1.0
+      transition_response: 1.0
+      reward: 1.0
+      next_feature: 1.0
+  calibration:
+    episodes: 128
+  adaptation:
+    env_steps: 1024000
+    critic_learning_rate: 0.0001
+    actor_learning_rate: 0.00025
+    auxiliary_learning_rate: 0.00025
+    ppo_clip: 0.2
+    gae_lambda: 0.95
+    gamma: 0.99
+    entropy_coefficient: 0.01
+    value_coefficient: 0.5
+    gradient_clip_norm: 0.25
+    update_epochs: 4
+    unroll_length: 400
+    num_minibatches: 32
+    learning_rate_warmup_fraction: 0.05
+    metrics_interval_env_steps: 102400
+  evaluation:
+    schedule: development_pool_bidirectional
+    episodes_per_pairing: 64
+
+seeds:
+  model_seed: 10101
+  environment_seed: 10102
+  evaluation_seed: 10103
+
+output_root: ../../../results/path_c_complete_model_zero_anchored_development

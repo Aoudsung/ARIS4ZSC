@@ -13,6 +13,10 @@ import yaml
 from experiments.overcooked_v2 import path_c_standard
 from experiments.overcooked_v2 import path_c_standard_evaluation
 from experiments.overcooked_v2 import path_c_standard_training
+from experiments.overcooked_v2 import path_c_adaptation
+from experiments.overcooked_v2 import path_c_backbone_ppo
+from experiments.overcooked_v2 import path_c_pool_admission
+from experiments.overcooked_v2 import path_c_response_probe
 from experiments.overcooked_v2.env_adapter import OCV2Adapter
 from experiments.overcooked_v2.batched_rollout import _validated_uint32_seeds
 from experiments.overcooked_v2.path_c_standard import (
@@ -21,6 +25,7 @@ from experiments.overcooked_v2.path_c_standard import (
     StandardEnvConfig,
     choose_primitive_actions,
     load_standard_checkpoint,
+    model_weights_sha256,
     save_standard_checkpoint,
     shared_team_reward,
     single_step_batch,
@@ -43,8 +48,10 @@ from experiments.overcooked_v2.path_c_standard_training import (
     PrimitiveEpisodeBuilder,
     StandardTrainingSpec,
     collate_primitive_episodes,
+    phase_shaping_anneal_factor,
     primitive_sequence_td_loss,
     select_partner_actions,
+    shaped_rewards_by_agent,
 )
 
 
@@ -154,6 +161,10 @@ def test_standard_policy_contract_contains_only_agent_local_evidence():
             inspect.getsource(path_c_standard),
             inspect.getsource(path_c_standard_training),
             inspect.getsource(path_c_standard_evaluation),
+            inspect.getsource(path_c_adaptation),
+            inspect.getsource(path_c_backbone_ppo),
+            inspect.getsource(path_c_pool_admission),
+            inspect.getsource(path_c_response_probe),
         )
     )
     for forbidden_import in (
@@ -200,6 +211,41 @@ def test_primitive_recurrent_model_unrolls_and_carries_hidden_state():
     assert next_state.learned.hidden[0].shape == (1, 2, 10)
 
 
+def test_standard_encoder_flattens_the_full_spatial_map():
+    model = PrimitiveRecurrentEnsembleQ(
+        [5, 5, 39],
+        n_heads=2,
+        visual_embedding_dim=16,
+        encoder_dim=12,
+        recurrent_dim=10,
+        conv_channels=[8, 8, 4],
+    )
+    encoder = model.learned.observation_encoder
+    assert encoder.spatial_mode == "flatten"
+    assert not any(
+        isinstance(layer, torch.nn.AdaptiveAvgPool2d)
+        for layer in encoder.convolutions
+    )
+    assert encoder.projection[1].in_features == 5 * 5 * 4
+
+
+def test_manifest_without_spatial_mode_restores_legacy_average_pool_checkpoint():
+    legacy = PrimitiveRecurrentEnsembleQ(
+        [5, 5, 39],
+        n_heads=2,
+        visual_embedding_dim=16,
+        encoder_dim=12,
+        recurrent_dim=10,
+        conv_channels=[8, 8, 4],
+        encoder_spatial_mode="adaptive_average_pool",
+    )
+    legacy_manifest = legacy.architecture_manifest()
+    legacy_manifest.pop("encoder_spatial_mode")
+    restored = PrimitiveRecurrentEnsembleQ.from_manifest(legacy_manifest)
+    restored.load_state_dict(legacy.state_dict(), strict=True)
+    assert restored.encoder_spatial_mode == "adaptive_average_pool"
+
+
 def test_probe_selection_uses_ensemble_disagreement_over_primitive_actions():
     q_values = torch.tensor(
         [
@@ -216,10 +262,15 @@ def test_probe_selection_uses_ensemble_disagreement_over_primitive_actions():
         epsilon=0.0,
         probe_enabled=True,
         disagreement_threshold=1e-4,
+        max_probe_regret=2.0,
+        probe_allowed=np.asarray([True]),
     )
     assert decision.actions.tolist() == [1]
     assert decision.is_probe.tolist() == [True]
     assert decision.is_exploration.tolist() == [False]
+    assert decision.probe_disagreement_pass.tolist() == [True]
+    assert decision.probe_regret_pass.tolist() == [True]
+    assert decision.probe_candidate_disagreement[0] > 0.0
 
 
 def test_probing_rejects_thresholds_that_would_probe_on_every_step():
@@ -233,6 +284,8 @@ def test_probing_rejects_thresholds_that_would_probe_on_every_step():
                 epsilon=0.0,
                 probe_enabled=True,
                 disagreement_threshold=degenerate_threshold,
+                max_probe_regret=1.0,
+                probe_allowed=np.asarray([True]),
             )
 
 
@@ -250,12 +303,20 @@ def test_probe_config_validation_is_fail_closed():
     disabled = validate_probe_config({"enabled": False})
     assert disabled["enabled"] is False
     enabled = validate_probe_config(
-        {"enabled": True, "disagreement_threshold": 0.02, "return_floor": 0.0}
+        {
+            "enabled": True,
+            "disagreement_threshold": 0.02,
+            "max_probe_regret": 1.0,
+            "probe_budget_per_episode": 20,
+            "probe_window_environment_steps": 100,
+        }
     )
     assert enabled == {
         "enabled": True,
         "disagreement_threshold": 0.02,
-        "return_floor": 0.0,
+        "max_probe_regret": 1.0,
+        "probe_budget_per_episode": 20,
+        "probe_window_environment_steps": 100,
         "disagreement_stat": "variance",
     }
 
@@ -266,6 +327,28 @@ def test_shared_team_reward_asserts_the_common_reward_invariant():
     split = {"agent_0": np.asarray([1.0, -0.5]), "agent_1": np.asarray([1.0, 0.5])}
     with pytest.raises(ValueError, match="shared team reward"):
         shared_team_reward(split)
+
+
+def test_phase_reward_shaping_anneals_to_zero_over_first_half():
+    assert phase_shaping_anneal_factor(0, 10_000_000) == pytest.approx(1.0)
+    assert phase_shaping_anneal_factor(2_500_000, 10_000_000) == pytest.approx(0.5)
+    assert phase_shaping_anneal_factor(5_000_000, 10_000_000) == pytest.approx(0.0)
+    assert phase_shaping_anneal_factor(9_999_750, 10_000_000) == pytest.approx(0.0)
+    assert phase_shaping_anneal_factor(10_000_000, 20_000_000) == pytest.approx(0.0)
+
+
+def test_environment_native_shaped_rewards_are_read_per_agent():
+    values = shaped_rewards_by_agent(
+        {
+            "shaped_reward": {
+                "agent_0": np.asarray([1.0, 2.0]),
+                "agent_1": np.asarray([3.0, 4.0]),
+            }
+        },
+        batch_size=2,
+    )
+    assert values[0].tolist() == [1.0, 2.0]
+    assert values[1].tolist() == [3.0, 4.0]
 
 
 def test_step_unroll_matches_sequence_forward_on_one_episode_rows():
@@ -321,7 +404,7 @@ def test_step_unroll_matches_sequence_forward_on_one_episode_rows():
         )
 
 
-def test_episode_td_batch_uses_raw_rewards_and_episode_level_head_masks():
+def test_episode_td_batch_separates_training_reward_from_previous_raw_reward():
     builders = []
     for episode_index in range(2):
         builder = PrimitiveEpisodeBuilder(
@@ -334,7 +417,8 @@ def test_episode_td_batch_uses_raw_rewards_and_episode_level_head_masks():
         )
         builder.append(
             action=episode_index,
-            reward=-1.25 + episode_index,
+            training_reward=3.5 + episode_index,
+            previous_raw_reward=-1.25 + episode_index,
             done=True,
             next_observation=np.ones((5, 5, 39), dtype=np.uint8),
         )
@@ -347,7 +431,10 @@ def test_episode_td_batch_uses_raw_rewards_and_episode_level_head_masks():
         gamma=0.99,
         device="cpu",
     )
-    assert batch.rewards[:, 0].tolist() == pytest.approx([-1.25, -0.25])
+    assert batch.rewards[:, 0].tolist() == pytest.approx([3.5, 4.5])
+    assert batch.observations.previous_rewards[:, 1].tolist() == pytest.approx(
+        [-1.25, -0.25]
+    )
     assert batch.bootstrap_mask.shape == (2, 2)
 
     online = PrimitiveRecurrentEnsembleQ(
@@ -388,6 +475,96 @@ def test_standard_checkpoint_binds_architecture_and_effective_data_budget(tmp_pa
     assert restored.architecture_manifest() == model.architecture_manifest()
     assert metadata["environment_steps"] == 30_000_000
     assert metadata["episodes"] == 75_000
+    assert metadata["model_weights_sha256"] == model_weights_sha256(
+        model.state_dict()
+    )
+
+
+def test_model_weight_hash_ignores_checkpoint_metadata_and_binds_every_tensor(tmp_path):
+    model = PrimitiveRecurrentEnsembleQ(
+        [5, 5, 39],
+        n_heads=2,
+        visual_embedding_dim=8,
+        encoder_dim=8,
+        recurrent_dim=8,
+        conv_channels=[4, 4, 4],
+    )
+    left = save_standard_checkpoint(
+        tmp_path / "left.pt",
+        model,
+        seed=1,
+        environment_steps=10,
+        episodes=1,
+        phase="fixture",
+        extra_metadata={"label": "left"},
+    )
+    right = save_standard_checkpoint(
+        tmp_path / "right.pt",
+        model,
+        seed=2,
+        environment_steps=20,
+        episodes=2,
+        phase="fixture",
+        extra_metadata={"label": "right"},
+    )
+    assert left["checkpoint_sha256"] != right["checkpoint_sha256"]
+    assert left["model_weights_sha256"] == right["model_weights_sha256"]
+
+    changed = {
+        name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+    }
+    first_name = sorted(changed)[0]
+    changed[first_name].view(-1)[0] += 1
+    assert model_weights_sha256(changed) != left["model_weights_sha256"]
+
+    parameter_and_buffer = {
+        "layer.weight": torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+        "normalizer.running_count": torch.tensor([7], dtype=torch.int64),
+    }
+    baseline = model_weights_sha256(parameter_and_buffer)
+    for name in parameter_and_buffer:
+        one_change = {
+            key: value.clone() for key, value in parameter_and_buffer.items()
+        }
+        one_change[name].view(-1)[0] += 1
+        assert model_weights_sha256(one_change) != baseline
+
+
+def test_checkpoint_v2_rejects_weight_hash_mismatch_and_v1_remains_readable(tmp_path):
+    model = PrimitiveRecurrentEnsembleQ(
+        [5, 5, 39],
+        n_heads=2,
+        visual_embedding_dim=8,
+        encoder_dim=8,
+        recurrent_dim=8,
+        conv_channels=[4, 4, 4],
+    )
+    path = tmp_path / "checkpoint.pt"
+    save_standard_checkpoint(
+        path,
+        model,
+        seed=1,
+        environment_steps=10,
+        episodes=1,
+        phase="fixture",
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    first_name = sorted(payload["model_state_dict"])[0]
+    payload["model_state_dict"][first_name].view(-1)[0] += 1
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="model-weight SHA-256"):
+        load_standard_checkpoint(path, device="cpu")
+
+    payload["metadata"]["schema_version"] = (
+        path_c_standard.LEGACY_STANDARD_CHECKPOINT_SCHEMA_VERSION
+    )
+    payload["metadata"].pop("model_weights_sha256")
+    torch.save(payload, path)
+    restored, metadata = load_standard_checkpoint(path, device="cpu")
+    assert restored.architecture_manifest() == model.architecture_manifest()
+    assert metadata["schema_version"] == (
+        path_c_standard.LEGACY_STANDARD_CHECKPOINT_SCHEMA_VERSION
+    )
 
 
 def test_training_spec_separates_smoke_from_formal_data_budget(tmp_path):
@@ -412,6 +589,18 @@ def test_training_spec_separates_smoke_from_formal_data_budget(tmp_path):
         },
     }
     assert StandardTrainingSpec.from_mapping(base).run_kind == "smoke"
+    with_stop = {
+        **base,
+        "training": {
+            **base["training"],
+            "stop_if_no_path_c_delivery_by_environment_steps": 400,
+        },
+    }
+    assert (
+        StandardTrainingSpec.from_mapping(with_stop)
+        .stop_if_no_path_c_delivery_by_environment_steps
+        == 400
+    )
     invalid = dict(base)
     invalid["scientific_readout_allowed"] = True
     with pytest.raises(ValueError, match="Smoke"):
@@ -449,11 +638,39 @@ def test_training_window_records_loss_reward_return_and_parameter_health():
         np.asarray([1.0, -1.0]),
         np.asarray([False, False]),
         probe_count=1,
+        training_rewards=np.asarray([1.5, -0.5]),
+        training_shaped_rewards=np.asarray([0.5, 0.5]),
+        shaped_rewards_by_slot={
+            "agent_0": np.asarray([1.0, 0.0]),
+            "agent_1": np.asarray([0.0, 1.0]),
+        },
+        anneal_factor=0.5,
+        probe_candidate_disagreement=np.asarray([0.03, 0.01]),
+        probe_candidate_q=np.asarray([0.2, -0.1]),
+        probe_candidate_regret=np.asarray([0.1, 0.2]),
+        probe_candidate_equals_greedy=np.asarray([False, False]),
+        probe_disagreement_pass=np.asarray([True, False]),
+        probe_regret_pass=np.asarray([True, False]),
+        probe_budget_pass=np.asarray([True, True]),
     )
     accumulator.record_environment_batch(
         np.asarray([0.0, 2.0]),
         np.asarray([True, True]),
         probe_count=2,
+        training_rewards=np.asarray([0.0, 3.0]),
+        training_shaped_rewards=np.asarray([0.0, 1.0]),
+        shaped_rewards_by_slot={
+            "agent_0": np.asarray([0.0, 1.0]),
+            "agent_1": np.asarray([1.0, 0.0]),
+        },
+        anneal_factor=0.25,
+        probe_candidate_disagreement=np.asarray([0.04, 0.02]),
+        probe_candidate_q=np.asarray([0.3, 0.1]),
+        probe_candidate_regret=np.asarray([0.1, 0.2]),
+        probe_candidate_equals_greedy=np.asarray([False, True]),
+        probe_disagreement_pass=np.asarray([True, True]),
+        probe_regret_pass=np.asarray([True, True]),
+        probe_budget_pass=np.asarray([True, False]),
     )
     accumulator.record_update(
         loss=0.25,
@@ -476,15 +693,20 @@ def test_training_window_records_loss_reward_return_and_parameter_health():
     assert row["schema_version"] == TRAINING_METRICS_SCHEMA_VERSION
     assert row["window_environment_steps"] == 4
     assert row["td_loss"]["mean"] == pytest.approx(0.25)
-    assert row["raw_step_reward"] == {
-        "sum": 2.0,
-        "mean_per_environment_step": 0.5,
-        "positive_event_count": 2,
-        "negative_event_count": 1,
-        "zero_event_count": 1,
-    }
+    assert row["raw_step_reward"]["sum"] == 2.0
+    assert row["raw_step_reward"]["mean_per_environment_step"] == 0.5
+    assert row["raw_step_reward"]["net_positive_reward_step_count_legacy"] == 2
+    assert row["raw_step_reward"]["net_negative_reward_step_count_legacy"] == 1
+    assert row["raw_step_reward"]["zero_event_count"] == 1
     assert row["raw_episode_return"]["count"] == 2
     assert row["raw_episode_return"]["mean"] == pytest.approx(1.0)
+    assert row["training_step_reward"]["sum"] == pytest.approx(4.0)
+    assert row["shaped_training_reward"]["annealed_sum"] == pytest.approx(2.0)
+    assert row["shaped_training_reward"]["anneal_factor"]["mean"] == pytest.approx(
+        0.375
+    )
+    assert row["probe_diagnostics"]["candidate_count"] == 4
+    assert row["probe_diagnostics"]["disagreement_threshold_pass_count"] == 3
     assert row["gradient_l2_norm_before_clipping"]["clipped_fraction"] == 1.0
     assert (
         row["model_parameter_health"]["learned"]["delta_l2_from_reference"]

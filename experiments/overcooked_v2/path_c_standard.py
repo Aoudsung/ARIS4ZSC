@@ -30,7 +30,8 @@ from experiments.overcooked_v2.residual_signature import (
 
 
 STANDARD_ENV_SCHEMA_VERSION = "path_c_standard_env_v1"
-STANDARD_CHECKPOINT_SCHEMA_VERSION = "path_c_standard_checkpoint_v1"
+LEGACY_STANDARD_CHECKPOINT_SCHEMA_VERSION = "path_c_standard_checkpoint_v1"
+STANDARD_CHECKPOINT_SCHEMA_VERSION = "path_c_standard_checkpoint_v2"
 PRIMITIVE_ACTION_NAMES = (
     "right",
     "down",
@@ -39,6 +40,57 @@ PRIMITIVE_ACTION_NAMES = (
     "stay",
     "interact",
 )
+ENCODER_SPATIAL_MODES = ("adaptive_average_pool", "flatten")
+
+
+def _hash_framed_bytes(digest: "hashlib._Hash", payload: bytes) -> None:
+    """Add one unambiguous byte string to a SHA-256 digest."""
+
+    digest.update(len(payload).to_bytes(8, byteorder="big", signed=False))
+    digest.update(payload)
+
+
+def model_weights_sha256(state_dict: Mapping[str, torch.Tensor]) -> str:
+    """Hash model parameters and persistent buffers independently of metadata.
+
+    The digest binds each sorted state name, tensor dtype, tensor shape, and the
+    contiguous CPU tensor bytes.  Checkpoint containers and their metadata are
+    deliberately excluded, so reserializing identical weights cannot create a
+    second model identity.
+    """
+
+    if not isinstance(state_dict, Mapping) or not state_dict:
+        raise ValueError("model state_dict must be a non-empty mapping.")
+    digest = hashlib.sha256(b"path_c_model_weights_sha256_v1\x00")
+    for raw_name in sorted(state_dict):
+        name = str(raw_name)
+        if not name or raw_name != name:
+            raise ValueError("model state_dict keys must be non-empty strings.")
+        tensor = state_dict[raw_name]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError("model state_dict values must be tensors.")
+        if tensor.layout != torch.strided:
+            raise TypeError("model weight hashing supports dense strided tensors only.")
+        value = tensor.detach().cpu().contiguous()
+        _hash_framed_bytes(digest, name.encode("utf-8"))
+        _hash_framed_bytes(digest, str(value.dtype).encode("ascii"))
+        shape = ",".join(str(int(dimension)) for dimension in value.shape)
+        _hash_framed_bytes(digest, shape.encode("ascii"))
+        _hash_framed_bytes(digest, value.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def checkpoint_file_sha256(path: str | Path) -> str:
+    """Return the SHA-256 of a complete serialized checkpoint file."""
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -264,6 +316,9 @@ class LocalObservationEncoder(nn.Module):
         input_channels: int,
         output_dim: int,
         *,
+        observation_height: int,
+        observation_width: int,
+        spatial_mode: str,
         conv_channels: Sequence[int] = (32, 32, 16),
     ) -> None:
         super().__init__()
@@ -277,18 +332,38 @@ class LocalObservationEncoder(nn.Module):
         self.input_channels = input_channels
         self.output_dim = output_dim
         self.conv_channels = channels
-        self.convolutions = nn.Sequential(
+        self.observation_height = _positive_int(
+            observation_height,
+            name="observation_height",
+        )
+        self.observation_width = _positive_int(
+            observation_width,
+            name="observation_width",
+        )
+        self.spatial_mode = str(spatial_mode)
+        if self.spatial_mode not in ENCODER_SPATIAL_MODES:
+            raise ValueError(
+                "spatial_mode must be 'adaptive_average_pool' or 'flatten'."
+            )
+        convolution_layers: list[nn.Module] = [
             nn.Conv2d(input_channels, channels[0], kernel_size=1),
             nn.ReLU(),
             nn.Conv2d(channels[0], channels[1], kernel_size=3, padding=1),
             nn.ReLU(),
             nn.Conv2d(channels[1], channels[2], kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
+        ]
+        if self.spatial_mode == "adaptive_average_pool":
+            convolution_layers.append(nn.AdaptiveAvgPool2d((1, 1)))
+            projection_input = channels[2]
+        else:
+            projection_input = (
+                channels[2] * self.observation_height * self.observation_width
+            )
+        self.convolutions = nn.Sequential(*convolution_layers)
         self.projection = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(channels[2], output_dim),
+            nn.Linear(projection_input, output_dim),
             nn.ReLU(),
             nn.LayerNorm(output_dim),
         )
@@ -330,6 +405,7 @@ class PrimitiveVisualCore(nn.Module):
         encoder_dim: int,
         recurrent_dim: int,
         conv_channels: Sequence[int],
+        encoder_spatial_mode: str,
     ) -> None:
         super().__init__()
         shape = tuple(_positive_int(item, name="observation_shape") for item in observation_shape)
@@ -345,9 +421,13 @@ class PrimitiveVisualCore(nn.Module):
         self.encoder_dim = _positive_int(encoder_dim, name="encoder_dim")
         self.recurrent_dim = _positive_int(recurrent_dim, name="recurrent_dim")
         self.conv_channels = tuple(int(item) for item in conv_channels)
+        self.encoder_spatial_mode = str(encoder_spatial_mode)
         self.observation_encoder = LocalObservationEncoder(
             shape[-1],
             self.visual_embedding_dim,
+            observation_height=shape[0],
+            observation_width=shape[1],
+            spatial_mode=self.encoder_spatial_mode,
             conv_channels=self.conv_channels,
         )
         evidence_dim = self.visual_embedding_dim + self.n_actions + 1 + 2
@@ -534,6 +614,7 @@ class PrimitiveRecurrentEnsembleQ(nn.Module):
         encoder_dim: int = 128,
         recurrent_dim: int = 128,
         conv_channels: Sequence[int] = (32, 32, 16),
+        encoder_spatial_mode: str = "flatten",
         prior_scale: float = 0.0,
         prior_seed: int = 0,
     ) -> None:
@@ -550,6 +631,11 @@ class PrimitiveRecurrentEnsembleQ(nn.Module):
         self.encoder_dim = _positive_int(encoder_dim, name="encoder_dim")
         self.recurrent_dim = _positive_int(recurrent_dim, name="recurrent_dim")
         self.conv_channels = tuple(int(item) for item in conv_channels)
+        self.encoder_spatial_mode = str(encoder_spatial_mode)
+        if self.encoder_spatial_mode not in ENCODER_SPATIAL_MODES:
+            raise ValueError(
+                "encoder_spatial_mode must be 'adaptive_average_pool' or 'flatten'."
+            )
         self.prior_scale = _finite_float(prior_scale, name="prior_scale")
         if self.prior_scale < 0.0:
             raise ValueError("prior_scale must be non-negative.")
@@ -564,6 +650,7 @@ class PrimitiveRecurrentEnsembleQ(nn.Module):
             encoder_dim=self.encoder_dim,
             recurrent_dim=self.recurrent_dim,
             conv_channels=self.conv_channels,
+            encoder_spatial_mode=self.encoder_spatial_mode,
         )
         self.fixed_prior: PrimitiveVisualCore | None = None
         if self.prior_scale > 0.0:
@@ -577,6 +664,7 @@ class PrimitiveRecurrentEnsembleQ(nn.Module):
                     encoder_dim=self.encoder_dim,
                     recurrent_dim=self.recurrent_dim,
                     conv_channels=self.conv_channels,
+                    encoder_spatial_mode=self.encoder_spatial_mode,
                 )
             for parameter in self.fixed_prior.parameters():
                 parameter.requires_grad_(False)
@@ -686,11 +774,12 @@ class PrimitiveRecurrentEnsembleQ(nn.Module):
             "encoder_dim": int(self.encoder_dim),
             "recurrent_dim": int(self.recurrent_dim),
             "conv_channels": list(self.conv_channels),
+            "encoder_spatial_mode": self.encoder_spatial_mode,
             "prior_scale": float(self.prior_scale),
             "prior_seed": int(self.prior_seed),
             "input_contract": (
                 "own_default_local_observation+own_previous_action+"
-                "own_previous_reward+episode_start"
+                "own_previous_raw_reward+episode_start"
             ),
         }
 
@@ -706,6 +795,13 @@ class PrimitiveRecurrentEnsembleQ(nn.Module):
             encoder_dim=int(manifest["encoder_dim"]),
             recurrent_dim=int(manifest["recurrent_dim"]),
             conv_channels=manifest["conv_channels"],
+            # Checkpoints written before freeze amendment 2 omitted this field
+            # and used global average pooling. Keeping that interpretation here
+            # makes the original seed-101 artifact readable after the new
+            # spatial-flatten encoder becomes the training default.
+            encoder_spatial_mode=str(
+                manifest.get("encoder_spatial_mode", "adaptive_average_pool")
+            ),
             prior_scale=float(manifest["prior_scale"]),
             prior_seed=int(manifest["prior_seed"]),
         )
@@ -716,6 +812,13 @@ class PrimitiveActionDecision:
     actions: np.ndarray
     is_probe: np.ndarray
     is_exploration: np.ndarray
+    probe_candidate_disagreement: np.ndarray
+    probe_candidate_q: np.ndarray
+    probe_candidate_regret: np.ndarray
+    probe_candidate_equals_greedy: np.ndarray
+    probe_disagreement_pass: np.ndarray
+    probe_regret_pass: np.ndarray
+    probe_budget_pass: np.ndarray
 
 
 @torch.no_grad()
@@ -727,7 +830,8 @@ def choose_primitive_actions(
     epsilon: float = 0.0,
     probe_enabled: bool = False,
     disagreement_threshold: float | None = None,
-    return_floor: float | None = None,
+    max_probe_regret: float | None = None,
+    probe_allowed: np.ndarray | None = None,
     disagreement_stat: str = "variance",
 ) -> PrimitiveActionDecision:
     """Choose primitive actions from ensemble Q values without external labels."""
@@ -743,7 +847,7 @@ def choose_primitive_actions(
         raise ValueError("epsilon must lie in [0,1].")
     for name, value in (
         ("disagreement_threshold", disagreement_threshold),
-        ("return_floor", return_floor),
+        ("max_probe_regret", max_probe_regret),
     ):
         if value is not None:
             _finite_float(value, name=name)
@@ -754,6 +858,13 @@ def choose_primitive_actions(
     greedy = mean_q.argmax(dim=-1)
     selected = greedy.clone()
     probe_mask = torch.zeros(q_values.shape[0], dtype=torch.bool, device=q_values.device)
+    candidate_score = torch.full_like(greedy, torch.nan, dtype=q_values.dtype)
+    candidate_q = torch.full_like(greedy, torch.nan, dtype=q_values.dtype)
+    candidate_regret = torch.full_like(greedy, torch.nan, dtype=q_values.dtype)
+    candidate_equals_greedy = torch.zeros_like(probe_mask)
+    disagreement_pass = torch.zeros_like(probe_mask)
+    regret_pass = torch.zeros_like(probe_mask)
+    budget_pass = torch.zeros_like(probe_mask)
     if probe_enabled:
         # The disagreement statistic is non-negative, so a missing or
         # non-positive threshold would turn every step into a probe and the
@@ -762,6 +873,20 @@ def choose_primitive_actions(
             raise ValueError(
                 "Enabled probing requires a strictly positive disagreement_threshold."
             )
+        if max_probe_regret is None or float(max_probe_regret) < 0.0:
+            raise ValueError(
+                "Enabled probing requires a finite non-negative max_probe_regret."
+            )
+        if probe_allowed is None:
+            raise ValueError("Enabled probing requires an explicit probe_allowed mask.")
+        allowed_array = np.asarray(probe_allowed, dtype=bool)
+        if allowed_array.shape != (q_values.shape[0],):
+            raise ValueError("probe_allowed must have shape [B].")
+        budget_pass = torch.as_tensor(
+            allowed_array,
+            dtype=torch.bool,
+            device=q_values.device,
+        )
         disagreement = normalized_advantage_disagreement(
             q_values,
             option_mask=valid,
@@ -770,9 +895,19 @@ def choose_primitive_actions(
         probe_actions = disagreement.argmax(dim=-1)
         candidate_score = disagreement.gather(1, probe_actions[:, None]).squeeze(1)
         candidate_q = mean_q.gather(1, probe_actions[:, None]).squeeze(1)
-        probe_mask = candidate_score >= float(disagreement_threshold)
-        if return_floor is not None:
-            probe_mask &= candidate_q >= float(return_floor)
+        greedy_q = mean_q.gather(1, greedy[:, None]).squeeze(1)
+        candidate_regret = greedy_q - candidate_q
+        candidate_equals_greedy = probe_actions == greedy
+        disagreement_pass = candidate_score >= float(disagreement_threshold)
+        regret_pass = candidate_regret <= float(max_probe_regret)
+        # Selecting the greedy action reveals no counterfactual response, so it
+        # is not a probe and must not consume budget or evaluation cost.
+        probe_mask = (
+            disagreement_pass
+            & regret_pass
+            & budget_pass
+            & ~candidate_equals_greedy
+        )
         selected = torch.where(probe_mask, probe_actions, selected)
     exploration = np.asarray(
         rng.random(q_values.shape[0]) < epsilon,
@@ -788,6 +923,27 @@ def choose_primitive_actions(
         actions=selected_np,
         is_probe=probe_np,
         is_exploration=exploration,
+        probe_candidate_disagreement=(
+            candidate_score.detach().cpu().numpy().astype(np.float32, copy=True)
+        ),
+        probe_candidate_q=(
+            candidate_q.detach().cpu().numpy().astype(np.float32, copy=True)
+        ),
+        probe_candidate_regret=(
+            candidate_regret.detach().cpu().numpy().astype(np.float32, copy=True)
+        ),
+        probe_candidate_equals_greedy=(
+            candidate_equals_greedy.detach().cpu().numpy().astype(bool, copy=True)
+        ),
+        probe_disagreement_pass=(
+            disagreement_pass.detach().cpu().numpy().astype(bool, copy=True)
+        ),
+        probe_regret_pass=(
+            regret_pass.detach().cpu().numpy().astype(bool, copy=True)
+        ),
+        probe_budget_pass=(
+            budget_pass.detach().cpu().numpy().astype(bool, copy=True)
+        ),
     )
 
 
@@ -861,7 +1017,14 @@ def validate_probe_config(payload: Mapping[str, Any] | None) -> dict[str, Any]:
     if not isinstance(payload, Mapping):
         raise TypeError("probe must be a mapping.")
     config = dict(payload)
-    allowed = {"enabled", "disagreement_threshold", "return_floor", "disagreement_stat"}
+    allowed = {
+        "enabled",
+        "disagreement_threshold",
+        "max_probe_regret",
+        "probe_budget_per_episode",
+        "probe_window_environment_steps",
+        "disagreement_stat",
+    }
     unknown = sorted(set(config) - allowed)
     if unknown:
         raise ValueError(f"Unknown probe field(s): {', '.join(unknown)}.")
@@ -869,7 +1032,9 @@ def validate_probe_config(payload: Mapping[str, Any] | None) -> dict[str, Any]:
         raise ValueError("probe.enabled must be an explicit boolean.")
     enabled = bool(config["enabled"])
     threshold = config.get("disagreement_threshold")
-    return_floor = config.get("return_floor")
+    max_probe_regret = config.get("max_probe_regret")
+    probe_budget = config.get("probe_budget_per_episode")
+    probe_window = config.get("probe_window_environment_steps")
     stat = str(config.get("disagreement_stat", "variance"))
     if stat not in {"variance", "range"}:
         raise ValueError("probe.disagreement_stat must be 'variance' or 'range'.")
@@ -884,12 +1049,39 @@ def validate_probe_config(payload: Mapping[str, Any] | None) -> dict[str, Any]:
                 "probe.disagreement_threshold must be strictly positive; "
                 "zero probes on every step."
             )
-    if return_floor is not None:
-        return_floor = _finite_float(return_floor, name="probe.return_floor")
+        if max_probe_regret is None:
+            raise ValueError("Enabled probing requires probe.max_probe_regret.")
+        max_probe_regret = _finite_float(
+            max_probe_regret,
+            name="probe.max_probe_regret",
+        )
+        if max_probe_regret < 0.0:
+            raise ValueError("probe.max_probe_regret must be non-negative.")
+        if probe_budget is None or probe_window is None:
+            raise ValueError(
+                "Enabled probing requires probe_budget_per_episode and "
+                "probe_window_environment_steps."
+            )
+        probe_budget = _positive_int(
+            probe_budget,
+            name="probe.probe_budget_per_episode",
+        )
+        probe_window = _positive_int(
+            probe_window,
+            name="probe.probe_window_environment_steps",
+        )
     return {
         "enabled": enabled,
         "disagreement_threshold": None if threshold is None else float(threshold),
-        "return_floor": None if return_floor is None else float(return_floor),
+        "max_probe_regret": (
+            None if max_probe_regret is None else float(max_probe_regret)
+        ),
+        "probe_budget_per_episode": (
+            None if probe_budget is None else int(probe_budget)
+        ),
+        "probe_window_environment_steps": (
+            None if probe_window is None else int(probe_window)
+        ),
         "disagreement_stat": stat,
     }
 
@@ -913,16 +1105,17 @@ def shared_team_reward(rewards: Mapping[str, Any]) -> np.ndarray:
 
 def save_standard_checkpoint(
     path: str | Path,
-    model: PrimitiveRecurrentEnsembleQ,
+    model: nn.Module,
     *,
     seed: int,
     environment_steps: int,
     episodes: int,
     phase: str,
     extra_metadata: Mapping[str, Any] | None = None,
-) -> None:
+) -> dict[str, Any]:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
+    weights_sha256 = model_weights_sha256(model.state_dict())
     metadata = {
         "schema_version": STANDARD_CHECKPOINT_SCHEMA_VERSION,
         "seed": int(seed),
@@ -931,6 +1124,7 @@ def save_standard_checkpoint(
         "phase": str(phase),
         "architecture": model.architecture_manifest(),
         "prior_state_sha256": model.prior_state_sha256(),
+        "model_weights_sha256": weights_sha256,
     }
     if extra_metadata:
         overlap = set(metadata) & set(extra_metadata)
@@ -947,13 +1141,19 @@ def save_standard_checkpoint(
         },
         target,
     )
+    return {
+        "path": str(target),
+        "environment_steps": int(environment_steps),
+        "checkpoint_sha256": checkpoint_file_sha256(target),
+        "model_weights_sha256": weights_sha256,
+    }
 
 
 def load_standard_checkpoint(
     path: str | Path,
     *,
     device: torch.device | str,
-) -> tuple[PrimitiveRecurrentEnsembleQ, dict[str, Any]]:
+) -> tuple[nn.Module, dict[str, Any]]:
     payload = torch.load(Path(path), map_location=device, weights_only=False)
     if not isinstance(payload, Mapping):
         raise ValueError("Standard Path C checkpoint must be a mapping.")
@@ -961,9 +1161,37 @@ def load_standard_checkpoint(
     state_dict = payload.get("model_state_dict")
     if not isinstance(metadata, Mapping) or not isinstance(state_dict, Mapping):
         raise ValueError("Standard Path C checkpoint is missing metadata or weights.")
-    if metadata.get("schema_version") != STANDARD_CHECKPOINT_SCHEMA_VERSION:
+    checkpoint_schema = metadata.get("schema_version")
+    if checkpoint_schema not in {
+        LEGACY_STANDARD_CHECKPOINT_SCHEMA_VERSION,
+        STANDARD_CHECKPOINT_SCHEMA_VERSION,
+    }:
         raise ValueError("Unsupported standard Path C checkpoint schema.")
-    model = PrimitiveRecurrentEnsembleQ.from_manifest(metadata["architecture"])
+    computed_weights_sha256 = model_weights_sha256(state_dict)
+    recorded_weights_sha256 = metadata.get("model_weights_sha256")
+    if checkpoint_schema == STANDARD_CHECKPOINT_SCHEMA_VERSION:
+        if recorded_weights_sha256 != computed_weights_sha256:
+            raise ValueError("Checkpoint model-weight SHA-256 does not match its tensors.")
+    elif recorded_weights_sha256 is not None and (
+        recorded_weights_sha256 != computed_weights_sha256
+    ):
+        raise ValueError("Legacy checkpoint model-weight SHA-256 is inconsistent.")
+    architecture = metadata["architecture"]
+    model_class = architecture.get("model_class")
+    if model_class == "PrimitiveRecurrentEnsembleQ":
+        model = PrimitiveRecurrentEnsembleQ.from_manifest(architecture)
+    elif model_class == "RecurrentIPPOBackbone":
+        from experiments.overcooked_v2.path_c_backbone_ppo import (
+            RecurrentIPPOBackbone,
+        )
+
+        model = RecurrentIPPOBackbone.from_manifest(architecture)
+    elif model_class == "PathCAdaptationPolicy":
+        from experiments.overcooked_v2.path_c_adaptation import PathCAdaptationPolicy
+
+        model = PathCAdaptationPolicy.from_manifest(architecture)
+    else:
+        raise ValueError(f"Unsupported standard checkpoint model class {model_class!r}.")
     model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.compact_recurrent_parameters()

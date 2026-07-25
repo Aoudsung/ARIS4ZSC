@@ -1,0 +1,75 @@
+schema_version: path_c_official_trainer_launch_v1
+# 本文件只登记官方训练器的主体基线运行；接线字段已经核对，但正式训练仍待另行授权。
+registration_status: static_registered_not_frozen
+scientific_readout_allowed: false
+type_a_acceptance:
+  status: amended_pending_registered_reference_run
+  amendment_signed: "2026-07-14"
+  reference_id: overcooked_v2_experiments_actor_critic_rnn_v1
+  reference_acceptance_rule_id: official_rnn_sp_seed999_final_quarter_return_gate_v1
+  reference_acceptance_config: path_c_official_sp_simple_seed999_acceptance.yaml
+  reference_acceptance_report: ../../../.codex_remote_validation/r015_official_sp_reference_seed999/reference_acceptance_report.json
+  remaining_gate: seed999_reference_curve_not_yet_run
+production_status: pending_separate_remote_authorization
+experiment_variant: rnn-sp
+layout: test_time_simple
+seed: 100
+TOTAL_TIMESTEPS: 30000000
+effective_environment_steps_contract:
+  nominal_total_timesteps: 30000000
+  num_updates: 457
+  num_envs: 256
+  num_steps: 256
+  effective_environment_steps: 29949952
+WANDB_MODE: disabled
+environment_config: ocv2_test_time_simple_standard.yaml
+environment_kwargs:
+  layout: test_time_simple
+  max_steps: 400
+  observation_type: DEFAULT
+  agent_view_size: 2
+  negative_rewards: true
+  random_agent_positions: true
+  sample_recipe_on_delivery: true
+  indicate_successful_delivery: true
+  force_path_planning: false
+  random_reset: false
+output_dir: ../../../results/path_c_official_sp_simple/seed_100
+official_package:
+  distribution_name: overcooked_v2_experiments
+  package_version: 0.0.1
+  editable_source_root: /apps/users/cxw/Document/CodeSpace/Selfs/TG-SSA/external/overcookedv2_experiments/experiments/overcooked_v2_experiments
+  hydra_entrypoint: overcooked_v2_experiments/ppo/main.py
+  repository_adapter: experiments/overcooked_v2/official/overcooked_v2_experiments_adapter.py
+partner_family:
+  family_id: official_rnn_sp_ippo_v1
+  training_algorithm: official_recurrent_independent_proximal_policy_optimization
+  training_objective: official_clipped_policy_and_value_objective_with_entropy
+  reward_objective: raw_team_reward_plus_official_environment_shaping_linear_to_zero_by_15000000_steps
+  observation_contract: official_local_5x5
+  action_space: six_primitive_actions
+  model_class: OfficialFlaxRecurrentActor
+  checkpoint_phase: completed_official_training_run
+  action_rule: official_flax_categorical_actor_v1
+  convention_generation: official_rnn_sp_parameter_shared_self_play
+model:
+  model_class: OfficialFlaxRecurrentActor
+  network_definition: overcooked_v2_experiments.ppo.models.rnn.ActorCriticRNN
+  recurrent_state_initializer: overcooked_v2_experiments.ppo.models.model.initialize_carry
+  apply_interface: "network.apply(params, recurrent_state, (observation[time,batch], episode_start[time,batch])) -> (next_state, categorical_distribution, value)"
+  action_rule: official_flax_categorical_actor_v1
+  action_order: [right, down, left, up, stay, interact]
+checkpoint:
+  expected_path: ../../../results/path_c_official_sp_simple/seed_100/run_0/ckpt_final
+  format: orbax_pytree_directory_v1
+  parameter_tree_path: [params]
+  native_save_mechanism: overcooked_v2_experiments.ppo.utils.store.store_checkpoint
+runtime:
+  wrapper: experiments/overcooked_v2/scripts/with_jax_cuda12.sh
+  JAX_PLATFORMS: cuda,cpu
+wiring_verification:
+  status: verified
+  hydra_overrides: [+experiment=rnn-sp, +env=test_time_simple, NUM_SEEDS=1, wandb.WANDB_MODE=disabled]
+  official_entrypoint_requires_repository_adapter: true
+  official_entrypoint_blocker: missing_unused_overcooked_ai_py_import
+  training_environment_overrides: {}

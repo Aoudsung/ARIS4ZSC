@@ -1,0 +1,46 @@
+schema_version: path_c_adaptation_v1
+run_kind: diagnostic
+scientific_readout_allowed: false
+training_mode: joint
+seed: 101
+device: cuda
+environment_config: ocv2_test_time_simple_standard.yaml
+output_dir: ../../../results/path_c_isolation_v1/random_probe_off/seed_101
+backbone_checkpoint: ../../../results/path_c_backbone_simple/seed_101/backbone_final.pt
+partner_pool_admission_report: ../../../results/path_c_pool_admission_diverse_simple/seed_101_102/pool_admission_report.json
+initialization: random
+response_initialization_checkpoint: ../../../results/path_c_auxiliary_prefit_random_simple_v1/seed_101/response_prefit.pt
+evidence: {partner_action_channel: false}
+model: {n_critic_heads: 5}
+probe:
+  controller: "off"
+  enabled: false
+  response_model_mode: partner_conditioned
+  response_disagreement_threshold: 1.0
+  response_route: use_registered_response
+  advantage_disagreement_threshold: 0.02
+  max_probe_regret: 1.0
+  probe_budget_per_episode: 20
+  probe_window_environment_steps: 100
+  response_ensemble_size: 2
+  response_hidden_dim: 64
+  partner_value_hidden_dim: 64
+  belief_probability_floor: 1.0e-6
+  bootstrap_seed: 51
+  critic_bootstrap_p: 0.5
+training:
+  total_environment_steps: 2000000
+  shaping_horizon_environment_steps: 1000000
+  stop_if_no_delivery_by_environment_steps: 1000000
+  batch_size_envs: 250
+  rollout_steps: 400
+  metrics_interval_environment_steps: 100000
+  target_update_environment_steps: 100000
+  actor_update_epochs: 4
+  trunk_learning_rate: 0.0001
+  actor_learning_rate: 0.00025
+  response_learning_rate: 0.00025
+  entropy_coefficient: 0.01
+  ppo_clip: 0.2
+  gamma: 0.99
+  gradient_clip_norm: 0.25

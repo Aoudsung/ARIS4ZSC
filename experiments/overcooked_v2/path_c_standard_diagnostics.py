@@ -22,8 +22,76 @@ from experiments.overcooked_v2.path_c_standard import (
 )
 
 
-TRAINING_METRICS_SCHEMA_VERSION = "path_c_standard_training_metrics_v1"
+TRAINING_METRICS_SCHEMA_VERSION = "path_c_standard_training_metrics_v3"
 CHECKPOINT_HEALTH_SCHEMA_VERSION = "path_c_standard_checkpoint_health_v1"
+
+
+@dataclass(frozen=True)
+class RawRewardEvents:
+    """Observable decomposition of shared OvercookedV2 raw step rewards."""
+
+    correct_delivery_count: int
+    wrong_delivery_count: int
+    indicator_activation_count: int
+    ambiguous_step_count: int
+    ambiguous_raw_rewards: tuple[float, ...]
+
+
+def decompose_raw_reward_events(raw_step_rewards: np.ndarray) -> RawRewardEvents:
+    """Decompose official +20/-20 deliveries and -5 indicator costs.
+
+    Pure repeated events are recognized first. Mixed totals are accepted only
+    when the bounded integer equation has one solution; otherwise the original
+    reward is retained in ``ambiguous_raw_rewards`` instead of inventing an
+    event label.
+    """
+
+    rewards = np.asarray(raw_step_rewards, dtype=np.float64)
+    if rewards.ndim != 1 or not bool(np.isfinite(rewards).all()):
+        raise ValueError("Raw reward events require one finite reward vector.")
+    correct = wrong = indicator = ambiguous = 0
+    ambiguous_values: list[float] = []
+    for raw_reward in rewards:
+        value = float(raw_reward)
+        if math.isclose(value, 0.0, abs_tol=1e-6):
+            continue
+        if value > 0.0 and math.isclose(value % 20.0, 0.0, abs_tol=1e-6):
+            count = int(round(value / 20.0))
+            if 1 <= count <= 2:
+                correct += count
+                continue
+        if value < 0.0 and math.isclose((-value) % 20.0, 0.0, abs_tol=1e-6):
+            count = int(round((-value) / 20.0))
+            if 1 <= count <= 2:
+                wrong += count
+                continue
+        if value < 0.0 and math.isclose((-value) % 5.0, 0.0, abs_tol=1e-6):
+            count = int(round((-value) / 5.0))
+            if 1 <= count <= 2:
+                indicator += count
+                continue
+        solutions = [
+            (a, b, c)
+            for a in range(3)
+            for b in range(3)
+            for c in range(3)
+            if math.isclose(20.0 * a - 20.0 * b - 5.0 * c, value, abs_tol=1e-6)
+        ]
+        if len(solutions) == 1:
+            a, b, c = solutions[0]
+            correct += a
+            wrong += b
+            indicator += c
+        else:
+            ambiguous += 1
+            ambiguous_values.append(value)
+    return RawRewardEvents(
+        correct_delivery_count=correct,
+        wrong_delivery_count=wrong,
+        indicator_activation_count=indicator,
+        ambiguous_step_count=ambiguous,
+        ambiguous_raw_rewards=tuple(ambiguous_values),
+    )
 
 
 def _parameter_group(name: str) -> str:
@@ -208,6 +276,22 @@ def _numeric_summary(values: Sequence[float]) -> dict[str, float | int | None]:
     }
 
 
+def _quantile_summary(values: Sequence[float]) -> dict[str, float | int | None]:
+    result = _numeric_summary(values)
+    if not values:
+        result.update({"p10": None, "p50": None, "p90": None})
+        return result
+    array = np.asarray(values, dtype=np.float64)
+    result.update(
+        {
+            "p10": float(np.quantile(array, 0.10)),
+            "p50": float(np.quantile(array, 0.50)),
+            "p90": float(np.quantile(array, 0.90)),
+        }
+    )
+    return result
+
+
 @dataclass
 class TrainingWindowAccumulator:
     """Accumulate one fixed environment-step window without consuming RNG state."""
@@ -222,6 +306,16 @@ class TrainingWindowAccumulator:
     positive_reward_count: int = field(default=0, init=False)
     negative_reward_count: int = field(default=0, init=False)
     zero_reward_count: int = field(default=0, init=False)
+    correct_delivery_count: int = field(default=0, init=False)
+    wrong_delivery_count: int = field(default=0, init=False)
+    indicator_activation_count: int = field(default=0, init=False)
+    ambiguous_reward_step_count: int = field(default=0, init=False)
+    training_reward_sum: float = field(default=0.0, init=False)
+    training_reward_count: int = field(default=0, init=False)
+    shaped_reward_sum: float = field(default=0.0, init=False)
+    shaped_reward_count: int = field(default=0, init=False)
+    shaped_reward_sum_by_slot: dict[str, float] = field(default_factory=dict, init=False)
+    anneal_factors: list[float] = field(default_factory=list, init=False)
     completed_episode_returns: list[float] = field(default_factory=list, init=False)
     losses: list[float] = field(default_factory=list, init=False)
     per_head_losses: list[list[float]] = field(init=False)
@@ -229,6 +323,14 @@ class TrainingWindowAccumulator:
     gradient_norms: list[float] = field(default_factory=list, init=False)
     clipped_gradient_count: int = field(default=0, init=False)
     probe_count: int = field(default=0, init=False)
+    probe_candidate_disagreement: list[float] = field(default_factory=list, init=False)
+    probe_candidate_q: list[float] = field(default_factory=list, init=False)
+    probe_candidate_regret: list[float] = field(default_factory=list, init=False)
+    probe_candidate_equals_greedy_count: int = field(default=0, init=False)
+    probe_disagreement_pass_count: int = field(default=0, init=False)
+    probe_regret_pass_count: int = field(default=0, init=False)
+    probe_budget_pass_count: int = field(default=0, init=False)
+    probe_candidate_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if int(self.batch_size) <= 0 or int(self.n_heads) <= 0:
@@ -245,6 +347,17 @@ class TrainingWindowAccumulator:
         dones: np.ndarray,
         *,
         probe_count: int,
+        training_rewards: np.ndarray | None = None,
+        training_shaped_rewards: np.ndarray | None = None,
+        shaped_rewards_by_slot: Mapping[str, np.ndarray] | None = None,
+        anneal_factor: float | None = None,
+        probe_candidate_disagreement: np.ndarray | None = None,
+        probe_candidate_q: np.ndarray | None = None,
+        probe_candidate_regret: np.ndarray | None = None,
+        probe_candidate_equals_greedy: np.ndarray | None = None,
+        probe_disagreement_pass: np.ndarray | None = None,
+        probe_regret_pass: np.ndarray | None = None,
+        probe_budget_pass: np.ndarray | None = None,
     ) -> None:
         reward_array = np.asarray(rewards, dtype=np.float64)
         done_array = np.asarray(dones, dtype=bool)
@@ -259,6 +372,47 @@ class TrainingWindowAccumulator:
         self.positive_reward_count += int(np.count_nonzero(reward_array > 0.0))
         self.negative_reward_count += int(np.count_nonzero(reward_array < 0.0))
         self.zero_reward_count += int(np.count_nonzero(reward_array == 0.0))
+        events = decompose_raw_reward_events(reward_array)
+        self.correct_delivery_count += events.correct_delivery_count
+        self.wrong_delivery_count += events.wrong_delivery_count
+        self.indicator_activation_count += events.indicator_activation_count
+        self.ambiguous_reward_step_count += events.ambiguous_step_count
+        training_array = (
+            reward_array
+            if training_rewards is None
+            else np.asarray(training_rewards, dtype=np.float64)
+        )
+        if training_array.ndim != 1 or not bool(np.isfinite(training_array).all()):
+            raise ValueError("Training-channel rewards must be one-dimensional and finite.")
+        self.training_reward_sum += float(training_array.sum())
+        self.training_reward_count += int(training_array.size)
+        shaped_array = (
+            np.zeros_like(training_array)
+            if training_shaped_rewards is None
+            else np.asarray(training_shaped_rewards, dtype=np.float64)
+        )
+        if shaped_array.shape != training_array.shape or not bool(
+            np.isfinite(shaped_array).all()
+        ):
+            raise ValueError("Shaped training rewards must match the training channel.")
+        self.shaped_reward_sum += float(shaped_array.sum())
+        self.shaped_reward_count += int(shaped_array.size)
+        if shaped_rewards_by_slot is not None:
+            for slot, values in shaped_rewards_by_slot.items():
+                slot_array = np.asarray(values, dtype=np.float64)
+                if slot_array.shape != (self.batch_size,) or not bool(
+                    np.isfinite(slot_array).all()
+                ):
+                    raise ValueError("Per-slot shaped reward diagnostics are misaligned.")
+                key = str(slot)
+                self.shaped_reward_sum_by_slot[key] = (
+                    self.shaped_reward_sum_by_slot.get(key, 0.0)
+                    + float(slot_array.sum())
+                )
+        factor = 0.0 if anneal_factor is None else float(anneal_factor)
+        if not math.isfinite(factor) or not 0.0 <= factor <= 1.0:
+            raise ValueError("Reward-shaping anneal factor must lie in [0,1].")
+        self.anneal_factors.append(factor)
         self.running_episode_returns += reward_array
         if bool(done_array.any()):
             self.completed_episode_returns.extend(
@@ -266,6 +420,56 @@ class TrainingWindowAccumulator:
             )
             self.running_episode_returns[done_array] = 0.0
         self.probe_count += int(probe_count)
+        probe_fields = (
+            probe_candidate_disagreement,
+            probe_candidate_q,
+            probe_candidate_regret,
+            probe_candidate_equals_greedy,
+            probe_disagreement_pass,
+            probe_regret_pass,
+            probe_budget_pass,
+        )
+        if any(value is not None for value in probe_fields):
+            if any(value is None for value in probe_fields):
+                raise ValueError("Probe diagnostics must be supplied together.")
+            disagreement = np.asarray(probe_candidate_disagreement, dtype=np.float64)
+            candidate_q = np.asarray(probe_candidate_q, dtype=np.float64)
+            candidate_regret = np.asarray(probe_candidate_regret, dtype=np.float64)
+            candidate_equals_greedy = np.asarray(
+                probe_candidate_equals_greedy,
+                dtype=bool,
+            )
+            disagreement_pass = np.asarray(probe_disagreement_pass, dtype=bool)
+            regret_pass = np.asarray(probe_regret_pass, dtype=bool)
+            budget_pass = np.asarray(probe_budget_pass, dtype=bool)
+            expected = (self.batch_size,)
+            if any(
+                value.shape != expected
+                for value in (
+                    disagreement,
+                    candidate_q,
+                    candidate_regret,
+                    candidate_equals_greedy,
+                    disagreement_pass,
+                    regret_pass,
+                    budget_pass,
+                )
+            ):
+                raise ValueError("Probe diagnostics differ from batch_size.")
+            if not bool(np.isfinite(disagreement).all()) or not bool(
+                np.isfinite(candidate_q).all()
+            ) or not bool(np.isfinite(candidate_regret).all()):
+                raise ValueError("Enabled probe diagnostics must be finite.")
+            self.probe_candidate_disagreement.extend(disagreement.tolist())
+            self.probe_candidate_q.extend(candidate_q.tolist())
+            self.probe_candidate_regret.extend(candidate_regret.tolist())
+            self.probe_candidate_equals_greedy_count += int(
+                candidate_equals_greedy.sum()
+            )
+            self.probe_disagreement_pass_count += int(disagreement_pass.sum())
+            self.probe_regret_pass_count += int(regret_pass.sum())
+            self.probe_budget_pass_count += int(budget_pass.sum())
+            self.probe_candidate_count += int(disagreement.size)
 
     def record_update(
         self,
@@ -371,9 +575,97 @@ class TrainingWindowAccumulator:
                 "mean_per_environment_step": float(
                     self.raw_reward_sum / self.environment_steps
                 ),
+                "net_positive_reward_step_count_legacy": int(
+                    self.positive_reward_count
+                ),
                 "positive_event_count": int(self.positive_reward_count),
+                "net_negative_reward_step_count_legacy": int(
+                    self.negative_reward_count
+                ),
                 "negative_event_count": int(self.negative_reward_count),
+                "legacy_count_meaning": (
+                    "positive_event_count and negative_event_count count net-signed "
+                    "reward steps, not decomposed environment events"
+                ),
                 "zero_event_count": int(self.zero_reward_count),
+                "correct_delivery_count": int(self.correct_delivery_count),
+                "wrong_delivery_count": int(self.wrong_delivery_count),
+                "indicator_activation_count": int(
+                    self.indicator_activation_count
+                ),
+                "ambiguous_reward_step_count": int(
+                    self.ambiguous_reward_step_count
+                ),
+            },
+            "training_step_reward": {
+                "sum": float(self.training_reward_sum),
+                "count": int(self.training_reward_count),
+                "mean_per_trained_transition": float(
+                    self.training_reward_sum / self.training_reward_count
+                ),
+            },
+            "shaped_training_reward": {
+                "annealed_sum": float(self.shaped_reward_sum),
+                "count": int(self.shaped_reward_count),
+                "mean_per_trained_transition": float(
+                    self.shaped_reward_sum / self.shaped_reward_count
+                ),
+                "environment_native_sum_by_slot": dict(
+                    sorted(self.shaped_reward_sum_by_slot.items())
+                ),
+                "anneal_factor": _numeric_summary(self.anneal_factors),
+            },
+            "probe_diagnostics": {
+                "all_heads_agree": bool(
+                    self.probe_candidate_count > 0
+                    and max(self.probe_candidate_disagreement, default=math.inf)
+                    <= 1.0e-8
+                ),
+                "candidate_count": int(self.probe_candidate_count),
+                "candidate_disagreement": _quantile_summary(
+                    self.probe_candidate_disagreement
+                ),
+                "candidate_q": _quantile_summary(self.probe_candidate_q),
+                "candidate_regret": _quantile_summary(
+                    self.probe_candidate_regret
+                ),
+                "candidate_equals_greedy_count": int(
+                    self.probe_candidate_equals_greedy_count
+                ),
+                "disagreement_threshold_pass_count": int(
+                    self.probe_disagreement_pass_count
+                ),
+                "disagreement_threshold_pass_fraction": (
+                    None
+                    if self.probe_candidate_count == 0
+                    else float(
+                        self.probe_disagreement_pass_count
+                        / self.probe_candidate_count
+                    )
+                ),
+                "regret_pass_count": int(
+                    self.probe_regret_pass_count
+                ),
+                "regret_pass_fraction": (
+                    None
+                    if self.probe_candidate_count == 0
+                    else float(
+                        self.probe_regret_pass_count
+                        / self.probe_candidate_count
+                    )
+                ),
+                "budget_and_window_pass_count": int(
+                    self.probe_budget_pass_count
+                ),
+                "budget_and_window_pass_fraction": (
+                    None
+                    if self.probe_candidate_count == 0
+                    else float(
+                        self.probe_budget_pass_count
+                        / self.probe_candidate_count
+                    )
+                ),
+                "actual_probe_count": int(self.probe_count),
             },
             "raw_episode_return": return_summary,
             "model_parameter_health": model_parameter_health(
@@ -390,6 +682,16 @@ class TrainingWindowAccumulator:
         self.positive_reward_count = 0
         self.negative_reward_count = 0
         self.zero_reward_count = 0
+        self.correct_delivery_count = 0
+        self.wrong_delivery_count = 0
+        self.indicator_activation_count = 0
+        self.ambiguous_reward_step_count = 0
+        self.training_reward_sum = 0.0
+        self.training_reward_count = 0
+        self.shaped_reward_sum = 0.0
+        self.shaped_reward_count = 0
+        self.shaped_reward_sum_by_slot.clear()
+        self.anneal_factors.clear()
         self.completed_episode_returns.clear()
         self.losses.clear()
         self.per_head_losses = [[] for _ in range(int(self.n_heads))]
@@ -397,6 +699,14 @@ class TrainingWindowAccumulator:
         self.gradient_norms.clear()
         self.clipped_gradient_count = 0
         self.probe_count = 0
+        self.probe_candidate_disagreement.clear()
+        self.probe_candidate_q.clear()
+        self.probe_candidate_regret.clear()
+        self.probe_candidate_equals_greedy_count = 0
+        self.probe_disagreement_pass_count = 0
+        self.probe_regret_pass_count = 0
+        self.probe_budget_pass_count = 0
+        self.probe_candidate_count = 0
 
 
 def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -454,6 +764,18 @@ def write_training_curves(metrics_path: str | Path, output_path: str | Path) -> 
     reward_mean = np.asarray(
         [row["raw_step_reward"]["mean_per_environment_step"] for row in rows]
     )
+    training_reward_mean = np.asarray(
+        [
+            row["training_step_reward"]["mean_per_trained_transition"]
+            for row in rows
+        ]
+    )
+    shaped_reward_mean = np.asarray(
+        [
+            row["shaped_training_reward"]["mean_per_trained_transition"]
+            for row in rows
+        ]
+    )
     grad_mean = np.asarray(
         [
             np.nan
@@ -479,8 +801,11 @@ def write_training_curves(metrics_path: str | Path, output_path: str | Path) -> 
     axes[0, 1].plot(steps, returns)
     axes[0, 1].fill_between(steps, return_p10, return_p90, alpha=0.2)
     axes[0, 1].set_title("Raw episode return (p10-p90)")
-    axes[1, 0].plot(steps, reward_mean)
-    axes[1, 0].set_title("Raw reward per environment step")
+    axes[1, 0].plot(steps, reward_mean, label="raw team reward")
+    axes[1, 0].plot(steps, training_reward_mean, label="TD training reward")
+    axes[1, 0].plot(steps, shaped_reward_mean, label="annealed shaped component")
+    axes[1, 0].legend(fontsize=8)
+    axes[1, 0].set_title("Reward channels")
     axes[1, 1].plot(steps, grad_mean)
     axes[1, 1].set_title("Gradient L2 norm before clipping")
     axes[2, 0].plot(steps, parameter_l2, label="parameter L2")

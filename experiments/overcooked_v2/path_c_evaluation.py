@@ -131,6 +131,7 @@ _EXPECTED_VARIANT_INPUT_CONTRACTS = {
 }
 
 _REQUIRED_PREREGISTRATION_SECTIONS = (
+    "method_contract_v2",
     "semantic_bindings",
     "semantic_sources",
     "evidence_spec",
@@ -151,6 +152,15 @@ _REQUIRED_PREREGISTRATION_SECTIONS = (
     "decision",
 )
 _PREREGISTRATION_SECTION_KEYS = {
+    "method_contract_v2": {
+        "backbone",
+        "adaptation",
+        "partner_pool",
+        "response_probe",
+        "forbidden_inputs",
+        "primary_evaluation_metric",
+        "raw_reward_decomposition",
+    },
     "semantic_bindings": {
         "code_commit",
         "resolved_config_sha256",
@@ -662,6 +672,187 @@ def _validate_preregistration_shape(payload: Mapping[str, Any]) -> None:
         section = _mapping(payload[section_name], section_name)
         _require_exact_mapping_keys(section, expected_keys, section_name)
         sections[section_name] = section
+
+    method_contract = sections["method_contract_v2"]
+    method_nested_keys = {
+        "backbone": {
+            "algorithm",
+            "policy_action_selection",
+            "environment_steps",
+            "shaping_horizon_environment_steps",
+            "pool_snapshot_environment_steps",
+            "budget_reporting",
+            "partner_pool_training_seeds",
+            "active_snapshots_per_training_seed",
+        },
+        "adaptation": {
+            "environment_steps",
+            "policy_action_selection",
+            "trunk_gradient_source",
+            "actor_input_gradient_boundary",
+            "response_model_input_gradient_boundary",
+            "shaping_horizon_environment_steps",
+            "response_prefit_environment_steps",
+            "response_prefit_updates",
+            "response_prefit_scientific_readout_allowed",
+        },
+        "partner_pool": {
+            "minimum_independent_training_seeds",
+            "active_snapshots_per_training_seed",
+            "partner_head_assignment",
+        },
+        "response_probe": {
+            "controller",
+            "partner_belief_initialization",
+            "partner_belief_update",
+            "information_statistic",
+            "calibration_episodes",
+            "calibration_probe_execution",
+            "threshold_quantile",
+            "threshold_candidate_rule",
+            "no_op_probe_rule",
+        },
+        "raw_reward_decomposition": {
+            "constants",
+            "pure_event_fast_path",
+            "correct_delivery_count_interpretation",
+            "repeated_indicator_example",
+        },
+    }
+    for mapping_name, expected_keys in method_nested_keys.items():
+        value = _mapping(
+            method_contract[mapping_name],
+            f"method_contract_v2.{mapping_name}",
+        )
+        _require_exact_mapping_keys(
+            value,
+            expected_keys,
+            f"method_contract_v2.{mapping_name}",
+        )
+    reward_constants = _mapping(
+        method_contract["raw_reward_decomposition"]["constants"],
+        "method_contract_v2.raw_reward_decomposition.constants",
+    )
+    _require_exact_mapping_keys(
+        reward_constants,
+        {"correct_delivery", "wrong_delivery", "indicator_activation"},
+        "method_contract_v2.raw_reward_decomposition.constants",
+    )
+    backbone_contract = _mapping(
+        method_contract["backbone"], "method_contract_v2.backbone"
+    )
+    if int(backbone_contract["environment_steps"]) != 30_000_000:
+        raise ValueError("The backbone budget must remain 30,000,000 environment steps.")
+    if int(backbone_contract["shaping_horizon_environment_steps"]) != 15_000_000:
+        raise ValueError("The backbone shaping horizon must remain 15,000,000 steps.")
+    if tuple(map(int, backbone_contract["pool_snapshot_environment_steps"])) != (
+        7_500_000,
+        15_000_000,
+        22_500_000,
+        30_000_000,
+    ):
+        raise ValueError("The backbone partner-snapshot schedule changed.")
+    expected_backbone_labels = {
+        "algorithm": "recurrent_parameter_shared_ippo",
+        "policy_action_selection": "stochastic_temperature_1",
+        "budget_reporting": "separate_pool_formation_cost",
+        "partner_pool_training_seeds": "at_least_two_independent_runs",
+    }
+    if any(
+        backbone_contract[key] != value
+        for key, value in expected_backbone_labels.items()
+    ) or int(backbone_contract["active_snapshots_per_training_seed"]) != 1:
+        raise ValueError("The backbone formation contract changed.")
+    adaptation_contract = _mapping(
+        method_contract["adaptation"], "method_contract_v2.adaptation"
+    )
+    if int(adaptation_contract["environment_steps"]) != 10_000_000:
+        raise ValueError("The adaptation budget must remain 10,000,000 environment steps.")
+    if int(adaptation_contract["response_prefit_environment_steps"]) != 1_000_000:
+        raise ValueError("Response-only prefit must remain 1,000,000 environment steps.")
+    if adaptation_contract["response_prefit_scientific_readout_allowed"] is not False:
+        raise ValueError("Response-only prefit cannot produce a scientific readout.")
+    expected_adaptation_labels = {
+        "policy_action_selection": "stochastic_temperature_1",
+        "trunk_gradient_source": "critic_td_only",
+        "actor_input_gradient_boundary": "detached_trunk_features",
+        "response_model_input_gradient_boundary": "detached_trunk_features",
+        "response_prefit_updates": "response_heads_only",
+    }
+    if any(
+        adaptation_contract[key] != value
+        for key, value in expected_adaptation_labels.items()
+    ) or int(adaptation_contract["shaping_horizon_environment_steps"]) != 5_000_000:
+        raise ValueError("The adaptation gradient or reward contract changed.")
+    partner_pool_contract = _mapping(
+        method_contract["partner_pool"], "method_contract_v2.partner_pool"
+    )
+    if int(partner_pool_contract["minimum_independent_training_seeds"]) < 2:
+        raise ValueError("The active partner pool requires at least two independent seeds.")
+    if int(partner_pool_contract["active_snapshots_per_training_seed"]) != 1:
+        raise ValueError("The active partner pool must select one snapshot per seed.")
+    if partner_pool_contract["partner_head_assignment"] != "one_head_per_active_partner":
+        raise ValueError("Each active partner must retain its own response head.")
+    response_probe_contract = _mapping(
+        method_contract["response_probe"], "method_contract_v2.response_probe"
+    )
+    if int(response_probe_contract["calibration_episodes"]) != 500:
+        raise ValueError("Response-probe calibration must contain 500 episodes.")
+    if response_probe_contract["calibration_probe_execution"] is not False:
+        raise ValueError("Response-probe calibration must not execute probes.")
+    threshold_quantile = _finite_number(
+        response_probe_contract["threshold_quantile"],
+        "method_contract_v2.response_probe.threshold_quantile",
+    )
+    if not 0.0 < threshold_quantile < 1.0:
+        raise ValueError("The response-probe threshold quantile must lie in (0, 1).")
+    expected_probe_labels = {
+        "controller": "response_voi",
+        "partner_belief_initialization": "uniform",
+        "partner_belief_update": "observable_response_likelihood",
+        "information_statistic": "weighted_generalized_jensen_shannon_divergence",
+        "threshold_candidate_rule": "safe_non_greedy_action_changing",
+        "no_op_probe_rule": "candidate_must_differ_from_sampled_actor_action",
+    }
+    if any(
+        response_probe_contract[key] != value
+        for key, value in expected_probe_labels.items()
+    ):
+        raise ValueError("The partner-response probe contract changed.")
+    if method_contract["primary_evaluation_metric"] != "raw_episode_return":
+        raise ValueError("The primary evaluation metric must remain raw episode return.")
+    forbidden_inputs = set(
+        map(
+            str,
+            _sequence(
+                method_contract["forbidden_inputs"],
+                "method_contract_v2.forbidden_inputs",
+            ),
+        )
+    )
+    if forbidden_inputs != {
+        "partner_identity",
+        "mechanism_label",
+        "style_label",
+        "privileged_global_state",
+    }:
+        raise ValueError("The method contract changed its forbidden-input set.")
+    if {
+        "correct_delivery": int(reward_constants["correct_delivery"]),
+        "wrong_delivery": int(reward_constants["wrong_delivery"]),
+        "indicator_activation": int(reward_constants["indicator_activation"]),
+    } != {
+        "correct_delivery": 20,
+        "wrong_delivery": -20,
+        "indicator_activation": -5,
+    }:
+        raise ValueError("The raw-reward decomposition constants changed.")
+    reward_contract = method_contract["raw_reward_decomposition"]
+    if reward_contract["pure_event_fast_path"] is not True or (
+        reward_contract["correct_delivery_count_interpretation"]
+        != "observable_lower_bound_when_mixed_totals_are_ambiguous"
+    ):
+        raise ValueError("The raw-reward event interpretation changed.")
 
     semantic_sources = sections["semantic_sources"]
     for source_name in _SEMANTIC_SOURCE_NAMES:

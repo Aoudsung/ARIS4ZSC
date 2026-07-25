@@ -1253,6 +1253,11 @@ def test_frozen_v3_preregistration_binds_all_semantic_hashes(tmp_path):
     assert preregistration.response_vocabulary_sha256 == (
         preregistration.response_summary_spec.sha256
     )
+    method_contract = preregistration.payload["method_contract_v2"]
+    assert method_contract["partner_pool"]["minimum_independent_training_seeds"] == 2
+    assert method_contract["response_probe"]["calibration_episodes"] == 500
+    assert method_contract["response_probe"]["calibration_probe_execution"] is False
+    assert method_contract["response_probe"]["threshold_quantile"] == 0.80
     for key, value in preregistration.semantic_bindings.items():
         if key not in {"code_commit", "rng_key_schedule_version"}:
             assert len(value) == 64

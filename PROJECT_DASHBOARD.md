@@ -1,7 +1,7 @@
 # PROJECT_DASHBOARD.md
 
 **ARIS-Bellman for Zero-Shot Coordination — pipeline status & decisive-results tracker.**
-Last updated: 2026-07-19 · Read this first for "where am I" (30 seconds).
+Last updated: 2026-07-25 · Read this first for "where am I" (30 seconds).
 
 > Required entrypoint per [CLAUDE.md](CLAUDE.md). Execution rules live in
 > [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md); this file is *status*, not *permission*.
@@ -28,19 +28,31 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 |---|---|
 | **Title** | Probe What Changes the Decision: Decision-Focused Active Partner Inference for Zero-Shot Coordination |
 | **Current line** | Path C = 面向协作决策的信息价值方法：只在伙伴回应可能改变后续控制且收益超过任务成本时探查。价值无关身份不变性和梯度路由只作机制约束与证伪检查，不再承担论文公开身份。 |
-| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md), [PATH_C_OPPORTUNITY_AUDIT_SPEC.md](idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md)（R015 官方四候选支持已成立；2026-07-17 的第一版过滤设计失败继续作为历史证据保留；第二版过滤、规划、配对执行、重放和统一执行链已经完成静态实现，但尚未运行，尚无新的设计选择、冻结清单、试点结果或正式结果）；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
+| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md), [PATH_C_OPPORTUNITY_AUDIT_SPEC.md](idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md)（旧伙伴池 Test Time Simple 已完成并触发家族级伙伴池设计修订；新版 `path_c_model_v3` 与 `path_c_outer_units_v2` 已通过远端目标测试和真实机械接线检查，完整 Simple 正在按训练前冻结合同执行。旧 Wide 已封存；新版 Simple 完成后将由同一统一驱动继续冻结代码的 Wide。R015 第二版仍是未运行的可选支持线）；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
 | **Thesis** | 在官方局部历史下，智能体应按注册回应通道对受限控制器的增量价值选择任务内探查，并相对最佳通道屏蔽动作扣除机会成本；主要证据来自匹配 cross-play 回报，而不是身份恢复。 |
 | **Benchmark** | JaxMARL **OvercookedV2** Test Time Simple（主基准）/Wide（布局复现）+ **Hanabi**（必需第二领域，尚未启动）+ toy_factor_game（理论回归） |
 | **Target tier** | ICLR / NeurIPS / ICML class |
-| **Compute budget** | 方法契约 v2 把伙伴骨干形成与 Path C 适应分开报告。旧 R015 伙伴生产完成四个运行共 80M 环境步，但联合准入未形成正式支持。新官方生产的三个 `rnn-sp` 各回读 29,949,952 步，两个 `rnn-op` 各回读 29,999,104 步，合计 149,848,064 步；seed 999 验收加五个训练实际为 4.7240 GPU 小时，单次准入另约 0.0631 GPU 小时，总计约 4.7871 GPU 小时。伙伴生产不是 Path C 科学结果，当前仍没有 R015 效应读数。 |
+| **Compute budget** | 旧 Test Time Simple 正式链从产物回读 2,010,480,640 个环境步，保留为设计诊断。新版每布局计划包含官方上游 1,498,480,640 步、预拟合 10,000,000 步、训练校准 2,000,000 步、四条件适应 400,000,000 步、部署校准 8,000,000 步和五个标准矩阵 100,000,000 步，共 2,018,480,640 步；回应屏蔽对照最坏另执行 54,000,000 步，实际预算必须从产物回读。冻结前另有一次两布局共享的官方 seed 999 生产验收，本次实际执行 29,949,952 步，不属于十训练单元或标准矩阵。 |
 
 ---
 
 ## 2. Pipeline status — CURRENT STAGE
 
-**Stage: 2026-07-19 用户裁决——完整模型优先。项目不再用逐个门控推进方法设计：先按提案实现一个完整的模型（提案 §4.2 的适应网络、§3.4 的顺序探查分数、四个匹配条件、配对评估），再通过实验迭代优化。实现基座沿用 2026-07-14 已签署的官方训练器决定：新适应层建在官方 Flax 循环网络之上，从现有五个官方 checkpoint（主体 seed 100，伙伴 101/102 自博弈、201/202 Other-Play）出发形成第一个开发伙伴池；手写 PyTorch 适应线冻结为历史，不再扩展。R015 保留全部历史证据，地位回到提案 §2.3 的原始定位——可选的支持性测量，不再排在模型实现之前。执行边界不变（远端运行仍须逐次授权），数据充分性纪律不变；开发阶段的训练与读数按开发诊断记录，确认性冻结推迟到正式十单元实验之前。实现设计见 PATH_C_MODULE_DESIGN.md §7。**
+**Stage: 2026-07-25 项目负责人已经明确授权把上游能力阈值改为只报告、不筛选，并继续完整实验。该修改是在看见 Test Time Simple 三个固定运行未达到 100 分后作出的结果相关协议修订，因此新版 Simple 与随后冻结代码的 Wide 均记为探索性结果，不能包装成原预登记的确认性实验。全部 50 个固定上游运行和三个固定进度 checkpoint 均被保留；不替换 seed，不重复训练到通过。首次恢复在第 0 单元训练校准阶段因 JAX 默认约 75% 显存池不足而停止：编译图约需 24.87 GiB，并另申请约 11.90 GiB，超过 46 GiB 卡默认约 34.5 GiB 的池。正式入口现允许选择 GPU 0–7，并把单作业显存池固定为 90%；仍只调度基本空闲且不可纠正错误为 0 的卡。恢复保护同时改为只封存失效的机械接线证据和冻结合同并重新生成，不移动或重训上游策略。CUDA 12 包装下六个目标测试文件重新执行为 79 项通过、0 失败、0 错误、0 跳过。当前 GPU 4、6、7 各约有 45.4 GiB 空闲且错误计数为 0，因此新后台驱动进程 `4182410` 正在这些卡上恢复 Simple；GPU 0、3 有已记录错误，GPU 1、2、5 当前显存不足，均未被选择。驱动正在按最终源码重新执行冻结前流程；只有在 Simple 的训练、五个标准矩阵、回应屏蔽对照及审计全部成功后才会继续 Wide。当前尚未进入正式评估矩阵。`PATH_C_FAMILY_POOL_FORMAL_CHAIN` 仍只标为 `implemented`，全部配置和产物继续保持 `scientific_readout_allowed: false`。**
 
-下段为 2026-07-18 及以前的旧阶段口径，保留作历史：
+**Historical stage: 2026-07-20 Path C 已完成固定骨干与伙伴池上的第二个独立适应训练 seed 四条件熟悉训练伙伴诊断。六个目标测试文件为 48 项通过、0 失败、0 错误、0 跳过，三项真实启动守卫和 81 项原始产物审计检查全部通过。seed-2 完整链从产物回读为 5,504,000 个环境步和 13,760 个完整回合；适应前骨干锚点为 38.6806，决策导向、关闭探查、随机安全探查和通用回应信息的诊断平均原始回报依次为 -28.0903、-21.1111、18.1250 和 11.7361。匹配回合中，决策导向减随机安全探查为 -46.2153，决策导向减关闭探查为 -6.9792，通用回应信息减关闭探查为 +32.8472；seed-1 的三个相应方向均未复现。两训练 draw 等权后，决策导向减随机探查为 -14.8785，决策导向减关闭探查为 -2.6563。该复现固定同一官方骨干和训练伙伴池，不是独立外层训练单元；全部读数只属于 `development` 诊断，不支持或反驳预登记的第一或第二项科学假设。完整预算、五行结果表、探查率和证据哈希见 `docs/status/EXPERIMENT_LOG.md`。**
+
+下段为 2026-07-20 第一个零锚阈值训练 draw 的旧阶段口径，保留作历史：
+
+**Stage: 2026-07-20 Path C 零锚探查阈值四条件开发迭代已经完成。决策阈值现为无探查决策分数 95 分位数与 0 的较大值，本轮阈值为 0.0097556；随机安全探查概率为严格超阈值比例 0.05，通用回应信息仍使用自身 80 分位数。六个目标测试文件为 48 项通过、0 失败、0 错误、0 跳过，三项真实启动守卫全部通过。预拟合权重和校准原始行与首次运行逐字相同；新增的适应前官方骨干评估完成 9 个配对乘每配对 64 个回合且零探查。四个条件各完成 1,024,000 个适应环境步、2,560 个适应回合和 576 个评估回合；完整链从产物回读为 5,504,000 个环境步和 13,760 个完整回合。决策导向的评估探查数从首次运行的 10,537 降至 3,338，本轮平均原始回报为 10.6597；关闭探查为 8.9931，两者使用相同回合 seed 的配对平均差为 +1.6667，配对差标准误为 2.5324。随机安全探查为 -5.7986，通用回应信息为 -20.9028。原始行重算、比率、预算、条件间 seed、收据和哈希检查全部通过。远端还证明相同参数、数据和 seed 的 GPU 第一次梯度更新不具备逐字确定性，因此跨运行的安静条件 checkpoint 和回报差不能作阈值因果解释。全部读数仍只属于 `development` 诊断，不支持或反驳预登记的第一项科学假设；十策略正式清单未生成，正式配置没有运行。下一项唯一优先工作是在不再改变机制的前提下，用第二个独立训练 seed 重复同一套四条件匹配开发运行，直接检验决策导向减关闭探查的差是否能跨训练运行复现。完整证据见 `docs/status/EXPERIMENT_LOG.md` 顶部条目。**
+
+下段为 2026-07-20 首次四条件开发运行的旧阶段口径，保留作历史：
+
+**Stage: 2026-07-20 Path C 完整模型的首次四条件开发运行已经完成。六个目标测试文件最终为 44 项通过、0 失败、0 错误、0 跳过；观测布局、交付计数和官方网络热启动一致性三项真实启动守卫全部通过，其中新模型与官方网络的循环状态、动作头（actor）对数概率和价值头（critic）最大绝对误差均为 0。共享预拟合完成 204,800 个环境步和 512 个回合，共享校准完成 51,200 个环境步和 128 个回合；四个条件各完成 1,024,000 个适应环境步、2,560 个适应回合，以及 9 个配对乘每配对 64 个回合的开发评估。原始行重算与保存摘要逐字段一致，全部哈希、非负交付计数、关闭探查条件零探查和有限参数检查均通过。完整证据见 `docs/status/EXPERIMENT_LOG.md` 的 2026-07-20 条目。全部运行仍标为 `development` 且禁止科学读数；十策略正式清单未生成，正式配置没有运行，本项目仍没有 Path C 确认性结果。下一步只分析九个配对中的席位差异与探查覆盖，先解释决策导向和随机安全探查的描述性回报为什么低于关闭探查，再决定下一次模型修改。**
+
+下段为 2026-07-19 及以前的旧阶段口径，保留作历史：
+
+**Stage: 2026-07-19 用户裁决——完整模型优先。项目不再用逐个门控推进方法设计：先按提案实现一个完整的模型（提案 §4.2 的适应网络、§3.4 的顺序探查分数、四个匹配条件、配对评估），再通过实验迭代优化。实现基座沿用 2026-07-14 已签署的官方训练器决定：新适应层建在官方 Flax 循环网络之上，从现有五个官方 checkpoint（主体 seed 100，伙伴 101/102 自博弈、201/202 Other-Play）出发形成第一个开发伙伴池；手写 PyTorch 适应线冻结为历史，不再扩展。R015 保留全部历史证据，地位回到提案 §2.3 的原始定位——可选的支持性测量，不再排在模型实现之前。执行边界不变（远端运行仍须逐次授权），数据充分性纪律不变；开发阶段的训练与读数按开发诊断记录，确认性冻结推迟到正式十单元实验之前。实现设计见 PATH_C_MODULE_DESIGN.md §7。**
 
 **Stage: R015 官方伙伴支持已经成立，延续动作规则仍为 `map_prototype_committed_cook_v1`。2026-07-17 第一版过滤器在六个候选上全部得到 100% 零支持关闭率；该失败、原始证据和机械报告继续作为历史记录，不被第二版代码改写。2026-07-18 已静态实现第二版端到端路径：过滤器对六种伙伴动作和与官方观测相容的环境结果作边缘化，再抽取相容后继；离线设计和在线执行共享同一设备内一步更新；规划按剩余长度分批，在分支头只更新一次信念并用编译循环推进后缀；三实验组的配对执行、独立重放、15 份机器制品、四原型乘 2,500 轮的正式抽样日程，以及“设计数据 → 两遍冻结装配 → 80 块试点 → 正式轮次”的可恢复统一入口均已接通。正式抽样日程使用 `path_c_r015_formal_sampling_schedule_v4`：每个轮—原型坐标在数据前绑定不变的审计单元编号和 32 个逐槽直接派生的 seed；32 位值允许偶然碰撞且不得重抽，只有整块机械失效才按编号推进，任何结果都不得参与选择。以上只是未运行的代码状态：第二版尚未产生设计数据，没有选择粒子数、重采样时机或规划分支数，没有冻结清单或试点结果，也没有 R015 科学读数。正式轮次仍须在试点完成后取得独立授权。预登记保持未冻结，`scientific_readout_allowed: false`。**
 
@@ -367,10 +379,10 @@ All claim-level readouts are Type-B (cross-model + human acquittal required; see
 
 | Required result | Question | Status |
 |---|---|---|
-| Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | 🟡 EARLIER CUDA JAX REPORTS REMAIN VALID FOR THEIR BOUND SOURCES; 2026-07-18 R015 V2 STATIC IMPLEMENTATION HAS NOT BEEN RUN OR BOUND; PREREGISTRATION FREEZE DEFERRED BY THE 2026-07-19 RULING TO BEFORE THE FORMAL 10-SEED EXPERIMENT — DOES NOT BLOCK DEVELOPMENT |
-| Published-protocol compatibility | Can Path C produce 10 independent policies and the official `test_time_simple`/`test_time_wide` SP/XP, all-pairing and role-swapped records? | 🟡 SIMPLE SEED 101 FORMAL TRAINING COMPLETE 2026-07-13; REMAINING 19 SEEDS AND FORMAL PAIRING MATRICES NOT RUN |
-| Standard benchmark performance | What are Path C's mean XP episode returns on both Test Time layouts relative to the published FCP references `6±29` and `23±40`? | ⬜ NOT RUN |
-| Probe ablation | Under the same Path C checkpoint and interaction cost, does value-directed probing outperform random and no probe? | ⬜ NOT RUN |
+| Software conformance | Do sequence, evidence, response, posterior, random-key and artifact semantics match their frozen versions? | 🟡 TEST TIME SIMPLE FROZEN PATH PASSED 62 TARGET TESTS AND FULL ARTIFACT AUDIT; R015 V2 REMAINS AN UNRUN OPTIONAL SUPPORT LINE |
+| Published-protocol compatibility | Can Path C produce 10 independent policies and the official `test_time_simple`/`test_time_wide` SP/XP, all-pairing and role-swapped records? | 🟡 TEST TIME SIMPLE COMPLETE: 10 INDEPENDENT UNITS AND FIVE 100-PAIRING MATRICES; TEST TIME WIDE NOT RUN |
+| Standard benchmark performance | What are Path C's mean XP episode returns on both Test Time layouts relative to the published FCP references `6±29` and `23±40`? | 🟡 TEST TIME SIMPLE RAW SP/XP SUMMARY COMPLETE; SCIENTIFIC READOUT DISABLED AND HUMAN ADJUDICATION REQUIRED; TEST TIME WIDE NOT RUN |
+| Probe ablation | Under the same Path C checkpoint and interaction cost, does value-directed probing outperform random and no probe? | 🟡 TEST TIME SIMPLE FORMAL MATRICES COMPLETE; PROJECT COMPARISON RECORDED SEPARATELY; NO SCIENTIFIC CLAIM ADJUDICATED |
 | Instrument and mechanism validity | Do the belief-kernel, positive/null and fingerprint checks support the scoped representation interpretation? | ⬜ NOT RUN; DOES NOT BLOCK STANDARD XP PERFORMANCE |
 
 Source of truth for run status: [EXPERIMENT_TRACKER.md](idea-stage/refine-logs/EXPERIMENT_TRACKER.md)
@@ -387,7 +399,7 @@ ARIS convention, see §6).
 | Path C standard benchmark smoke | ✅ R010 passed remotely and post-review evidence was re-bound to `c70bf03...` on 2026-07-12; smoke artifacts are Type-A only. |
 | R015 独立设计数据 | ⏸ 2026-07-19 起降级为可选支持性测量，不再排在模型实现之前。第一版 80 条历史和六候选的 `filter_design_precision_infeasible` 结果作为历史证据保留。第二版端到端代码已静态实现但尚未远端核查或运行；没有第二版过滤器或规划分支数选择，没有冻结清单或试点结果。 |
 | 开发诊断迭代（`run_kind: development`，开发期训练与读数） | ✅ Unlocked：按 [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md) §7 的完整模型实现推进；远端执行，逐次或成批用户授权；从产物回读有效数据预算；读数只作开发诊断，永不进入主张表（[OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md) §6.7）。 |
-| Path C main training and XP evaluation | Standard smoke passes; official Test Time configuration and 10-seed/30M-step/500-episode schedule are fixed; explicit remote-run authorization is recorded; each run reads back its effective data budget. Per the 2026-07-19 user decision, R015 no longer takes priority over model implementation; it is optional supporting evidence. Instrument validity only constrains mechanism wording. 开发阶段的训练与读数不使用本行，按上一行（开发诊断迭代）执行；确认性冻结与预注册按 2026-07-19 裁决推迟到正式十单元实验之前。 |
+| Path C main training and XP evaluation | 旧伙伴池 Test Time Simple 已完成十单元训练、五个正式矩阵和审计，但只作为结果后设计诊断。家族级伙伴池新版已通过 75 项目标测试和真实机械接线检查，完整 Test Time Simple 正在执行；只有它成功完成后，统一驱动才会以同一冻结代码继续 Test Time Wide。两种布局均只允许 GPU 4、6、7，GPU 5 被执行入口机械拒绝。 |
 | Path C mechanism evaluation | The relevant posterior/reset and instrument checks have recorded evidence. These checks gate mechanism wording only. |
 | `/auto-review-loop` (W2) | ≥1 decisive result supported by cross-model verdict |
 | `/paper-writing` (W3) | `NARRATIVE_REPORT.md` exists + main claims supported |

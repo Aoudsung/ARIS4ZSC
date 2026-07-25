@@ -1,0 +1,22 @@
+schema_version: path_c_pool_admission_v1
+device: cuda
+evaluation_seed: 8102
+environment_config: ocv2_test_time_simple_standard.yaml
+output_dir: ../../../results/path_c_pool_admission_diverse_simple/seed_101_102
+checkpoint_paths:
+  - ../../../results/path_c_backbone_simple/seed_101/partner_pool/step_7500000.pt
+  - ../../../results/path_c_backbone_simple/seed_101/partner_pool/step_15000000.pt
+  - ../../../results/path_c_backbone_simple/seed_101/partner_pool/step_22500000.pt
+  - ../../../results/path_c_backbone_simple/seed_101/partner_pool/step_30000000.pt
+  - ../../../results/path_c_backbone_simple/seed_102/partner_pool/step_7500000.pt
+  - ../../../results/path_c_backbone_simple/seed_102/partner_pool/step_15000000.pt
+  - ../../../results/path_c_backbone_simple/seed_102/partner_pool/step_22500000.pt
+  - ../../../results/path_c_backbone_simple/seed_102/partner_pool/step_30000000.pt
+evaluation:
+  episodes_per_pairing: 100
+  evaluation_batch_size: 100
+  policy_action_selection: stochastic
+  minimum_admitted_members: 2
+  minimum_distinct_training_seeds: 2
+  members_per_training_seed: 1
+  admission_floor: 0.5

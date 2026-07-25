@@ -1,0 +1,56 @@
+schema_version: path_c_standard_training_v1
+run_kind: partner_family
+training_mode: self_play_only
+scientific_readout_allowed: false
+seed: 201
+device: cuda
+environment_config: ocv2_test_time_simple_standard.yaml
+output_dir: ../../../results/path_c_q_partner_simple/seed_201
+
+# 该字段完整定义第二伙伴族。训练产物会同时保存本字段、语义哈希和本配置哈希。
+partner_family:
+  family_id: recurrent_ensemble_q_self_play_v1
+  training_algorithm: recurrent_ensemble_double_q_learning
+  training_objective: bootstrap_head_huber_temporal_difference
+  reward_objective: raw_team_reward_plus_environment_native_per_agent_shaping_linear_to_zero_by_5000000_steps
+  convention_generation: parameter_shared_two_agent_epsilon_greedy_self_play
+  observation_contract: official_local_5x5
+  action_space: six_primitive_actions
+  model_class: PrimitiveRecurrentEnsembleQ
+  checkpoint_phase: self_play_partner_snapshot
+  action_rule: greedy_mean_q
+
+model:
+  observation_shape: [5, 5, 39]
+  n_heads: 5
+  visual_embedding_dim: 128
+  encoder_dim: 128
+  recurrent_dim: 128
+  conv_channels: [32, 32, 16]
+  encoder_spatial_mode: flatten
+  prior_scale: 0.1
+  prior_seed: 31
+
+# 伙伴形成阶段不执行探查；正式使用时按多头平均 Q 值选择贪心动作。
+probe:
+  enabled: false
+
+training:
+  total_environment_steps: 10000000
+  self_play_environment_steps: 10000000
+  path_c_environment_steps: 0
+  batch_size_envs: 250
+  partner_pool_snapshot_steps: [2500000, 5000000, 7500000, 10000000]
+  replay_capacity_episodes: 1024
+  minibatch_episodes: 8
+  learning_starts_episodes: 128
+  updates_per_vector_step: 1
+  target_update_environment_steps: 100000
+  metrics_interval_environment_steps: 100000
+  gamma: 0.99
+  learning_rate: 0.00025
+  gradient_clip_norm: 10.0
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_environment_steps: 5000000
+  bootstrap_p: 0.5

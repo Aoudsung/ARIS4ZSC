@@ -40,3 +40,34 @@ p0_loose_files.tar.gz — P0 轮散文件（AUDIT_OUTPUT/P0_STEP2_PROMPT/P0_STEP
 1.1M  ocv2_train_s0_review_20260627_153653.zip
  11M  ocv2_zscsession_20260701_182027.zip
  36M  role_conditioned_v1_20260702_102332.zip
+
+## 追加（2026-07-23）：Path C 远端结构化归档
+
+本节只登记远端归档；按用户指示，不在本机保存副本。归档位于：
+
+`/apps/users/cxw/Document/CodeSpace/Selfs/CPR_REPO/archive/raw/path_c_remote_archive_20260723/`
+
+六个包共包含 1,009 个原始文件、5,396,088,077 字节；压缩包合计
+1,073,516,672 字节，包含元数据的整个归档目录为 1,076,462,140 字节。每个包均已在远端
+完整解压，并按逐文件 SHA-256 清单复算通过。原路径到归档成员的完整映射位于
+`metadata/package_index.json` 和各包的 `metadata/*.manifest.json`。
+
+| 归档包 | 原路径摘要 | 文件数 | 原始字节数 | 压缩字节数 | SHA-256 |
+|---|---|---:|---:|---:|---|
+| `development_initial_familiar_partner.tar.gz` | `results/path_c_complete_model/` 及对应远端验证证据 | 97 | 1,296,423,485 | 181,659,115 | `15263f64aeb47445f4cad7cdab745673cc7c2f20a916d4709f1673b45235f229` |
+| `development_zero_anchor_familiar_partner.tar.gz` | `results/path_c_complete_model_zero_anchored_development/` 及对应远端验证证据 | 176 | 2,100,087,433 | 326,030,975 | `fdaf597f6c8a3035226767417bd505948fb903d98b2809038177adc721f5dd56` |
+| `development_seed2_familiar_partner.tar.gz` | `results/path_c_complete_model_zero_anchored_development_seed2/` 及对应远端验证证据 | 87 | 1,300,560,934 | 182,615,030 | `744c820258d9214294df309e1c5dad408ccc036fa90a42636b589a5c31fc361f` |
+| `legacy_pre_standard_zsc.tar.gz` | 标准协议建立前、不再被当前配置或测试读取的 R010、R015 和旧 Standard 结果 | 225 | 213,406,656 | 110,225,156 | `a75d032c3a0c3e0accf7249e799333e9fc199a6ca3c8c1da44d135d698c4cc15` |
+| `formal_failed_runs.tar.gz` | 正式上游设备错误、预拟合显存失败和两次适应内存失败的完整证据 | 327 | 472,696,078 | 262,036,044 | `7145ba66331325cf5036422c4334cec48a2a037a178f5ed7f55102b7c2d5ab03` |
+| `legacy_code_snapshots_and_redundant_validation.tar.gz` | `.before_*` 快照、旧同步副本和重复中间验证版本 | 97 | 12,913,491 | 10,950,352 | `59d47c6d8b05ab9bdeed4b25171ca009031caab8038ff5c3bfaa63b1af76ccd9` |
+
+归档元数据封印文件 SHA-256 为
+`dbff6ff20d726659fa863efface6c46bcecf1dd84f4afae0381ab0ffba17068a`；
+清理收据 SHA-256 为
+`ba1e897cddfc2ba0456cf05b25eb44453d8176da9436261a8dfb91d4c5e23b45`；
+清理后复核文件 SHA-256 为
+`19efdf6b8d0d75388b1b945bfae543be6233374bdcf9d9006ab6ef057c0d2414`。
+精确清理移除了 375 个目标、5,355,273,840 字节。正式 Test Time Simple 根、冻结生产
+源码和正式续跑证据的逐文件摘要均保持不变；五个正式策略群体仍各有 100 份完整配对收据。
+冻结源码清单包含的 38 个 AppleDouble 元数据伴随文件没有删除，以免改变后续
+Test Time Wide 必须复用的正式源码合同。

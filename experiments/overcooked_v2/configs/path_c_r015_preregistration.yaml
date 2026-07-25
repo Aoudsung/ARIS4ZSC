@@ -1,0 +1,454 @@
+schema_version: path_c_r015_preregistration_v2
+status: template_not_valid_for_runs
+scientific_readout_allowed: false
+
+experiment:
+  experiment_id: R015
+  description: 机会审计实验编号 R015，只裁决主体固定在厨师席时，官方局部历史下的单次安全探查机会。
+  freeze_status: static_registered_not_frozen
+  ego_agent_id: agent_1
+  ego_role: cook
+  partner_agent_id: agent_0
+  partner_role: signaler
+  formal_groups:
+    - A1
+    - A2-mask
+    - A2-use
+  diagnostic_groups:
+    - A0
+  maximum_probes_per_episode: 1
+  probe_window_environment_steps: 100
+  consultation_interval_environment_steps: 5
+  registered_probe_scripts:
+    - probe_id: up
+      primitive_actions: [up]
+    - probe_id: down
+      primitive_actions: [down]
+    - probe_id: right
+      primitive_actions: [right]
+    - probe_id: left
+      primitive_actions: [left]
+    - probe_id: stay
+      primitive_actions: [stay]
+    - probe_id: interact
+      primitive_actions: [interact]
+
+# 旧控制器接口已有实现；新版过滤器和设备合同尚待静态实现及远端核查。数值槽位未选择，不能运行。
+controller:
+  consultation_steps: [1, 6, 11, 16, 21, 26, 31, 36, 41, 46, 51, 56, 61, 66, 71, 76, 81, 86, 91, 96]
+  score_rule: S_seq=J_use-V_mask
+  score_tie_break: registered_probe_order
+  masked_reference_tie_break: base_then_registered_probe_order
+  response_summary:
+    implementation_constant: REGISTERED_LOCAL_RESPONSE_SPEC
+    response_classes: [visible, unseen, local_non_agent_change]
+    latency_bin_upper_bounds: [1]
+    source_fields: adjacent_official_local_observations_only
+    evaluator_partner_action_allowed: false
+  hidden_state_filter:
+    mode: official_history_fully_adapted_particle_filter_v2
+    prototype_count: 4
+    # 正式估计对四原型等权，过滤器登记先验也固定等权；数值近似只选择粒子数和重采样时机。
+    prototype_prior:
+      official_rnn_sp_ippo_v1_seed101_step29949952: 0.25
+      official_rnn_sp_ippo_v1_seed102_step29949952: 0.25
+      official_rnn_op_other_play_v1_seed201_step29999104: 0.25
+      official_rnn_op_other_play_v1_seed202_step29999104: 0.25
+    particles_per_prototype: pending_design_data
+    initialization_rule: independent_prior_draws_conditioned_on_opening_official_observation_v1
+    initialization_accepted_particles_per_prototype: same_as_particles_per_prototype
+    rejected_initial_proposals_count_as_particle_slots: false
+    copy_accepted_initial_particles_to_fill_slots_allowed: false
+    conditioned_opening_prefix_cache_schema: path_c_r015_conditioned_opening_particle_prefix_cache_v1
+    conditioned_opening_prefix_cache_contract: r015_shared_conditioned_opening_256_particle_prefix_v1
+    conditioned_opening_prefix_materialization_order: particles_64_then_increment_to_128_then_increment_to_256
+    conditioned_opening_prefix_slot_generated_at_most_once: true
+    lower_particle_counts_use_conditioned_opening_prefix: true
+    resampling_timings_share_conditioned_opening_only: true
+    scan_or_post_resampling_state_cache_allowed: false
+    conditioned_opening_cache_bindings:
+      - design_protocol_sha256
+      - source_closure_sha256
+      - design_history_sha256
+      - initialization_root_key
+    trust_unbound_conditioned_opening_disk_cache_after_crash: false
+    # 初始化根键只绑定过滤重放流和全局设计序号；P、重采样时机、真实 episode seed 和身份均不进入。
+    initialization_key_source: r015_filter_device_fold_in_keys_v2
+    initialization_key_coordinates: [filter_repeat_namespace, design_sequence_index]
+    initialization_key_excludes:
+      - particles_per_prototype
+      - resampling_timing
+      - episode_seed
+      - true_partner_identity
+      - complete_hidden_state
+    shared_conditioned_proposal_prefix_across_particle_counts: true
+    shared_innovations_before_resampling_timings_diverge: true
+    transition_update_rule: exact_six_action_marginal_then_conditional_successor_v1
+    partner_actions_marginalized: [up, down, right, left, stay, interact]
+    environment_outcomes_affecting_official_match_marginalized: true
+    official_match_fields:
+      - next_official_local_observation
+      - raw_team_reward
+      - episode_boundary
+    single_sample_then_hard_reject_allowed: false
+    # ESS（effective sample size）表示有效样本量，固定从重采样前父粒子预测权重计算。
+    ess_rule: pre_resample_parent_predictive_weight_ess_v1
+    ess_denominator: particles_per_prototype
+    post_resample_copies_allowed_as_ess_evidence: false
+    zero_support_status_id: finite_particle_cloud_zero_support
+    zero_support_condition: sum_parent_weight_times_predictive_likelihood_equals_zero
+    zero_support_implies_prototype_model_zero_probability: false
+    resampling_algorithm: strict_systematic_per_prototype_v2
+    resampling_parent_lookup: first_cdf_greater_than_or_equal_to_position
+    resampling_comparison: cdf_less_than_position
+    resampling_comparisons_per_child: ceil_log2_particles_per_prototype
+    resampling_p_by_p_selection_matrix_allowed: false
+    preserve_resampling_ancestor_indices: true
+    # 值 1 只保留旧清单字段兼容性；实际时机由下一个槽位在自适应和每步之间选择。
+    resampling_interval_environment_steps: 1
+    resampling_timing: pending_design_data
+    resampling_ess_fraction_threshold: pending_design_data
+    zero_support_action: invalidate_and_replace_whole_block
+    device_execution_id: r015_filter_jit_scan_vmap_v2
+    device_key_contract: r015_filter_device_fold_in_keys_v2
+    microbatch_schedule_id: fixed_4096_parent_particle_slots_v1
+    parent_particle_slot_target_per_microbatch: 4096
+    prototype_groups_per_microbatch: 4
+    parent_particle_slots_per_prototype_group: 1024
+    lanes_per_microbatch_by_particles_per_prototype:
+      64: 16
+      128: 8
+      256: 4
+    group_partner_network_by_prototype: true
+    continuation_member_forwards_in_filter_candidate_stage: 0
+    continuation_member_states_initialized_in_filter_candidate_stage: false
+  planning:
+    branches_per_candidate: pending_design_data
+    branch_sampling: sampled_hidden_state_branches_v1
+    branch_belief: frozen_belief_branch_continuation_v1
+    grid_evaluation: lazy_ascending_first_pass
+    nested_branch_counts: [2, 4, 8, 16]
+    horizon: full_remaining_episode_to_step_400
+    stability_threshold: 0.95
+    common_random_numbers_across_r_and_2r: true
+    common_random_numbers_across_base_and_probe_scripts: true
+    branch_random_evidence:
+      required_fields:
+        - future_random_root_key
+        - future_random_derivation_contract_id
+        - future_random_step_count
+        - future_random_sequence_sha256
+      full_sequence_order: environment_step_ascending
+      full_sequence_sha256_serialization: sha256_canonical_json_v1
+      verifier_reconstructs_full_sequence: true
+      compact_evidence_changes_random_stream: false
+      store_future_random_keys_stepwise: false
+    cost_accounting:
+      per_consultation_semantic_costs:
+        required_fields:
+          - real_environment_transitions
+          - paired_suffix_batched_lane_time_steps
+          - branch_head_particle_transitions
+        record_real_environment_transitions: true
+        record_paired_suffix_batched_lane_time_steps: true
+        record_branch_head_particle_transitions: true
+      per_planning_candidate_device_execution:
+        record_scope: planning_candidate_top_level
+        # 长度桶表示剩余规划步数相同的咨询点集合。
+        group_by: [remaining_horizon_length, device_batch_index]
+        required_fields:
+          - remaining_horizon_length
+          - device_batch_index
+          - compiled_batch_calls
+          - active_batch_size
+          - wall_seconds
+          - throughput
+        record_compiled_batch_calls: true
+        record_active_batch_size: true
+        record_wall_seconds: true
+        record_real_transition_throughput: true
+        record_host_sync_inside_environment_loop: true
+        candidate_throughput_formula: candidate_total_real_environment_transitions/candidate_total_wall_seconds
+      per_consultation_device_metric_allocation_allowed: false
+      cross_consultation_vmap_pseudo_allocation_allowed: false
+      device_execution_metrics_allowed_as_planning_selection_input: false
+  # MAP（maximum a posteriori）表示当前后验概率唯一最大的伙伴原型。
+  # 五个成员的循环状态从回合开始并行推进，切换时使用当前状态，绝不清零。
+  continuation:
+    rule_id: map_prototype_committed_cook_v1
+    action_rule: official_flax_categorical_actor_v1
+    routing_rule: unique_exact_map_else_ego_seed100
+    tie_fallback: ego_seed100
+    parallel_recurrent_member_count: 5
+    switch_state_rule: adopt_current_parallel_state_without_reset
+    planning_routing_frequency: commit_once_at_branch_head
+    execution_routing_frequency: update_online_each_environment_step
+    shared_member_selection_rule: unique_exact_map_else_ego_seed100
+    baseline_member_id: official_rnn_sp_ippo_v1_seed100_step29949952
+    prototype_member_ids:
+      - official_rnn_sp_ippo_v1_seed101_step29949952
+      - official_rnn_sp_ippo_v1_seed102_step29949952
+      - official_rnn_op_other_play_v1_seed201_step29999104
+      - official_rnn_op_other_play_v1_seed202_step29999104
+
+# 设计数据协议先于数据登记；结果和待签冻结清单都仍不存在。
+design_data:
+  protocol_path: path_c_r015_design_data_protocol.yaml
+  protocol_sha256: pending_static_review
+  protocol_schema: path_c_r015_design_data_protocol_v2
+  filter_selection_rule: r015_filter_s1_s2_s3_first_pass_v2
+  filter_evidence_schema: path_c_r015_filter_design_evidence_v2
+  planning_evidence_schema: path_c_r015_planning_design_evidence_v2
+  planning_candidate_result_schema: path_c_r015_planning_candidate_result_v2
+  planning_evidence_required_summaries:
+    - per_consultation_semantic_costs
+    - candidate_top_level_length_bucket_and_device_batch_metrics
+    - branch_random_root_key_derivation_contract_id_step_count_and_full_sequence_sha256
+  planning_evidence_forbidden_payloads:
+    - future_random_keys
+    - per_step_future_random_keys
+    - per_consultation_compiled_batch_calls
+    - per_consultation_active_batch_size
+    - per_consultation_wall_seconds
+    - per_consultation_throughput
+    - per_consultation_real_transition_throughput
+  filter_selection_report_path: pending_design_run
+  filter_selection_report_sha256: pending_design_run
+  planning_selection_report_path: pending_design_run
+  planning_selection_report_sha256: pending_design_run
+  # 该脚本在冻结装配前一次性生成可解析清单和四原型×2,500 轮正式抽样日程；
+  # 它不执行环境，也不把实现源码路径冒充清单路径。
+  machine_artifact_builder: ../scripts/build_r015_machine_artifacts.py
+  machine_artifact_bundle_schema: path_c_r015_machine_artifact_bundle_v1
+  freeze_manifest_builder: ../scripts/build_r015_freeze_manifest.py
+  pilot_protocol_path: path_c_r015_pilot.yaml
+  pilot_protocol_sha256: pending_static_review
+  design_seed_contract: r015_design_role_isolation_v2
+  design_episode_namespace: r015_design_episode_20260718_v2
+  design_root_seed: 18071801
+  filter_repeat_namespaces:
+    - r015_filter_repeat_0_20260718_v2
+    - r015_filter_repeat_1_20260718_v2
+  superseded_v1_design:
+    history_sha256: 55bae9cd26b079cc628b0b18537f4fa7e9172fb880b5108f4c952bd38a180232
+    selection_report_path: ../../../review_bundles/r015_design_freeze_pilot_20260715/design_results/design_selection_report.json
+    selection_report_sha256: 158a88a7223a4169577e40e7bf5c0dbcd929db53f7698042df60b3214d31da5a
+    status: filter_design_precision_infeasible
+    allowed_as_v2_selection_input: false
+  design_data_allowed_in_formal_statistics: false
+  pilot_data_allowed_in_formal_statistics: false
+  history_collection_action_rule: ego_seed100_official_categorical_no_probe_v1
+
+# 此文件只引用伙伴支持的唯一登记表，不复制伙伴族或候选清单。
+partner_support:
+  registration_path: path_c_r015_partner_support_simple.yaml
+  registration_sha256: pending
+  report_path: pending
+
+information:
+  controller_input: official_local_history_only
+  allowed_controller_fields:
+    - official_local_observation
+    - ego_action_history
+    - ego_option_or_probe_history
+    - ego_option_or_probe_elapsed_time
+    - raw_team_reward_history
+    - episode_boundaries
+    - legal_action_mask_derived
+    - task_progress_derived
+    - response_summary_v1_derived
+  forbidden_controller_fields:
+    - evaluator_partner_action
+    - partner_identity
+    - partner_private_observation
+    - partner_recurrent_state
+    - complete_grid
+    - complete_hidden_state
+    - hidden_recipe
+    - evaluator_random_state
+    - training_family_label
+  current_probe_response_projection:
+    name: current_probe_response_projection_v1
+    mask_targets:
+      - partner_belief_update_input
+      - continuation_controller_serialized_input
+      - recurrent_state_writes
+    preserved_fields:
+      - official_local_observation
+      - ego_actions
+      - raw_team_rewards
+      - episode_boundaries
+      - future_passive_response_tokens
+    use_only_route: current_response_token_to_partner_belief_update
+
+statistics:
+  partner_prototype_count: 4
+  pilot_blocks_per_prototype: 20
+  n_rounds_max: 2500
+  formal_paired_block_budget: 10000
+  formal_arm_episode_budget: 30000
+  formal_arm_environment_step_budget: 12000000
+  maximum_safety_comparisons: 40000
+  # 规划语义成本逐咨询点另报，设备读数在规划候选顶层按长度桶和设备批次另报；二者都不进入统计。
+  planning_fork_steps_included: false
+  delivery_reward: 20.0
+  practical_margin_fraction: 0.25
+  return_lower_bound: -400.0
+  return_upper_bound: 400.0
+  # 任意 399 步后缀可能继承探查前的在制品，故不能降为 760；证明见绑定推导文档。
+  paired_difference_absolute_bound: 800.0
+  paired_difference_width: 1600.0
+  empirical_bernstein_formula: maurer_pontil_empirical_bernstein_bounded_v1
+  # 每一轮的完整四原型向量由同一冻结规则独立生成；主体恒为 agent_1 厨师席。
+  # 每个轮—原型坐标在正式数据前按各自坐标直接派生 32 个 seed；32 位值允许偶然碰撞，且不得因碰撞重抽。
+  # 运行后计数、触发状态、回报和效应值均不得选择 seed 或重排轮次。
+  round_sampling_contract: iid_round_vectors_ego_cook_seat_with_prefrozen_replacements_v4
+  formal_sampling_schedule_schema: path_c_r015_formal_sampling_schedule_v4
+  mechanical_replacement_attempts_per_coordinate: 32
+  mechanical_replacement_attempt_indices: 0_through_31
+  replacement_episode_seed_derivation_id: sha256_registered_coordinate_low32_allow_collisions_v1
+  replacement_episode_seed_collision_policy: allow_value_collisions_without_redraw
+  audit_unit_changes_across_replacement_attempts: false
+  replacement_seed_selection_uses_outcomes: false
+  mechanical_attempt_exhaustion_rule: terminate_entire_formal_audit
+  ego_agent_id: agent_1
+  # 零触发乘积界要求四个原型的触发前缀分别使用独立随机流；正式抽样清单必须机械绑定此规则。
+  zero_count_independence_contract: independent_firing_prefixes_across_prototypes_v1
+  alpha_total: 0.05
+  alpha_safety: 0.025
+  alpha_eb_net: 0.010
+  alpha_eb_response: 0.010
+  alpha_rho: 0.005
+  kill_checkpoint_rounds: [200, 400, 800, 1600, 2500]
+  alpha_rho_per_checkpoint: 0.001
+  alpha_rho_per_prototype_cp: 0.00025
+  safety_risk_limit: 0.05
+  safety_repeats_per_comparison: 279
+  formal_effect_look_count: 1
+  formal_effect_look_round: 2500
+
+# 下列路径和摘要必须在正式运行前由真实文件回读。pending 不能进入正式裁决。
+artifacts:
+  environment_config:
+    path: pending
+    sha256: pending
+  environment_source:
+    path: pending
+    sha256: pending
+  ego_checkpoint:
+    source_family_id: official_rnn_sp_ippo_v1
+    training_seed: 100
+    experiment_variant: rnn-sp
+    training_config_path: path_c_official_sp_simple_seed100.yaml
+    training_manifest_path: pending
+    training_run_id: pending
+    model_class: OfficialFlaxRecurrentActor
+    action_rule: official_flax_categorical_actor_v1
+    model_weights_hash_domain: path_c_flax_weights_sha256_v1
+    model_weights_sha256: pending
+    path: pending
+    sha256: pending
+  ego_evidence_contract:
+    # R015 专用主体可见历史合同；它不复用旧实现的同名编码类，
+    # 也不允许旧编码中的伙伴原始动作进入正式控制器。
+    path: pending
+    sha256: pending
+  formal_sampling_schedule:
+    # 正式数据产生前冻结每轮、每个原型的 round_index、prototype_id、不随替换改变的
+    # audit_unit_id、编号 0 至 31 的 32 个坐标派生 episode_seed 和固定主体席位 agent_1。
+    # 只有整个配对块机械失效才能按编号推进；不得读取回报、配对差、触发状态或效应值来选择
+    # seed。32 个尝试全部机械失效时终止整个正式审计。四个原型的触发前缀不得共享随机源。
+    schema_version: path_c_r015_formal_sampling_schedule_v4
+    path: pending
+    sha256: pending
+  response_projection:
+    # 可解析的 path_c_r015_response_projection_v1 清单，而非仅有实现文件。
+    path: pending
+    sha256: pending
+  response_vocabulary:
+    path: pending
+    sha256: pending
+  probe_registry:
+    # 可解析清单必须与 experiment.registered_probe_scripts 的语义摘要一致。
+    path: pending
+    sha256: pending
+  official_history_filter:
+    # 可解析的 path_c_r015_official_history_filter_v2 清单，必须绑定条件提议、边缘化和设备合同。
+    path: pending
+    sha256: pending
+  continuation_planner:
+    # 必须是完整回合顺序分支控制器清单；两动作代理量不能进入此位置。清单同时绑定
+    # 分支随机数的紧凑证据合同，以及逐点语义成本与候选顶层设备读数的两层记录合同。
+    path: pending
+    sha256: pending
+  continuation_controller:
+    # 该清单把具体延续规则、五个成员及其实际 checkpoint 双摘要绑定到同一实现。
+    rule_id: map_prototype_committed_cook_v1
+    action_rule: official_flax_categorical_actor_v1
+    tie_fallback: ego_seed100
+    switch_state_rule: adopt_current_parallel_state_without_reset
+    checkpoint_weight_sha256_references:
+      official_rnn_sp_ippo_v1_seed100_step29949952: artifacts.ego_checkpoint.model_weights_sha256
+      official_rnn_sp_ippo_v1_seed101_step29949952: partner_support.report.candidates.official_rnn_sp_ippo_v1_seed101_step29949952.model_weights_sha256
+      official_rnn_sp_ippo_v1_seed102_step29949952: partner_support.report.candidates.official_rnn_sp_ippo_v1_seed102_step29949952.model_weights_sha256
+      official_rnn_op_other_play_v1_seed201_step29999104: partner_support.report.candidates.official_rnn_op_other_play_v1_seed201_step29999104.model_weights_sha256
+      official_rnn_op_other_play_v1_seed202_step29999104: partner_support.report.candidates.official_rnn_op_other_play_v1_seed202_step29999104.model_weights_sha256
+    path: pending
+    sha256: pending
+  decision_evidence_verifier:
+    # 冻结实现必须从每次咨询的官方历史和规划分支重算完整候选集、
+    # 价值、安全资格、选择与首个正分停止，不接受数据集的自报分数。它还必须由根键重建
+    # 未来随机数序列、核对长度和摘要，并拒绝逐步键列表及逐咨询点伪分摊的设备读数。
+    path: pending
+    sha256: pending
+  return_bound_derivation:
+    # 可解析证明清单必须绑定环境配置与源码，覆盖 400 步未折扣原始
+    # 团队回报，并证明登记的交付奖励和回报上下界。
+    path: pending
+    sha256: pending
+  wrong_delivery_detector:
+    # 安全事件只含错误交付；配方指示器成本仍只进入原始回报。
+    path: pending
+    sha256: pending
+  planning_stability_report:
+    # 独立设计数据上的规划分支数与两倍分支数排序一致率至少为 95%；逐点语义成本和候选顶层
+    # 按长度桶、设备批次记录的运行时读数必须分层保存。
+    path: pending
+    sha256: pending
+  pilot_wiring_report:
+    # 每个原型 20 个完整块；均值、符号和方差均不得决定正式样本量。
+    path: pending
+    sha256: pending
+  random_key_derivation:
+    # 可解析清单必须使用 sha256_canonical_json_v1，按登记的六个坐标
+    # 重算实际回合键和每个安全分支键，并区分四种用途。规划分支证据只保存
+    # future_random_root_key、future_random_derivation_contract_id、future_random_step_count
+    # 和 future_random_sequence_sha256，不逐步展开 future_random_keys。
+    path: pending
+    sha256: pending
+  safety_branch_evidence_verifier:
+    # 冻结实现必须由官方历史和支持原型 checkpoint 重建兼容隐藏状态，
+    # 用登记脚本与分支键重放每个分支，并重算逐分支错误交付结果。
+    path: pending
+    sha256: pending
+  trace_replay_verifier:
+    # 正式轨迹的 400 步环境转移、主体与伙伴动作、两侧循环状态写入，
+    # 以及 A1/A2 回应路由都必须由冻结 checkpoint 和控制器逐步重放。
+    path: pending
+    sha256: pending
+
+formal_data:
+  # 每个配对块必须嵌入 path_c_r015_trace_manifest_v1，裁决器据此重算
+  # 三组动作、官方历史、回应投影输入、随机分支和原始回报，孤立摘要不被接受。
+  dataset_path: pending
+  # 五个 checkpoint 各自使用只含轮数和四原型触发次数的记录；任何配对差或回报字段均非法。
+  firing_count_checkpoint_paths: pending
+  # 正式查看前以独占方式创建；一旦存在，当前实验编号不得再次裁决。
+  view_consumption_record_path: pending
+
+# 当前没有经过证明的完整状态策略类上界，因此不得作基底无机会的否定。
+full_state_upper_bound:
+  status: not_provided
+  value: null
+  proof_artifact_path: null
+  proof_artifact_sha256: null

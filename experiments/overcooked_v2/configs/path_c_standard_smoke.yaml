@@ -12,6 +12,7 @@ model:
   encoder_dim: 64
   recurrent_dim: 64
   conv_channels: [16, 16, 8]
+  encoder_spatial_mode: flatten
   prior_scale: 0.1
   prior_seed: 31
 # The disagreement statistic is non-negative, so the threshold must stay
@@ -19,7 +20,10 @@ model:
 probe:
   enabled: true
   disagreement_threshold: 0.02
-  return_floor: null
+  # 数字槽：远端运行授权前冻结。
+  max_probe_regret: 1.0
+  probe_budget_per_episode: 20
+  probe_window_environment_steps: 100
   disagreement_stat: variance
 training:
   total_environment_steps: 1600

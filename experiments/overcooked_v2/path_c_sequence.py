@@ -109,9 +109,13 @@ def _nonnegative_int(value: Any, *, name: str) -> int:
 
 @dataclass(frozen=True)
 class EgoEvidenceSpecV1:
-    """Frozen, observable-only evidence contract for the Path C ego.
+    """Legacy option-level evidence contract for the predecessor instrument.
 
-    One encoded row describes the public state at an option-decision boundary and
+    This schema includes partner primitive actions and therefore is not the
+    official-information contract for the decision-focused proposal or R015.
+    Those formal paths use local observations plus the registered response
+    summary and reject this schema. One encoded row describes the public state at
+    an option-decision boundary and
     the complete primitive-action window that ended at that boundary. Exact action
     order is retained with an explicit padding token. Identity, mechanism, style,
     fingerprint, seed-group, and trajectory-source fields are not admissible.
