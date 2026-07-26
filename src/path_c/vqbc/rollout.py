@@ -10,7 +10,7 @@ from .policy import (
     regularized_policy,
     uniform_slot_log_belief,
 )
-from .quotient import aggregate_slots, quotient_bayes_update
+from .quotient import slot_bayes_update
 from .types import (
     VQBCDecisionRecord,
     VQBCPolicyState,
@@ -345,21 +345,11 @@ def collect_rollout(
             dones,
             codebook_embeddings,
         )
-        aggregated = aggregate_slots(
-            class_ids=output.quotient_ids,
+        updated_belief = slot_bayes_update(
             slot_log_belief=stepped_policy.slot_log_belief,
-            response_probabilities=output.response_probabilities,
-            reward_mean=output.reward_mean,
-            next_q_mean=output.next_q_mean,
-        )
-        updated_belief = quotient_bayes_update(
-            class_ids=output.quotient_ids,
-            class_belief=aggregated.class_belief,
-            class_response_probabilities=aggregated.response_probabilities,
+            slot_response_probabilities=output.response_probabilities,
             action=ego_action,
             response_code=response_code,
-            class_counts=aggregated.class_counts,
-            class_mask=aggregated.class_mask,
         )
         uniform = uniform_slot_log_belief(
             (count,), int(updated_belief.shape[-1])

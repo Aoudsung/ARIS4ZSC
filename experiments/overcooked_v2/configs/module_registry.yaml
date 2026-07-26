@@ -3,7 +3,12 @@
   "registry_version": "path_c_r015_design_freeze_static_2026_07_15",
   "source_git_sha": "a2d9b18887e58400692da1104d43be35afcaac2a",
   "worktree_binding": "The uncommitted official-trainer and partner-support scope passed 159 remote CUDA JAX tests on 2026-07-14; log SHA-256 ae01ae5f20f817e31d379bbe35d8332fc4c194010597785a920ab75fb565911f and JUnit SHA-256 2b27c52e02d1caf29802ba2509d62c8e68b41e62e0d93ac07cf44c96e2122bc5. The 2026-07-15 R015 design-data selection, adaptive resampling, pending freeze-manifest, pilot contract, and new tests are static only and have not been executed. Partner support is admitted, but no R015 design values or frozen preregistration exist.",
-  "allowed_statuses": ["planned", "implemented", "tested", "frozen"],
+  "allowed_statuses": [
+    "planned",
+    "implemented",
+    "tested",
+    "frozen"
+  ],
   "test_execution_status": "r015_design_freeze_static_changes_not_run",
   "status_meaning": {
     "planned": "One or more review requirements remain unresolved. Existing scaffolding is decision-ineligible and cannot support a frozen run.",
@@ -273,7 +278,9 @@
       "id": "I3_FULL_STATE_OUTER_SAMPLING",
       "status": "tested",
       "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
-      "implementation_files": ["experiments/overcooked_v2/path_c_belief_audit.py"],
+      "implementation_files": [
+        "experiments/overcooked_v2/path_c_belief_audit.py"
+      ],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_full_state_sampler_draws_complete_outer_states_with_replacement",
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_full_state_sampler_coordinates_are_chunk_stable_and_unit_specific",
@@ -286,7 +293,9 @@
       "id": "I4_EXACT_HISTORY_MATCHING",
       "status": "tested",
       "git_sha": "fc647fb00255c5bfc58253a38fa145cb8864afd7",
-      "implementation_files": ["experiments/overcooked_v2/path_c_belief_audit.py"],
+      "implementation_files": [
+        "experiments/overcooked_v2/path_c_belief_audit.py"
+      ],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_exact_history_key_uses_raw_discrete_bytes_and_joint_actions",
         "experiments/overcooked_v2/tests/test_path_c_belief_audit.py::test_tier2_index_enforces_episode_uniqueness_and_positivity",
@@ -696,7 +705,7 @@
       ]
     },
     {
-      "id": "PATH_C_VQBC_V4_CHAIN",
+      "id": "PATH_C_VQBC_V4_1_CHAIN",
       "status": "tested",
       "git_sha": null,
       "implementation_files": [
@@ -724,19 +733,27 @@
         "experiments/overcooked_v2/scripts/run_path_c_vqbc_response_contrast.py",
         "experiments/overcooked_v2/configs/path_c_vqbc_v4_development_simple.yaml",
         "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_simple.yaml",
-        "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_wide.yaml"
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_wide.yaml",
+        "docs/status/PATH_C_VQBC_V4_1_ROOT_REPAIR.md"
       ],
       "test_ids": [
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_checkpoint_reference_ownership_rejects_global_or_foreign_anchor",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_pool_check_binds_live_reference_output_to_the_unit",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_j_use_updates_belief_inside_max_and_j_mask_keeps_prior",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_belief_change_can_reverse_normal_action_order",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_v4_development_config_uses_fixed_model_and_complete_rollouts",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_v4_1_config_rejects_retired_shared_slot_decoder_fields",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_value_quotient_requires_certified_equivalence_not_overlap",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_class_view_conditions_on_persistent_within_class_posterior",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_slot_bayes_preserves_within_class_evidence_and_old_projection_fails",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_vqbc_forward_uses_persistent_slot_posterior_to_change_normal_actions",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_episode_responsibility_accumulates_control_evidence",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_responsibility_availability_excludes_bootstrap_slots",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_outcome_likelihood_separates_slots_when_td_is_equal",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_development_minibatches_are_exact_nonrepeating_lane_partitions",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_response_trigger_rejects_float32_roundoff_scale_values",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_each_slot_owns_independent_q_and_outcome_parameters",
         "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_only_bellman_path_reaches_backbone_and_random_prior_is_frozen",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_slot_outcome_loss_uses_only_stopped_responsibility_weights",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_training_diagnostics_expose_slot_code_policy_and_value_health",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_response_signature_is_assignment_independent_and_averages_experts",
         "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_checkpoint_round_trip_keeps_resume_random_and_rollout_state",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_four_modes_each_have_ten_self_and_ninety_directed_cross_pairings",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_untriggered_response_contrast_requires_identical_branches"
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_untriggered_response_contrast_requires_identical_branches",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_frozen_assignment_e_step_uses_target_model_and_dynamic_slot_count"
       ]
     }
   ]

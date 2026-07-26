@@ -22,11 +22,13 @@ from ..contracts.outer_units import (
 )
 
 
-VQBC_SCHEMA_VERSION = "path_c_model_v4"
+VQBC_SCHEMA_VERSION = "path_c_model_v4_1"
 VQBC_FORMAL_ENVIRONMENT_STEPS = 11_000_000
 VQBC_DEVELOPMENT_ENVIRONMENT_STEPS = 1_228_800
 VQBC_FORMAL_NUM_ENVS = 250
 VQBC_DEVELOPMENT_NUM_ENVS = 32
+VQBC_FORMAL_MINIBATCHES = 50
+VQBC_DEVELOPMENT_MINIBATCHES = 8
 VQBC_EPISODE_STEPS = 400
 VQBC_ACTION_COUNT = 6
 VQBC_SLOT_COUNT = 8
@@ -360,8 +362,6 @@ class VQBCModelConfig:
     hidden_dim: int
     head_hidden_dim: int
     action_embedding_dim: int
-    slot_embedding_dim: int
-    response_embedding_dim: int
     slot_count: int
     response_count: int
     action_count: int
@@ -376,8 +376,6 @@ class VQBCModelConfig:
             "hidden_dim",
             "head_hidden_dim",
             "action_embedding_dim",
-            "slot_embedding_dim",
-            "response_embedding_dim",
             "slot_count",
             "response_count",
             "action_count",
@@ -393,12 +391,6 @@ class VQBCModelConfig:
             ),
             action_embedding_dim=_positive_int(
                 payload["action_embedding_dim"], "model.action_embedding_dim"
-            ),
-            slot_embedding_dim=_positive_int(
-                payload["slot_embedding_dim"], "model.slot_embedding_dim"
-            ),
-            response_embedding_dim=_positive_int(
-                payload["response_embedding_dim"], "model.response_embedding_dim"
             ),
             slot_count=_positive_int(payload["slot_count"], "model.slot_count"),
             response_count=_positive_int(
@@ -419,8 +411,6 @@ class VQBCModelConfig:
             config.hidden_dim != 128
             or config.head_hidden_dim != 128
             or config.action_embedding_dim != 16
-            or config.slot_embedding_dim != 16
-            or config.response_embedding_dim != 16
             or config.slot_count != VQBC_SLOT_COUNT
             or config.response_count != VQBC_RESPONSE_COUNT
             or config.action_count != VQBC_ACTION_COUNT
@@ -732,12 +722,17 @@ class VQBCConfig:
             if self.run_kind == "formal"
             else VQBC_DEVELOPMENT_ENVIRONMENT_STEPS
         )
+        expected_minibatches = (
+            VQBC_FORMAL_MINIBATCHES
+            if self.run_kind == "formal"
+            else VQBC_DEVELOPMENT_MINIBATCHES
+        )
         if (
             self.environment.num_envs != expected_envs
             or self.training.environment_steps != expected_steps
             or self.training.unroll_length != VQBC_EPISODE_STEPS
             or self.training.update_epochs != 4
-            or self.training.minibatches_per_epoch != 50
+            or self.training.minibatches_per_epoch != expected_minibatches
             or self.training.bellman_learning_rate != 1.0e-4
             or self.training.outcome_learning_rate != 2.5e-4
             or self.training.gradient_clip_norm != 0.25
@@ -855,7 +850,7 @@ class VQBCFormalTemplate:
     def from_mapping(
         cls, payload: Mapping[str, Any], *, base_dir: str | Path = "."
     ) -> "VQBCFormalTemplate":
-        payload = _mapping(payload, "path_c_model_v4 formal template")
+        payload = _mapping(payload, "path_c_model_v4_1 formal template")
         fields = {
             "schema_version",
             "run_kind",
@@ -1009,7 +1004,9 @@ __all__ = [
     "VQBC_ACTION_COUNT",
     "VQBC_DEPLOYMENT_MODES",
     "VQBC_DEVELOPMENT_ENVIRONMENT_STEPS",
+    "VQBC_DEVELOPMENT_MINIBATCHES",
     "VQBC_FORMAL_ENVIRONMENT_STEPS",
+    "VQBC_FORMAL_MINIBATCHES",
     "VQBC_RESPONSE_COUNT",
     "VQBC_SCHEMA_VERSION",
     "VQBC_SLOT_COUNT",

@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .config import VQBCModelConfig
+from .config import VQBCModelConfig, VQBC_SLOT_COUNT
 from .integrity import copy_explicit_parameter_leaves
 from .policy import (
     bellman_control_values,
     deployment_policy,
     generic_response_information,
+    normalized_log_belief,
 )
-from .quotient import aggregate_slots, complete_link_class_ids, value_signatures
+from .quotient import complete_link_class_ids, value_signatures
 from .types import VQBCOutput
 
 
@@ -19,7 +20,7 @@ _MODEL_CACHE: dict[tuple[int, ...], Any] = {}
 
 
 def _model_class() -> Any:
-    cached = _MODEL_CACHE.get((4,))
+    cached = _MODEL_CACHE.get((5,))
     if cached is not None:
         return cached
 
@@ -146,118 +147,97 @@ def _model_class() -> Any:
             joined = nn.LayerNorm(name="LayerNorm_0")(joined)
             return ScannedRNN(name="ScannedRNN_0")(carry, (joined, starts))
 
-    class DuelingEstimator(nn.Module):
+    class IndependentDuelingEstimator(nn.Module):
+        """A bank of genuinely independent Bellman experts."""
+
         slot_count: int
         action_count: int
         hidden_dim: int
-        slot_embedding_dim: int
         output_scale: float
         prefix: str
 
         @nn.compact
         def __call__(self, features: Any) -> tuple[Any, Any]:
-            shared_hidden = nn.relu(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(2.0),
+            slot_values = []
+            slot_advantages = []
+            for slot in range(self.slot_count):
+                hidden = nn.relu(
+                    nn.Dense(
+                        self.hidden_dim,
+                        kernel_init=orthogonal(2.0),
+                        bias_init=zeros,
+                        name=f"{self.prefix}_slot_{slot}_hidden",
+                    )(features)
+                )
+                value = nn.Dense(
+                    1,
+                    kernel_init=orthogonal(1.0),
                     bias_init=zeros,
-                    name=f"{self.prefix}_shared_hidden",
-                )(features)
-            )
-            shared_value = nn.Dense(
-                1,
-                kernel_init=orthogonal(1.0),
-                bias_init=zeros,
-                name=f"{self.prefix}_shared_value",
-            )(shared_hidden)[..., 0]
-            slot_embedding = self.param(
-                f"{self.prefix}_slot_embedding",
-                normal(0.02),
-                (self.slot_count, self.slot_embedding_dim),
-            )
-            feature_grid = jnp.broadcast_to(
-                features[..., None, :],
-                features.shape[:-1] + (self.slot_count, features.shape[-1]),
-            )
-            embedding_grid = jnp.broadcast_to(
-                slot_embedding,
-                features.shape[:-1] + slot_embedding.shape,
-            )
-            joined = jnp.concatenate((feature_grid, embedding_grid), axis=-1)
-            hidden = nn.relu(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    name=f"{self.prefix}_slot_{slot}_value",
+                )(hidden)[..., 0]
+                raw_advantage = nn.Dense(
+                    self.action_count,
+                    kernel_init=orthogonal(self.output_scale),
                     bias_init=zeros,
-                    name=f"{self.prefix}_slot_hidden",
-                )(joined)
+                    name=f"{self.prefix}_slot_{slot}_advantages",
+                )(hidden)
+                centered = raw_advantage - jnp.mean(
+                    raw_advantage, axis=-1, keepdims=True
+                )
+                slot_values.append(value[..., None] + centered)
+                slot_advantages.append(centered)
+            return (
+                jnp.stack(slot_values, axis=-2),
+                jnp.stack(slot_advantages, axis=-2),
             )
-            offset = nn.Dense(
-                1,
-                kernel_init=orthogonal(self.output_scale),
-                bias_init=zeros,
-                name=f"{self.prefix}_slot_offset",
-            )(hidden)[..., 0]
-            advantages = nn.Dense(
-                self.action_count,
-                kernel_init=orthogonal(self.output_scale),
-                bias_init=zeros,
-                name=f"{self.prefix}_advantages",
-            )(hidden)
-            centered = advantages - jnp.mean(advantages, axis=-1, keepdims=True)
-            return shared_value[..., None, None] + offset[..., :, None] + centered, centered
 
     class TwinDuelingQ(nn.Module):
         slot_count: int
         action_count: int
         hidden_dim: int
-        slot_embedding_dim: int
         prior_scale: float
 
         @nn.compact
         def __call__(self, features: Any) -> tuple[Any, Any, Any, Any]:
             learned = []
-            learned_advantages = []
             priors = []
             for estimator in range(2):
-                learned_value, learned_advantage = DuelingEstimator(
+                learned_value, unused_learned_advantage = (
+                    IndependentDuelingEstimator(
+                        slot_count=self.slot_count,
+                        action_count=self.action_count,
+                        hidden_dim=self.hidden_dim,
+                        output_scale=1.0e-2,
+                        prefix=f"learned_estimator_{estimator}",
+                        name=f"LearnedEstimator_{estimator}",
+                    )(features)
+                )
+                prior_value, unused_prior_advantage = IndependentDuelingEstimator(
                     slot_count=self.slot_count,
                     action_count=self.action_count,
                     hidden_dim=self.hidden_dim,
-                    slot_embedding_dim=self.slot_embedding_dim,
-                    output_scale=1.0e-3,
-                    prefix=f"learned_estimator_{estimator}",
-                    name=f"LearnedEstimator_{estimator}",
-                )(features)
-                prior_value, unused_prior_advantage = DuelingEstimator(
-                    slot_count=self.slot_count,
-                    action_count=self.action_count,
-                    hidden_dim=self.hidden_dim,
-                    slot_embedding_dim=self.slot_embedding_dim,
                     output_scale=1.0,
                     prefix=f"prior_estimator_{estimator}",
                     name=f"PriorEstimator_{estimator}",
                 )(features)
-                del unused_prior_advantage
+                del unused_learned_advantage, unused_prior_advantage
                 learned.append(learned_value)
-                learned_advantages.append(learned_advantage)
                 priors.append(jax.lax.stop_gradient(prior_value))
             learned_values = jnp.stack(learned, axis=-3)
             prior_values = jnp.stack(priors, axis=-3)
             q_values = learned_values + self.prior_scale * prior_values
-            return (
-                q_values,
-                learned_values,
-                prior_values,
-                q_values - jnp.mean(q_values, axis=-1, keepdims=True),
+            control_signatures = q_values - jnp.max(
+                q_values, axis=-1, keepdims=True
             )
+            return q_values, learned_values, prior_values, control_signatures
 
     class OutcomeModel(nn.Module):
+        """Slot-conditional outcome model with independent expert decoders."""
+
         slot_count: int
         action_count: int
         response_count: int
         hidden_dim: int
-        slot_embedding_dim: int
         action_embedding_dim: int
         log_standard_deviation_minimum: float
         log_standard_deviation_maximum: float
@@ -265,11 +245,6 @@ def _model_class() -> Any:
         @nn.compact
         def __call__(self, features: Any) -> Mapping[str, Any]:
             detached = jax.lax.stop_gradient(features)
-            slot_embedding = self.param(
-                "slot_embedding",
-                normal(0.02),
-                (self.slot_count, self.slot_embedding_dim),
-            )
             action_embedding = self.param(
                 "action_embedding",
                 normal(0.02),
@@ -277,80 +252,84 @@ def _model_class() -> Any:
             )
             prefix = detached.shape[:-1]
             feature_grid = jnp.broadcast_to(
-                detached[..., None, None, :],
-                prefix
-                + (
-                    self.slot_count,
-                    self.action_count,
-                    detached.shape[-1],
-                ),
-            )
-            slot_grid = jnp.broadcast_to(
-                slot_embedding[:, None, :],
-                prefix
-                + (
-                    self.slot_count,
-                    self.action_count,
-                    self.slot_embedding_dim,
-                ),
+                detached[..., None, :],
+                prefix + (self.action_count, detached.shape[-1]),
             )
             action_grid = jnp.broadcast_to(
-                action_embedding[None, :, :],
-                prefix
-                + (
-                    self.slot_count,
-                    self.action_count,
-                    self.action_embedding_dim,
-                ),
+                action_embedding,
+                prefix + action_embedding.shape,
             )
-            joined = jnp.concatenate((feature_grid, slot_grid, action_grid), axis=-1)
-            hidden = nn.relu(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="hidden",
-                )(joined)
-            )
-            response_logits = nn.Dense(
-                self.response_count,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="response_logits",
-            )(hidden)
-            reward_mean = nn.Dense(
-                1, kernel_init=zeros, bias_init=zeros, name="reward_mean"
-            )(hidden)[..., 0]
-            reward_log_std = nn.Dense(
-                1,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="reward_log_standard_deviation",
-            )(hidden)[..., 0]
+            joined = jnp.concatenate((feature_grid, action_grid), axis=-1)
+
+            response_logits_by_slot = []
+            reward_mean_by_slot = []
+            reward_log_std_by_slot = []
+            next_q_mean_by_slot = []
+            next_q_log_std_by_slot = []
             continuation_size = 2 * self.response_count * self.action_count
-            next_q_mean = nn.Dense(
-                continuation_size,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="next_q_mean",
-            )(hidden).reshape(
-                prefix
-                + (
-                    self.slot_count,
-                    self.action_count,
-                    2,
-                    self.response_count,
-                    self.action_count,
+            for slot in range(self.slot_count):
+                hidden = nn.relu(
+                    nn.Dense(
+                        self.hidden_dim,
+                        kernel_init=orthogonal(jnp.sqrt(2.0)),
+                        bias_init=zeros,
+                        name=f"slot_{slot}_hidden",
+                    )(joined)
                 )
-            )
-            next_q_log_std = nn.Dense(
-                continuation_size,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="next_q_log_standard_deviation",
-            )(hidden).reshape(next_q_mean.shape)
-            next_q_mean = jnp.moveaxis(next_q_mean, -3, -5)
-            next_q_log_std = jnp.moveaxis(next_q_log_std, -3, -5)
+                response_logits_by_slot.append(
+                    nn.Dense(
+                        self.response_count,
+                        kernel_init=zeros,
+                        bias_init=zeros,
+                        name=f"slot_{slot}_response_logits",
+                    )(hidden)
+                )
+                reward_mean_by_slot.append(
+                    nn.Dense(
+                        1,
+                        kernel_init=zeros,
+                        bias_init=zeros,
+                        name=f"slot_{slot}_reward_mean",
+                    )(hidden)[..., 0]
+                )
+                reward_log_std_by_slot.append(
+                    nn.Dense(
+                        1,
+                        kernel_init=zeros,
+                        bias_init=zeros,
+                        name=f"slot_{slot}_reward_log_standard_deviation",
+                    )(hidden)[..., 0]
+                )
+                next_mean = nn.Dense(
+                    continuation_size,
+                    kernel_init=zeros,
+                    bias_init=zeros,
+                    name=f"slot_{slot}_next_q_mean",
+                )(hidden).reshape(
+                    prefix
+                    + (
+                        self.action_count,
+                        2,
+                        self.response_count,
+                        self.action_count,
+                    )
+                )
+                next_log_std = nn.Dense(
+                    continuation_size,
+                    kernel_init=zeros,
+                    bias_init=zeros,
+                    name=f"slot_{slot}_next_q_log_standard_deviation",
+                )(hidden).reshape(next_mean.shape)
+                next_q_mean_by_slot.append(jnp.moveaxis(next_mean, -3, -4))
+                next_q_log_std_by_slot.append(
+                    jnp.moveaxis(next_log_std, -3, -4)
+                )
+
+            response_logits = jnp.stack(response_logits_by_slot, axis=-3)
+            reward_mean = jnp.stack(reward_mean_by_slot, axis=-2)
+            reward_log_std = jnp.stack(reward_log_std_by_slot, axis=-2)
+            next_q_mean = jnp.stack(next_q_mean_by_slot, axis=-4)
+            next_q_log_std = jnp.stack(next_q_log_std_by_slot, axis=-4)
             next_q_mean = next_q_mean.at[
                 ..., self.response_count - 1, :
             ].set(0.0)
@@ -423,7 +402,6 @@ def _model_class() -> Any:
         hidden_dim: int
         head_hidden_dim: int
         action_embedding_dim: int
-        slot_embedding_dim: int
         slot_count: int
         action_count: int
         response_count: int
@@ -443,7 +421,6 @@ def _model_class() -> Any:
                 slot_count=self.slot_count,
                 action_count=self.action_count,
                 hidden_dim=self.head_hidden_dim,
-                slot_embedding_dim=self.slot_embedding_dim,
                 prior_scale=self.prior_scale,
             )
             self.outcome = OutcomeModel(
@@ -451,7 +428,6 @@ def _model_class() -> Any:
                 action_count=self.action_count,
                 response_count=self.response_count,
                 hidden_dim=self.head_hidden_dim,
-                slot_embedding_dim=self.slot_embedding_dim,
                 action_embedding_dim=self.action_embedding_dim,
                 log_standard_deviation_minimum=(
                     self.log_standard_deviation_minimum
@@ -533,7 +509,7 @@ def _model_class() -> Any:
                 observations, actions, next_observations, dones
             )
 
-    _MODEL_CACHE[(4,)] = VQBCFlaxModel
+    _MODEL_CACHE[(5,)] = VQBCFlaxModel
     return VQBCFlaxModel
 
 
@@ -546,7 +522,6 @@ def build_vqbc_model(
         hidden_dim=model_config.hidden_dim,
         head_hidden_dim=model_config.head_hidden_dim,
         action_embedding_dim=model_config.action_embedding_dim,
-        slot_embedding_dim=model_config.slot_embedding_dim,
         slot_count=model_config.slot_count,
         action_count=model_config.action_count,
         response_count=model_config.response_count,
@@ -617,23 +592,22 @@ def vqbc_forward(
     q_values = raw_output["q_values"]
     signatures, radii = value_signatures(q_values)
     class_ids = complete_link_class_ids(signatures, radii)
-    aggregated = aggregate_slots(
-        class_ids=class_ids,
-        slot_log_belief=slot_log_belief,
+    # Quotients are a diagnostic/current-control view. Bayesian filtering and
+    # response-conditioned continuation remain at persistent slot level so a
+    # class that is equivalent now may split later without losing evidence.
+    import jax.numpy as jnp
+
+    slot_probabilities = jnp.exp(normalized_log_belief(slot_log_belief))
+    control = bellman_control_values(
+        class_belief=slot_probabilities,
         response_probabilities=raw_output["response_probabilities"],
         reward_mean=raw_output["reward_mean"],
         next_q_mean=raw_output["next_q_mean"],
-    )
-    control = bellman_control_values(
-        class_belief=aggregated.class_belief,
-        response_probabilities=aggregated.response_probabilities,
-        reward_mean=aggregated.reward_mean,
-        next_q_mean=aggregated.next_q_mean,
         gamma=gamma,
     )
     information = generic_response_information(
-        class_belief=aggregated.class_belief,
-        response_probabilities=aggregated.response_probabilities,
+        class_belief=slot_probabilities,
+        response_probabilities=raw_output["response_probabilities"],
     )
     policy = deployment_policy(
         mode=deployment_mode,
@@ -713,13 +687,24 @@ def explicit_official_parameter_mapping() -> dict[tuple[str, ...], tuple[str, ..
     for estimator in range(2):
         target = f"LearnedEstimator_{estimator}"
         prefix = f"learned_estimator_{estimator}"
-        for leaf in ("kernel", "bias"):
-            critic[
-                ("q_heads", target, f"{prefix}_shared_hidden", leaf)
-            ] = ("params", "Dense_2", leaf)
-            critic[
-                ("q_heads", target, f"{prefix}_shared_value", leaf)
-            ] = ("params", "Dense_3", leaf)
+        for slot in range(VQBC_SLOT_COUNT):
+            for leaf in ("kernel", "bias"):
+                critic[
+                    (
+                        "q_heads",
+                        target,
+                        f"{prefix}_slot_{slot}_hidden",
+                        leaf,
+                    )
+                ] = ("params", "Dense_2", leaf)
+                critic[
+                    (
+                        "q_heads",
+                        target,
+                        f"{prefix}_slot_{slot}_value",
+                        leaf,
+                    )
+                ] = ("params", "Dense_3", leaf)
     return {**convolution, **encoder, **normalization, **recurrent, **critic}
 
 

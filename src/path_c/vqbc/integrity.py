@@ -48,7 +48,7 @@ def _leaves(
 
 
 def tree_sha256(params: Mapping[str, Any]) -> str:
-    digest = hashlib.sha256(b"path_c_vqbc_model_weights_v1\x00")
+    digest = hashlib.sha256(b"path_c_vqbc_model_weights_v2\x00")
     leaves = list(_leaves(params))
     if not leaves:
         raise ValueError("Parameter tree has no leaves.")

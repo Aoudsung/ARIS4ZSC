@@ -121,7 +121,7 @@ class VQBCTrainState(NamedTuple):
 
 
 @dataclass(frozen=True, slots=True)
-class CheckpointMetadataV2:
+class CheckpointMetadataV3:
     """Content bindings for a resumable fourth-version checkpoint."""
 
     schema_version: str
@@ -142,7 +142,7 @@ class CheckpointMetadataV2:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.schema_version != "path_c_model_checkpoint_metadata_v2":
+        if self.schema_version != "path_c_model_checkpoint_metadata_v3":
             raise ValueError("Fourth-model checkpoint metadata schema changed.")
         if self.run_kind not in {"development", "formal"}:
             raise ValueError("Checkpoint run_kind must be development or formal.")
@@ -190,7 +190,7 @@ class CheckpointMetadataV2:
         return asdict(self)
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any]) -> "CheckpointMetadataV2":
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "CheckpointMetadataV3":
         if not isinstance(payload, Mapping):
             raise TypeError("Checkpoint metadata must be a mapping.")
         fields = {item.name for item in cls.__dataclass_fields__.values()}
@@ -214,7 +214,7 @@ def finite_scalar(value: Any, name: str) -> float:
 
 
 __all__ = [
-    "CheckpointMetadataV2",
+    "CheckpointMetadataV3",
     "VQBCCodebookState",
     "VQBCDecisionRecord",
     "VQBCKLState",

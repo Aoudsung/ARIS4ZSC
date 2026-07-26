@@ -13,7 +13,7 @@ from .objectives import (
     FrozenAssignments,
     bellman_loss,
     bellman_targets,
-    episode_responsibilities,
+    episode_responsibility_evidence,
     outcome_loss,
     response_encoder_loss,
     sample_bootstrap_mask,
@@ -32,6 +32,7 @@ class OptimizerBundle(NamedTuple):
 
 class TrainingUpdate(NamedTuple):
     params: Any
+    target_params: Any
     bellman_optimizer_state: Any
     outcome_optimizer_state: Any
     metrics: Mapping[str, Any]
@@ -201,14 +202,16 @@ def prepare_frozen_assignments(
     gamma: float,
     responsibility_temperature: float,
     bootstrap_probability: float,
+    bootstrap_mask: Any | None = None,
     terminal_response: int = 15,
     environment_chunk_size: int | None = None,
 ) -> FrozenAssignments:
-    """Freeze assignments while bounding the large outcome tensor by lane chunks."""
+    """Run a frozen target-network E-step over complete episode lanes."""
 
     import jax
     import jax.numpy as jnp
 
+    del online_params  # E-step evidence is cross-fitted from the target model.
     environment_count = int(batch.actions.shape[1])
     chunk_size = (
         environment_count
@@ -221,20 +224,23 @@ def prepare_frozen_assignments(
         raise ValueError(
             "Assignment environment count must divide exactly into lane chunks."
         )
-    mask = sample_bootstrap_mask(
-        key,
-        environment_count=environment_count,
-        slot_count=8,
-        probability=bootstrap_probability,
-    )
+    slot_count = int(batch.slot_log_beliefs.shape[-1])
+    if bootstrap_mask is None:
+        mask = sample_bootstrap_mask(
+            key,
+            environment_count=environment_count,
+            slot_count=slot_count,
+            probability=bootstrap_probability,
+        )
+    else:
+        mask = jnp.asarray(bootstrap_mask, dtype=jnp.bool_)
+        if mask.shape != (environment_count, slot_count):
+            raise ValueError("A supplied bootstrap mask has the wrong shape.")
     chunk_offsets = jnp.arange(chunk_size, dtype=jnp.int32)
 
-    def prepare_chunk(start: Any) -> tuple[Any, Any, Any, Any]:
+    def prepare_chunk(start: Any) -> tuple[Any, Any, Any, Any, Any]:
         indexes = start + chunk_offsets
         current = slice_rollout_batch(batch, indexes)
-        online = apply_control_sequence(
-            model=model, params=online_params, batch=current
-        )
         target = jax.tree_util.tree_map(
             jax.lax.stop_gradient,
             apply_model_sequence(
@@ -257,36 +263,46 @@ def prepare_frozen_assignments(
                 gamma=gamma,
             )
         )
-        responsibilities = episode_responsibilities(
-            q_values=online["q_values"][:-1],
-            actions=current.actions,
-            targets=targets,
-            temperature=responsibility_temperature,
-        )
         signatures = jax.lax.stop_gradient(
             target_response_signatures(
                 target_centered_advantages=target[
                     "centered_advantages"
-                ][1:],
-                stopped_responsibilities=responsibilities,
+                ][1:]
             )
         )
         code_targets, unused_error = nearest_codes(
             signatures, codebook_embeddings
         )
         del unused_error
-        return (
-            responsibilities,
-            targets,
-            signatures,
-            jax.lax.stop_gradient(
-                jnp.where(current.dones, terminal_response, code_targets)
-            ),
+        code_targets = jax.lax.stop_gradient(
+            jnp.where(current.dones, terminal_response, code_targets)
         )
+        responsibilities, energies = episode_responsibility_evidence(
+            q_values=target["q_values"][:-1],
+            actions=current.actions,
+            targets=targets,
+            temperature=responsibility_temperature,
+            response_logits=target["response_logits"][:-1],
+            reward_mean=target["reward_mean"][:-1],
+            reward_log_standard_deviation=target[
+                "reward_log_standard_deviation"
+            ][:-1],
+            next_q_mean=target["next_q_mean"][:-1],
+            next_q_log_standard_deviation=target[
+                "next_q_log_standard_deviation"
+            ][:-1],
+            response_codes=code_targets,
+            rewards=current.rewards,
+            target_next_q_values=target["q_values"][1:],
+            dones=current.dones,
+            availability_mask=mask[indexes],
+        )
+        return responsibilities, energies, targets, signatures, code_targets
 
     starts = jnp.arange(0, environment_count, chunk_size, dtype=jnp.int32)
     (
         chunk_responsibilities,
+        chunk_energies,
         chunk_targets,
         chunk_signatures,
         chunk_code_targets,
@@ -295,6 +311,9 @@ def prepare_frozen_assignments(
     return FrozenAssignments(
         responsibilities=chunk_responsibilities.reshape(
             (environment_count, chunk_responsibilities.shape[-1])
+        ),
+        responsibility_energies=chunk_energies.reshape(
+            (environment_count, chunk_energies.shape[-1])
         ),
         bootstrap_mask=mask,
         bellman_targets=jnp.swapaxes(chunk_targets, 0, 1).reshape(
@@ -307,9 +326,7 @@ def prepare_frozen_assignments(
         ),
         response_code_targets=jnp.swapaxes(
             chunk_code_targets, 0, 1
-        ).reshape(
-            (time_count, environment_count)
-        ),
+        ).reshape((time_count, environment_count)),
     )
 
 
@@ -321,6 +338,7 @@ def slice_environment_lanes(
     batch_slice = slice_rollout_batch(batch, indexes)
     assignment_slice = FrozenAssignments(
         responsibilities=assignments.responsibilities[indexes],
+        responsibility_energies=assignments.responsibility_energies[indexes],
         bootstrap_mask=assignments.bootstrap_mask[indexes],
         bellman_targets=assignments.bellman_targets[:, indexes],
         response_signature_targets=assignments.response_signature_targets[
@@ -340,39 +358,32 @@ def environment_minibatch_schedule(
     minibatches_per_epoch: int,
     update_epochs: int,
 ) -> Any:
-    """Use partitions when possible and keyed one-lane cycling for 32-env development."""
+    """Return exact non-repeating lane partitions for every training epoch."""
 
     import jax
     import jax.numpy as jnp
 
-    if environment_count >= minibatches_per_epoch:
-        if environment_count % minibatches_per_epoch:
-            raise ValueError("Formal environment lanes must divide into 50 minibatches.")
-        lane_count = environment_count // minibatches_per_epoch
-        keys = jax.random.split(key, update_epochs)
-        schedules = [
-            jax.random.permutation(keys[index], environment_count).reshape(
+    if minibatches_per_epoch <= 0 or update_epochs <= 0:
+        raise ValueError("Minibatches and update epochs must be positive.")
+    if environment_count < minibatches_per_epoch:
+        raise ValueError(
+            "Minibatches per epoch cannot exceed complete environment lanes."
+        )
+    if environment_count % minibatches_per_epoch:
+        raise ValueError(
+            "Environment lanes must divide exactly into recurrent minibatches."
+        )
+    lane_count = environment_count // minibatches_per_epoch
+    keys = jax.random.split(key, update_epochs)
+    return jnp.stack(
+        [
+            jax.random.permutation(epoch_key, environment_count).reshape(
                 (minibatches_per_epoch, lane_count)
             )
-            for index in range(update_epochs)
-        ]
-    else:
-        keys = jax.random.split(key, update_epochs)
-        repeats = (
-            minibatches_per_epoch + environment_count - 1
-        ) // environment_count
-        schedules = []
-        for index in range(update_epochs):
-            epoch_keys = jax.random.split(keys[index], repeats)
-            order = jnp.concatenate(
-                [
-                    jax.random.permutation(epoch_key, environment_count)
-                    for epoch_key in epoch_keys
-                ],
-                axis=0,
-            )[:minibatches_per_epoch]
-            schedules.append(order[:, None])
-    return jnp.concatenate(schedules, axis=0)
+            for epoch_key in keys
+        ],
+        axis=0,
+    )
 
 
 def _losses(
@@ -408,12 +419,13 @@ def _losses(
         next_q_log_standard_deviation=output[
             "next_q_log_standard_deviation"
         ][:-1],
-        response_codes=batch.response_codes,
+        response_codes=assignments.response_code_targets,
         rewards=batch.rewards,
         target_next_q_values=target_output["q_values"][1:],
         dones=batch.dones,
         actions=batch.actions,
         stopped_responsibilities=assignments.responsibilities,
+        bootstrap_mask=assignments.bootstrap_mask,
     )
     predicted_signature = model.apply(
         {"params": params},
@@ -447,6 +459,7 @@ def apply_minibatch_update(
     batch: VQBCRolloutBatch,
     assignments: FrozenAssignments,
     codebook_embeddings: Any,
+    polyak_coefficient: float,
 ) -> TrainingUpdate:
     import jax
     import optax
@@ -492,8 +505,12 @@ def apply_minibatch_update(
         outcome_gradients, outcome_optimizer_state, params
     )
     params = optax.apply_updates(params, outcome_updates)
+    target_params = polyak_update(
+        target_params, params, polyak_coefficient
+    )
     return TrainingUpdate(
         params=params,
+        target_params=target_params,
         bellman_optimizer_state=bellman_optimizer_state,
         outcome_optimizer_state=outcome_optimizer_state,
         metrics={**bellman_metrics, **outcome_metrics},
@@ -510,27 +527,32 @@ def apply_rollout_updates(
     assignments: FrozenAssignments,
     codebook_embeddings: Any,
     schedule: Any,
+    polyak_coefficient: float,
 ) -> TrainingUpdate:
-    """Run four epochs over fifty complete-lane minibatches per epoch."""
+    """Run one M-step epoch over an exact complete-lane partition."""
 
     import jax
     import jax.numpy as jnp
 
+    schedule_array = jnp.asarray(schedule)
+    if schedule_array.ndim != 2:
+        raise ValueError("One M-step requires [minibatch, lane] schedule axes.")
     initial = (
         params,
+        target_params,
         optimizer_bundle.bellman_state,
         optimizer_bundle.outcome_state,
     )
 
-    def update_one(carry: tuple[Any, Any, Any], indexes: Any) -> tuple[Any, Any]:
-        current_params, bellman_state, outcome_state = carry
+    def update_one(carry: tuple[Any, Any, Any, Any], indexes: Any) -> tuple[Any, Any]:
+        current_params, current_target, bellman_state, outcome_state = carry
         minibatch, mini_assignments = slice_environment_lanes(
             batch, assignments, indexes
         )
         updated = apply_minibatch_update(
             model=model,
             params=current_params,
-            target_params=target_params,
+            target_params=current_target,
             bellman_optimizer=optimizer_bundle.bellman_optimizer,
             outcome_optimizer=optimizer_bundle.outcome_optimizer,
             bellman_optimizer_state=bellman_state,
@@ -538,18 +560,21 @@ def apply_rollout_updates(
             batch=minibatch,
             assignments=mini_assignments,
             codebook_embeddings=codebook_embeddings,
+            polyak_coefficient=polyak_coefficient,
         )
         return (
             updated.params,
+            updated.target_params,
             updated.bellman_optimizer_state,
             updated.outcome_optimizer_state,
         ), updated.metrics
 
-    final, metrics = jax.lax.scan(update_one, initial, jnp.asarray(schedule))
+    final, metrics = jax.lax.scan(update_one, initial, schedule_array)
     return TrainingUpdate(
         params=final[0],
-        bellman_optimizer_state=final[1],
-        outcome_optimizer_state=final[2],
+        target_params=final[1],
+        bellman_optimizer_state=final[2],
+        outcome_optimizer_state=final[3],
         metrics=jax.tree_util.tree_map(lambda value: jnp.mean(value), metrics),
     )
 
@@ -658,6 +683,12 @@ def rollout_health_diagnostics(
         responsibility_fraction
         * jnp.log(jnp.maximum(responsibility_fraction, 1.0e-12))
     )
+    energies = jnp.asarray(
+        assignments.responsibility_energies, dtype=jnp.float32
+    )
+    sorted_energies = jnp.sort(energies, axis=-1)
+    energy_margin = sorted_energies[..., 1] - sorted_energies[..., 0]
+    energy_spread = sorted_energies[..., -1] - sorted_energies[..., 0]
 
     quotient_counts = jnp.asarray(batch.quotient_counts, dtype=jnp.int32)
     quotient_histogram = jnp.bincount(
@@ -709,6 +740,11 @@ def rollout_health_diagnostics(
             "effective_fraction_by_slot": responsibility_fraction,
             "mass_entropy": responsibility_mass_entropy,
             "effective_slot_count": jnp.exp(responsibility_mass_entropy),
+            "energy_margin": _distribution_summary(energy_margin),
+            "energy_spread": _distribution_summary(energy_spread),
+            "bootstrap_active_fraction": jnp.mean(
+                jnp.asarray(assignments.bootstrap_mask, dtype=jnp.float32)
+            ),
         },
         "quotient": {
             "active_count": _distribution_summary(quotient_counts),

@@ -25,7 +25,7 @@ from src.path_c.vqbc.model import (
     initialize_vqbc_from_official,
 )
 from src.path_c.vqbc.policy import uniform_slot_log_belief
-from src.path_c.vqbc.quotient import aggregate_slots, quotient_bayes_update
+from src.path_c.vqbc.quotient import slot_bayes_update
 from src.path_c.vqbc.rollout import (
     VQBCRolloutCallbacks,
     initialize_policy_state,
@@ -38,10 +38,10 @@ from src.path_c.vqbc.training import (
     apply_rollout_updates,
     environment_minibatch_schedule,
     make_optimizers,
-    polyak_update,
     prepare_frozen_assignments,
     rollout_health_diagnostics,
     rollout_kl_means,
+    sample_bootstrap_mask,
     update_codebook_from_assignments,
     update_kl_state,
 )
@@ -285,21 +285,11 @@ def _partner_callbacks(
         del unused_logits, unused_signatures
         response_codes = response_codes[0]
         output = context.dynamic_output
-        aggregated = aggregate_slots(
-            class_ids=output.quotient_ids,
+        updated_belief = slot_bayes_update(
             slot_log_belief=carry.dynamic_policy.slot_log_belief,
-            response_probabilities=output.response_probabilities,
-            reward_mean=output.reward_mean,
-            next_q_mean=output.next_q_mean,
-        )
-        updated_belief = quotient_bayes_update(
-            class_ids=output.quotient_ids,
-            class_belief=aggregated.class_belief,
-            class_response_probabilities=aggregated.response_probabilities,
+            slot_response_probabilities=output.response_probabilities,
             action=context.dynamic_action,
             response_code=response_codes,
-            class_counts=aggregated.class_counts,
-            class_mask=aggregated.class_mask,
         )
         uniform = uniform_slot_log_belief(
             updated_belief.shape[:-1], slot_count
@@ -600,6 +590,7 @@ def run_vqbc_training(
             assignments=assignments,
             codebook_embeddings=codebook_embeddings,
             schedule=schedule,
+            polyak_coefficient=config.training.polyak_coefficient,
         )
 
     compiled_rollout_updates = jax.jit(apply_compiled_updates)
@@ -621,6 +612,7 @@ def run_vqbc_training(
         key: Any,
         temperature: Any,
         generic_temperature: Any,
+        bootstrap_mask: Any,
     ) -> Any:
         return prepare_frozen_assignments(
             model=wiring.model,
@@ -636,6 +628,7 @@ def run_vqbc_training(
                 config.training.responsibility_temperature
             ),
             bootstrap_probability=config.training.bootstrap_probability,
+            bootstrap_mask=bootstrap_mask,
             environment_chunk_size=max(
                 1,
                 config.environment.num_envs
@@ -651,14 +644,21 @@ def run_vqbc_training(
             assignment_key,
             schedule_key,
             codebook_key,
+            bootstrap_key,
             next_state_key,
-        ) = jax.random.split(state.random_key, 4)
+        ) = jax.random.split(state.random_key, 5)
         rollout_state, batch = compiled_rollout_collector(
             state=state.rollout_state,
             params=state.online_params,
             codebook_embeddings=state.codebook.embeddings,
         )
-        assignments = compiled_assignments(
+        bootstrap_mask = sample_bootstrap_mask(
+            bootstrap_key,
+            environment_count=config.environment.num_envs,
+            slot_count=config.model.slot_count,
+            probability=config.training.bootstrap_probability,
+        )
+        provisional = compiled_assignments(
             state.online_params,
             state.target_params,
             batch=batch,
@@ -668,26 +668,17 @@ def run_vqbc_training(
             generic_temperature=jnp.exp(
                 state.kl_state.generic_log_temperature
             ),
+            bootstrap_mask=bootstrap_mask,
         )
         codebook_update = update_codebook_from_assignments(
             state.codebook,
-            assignments=assignments,
+            assignments=provisional,
             dones=batch.dones,
             key=codebook_key,
             decay=config.training.codebook_decay,
             replacement_after_rollouts=(
                 config.training.code_replacement_rollouts
             ),
-        )
-        refreshed_codes, unused_quantization_error = nearest_codes(
-            assignments.response_signature_targets,
-            codebook_update.state.embeddings,
-        )
-        del unused_quantization_error
-        assignments = assignments._replace(
-            response_code_targets=jnp.where(
-                batch.dones, config.model.response_count - 1, refreshed_codes
-            )
         )
         schedule = environment_minibatch_schedule(
             schedule_key,
@@ -697,16 +688,41 @@ def run_vqbc_training(
             ),
             update_epochs=config.training.update_epochs,
         )
-        update = compiled_rollout_updates(
-            state.online_params,
-            state.target_params,
-            state.bellman_optimizer_state,
-            state.outcome_optimizer_state,
-            batch=batch,
-            assignments=assignments,
-            codebook_embeddings=codebook_update.state.embeddings,
-            schedule=schedule,
-        )
+        online_params = state.online_params
+        target_params = state.target_params
+        bellman_state = state.bellman_optimizer_state
+        outcome_state = state.outcome_optimizer_state
+        update = None
+        assignments = provisional
+        for epoch in range(config.training.update_epochs):
+            assignments = compiled_assignments(
+                online_params,
+                target_params,
+                batch=batch,
+                codebook_embeddings=codebook_update.state.embeddings,
+                key=jax.random.fold_in(assignment_key, epoch + 1),
+                temperature=jnp.exp(state.kl_state.log_temperature),
+                generic_temperature=jnp.exp(
+                    state.kl_state.generic_log_temperature
+                ),
+                bootstrap_mask=bootstrap_mask,
+            )
+            update = compiled_rollout_updates(
+                online_params,
+                target_params,
+                bellman_state,
+                outcome_state,
+                batch=batch,
+                assignments=assignments,
+                codebook_embeddings=codebook_update.state.embeddings,
+                schedule=schedule[epoch],
+            )
+            online_params = update.params
+            target_params = update.target_params
+            bellman_state = update.bellman_optimizer_state
+            outcome_state = update.outcome_optimizer_state
+        if update is None:
+            raise RuntimeError("VQBC completed no M-step epoch.")
         posterior_kl, generic_kl = rollout_kl_means(batch)
         kl_state = update_kl_state(
             state.kl_state,
@@ -730,11 +746,7 @@ def run_vqbc_training(
         rollout_state = rollout_state._replace(policy_state=policy_state)
         state = VQBCTrainState(
             online_params=update.params,
-            target_params=polyak_update(
-                state.target_params,
-                update.params,
-                config.training.polyak_coefficient,
-            ),
+            target_params=update.target_params,
             bellman_optimizer_state=update.bellman_optimizer_state,
             outcome_optimizer_state=update.outcome_optimizer_state,
             codebook=codebook_update.state,
@@ -764,7 +776,7 @@ def run_vqbc_training(
             _append_json_line(
                 metrics_path,
                 {
-                    "schema_version": "path_c_vqbc_training_metric_v2",
+                    "schema_version": "path_c_vqbc_training_metric_v3",
                     "run_kind": config.run_kind,
                     "scientific_readout_allowed": False,
                     "diagnostic_window": "latest_complete_rollout",
@@ -817,7 +829,7 @@ def run_vqbc_training(
     _atomic_json(
         summary_path,
         {
-            "schema_version": "path_c_vqbc_training_summary_v1",
+            "schema_version": "path_c_vqbc_training_summary_v2",
             "run_kind": config.run_kind,
             "scientific_readout_allowed": False,
             "effective_environment_steps": int(

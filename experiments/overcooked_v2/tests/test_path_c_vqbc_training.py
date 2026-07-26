@@ -56,8 +56,6 @@ def _model_config() -> VQBCModelConfig:
         hidden_dim=128,
         head_hidden_dim=128,
         action_embedding_dim=16,
-        slot_embedding_dim=16,
-        response_embedding_dim=16,
         slot_count=8,
         response_count=16,
         action_count=6,
@@ -124,6 +122,25 @@ def test_model_output_shapes_and_zero_initialized_outcome() -> None:
     np.testing.assert_array_equal(terminal, np.zeros(terminal.shape))
 
 
+def test_each_slot_owns_independent_q_and_outcome_parameters() -> None:
+    unused_model, params, *unused = _model_and_inputs()
+    del unused_model, unused
+    estimator = params["q_heads"]["LearnedEstimator_0"]
+    assert "learned_estimator_0_slot_0_hidden" in estimator
+    assert "learned_estimator_0_slot_1_hidden" in estimator
+    assert "slot_0_hidden" in params["outcome"]
+    assert "slot_1_hidden" in params["outcome"]
+    assert not np.array_equal(
+        np.asarray(
+            estimator["learned_estimator_0_slot_0_advantages"]["kernel"]
+        ),
+        np.asarray(
+            estimator["learned_estimator_0_slot_1_advantages"]["kernel"]
+        ),
+    )
+
+
+
 def test_only_bellman_path_reaches_backbone_and_random_prior_is_frozen() -> None:
     model, params, observations, actions, rewards, starts = _model_and_inputs()
 
@@ -145,11 +162,13 @@ def test_only_bellman_path_reaches_backbone_and_random_prior_is_frozen() -> None
     assert _tree_l1(q_grad["q_heads"]["PriorEstimator_1"]) == 0.0
 
     outcome_probe = unfreeze(params)
-    outcome_probe["outcome"]["hidden"]["kernel"] = jnp.ones_like(
-        outcome_probe["outcome"]["hidden"]["kernel"]
+    outcome_probe["outcome"]["slot_0_hidden"]["kernel"] = jnp.ones_like(
+        outcome_probe["outcome"]["slot_0_hidden"]["kernel"]
     )
-    outcome_probe["outcome"]["response_logits"]["kernel"] = jnp.ones_like(
-        outcome_probe["outcome"]["response_logits"]["kernel"]
+    outcome_probe["outcome"]["slot_0_response_logits"]["kernel"] = (
+        jnp.ones_like(
+            outcome_probe["outcome"]["slot_0_response_logits"]["kernel"]
+        )
     )
     outcome_probe = freeze(outcome_probe)
 
@@ -258,7 +277,7 @@ def test_codebook_uses_nonterminal_signatures_and_replaces_stale_codes() -> None
     assert update.state.embeddings.shape == (3, 2)
 
 
-def test_response_signature_stops_responsibility_and_averages_twins() -> None:
+def test_response_signature_is_assignment_independent_and_averages_experts() -> None:
     advantages = jnp.asarray(
         [
             [
@@ -269,12 +288,10 @@ def test_response_signature_stops_responsibility_and_averages_twins() -> None:
             ]
         ]
     )
-    responsibilities = jnp.asarray([[0.25, 0.75]])
     signature = target_response_signatures(
         target_centered_advantages=advantages,
-        stopped_responsibilities=responsibilities,
     )
-    np.testing.assert_allclose(signature, [[[0.5, 1.5]]])
+    np.testing.assert_allclose(signature, [[[1.0, 1.0]]])
 
 
 def test_slot_outcome_loss_uses_only_stopped_responsibility_weights() -> None:
@@ -374,6 +391,7 @@ def test_training_diagnostics_expose_slot_code_policy_and_value_health() -> None
     )
     assignments = FrozenAssignments(
         responsibilities=jnp.asarray([[1.0, 0.0], [0.25, 0.75]]),
+        responsibility_energies=jnp.asarray([[0.1, 0.9], [0.4, 0.6]]),
         bootstrap_mask=jnp.ones((2, 2), dtype=jnp.bool_),
         bellman_targets=jnp.zeros((2, 2, 2)),
         response_signature_targets=jnp.zeros((2, 2, 2)),

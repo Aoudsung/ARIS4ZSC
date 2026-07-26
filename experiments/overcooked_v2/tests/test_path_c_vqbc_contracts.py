@@ -18,10 +18,7 @@ from src.path_c.vqbc.objectives import (
     assert_training_batch_has_no_audit_labels,
 )
 from src.path_c.vqbc.pipeline import run_vqbc_pool_check
-from src.path_c.vqbc.types import CheckpointMetadataV2
-from experiments.overcooked_v2.path_c_official_artifact import (
-    _source_dependency_closure,
-)
+from src.path_c.vqbc.types import CheckpointMetadataV3
 
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
@@ -39,11 +36,12 @@ def test_v4_development_config_uses_fixed_model_and_complete_rollouts() -> None:
     config = VQBCConfig.from_mapping(
         _development_payload(), base_dir=CONFIG_ROOT
     )
-    assert config.schema_version == "path_c_model_v4"
+    assert config.schema_version == "path_c_model_v4_1"
     assert config.run_kind == "development"
     assert config.model.slot_count == 8
     assert config.model.response_count == 16
     assert config.training.environment_steps == 1_228_800
+    assert config.training.minibatches_per_epoch == 8
     assert config.rollout_count == 96
     assert config.evaluation.deployment_modes == VQBC_DEPLOYMENT_MODES
     assert config.partner_sampling.include_frozen_current_policy
@@ -65,6 +63,15 @@ def test_v4_config_rejects_legacy_control_fields(legacy_field: str) -> None:
     payload[legacy_field] = {}
     with pytest.raises(ValueError, match="unknown"):
         VQBCConfig.from_mapping(payload, base_dir=CONFIG_ROOT)
+
+
+def test_v4_1_config_rejects_retired_shared_slot_decoder_fields() -> None:
+    for field in ("slot_embedding_dim", "response_embedding_dim"):
+        payload = _development_payload()
+        payload["model"][field] = 16
+        with pytest.raises(ValueError, match="unknown"):
+            VQBCConfig.from_mapping(payload, base_dir=CONFIG_ROOT)
+
 
 
 def test_v4_config_rejects_actor_learning_rate_and_prototype_routing() -> None:
@@ -111,10 +118,10 @@ def test_training_batch_contract_rejects_every_audit_identity() -> None:
             )
 
 
-def _metadata(config: VQBCConfig) -> CheckpointMetadataV2:
+def _metadata(config: VQBCConfig) -> CheckpointMetadataV3:
     reference = config.backbone_init
-    return CheckpointMetadataV2(
-        schema_version="path_c_model_checkpoint_metadata_v2",
+    return CheckpointMetadataV3(
+        schema_version="path_c_model_checkpoint_metadata_v3",
         run_kind=config.run_kind,
         scientific_readout_allowed=False,
         outer_unit_id=None,
@@ -192,7 +199,7 @@ def test_checkpoint_metadata_round_trip_keeps_reference_contract() -> None:
         _development_payload(), base_dir=CONFIG_ROOT
     )
     metadata = _metadata(config)
-    assert CheckpointMetadataV2.from_mapping(
+    assert CheckpointMetadataV3.from_mapping(
         metadata.to_mapping()
     ) == metadata
 
@@ -200,6 +207,11 @@ def test_checkpoint_metadata_round_trip_keeps_reference_contract() -> None:
 def test_archived_source_mirror_requires_the_registered_exact_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    pytest.importorskip("jaxmarl")
+    from experiments.overcooked_v2.path_c_official_artifact import (
+        _source_dependency_closure,
+    )
+
     live_path = (
         tmp_path
         / "live"

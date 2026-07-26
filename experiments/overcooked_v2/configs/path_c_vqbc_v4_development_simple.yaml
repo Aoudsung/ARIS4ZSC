@@ -1,4 +1,4 @@
-schema_version: path_c_model_v4
+schema_version: path_c_model_v4_1
 run_kind: development
 scientific_readout_allowed: false
 
@@ -73,8 +73,6 @@ model:
   hidden_dim: 128
   head_hidden_dim: 128
   action_embedding_dim: 16
-  slot_embedding_dim: 16
-  response_embedding_dim: 16
   slot_count: 8
   response_count: 16
   action_count: 6
@@ -86,7 +84,7 @@ training:
   environment_steps: 1228800
   unroll_length: 400
   update_epochs: 4
-  minibatches_per_epoch: 50
+  minibatches_per_epoch: 8
   bellman_learning_rate: 0.0001
   outcome_learning_rate: 0.00025
   gradient_clip_norm: 0.25

@@ -35,7 +35,7 @@ from src.path_c.vqbc.policy import (
     uniform_slot_log_belief,
     update_log_temperature,
 )
-from src.path_c.vqbc.quotient import aggregate_slots, quotient_bayes_update
+from src.path_c.vqbc.quotient import slot_bayes_update
 from src.path_c.vqbc.rollout import (
     VQBCRolloutCallbacks,
     initialize_policy_state,
@@ -215,21 +215,11 @@ class VQBCDeploymentPolicy:
         codes = codes[0]
         step.decision = step.decision._replace(response_code=codes)
         output = step.output
-        aggregated = aggregate_slots(
-            class_ids=output.quotient_ids,
+        updated = slot_bayes_update(
             slot_log_belief=step.state.slot_log_belief,
-            response_probabilities=output.response_probabilities,
-            reward_mean=output.reward_mean,
-            next_q_mean=output.next_q_mean,
-        )
-        updated = quotient_bayes_update(
-            class_ids=output.quotient_ids,
-            class_belief=aggregated.class_belief,
-            class_response_probabilities=aggregated.response_probabilities,
+            slot_response_probabilities=output.response_probabilities,
             action=step.action,
             response_code=codes,
-            class_counts=aggregated.class_counts,
-            class_mask=aggregated.class_mask,
         )
         normal_update = deployment_belief_after_response(
             mode=deployment_mode,

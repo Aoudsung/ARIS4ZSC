@@ -9,7 +9,26 @@ from typing import Any, Mapping, Sequence
 
 
 RESPONSE_CONTRAST_BRANCHES = ("A1", "A2-mask", "A2-use")
-RESPONSE_CONTRAST_SCHEMA_VERSION = "path_c_vqbc_response_contrast_rows_v1"
+RESPONSE_CONTRAST_SCHEMA_VERSION = "path_c_vqbc_response_contrast_rows_v2"
+INFORMATION_TRIGGER_FLOAT32_ULPS = 256.0
+
+
+def information_trigger_tolerance(j_use: Any, j_mask: Any) -> Any:
+    """Return a scale-aware float32 roundoff floor for S(a)."""
+
+    import jax.numpy as jnp
+
+    use = jnp.asarray(j_use, dtype=jnp.float32)
+    mask = jnp.asarray(j_mask, dtype=jnp.float32)
+    scale = jnp.maximum(
+        1.0,
+        jnp.maximum(jnp.max(jnp.abs(use), axis=-1), jnp.max(jnp.abs(mask), axis=-1)),
+    )
+    return (
+        jnp.asarray(INFORMATION_TRIGGER_FLOAT32_ULPS, dtype=jnp.float32)
+        * jnp.finfo(jnp.float32).eps
+        * scale
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +85,12 @@ def first_positive_trigger(information_net_values: Any) -> tuple[int | None, flo
     values = np.asarray(information_net_values, dtype=np.float64)
     if values.ndim != 2 or values.shape[-1] != 6:
         raise ValueError("Trigger values must have [step, action] shape.")
-    positive = np.argwhere(np.max(values, axis=-1) > 0.0)
+    maximum = np.max(values, axis=-1)
+    scale = np.maximum(1.0, np.max(np.abs(values), axis=-1))
+    tolerance = (
+        INFORMATION_TRIGGER_FLOAT32_ULPS * np.finfo(np.float32).eps * scale
+    )
+    positive = np.argwhere(maximum > tolerance)
     if positive.size == 0:
         return None, None
     step = int(positive[0, 0])
@@ -126,7 +150,7 @@ def summarize_response_contrast(
     trigger_count = sum(row.triggered for row in values)
     if trigger_count < 10:
         return {
-            "schema_version": "path_c_vqbc_response_contrast_summary_v1",
+            "schema_version": "path_c_vqbc_response_contrast_summary_v2",
             "scientific_readout_allowed": False,
             "row_count": len(values),
             "trigger_count": trigger_count,
@@ -146,7 +170,7 @@ def summarize_response_contrast(
         (index - center) * value for index, value in enumerate(primary)
     ) / denominator
     return {
-        "schema_version": "path_c_vqbc_response_contrast_summary_v1",
+        "schema_version": "path_c_vqbc_response_contrast_summary_v2",
         "scientific_readout_allowed": False,
         "row_count": len(values),
         "trigger_count": trigger_count,
@@ -162,9 +186,11 @@ def summarize_response_contrast(
 
 __all__ = [
     "RESPONSE_CONTRAST_BRANCHES",
+    "INFORMATION_TRIGGER_FLOAT32_ULPS",
     "VQBCResponseContrastRow",
     "effect_components",
     "equal_frequency_bins",
     "first_positive_trigger",
+    "information_trigger_tolerance",
     "summarize_response_contrast",
 ]

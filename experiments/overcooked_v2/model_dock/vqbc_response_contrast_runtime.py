@@ -15,6 +15,7 @@ from src.path_c.vqbc.policy import regularized_policy
 from src.path_c.vqbc.response_contrast import (
     RESPONSE_CONTRAST_SCHEMA_VERSION,
     VQBCResponseContrastRow,
+    information_trigger_tolerance,
     summarize_response_contrast,
 )
 
@@ -201,7 +202,14 @@ def _evaluate_response_contrast_episode(
             - jnp.max(left_step.output.j_mask, axis=-1, keepdims=True)
         )
         maximum = float(np.asarray(jnp.max(information_net_value)))
-        if maximum <= 0.0:
+        tolerance = float(
+            np.asarray(
+                information_trigger_tolerance(
+                    left_step.output.j_use, left_step.output.j_mask
+                )
+            )
+        )
+        if maximum <= tolerance:
             shared = _advance(
                 branch=shared,
                 left_policy=left_policy,
@@ -465,7 +473,10 @@ def _make_development_contrast_batch_runner(
                 use_left.output.j_mask, axis=-1, keepdims=True
             )
             maximum = jnp.max(information_net_value, axis=-1)
-            newly_triggered = (~triggered) & (maximum > 0.0)
+            tolerance = information_trigger_tolerance(
+                use_left.output.j_use, use_left.output.j_mask
+            )
+            newly_triggered = (~triggered) & (maximum > tolerance)
             a1_distribution = regularized_policy(
                 use_left.decision.reference_logits,
                 use_left.output.j_mask,

@@ -187,26 +187,25 @@ def update_codebook(
     )
 
 
-def target_response_signatures(
-    *, target_centered_advantages: Any, stopped_responsibilities: Any
-) -> Any:
-    """Responsibility-weight the twin-mean next-state value signature."""
+def target_response_signatures(*, target_centered_advantages: Any) -> Any:
+    """Return an assignment-independent next-control response signature.
 
-    import jax
+    The response alphabet must not depend on the latent E-step that it later
+    helps evaluate. We therefore average the two target estimators and then
+    average over the permutation-symmetric slot bank. Partner-dependent public
+    transitions can still change this value signature through the next history,
+    but no current responsibility or identity label enters the code target.
+    """
+
     import jax.numpy as jnp
 
     advantages = jnp.asarray(target_centered_advantages)
-    responsibilities = jax.lax.stop_gradient(
-        jnp.asarray(stopped_responsibilities)
-    )
     if advantages.shape[-3] != 2:
         raise ValueError("Target response signatures require two Q estimators.")
     mean_advantage = 0.5 * (
         advantages[..., 0, :, :] + advantages[..., 1, :, :]
     )
-    while responsibilities.ndim < mean_advantage.ndim - 1:
-        responsibilities = responsibilities[None, ...]
-    return jnp.sum(responsibilities[..., :, None] * mean_advantage, axis=-2)
+    return jnp.mean(mean_advantage, axis=-2)
 
 
 __all__ = [

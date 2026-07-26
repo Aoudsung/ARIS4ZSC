@@ -17,7 +17,7 @@ from .checkpoint import (
 from .config import VQBCConfig
 from .config import VQBC_DEPLOYMENT_MODES
 from .integrity import file_sha256
-from .types import CheckpointMetadataV2
+from .types import CheckpointMetadataV3
 
 
 VQBC_POPULATION_SCHEMA_VERSION = "path_c_vqbc_population_v1"
@@ -43,7 +43,7 @@ class VQBCPopulationEntry:
     resolved_config_path: Path
     checkpoint_path: Path
     config: VQBCConfig
-    checkpoint_metadata: CheckpointMetadataV2
+    checkpoint_metadata: CheckpointMetadataV3
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +105,7 @@ def build_population_manifest(
         checkpoint_payload = json.loads(
             checkpoint_manifest.read_text(encoding="utf-8")
         )
-        metadata = CheckpointMetadataV2.from_mapping(
+        metadata = CheckpointMetadataV3.from_mapping(
             checkpoint_payload.get("metadata", {})
         )
         assert_reference_ownership(
@@ -222,7 +222,7 @@ def load_population(path: str | Path) -> VQBCPopulation:
         checkpoint_payload = json.loads(
             checkpoint_manifest.read_text(encoding="utf-8")
         )
-        metadata = CheckpointMetadataV2.from_mapping(
+        metadata = CheckpointMetadataV3.from_mapping(
             checkpoint_payload.get("metadata", {})
         )
         assert_reference_ownership(

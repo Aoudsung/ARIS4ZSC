@@ -6,8 +6,9 @@ self-play（SP）指同一次独立训练内的策略彼此协作；cross-play�
 **日期：** 2026-07-24
 **状态：** 正式主链已修订为家族级伙伴原型与受虚构协作启发的 checkpoint 历史群体。
 第三版配置、第二版外层训练单元清单、训练校准与部署校准分离、标准评估矩阵和回应屏蔽部署
-对照均为静态 `implemented`；远端测试和机械接线检查完成前不写 `tested`。旧伙伴池的
-Test Time Simple 结果只保留为设计诊断，旧 Test Time Wide 作业已封存，不进入新版读数。
+对照保留为历史实现。V4.1 已完成 50 项远端软件测试和首开发单元复跑，登记为 `tested`；
+回应屏蔽效应仍为 0，因此该状态不表示机制验收或正式冻结。旧伙伴池的 Test Time Simple
+结果只保留为设计诊断，旧 Test Time Wide 作业已封存，不进入新版读数。
 **规范来源：** `PATH_C_PROPOSAL.md`、`PATH_C_THEORY.md`、
 `experiments/overcooked_v2/configs/path_c_preregistration.yaml` 与
 `experiments/overcooked_v2/configs/module_registry.yaml`。
@@ -333,17 +334,19 @@ OCV2 bridge 已定义无 pickle codec、内容寻址 bundle 与 fresh-runtime ho
 | I8_SPLIT_AND_CROSS_FITTING | tested |
 | V3_BACKBONE_ADMISSION_ADAPTATION_PROBE | implemented |
 | PATH_C_FAMILY_POOL_FORMAL_CHAIN | implemented |
-| PATH_C_VQBC_V4_CHAIN | tested |
+| PATH_C_VQBC_V4_1_CHAIN | tested |
 | R015_TWO_FAMILY_SUPPORT | implemented |
 | R015_PAIRED_AUDIT_ADJUDICATION | implemented |
 | D1_ARTIFACT_CONTRACT | planned |
 | D2_CONFORMANCE_TEST_DEFINITIONS | tested |
 <!-- PATH_C_MODULE_TRACEABILITY:END -->
 
-第三版骨干适配模块和家族级伙伴池正式链尚未获得本轮新测试证据，因此保持
-`implemented`。第四版 VQBC 已在远端完成 41 项目标测试和首开发单元运行，因此标为
-`tested`。表中其余 `tested` 状态是历史模块在各自记录 commit 上的已有证据，不传递到其他
-本轮变更。只有填满预注册数值槽并绑定最终哈希后，相关模块才可能进入 `frozen`。
+第三版骨干适配模块和家族级伙伴池正式链保持 `implemented`。VQBC V4.1 已在注册远端环境完成
+Flax、Optax、JaxMARL 和 GPU 覆盖的四个目标测试文件，结果为 50 项通过、0 失败、0 跳过；
+同一 seed-100 开发单元、四模式评估和回应屏蔽对照也已完成。因此活跃项
+`PATH_C_VQBC_V4_1_CHAIN` 标为 `tested`。该状态只表示登记测试已有通过证据；回应屏蔽效应仍为
+0，不能据此写成机制验收通过或 `frozen`。表中其余 `tested` 状态仍是历史模块在各自记录
+commit 上的已有证据，不传递到本轮变更。
 
 ## 6. 当前实施动作
 
@@ -507,3 +510,57 @@ evaluation / pipeline 子包）+ OvercookedV2 对接层
 已完成远端 41 项目标测试和首个 Test Time Simple 开发单元训练、四模式评估及回应屏蔽
 对照，因此实现状态为 `tested`。开发结果显示八个无标签价值槽仍保持对称、所有活动价值商数
 均为 1，后验没有改变正常动作；该结果不具备科学结论权限，也不授权十单元正式训练。
+
+
+### 7.9 V4.1 潜在 Bellman 混合根因修复（2026-07-26）
+
+第四版执行闭环已经证明后验能够进入正常动作，但首开发单元的八槽责任度、价值商和后验全程
+塌缩。V4.1 不调整探查阈值、训练步数或伙伴标签，而是统一替换潜在结构学习内核：
+
+1. 每个 slot、每个 twin 使用独立 dueling Q 参数；共享仅止于 TD-only recurrent backbone；
+2. episode responsibility 使用完整 400 步上的 TD、response、reward 与 next-Q 联合证据和，
+   并由 target network 与 episode bootstrap mask交叉拟合；
+3. 每个 epoch重新执行 E-step，完整 lane只进入一个 minibatch，target每个 minibatch执行
+   Polyak update；
+4. slot posterior永久保留并在slot层Bayes更新；value quotient只作为当前控制视图；
+5. 只有 `distance + radius_i + radius_j <= epsilon_eq` 时才认证等价，uncertainty不再促进合并；
+6. response code target不再读取当前 responsibility，解除潜在assignment与回应码本的循环依赖；
+7. 回应屏蔽触发使用尺度相关float32容差，不再将机器舍入误差视为正信息价值。
+
+V4.1 schema 为 `path_c_model_v4_1`，checkpoint manifest与metadata分别升级为
+`path_c_flax_checkpoint_v3` 和 `path_c_model_checkpoint_metadata_v3`。旧V4 checkpoint、共享slot
+decoder字段和class-to-uniform-slot posterior投影均失败关闭。详细代码—根因映射和远端复跑
+裁决见 `docs/status/PATH_C_VQBC_V4_1_ROOT_REPAIR.md`。本节记录实施时的本地静态边界；随后完成的
+远端测试和同一开发单元复跑见 §7.10。十单元正式训练继续关闭。
+
+### 7.10 V4.1 首开发单元远端复跑（2026-07-26）
+
+V4.1 在独立远端目录完成四个目标测试文件，结果为 50 项通过、0 失败、0 跳过。seed-100
+开发训练从产物回读 1,228,800 个环境步、3,072 个完整回合和 96 次更新；四模式评估完成
+800,000 个环境步，回应屏蔽对照完成 600,000 个有效分支环境步。全部产物保持
+`scientific_readout_allowed: false`。
+
+潜在结构出现了实质变化：最近 rollout 的 12,800 个状态全部形成 8 个活动价值商，最终后验
+熵均值降至 0.080809；`posterior_use` 与 `prior_only` 在 500 个匹配回合中的 452 个回合产生
+不同的参考动作偏离数。因此 V4.1 已打破第四版的均匀槽对称性，后验也会改变正常动作。不过
+最终 32 个回合的责任度有效质量为 `[0,4,23,1,0,3,0,1]`，使用仍集中在少数专家。
+
+决定性缺口仍然存在：500 个回应屏蔽回合的预测信息净值均明显为正，范围为 0.139714 至
+0.278620，但 `A2-use-A2-mask` 逐行、十个等频分箱和最高分箱效应全部为 0。这说明当前回应
+使用通道尚未承载可观察的奖励效应。十单元正式训练继续关闭；随后完成的第 0 步控制路径追踪
+见 §7.11。
+
+### 7.11 回应屏蔽控制路径追踪（2026-07-26）
+
+追加的远端开发诊断没有训练参数，只沿相同 checkpoint 追踪 32 个第 0 步样本和 32 个完整
+双分支回合，共 25,664 个有效环境步。实际回应更新使槽信念与屏蔽分支的 L1 距离均值达到
+0.367，因此回应编码、似然选择和屏蔽开关均已接入真实后验路径。
+
+失效发生在后验与执行动作之间。回应后下一步 `J_use` 的最大绝对变化均值为 2.364，真实动作
+分布的总变差距离均值却只有 0.000741，下一步采样动作和最大概率动作均不改变。完整回合中只有
+3/32 个左侧策略最终改变动作，且没有任何逐步奖励或回报差异。
+
+静态代码与追踪读数共同确定原因：信息价值公式使用无约束的下一动作最大值，执行策略却由冻结
+参考策略和 KL 散度温度共同约束。前者计算的控制切换通常不是后者会执行的动作，所以高
+`S(a)` 不能解释真实分支的可用价值。正式训练继续关闭；下一次代码修订应使回应价值的延续
+算子直接对应真实执行分布。
