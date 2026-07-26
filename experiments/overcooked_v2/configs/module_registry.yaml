@@ -694,6 +694,50 @@
         "experiments/overcooked_v2/tests/test_path_c_model_evaluation.py::test_response_contrast_pairs_three_branches_and_recomputes_effect_identity",
         "experiments/overcooked_v2/tests/test_path_c_model_evaluation.py::test_response_contrast_requires_identical_complete_trajectory_without_trigger"
       ]
+    },
+    {
+      "id": "PATH_C_VQBC_V4_CHAIN",
+      "status": "tested",
+      "git_sha": null,
+      "implementation_files": [
+        "src/path_c/vqbc/__init__.py",
+        "src/path_c/vqbc/config.py",
+        "src/path_c/vqbc/types.py",
+        "src/path_c/vqbc/integrity.py",
+        "src/path_c/vqbc/model.py",
+        "src/path_c/vqbc/quotient.py",
+        "src/path_c/vqbc/policy.py",
+        "src/path_c/vqbc/codebook.py",
+        "src/path_c/vqbc/objectives.py",
+        "src/path_c/vqbc/rollout.py",
+        "src/path_c/vqbc/training.py",
+        "src/path_c/vqbc/checkpoint.py",
+        "src/path_c/vqbc/pipeline.py",
+        "src/path_c/vqbc/evaluation.py",
+        "src/path_c/vqbc/response_contrast.py",
+        "experiments/overcooked_v2/model_dock/vqbc_runtime.py",
+        "experiments/overcooked_v2/model_dock/vqbc_evaluation_runtime.py",
+        "experiments/overcooked_v2/model_dock/vqbc_response_contrast_runtime.py",
+        "experiments/overcooked_v2/scripts/run_path_c_vqbc.py",
+        "experiments/overcooked_v2/scripts/build_path_c_vqbc_population.py",
+        "experiments/overcooked_v2/scripts/evaluate_path_c_vqbc.py",
+        "experiments/overcooked_v2/scripts/run_path_c_vqbc_response_contrast.py",
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_development_simple.yaml",
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_simple.yaml",
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_wide.yaml"
+      ],
+      "test_ids": [
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_checkpoint_reference_ownership_rejects_global_or_foreign_anchor",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_pool_check_binds_live_reference_output_to_the_unit",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_j_use_updates_belief_inside_max_and_j_mask_keeps_prior",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_belief_change_can_reverse_normal_action_order",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_only_bellman_path_reaches_backbone_and_random_prior_is_frozen",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_slot_outcome_loss_uses_only_stopped_responsibility_weights",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_training_diagnostics_expose_slot_code_policy_and_value_health",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_checkpoint_round_trip_keeps_resume_random_and_rollout_state",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_four_modes_each_have_ten_self_and_ninety_directed_cross_pairings",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_untriggered_response_contrast_requires_identical_branches"
+      ]
     }
   ]
 }

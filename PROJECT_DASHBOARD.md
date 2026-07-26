@@ -1,7 +1,7 @@
 # PROJECT_DASHBOARD.md
 
 **ARIS-Bellman for Zero-Shot Coordination — pipeline status & decisive-results tracker.**
-Last updated: 2026-07-25 · Read this first for "where am I" (30 seconds).
+Last updated: 2026-07-26 · Read this first for "where am I" (30 seconds).
 
 > Required entrypoint per [CLAUDE.md](CLAUDE.md). Execution rules live in
 > [OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md); this file is *status*, not *permission*.
@@ -28,17 +28,19 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 |---|---|
 | **Title** | Probe What Changes the Decision: Decision-Focused Active Partner Inference for Zero-Shot Coordination |
 | **Current line** | Path C = 面向协作决策的信息价值方法：只在伙伴回应可能改变后续控制且收益超过任务成本时探查。价值无关身份不变性和梯度路由只作机制约束与证伪检查，不再承担论文公开身份。 |
-| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md), [PATH_C_OPPORTUNITY_AUDIT_SPEC.md](idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md)（旧伙伴池 Test Time Simple 已完成并触发家族级伙伴池设计修订；新版 `path_c_model_v3` 与 `path_c_outer_units_v2` 已通过远端目标测试和真实机械接线检查，完整 Simple 正在按训练前冻结合同执行。旧 Wide 已封存；新版 Simple 完成后将由同一统一驱动继续冻结代码的 Wide。R015 第二版仍是未运行的可选支持线）；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
+| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md), [PATH_C_OPPORTUNITY_AUDIT_SPEC.md](idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md)（当前实现是 `path_c_model_v4` 的价值商信念条件 Bellman 控制器。首个 Test Time Simple 开发单元已完成训练、四模式评估和回应屏蔽对照；八个无标签槽没有分化，因此十单元正式训练未启动。第三版 Test Time Wide 继续在隔离目录运行，只保留其已授权历史链，不覆盖第四版）；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
 | **Thesis** | 在官方局部历史下，智能体应按注册回应通道对受限控制器的增量价值选择任务内探查，并相对最佳通道屏蔽动作扣除机会成本；主要证据来自匹配 cross-play 回报，而不是身份恢复。 |
 | **Benchmark** | JaxMARL **OvercookedV2** Test Time Simple（主基准）/Wide（布局复现）+ **Hanabi**（必需第二领域，尚未启动）+ toy_factor_game（理论回归） |
 | **Target tier** | ICLR / NeurIPS / ICML class |
-| **Compute budget** | 旧 Test Time Simple 正式链从产物回读 2,010,480,640 个环境步，保留为设计诊断。新版每布局计划包含官方上游 1,498,480,640 步、预拟合 10,000,000 步、训练校准 2,000,000 步、四条件适应 400,000,000 步、部署校准 8,000,000 步和五个标准矩阵 100,000,000 步，共 2,018,480,640 步；回应屏蔽对照最坏另执行 54,000,000 步，实际预算必须从产物回读。冻结前另有一次两布局共享的官方 seed 999 生产验收，本次实际执行 29,949,952 步，不属于十训练单元或标准矩阵。 |
+| **Compute budget** | 第四版首开发单元从产物回读 1,228,800 个训练环境步和 3,072 个完整训练回合；四模式开发评估为 800,000 个环境步，回应屏蔽对照由原始触发步回读 595,520 个有效分支环境步。旧伙伴池 Test Time Simple 正式链从产物回读 2,010,480,640 个环境步；家族级伙伴池第三版 Test Time Simple 为 2,072,480,640 个环境步。第三版 Test Time Wide 仍在执行，实际预算待最终审计后回读。冻结前另有一次两布局共享的官方 seed 999 生产验收，本次实际执行 29,949,952 步，不属于十训练单元或标准矩阵。 |
 
 ---
 
 ## 2. Pipeline status — CURRENT STAGE
 
-**Stage: 2026-07-25 项目负责人已经明确授权把上游能力阈值改为只报告、不筛选，并继续完整实验。该修改是在看见 Test Time Simple 三个固定运行未达到 100 分后作出的结果相关协议修订，因此新版 Simple 与随后冻结代码的 Wide 均记为探索性结果，不能包装成原预登记的确认性实验。全部 50 个固定上游运行和三个固定进度 checkpoint 均被保留；不替换 seed，不重复训练到通过。首次恢复在第 0 单元训练校准阶段因 JAX 默认约 75% 显存池不足而停止：编译图约需 24.87 GiB，并另申请约 11.90 GiB，超过 46 GiB 卡默认约 34.5 GiB 的池。正式入口现允许选择 GPU 0–7，并把单作业显存池固定为 90%；仍只调度基本空闲且不可纠正错误为 0 的卡。恢复保护同时改为只封存失效的机械接线证据和冻结合同并重新生成，不移动或重训上游策略。CUDA 12 包装下六个目标测试文件重新执行为 79 项通过、0 失败、0 错误、0 跳过。当前 GPU 4、6、7 各约有 45.4 GiB 空闲且错误计数为 0，因此新后台驱动进程 `4182410` 正在这些卡上恢复 Simple；GPU 0、3 有已记录错误，GPU 1、2、5 当前显存不足，均未被选择。驱动正在按最终源码重新执行冻结前流程；只有在 Simple 的训练、五个标准矩阵、回应屏蔽对照及审计全部成功后才会继续 Wide。当前尚未进入正式评估矩阵。`PATH_C_FAMILY_POOL_FORMAL_CHAIN` 仍只标为 `implemented`，全部配置和产物继续保持 `scientific_readout_allowed: false`。**
+**Stage: 2026-07-26 第四版价值商信念条件 Bellman 控制器的首个 Test Time Simple 开发单元已完成。远端四个目标测试文件为 41 项通过、0 失败；训练产物回读 1,228,800 个环境步、3,072 个完整回合和 96 次更新。全部 12 个定期训练观测点的活动价值商数均为 1，责任度和后验熵始终为 `log(8)`。四模式各 500 个匹配回合中，`posterior_use` 与 `prior_only` 逐 seed 完全相同；回应屏蔽对照的 500 个回合三分支回报也逐行相同。当前实现没有让八个无标签价值槽分化，后验不承载正常动作差异，因此不启动十单元正式训练。下一项唯一优先工作是修复槽对称性和价值商形成机制，再重复同一个首开发单元。完整证据和 SHA-256 见 [EXPERIMENT_LOG.md](docs/status/EXPERIMENT_LOG.md) 顶部条目；全部读数保持 `scientific_readout_allowed: false`。**
+
+**Parallel historical run: 2026-07-25 家族级伙伴池第三版 Test Time Simple 已完成 10 个训练单元、五个标准配对矩阵、决策导向回应屏蔽对照和最终审计。六个目标测试文件为 79 项通过、0 失败、0 错误、0 跳过；完整链从产物回读 2,072,480,640 个环境步。决策导向的自我配对/跨策略配对均值为 79.90/−0.28，关闭探查为 94.01/−1.98；两者匹配跨策略配对平均差为 +1.7071，训练单元节点重采样 95% 区间为 [−2.8061, 7.7083]，没有达到 20 分实际意义门槛。注册回应使用效应为 +0.0156，净效应为 +0.0431。因为上游能力阈值是在观察三个未达标任务后改为只报告，本次运行属于结果相关协议修订后的探索性结果，继续保持 `scientific_readout_allowed: false`。最终审计 SHA-256 为 `4e5d16c752491023103732f5d90a9bbcd03d6f241a19b03ded4380cf4d296815`，完整报告见 [PATH_C_TEST_TIME_SIMPLE_RESULTS.md](docs/status/PATH_C_TEST_TIME_SIMPLE_RESULTS.md)。统一驱动进程 `4182410` 已完成 Test Time Wide 的准备、目标测试、机械接线和冻结阶段，正在继续 Wide；尚无 Wide 最终审计读数。**
 
 **Historical stage: 2026-07-20 Path C 已完成固定骨干与伙伴池上的第二个独立适应训练 seed 四条件熟悉训练伙伴诊断。六个目标测试文件为 48 项通过、0 失败、0 错误、0 跳过，三项真实启动守卫和 81 项原始产物审计检查全部通过。seed-2 完整链从产物回读为 5,504,000 个环境步和 13,760 个完整回合；适应前骨干锚点为 38.6806，决策导向、关闭探查、随机安全探查和通用回应信息的诊断平均原始回报依次为 -28.0903、-21.1111、18.1250 和 11.7361。匹配回合中，决策导向减随机安全探查为 -46.2153，决策导向减关闭探查为 -6.9792，通用回应信息减关闭探查为 +32.8472；seed-1 的三个相应方向均未复现。两训练 draw 等权后，决策导向减随机探查为 -14.8785，决策导向减关闭探查为 -2.6563。该复现固定同一官方骨干和训练伙伴池，不是独立外层训练单元；全部读数只属于 `development` 诊断，不支持或反驳预登记的第一或第二项科学假设。完整预算、五行结果表、探查率和证据哈希见 `docs/status/EXPERIMENT_LOG.md`。**
 
@@ -399,7 +401,7 @@ ARIS convention, see §6).
 | Path C standard benchmark smoke | ✅ R010 passed remotely and post-review evidence was re-bound to `c70bf03...` on 2026-07-12; smoke artifacts are Type-A only. |
 | R015 独立设计数据 | ⏸ 2026-07-19 起降级为可选支持性测量，不再排在模型实现之前。第一版 80 条历史和六候选的 `filter_design_precision_infeasible` 结果作为历史证据保留。第二版端到端代码已静态实现但尚未远端核查或运行；没有第二版过滤器或规划分支数选择，没有冻结清单或试点结果。 |
 | 开发诊断迭代（`run_kind: development`，开发期训练与读数） | ✅ Unlocked：按 [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md) §7 的完整模型实现推进；远端执行，逐次或成批用户授权；从产物回读有效数据预算；读数只作开发诊断，永不进入主张表（[OPERATING_CONSTRAINTS.md](OPERATING_CONSTRAINTS.md) §6.7）。 |
-| Path C main training and XP evaluation | 旧伙伴池 Test Time Simple 已完成十单元训练、五个正式矩阵和审计，但只作为结果后设计诊断。家族级伙伴池新版已通过 75 项目标测试和真实机械接线检查，完整 Test Time Simple 正在执行；只有它成功完成后，统一驱动才会以同一冻结代码继续 Test Time Wide。两种布局均只允许 GPU 4、6、7，GPU 5 被执行入口机械拒绝。 |
+| Path C main training and XP evaluation | 第四版首开发单元已完成，但槽没有分化，十单元正式训练保持未启动。第三版家族级伙伴池 Test Time Simple 已完成 79 项目标测试、10 个训练单元、五个标准矩阵、回应屏蔽对照和最终审计；其统一驱动仍在隔离运行 Test Time Wide，Wide 最终审计尚未完成。 |
 | Path C mechanism evaluation | The relevant posterior/reset and instrument checks have recorded evidence. These checks gate mechanism wording only. |
 | `/auto-review-loop` (W2) | ≥1 decisive result supported by cross-model verdict |
 | `/paper-writing` (W3) | `NARRATIVE_REPORT.md` exists + main claims supported |
@@ -478,9 +480,9 @@ repeat or extend that rule.
 | Path C proposal | `idea-stage/refine-logs/PATH_C_PROPOSAL.md` | ✅ active current line |
 | Path C execution plan | `idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md` | ✅ active current plan |
 | Path C preregistration | `idea-stage/refine-logs/PATH_C_PREREGISTRATION.md` | 🟡 third-version template; numeric and semantic hashes not frozen |
-| Path C module design | `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md` | 🟡 当前静态结构图；§7 记录 2026-07-19 完整模型优先的实现决策；R015 官方训练器产物合同、Flax 策略接口、固定厨师席路由、seed 999 验收和伙伴准入均有远端证据 |
-| Path C model implementation spec | `idea-stage/refine-logs/PATH_C_MODEL_IMPLEMENTATION_SPEC.md` | ✅ 2026-07-19 完整模型实现规格（交付 Codex）：`src/path_c/` 分层包 + OvercookedV2 对接层 + 单一流水线入口；四条件控制器全部实现为可运行代码 |
-| Path C module registry | `experiments/overcooked_v2/configs/module_registry.yaml` | 🟡 官方伙伴支持模块保留历史 `tested` 证据；适配器拆分后的目标范围为 192 项并全部通过，真实五 checkpoint 生产接线也通过；设计阶段因完整未来信念更新的嵌套执行量尚未解而锁定。登记文件本轮未修改；没有新 commit SHA |
+| Path C module design | `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md` | 🟡 §7.8 记录第四版价值商信念条件 Bellman 控制器；首开发单元已有远端证据，但槽分化失败，正式十单元未启动 |
+| Path C model implementation spec | `idea-stage/refine-logs/PATH_C_MODEL_IMPLEMENTATION_SPEC.md` | ✅ 第四版完整接口、公式、训练、四模式评估和回应屏蔽规定见 §14；实现位于 `src/path_c/vqbc/` 与 OvercookedV2 对接层 |
+| Path C module registry | `experiments/overcooked_v2/configs/module_registry.yaml` | 🟡 `PATH_C_VQBC_V4_CHAIN` 已由远端 41 项目标测试支持为 `tested`；仍没有新 commit SHA，且没有模块进入 `frozen` |
 | Migration plan | `artifacts/OvercookedV2_plan.md` | ✅ |
 
 **Divergence to reconcile (low priority):** ARIS convention is `refine-logs/` at
@@ -529,6 +531,7 @@ them explicitly to ablations, and add the standard Test Time SP/XP evaluator.
 | I6_SIMULTANEOUS_KERNEL_BOUNDS | tested |
 | I7_VALIDITY_CONTROLS | tested |
 | I8_SPLIT_AND_CROSS_FITTING | tested |
+| PATH_C_VQBC_V4_CHAIN | tested |
 | D1_ARTIFACT_CONTRACT | planned |
 | D2_CONFORMANCE_TEST_DEFINITIONS | tested |
 <!-- PATH_C_MODULE_TRACEABILITY:END -->

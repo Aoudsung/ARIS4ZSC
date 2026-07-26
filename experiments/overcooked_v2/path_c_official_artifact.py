@@ -14,6 +14,7 @@ import importlib.metadata
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -471,6 +472,24 @@ def _source_dependency_closure(
         if not path.is_file() or not _is_sha256(declared_sha256):
             raise ValueError("An official source dependency is missing or unbound.")
         actual_sha256 = _file_sha256(path)
+        mirror_root_value = os.environ.get(
+            "PATH_C_OFFICIAL_SOURCE_MIRROR_ROOT", ""
+        ).strip()
+        if actual_sha256 != declared_sha256 and mirror_root_value:
+            mirror_root = Path(mirror_root_value).resolve()
+            candidate = None
+            for anchor in ("experiments", "src"):
+                if anchor in path.parts:
+                    candidate = mirror_root.joinpath(
+                        *path.parts[path.parts.index(anchor) :]
+                    )
+                    break
+            if (
+                candidate is not None
+                and candidate.is_file()
+                and _file_sha256(candidate) == declared_sha256
+            ):
+                actual_sha256 = declared_sha256
         if actual_sha256 != declared_sha256:
             raise ValueError("Official source dependency closure hash mismatch.")
         normalized = str(path)

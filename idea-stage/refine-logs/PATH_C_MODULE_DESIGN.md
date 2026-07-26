@@ -333,15 +333,17 @@ OCV2 bridge 已定义无 pickle codec、内容寻址 bundle 与 fresh-runtime ho
 | I8_SPLIT_AND_CROSS_FITTING | tested |
 | V3_BACKBONE_ADMISSION_ADAPTATION_PROBE | implemented |
 | PATH_C_FAMILY_POOL_FORMAL_CHAIN | implemented |
+| PATH_C_VQBC_V4_CHAIN | tested |
 | R015_TWO_FAMILY_SUPPORT | implemented |
 | R015_PAIRED_AUDIT_ADJUDICATION | implemented |
 | D1_ARTIFACT_CONTRACT | planned |
 | D2_CONFORMANCE_TEST_DEFINITIONS | tested |
 <!-- PATH_C_MODULE_TRACEABILITY:END -->
 
-本轮改变的三个模块尚未运行测试，因此只能标为 `implemented`。表中其他 `tested` 状态是历史
-模块在其各自记录 commit 上的已有证据，不传递到本轮变更。只有实际执行对应测试并保存结果后，
-本轮模块才能进入 `tested`；只有填满预注册数值槽并绑定最终哈希后才可能进入 `frozen`。
+第三版骨干适配模块和家族级伙伴池正式链尚未获得本轮新测试证据，因此保持
+`implemented`。第四版 VQBC 已在远端完成 41 项目标测试和首开发单元运行，因此标为
+`tested`。表中其余 `tested` 状态是历史模块在各自记录 commit 上的已有证据，不传递到其他
+本轮变更。只有填满预注册数值槽并绑定最终哈希后，相关模块才可能进入 `frozen`。
 
 ## 6. 当前实施动作
 
@@ -478,3 +480,30 @@ evaluation / pipeline 子包）+ OvercookedV2 对接层
    路由。
 3. 梯度路由约束（§7.3）。
 4. 接线回读：每次运行从产物回读实际生效条件，不信配置意图。
+
+### 7.8 第四版替代决定（2026-07-25）
+
+§7.1–§7.7 记录第三版形成过程，只用于历史解释。当前实现改为价值商信念条件 Bellman
+控制器（Value-Quotient Belief-Conditioned Bellman Controller，简称 VQBC）第四版：
+每个外层训练单元只训练一个模型，本单元自己的官方 checkpoint 作为冻结参考策略，8 个
+无标签动作价值槽通过动态 complete-link 价值商形成后验，唯一回应概率核同时服务
+`J_use`、`J_mask` 和通用回应信息部署模式。正常动作始终由后验条件策略产生，不再使用
+外部探查动作覆盖、候选窗口、探查预算、阈值校准、可训练 actor、预拟合阶段或伙伴家族
+训练路由。
+
+第四版训练顺序固定为 `pool_check → training`，正式预算合并为 11M 环境步；同一 checkpoint
+以 `posterior_use`、`prior_only`、`reference_only` 和
+`generic_response_information` 四种模式部署。标准评估继续使用 10 个 self-play 配对和
+90 个有向 cross-play 配对，每配对 500 回合；左右两侧分别加载自己的参考参数、循环状态、
+信念和 KL 散度温度。回应屏蔽对照现在属于第四版实现范围。
+
+训练指标从第一次完整 rollout 起记录责任度熵、每槽有效质量、当前价值商数量、回应码
+使用和困惑度、KL 散度第 95 百分位数、参考动作偏离率、后验熵以及
+`J_use-J_mask` 分布；这些指标用于判断无标签槽是否实际分化，不替代开发运行授权或科学
+证据。
+
+完整接口、公式、文件、训练和验收规定见
+[PATH_C_MODEL_IMPLEMENTATION_SPEC.md](PATH_C_MODEL_IMPLEMENTATION_SPEC.md) §14。第四版当前
+已完成远端 41 项目标测试和首个 Test Time Simple 开发单元训练、四模式评估及回应屏蔽
+对照，因此实现状态为 `tested`。开发结果显示八个无标签价值槽仍保持对称、所有活动价值商数
+均为 1，后验没有改变正常动作；该结果不具备科学结论权限，也不授权十单元正式训练。
