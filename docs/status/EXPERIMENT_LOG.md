@@ -4,6 +4,23 @@
 record; latest recorded scientific state = Link-A round 2 failed on 2026-07-09,
 and the active project line is now Path C.
 
+### 2026-07-26 Path C V4.2 全仓库简化（静态实现；未运行）
+
+- 在分支 `codex/path-c-simplification` 以提交 `f0ba51c` 保存重构前 V4.2 基线。旧 PyTorch、
+  R015、Path C V1–V4.1、旧标准链、`src/aris_bellman` 和 toy factor game 已从当前工作树删除；
+  历史提交、实验结果、论文材料、用户文件和远端产物未删除。
+- 活跃实现收敛为 `model.py`、`method.py`、`training.py`、`runner.py`、`evaluation.py` 和
+  `storage.py` 六个模块。官方网络、训练器和 checkpoint 通过公开接口调用；项目评估循环以官方公开评估器的可观察结果作对照；Simple 与
+  Wide 共用一个适配器和同一入口，每个布局只保留一份配置。
+- checkpoint 恢复改为指定目录中最新完整 Orbax step；源码哈希闭包、自定义序列化、内容寻址
+  阶段目录和旧 checkpoint 兼容路径已移除。训练、评估和控制台输出改为完整记录，不再静默
+  截断。
+- 六个新测试文件按数学、模型、官方集成、训练、评估和数据行为划分。期望值来自手算、官方
+  公开行为或人工事实，不检查源码字符串或内部调用顺序。
+- 本条只登记静态代码变化。本轮没有运行 Python、测试、训练、评估或远端命令，因此状态为
+  `implemented`，不能继承旧版本的测试证据。状态文档最后一次记录的旧版本 Test Time Wide
+  远端作业未受影响；新实现必须等待其审计完成后在新目录验证，并另行取得运行授权。
+
 ### 2026-07-26 Path C VQBC V4.2 行为一致反事实修复完成（静态/本地；未运行远端训练）
 
 - **修订边界：** V4.1 的槽分化、持久后验和远端 50 项测试继续作为历史证据。V4.2 修改了

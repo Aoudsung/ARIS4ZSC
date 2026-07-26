@@ -1,5 +1,19 @@
-"""Domain-independent implementation of the Path C adaptation model."""
+"""Active Path C V4.2 research implementation."""
 
-from .contracts.config import PathCModelConfig
+from .method import DEPLOYMENT_MODES, PolicyState
+from .model import ModelOutput, build_model
+from .runner import RunnerState
+from .storage import RunConfig, load_config
+from .training import TrainState, TransitionBatch
 
-__all__ = ["PathCModelConfig"]
+__all__ = [
+    "DEPLOYMENT_MODES",
+    "ModelOutput",
+    "PolicyState",
+    "RunConfig",
+    "RunnerState",
+    "TrainState",
+    "TransitionBatch",
+    "build_model",
+    "load_config",
+]

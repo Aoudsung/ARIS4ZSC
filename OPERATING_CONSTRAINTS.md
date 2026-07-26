@@ -1,254 +1,60 @@
 # OPERATING_CONSTRAINTS.md
 
-**Authoritative execution boundary for the ARIS4ZSC project.**
-Last updated: 2026-07-19 · Owner: project lead
+本文件只规定执行权限和科研读数边界，不规定模型内部结构。
 
-> 治理精简 2026-07-08：本文件的门已按 docs/status/GOVERNANCE_CUTLIST.md 处置；加/减门须过 OPERATING_CONSTRAINTS.md §7 退休阀门。
+最后更新：2026-07-26
 
-> Precedence: this file is the source of truth for *what an agent may execute* in
-> this project. If a generic ARIS skill's default behavior conflicts with the
-> boundary below, **this file wins** — stop at a static handoff instead.
-> Referenced as a required entrypoint by [CLAUDE.md](CLAUDE.md) and
-> [AGENTS.md](AGENTS.md).
+## 1. 执行权限
 
----
+- 未经用户在当前任务中明确授权，不运行本地测试、项目入口、训练、评估、结果生成、论文编译或远端命令。
+- 静态阅读、检索、差异检查和用户明确要求的代码、配置及文档修改可以直接进行。
+- 所有训练和评估只在用户授权的远端环境执行。连接方法和服务器目录以用户提供的连接文档为准。
+- 一次运行授权只覆盖用户点名的运行或批次，不自动授权后续训练、评估、部署或提交。
 
-## 0. Terminology (read once, avoid the collision)
+## 2. 运行类型
 
-Two different things in this repo are both called "ARIS":
+项目只有三种运行类型：
 
-| Term | Means | Lives in |
-|------|-------|----------|
-| **ARIS** (the harness) | Auto-claude-code **R**esearch **I**n **S**leep — the agent framework (80 skills, cross-model review). The *tooling*. | `.claude/skills/` → `~/aris_repo` |
-| **ARIS-Bellman** (the method) | The research contribution: factor-local Bellman control for ZSC. The *science under study*. | `src/aris_bellman/`, `experiments/overcooked_v2/` |
+| 类型 | 用途 | 结果权限 |
+|---|---|---|
+| 机械接线检查 | 验证依赖、编译、环境交互、一次更新和读写 | 只能说明软件能否运行 |
+| 开发实验 | 用足量数据比较设计选择 | 只能指导设计，不能进入正式主张 |
+| 正式实验 | 按冻结协议训练和评估 | 仍需人工审阅后才能形成科学结论 |
 
-When this doc says "skill", "harness", "review loop" → ARIS the harness.
-When it says "method", "the model", "training", "factor" → ARIS-Bellman.
-Full project identity: [PROJECT_DASHBOARD.md](PROJECT_DASHBOARD.md).
+机械接线检查不得用回报高低诊断方法。开发实验必须在记录中明确写出 `run_kind: development`。正式实验必须在运行前冻结方法、配置、训练单元和统计规则。
 
----
+## 3. 实际数据预算
 
-## 1. Execution boundary
+- 每次训练和评估都必须从产物回读实际环境步、完整回合和更新次数，不能只引用配置中的计划值。
+- 报告必须区分训练环境步、标准评估环境步和反事实分支环境步。
+- 数据量不足的运行只能作为机械接线检查，不能据此判断机制是否有效。
+- 当结果看似失败时，先核对实际训练数据和能力曲线，再提出机制解释。
 
-**Current constraint: no local code execution or local project runs unless the
-user explicitly relaxes this rule, per session.**
+## 4. 科学读数
 
-### Allowed (static maintenance — no approval needed)
-- Read / search files, inspect `git status` / `git log` / diffs.
-- Create or edit Markdown coordination documents.
-- Update configuration needed for agent coordination (`.aris/`, `.claude/hooks/`,
-  this file, the dashboard).
+- 软件完成、测试通过和文件齐全只属于工程事实，不自动支持研究假设。
+- 自我配对和跨策略配对必须分开汇总。OvercookedV2 的正式统计单位是配对均值，不以回合级标准误替代跨配对标准差。
+- 开发实验、结果相关修订后的实验和未完成独立复现的实验必须明确标为探索性结果。
+- 最终科学裁决由用户完成；代理不得自行把开发现象升级为确认性结论。
 
-### Forbidden without explicit per-session authorization
-- Local tests, local project runners, experiment execution, local result
-  generation.
-- LaTeX compilation, paper submission, rebuttal, camera-ready work.
-- Remote SSH execution used as a substitute for the contract in §2 without
-  authorization.
-- Starting `/auto-review-loop`, `/paper-writing`, `/research-pipeline`,
-  `/rebuttal`, or any acceptance / camera-ready workflow before its readiness
-  gate is satisfied by recorded evidence (gates: [PROJECT_DASHBOARD.md](PROJECT_DASHBOARD.md) §4).
+## 5. 活跃实现和部署隔离
 
-### ARIS skill scope
-ARIS skills may be used only within this boundary. When a skill would run tests,
-experiments, LaTeX, paper-writing, review loops, or remote commands, **stop at a
-static handoff** unless the user has explicitly authorized that action.
+- 活跃实现是 Path C V4.2，结构见 `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md`。
+- 历史执行代码已从工作树删除，历史提交、实验结果、论文材料和远端产物不删除。
+- 2026-07-26 开始的简化实现尚未运行测试或实验，状态只能写为 `implemented`。
+- 当前远端旧版本作业在其最终审计完成前不得被新实现覆盖。新实现必须使用新目录，且不得恢复旧 V4.2 checkpoint。
 
----
+## 6. 恢复、记录和错误处理
 
-## 2. Remote execution contract
+- 训练恢复只使用指定输出目录中最新的完整 Orbax step 和其中记录的实际计数。
+- 每个评估回合、每个回应屏蔽分支、每条登记决策、每次指标写入和完整控制台日志都必须保存。
+- 分析可以声明时间窗口，但完整来源必须保留并可定位；禁止静默截断输入、输出、字符串或记录行。
+- 形状错误、非有限数值、负交付计数或外部接口变化应直接停止并保留异常。不得用默认值、扩大容差、`nan_to_num` 或自动切换实现掩盖问题。
+- 正式归档可在运行结束后用标准工具生成一次文件清单；清单不参与训练、恢复或评估判断。
 
-All experiments run **remote-only**, never local. Contract pinned in
-[CUSTOMER.md](CUSTOMER.md):
+## 7. 最少治理原则
 
-- Host: `ssh zsc-customer` (persistent control connection, 8h reuse; password in CUSTOMER.md).
-- Project path (has `.venv`): `/apps/users/cxw/Document/CodeSpace/Selfs/CPR_REPO`.
-- 8 GPUs available.
-- **Drift check (after-the-fact audit, not a start gate): after a code update,
-  produce an explicit `git` diff and review it when checking what changed.** This
-  is a cheap post-hoc drift check — it does not gate whether a run may start (§7.2).
-- Formal run contract (preflight → CE → graph → train → eval) is defined in
-  [README_FIXES_20260624.md](archive/docs/README_FIXES_20260624.md). Formal training **requires an
-  accepted preflight** via `--preflight_path`; rejected-layout smoke runs must not
-  go through the formal trainer.
-
-Even when remote execution is authorized, the no-local-exec rule above still
-holds for the host machine.
-
----
-
-## 3. ARIS invocation defaults for this project
-
-When invoking any experiment- or review-class ARIS skill in this project, apply
-these defaults (override inline only with explicit user authorization). Mirrored
-machine-readably in [`.aris/config.json`](.aris/config.json); will be **enforced**
-by the Phase-1 PreToolUse hook (`.claude/hooks/`, not yet installed).
-
-| Parameter | Project default | Why |
-|-----------|----------------|-----|
-| `GPU` | `remote` | No local execution; §2 contract |
-| `AUTO_PROCEED` | `false` | Stops the loop for human judgment only at the two points that have caught real failures — run authorization and final read-out adjudication (§7.5). Not a sign-off before every launch or mid-experiment. |
-| `human checkpoint` | `run authorization + final read-out only` | Per §7.5, human sign-off is reserved for run authorization (the execution-boundary consent) and final read-out adjudication. No per-launch or mid-experiment sign-off — that maps to no recorded catch; the claim-acceptance judgment is carried by the Type-B acceptance gate (§4). |
-| `CODE_REVIEW` | `true` | Cross-model review of experiment code before deploy |
-| `reviewer` | `codex` (GPT-5.5, xhigh) | Must be a **different model family** than the Claude executor |
-
-Final-artifact assurance (the full audit chain, `assurance = submission`) is
-folded into the Type-B acceptance gate — see §4.
-
----
-
-## 4. Acceptance-gate rule (autonomy boundary)
-
-ARIS is built to run autonomously ("research in sleep"). In this project, autonomy
-is allowed to **drive** but never to **acquit** — per
-`shared-references/acceptance-gate.md`:
-
-- **Type-A gates** (did it run / compile / finish — machine-checkable): an agent
-  may self-judge.
-- **Type-B gates** (is the claim supported / is the result good / is the proof
-  valid): **never** self-judged. Route to the cross-model reviewer (codex) and,
-  in this project, also to a human checkpoint.
-
-The five decisive scientific claims ([PROJECT_DASHBOARD.md](PROJECT_DASHBOARD.md) §3)
-are Type-B. No loop may declare them supported on its own verdict.
-
-**Final / outward artifacts** (submission-scale deliverables) are the product-scale
-form of the same rule: they require the full assurance audit chain
-(`assurance = submission`) and may never be self-signed. This is the merged home
-of the former §3 `assurance` default.
-
----
-
-## 5. Enforcement status
-
-| Layer | Mechanism | Status |
-|-------|-----------|--------|
-| Declared intent | this file + [`.aris/config.json`](.aris/config.json) | ✅ in place |
-| Always-loaded restatement | [CLAUDE.md](CLAUDE.md) entrypoints | ✅ in place |
-| Mechanical enforcement | `.claude/hooks/no_local_exec_guard.py` PreToolUse guard (stop-and-**ask** on local exec; remote `zsc-customer` never gated; fail-open) | 🟡 drafted — **pending user approval** via `/hooks` or session restart |
-| Scientific-invariant gate (pre-claim / pre-deploy audit) | `.aris/tools/aris_bellman_fidelity_gate.py` — static, 9 checks (I1–I9), 6-state verdict, exit 1 on RED; runs in-boundary | ✅ built — green on current tree (`FIDELITY_GATE.{json,md}`) |
-
-The static fidelity gate (I1–I9) is an **after-the-fact audit, not a start gate**:
-require it green *before reading a claim or before deploying changed method code*,
-not before every run (§7.2). It checks method identity; it never decides whether a
-run may launch.
-
-The guard is registered in `.claude/settings.json` but Claude Code requires the
-user to approve a new hook before it runs. Until approved, the boundary remains
-**advisory** and depends on the agent honoring this doc — treat a local-execution
-request as a stop-and-confirm. Once approved, matching local-exec commands raise an
-approval prompt (the user may authorize a one-off, or "always allow" to relax for
-the session); the guard can only add a prompt, never hard-block.
-
----
-
-## 6. Data-sufficiency discipline (2026-07-06 — user directive after the 32-episode misdiagnosis)
-
-**Origin (measured, one month of damage):** the formal e1rev configs carried
-`total_updates: 5000` × `updates_per_transition: 8` ⇒ **625 transitions ≈ 32
-episodes of total training experience**, and no document ever stated this
-number. Every negative diagnosis produced on that substrate — held-out egoCCR
-0.125, the four-granularity table, "belief shifts Q but cannot flip wait",
-"terminal competence evaporates" — was later shown to be a sample-starvation
-artifact: at 2000 episodes the SAME method with NO mechanism change passed the
-preregistered role-adaptation criterion (4/5 seeds) and the E2 zeroed test
-showed the belief channel load-bearing. Cost: ~1 month, three external review
-rounds, multiple mechanism hypotheses chased.
-
-**Rules (binding for every future run):**
-
-1. **Effective data budget must be computed and recorded** for every training
-   run, at launch and in the log entry: transitions
-   (= total_updates / updates_per_transition under the 1-collect loop) and
-   episodes (≈ transitions / max_episode_options). Read it back from produced
-   artifacts (`metrics.episode_returns` length, `resolved_config.json`), never
-   from config intent.
-2. **Smoke-scale runs may satisfy Type-A gates only** (does it run / compile /
-   produce artifacts). They must be labeled SMOKE in EXPERIMENT_LOG and their
-   numbers may not enter any table, comparison, diagnosis, or claim readout.
-   Cheap smoke tests remain encouraged — for wiring, never for science.
-3. **Type-B / claim-level readouts require a data-sufficient substrate.** The
-   floor is set by the latest recorded sufficiency evidence for that substrate
-   (currently asymm×role_conditioned_v2: **≥ 2000 episodes / 40k transitions**,
-   EXPERIMENT_LOG 2026-07-06), plus a passed consolidation check (late-window
-   validation competence persists; if the curve is still rising, scale further
-   before adjudicating).
-4. **Any change to a data-quantity parameter** (`updates_per_transition`,
-   `total_updates`, `max_episode_options`, `replay_size`) requires restating
-   the effective episode count in the change record.
-5. When a result looks like a method failure, **check the data budget before
-   hypothesizing mechanisms** — "how many episodes did this model actually
-   experience?" is the first diagnostic question, not the last.
-6. **自写训练器在承担正式计算花销前必须复现对应方法的参照曲线。** 本规则防止的已记录
-   失败是 2026-07-14 根因裁决：本项目手写的 PyTorch 训练器在相同 3000 万环境步预算下
-   只达到约 19 分并发生能力消退，而官方 JaxMARL Independent Proximal Policy
-   Optimization 基线达到约 130 分。该旧曲线只证明任务与训练链能够学习；它不再定义正式
-   网络身份。R015 正式网络的唯一参照是 `overcooked_v2_experiments` 0.0.1
-   `ActorCriticRNN`。正式花销前以独立 `rnn-sp` seed 999 运行同一官方日程：最终四分之一的
-   官方原始回报均值须不低于 100，且不低于四个固定区间最高均值的 0.9；两项同时满足才可
-   承担正式生产。名义 `TOTAL_TIMESTEPS` 为 3000 万，实际预算必须按整数更新日程回读：
-   `rnn-sp` 29,949,952、`rnn-op` 29,999,104 个有效环境步。
-   当项目不再维护自写训练器、全部正式生产都使用已经验证的外部训练器时，本规则归档。
-7. **开发诊断运行（`run_kind: development`）是 smoke 与正式运行之间的第三类运行。** 本条
-   服务 2026-07-19 用户裁决的完整模型优先开发模式——先按提案实现完整模型，再通过实验
-   迭代优化（PATH_C_MODULE_DESIGN.md §7）。本条防止的已记录失败：此前运行分类只有
-   smoke（只许查接线、不许读数）与正式（须先完成确认性冻结）两类，任何开发期训练都被迫
-   二选一，迭代读数要么被禁止、要么被要求先冻结，开发因此不断被在架条款拦回文档工作。
-   规则：只在远端执行；逐次或成批取得用户授权；必须按第 1 条从产物回读并记录有效数据
-   预算；在 EXPERIMENT_LOG 标注 `run_kind: development`。其读数用于设计迭代，永不进入
-   主张表、比较或正式读数。本条不新设启动门：充分性下限（第 3 条）与参照曲线要求
-   （第 6 条）只门正式计算，不门开发运行；除执行边界（§1–§2）外，开发运行没有额外前置
-   条件。当项目进入正式十单元实验阶段并不再有开发运行时，本条归档。
-
----
-
-## 7. Gate lifecycle — every gate must be able to die (2026-07-08)
-
-**Origin:** the governance layer grew monotonically — every recorded failure
-added a permanent gate, discipline, ledger ID, or pre-registration, and none
-were ever retired. The accumulated mass made starting an experiment feel like
-"build all the gates first." A full audit (`docs/status/GOVERNANCE_CUTLIST.md`) found ~124
-gate-entries across 7 docs collapsing to ~20–25 unique load-bearing rules; the
-rest were duplicate restatements, closed incidents, or ceremony mapping to no
-recorded failure. This section is the ratchet's retirement valve.
-
-**Rules (binding for every future gate):**
-
-1. **A new gate must record two things or it is not added:** the *specific real
-   recorded failure* it prevents, and its *retirement condition*. A rule that
-   maps to no recorded incident is at most a post-hoc audit, never a
-   start-blocking gate.
-2. **Default altitude = gate the claim, not the run start.** A check may block
-   *starting* a run only when its failure cannot be detected or repaired after
-   the fact — currently: preflight layout validity, effective data budget,
-   oracle-free evidence path, and blind-split non-contamination. Everything else
-   (static fidelity invariants, wiring read-backs, wording ladders, method-
-   identity checks) runs as a **pre-claim / pre-deploy audit**, not a per-launch
-   hoop. The fidelity gate is one fast static command; require it green *before
-   reading a claim or changing method code*, not before every run.
-   “已经花掉的计算无法追回”本身不构成本款例外；只要失败能在运行后的产物中识别，相关
-   检查就属于项目排序或读数前审计，而不是启动条件。
-3. **One home per rule.** A rule lives in exactly one file; everywhere else links
-   to it. Do not restate the same gate in CLAUDE.md + this file + AGENTS.md +
-   the dashboard + the ledger.
-4. **Periodic sweep.** When a gate's incident is closed or its retirement
-   condition is met, archive it. Closed/tautological gates do not stay listed as
-   active.
-5. **Human sign-off is scarce.** Retain human Type-B judgment at the two points
-   that have caught real failures — run authorization (the execution-boundary
-   consent) and final read-out adjudication. Do not add per-launch or
-   mid-experiment human sign-offs; they map to no recorded catch and are pure
-   start-latency.
-
----
-
-## 已归档 / 已合并（2026-07-08，依据 docs/status/GOVERNANCE_CUTLIST.md）
-
-- **`assurance = submission` 五层审计链（原 §3 表的一行）** → 合并进 §4 Type-B
-  接受门。理由：它没有独立对应的真实失败，是"不得自我签收对外产物"原则在产物尺度上
-  的重复表述。唯一内容（最终/对外产物须过完整审计链、不得自判）现由 §4 承载。
-
-注：以下三项为**降级**（保留检查、改为事后/读数前审计），仍在各自章节的在架面上，
-不移入本节——每次代码更新后的 `git` diff（§2，事后漂移检查）、`AUTO_PROCEED` /
-`human checkpoint` 的启动前签字（§3，只保留 §7.5 的两个人工判断点）、静态 fidelity
-门 I1–I9（§5，读数前 / 改方法后审计）。
+- 不为没有发生过的风险增加运行门槛。
+- 工程检查优先阻止错误科学读数，不应无故阻止可恢复的计算开始。
+- 配置、状态和统计分别只有一个事实来源；摘要必须能从完整原始记录重算。
+- 不新增与研究公式、官方接口或最终数据输出无关的安全、防伪、身份绑定或内容寻址代码。

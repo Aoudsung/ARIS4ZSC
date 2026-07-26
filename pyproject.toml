@@ -5,25 +5,31 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aris4zsc"
 version = "0.1.0"
-description = "ARIS-Bellman toy experiments for zero-shot coordination via interaction-factor beliefs"
+description = "Path C zero-shot coordination experiments in OvercookedV2"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
-  "torch>=2.0",
   "pyyaml>=6.0",
-  "jsonschema>=4.20",
-  "pytest>=8",
   "pyarrow>=14.0",
+  "jax==0.4.38",
+  "jaxlib==0.4.38",
+  "jaxmarl==0.1.0",
+  "overcooked_v2_experiments @ git+https://github.com/overcookedv2/experiments.git@5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e#subdirectory=experiments",
+  "chex>=0.1.86",
+  "flax>=0.8",
+  "optax>=0.2",
+  "orbax-checkpoint>=0.5",
+  "distrax>=0.1",
+  "hydra-core>=1.3",
+  "omegaconf>=2.3",
+  "wandb>=0.17",
+  "pytest>=8",
 ]
 
 [project.optional-dependencies]
-jaxmarl = [
-  "jax>=0.4",
-  "jaxmarl==0.1.0",
-  "chex",
-  "flax",
-]
 dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
-where = ["experiments"]
+where = ["."]
+include = ["src.path_c*", "experiments.overcooked_v2*"]
+namespaces = true
