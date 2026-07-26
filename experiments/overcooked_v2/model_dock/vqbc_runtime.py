@@ -158,6 +158,7 @@ def _model_callback(model: Any) -> Any:
         previous_actions: Any,
         previous_team_rewards: Any,
         episode_start: Any,
+        slot_log_belief: Any,
     ) -> tuple[Any, Mapping[str, Any]]:
         return model.apply(
             {"params": params},
@@ -166,6 +167,7 @@ def _model_callback(model: Any) -> Any:
             previous_actions,
             previous_team_rewards,
             episode_start,
+            slot_log_belief,
         )
 
     return apply
@@ -352,6 +354,9 @@ def _verify_reference_parity(
         jnp.full(observations.shape[:2], 6, dtype=jnp.int32),
         jnp.zeros(observations.shape[:2], dtype=jnp.float32),
         starts,
+        uniform_slot_log_belief(
+            observations.shape[:2], int(model.slot_count)
+        ),
     )
     del unused_output
     carry_equal = all(

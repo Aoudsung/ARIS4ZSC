@@ -28,17 +28,17 @@ This project (`ARIS4ZSC`) = *using ARIS the harness to develop the ARIS-Bellman 
 |---|---|
 | **Title** | Probe What Changes the Decision: Decision-Focused Active Partner Inference for Zero-Shot Coordination |
 | **Current line** | Path C = 面向协作决策的信息价值方法：只在伙伴回应可能改变后续控制且收益超过任务成本时探查。价值无关身份不变性和梯度路由只作机制约束与证伪检查，不再承担论文公开身份。 |
-| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md), [PATH_C_OPPORTUNITY_AUDIT_SPEC.md](idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md)（当前实现为 `path_c_model_v4_1` 的持久槽后验潜在 Bellman 混合控制器。V4.1 已完成同一 seed-100 开发单元的远端训练、四模式评估、回应屏蔽对照和控制路径追踪：潜在槽已分化，屏蔽也确实改变后验，但无约束的延续最大化与真实 KL 约束执行不一致，使预测回应价值大多不能转成动作变化。实现可记为 `tested`，这不表示机制验收通过；十单元正式训练继续关闭。第三版 Test Time Wide 继续作为隔离历史链，不覆盖 V4.1）；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
+| **Current proposal** | [PATH_C_PROPOSAL.md](idea-stage/refine-logs/PATH_C_PROPOSAL.md), [PATH_C_THEORY.md](idea-stage/refine-logs/PATH_C_THEORY.md), [PATH_C_MODULE_DESIGN.md](idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md), [PATH_C_EXECUTION_PLAN.md](idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md), [PATH_C_PREREGISTRATION.md](idea-stage/refine-logs/PATH_C_PREREGISTRATION.md), [PATH_C_OPPORTUNITY_AUDIT_SPEC.md](idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md)（活跃实现为 `path_c_model_v4_2`。V4.2 在 V4.1 已形成独立槽和持久后验的基础上，统一了 use/mask 的物理世界权重、belief-conditioned Q、行为一致 raw-return continuation 和真实 KL 执行分布；回应屏蔽三分支也改为 policy-level 触发并保存全路径差异。该版本仅为静态 `implemented`，尚未继承 V4.1 的远端 `tested` 状态；十单元正式训练继续关闭。V4.1 的 seed-100 训练与零效应只作为根因证据，第三版 Test Time Wide 继续作为隔离历史链）；实现状态由 `experiments/overcooked_v2/configs/module_registry.yaml` 管理。 |
 | **Thesis** | 在官方局部历史下，智能体应按注册回应通道对受限控制器的增量价值选择任务内探查，并相对最佳通道屏蔽动作扣除机会成本；主要证据来自匹配 cross-play 回报，而不是身份恢复。 |
 | **Benchmark** | JaxMARL **OvercookedV2** Test Time Simple（主基准）/Wide（布局复现）+ **Hanabi**（必需第二领域，尚未启动）+ toy_factor_game（理论回归） |
 | **Target tier** | ICLR / NeurIPS / ICML class |
-| **Compute budget** | V4.1 首开发单元从产物回读 1,228,800 个训练环境步和 3,072 个完整训练回合；四模式开发评估为 800,000 个环境步，回应屏蔽对照为 600,000 个有效分支环境步，随后控制路径追踪追加 25,664 步，V4.1 本轮累计 2,654,464 步。旧第四版相应记录为 1,228,800、800,000 和 595,520 步。旧伙伴池 Test Time Simple 正式链从产物回读 2,010,480,640 个环境步；家族级伙伴池第三版 Test Time Simple 为 2,072,480,640 个环境步。第三版 Test Time Wide 仍在执行，实际预算待最终审计后回读。冻结前另有一次两布局共享的官方 seed 999 生产验收，本次实际执行 29,949,952 步，不属于十训练单元或标准矩阵。 |
+| **Compute budget** | V4.2 尚未运行新的环境步；V4.1 首开发单元从产物回读 1,228,800 个训练环境步和 3,072 个完整训练回合；四模式开发评估为 800,000 个环境步，回应屏蔽对照为 600,000 个有效分支环境步，随后控制路径追踪追加 25,664 步，V4.1 本轮累计 2,654,464 步。旧第四版相应记录为 1,228,800、800,000 和 595,520 步。旧伙伴池 Test Time Simple 正式链从产物回读 2,010,480,640 个环境步；家族级伙伴池第三版 Test Time Simple 为 2,072,480,640 个环境步。第三版 Test Time Wide 仍在执行，实际预算待最终审计后回读。冻结前另有一次两布局共享的官方 seed 999 生产验收，本次实际执行 29,949,952 步，不属于十训练单元或标准矩阵。 |
 
 ---
 
 ## 2. Pipeline status — CURRENT STAGE
 
-**Stage: 2026-07-26 VQBC V4.1 已完成远端重复验证和回应屏蔽控制路径追踪。四个目标测试文件为 50 项通过、0 失败；训练、四模式评估、回应屏蔽对照和后续追踪累计 2,654,464 个有效环境步。追踪证明实际回应会显著改变槽信念，屏蔽开关也确实阻断该更新；32 个完整追踪回合中有 3 个回合的左侧动作和后续观测发生差异，因此控制路径不是空接线。决定性问题是预测与执行不一致：`J_use/J_mask` 用无约束的下一动作最大值计算回应价值，真实执行却受冻结参考策略和 KL 散度约束。第 0 步后 `J_use` 的最大绝对变化均值为 2.364，但真实动作分布的总变差距离均值只有 0.000741，下一步动作无一改变；完整回合的奖励和回报也全部不变。实现状态保持 `tested`，机制验收没有通过，十单元正式训练继续关闭。下一项唯一优先工作是让回应价值的延续算子与真实 KL 约束执行分布一致。详细证据见 [PATH_C_VQBC_V4_1_ROOT_REPAIR.md](docs/status/PATH_C_VQBC_V4_1_ROOT_REPAIR.md) 和 [EXPERIMENT_LOG.md](docs/status/EXPERIMENT_LOG.md)。全部产物保持 `scientific_readout_allowed: false`。**
+**Stage: 2026-07-26 VQBC V4.2 行为一致反事实修复已静态完成。Q experts 与 outcome continuation 均显式条件于停止梯度的 controller belief；use/mask 共用 `b(m)p_m(y|a)` 的物理联合权重，只改变 continuation controller belief；旧无约束 `max_u` 和 next-Q tensor 已删除，target continuation改由 target network 在真实下一 reference logits、相同温度和运行时 KL-regularized policy 下生成的 raw-return scalar。回应屏蔽对照使用随机策略级 predicted raw net effect触发，A1 与 A2-mask 都屏蔽触发回应，并记录belief L1、policy TV和首次动作/观测/回应/奖励分歧。config/checkpoint/evaluation schema均升级到V4.2并拒绝旧状态。当前本地纯JAX、配置和评估合同已通过；Flax、Optax、JaxMARL远端测试与同预算seed-100复跑尚未执行，因此模块状态为 `implemented`，不是 `tested`。十单元正式训练继续关闭。详细说明见 [PATH_C_VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR.md](docs/status/PATH_C_VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR.md) 和 [EXPERIMENT_LOG.md](docs/status/EXPERIMENT_LOG.md)。全部产物保持 `scientific_readout_allowed: false`。**
 
 **Parallel historical run: 2026-07-25 家族级伙伴池第三版 Test Time Simple 已完成 10 个训练单元、五个标准配对矩阵、决策导向回应屏蔽对照和最终审计。六个目标测试文件为 79 项通过、0 失败、0 错误、0 跳过；完整链从产物回读 2,072,480,640 个环境步。决策导向的自我配对/跨策略配对均值为 79.90/−0.28，关闭探查为 94.01/−1.98；两者匹配跨策略配对平均差为 +1.7071，训练单元节点重采样 95% 区间为 [−2.8061, 7.7083]，没有达到 20 分实际意义门槛。注册回应使用效应为 +0.0156，净效应为 +0.0431。因为上游能力阈值是在观察三个未达标任务后改为只报告，本次运行属于结果相关协议修订后的探索性结果，继续保持 `scientific_readout_allowed: false`。最终审计 SHA-256 为 `4e5d16c752491023103732f5d90a9bbcd03d6f241a19b03ded4380cf4d296815`，完整报告见 [PATH_C_TEST_TIME_SIMPLE_RESULTS.md](docs/status/PATH_C_TEST_TIME_SIMPLE_RESULTS.md)。统一驱动进程 `4182410` 已完成 Test Time Wide 的准备、目标测试、机械接线和冻结阶段，正在继续 Wide；尚无 Wide 最终审计读数。**
 
@@ -480,10 +480,10 @@ repeat or extend that rule.
 | Path C proposal | `idea-stage/refine-logs/PATH_C_PROPOSAL.md` | ✅ active current line |
 | Path C execution plan | `idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md` | ✅ active current plan |
 | Path C preregistration | `idea-stage/refine-logs/PATH_C_PREREGISTRATION.md` | 🟡 third-version template; numeric and semantic hashes not frozen |
-| Path C module design | `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md` | 🟡 V4.1 已完成 50 项远端测试和同一开发单元复跑；槽已分化且后验会改变动作，但回应屏蔽效应仍为 0，正式训练继续关闭 |
+| Path C module design | `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md` | 🟡 V4.2 行为一致反事实链已静态实现；远端 Flax/Optax/JaxMARL 测试和同预算 seed-100 复跑未执行，正式训练继续关闭 |
 | Path C VQBC V4.1 diagnostic report | `docs/status/PATH_C_VQBC_V4_1_EXPERIMENT_DIAGNOSTIC_REPORT.md` | 🟡 当前训练、四模式评估、回应屏蔽和控制路径追踪的技术报告；结论仅用于开发迭代 |
-| Path C model implementation spec | `idea-stage/refine-logs/PATH_C_MODEL_IMPLEMENTATION_SPEC.md` | 🟡 第四版原规格保留为历史；V4.1 统一潜在混合修订由 `docs/status/PATH_C_VQBC_V4_1_ROOT_REPAIR.md` 与 `src/path_c/vqbc/` 当前代码定义 |
-| Path C module registry | `experiments/overcooked_v2/configs/module_registry.yaml` | 🟡 活跃项为 `PATH_C_VQBC_V4_1_CHAIN: tested`；这只绑定 50 项远端软件测试，不表示机制验收或正式冻结 |
+| Path C model implementation spec | `idea-stage/refine-logs/PATH_C_MODEL_IMPLEMENTATION_SPEC.md` | 🟡 第四版原规格保留为历史；V4.2 当前实现由 `docs/status/PATH_C_VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR.md` 与 `src/path_c/vqbc/` 定义 |
+| Path C module registry | `experiments/overcooked_v2/configs/module_registry.yaml` | 🟡 活跃项为 `PATH_C_VQBC_V4_2_CHAIN: implemented`；V4.1 的远端测试不传递到新 schema |
 | Migration plan | `artifacts/OvercookedV2_plan.md` | ✅ |
 
 **Divergence to reconcile (low priority):** ARIS convention is `refine-logs/` at
@@ -532,7 +532,7 @@ them explicitly to ablations, and add the standard Test Time SP/XP evaluator.
 | I6_SIMULTANEOUS_KERNEL_BOUNDS | tested |
 | I7_VALIDITY_CONTROLS | tested |
 | I8_SPLIT_AND_CROSS_FITTING | tested |
-| PATH_C_VQBC_V4_1_CHAIN | tested |
+| PATH_C_VQBC_V4_2_CHAIN | implemented |
 | D1_ARTIFACT_CONTRACT | planned |
 | D2_CONFORMANCE_TEST_DEFINITIONS | tested |
 <!-- PATH_C_MODULE_TRACEABILITY:END -->

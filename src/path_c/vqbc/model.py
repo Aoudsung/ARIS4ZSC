@@ -1,4 +1,4 @@
-"""Flax implementation of the value-quotient belief-conditioned controller."""
+"""Flax implementation of behavior-consistent VQBC V4.2."""
 
 from __future__ import annotations
 
@@ -11,8 +11,13 @@ from .policy import (
     deployment_policy,
     generic_response_information,
     normalized_log_belief,
+    policy_effect_decomposition,
 )
-from .quotient import complete_link_class_ids, value_signatures
+from .quotient import (
+    complete_link_class_ids,
+    posterior_supported_class_count,
+    value_signatures,
+)
 from .types import VQBCOutput
 
 
@@ -20,7 +25,7 @@ _MODEL_CACHE: dict[tuple[int, ...], Any] = {}
 
 
 def _model_class() -> Any:
-    cached = _MODEL_CACHE.get((5,))
+    cached = _MODEL_CACHE.get((7,))
     if cached is not None:
         return cached
 
@@ -115,7 +120,7 @@ def _model_class() -> Any:
                 or starts.shape != values.shape[:2]
             ):
                 raise ValueError(
-                    "History backbone inputs must share [time, batch] leading axes."
+                    "History backbone inputs must share [time, batch] axes."
                 )
             encoded = jax.vmap(
                 OfficialCNN(
@@ -143,32 +148,45 @@ def _model_class() -> Any:
                 bias_init=zeros,
                 name="PreviousRewardProjection",
             )(rewards[..., None])
-            joined = encoded + action_projection + reward_projection
-            joined = nn.LayerNorm(name="LayerNorm_0")(joined)
+            joined = nn.LayerNorm(name="LayerNorm_0")(
+                encoded + action_projection + reward_projection
+            )
             return ScannedRNN(name="ScannedRNN_0")(carry, (joined, starts))
 
     class IndependentDuelingEstimator(nn.Module):
-        """A bank of genuinely independent Bellman experts."""
-
         slot_count: int
         action_count: int
         hidden_dim: int
         output_scale: float
         prefix: str
+        condition_on_belief: bool
 
         @nn.compact
-        def __call__(self, features: Any) -> tuple[Any, Any]:
-            slot_values = []
-            slot_advantages = []
+        def __call__(
+            self, features: Any, slot_log_belief: Any
+        ) -> tuple[Any, Any]:
+            belief = jax.lax.stop_gradient(
+                jax.nn.softmax(jnp.asarray(slot_log_belief), axis=-1)
+            )
+            if belief.shape != features.shape[:-1] + (self.slot_count,):
+                raise ValueError("Q heads require [..., slot] belief axes.")
+            values = []
+            advantages = []
             for slot in range(self.slot_count):
-                hidden = nn.relu(
-                    nn.Dense(
+                base_hidden = nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(2.0),
+                    bias_init=zeros,
+                    name=f"{self.prefix}_slot_{slot}_hidden",
+                )(features)
+                if self.condition_on_belief:
+                    base_hidden = base_hidden + nn.Dense(
                         self.hidden_dim,
-                        kernel_init=orthogonal(2.0),
+                        kernel_init=zeros,
                         bias_init=zeros,
-                        name=f"{self.prefix}_slot_{slot}_hidden",
-                    )(features)
-                )
+                        name=f"{self.prefix}_slot_{slot}_belief_projection",
+                    )(belief)
+                hidden = nn.relu(base_hidden)
                 value = nn.Dense(
                     1,
                     kernel_init=orthogonal(1.0),
@@ -184,12 +202,9 @@ def _model_class() -> Any:
                 centered = raw_advantage - jnp.mean(
                     raw_advantage, axis=-1, keepdims=True
                 )
-                slot_values.append(value[..., None] + centered)
-                slot_advantages.append(centered)
-            return (
-                jnp.stack(slot_values, axis=-2),
-                jnp.stack(slot_advantages, axis=-2),
-            )
+                values.append(value[..., None] + centered)
+                advantages.append(centered)
+            return jnp.stack(values, axis=-2), jnp.stack(advantages, axis=-2)
 
     class TwinDuelingQ(nn.Module):
         slot_count: int
@@ -198,41 +213,42 @@ def _model_class() -> Any:
         prior_scale: float
 
         @nn.compact
-        def __call__(self, features: Any) -> tuple[Any, Any, Any, Any]:
+        def __call__(
+            self, features: Any, slot_log_belief: Any
+        ) -> tuple[Any, Any, Any, Any]:
             learned = []
             priors = []
             for estimator in range(2):
-                learned_value, unused_learned_advantage = (
-                    IndependentDuelingEstimator(
-                        slot_count=self.slot_count,
-                        action_count=self.action_count,
-                        hidden_dim=self.hidden_dim,
-                        output_scale=1.0e-2,
-                        prefix=f"learned_estimator_{estimator}",
-                        name=f"LearnedEstimator_{estimator}",
-                    )(features)
-                )
-                prior_value, unused_prior_advantage = IndependentDuelingEstimator(
+                learned_value, unused = IndependentDuelingEstimator(
+                    slot_count=self.slot_count,
+                    action_count=self.action_count,
+                    hidden_dim=self.hidden_dim,
+                    output_scale=1.0e-2,
+                    prefix=f"learned_estimator_{estimator}",
+                    condition_on_belief=True,
+                    name=f"LearnedEstimator_{estimator}",
+                )(features, slot_log_belief)
+                del unused
+                prior_value, unused = IndependentDuelingEstimator(
                     slot_count=self.slot_count,
                     action_count=self.action_count,
                     hidden_dim=self.hidden_dim,
                     output_scale=1.0,
                     prefix=f"prior_estimator_{estimator}",
+                    condition_on_belief=False,
                     name=f"PriorEstimator_{estimator}",
-                )(features)
-                del unused_learned_advantage, unused_prior_advantage
+                )(features, slot_log_belief)
+                del unused
                 learned.append(learned_value)
                 priors.append(jax.lax.stop_gradient(prior_value))
             learned_values = jnp.stack(learned, axis=-3)
             prior_values = jnp.stack(priors, axis=-3)
             q_values = learned_values + self.prior_scale * prior_values
-            control_signatures = q_values - jnp.max(
-                q_values, axis=-1, keepdims=True
-            )
-            return q_values, learned_values, prior_values, control_signatures
+            signatures = q_values - jnp.max(q_values, axis=-1, keepdims=True)
+            return q_values, learned_values, prior_values, signatures
 
     class OutcomeModel(nn.Module):
-        """Slot-conditional outcome model with independent expert decoders."""
+        """Physical outcomes and behavior-consistent continuation scalars."""
 
         slot_count: int
         action_count: int
@@ -243,8 +259,15 @@ def _model_class() -> Any:
         log_standard_deviation_maximum: float
 
         @nn.compact
-        def __call__(self, features: Any) -> Mapping[str, Any]:
+        def __call__(
+            self, features: Any, slot_log_belief: Any
+        ) -> Mapping[str, Any]:
             detached = jax.lax.stop_gradient(features)
+            belief = jax.lax.stop_gradient(
+                jax.nn.softmax(jnp.asarray(slot_log_belief), axis=-1)
+            )
+            if belief.shape != detached.shape[:-1] + (self.slot_count,):
+                raise ValueError("Outcome model requires one posterior per feature.")
             action_embedding = self.param(
                 "action_embedding",
                 normal(0.02),
@@ -256,17 +279,14 @@ def _model_class() -> Any:
                 prefix + (self.action_count, detached.shape[-1]),
             )
             action_grid = jnp.broadcast_to(
-                action_embedding,
-                prefix + action_embedding.shape,
+                action_embedding, prefix + action_embedding.shape
             )
             joined = jnp.concatenate((feature_grid, action_grid), axis=-1)
 
             response_logits_by_slot = []
             reward_mean_by_slot = []
             reward_log_std_by_slot = []
-            next_q_mean_by_slot = []
-            next_q_log_std_by_slot = []
-            continuation_size = 2 * self.response_count * self.action_count
+            hidden_by_slot = []
             for slot in range(self.slot_count):
                 hidden = nn.relu(
                     nn.Dense(
@@ -276,6 +296,7 @@ def _model_class() -> Any:
                         name=f"slot_{slot}_hidden",
                     )(joined)
                 )
+                hidden_by_slot.append(hidden)
                 response_logits_by_slot.append(
                     nn.Dense(
                         self.response_count,
@@ -300,53 +321,102 @@ def _model_class() -> Any:
                         name=f"slot_{slot}_reward_log_standard_deviation",
                     )(hidden)[..., 0]
                 )
-                next_mean = nn.Dense(
-                    continuation_size,
+
+            response_logits = jnp.stack(response_logits_by_slot, axis=-3)
+            response_probabilities = jax.nn.softmax(response_logits, axis=-1)
+            reward_mean = jnp.stack(reward_mean_by_slot, axis=-2)
+            reward_log_std = jnp.stack(reward_log_std_by_slot, axis=-2)
+
+            physical_joint = belief[..., :, None, None] * response_probabilities
+            marginal = jnp.sum(physical_joint, axis=-3)
+            posterior = physical_joint / jnp.maximum(
+                marginal[..., None, :, :], 1.0e-8
+            )
+            # [..., slot, action, response] -> [..., action, response, slot]
+            use_belief = jnp.moveaxis(posterior, -3, -1)
+            mask_belief = jnp.broadcast_to(
+                belief[..., None, None, :], use_belief.shape
+            )
+
+            def belief_features(values: Any) -> Any:
+                clipped = jnp.clip(values, 1.0e-8, 1.0)
+                entropy_parts = -clipped * jnp.log(clipped)
+                entropy = jnp.sum(entropy_parts, axis=-1, keepdims=True)
+                return jnp.concatenate(
+                    (clipped, jnp.square(clipped), entropy_parts, entropy),
+                    axis=-1,
+                )
+
+            use_features = belief_features(use_belief)
+            mask_features = belief_features(mask_belief)
+            belief_width = 3 * self.slot_count + 1
+            parameter_width = 2 * self.response_count * (belief_width + 1)
+
+            def evaluate(parameters: Any, branch_features: Any) -> Any:
+                bias = parameters[..., 0]
+                coefficients = parameters[..., 1:]
+                return bias + jnp.einsum(
+                    "...aeyf,...ayf->...aey", coefficients, branch_features
+                )
+
+            use_mean_slots = []
+            mask_mean_slots = []
+            use_std_slots = []
+            mask_std_slots = []
+            for slot, hidden in enumerate(hidden_by_slot):
+                mean_parameters = nn.Dense(
+                    parameter_width,
                     kernel_init=zeros,
                     bias_init=zeros,
-                    name=f"slot_{slot}_next_q_mean",
+                    name=f"slot_{slot}_continuation_mean_parameters",
                 )(hidden).reshape(
                     prefix
                     + (
                         self.action_count,
                         2,
                         self.response_count,
-                        self.action_count,
+                        belief_width + 1,
                     )
                 )
-                next_log_std = nn.Dense(
-                    continuation_size,
+                std_parameters = nn.Dense(
+                    parameter_width,
                     kernel_init=zeros,
                     bias_init=zeros,
-                    name=f"slot_{slot}_next_q_log_standard_deviation",
-                )(hidden).reshape(next_mean.shape)
-                next_q_mean_by_slot.append(jnp.moveaxis(next_mean, -3, -4))
-                next_q_log_std_by_slot.append(
-                    jnp.moveaxis(next_log_std, -3, -4)
-                )
+                    name=f"slot_{slot}_continuation_log_std_parameters",
+                )(hidden).reshape(mean_parameters.shape)
+                use_mean_slots.append(evaluate(mean_parameters, use_features))
+                mask_mean_slots.append(evaluate(mean_parameters, mask_features))
+                use_std_slots.append(evaluate(std_parameters, use_features))
+                mask_std_slots.append(evaluate(std_parameters, mask_features))
 
-            response_logits = jnp.stack(response_logits_by_slot, axis=-3)
-            reward_mean = jnp.stack(reward_mean_by_slot, axis=-2)
-            reward_log_std = jnp.stack(reward_log_std_by_slot, axis=-2)
-            next_q_mean = jnp.stack(next_q_mean_by_slot, axis=-4)
-            next_q_log_std = jnp.stack(next_q_log_std_by_slot, axis=-4)
-            next_q_mean = next_q_mean.at[
-                ..., self.response_count - 1, :
-            ].set(0.0)
+            def arrange(values: list[Any]) -> Any:
+                # slot items [..., action, estimator, response] ->
+                # [..., estimator, slot, action, response]
+                return jnp.moveaxis(jnp.stack(values, axis=-2), -4, -2)
+
+            use_mean = arrange(use_mean_slots)
+            mask_mean = arrange(mask_mean_slots)
+            use_log_std = arrange(use_std_slots)
+            mask_log_std = arrange(mask_std_slots)
+            terminal = self.response_count - 1
+            use_mean = use_mean.at[..., terminal].set(0.0)
+            mask_mean = mask_mean.at[..., terminal].set(0.0)
             lower = self.log_standard_deviation_minimum
             upper = self.log_standard_deviation_maximum
             return {
                 "response_logits": response_logits,
-                "response_probabilities": jax.nn.softmax(
-                    response_logits, axis=-1
-                ),
+                "response_probabilities": response_probabilities,
                 "reward_mean": reward_mean,
                 "reward_log_standard_deviation": jnp.clip(
                     reward_log_std, lower, upper
                 ),
-                "next_q_mean": next_q_mean,
-                "next_q_log_standard_deviation": jnp.clip(
-                    next_q_log_std, lower, upper
+                "continuation_use_mean": use_mean,
+                "continuation_use_log_standard_deviation": jnp.clip(
+                    use_log_std, lower, upper
+                ),
+                "continuation_mask_mean": mask_mean,
+                "continuation_mask_log_standard_deviation": jnp.clip(
+                    mask_log_std, lower, upper
                 ),
             }
 
@@ -365,7 +435,7 @@ def _model_class() -> Any:
             current = jnp.asarray(observations, dtype=jnp.float32)
             following = jnp.asarray(next_observations, dtype=jnp.float32)
             if current.shape != following.shape:
-                raise ValueError("Response encoder observations must have equal shapes.")
+                raise ValueError("Response encoder observations must match.")
             flat_current = current.reshape(current.shape[:2] + (-1,))
             flat_following = following.reshape(following.shape[:2] + (-1,))
             action_one_hot = jax.nn.one_hot(
@@ -442,9 +512,36 @@ def _model_class() -> Any:
             )
 
         def initial_carry(self, batch_size: int) -> Any:
-            if batch_size <= 0:
-                raise ValueError("The recurrent batch size must be positive.")
             return jnp.zeros((batch_size, self.hidden_dim), dtype=jnp.float32)
+
+        def from_features(
+            self, features: Any, slot_log_belief: Any
+        ) -> Mapping[str, Any]:
+            q_values, learned_q, prior_q, centered = self.q_heads(
+                features, slot_log_belief
+            )
+            return {
+                "features": features,
+                "q_values": q_values,
+                "learned_q_values": learned_q,
+                "prior_q_values": prior_q,
+                "centered_advantages": centered,
+                **self.outcome(features, slot_log_belief),
+            }
+
+        def control_from_features(
+            self, features: Any, slot_log_belief: Any
+        ) -> Mapping[str, Any]:
+            q_values, learned_q, prior_q, centered = self.q_heads(
+                features, slot_log_belief
+            )
+            return {
+                "features": features,
+                "q_values": q_values,
+                "learned_q_values": learned_q,
+                "prior_q_values": prior_q,
+                "centered_advantages": centered,
+            }
 
         def __call__(
             self,
@@ -453,6 +550,7 @@ def _model_class() -> Any:
             previous_actions: Any,
             previous_team_rewards: Any,
             episode_start: Any,
+            slot_log_belief: Any,
         ) -> tuple[Any, Mapping[str, Any]]:
             next_carry, features = self.backbone(
                 carry,
@@ -461,16 +559,7 @@ def _model_class() -> Any:
                 previous_team_rewards,
                 episode_start,
             )
-            q_values, learned_q, prior_q, centered = self.q_heads(features)
-            outcome = self.outcome(features)
-            return next_carry, {
-                "features": features,
-                "q_values": q_values,
-                "learned_q_values": learned_q,
-                "prior_q_values": prior_q,
-                "centered_advantages": centered,
-                **outcome,
-            }
+            return next_carry, self.from_features(features, slot_log_belief)
 
         def control_only(
             self,
@@ -479,9 +568,8 @@ def _model_class() -> Any:
             previous_actions: Any,
             previous_team_rewards: Any,
             episode_start: Any,
+            slot_log_belief: Any,
         ) -> tuple[Any, Mapping[str, Any]]:
-            """Evaluate the backbone and Q heads without materializing outcome axes."""
-
             next_carry, features = self.backbone(
                 carry,
                 observations,
@@ -489,14 +577,9 @@ def _model_class() -> Any:
                 previous_team_rewards,
                 episode_start,
             )
-            q_values, learned_q, prior_q, centered = self.q_heads(features)
-            return next_carry, {
-                "features": features,
-                "q_values": q_values,
-                "learned_q_values": learned_q,
-                "prior_q_values": prior_q,
-                "centered_advantages": centered,
-            }
+            return next_carry, self.control_from_features(
+                features, slot_log_belief
+            )
 
         def encode_response(
             self,
@@ -509,7 +592,7 @@ def _model_class() -> Any:
                 observations, actions, next_observations, dones
             )
 
-    _MODEL_CACHE[(5,)] = VQBCFlaxModel
+    _MODEL_CACHE[(7,)] = VQBCFlaxModel
     return VQBCFlaxModel
 
 
@@ -517,7 +600,7 @@ def build_vqbc_model(
     *, model_config: VQBCModelConfig, official_dimensions: Mapping[str, Any]
 ) -> Any:
     if int(official_dimensions["gru_hidden_dim"]) != model_config.hidden_dim:
-        raise ValueError("The fourth-model recurrent width must match the official model.")
+        raise ValueError("VQBC recurrent width must match the official model.")
     return _model_class()(
         hidden_dim=model_config.hidden_dim,
         head_hidden_dim=model_config.head_hidden_dim,
@@ -545,9 +628,7 @@ def response_logits_from_codebook(
     codebook = jnp.asarray(codebook_embeddings)
     if signature.shape[-1] != codebook.shape[-1]:
         raise ValueError("Response signatures and codebook entries differ in width.")
-    return -jnp.sum(
-        jnp.square(signature[..., None, :] - codebook), axis=-1
-    )
+    return -jnp.sum(jnp.square(signature[..., None, :] - codebook), axis=-1)
 
 
 def encode_response_codes(
@@ -587,27 +668,29 @@ def vqbc_forward(
     deployment_mode: str,
     gamma: float,
 ) -> VQBCOutput:
-    """Apply value quotienting and the registered deployment policy."""
+    import jax.numpy as jnp
 
     q_values = raw_output["q_values"]
     signatures, radii = value_signatures(q_values)
     class_ids = complete_link_class_ids(signatures, radii)
-    # Quotients are a diagnostic/current-control view. Bayesian filtering and
-    # response-conditioned continuation remain at persistent slot level so a
-    # class that is equivalent now may split later without losing evidence.
-    import jax.numpy as jnp
-
     slot_probabilities = jnp.exp(normalized_log_belief(slot_log_belief))
     control = bellman_control_values(
-        class_belief=slot_probabilities,
+        slot_belief=slot_probabilities,
         response_probabilities=raw_output["response_probabilities"],
         reward_mean=raw_output["reward_mean"],
-        next_q_mean=raw_output["next_q_mean"],
+        continuation_use_mean=raw_output["continuation_use_mean"],
+        continuation_mask_mean=raw_output["continuation_mask_mean"],
         gamma=gamma,
     )
     information = generic_response_information(
-        class_belief=slot_probabilities,
+        slot_belief=slot_probabilities,
         response_probabilities=raw_output["response_probabilities"],
+    )
+    effects = policy_effect_decomposition(
+        reference_logits=reference_logits,
+        j_use=control.j_use,
+        j_mask=control.j_mask,
+        temperature=temperature,
     )
     policy = deployment_policy(
         mode=deployment_mode,
@@ -629,15 +712,30 @@ def vqbc_forward(
         reward_log_standard_deviation=raw_output[
             "reward_log_standard_deviation"
         ],
-        next_q_mean=raw_output["next_q_mean"],
-        next_q_log_standard_deviation=raw_output[
-            "next_q_log_standard_deviation"
+        continuation_use_mean=raw_output["continuation_use_mean"],
+        continuation_use_log_standard_deviation=raw_output[
+            "continuation_use_log_standard_deviation"
+        ],
+        continuation_mask_mean=raw_output["continuation_mask_mean"],
+        continuation_mask_log_standard_deviation=raw_output[
+            "continuation_mask_log_standard_deviation"
         ],
         quotient_ids=class_ids,
+        supported_quotient_count=posterior_supported_class_count(
+            class_ids=class_ids, slot_log_belief=slot_log_belief
+        ),
         j_use=control.j_use,
         j_mask=control.j_mask,
+        per_action_response_value=control.per_action_response_value,
+        per_action_net_value=control.information_net_value,
         information_gain=information,
         execution_logits=policy.logits,
+        mask_execution_logits=effects.mask_policy.logits,
+        predicted_response_effect=effects.raw_response_effect,
+        predicted_policy_cost=effects.raw_policy_cost,
+        predicted_net_effect=effects.raw_net_effect,
+        predicted_regularized_net_effect=effects.regularized_net_effect,
+        predicted_policy_total_variation=effects.total_variation,
     )
 
 
@@ -689,22 +787,18 @@ def explicit_official_parameter_mapping() -> dict[tuple[str, ...], tuple[str, ..
         prefix = f"learned_estimator_{estimator}"
         for slot in range(VQBC_SLOT_COUNT):
             for leaf in ("kernel", "bias"):
-                critic[
-                    (
-                        "q_heads",
-                        target,
-                        f"{prefix}_slot_{slot}_hidden",
-                        leaf,
-                    )
-                ] = ("params", "Dense_2", leaf)
-                critic[
-                    (
-                        "q_heads",
-                        target,
-                        f"{prefix}_slot_{slot}_value",
-                        leaf,
-                    )
-                ] = ("params", "Dense_3", leaf)
+                critic[(
+                    "q_heads",
+                    target,
+                    f"{prefix}_slot_{slot}_hidden",
+                    leaf,
+                )] = ("params", "Dense_2", leaf)
+                critic[(
+                    "q_heads",
+                    target,
+                    f"{prefix}_slot_{slot}_value",
+                    leaf,
+                )] = ("params", "Dense_3", leaf)
     return {**convolution, **encoder, **normalization, **recurrent, **critic}
 
 
@@ -723,6 +817,10 @@ def initialize_vqbc_from_official(
 
     batch_size = int(example_observations.shape[1])
     model_key, encoder_key = jax.random.split(random_key)
+    belief = jnp.full(
+        example_observations.shape[:2] + (int(model.slot_count),),
+        -jnp.log(jnp.asarray(float(model.slot_count), dtype=jnp.float32)),
+    )
     variables = model.init(
         model_key,
         model.initial_carry(batch_size),
@@ -730,6 +828,7 @@ def initialize_vqbc_from_official(
         example_previous_actions,
         example_previous_team_rewards,
         example_episode_start,
+        belief,
     )
     encoder_variables = model.init(
         encoder_key,
@@ -739,16 +838,12 @@ def initialize_vqbc_from_official(
         jnp.zeros(example_observations.shape[:2], dtype=jnp.bool_),
         method=model.encode_response,
     )
-    initialized = {
-        str(name): value for name, value in variables["params"].items()
-    }
+    initialized = {str(name): value for name, value in variables["params"].items()}
     initialized["response_encoder"] = encoder_variables["params"][
         "response_encoder"
     ]
     return copy_explicit_parameter_leaves(
-        initialized,
-        official_params,
-        explicit_official_parameter_mapping(),
+        initialized, official_params, explicit_official_parameter_mapping()
     )
 
 

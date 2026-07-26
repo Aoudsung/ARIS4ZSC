@@ -22,7 +22,7 @@ from ..contracts.outer_units import (
 )
 
 
-VQBC_SCHEMA_VERSION = "path_c_model_v4_1"
+VQBC_SCHEMA_VERSION = "path_c_model_v4_2"
 VQBC_FORMAL_ENVIRONMENT_STEPS = 11_000_000
 VQBC_DEVELOPMENT_ENVIRONMENT_STEPS = 1_228_800
 VQBC_FORMAL_NUM_ENVS = 250
@@ -850,7 +850,7 @@ class VQBCFormalTemplate:
     def from_mapping(
         cls, payload: Mapping[str, Any], *, base_dir: str | Path = "."
     ) -> "VQBCFormalTemplate":
-        payload = _mapping(payload, "path_c_model_v4_1 formal template")
+        payload = _mapping(payload, "path_c_model_v4_2 formal template")
         fields = {
             "schema_version",
             "run_kind",

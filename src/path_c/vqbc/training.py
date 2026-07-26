@@ -1,25 +1,24 @@
-"""Fresh-rollout training, separate optimizers, target updates, and KL control."""
+"""Fresh-rollout VQBC V4.2 training with behavior-consistent targets."""
 
 from __future__ import annotations
 
 from typing import Any, Mapping, NamedTuple
 
-from .codebook import (
-    nearest_codes,
-    target_response_signatures,
-    update_codebook,
-)
+from .codebook import nearest_codes, target_response_signatures, update_codebook
+from .model import vqbc_forward
 from .objectives import (
     FrozenAssignments,
+    LossBundle,
     bellman_loss,
     bellman_targets,
     episode_responsibility_evidence,
     outcome_loss,
+    raw_policy_continuation_targets,
     response_encoder_loss,
     sample_bootstrap_mask,
 )
-from .policy import regularized_policy, update_log_temperature
-from .model import vqbc_forward
+from .policy import uniform_slot_log_belief, update_log_temperature
+from .quotient import slot_bayes_update
 from .types import VQBCKLState, VQBCRolloutBatch
 
 
@@ -54,8 +53,6 @@ def _bellman_labels(params: Mapping[str, Any]) -> Any:
     import jax
 
     labels = _labels_for_top_level(params, {"backbone"})
-    if "q_heads" not in params:
-        raise ValueError("Fourth-model parameters are missing q_heads.")
     labels["q_heads"] = {
         str(name): jax.tree_util.tree_map(
             lambda unused, label=(
@@ -75,8 +72,6 @@ def make_optimizers(
     outcome_learning_rate: float,
     gradient_clip_norm: float,
 ) -> OptimizerBundle:
-    """Clip Bellman and outcome gradients separately before their Adam updates."""
-
     import optax
 
     def transform(rate: float, labels: Any) -> Any:
@@ -91,9 +86,7 @@ def make_optimizers(
             labels,
         )
 
-    bellman = transform(
-        bellman_learning_rate, _bellman_labels(params)
-    )
+    bellman = transform(bellman_learning_rate, _bellman_labels(params))
     outcome = transform(
         outcome_learning_rate,
         _labels_for_top_level(params, {"outcome", "response_encoder"}),
@@ -116,6 +109,7 @@ def apply_model_sequence(
         batch.previous_actions,
         batch.previous_team_rewards,
         batch.episode_start,
+        batch.slot_log_beliefs,
     )
     del unused_carry
     return output
@@ -131,62 +125,173 @@ def apply_control_sequence(
         batch.previous_actions,
         batch.previous_team_rewards,
         batch.episode_start,
+        batch.slot_log_beliefs,
         method=model.control_only,
     )
     del unused_carry
     return output
 
 
-def slice_rollout_batch(
-    batch: VQBCRolloutBatch, indexes: Any
-) -> VQBCRolloutBatch:
-    return VQBCRolloutBatch(
-        observations=batch.observations[:, indexes],
-        response_next_observations=batch.response_next_observations[:, indexes],
-        episode_start=batch.episode_start[:, indexes],
-        previous_actions=batch.previous_actions[:, indexes],
-        previous_team_rewards=batch.previous_team_rewards[:, indexes],
-        initial_value_carry=batch.initial_value_carry[indexes],
-        reference_logits=batch.reference_logits[:, indexes],
-        execution_logits=batch.execution_logits[:, indexes],
-        generic_execution_logits=batch.generic_execution_logits[:, indexes],
-        slot_log_beliefs=batch.slot_log_beliefs[:, indexes],
-        actions=batch.actions[:, indexes],
-        rewards=batch.rewards[:, indexes],
-        dones=batch.dones[:, indexes],
-        response_codes=batch.response_codes[:, indexes],
-        episode_ids=batch.episode_ids[:, indexes],
-        episode_steps=batch.episode_steps[:, indexes],
-        completed_episode_returns=batch.completed_episode_returns[:, indexes],
-        quotient_counts=batch.quotient_counts[:, indexes],
-        j_use=batch.j_use[:, indexes],
-        j_mask=batch.j_mask[:, indexes],
+def apply_heads_from_features(
+    *,
+    model: Any,
+    params: Mapping[str, Any],
+    features: Any,
+    slot_log_beliefs: Any,
+) -> Mapping[str, Any]:
+    return model.apply(
+        {"params": params},
+        features,
+        slot_log_beliefs,
+        method=model.from_features,
     )
 
 
-def _next_policy_probabilities(
+def slice_rollout_batch(batch: VQBCRolloutBatch, indexes: Any) -> VQBCRolloutBatch:
+    return VQBCRolloutBatch(
+        **{
+            name: (
+                value[:, indexes]
+                if name != "initial_value_carry"
+                else value[indexes]
+            )
+            for name, value in batch._asdict().items()
+        }
+    )
+
+
+def _forward(
     *,
-    target_output: Mapping[str, Any],
-    batch: VQBCRolloutBatch,
+    raw_output: Mapping[str, Any],
+    reference_logits: Any,
+    slot_log_belief: Any,
     temperature: Any,
     generic_temperature: Any,
     gamma: float,
 ) -> Any:
-    forward = vqbc_forward(
-        raw_output={
-            name: value[1:]
-            for name, value in target_output.items()
-        },
-        reference_logits=batch.reference_logits[1:],
-        slot_log_belief=batch.slot_log_beliefs[1:],
+    return vqbc_forward(
+        raw_output=raw_output,
+        reference_logits=reference_logits,
+        slot_log_belief=slot_log_belief,
         temperature=temperature,
         generic_temperature=generic_temperature,
         deployment_mode="posterior_use",
         gamma=gamma,
     )
+
+
+def _branch_targets(
+    *,
+    model: Any,
+    target_params: Mapping[str, Any],
+    target_output: Mapping[str, Any],
+    batch: VQBCRolloutBatch,
+    temperature: Any,
+    generic_temperature: Any,
+    gamma: float,
+) -> tuple[Any, Any, Any, Any, Any]:
+    """Exact runtime policy targets for use and one-response-mask branches."""
+
     import jax
 
-    return jax.nn.softmax(forward.execution_logits, axis=-1)
+    use_raw = {name: value[1:] for name, value in target_output.items()}
+    use_forward = _forward(
+        raw_output=use_raw,
+        reference_logits=batch.reference_logits[1:],
+        slot_log_belief=batch.slot_log_beliefs[1:],
+        temperature=temperature,
+        generic_temperature=generic_temperature,
+        gamma=gamma,
+    )
+    # Same next observation/history; only the controller belief is masked.
+    mask_raw = jax.tree_util.tree_map(
+        jax.lax.stop_gradient,
+        apply_heads_from_features(
+            model=model,
+            params=target_params,
+            features=target_output["features"][1:],
+            slot_log_beliefs=batch.slot_log_beliefs[:-1],
+        ),
+    )
+    mask_forward = _forward(
+        raw_output=mask_raw,
+        reference_logits=batch.reference_logits[1:],
+        slot_log_belief=batch.slot_log_beliefs[:-1],
+        temperature=temperature,
+        generic_temperature=generic_temperature,
+        gamma=gamma,
+    )
+    import jax.numpy as jnp
+
+    use_probabilities = jax.nn.softmax(use_forward.execution_logits, axis=-1)
+    mask_probabilities = jax.nn.softmax(mask_forward.execution_logits, axis=-1)
+    use_targets = raw_policy_continuation_targets(
+        execution_probabilities=use_probabilities,
+        target_q_values=use_raw["q_values"],
+        dones=batch.dones,
+    )
+    mask_targets = raw_policy_continuation_targets(
+        execution_probabilities=mask_probabilities,
+        target_q_values=mask_raw["q_values"],
+        dones=batch.dones,
+    )
+    return use_forward, mask_forward, use_probabilities, use_targets, mask_targets
+
+
+def _stale_belief_targets(
+    *,
+    model: Any,
+    target_params: Mapping[str, Any],
+    target_output: Mapping[str, Any],
+    batch: VQBCRolloutBatch,
+    response_codes: Any,
+    temperature: Any,
+    generic_temperature: Any,
+    gamma: float,
+) -> tuple[Any, Any]:
+    """Bellman targets for the one-response-stale states used by A2-mask."""
+
+    import jax
+
+    stale_current = batch.slot_log_beliefs[:-2]
+    stale_current_raw = apply_heads_from_features(
+        model=model,
+        params=target_params,
+        features=target_output["features"][1:-1],
+        slot_log_beliefs=stale_current,
+    )
+    stale_next = slot_bayes_update(
+        slot_log_belief=stale_current,
+        slot_response_probabilities=stale_current_raw["response_probabilities"],
+        action=batch.actions[1:],
+        response_code=response_codes[1:],
+    )
+    stale_next_raw = jax.tree_util.tree_map(
+        jax.lax.stop_gradient,
+        apply_heads_from_features(
+            model=model,
+            params=target_params,
+            features=target_output["features"][2:],
+            slot_log_beliefs=stale_next,
+        ),
+    )
+    stale_forward = _forward(
+        raw_output=stale_next_raw,
+        reference_logits=batch.reference_logits[2:],
+        slot_log_belief=stale_next,
+        temperature=temperature,
+        generic_temperature=generic_temperature,
+        gamma=gamma,
+    )
+    probabilities = jax.nn.softmax(stale_forward.execution_logits, axis=-1)
+    targets = bellman_targets(
+        rewards=batch.rewards[1:],
+        dones=batch.dones[1:],
+        next_execution_probabilities=probabilities,
+        target_next_q_values=stale_next_raw["q_values"],
+        gamma=gamma,
+    )
+    return jax.lax.stop_gradient(stale_current), jax.lax.stop_gradient(targets)
 
 
 def prepare_frozen_assignments(
@@ -206,76 +311,101 @@ def prepare_frozen_assignments(
     terminal_response: int = 15,
     environment_chunk_size: int | None = None,
 ) -> FrozenAssignments:
-    """Run a frozen target-network E-step over complete episode lanes."""
+    """Cross-fitted target-network E-step over complete episode lanes."""
 
     import jax
     import jax.numpy as jnp
 
-    del online_params  # E-step evidence is cross-fitted from the target model.
+    del online_params
     environment_count = int(batch.actions.shape[1])
-    chunk_size = (
-        environment_count
-        if environment_chunk_size is None
-        else int(environment_chunk_size)
+    chunk_size = environment_count if environment_chunk_size is None else int(
+        environment_chunk_size
     )
-    if chunk_size <= 0:
-        raise ValueError("Assignment environment chunks must be positive.")
-    if environment_count % chunk_size:
-        raise ValueError(
-            "Assignment environment count must divide exactly into lane chunks."
-        )
+    if chunk_size <= 0 or environment_count % chunk_size:
+        raise ValueError("Assignment chunks must divide environment lanes.")
     slot_count = int(batch.slot_log_beliefs.shape[-1])
-    if bootstrap_mask is None:
-        mask = sample_bootstrap_mask(
+    mask = (
+        sample_bootstrap_mask(
             key,
             environment_count=environment_count,
             slot_count=slot_count,
             probability=bootstrap_probability,
         )
-    else:
-        mask = jnp.asarray(bootstrap_mask, dtype=jnp.bool_)
-        if mask.shape != (environment_count, slot_count):
-            raise ValueError("A supplied bootstrap mask has the wrong shape.")
-    chunk_offsets = jnp.arange(chunk_size, dtype=jnp.int32)
+        if bootstrap_mask is None
+        else jnp.asarray(bootstrap_mask, dtype=jnp.bool_)
+    )
+    if mask.shape != (environment_count, slot_count):
+        raise ValueError("Bootstrap mask has the wrong shape.")
+    offsets = jnp.arange(chunk_size, dtype=jnp.int32)
 
-    def prepare_chunk(start: Any) -> tuple[Any, Any, Any, Any, Any]:
-        indexes = start + chunk_offsets
+    def prepare_chunk(start: Any) -> tuple[Any, ...]:
+        indexes = start + offsets
         current = slice_rollout_batch(batch, indexes)
         target = jax.tree_util.tree_map(
             jax.lax.stop_gradient,
-            apply_model_sequence(
-                model=model, params=target_params, batch=current
-            ),
+            apply_model_sequence(model=model, params=target_params, batch=current),
         )
-        next_probabilities = _next_policy_probabilities(
+        (
+            unused_use_forward,
+            unused_mask_forward,
+            use_probabilities,
+            use_continuation_targets,
+            mask_continuation_targets,
+        ) = _branch_targets(
+            model=model,
+            target_params=target_params,
             target_output=target,
             batch=current,
             temperature=temperature,
             generic_temperature=generic_temperature,
             gamma=gamma,
         )
+        del unused_use_forward, unused_mask_forward
         targets = jax.lax.stop_gradient(
             bellman_targets(
                 rewards=current.rewards,
                 dones=current.dones,
-                next_execution_probabilities=next_probabilities,
+                next_execution_probabilities=use_probabilities,
                 target_next_q_values=target["q_values"][1:],
                 gamma=gamma,
             )
         )
+        # Response codes are properties of the observable transition, not of
+        # the controller belief used by a particular counterfactual branch.
+        # Re-evaluate the target heads under a canonical uniform belief so an
+        # identical (o, a, o') transition cannot receive different code targets
+        # solely because use and mask carry different explicit beliefs.
+        canonical_belief = uniform_slot_log_belief(
+            target["features"][1:].shape[:-1], slot_count
+        )
+        canonical = jax.tree_util.tree_map(
+            jax.lax.stop_gradient,
+            apply_heads_from_features(
+                model=model,
+                params=target_params,
+                features=target["features"][1:],
+                slot_log_beliefs=canonical_belief,
+            ),
+        )
         signatures = jax.lax.stop_gradient(
             target_response_signatures(
-                target_centered_advantages=target[
-                    "centered_advantages"
-                ][1:]
+                target_centered_advantages=canonical["centered_advantages"]
             )
         )
-        code_targets, unused_error = nearest_codes(
-            signatures, codebook_embeddings
-        )
+        code_targets, unused_error = nearest_codes(signatures, codebook_embeddings)
         del unused_error
         code_targets = jax.lax.stop_gradient(
             jnp.where(current.dones, terminal_response, code_targets)
+        )
+        stale_beliefs, stale_targets = _stale_belief_targets(
+            model=model,
+            target_params=target_params,
+            target_output=target,
+            batch=current,
+            response_codes=current.response_codes,
+            temperature=temperature,
+            generic_temperature=generic_temperature,
+            gamma=gamma,
         )
         responsibilities, energies = episode_responsibility_evidence(
             q_values=target["q_values"][:-1],
@@ -287,46 +417,54 @@ def prepare_frozen_assignments(
             reward_log_standard_deviation=target[
                 "reward_log_standard_deviation"
             ][:-1],
-            next_q_mean=target["next_q_mean"][:-1],
-            next_q_log_standard_deviation=target[
-                "next_q_log_standard_deviation"
+            continuation_use_mean=target["continuation_use_mean"][:-1],
+            continuation_use_log_standard_deviation=target[
+                "continuation_use_log_standard_deviation"
             ][:-1],
-            response_codes=code_targets,
+            continuation_mask_mean=target["continuation_mask_mean"][:-1],
+            continuation_mask_log_standard_deviation=target[
+                "continuation_mask_log_standard_deviation"
+            ][:-1],
+            response_codes=current.response_codes,
             rewards=current.rewards,
-            target_next_q_values=target["q_values"][1:],
-            dones=current.dones,
+            continuation_use_targets=use_continuation_targets,
+            continuation_mask_targets=mask_continuation_targets,
             availability_mask=mask[indexes],
         )
-        return responsibilities, energies, targets, signatures, code_targets
+        return (
+            responsibilities,
+            energies,
+            targets,
+            stale_targets,
+            stale_beliefs,
+            signatures,
+            code_targets,
+            use_continuation_targets,
+            mask_continuation_targets,
+        )
 
     starts = jnp.arange(0, environment_count, chunk_size, dtype=jnp.int32)
-    (
-        chunk_responsibilities,
-        chunk_energies,
-        chunk_targets,
-        chunk_signatures,
-        chunk_code_targets,
-    ) = jax.lax.map(prepare_chunk, starts)
+    chunks = jax.lax.map(prepare_chunk, starts)
     time_count = int(batch.actions.shape[0])
+
+    def restore_time(values: Any, length: int) -> Any:
+        return jnp.swapaxes(values, 0, 1).reshape(
+            (length, environment_count) + values.shape[3:]
+        )
+
     return FrozenAssignments(
-        responsibilities=chunk_responsibilities.reshape(
-            (environment_count, chunk_responsibilities.shape[-1])
-        ),
-        responsibility_energies=chunk_energies.reshape(
-            (environment_count, chunk_energies.shape[-1])
+        responsibilities=chunks[0].reshape((environment_count, slot_count)),
+        responsibility_energies=chunks[1].reshape(
+            (environment_count, slot_count)
         ),
         bootstrap_mask=mask,
-        bellman_targets=jnp.swapaxes(chunk_targets, 0, 1).reshape(
-            (time_count, environment_count, chunk_targets.shape[-1])
-        ),
-        response_signature_targets=jnp.swapaxes(
-            chunk_signatures, 0, 1
-        ).reshape(
-            (time_count, environment_count, chunk_signatures.shape[-1])
-        ),
-        response_code_targets=jnp.swapaxes(
-            chunk_code_targets, 0, 1
-        ).reshape((time_count, environment_count)),
+        bellman_targets=restore_time(chunks[2], time_count),
+        stale_bellman_targets=restore_time(chunks[3], time_count - 1),
+        stale_current_beliefs=restore_time(chunks[4], time_count - 1),
+        response_signature_targets=restore_time(chunks[5], time_count),
+        response_code_targets=restore_time(chunks[6], time_count),
+        continuation_use_targets=restore_time(chunks[7], time_count),
+        continuation_mask_targets=restore_time(chunks[8], time_count),
     )
 
 
@@ -335,18 +473,19 @@ def slice_environment_lanes(
 ) -> tuple[VQBCRolloutBatch, FrozenAssignments]:
     import jax
 
-    batch_slice = slice_rollout_batch(batch, indexes)
     assignment_slice = FrozenAssignments(
         responsibilities=assignments.responsibilities[indexes],
         responsibility_energies=assignments.responsibility_energies[indexes],
         bootstrap_mask=assignments.bootstrap_mask[indexes],
         bellman_targets=assignments.bellman_targets[:, indexes],
-        response_signature_targets=assignments.response_signature_targets[
-            :, indexes
-        ],
+        stale_bellman_targets=assignments.stale_bellman_targets[:, indexes],
+        stale_current_beliefs=assignments.stale_current_beliefs[:, indexes],
+        response_signature_targets=assignments.response_signature_targets[:, indexes],
         response_code_targets=assignments.response_code_targets[:, indexes],
+        continuation_use_targets=assignments.continuation_use_targets[:, indexes],
+        continuation_mask_targets=assignments.continuation_mask_targets[:, indexes],
     )
-    return batch_slice, jax.tree_util.tree_map(
+    return slice_rollout_batch(batch, indexes), jax.tree_util.tree_map(
         jax.lax.stop_gradient, assignment_slice
     )
 
@@ -358,21 +497,13 @@ def environment_minibatch_schedule(
     minibatches_per_epoch: int,
     update_epochs: int,
 ) -> Any:
-    """Return exact non-repeating lane partitions for every training epoch."""
-
     import jax
     import jax.numpy as jnp
 
-    if minibatches_per_epoch <= 0 or update_epochs <= 0:
-        raise ValueError("Minibatches and update epochs must be positive.")
     if environment_count < minibatches_per_epoch:
-        raise ValueError(
-            "Minibatches per epoch cannot exceed complete environment lanes."
-        )
+        raise ValueError("Minibatches cannot exceed complete environment lanes.")
     if environment_count % minibatches_per_epoch:
-        raise ValueError(
-            "Environment lanes must divide exactly into recurrent minibatches."
-        )
+        raise ValueError("Environment lanes must divide exactly into minibatches.")
     lane_count = environment_count // minibatches_per_epoch
     keys = jax.random.split(key, update_epochs)
     return jnp.stack(
@@ -390,24 +521,36 @@ def _losses(
     *,
     model: Any,
     params: Mapping[str, Any],
-    target_params: Mapping[str, Any],
     batch: VQBCRolloutBatch,
     assignments: FrozenAssignments,
     codebook_embeddings: Any,
-) -> tuple[Any, Any]:
-    import jax
-
+) -> tuple[LossBundle, tuple[Any, Mapping[str, Any]]]:
     output = apply_model_sequence(model=model, params=params, batch=batch)
-    target_output = jax.tree_util.tree_map(
-        jax.lax.stop_gradient,
-        apply_model_sequence(model=model, params=target_params, batch=batch),
-    )
-    bellman = bellman_loss(
+    actual = bellman_loss(
         q_values=output["q_values"][:-1],
         actions=batch.actions,
         targets=assignments.bellman_targets,
         stopped_responsibilities=assignments.responsibilities,
         bootstrap_mask=assignments.bootstrap_mask,
+        metric_prefix="bellman",
+    )
+    stale_raw = apply_heads_from_features(
+        model=model,
+        params=params,
+        features=output["features"][1:-1],
+        slot_log_beliefs=assignments.stale_current_beliefs,
+    )
+    stale = bellman_loss(
+        q_values=stale_raw["q_values"],
+        actions=batch.actions[1:],
+        targets=assignments.stale_bellman_targets,
+        stopped_responsibilities=assignments.responsibilities,
+        bootstrap_mask=assignments.bootstrap_mask,
+        metric_prefix="stale_belief_bellman",
+    )
+    bellman = LossBundle(
+        total=actual.total + stale.total,
+        metrics={**actual.metrics, **stale.metrics},
     )
     outcome = outcome_loss(
         response_logits=output["response_logits"][:-1],
@@ -415,14 +558,18 @@ def _losses(
         reward_log_standard_deviation=output[
             "reward_log_standard_deviation"
         ][:-1],
-        next_q_mean=output["next_q_mean"][:-1],
-        next_q_log_standard_deviation=output[
-            "next_q_log_standard_deviation"
+        continuation_use_mean=output["continuation_use_mean"][:-1],
+        continuation_use_log_standard_deviation=output[
+            "continuation_use_log_standard_deviation"
         ][:-1],
-        response_codes=assignments.response_code_targets,
+        continuation_mask_mean=output["continuation_mask_mean"][:-1],
+        continuation_mask_log_standard_deviation=output[
+            "continuation_mask_log_standard_deviation"
+        ][:-1],
+        response_codes=batch.response_codes,
         rewards=batch.rewards,
-        target_next_q_values=target_output["q_values"][1:],
-        dones=batch.dones,
+        continuation_use_targets=assignments.continuation_use_targets,
+        continuation_mask_targets=assignments.continuation_mask_targets,
         actions=batch.actions,
         stopped_responsibilities=assignments.responsibilities,
         bootstrap_mask=assignments.bootstrap_mask,
@@ -465,31 +612,29 @@ def apply_minibatch_update(
     import optax
 
     def bellman_function(candidate: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
-        bellman, unused_outcome = _losses(
+        bellman, unused = _losses(
             model=model,
             params=candidate,
-            target_params=target_params,
             batch=batch,
             assignments=assignments,
             codebook_embeddings=codebook_embeddings,
         )
-        del unused_outcome
+        del unused
         return bellman.total, bellman.metrics
 
-    (unused_bellman_loss, bellman_metrics), bellman_gradients = (
-        jax.value_and_grad(bellman_function, has_aux=True)(params)
+    (unused, bellman_metrics), gradients = jax.value_and_grad(
+        bellman_function, has_aux=True
+    )(params)
+    del unused
+    updates, bellman_optimizer_state = bellman_optimizer.update(
+        gradients, bellman_optimizer_state, params
     )
-    del unused_bellman_loss
-    bellman_updates, bellman_optimizer_state = bellman_optimizer.update(
-        bellman_gradients, bellman_optimizer_state, params
-    )
-    params = optax.apply_updates(params, bellman_updates)
+    params = optax.apply_updates(params, updates)
 
     def outcome_function(candidate: Mapping[str, Any]) -> tuple[Any, Mapping[str, Any]]:
         unused_bellman, outcome = _losses(
             model=model,
             params=candidate,
-            target_params=target_params,
             batch=batch,
             assignments=assignments,
             codebook_embeddings=codebook_embeddings,
@@ -497,17 +642,15 @@ def apply_minibatch_update(
         del unused_bellman
         return outcome
 
-    (unused_outcome_loss, outcome_metrics), outcome_gradients = (
-        jax.value_and_grad(outcome_function, has_aux=True)(params)
+    (unused, outcome_metrics), gradients = jax.value_and_grad(
+        outcome_function, has_aux=True
+    )(params)
+    del unused
+    updates, outcome_optimizer_state = outcome_optimizer.update(
+        gradients, outcome_optimizer_state, params
     )
-    del unused_outcome_loss
-    outcome_updates, outcome_optimizer_state = outcome_optimizer.update(
-        outcome_gradients, outcome_optimizer_state, params
-    )
-    params = optax.apply_updates(params, outcome_updates)
-    target_params = polyak_update(
-        target_params, params, polyak_coefficient
-    )
+    params = optax.apply_updates(params, updates)
+    target_params = polyak_update(target_params, params, polyak_coefficient)
     return TrainingUpdate(
         params=params,
         target_params=target_params,
@@ -529,8 +672,6 @@ def apply_rollout_updates(
     schedule: Any,
     polyak_coefficient: float,
 ) -> TrainingUpdate:
-    """Run one M-step epoch over an exact complete-lane partition."""
-
     import jax
     import jax.numpy as jnp
 
@@ -544,7 +685,7 @@ def apply_rollout_updates(
         optimizer_bundle.outcome_state,
     )
 
-    def update_one(carry: tuple[Any, Any, Any, Any], indexes: Any) -> tuple[Any, Any]:
+    def update_one(carry: tuple[Any, ...], indexes: Any) -> tuple[Any, Any]:
         current_params, current_target, bellman_state, outcome_state = carry
         minibatch, mini_assignments = slice_environment_lanes(
             batch, assignments, indexes
@@ -597,10 +738,10 @@ def rollout_kl_means(batch: VQBCRolloutBatch) -> tuple[Any, Any]:
     reference = jax.nn.log_softmax(batch.reference_logits[:-1], axis=-1)
 
     def one(logits: Any) -> Any:
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        probabilities = jnp.exp(log_probs)
+        log_probabilities = jax.nn.log_softmax(logits, axis=-1)
+        probabilities = jnp.exp(log_probabilities)
         return jnp.mean(
-            jnp.sum(probabilities * (log_probs - reference), axis=-1)
+            jnp.sum(probabilities * (log_probabilities - reference), axis=-1)
         )
 
     return one(batch.execution_logits), one(batch.generic_execution_logits)
@@ -642,9 +783,7 @@ def _code_usage_summary(codes: Any, *, response_count: int) -> Mapping[str, Any]
         return {
             "counts": current_counts,
             "probabilities": probabilities,
-            "active_code_count": jnp.sum(
-                current_counts > 0, dtype=jnp.int32
-            ),
+            "active_code_count": jnp.sum(current_counts > 0, dtype=jnp.int32),
             "entropy": entropy,
             "perplexity": jnp.where(total > 0, jnp.exp(entropy), 0.0),
         }
@@ -661,131 +800,91 @@ def rollout_health_diagnostics(
     assignments: FrozenAssignments,
     response_count: int = 16,
 ) -> Mapping[str, Any]:
-    """Summarize slot, response, posterior, policy, and control health."""
-
     import jax
     import jax.numpy as jnp
 
-    responsibilities = jnp.asarray(
-        assignments.responsibilities, dtype=jnp.float32
-    )
+    responsibilities = jnp.asarray(assignments.responsibilities)
     responsibility_entropy = -jnp.sum(
-        responsibilities
-        * jnp.log(jnp.maximum(responsibilities, 1.0e-12)),
+        responsibilities * jnp.log(jnp.maximum(responsibilities, 1.0e-12)),
         axis=-1,
     )
     slot_count = int(responsibilities.shape[-1])
-    responsibility_mass = jnp.sum(responsibilities, axis=0)
-    responsibility_fraction = responsibility_mass / jnp.maximum(
-        jnp.sum(responsibility_mass), 1.0
+    mass = jnp.sum(responsibilities, axis=0)
+    fraction = mass / jnp.maximum(jnp.sum(mass), 1.0)
+    mass_entropy = -jnp.sum(
+        fraction * jnp.log(jnp.maximum(fraction, 1.0e-12))
     )
-    responsibility_mass_entropy = -jnp.sum(
-        responsibility_fraction
-        * jnp.log(jnp.maximum(responsibility_fraction, 1.0e-12))
-    )
-    energies = jnp.asarray(
-        assignments.responsibility_energies, dtype=jnp.float32
-    )
-    sorted_energies = jnp.sort(energies, axis=-1)
-    energy_margin = sorted_energies[..., 1] - sorted_energies[..., 0]
-    energy_spread = sorted_energies[..., -1] - sorted_energies[..., 0]
-
-    quotient_counts = jnp.asarray(batch.quotient_counts, dtype=jnp.int32)
-    quotient_histogram = jnp.bincount(
-        quotient_counts.reshape((-1,)), length=slot_count + 1
-    )[1:]
-
-    reference_log_probabilities = jax.nn.log_softmax(
-        batch.reference_logits[:-1], axis=-1
-    )
-
-    def policy_kl(logits: Any) -> Any:
-        log_probabilities = jax.nn.log_softmax(logits, axis=-1)
-        probabilities = jnp.exp(log_probabilities)
-        return jnp.maximum(
-            jnp.sum(
-                probabilities
-                * (log_probabilities - reference_log_probabilities),
-                axis=-1,
-            ),
-            0.0,
-        )
-
-    posterior_kl = policy_kl(batch.execution_logits)
-    generic_kl = policy_kl(batch.generic_execution_logits)
-    reference_argmax = jnp.argmax(batch.reference_logits[:-1], axis=-1)
-
-    slot_log_probabilities = jax.nn.log_softmax(
-        batch.slot_log_beliefs[:-1], axis=-1
-    )
-    slot_probabilities = jnp.exp(slot_log_probabilities)
-    posterior_entropy = -jnp.sum(
-        slot_probabilities * slot_log_probabilities, axis=-1
-    )
-
-    value_difference = jnp.asarray(batch.j_use) - jnp.asarray(batch.j_mask)
-    selected_value_difference = jnp.take_along_axis(
-        value_difference,
-        jnp.asarray(batch.actions, dtype=jnp.int32)[..., None],
-        axis=-1,
-    )[..., 0]
-
+    energies = jnp.sort(assignments.responsibility_energies, axis=-1)
+    beliefs = jax.nn.log_softmax(batch.slot_log_beliefs[:-1], axis=-1)
+    probabilities = jnp.exp(beliefs)
+    posterior_entropy = -jnp.sum(probabilities * beliefs, axis=-1)
     return {
         "responsibility": {
             "entropy": _distribution_summary(responsibility_entropy),
-            "normalized_entropy_mean": (
-                jnp.mean(responsibility_entropy) / jnp.log(float(slot_count))
-            ),
-            "effective_mass_by_slot": responsibility_mass,
-            "effective_fraction_by_slot": responsibility_fraction,
-            "mass_entropy": responsibility_mass_entropy,
-            "effective_slot_count": jnp.exp(responsibility_mass_entropy),
-            "energy_margin": _distribution_summary(energy_margin),
-            "energy_spread": _distribution_summary(energy_spread),
+            "normalized_entropy_mean": jnp.mean(responsibility_entropy)
+            / jnp.log(float(slot_count)),
+            "effective_mass_by_slot": mass,
+            "effective_fraction_by_slot": fraction,
+            "mass_entropy": mass_entropy,
+            "effective_slot_count": jnp.exp(mass_entropy),
+            "energy_margin": _distribution_summary(energies[..., 1] - energies[..., 0]),
+            "energy_spread": _distribution_summary(energies[..., -1] - energies[..., 0]),
             "bootstrap_active_fraction": jnp.mean(
-                jnp.asarray(assignments.bootstrap_mask, dtype=jnp.float32)
+                assignments.bootstrap_mask.astype(jnp.float32)
             ),
         },
         "quotient": {
-            "active_count": _distribution_summary(quotient_counts),
-            "count_histogram": quotient_histogram,
+            "posterior_supported_active_count": _distribution_summary(
+                batch.quotient_counts
+            ),
+            "count_histogram": jnp.bincount(
+                batch.quotient_counts.reshape((-1,)), length=slot_count + 1
+            )[1:],
         },
         "response_code": {
             "observed": _code_usage_summary(
                 batch.response_codes, response_count=response_count
             ),
             "value_target": _code_usage_summary(
-                assignments.response_code_targets,
-                response_count=response_count,
+                assignments.response_code_targets, response_count=response_count
             ),
         },
         "policy": {
-            "posterior_kl": _distribution_summary(posterior_kl),
-            "generic_kl": _distribution_summary(generic_kl),
-            "posterior_argmax_deviation_rate": jnp.mean(
-                jnp.argmax(batch.execution_logits, axis=-1)
-                != reference_argmax
-            ),
-            "generic_argmax_deviation_rate": jnp.mean(
-                jnp.argmax(batch.generic_execution_logits, axis=-1)
-                != reference_argmax
-            ),
             "posterior_entropy": _distribution_summary(posterior_entropy),
-            "normalized_posterior_entropy_mean": (
-                jnp.mean(posterior_entropy) / jnp.log(float(slot_count))
+            "normalized_posterior_entropy_mean": jnp.mean(posterior_entropy)
+            / jnp.log(float(slot_count)),
+            "use_mask_total_variation": _distribution_summary(
+                batch.predicted_policy_total_variations
             ),
         },
         "value_information": {
-            "all_action_j_use_minus_j_mask": {
-                **_distribution_summary(value_difference),
-                "positive_fraction": jnp.mean(value_difference > 0.0),
-            },
-            "executed_action_j_use_minus_j_mask": {
-                **_distribution_summary(selected_value_difference),
-                "positive_fraction": jnp.mean(
-                    selected_value_difference > 0.0
-                ),
-            },
+            "per_action_response_value": _distribution_summary(
+                batch.per_action_response_values
+            ),
+            "per_action_net_value": _distribution_summary(
+                batch.per_action_net_values
+            ),
+            "executed_action_response_value": _distribution_summary(
+                batch.executed_action_response_values
+            ),
+            "executed_action_net_value": _distribution_summary(
+                batch.executed_action_net_values
+            ),
+            "maximum_action_net_value": _distribution_summary(
+                batch.maximum_action_net_values
+            ),
+            "predicted_response_effect": _distribution_summary(
+                batch.predicted_response_effects
+            ),
+            "predicted_policy_cost": _distribution_summary(
+                batch.predicted_policy_costs
+            ),
+            "predicted_net_effect": _distribution_summary(
+                batch.predicted_net_effects
+            ),
+            "regularized_net_effect": _distribution_summary(
+                batch.predicted_regularized_net_effects
+            ),
         },
     }
 
@@ -842,8 +941,9 @@ def update_codebook_from_assignments(
 __all__ = [
     "OptimizerBundle",
     "TrainingUpdate",
-    "apply_minibatch_update",
     "apply_control_sequence",
+    "apply_heads_from_features",
+    "apply_minibatch_update",
     "apply_model_sequence",
     "apply_rollout_updates",
     "environment_minibatch_schedule",
@@ -852,6 +952,7 @@ __all__ = [
     "prepare_frozen_assignments",
     "rollout_health_diagnostics",
     "rollout_kl_means",
+    "sample_bootstrap_mask",
     "slice_environment_lanes",
     "slice_rollout_batch",
     "update_codebook_from_assignments",

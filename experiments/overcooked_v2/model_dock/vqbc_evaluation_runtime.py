@@ -14,6 +14,7 @@ from src.path_c.vqbc.checkpoint import (
 )
 from src.path_c.vqbc.evaluation import (
     VQBCEpisodeRow,
+    VQBC_EVALUATION_ROWS_SCHEMA_VERSION,
     VQBCPairing,
     VQBCPopulation,
     standard_episode_seed,
@@ -111,6 +112,7 @@ class VQBCDeploymentPolicy:
             previous_actions: Any,
             previous_rewards: Any,
             starts: Any,
+            slot_log_belief: Any,
         ) -> Any:
             return self.model.apply(
                 {"params": params},
@@ -119,6 +121,7 @@ class VQBCDeploymentPolicy:
                 previous_actions,
                 previous_rewards,
                 starts,
+                slot_log_belief,
             )
 
         def reference_apply(
@@ -330,7 +333,7 @@ def _evaluate_batch(
     ):
         rows.append(
             VQBCEpisodeRow(
-                schema_version="path_c_vqbc_evaluation_rows_v1",
+                schema_version=VQBC_EVALUATION_ROWS_SCHEMA_VERSION,
                 population_id=population_id,
                 layout=left.config.environment.layout,
                 deployment_mode=pairing.deployment_mode,
@@ -749,7 +752,7 @@ def run_development_evaluation(
     checkpoint = Path(checkpoint_path).resolve()
     entry = _DevelopmentEntry(config=config, checkpoint_path=checkpoint)
     population_id = (
-        f"path_c_vqbc_v4_development_{config.environment.layout}_"
+        f"path_c_vqbc_v4_2_development_{config.environment.layout}_"
         f"{config.seeds.model_seed}"
     )
     rows = []

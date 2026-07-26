@@ -17,12 +17,12 @@ from .checkpoint import (
 from .config import VQBCConfig
 from .config import VQBC_DEPLOYMENT_MODES
 from .integrity import file_sha256
-from .types import CheckpointMetadataV3
+from .types import CheckpointMetadataV4
 
 
-VQBC_POPULATION_SCHEMA_VERSION = "path_c_vqbc_population_v1"
-VQBC_EVALUATION_ROWS_SCHEMA_VERSION = "path_c_vqbc_evaluation_rows_v1"
-VQBC_EVALUATION_SUMMARY_SCHEMA_VERSION = "path_c_vqbc_evaluation_summary_v1"
+VQBC_POPULATION_SCHEMA_VERSION = "path_c_vqbc_population_v2"
+VQBC_EVALUATION_ROWS_SCHEMA_VERSION = "path_c_vqbc_evaluation_rows_v2"
+VQBC_EVALUATION_SUMMARY_SCHEMA_VERSION = "path_c_vqbc_evaluation_summary_v2"
 VQBC_OUTER_UNIT_COUNT = 10
 VQBC_PAIRINGS_PER_MODE = 100
 VQBC_EPISODES_PER_PAIRING = 500
@@ -43,7 +43,7 @@ class VQBCPopulationEntry:
     resolved_config_path: Path
     checkpoint_path: Path
     config: VQBCConfig
-    checkpoint_metadata: CheckpointMetadataV3
+    checkpoint_metadata: CheckpointMetadataV4
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +105,7 @@ def build_population_manifest(
         checkpoint_payload = json.loads(
             checkpoint_manifest.read_text(encoding="utf-8")
         )
-        metadata = CheckpointMetadataV3.from_mapping(
+        metadata = CheckpointMetadataV4.from_mapping(
             checkpoint_payload.get("metadata", {})
         )
         assert_reference_ownership(
@@ -222,7 +222,7 @@ def load_population(path: str | Path) -> VQBCPopulation:
         checkpoint_payload = json.loads(
             checkpoint_manifest.read_text(encoding="utf-8")
         )
-        metadata = CheckpointMetadataV3.from_mapping(
+        metadata = CheckpointMetadataV4.from_mapping(
             checkpoint_payload.get("metadata", {})
         )
         assert_reference_ownership(

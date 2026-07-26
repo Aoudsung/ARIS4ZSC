@@ -1,4 +1,4 @@
-"""Device-side complete-episode rollout for the fourth Path C model."""
+"""Device-side complete-episode rollout for behavior-consistent VQBC V4.2."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, NamedTuple
 from .model import encode_response_codes, vqbc_forward
 from .policy import (
     deployment_belief_after_response,
+    normalized_log_belief,
     regularized_policy,
     uniform_slot_log_belief,
 )
@@ -20,8 +21,6 @@ from .types import (
 
 
 class VQBCRolloutCallbacks(NamedTuple):
-    """Injected pure operations for official networks and training partners."""
-
     model_apply: Callable[..., Any]
     reference_apply: Callable[..., Any]
     partner_step: Callable[..., Any]
@@ -33,7 +32,7 @@ def _seat_observations(observations: Any, seats: Any) -> tuple[Any, Any]:
 
     values = jnp.asarray(observations)
     if values.ndim < 3 or values.shape[1] != 2:
-        raise ValueError("Vector observations must have [environment, seat, ...] shape.")
+        raise ValueError("Vector observations require [environment, seat, ...].")
     selector = jnp.asarray(seats, dtype=jnp.bool_).reshape(
         (values.shape[0],) + (1,) * (values.ndim - 2)
     )
@@ -58,9 +57,7 @@ def initialize_policy_state(
         reference_carry=reference_initial_carry(batch_size),
         value_carry=model_initial_carry(batch_size),
         slot_log_belief=uniform_slot_log_belief((batch_size,), slot_count),
-        previous_action=jnp.full(
-            (batch_size,), action_count, dtype=jnp.int32
-        ),
+        previous_action=jnp.full((batch_size,), action_count, dtype=jnp.int32),
         previous_team_reward=jnp.zeros((batch_size,), dtype=jnp.float32),
         episode_start=jnp.ones((batch_size,), dtype=jnp.bool_),
         log_temperature=jnp.full(
@@ -79,8 +76,8 @@ def initialize_rollout(
     reference_initial_carry: Callable[[int], Any],
     partner_initial_carry: Callable[[int], Any],
     random_key: Any,
-    slot_count: int = 8,
-    action_count: int = 6,
+    slot_count: int,
+    action_count: int,
     partner_member_count: int,
     initial_temperature: float = 1.0,
 ) -> VQBCRolloutState:
@@ -89,7 +86,9 @@ def initialize_rollout(
 
     if partner_member_count <= 0:
         raise ValueError("At least one immutable training partner is required.")
-    next_key, environment_key, partner_key, seat_key = jax.random.split(random_key, 4)
+    next_key, environment_key, partner_key, seat_key = jax.random.split(
+        random_key, 4
+    )
     environment_state, observations = environment.reset(environment_key)
     count = int(environment.num_envs)
     return VQBCRolloutState(
@@ -104,8 +103,6 @@ def initialize_rollout(
             initial_temperature=initial_temperature,
         ),
         partner_carry=partner_initial_carry(count),
-        # Member zero is the rollout-frozen current policy.  Remaining indexes
-        # address immutable historical checkpoints.
         partner_member_index=jax.random.randint(
             partner_key, (count,), 0, partner_member_count + 1
         ),
@@ -132,6 +129,12 @@ def policy_action(
     import jax
     import jax.numpy as jnp
 
+    belief = policy_state.slot_log_belief
+    if deployment_mode == "prior_only":
+        belief = uniform_slot_log_belief(
+            belief.shape[:-1], int(belief.shape[-1])
+        )
+    belief = normalized_log_belief(belief)
     next_reference_carry, reference_logits = callbacks.reference_apply(
         policy_state.reference_carry,
         observations,
@@ -144,13 +147,9 @@ def policy_action(
         policy_state.previous_action[None, ...],
         policy_state.previous_team_reward[None, ...],
         policy_state.episode_start[None, ...],
+        belief[None, ...],
     )
     raw = jax.tree_util.tree_map(lambda value: value[0], raw_sequence)
-    belief = policy_state.slot_log_belief
-    if deployment_mode == "prior_only":
-        belief = uniform_slot_log_belief(
-            belief.shape[:-1], int(belief.shape[-1])
-        )
     output = vqbc_forward(
         raw_output=raw,
         reference_logits=reference_logits,
@@ -180,14 +179,18 @@ def policy_action(
     execution_probs = jnp.exp(execution_log_probs)
     kl = jnp.maximum(
         jnp.sum(
-            execution_probs * (execution_log_probs - reference_log_probs),
-            axis=-1,
+            execution_probs * (execution_log_probs - reference_log_probs), axis=-1
         ),
         0.0,
     )
-    class_count = jnp.max(output.quotient_ids, axis=-1) + 1
     slot_probs = jnp.exp(belief)
     entropy = -jnp.sum(slot_probs * belief, axis=-1)
+    executed_response = jnp.take_along_axis(
+        output.per_action_response_value, action[..., None], axis=-1
+    )[..., 0]
+    executed_net = jnp.take_along_axis(
+        output.per_action_net_value, action[..., None], axis=-1
+    )[..., 0]
     next_state = policy_state._replace(
         reference_carry=next_reference_carry,
         value_carry=next_value_carry,
@@ -196,14 +199,29 @@ def policy_action(
     record = VQBCDecisionRecord(
         reference_logits=reference_logits,
         execution_logits=output.execution_logits,
+        mask_execution_logits=output.mask_execution_logits,
         j_use=output.j_use,
         j_mask=output.j_mask,
+        per_action_response_value=output.per_action_response_value,
+        per_action_net_value=output.per_action_net_value,
         kl_divergence=kl,
         action=action,
         reference_greedy_action=jnp.argmax(reference_logits, axis=-1),
-        quotient_count=class_count,
+        quotient_count=output.supported_quotient_count,
         belief_entropy=entropy,
         response_code=jnp.full(action.shape, -1, dtype=jnp.int32),
+        predicted_response_effect=output.predicted_response_effect,
+        predicted_policy_cost=output.predicted_policy_cost,
+        predicted_net_effect=output.predicted_net_effect,
+        predicted_regularized_net_effect=(
+            output.predicted_regularized_net_effect
+        ),
+        predicted_policy_total_variation=(
+            output.predicted_policy_total_variation
+        ),
+        executed_action_response_value=executed_response,
+        executed_action_net_value=executed_net,
+        maximum_action_net_value=jnp.max(output.per_action_net_value, axis=-1),
     )
     return next_state, action, output, record, generic.logits
 
@@ -222,13 +240,11 @@ def collect_rollout(
     gamma: float = 0.99,
     terminal_response: int = 15,
 ) -> tuple[VQBCRolloutState, VQBCRolloutBatch]:
-    """Collect synchronized complete episodes without carrying a replay pool."""
-
     import jax
     import jax.numpy as jnp
 
     if length != int(environment.episode_steps):
-        raise ValueError("Fourth-model rollout length must equal one full episode.")
+        raise ValueError("VQBC rollout length must equal one full episode.")
     count = int(environment.num_envs)
     initial_value_carry = state.policy_state.value_carry
 
@@ -247,13 +263,7 @@ def collect_rollout(
         ego_observation, partner_observation = _seat_observations(
             current.observations, current.ego_seat
         )
-        (
-            stepped_policy,
-            ego_action,
-            output,
-            decision,
-            generic_logits,
-        ) = policy_action(
+        stepped_policy, ego_action, output, decision, generic_logits = policy_action(
             callbacks=callbacks,
             params=params,
             policy_state=current.policy_state,
@@ -262,17 +272,15 @@ def collect_rollout(
             deployment_mode=deployment_mode,
             gamma=gamma,
         )
-        (
-            partner_action,
-            tentative_partner_carry,
-            partner_context,
-        ) = callbacks.partner_step(
-            params,
-            current.partner_member_index,
-            partner_observation,
-            current.partner_carry,
-            current.policy_state.episode_start,
-            partner_key,
+        partner_action, tentative_partner_carry, partner_context = (
+            callbacks.partner_step(
+                params,
+                current.partner_member_index,
+                partner_observation,
+                current.partner_carry,
+                current.policy_state.episode_start,
+                partner_key,
+            )
         )
         joint_actions = jnp.stack(
             (
@@ -292,18 +300,19 @@ def collect_rollout(
         )
         dones = jnp.asarray(dones, dtype=jnp.bool_)
         rewards = jnp.asarray(rewards, dtype=jnp.float32)
-        next_ego_observation, unused_partner_observation = _seat_observations(
+        next_ego_observation, unused_partner = _seat_observations(
             next_observations, current.ego_seat
         )
-        del unused_partner_observation
-        terminal_observations, unused_terminal_partner = _seat_observations(
+        del unused_partner
+        terminal_ego, unused_terminal_partner = _seat_observations(
             info["terminal_observations"], current.ego_seat
         )
         del unused_terminal_partner
+        observation_mask = dones.reshape(
+            dones.shape + (1,) * (next_ego_observation.ndim - 1)
+        )
         response_next_observation = jnp.where(
-            dones.reshape(dones.shape + (1,) * (next_ego_observation.ndim - 1)),
-            terminal_observations,
-            next_ego_observation,
+            observation_mask, terminal_ego, next_ego_observation
         )
         response_code, unused_logits, unused_signature = encode_response_codes(
             model=model,
@@ -318,20 +327,19 @@ def collect_rollout(
         del unused_logits, unused_signature
         response_code = response_code[0]
         decision = decision._replace(response_code=response_code)
-        unused_ego_observation, partner_next_observation = _seat_observations(
+
+        unused_ego, partner_next = _seat_observations(
             next_observations, current.ego_seat
         )
-        del unused_ego_observation
-        unused_terminal_ego, terminal_partner_observation = _seat_observations(
+        del unused_ego
+        unused_terminal_ego, terminal_partner = _seat_observations(
             info["terminal_observations"], current.ego_seat
         )
         del unused_terminal_ego
-        partner_response_next_observation = jnp.where(
-            dones.reshape(
-                dones.shape + (1,) * (partner_next_observation.ndim - 1)
-            ),
-            terminal_partner_observation,
-            partner_next_observation,
+        partner_response_next = jnp.where(
+            dones.reshape(dones.shape + (1,) * (partner_next.ndim - 1)),
+            terminal_partner,
+            partner_next,
         )
         next_partner_carry = callbacks.partner_observe(
             params,
@@ -339,30 +347,27 @@ def collect_rollout(
             tentative_partner_carry,
             partner_context,
             partner_observation,
-            partner_response_next_observation,
+            partner_response_next,
             partner_action,
             rewards,
             dones,
             codebook_embeddings,
         )
+
         updated_belief = slot_bayes_update(
             slot_log_belief=stepped_policy.slot_log_belief,
             slot_response_probabilities=output.response_probabilities,
             action=ego_action,
             response_code=response_code,
         )
-        uniform = uniform_slot_log_belief(
-            (count,), int(updated_belief.shape[-1])
-        )
         updated_belief = deployment_belief_after_response(
             mode=deployment_mode,
             current_log_belief=stepped_policy.slot_log_belief,
             updated_log_belief=updated_belief,
         )
+        uniform = uniform_slot_log_belief((count,), int(updated_belief.shape[-1]))
         next_policy = stepped_policy._replace(
-            slot_log_belief=jnp.where(
-                dones[:, None], uniform, updated_belief
-            ),
+            slot_log_belief=jnp.where(dones[:, None], uniform, updated_belief),
             previous_action=jnp.where(
                 dones,
                 jnp.full((count,), output.q_values.shape[-1], dtype=jnp.int32),
@@ -391,12 +396,9 @@ def collect_rollout(
             episode_step=jnp.where(dones, 0, current.episode_step + 1),
             episode_id=jnp.where(dones, next_episode_id, current.episode_id),
             episode_return=jnp.where(dones, 0.0, completed_return),
-            completed_episodes=(
-                current.completed_episodes + jnp.sum(dones, dtype=jnp.int64)
-            ),
-            effective_environment_steps=(
-                current.effective_environment_steps + count
-            ),
+            completed_episodes=current.completed_episodes
+            + jnp.sum(dones, dtype=jnp.int64),
+            effective_environment_steps=current.effective_environment_steps + count,
             random_key=next_root_key,
         )
         return next_state, (
@@ -407,8 +409,9 @@ def collect_rollout(
             current.policy_state.previous_team_reward,
             decision.reference_logits,
             decision.execution_logits,
+            decision.mask_execution_logits,
             generic_logits,
-            current.policy_state.slot_log_belief,
+            stepped_policy.slot_log_belief,
             ego_action,
             rewards,
             dones,
@@ -419,6 +422,16 @@ def collect_rollout(
             decision.quotient_count,
             decision.j_use,
             decision.j_mask,
+            decision.per_action_response_value,
+            decision.per_action_net_value,
+            decision.predicted_response_effect,
+            decision.predicted_policy_cost,
+            decision.predicted_net_effect,
+            decision.predicted_regularized_net_effect,
+            decision.predicted_policy_total_variation,
+            decision.executed_action_response_value,
+            decision.executed_action_net_value,
+            decision.maximum_action_net_value,
         )
 
     final_state, recorded = jax.lax.scan(
@@ -440,17 +453,11 @@ def collect_rollout(
         ),
         response_next_observations=recorded[1],
         episode_start=jnp.concatenate(
-            (
-                recorded[2],
-                final_state.policy_state.episode_start[None, ...],
-            ),
+            (recorded[2], final_state.policy_state.episode_start[None, ...]),
             axis=0,
         ),
         previous_actions=jnp.concatenate(
-            (
-                recorded[3],
-                final_state.policy_state.previous_action[None, ...],
-            ),
+            (recorded[3], final_state.policy_state.previous_action[None, ...]),
             axis=0,
         ),
         previous_team_rewards=jnp.concatenate(
@@ -465,31 +472,38 @@ def collect_rollout(
             (recorded[5], final_reference_logits[None, ...]), axis=0
         ),
         execution_logits=recorded[6],
-        generic_execution_logits=recorded[7],
+        mask_execution_logits=recorded[7],
+        generic_execution_logits=recorded[8],
         slot_log_beliefs=jnp.concatenate(
-            (
-                recorded[8],
-                final_state.policy_state.slot_log_belief[None, ...],
-            ),
+            (recorded[9], final_state.policy_state.slot_log_belief[None, ...]),
             axis=0,
         ),
-        actions=recorded[9],
-        rewards=recorded[10],
-        dones=recorded[11],
-        response_codes=recorded[12],
-        episode_ids=recorded[13],
-        episode_steps=recorded[14],
-        completed_episode_returns=recorded[15],
-        quotient_counts=recorded[16],
-        j_use=recorded[17],
-        j_mask=recorded[18],
+        actions=recorded[10],
+        rewards=recorded[11],
+        dones=recorded[12],
+        response_codes=recorded[13],
+        episode_ids=recorded[14],
+        episode_steps=recorded[15],
+        completed_episode_returns=recorded[16],
+        quotient_counts=recorded[17],
+        j_use=recorded[18],
+        j_mask=recorded[19],
+        per_action_response_values=recorded[20],
+        per_action_net_values=recorded[21],
+        predicted_response_effects=recorded[22],
+        predicted_policy_costs=recorded[23],
+        predicted_net_effects=recorded[24],
+        predicted_regularized_net_effects=recorded[25],
+        predicted_policy_total_variations=recorded[26],
+        executed_action_response_values=recorded[27],
+        executed_action_net_values=recorded[28],
+        maximum_action_net_values=recorded[29],
     )
     return final_state, batch
 
 
 def make_compiled_collector(**static_arguments: Any) -> Callable[..., Any]:
     import functools
-
     import jax
 
     return jax.jit(functools.partial(collect_rollout, **static_arguments))

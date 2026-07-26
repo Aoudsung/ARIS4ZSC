@@ -7,17 +7,22 @@ jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 
 from src.path_c.vqbc.model import vqbc_forward
+from src.path_c.vqbc.objectives import (
+    episode_responsibility_evidence,
+    raw_policy_continuation_targets,
+)
 from src.path_c.vqbc.policy import (
     bellman_control_values,
     deployment_belief_after_response,
     generic_response_information,
+    policy_effect_decomposition,
+    regularized_objective_value,
     regularized_policy,
 )
-from src.path_c.vqbc.training import prepare_frozen_assignments
-from src.path_c.vqbc.types import VQBCRolloutBatch
 from src.path_c.vqbc.quotient import (
     aggregate_slots,
     complete_link_class_ids,
+    posterior_supported_class_count,
     quotient_bayes_update,
     slot_bayes_update,
 )
@@ -42,55 +47,24 @@ def test_class_view_conditions_on_persistent_within_class_posterior() -> None:
         [[[[0.8, 0.2]], [[0.2, 0.8]], [[0.5, 0.5]]]]
     )
     reward = jnp.zeros((1, 3, 1))
-    continuation = jnp.zeros((1, 2, 3, 1, 2, 1))
     first = aggregate_slots(
         class_ids=class_ids,
         slot_log_belief=jnp.log(jnp.asarray([[0.1, 0.5, 0.4]])),
         response_probabilities=response,
         reward_mean=reward,
-        next_q_mean=continuation,
     )
     second = aggregate_slots(
         class_ids=class_ids,
         slot_log_belief=jnp.log(jnp.asarray([[0.5, 0.1, 0.4]])),
         response_probabilities=response,
         reward_mean=reward,
-        next_q_mean=continuation,
     )
     np.testing.assert_allclose(first.class_belief, second.class_belief)
     np.testing.assert_allclose(first.response_probabilities[0, 0, 0], [0.3, 0.7])
     np.testing.assert_allclose(second.response_probabilities[0, 0, 0], [0.7, 0.3])
 
 
-
-def test_j_use_updates_belief_inside_max_and_j_mask_keeps_prior() -> None:
-    belief = jnp.asarray([0.5, 0.5])
-    response = jnp.asarray(
-        [
-            [[0.9, 0.1]],
-            [[0.1, 0.9]],
-        ]
-    )
-    reward = jnp.zeros((2, 1))
-    continuation_one = jnp.asarray(
-        [
-            [[[10.0, 0.0], [10.0, 0.0]]],
-            [[[0.0, 10.0], [0.0, 10.0]]],
-        ]
-    )
-    continuation = jnp.stack((continuation_one, continuation_one), axis=0)
-    values = bellman_control_values(
-        class_belief=belief,
-        response_probabilities=response,
-        reward_mean=reward,
-        next_q_mean=continuation,
-        gamma=1.0,
-    )
-    np.testing.assert_allclose(values.j_use, [9.0], atol=1.0e-6)
-    np.testing.assert_allclose(values.j_mask, [5.0], atol=1.0e-6)
-
-
-def test_slot_bayes_preserves_within_class_evidence_and_old_projection_fails() -> None:
+def test_slot_bayes_preserves_within_class_evidence_and_projection_is_retired() -> None:
     updated = slot_bayes_update(
         slot_log_belief=jnp.log(jnp.asarray([0.1, 0.5, 0.4])),
         slot_response_probabilities=jnp.asarray(
@@ -110,18 +84,111 @@ def test_slot_bayes_preserves_within_class_evidence_and_old_projection_fails() -
         quotient_bayes_update()
 
 
+def test_use_and_mask_share_the_same_physical_world_weighting() -> None:
+    belief = jnp.asarray([0.5, 0.5])
+    response = jnp.asarray(
+        [
+            [[0.9, 0.1]],
+            [[0.1, 0.9]],
+        ]
+    )
+    reward = jnp.zeros((2, 1))
+    use_one = jnp.asarray(
+        [
+            [[10.0, 0.0]],
+            [[0.0, 10.0]],
+        ]
+    )
+    mask_one = jnp.full_like(use_one, 5.0)
+    use = jnp.stack((use_one, use_one), axis=0)
+    mask = jnp.stack((mask_one, mask_one), axis=0)
+    values = bellman_control_values(
+        slot_belief=belief,
+        response_probabilities=response,
+        reward_mean=reward,
+        continuation_use_mean=use,
+        continuation_mask_mean=mask,
+        gamma=1.0,
+    )
+    np.testing.assert_allclose(values.j_use, [9.0], atol=1.0e-6)
+    np.testing.assert_allclose(values.j_mask, [5.0], atol=1.0e-6)
+    expected_joint = belief[:, None, None] * response
+    np.testing.assert_allclose(values.physical_joint, expected_joint)
+    # The posterior is diagnostic only; neither branch substitutes it for the
+    # physical joint law used in the expectation.
+    np.testing.assert_allclose(values.updated_belief[:, 0, 0], [0.9, 0.1])
 
-def test_zero_outcome_policy_is_elementwise_equal_to_reference() -> None:
-    reference = jnp.asarray([[0.2, -0.3, 0.1, 0.0, -0.2, 0.4]])
-    score = jnp.zeros_like(reference)
-    execution = regularized_policy(reference, score, 1.0)
-    np.testing.assert_array_equal(
-        np.asarray(execution.logits),
-        np.asarray(reference),
+
+def test_policy_effect_decomposition_matches_raw_identity() -> None:
+    reference = jnp.asarray([[1.0, -0.5, 0.2]])
+    j_use = jnp.asarray([[3.0, 0.5, 1.0]])
+    j_mask = jnp.asarray([[2.0, 0.0, 1.5]])
+    effects = policy_effect_decomposition(
+        reference_logits=reference,
+        j_use=j_use,
+        j_mask=j_mask,
+        temperature=0.7,
+    )
+    np.testing.assert_allclose(
+        effects.raw_net_effect,
+        effects.raw_response_effect - effects.raw_policy_cost,
+        rtol=1.0e-6,
+        atol=1.0e-6,
+    )
+    direct = (
+        np.sum(np.asarray(effects.use_policy.probabilities) * np.asarray(j_use), axis=-1)
+        - np.sum(
+            np.asarray(effects.mask_policy.probabilities) * np.asarray(j_mask),
+            axis=-1,
+        )
+    )
+    np.testing.assert_allclose(effects.raw_net_effect, direct)
+
+
+def test_action_independent_value_shift_does_not_change_runtime_policy() -> None:
+    reference = jnp.asarray([[2.0, 0.0, -1.0]])
+    mask = jnp.asarray([[0.1, 0.5, -0.2]])
+    use = mask + 7.0
+    effects = policy_effect_decomposition(
+        reference_logits=reference,
+        j_use=use,
+        j_mask=mask,
+        temperature=1.0,
+    )
+    np.testing.assert_allclose(
+        effects.use_policy.probabilities,
+        effects.mask_policy.probabilities,
+        atol=1.0e-7,
+    )
+    np.testing.assert_allclose(effects.total_variation, 0.0, atol=1.0e-7)
+    np.testing.assert_allclose(effects.raw_response_effect, 7.0, atol=1.0e-6)
+
+
+def test_regularized_value_matches_runtime_policy_objective() -> None:
+    reference = jnp.asarray([[0.2, -0.3, 0.1]])
+    score = jnp.asarray([[1.4, -0.2, 0.5]])
+    temperature = 0.8
+    policy = regularized_policy(reference, score, temperature)
+    reference_log = jax.nn.log_softmax(reference, axis=-1)
+    policy_log = jax.nn.log_softmax(policy.logits, axis=-1)
+    direct = jnp.sum(policy.probabilities * score, axis=-1) - temperature * jnp.sum(
+        policy.probabilities * (policy_log - reference_log), axis=-1
+    )
+    np.testing.assert_allclose(
+        regularized_objective_value(reference, score, temperature),
+        direct,
+        rtol=1.0e-6,
+        atol=1.0e-6,
     )
 
 
-def test_generic_information_reads_only_the_shared_response_kernel() -> None:
+def test_zero_score_policy_is_elementwise_equal_to_reference() -> None:
+    reference = jnp.asarray([[0.2, -0.3, 0.1, 0.0, -0.2, 0.4]])
+    execution = regularized_policy(reference, jnp.zeros_like(reference), 1.0)
+    np.testing.assert_array_equal(execution.logits, reference)
+
+
+def test_generic_information_reads_only_slot_response_kernel() -> None:
     belief = jnp.asarray([0.5, 0.5])
     response = jnp.asarray(
         [
@@ -130,7 +197,7 @@ def test_generic_information_reads_only_the_shared_response_kernel() -> None:
         ]
     )
     information = generic_response_information(
-        class_belief=belief,
+        slot_belief=belief,
         response_probabilities=response,
     )
     assert float(information[0]) > 0.0
@@ -146,141 +213,92 @@ def test_prior_only_never_absorbs_a_response() -> None:
     np.testing.assert_allclose(jnp.exp(updated), [1.0 / 3.0] * 3)
 
 
-def test_belief_change_can_reverse_normal_action_order() -> None:
-    response = jnp.full((2, 2, 2), 0.5)
-    reward = jnp.zeros((2, 2))
-    continuation_one = jnp.asarray(
-        [
-            [
-                [[5.0, 0.0], [5.0, 0.0]],
-                [[0.0, 0.0], [0.0, 0.0]],
-            ],
-            [
-                [[0.0, 0.0], [0.0, 0.0]],
-                [[0.0, 5.0], [0.0, 5.0]],
-            ],
-        ]
-    )
-    continuation = jnp.stack((continuation_one, continuation_one), axis=0)
-    left = bellman_control_values(
-        class_belief=jnp.asarray([0.9, 0.1]),
-        response_probabilities=response,
-        reward_mean=reward,
-        next_q_mean=continuation,
-        gamma=1.0,
-    )
-    right = bellman_control_values(
-        class_belief=jnp.asarray([0.1, 0.9]),
-        response_probabilities=response,
-        reward_mean=reward,
-        next_q_mean=continuation,
-        gamma=1.0,
-    )
-    assert int(jnp.argmax(left.j_use)) != int(jnp.argmax(right.j_use))
-
-
-def test_vqbc_forward_uses_persistent_slot_posterior_to_change_normal_actions() -> None:
-    batch, estimators, slots, actions, responses = 2, 2, 8, 6, 16
-    q_values = jnp.zeros((batch, estimators, slots, actions))
-    q_values = q_values.at[:, :, 0, 0].set(4.0)
-    q_values = q_values.at[:, :, 1, 1].set(4.0)
-    response = jnp.full((batch, slots, actions, responses), 1.0 / responses)
-    next_q = jnp.zeros(
-        (batch, estimators, slots, actions, responses, actions)
-    )
-    next_q = next_q.at[:, :, 0, 0, :, 0].set(5.0)
-    next_q = next_q.at[:, :, 1, 1, :, 1].set(5.0)
-    raw = {
-        "features": jnp.zeros((batch, 3)),
-        "q_values": q_values,
-        "learned_q_values": q_values,
-        "prior_q_values": jnp.zeros_like(q_values),
-        "centered_advantages": q_values
-        - jnp.max(q_values, axis=-1, keepdims=True),
+def _forward_raw(slot_count: int = 2, action_count: int = 6, response_count: int = 2):
+    q = jnp.zeros((2, slot_count, action_count))
+    q = q.at[:, 0, 0].set(2.0)
+    q = q.at[:, 1, 1].set(2.0)
+    response = jnp.full((slot_count, action_count, response_count), 1.0 / response_count)
+    reward = jnp.zeros((slot_count, action_count))
+    reward = reward.at[0, 0].set(4.0)
+    reward = reward.at[1, 1].set(4.0)
+    continuation = jnp.zeros((2, slot_count, action_count, response_count))
+    return {
+        "features": jnp.zeros((3,)),
+        "q_values": q,
+        "learned_q_values": q,
+        "prior_q_values": jnp.zeros_like(q),
+        "centered_advantages": q - jnp.max(q, axis=-1, keepdims=True),
         "response_logits": jnp.log(response),
         "response_probabilities": response,
-        "reward_mean": jnp.zeros((batch, slots, actions)),
-        "reward_log_standard_deviation": jnp.zeros(
-            (batch, slots, actions)
-        ),
-        "next_q_mean": next_q,
-        "next_q_log_standard_deviation": jnp.zeros_like(next_q),
+        "reward_mean": reward,
+        "reward_log_standard_deviation": jnp.zeros_like(reward),
+        "continuation_use_mean": continuation,
+        "continuation_use_log_standard_deviation": jnp.zeros_like(continuation),
+        "continuation_mask_mean": continuation,
+        "continuation_mask_log_standard_deviation": jnp.zeros_like(continuation),
     }
-    reference = jnp.zeros((batch, actions))
-    left_belief = jnp.log(
-        jnp.asarray([[0.8, 0.1] + [0.1 / 6.0] * 6] * batch)
-    )
-    right_belief = jnp.log(
-        jnp.asarray([[0.1, 0.8] + [0.1 / 6.0] * 6] * batch)
-    )
-
-    def forward(log_belief):
-        return vqbc_forward(
-            raw_output=raw,
-            reference_logits=reference,
-            slot_log_belief=log_belief,
-            temperature=1.0,
-            generic_temperature=1.0,
-            deployment_mode="posterior_use",
-            gamma=0.99,
-        )
-
-    left = forward(left_belief)
-    right = forward(right_belief)
-    np.testing.assert_array_equal(
-        np.asarray(jnp.argmax(left.execution_logits, axis=-1)), [0, 0]
-    )
-    np.testing.assert_array_equal(
-        np.asarray(jnp.argmax(right.execution_logits, axis=-1)), [1, 1]
-    )
-    assert np.all(np.asarray(jnp.max(left.quotient_ids, axis=-1) + 1) >= 2)
 
 
-def test_episode_responsibility_accumulates_control_evidence() -> None:
-    from src.path_c.vqbc.objectives import episode_responsibilities
-
-    q_values = jnp.asarray(
-        [
-            [[[[0.1], [0.5]], [[0.1], [0.5]]]],
-            [[[[0.1], [0.5]], [[0.1], [0.5]]]],
-        ]
+def test_persistent_belief_changes_normal_action_order() -> None:
+    raw = _forward_raw()
+    reference = jnp.zeros((6,))
+    left = vqbc_forward(
+        raw_output=raw,
+        reference_logits=reference,
+        slot_log_belief=jnp.log(jnp.asarray([0.9, 0.1])),
+        temperature=1.0,
+        generic_temperature=1.0,
+        deployment_mode="posterior_use",
+        gamma=0.99,
     )
-    responsibilities = episode_responsibilities(
+    right = vqbc_forward(
+        raw_output=raw,
+        reference_logits=reference,
+        slot_log_belief=jnp.log(jnp.asarray([0.1, 0.9])),
+        temperature=1.0,
+        generic_temperature=1.0,
+        deployment_mode="posterior_use",
+        gamma=0.99,
+    )
+    assert int(jnp.argmax(left.execution_logits)) == 0
+    assert int(jnp.argmax(right.execution_logits)) == 1
+
+
+def test_supported_quotient_count_excludes_negligible_slot_mass() -> None:
+    class_ids = jnp.arange(8, dtype=jnp.int32)
+    belief = jnp.asarray([0.55, 0.4495] + [0.0005 / 6.0] * 6)
+    count = posterior_supported_class_count(
+        class_ids=class_ids,
+        slot_log_belief=jnp.log(belief),
+        probability_floor=1.0e-3,
+    )
+    assert int(count) == 2
+
+
+def test_full_episode_responsibility_accumulates_control_evidence() -> None:
+    q_values = jnp.zeros((3, 1, 2, 2, 1))
+    q_values = q_values.at[:, :, :, 0, 0].set(0.1)
+    q_values = q_values.at[:, :, :, 1, 0].set(0.5)
+    responsibilities, energies = episode_responsibility_evidence(
         q_values=q_values,
-        actions=jnp.zeros((2, 1), dtype=jnp.int32),
-        targets=jnp.zeros((2, 1, 2)),
+        actions=jnp.zeros((3, 1), dtype=jnp.int32),
+        targets=jnp.zeros((3, 1, 2)),
         temperature=1.0,
     )
     assert float(responsibilities[0, 0]) > float(responsibilities[0, 1])
+    assert float(energies[0, 1] - energies[0, 0]) > 0.0
 
 
-def test_responsibility_availability_excludes_bootstrap_slots() -> None:
-    from src.path_c.vqbc.objectives import episode_responsibilities
-
-    responsibilities = episode_responsibilities(
-        q_values=jnp.zeros((2, 1, 2, 2, 1)),
-        actions=jnp.zeros((2, 1), dtype=jnp.int32),
-        targets=jnp.zeros((2, 1, 2)),
-        temperature=1.0,
-        availability_mask=jnp.asarray([[False, True]]),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(responsibilities), np.asarray([[0.0, 1.0]])
-    )
-
-
-def test_outcome_likelihood_separates_slots_when_td_is_equal() -> None:
-    from src.path_c.vqbc.objectives import episode_responsibilities
-
-    time, batch, estimators, slots = 2, 1, 2, 2
-    actions, responses, next_actions = 1, 2, 1
+def test_outcome_evidence_can_separate_td_equivalent_slots() -> None:
+    time, batch, estimators, slots, actions, responses = 2, 1, 2, 2, 1, 2
     response_logits = jnp.asarray(
         [
             [[[[8.0, -8.0]], [[-8.0, 8.0]]]],
             [[[[8.0, -8.0]], [[-8.0, 8.0]]]],
         ]
     )
-    responsibilities = episode_responsibilities(
+    zeros_cont = jnp.zeros((time, batch, estimators, slots, actions, responses))
+    responsibilities, unused = episode_responsibility_evidence(
         q_values=jnp.zeros((time, batch, estimators, slots, actions)),
         actions=jnp.zeros((time, batch), dtype=jnp.int32),
         targets=jnp.zeros((time, batch, slots)),
@@ -288,205 +306,33 @@ def test_outcome_likelihood_separates_slots_when_td_is_equal() -> None:
         response_logits=response_logits,
         reward_mean=jnp.zeros((time, batch, slots, actions)),
         reward_log_standard_deviation=jnp.zeros((time, batch, slots, actions)),
-        next_q_mean=jnp.zeros(
-            (time, batch, estimators, slots, actions, responses, next_actions)
-        ),
-        next_q_log_standard_deviation=jnp.zeros(
-            (time, batch, estimators, slots, actions, responses, next_actions)
-        ),
+        continuation_use_mean=zeros_cont,
+        continuation_use_log_standard_deviation=zeros_cont,
+        continuation_mask_mean=zeros_cont,
+        continuation_mask_log_standard_deviation=zeros_cont,
         response_codes=jnp.zeros((time, batch), dtype=jnp.int32),
         rewards=jnp.zeros((time, batch)),
-        target_next_q_values=jnp.zeros(
-            (time, batch, estimators, slots, next_actions)
-        ),
-        dones=jnp.zeros((time, batch), dtype=jnp.bool_),
+        continuation_use_targets=jnp.zeros((time, batch, estimators, slots)),
+        continuation_mask_targets=jnp.zeros((time, batch, estimators, slots)),
     )
+    del unused
     assert float(responsibilities[0, 0]) > 0.999
 
 
-def test_frozen_assignment_e_step_uses_target_model_and_dynamic_slot_count() -> None:
-    time_count, environment_count = 2, 4
-    slot_count, action_count, response_count = 2, 2, 4
-
-    class FakeModel:
-        control_only = object()
-
-        def apply(
-            self,
-            unused_variables,
-            initial_carry,
-            observations,
-            previous_actions,
-            previous_rewards,
-            starts,
-            method=None,
-        ):
-            del unused_variables, previous_actions, previous_rewards, starts, method
-            time, batch = observations.shape[:2]
-            q = jnp.zeros((time, batch, 2, slot_count, action_count))
-            q = q.at[..., 0, 0].set(1.0)
-            q = q.at[..., 1, 1].set(1.0)
-            response_logits = jnp.zeros(
-                (time, batch, slot_count, action_count, response_count)
-            )
-            reward = jnp.zeros((time, batch, slot_count, action_count))
-            next_q = jnp.zeros(
-                (
-                    time,
-                    batch,
-                    2,
-                    slot_count,
-                    action_count,
-                    response_count,
-                    action_count,
-                )
-            )
-            return initial_carry, {
-                "features": jnp.zeros((time, batch, 1)),
-                "q_values": q,
-                "learned_q_values": q,
-                "prior_q_values": jnp.zeros_like(q),
-                "centered_advantages": q
-                - jnp.max(q, axis=-1, keepdims=True),
-                "response_logits": response_logits,
-                "response_probabilities": jax.nn.softmax(
-                    response_logits, axis=-1
-                ),
-                "reward_mean": reward,
-                "reward_log_standard_deviation": jnp.zeros_like(reward),
-                "next_q_mean": next_q,
-                "next_q_log_standard_deviation": jnp.zeros_like(next_q),
-            }
-
-    batch = VQBCRolloutBatch(
-        observations=jnp.zeros((time_count + 1, environment_count, 1)),
-        response_next_observations=jnp.zeros(
-            (time_count, environment_count, 1)
-        ),
-        episode_start=jnp.zeros(
-            (time_count + 1, environment_count), dtype=jnp.bool_
-        ),
-        previous_actions=jnp.zeros(
-            (time_count + 1, environment_count), dtype=jnp.int32
-        ),
-        previous_team_rewards=jnp.zeros(
-            (time_count + 1, environment_count)
-        ),
-        initial_value_carry=jnp.zeros((environment_count, 1)),
-        reference_logits=jnp.zeros(
-            (time_count + 1, environment_count, action_count)
-        ),
-        execution_logits=jnp.zeros(
-            (time_count, environment_count, action_count)
-        ),
-        generic_execution_logits=jnp.zeros(
-            (time_count, environment_count, action_count)
-        ),
-        slot_log_beliefs=jnp.full(
-            (time_count + 1, environment_count, slot_count),
-            -jnp.log(float(slot_count)),
-        ),
-        actions=jnp.zeros(
-            (time_count, environment_count), dtype=jnp.int32
-        ),
-        rewards=jnp.zeros((time_count, environment_count)),
-        dones=jnp.asarray(
-            [[False] * environment_count, [True] * environment_count]
-        ),
-        response_codes=jnp.zeros(
-            (time_count, environment_count), dtype=jnp.int32
-        ),
-        episode_ids=jnp.zeros(
-            (time_count, environment_count), dtype=jnp.int32
-        ),
-        episode_steps=jnp.zeros(
-            (time_count, environment_count), dtype=jnp.int32
-        ),
-        completed_episode_returns=jnp.zeros(
-            (time_count, environment_count)
-        ),
-        quotient_counts=jnp.ones(
-            (time_count, environment_count), dtype=jnp.int32
-        ),
-        j_use=jnp.zeros((time_count, environment_count, action_count)),
-        j_mask=jnp.zeros((time_count, environment_count, action_count)),
+def test_raw_continuation_target_uses_exact_execution_distribution() -> None:
+    probabilities = jnp.asarray([[0.25, 0.75]])
+    q_values = jnp.asarray(
+        [
+            [
+                [[3.0, 1.0], [2.0, 4.0]],
+                [[1.0, 5.0], [4.0, 0.0]],
+            ]
+        ]
     )
-    availability = jnp.asarray(
-        [[True, False], [False, True], [True, True], [True, False]]
+    target = raw_policy_continuation_targets(
+        execution_probabilities=probabilities,
+        target_q_values=q_values,
+        dones=jnp.asarray([False]),
     )
-    assignments = prepare_frozen_assignments(
-        model=FakeModel(),
-        online_params={"ignored": jnp.asarray(1.0)},
-        target_params={"ignored": jnp.asarray(2.0)},
-        batch=batch,
-        codebook_embeddings=jnp.asarray(
-            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
-        ),
-        key=jax.random.PRNGKey(3),
-        temperature=jnp.asarray(1.0),
-        generic_temperature=jnp.asarray(1.0),
-        gamma=0.99,
-        responsibility_temperature=1.0,
-        bootstrap_probability=0.8,
-        bootstrap_mask=availability,
-        terminal_response=3,
-        environment_chunk_size=2,
-    )
-    assert assignments.responsibilities.shape == (environment_count, slot_count)
-    assert assignments.responsibility_energies.shape == (
-        environment_count,
-        slot_count,
-    )
-    assert assignments.bellman_targets.shape == (
-        time_count,
-        environment_count,
-        slot_count,
-    )
-    assert assignments.response_signature_targets.shape == (
-        time_count,
-        environment_count,
-        action_count,
-    )
-    assert assignments.response_code_targets.shape == (
-        time_count,
-        environment_count,
-    )
-    np.testing.assert_allclose(
-        np.asarray(assignments.responsibilities).sum(axis=-1), 1.0
-    )
-    np.testing.assert_array_equal(
-        np.asarray(assignments.responsibilities)[~np.asarray(availability)],
-        0.0,
-    )
-
-
-def test_development_minibatches_are_exact_nonrepeating_lane_partitions() -> None:
-    from src.path_c.vqbc.training import environment_minibatch_schedule
-
-    schedule = environment_minibatch_schedule(
-        jax.random.PRNGKey(17),
-        environment_count=32,
-        minibatches_per_epoch=8,
-        update_epochs=4,
-    )
-    assert schedule.shape == (4, 8, 4)
-    for epoch in np.asarray(schedule):
-        np.testing.assert_array_equal(np.sort(epoch.reshape(-1)), np.arange(32))
-
-
-def test_response_trigger_rejects_float32_roundoff_scale_values() -> None:
-    from src.path_c.vqbc.response_contrast import (
-        first_positive_trigger,
-        information_trigger_tolerance,
-    )
-
-    j_use = jnp.asarray([[100.0, 100.0]])
-    j_mask = jnp.asarray([[100.0, 100.0]])
-    tolerance = float(information_trigger_tolerance(j_use, j_mask)[0])
-    assert tolerance > 1.0e-5
-    assert first_positive_trigger(np.full((4, 6), 1.0e-6)) == (None, None)
-    step, value = first_positive_trigger(
-        np.vstack((np.zeros((1, 6)), np.full((1, 6), 1.0e-2)))
-    )
-    assert step == 1
-    assert value == pytest.approx(1.0e-2)
+    expected = np.einsum("a,ema->em", np.asarray(probabilities[0]), np.asarray(q_values[0]))
+    np.testing.assert_allclose(target[0], expected)

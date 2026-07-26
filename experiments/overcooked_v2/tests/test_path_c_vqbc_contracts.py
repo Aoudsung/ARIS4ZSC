@@ -18,7 +18,7 @@ from src.path_c.vqbc.objectives import (
     assert_training_batch_has_no_audit_labels,
 )
 from src.path_c.vqbc.pipeline import run_vqbc_pool_check
-from src.path_c.vqbc.types import CheckpointMetadataV3
+from src.path_c.vqbc.types import CheckpointMetadataV4
 
 
 CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
@@ -27,7 +27,7 @@ CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs"
 def _development_payload() -> dict:
     return yaml.safe_load(
         (
-            CONFIG_ROOT / "path_c_vqbc_v4_development_simple.yaml"
+            CONFIG_ROOT / "path_c_vqbc_v4_2_development_simple.yaml"
         ).read_text(encoding="utf-8")
     )
 
@@ -36,7 +36,7 @@ def test_v4_development_config_uses_fixed_model_and_complete_rollouts() -> None:
     config = VQBCConfig.from_mapping(
         _development_payload(), base_dir=CONFIG_ROOT
     )
-    assert config.schema_version == "path_c_model_v4_1"
+    assert config.schema_version == "path_c_model_v4_2"
     assert config.run_kind == "development"
     assert config.model.slot_count == 8
     assert config.model.response_count == 16
@@ -45,6 +45,13 @@ def test_v4_development_config_uses_fixed_model_and_complete_rollouts() -> None:
     assert config.rollout_count == 96
     assert config.evaluation.deployment_modes == VQBC_DEPLOYMENT_MODES
     assert config.partner_sampling.include_frozen_current_policy
+
+
+def test_v4_2_rejects_v4_1_config_schema() -> None:
+    payload = _development_payload()
+    payload["schema_version"] = "path_c_model_v4_1"
+    with pytest.raises(ValueError, match="schema_version"):
+        VQBCConfig.from_mapping(payload, base_dir=CONFIG_ROOT)
 
 
 @pytest.mark.parametrize(
@@ -65,7 +72,7 @@ def test_v4_config_rejects_legacy_control_fields(legacy_field: str) -> None:
         VQBCConfig.from_mapping(payload, base_dir=CONFIG_ROOT)
 
 
-def test_v4_1_config_rejects_retired_shared_slot_decoder_fields() -> None:
+def test_v4_2_config_rejects_retired_shared_slot_decoder_fields() -> None:
     for field in ("slot_embedding_dim", "response_embedding_dim"):
         payload = _development_payload()
         payload["model"][field] = 16
@@ -87,8 +94,8 @@ def test_v4_config_rejects_actor_learning_rate_and_prototype_routing() -> None:
 
 def test_source_free_formal_templates_bind_registered_budgets() -> None:
     for name, layout in (
-        ("path_c_vqbc_v4_formal_simple.yaml", "test_time_simple"),
-        ("path_c_vqbc_v4_formal_wide.yaml", "test_time_wide"),
+        ("path_c_vqbc_v4_2_formal_simple.yaml", "test_time_simple"),
+        ("path_c_vqbc_v4_2_formal_wide.yaml", "test_time_wide"),
     ):
         path = CONFIG_ROOT / name
         template = VQBCFormalTemplate.from_mapping(
@@ -118,10 +125,10 @@ def test_training_batch_contract_rejects_every_audit_identity() -> None:
             )
 
 
-def _metadata(config: VQBCConfig) -> CheckpointMetadataV3:
+def _metadata(config: VQBCConfig) -> CheckpointMetadataV4:
     reference = config.backbone_init
-    return CheckpointMetadataV3(
-        schema_version="path_c_model_checkpoint_metadata_v3",
+    return CheckpointMetadataV4(
+        schema_version="path_c_model_checkpoint_metadata_v4",
         run_kind=config.run_kind,
         scientific_readout_allowed=False,
         outer_unit_id=None,
@@ -199,7 +206,7 @@ def test_checkpoint_metadata_round_trip_keeps_reference_contract() -> None:
         _development_payload(), base_dir=CONFIG_ROOT
     )
     metadata = _metadata(config)
-    assert CheckpointMetadataV3.from_mapping(
+    assert CheckpointMetadataV4.from_mapping(
         metadata.to_mapping()
     ) == metadata
 

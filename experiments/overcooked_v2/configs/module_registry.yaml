@@ -705,8 +705,8 @@
       ]
     },
     {
-      "id": "PATH_C_VQBC_V4_1_CHAIN",
-      "status": "tested",
+      "id": "PATH_C_VQBC_V4_2_CHAIN",
+      "status": "implemented",
       "git_sha": null,
       "implementation_files": [
         "src/path_c/vqbc/__init__.py",
@@ -731,29 +731,33 @@
         "experiments/overcooked_v2/scripts/build_path_c_vqbc_population.py",
         "experiments/overcooked_v2/scripts/evaluate_path_c_vqbc.py",
         "experiments/overcooked_v2/scripts/run_path_c_vqbc_response_contrast.py",
-        "experiments/overcooked_v2/configs/path_c_vqbc_v4_development_simple.yaml",
-        "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_simple.yaml",
-        "experiments/overcooked_v2/configs/path_c_vqbc_v4_formal_wide.yaml",
-        "docs/status/PATH_C_VQBC_V4_1_ROOT_REPAIR.md"
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_2_development_simple.yaml",
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_2_formal_simple.yaml",
+        "experiments/overcooked_v2/configs/path_c_vqbc_v4_2_formal_wide.yaml",
+        "docs/status/PATH_C_VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR.md",
+        "provenance/VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR_VALIDATION_20260726.md"
       ],
       "test_ids": [
         "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_v4_development_config_uses_fixed_model_and_complete_rollouts",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_v4_1_config_rejects_retired_shared_slot_decoder_fields",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_value_quotient_requires_certified_equivalence_not_overlap",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_class_view_conditions_on_persistent_within_class_posterior",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_slot_bayes_preserves_within_class_evidence_and_old_projection_fails",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_vqbc_forward_uses_persistent_slot_posterior_to_change_normal_actions",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_episode_responsibility_accumulates_control_evidence",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_responsibility_availability_excludes_bootstrap_slots",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_outcome_likelihood_separates_slots_when_td_is_equal",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_development_minibatches_are_exact_nonrepeating_lane_partitions",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_response_trigger_rejects_float32_roundoff_scale_values",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_each_slot_owns_independent_q_and_outcome_parameters",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_v4_2_rejects_v4_1_config_schema",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_contracts.py::test_v4_2_config_rejects_retired_shared_slot_decoder_fields",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_use_and_mask_share_the_same_physical_world_weighting",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_policy_effect_decomposition_matches_raw_identity",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_action_independent_value_shift_does_not_change_runtime_policy",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_raw_continuation_target_uses_exact_execution_distribution",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_persistent_belief_changes_normal_action_order",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_supported_quotient_count_excludes_negligible_slot_mass",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_model_output_shapes_and_zero_initialized_behavior_continuation",
         "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_only_bellman_path_reaches_backbone_and_random_prior_is_frozen",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_response_signature_is_assignment_independent_and_averages_experts",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_checkpoint_round_trip_keeps_resume_random_and_rollout_state",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_untriggered_response_contrast_requires_identical_branches",
-        "experiments/overcooked_v2/tests/test_path_c_vqbc_math.py::test_frozen_assignment_e_step_uses_target_model_and_dynamic_slot_count"
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_each_slot_has_independent_q_parameters_and_belief_projection",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_belief_conditioning_can_change_q_at_fixed_recurrent_features",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_response_signature_is_independent_of_responsibility",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_executed_response_codes_drive_outcome_and_stale_belief_targets",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_environment_minibatch_schedule_partitions_each_epoch_without_repeats",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_training.py::test_checkpoint_round_trip_rejects_old_state_namespace",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_response_contrast_recomputes_effects_and_bins_policy_level_prediction",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_response_contrast_trigger_uses_policy_effect_not_action_maximum",
+        "experiments/overcooked_v2/tests/test_path_c_vqbc_evaluation.py::test_a1_and_a2_mask_both_block_the_first_response"
       ]
     }
   ]

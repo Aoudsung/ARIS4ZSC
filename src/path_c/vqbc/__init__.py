@@ -10,7 +10,7 @@ from .config import (
 )
 from .model import build_vqbc_model, initialize_vqbc_from_official, vqbc_forward
 from .types import (
-    CheckpointMetadataV3,
+    CheckpointMetadataV4,
     VQBCDecisionRecord,
     VQBCOutput,
     VQBCPolicyState,
@@ -18,7 +18,7 @@ from .types import (
 )
 
 __all__ = [
-    "CheckpointMetadataV3",
+    "CheckpointMetadataV4",
     "VQBCConfig",
     "VQBCDecisionRecord",
     "VQBCFormalTemplate",

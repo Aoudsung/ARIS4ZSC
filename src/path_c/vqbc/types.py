@@ -1,4 +1,4 @@
-"""State, output, batch, and checkpoint records for Path C model version four."""
+"""State, output, batch, and checkpoint records for Path C VQBC V4.2."""
 
 from __future__ import annotations
 
@@ -29,26 +29,48 @@ class VQBCOutput(NamedTuple):
     response_probabilities: Any
     reward_mean: Any
     reward_log_standard_deviation: Any
-    next_q_mean: Any
-    next_q_log_standard_deviation: Any
+    continuation_use_mean: Any
+    continuation_use_log_standard_deviation: Any
+    continuation_mask_mean: Any
+    continuation_mask_log_standard_deviation: Any
     quotient_ids: Any
+    supported_quotient_count: Any
     j_use: Any
     j_mask: Any
+    per_action_response_value: Any
+    per_action_net_value: Any
     information_gain: Any
     execution_logits: Any
+    mask_execution_logits: Any
+    predicted_response_effect: Any
+    predicted_policy_cost: Any
+    predicted_net_effect: Any
+    predicted_regularized_net_effect: Any
+    predicted_policy_total_variation: Any
 
 
 class VQBCDecisionRecord(NamedTuple):
     reference_logits: Any
     execution_logits: Any
+    mask_execution_logits: Any
     j_use: Any
     j_mask: Any
+    per_action_response_value: Any
+    per_action_net_value: Any
     kl_divergence: Any
     action: Any
     reference_greedy_action: Any
     quotient_count: Any
     belief_entropy: Any
     response_code: Any
+    predicted_response_effect: Any
+    predicted_policy_cost: Any
+    predicted_net_effect: Any
+    predicted_regularized_net_effect: Any
+    predicted_policy_total_variation: Any
+    executed_action_response_value: Any
+    executed_action_net_value: Any
+    maximum_action_net_value: Any
 
 
 class VQBCRolloutState(NamedTuple):
@@ -67,7 +89,7 @@ class VQBCRolloutState(NamedTuple):
 
 
 class VQBCRolloutBatch(NamedTuple):
-    """Training tensors only; partner identity and provenance are excluded."""
+    """Differentiable training tensors; partner identity is excluded."""
 
     observations: Any
     response_next_observations: Any
@@ -77,6 +99,7 @@ class VQBCRolloutBatch(NamedTuple):
     initial_value_carry: Any
     reference_logits: Any
     execution_logits: Any
+    mask_execution_logits: Any
     generic_execution_logits: Any
     slot_log_beliefs: Any
     actions: Any
@@ -89,6 +112,16 @@ class VQBCRolloutBatch(NamedTuple):
     quotient_counts: Any
     j_use: Any
     j_mask: Any
+    per_action_response_values: Any
+    per_action_net_values: Any
+    predicted_response_effects: Any
+    predicted_policy_costs: Any
+    predicted_net_effects: Any
+    predicted_regularized_net_effects: Any
+    predicted_policy_total_variations: Any
+    executed_action_response_values: Any
+    executed_action_net_values: Any
+    maximum_action_net_values: Any
 
 
 class VQBCCodebookState(NamedTuple):
@@ -121,8 +154,8 @@ class VQBCTrainState(NamedTuple):
 
 
 @dataclass(frozen=True, slots=True)
-class CheckpointMetadataV3:
-    """Content bindings for a resumable fourth-version checkpoint."""
+class CheckpointMetadataV4:
+    """Content bindings for a resumable behavior-consistent VQBC checkpoint."""
 
     schema_version: str
     run_kind: str
@@ -142,12 +175,12 @@ class CheckpointMetadataV3:
     extra: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.schema_version != "path_c_model_checkpoint_metadata_v3":
-            raise ValueError("Fourth-model checkpoint metadata schema changed.")
+        if self.schema_version != "path_c_model_checkpoint_metadata_v4":
+            raise ValueError("VQBC V4.2 checkpoint metadata schema changed.")
         if self.run_kind not in {"development", "formal"}:
             raise ValueError("Checkpoint run_kind must be development or formal.")
         if self.scientific_readout_allowed:
-            raise ValueError("Fourth-model implementation checkpoints are non-claim.")
+            raise ValueError("VQBC implementation checkpoints are non-claim.")
         if self.outer_unit_id is not None and (
             isinstance(self.outer_unit_id, bool)
             or not isinstance(self.outer_unit_id, Integral)
@@ -181,7 +214,11 @@ class CheckpointMetadataV3:
             "update_count",
         ):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, Integral) or int(value) < 0:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or int(value) < 0
+            ):
                 raise ValueError(f"{name} must be a non-negative integer.")
         if not isinstance(self.extra, Mapping):
             raise TypeError("Checkpoint extra metadata must be a mapping.")
@@ -190,7 +227,7 @@ class CheckpointMetadataV3:
         return asdict(self)
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any]) -> "CheckpointMetadataV3":
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "CheckpointMetadataV4":
         if not isinstance(payload, Mapping):
             raise TypeError("Checkpoint metadata must be a mapping.")
         fields = {item.name for item in cls.__dataclass_fields__.values()}
@@ -214,7 +251,7 @@ def finite_scalar(value: Any, name: str) -> float:
 
 
 __all__ = [
-    "CheckpointMetadataV3",
+    "CheckpointMetadataV4",
     "VQBCCodebookState",
     "VQBCDecisionRecord",
     "VQBCKLState",

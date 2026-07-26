@@ -1,19 +1,19 @@
-# Path C 第三版模块设计
+# Path C 模块设计：第三版历史链与 VQBC V4.2 活跃链
 
 self-play（SP）指同一次独立训练内的策略彼此协作；cross-play（XP）指不同独立训练运行
 得到的策略在测试时配对。
 
-**日期：** 2026-07-24
-**状态：** 正式主链已修订为家族级伙伴原型与受虚构协作启发的 checkpoint 历史群体。
-第三版配置、第二版外层训练单元清单、训练校准与部署校准分离、标准评估矩阵和回应屏蔽部署
-对照保留为历史实现。V4.1 已完成 50 项远端软件测试和首开发单元复跑，登记为 `tested`；
-回应屏蔽效应仍为 0，因此该状态不表示机制验收或正式冻结。旧伙伴池的 Test Time Simple
-结果只保留为设计诊断，旧 Test Time Wide 作业已封存，不进入新版读数。
+**日期：** 2026-07-26
+**状态：** 第三版家族级伙伴池和 VQBC V4.1 均保留为历史实现。活跃代码对象升级为
+`path_c_model_v4_2`：belief-conditioned Bellman experts、共同物理世界权重、与真实 KL 执行器一致的
+raw-return continuation，以及可诊断的 A1/A2 matched contrast 已静态实现。V4.2 尚未在注册远端
+Flax/Optax/JaxMARL 环境执行，登记为 `implemented`；V4.1 的 50 项远端软件测试和零回应效应
+继续作为历史证据，不传递到 V4.2。十单元正式训练继续关闭。
 **规范来源：** `PATH_C_PROPOSAL.md`、`PATH_C_THEORY.md`、
 `experiments/overcooked_v2/configs/path_c_preregistration.yaml` 与
 `experiments/overcooked_v2/configs/module_registry.yaml`。
 
-本文只说明第三版代码对象及依赖关系。执行权限仍由根目录
+本文同时说明第三版历史对象和 VQBC 活跃对象的依赖关系。执行权限仍由根目录
 `OPERATING_CONSTRAINTS.md` 管理；本地未执行项目代码。远端测试由用户明确授权，且只形成软件验证记录，不形成科学读数。
 
 ## 1. 不可变的实现口径
@@ -334,18 +334,17 @@ OCV2 bridge 已定义无 pickle codec、内容寻址 bundle 与 fresh-runtime ho
 | I8_SPLIT_AND_CROSS_FITTING | tested |
 | V3_BACKBONE_ADMISSION_ADAPTATION_PROBE | implemented |
 | PATH_C_FAMILY_POOL_FORMAL_CHAIN | implemented |
-| PATH_C_VQBC_V4_1_CHAIN | tested |
+| PATH_C_VQBC_V4_2_CHAIN | implemented |
 | R015_TWO_FAMILY_SUPPORT | implemented |
 | R015_PAIRED_AUDIT_ADJUDICATION | implemented |
 | D1_ARTIFACT_CONTRACT | planned |
 | D2_CONFORMANCE_TEST_DEFINITIONS | tested |
 <!-- PATH_C_MODULE_TRACEABILITY:END -->
 
-第三版骨干适配模块和家族级伙伴池正式链保持 `implemented`。VQBC V4.1 已在注册远端环境完成
-Flax、Optax、JaxMARL 和 GPU 覆盖的四个目标测试文件，结果为 50 项通过、0 失败、0 跳过；
-同一 seed-100 开发单元、四模式评估和回应屏蔽对照也已完成。因此活跃项
-`PATH_C_VQBC_V4_1_CHAIN` 标为 `tested`。该状态只表示登记测试已有通过证据；回应屏蔽效应仍为
-0，不能据此写成机制验收通过或 `frozen`。表中其余 `tested` 状态仍是历史模块在各自记录
+第三版骨干适配模块和家族级伙伴池正式链保持 `implemented`。VQBC V4.1 在注册远端环境完成的 50 项测试和开发读数保留为历史证据。V4.2 修改了模型、
+目标、checkpoint 和回应屏蔽 schema，不能继承 V4.1 的 `tested` 状态。因此活跃项
+`PATH_C_VQBC_V4_2_CHAIN` 标为 `implemented`；完成注册远端测试和同预算 seed-100 复跑前不得
+写成 `tested`、机制验收或 `frozen`。表中其余 `tested` 状态仍是历史模块在各自记录
 commit 上的已有证据，不传递到本轮变更。
 
 ## 6. 当前实施动作
@@ -564,3 +563,40 @@ V4.1 在独立远端目录完成四个目标测试文件，结果为 50 项通�
 参考策略和 KL 散度温度共同约束。前者计算的控制切换通常不是后者会执行的动作，所以高
 `S(a)` 不能解释真实分支的可用价值。正式训练继续关闭；下一次代码修订应使回应价值的延续
 算子直接对应真实执行分布。
+
+
+## 7.12 VQBC V4.2 行为一致反事实控制（2026-07-26）
+
+V4.1 已证明独立 Bellman experts 和持久 slot posterior 能够打破槽对称性，也证明 posterior 会
+进入正常动作。其失败发生在下一层：内部 `J_use/J_mask` 用无约束下一动作最大值估计回应价值，
+实际执行却是冻结 reference policy 上的 KL-regularized distribution；500 个 matched contrast
+回合因而出现正预测和逐行零效应。V4.2 统一模型、目标和运行器中的反事实语义。
+
+### 7.12.1 共同物理世界、不同 controller belief
+
+use 与 mask 均按 `b(m) p_m(y|h,a)` 积分真实槽和回应。评价者对世界的条件分布不因屏蔽而改变；
+唯一干预是 continuation controller 分别读取 `b^{a,y}` 与 `b`。`bellman_control_values` 直接接收
+两种 behavior-consistent continuation scalar，不再用不同 slot mixture 代替回应屏蔽。
+
+### 7.12.2 Belief-conditioned Q 与 raw-return continuation
+
+每个 Q expert 计算 `Q_e,m(z, stop_gradient(b), a)`。belief 不进入 auxiliary backbone gradient，
+共享 representation 仍只接收 Bellman/action-value gradient。OutcomeModel 删除完整 next-Q tensor，
+改为预测每个 `(e,m,a,y)` 在 use/mask controller belief 下、按照真实目标执行分布继续行动所得的
+raw-return scalar。训练 target 由 target network、真实下一 reference logits、同一温度和运行时
+`regularized_policy` 逐元素生成。
+
+### 7.12.3 随机策略级效应与 matched contrast
+
+控制器同时输出 `pi_U` 和 `pi_M`，并记录 policy-level raw response effect、policy cost、net effect、
+regularized objective difference 和 total variation。A1 从 `pi_M` 采样并屏蔽触发回应；A2-mask 与
+A2-use 执行同一个 `pi_U` 动作，仅在该回应是否进入 belief 上不同。触发和分箱使用 policy-level
+raw net effect；最大动作分数和实际执行动作分数只作诊断。原始行还绑定 belief L1、首次动作、
+观测、回应码和奖励分歧位置及计数。
+
+### 7.12.4 版本边界
+
+V4.2 使用 `path_c_model_v4_2`、`path_c_flax_checkpoint_v4` 和
+`path_c_model_checkpoint_metadata_v4`。配置文件更名为 `path_c_vqbc_v4_2_*`。V4/V4.1 checkpoint、
+resolved config、population manifest 和 response-contrast rows 均失败关闭，不能静默恢复。详细
+代码与复跑条件见 `docs/status/PATH_C_VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR.md`。

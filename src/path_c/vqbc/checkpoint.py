@@ -9,10 +9,10 @@ from typing import Any, Mapping
 
 from .config import VQBCCheckpointRef, VQBCConfig
 from .integrity import file_sha256, tree_sha256
-from .types import CheckpointMetadataV3
+from .types import CheckpointMetadataV4
 
 
-CHECKPOINT_SCHEMA_VERSION_V3 = "path_c_flax_checkpoint_v3"
+CHECKPOINT_SCHEMA_VERSION_V4 = "path_c_flax_checkpoint_v4"
 TRAIN_STATE_FORMAT = "flax_msgpack_pytree_leaves_v1"
 STATE_FILE = "train_state.msgpack"
 DEPLOYMENT_FILE = "deployment.msgpack"
@@ -34,7 +34,7 @@ def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def state_sha256(serialized_state: bytes) -> str:
-    return hashlib.sha256(b"path_c_vqbc_train_state_v2\x00" + serialized_state).hexdigest()
+    return hashlib.sha256(b"path_c_vqbc_train_state_v4_2\x00" + serialized_state).hexdigest()
 
 
 def _serialize_train_state(train_state: Any) -> bytes:
@@ -80,10 +80,10 @@ def checkpoint_metadata(
     config: VQBCConfig,
     train_state: Any,
     serialized_state: bytes,
-) -> CheckpointMetadataV3:
+) -> CheckpointMetadataV4:
     model_hash = tree_sha256(train_state.online_params)
-    return CheckpointMetadataV3(
-        schema_version="path_c_model_checkpoint_metadata_v3",
+    return CheckpointMetadataV4(
+        schema_version="path_c_model_checkpoint_metadata_v4",
         run_kind=config.run_kind,
         scientific_readout_allowed=False,
         outer_unit_id=(
@@ -144,7 +144,7 @@ def save_vqbc_checkpoint(
     _atomic_bytes(state_path, serialized)
     _atomic_bytes(deployment_path, deployment_serialized)
     manifest = {
-        "schema_version": CHECKPOINT_SCHEMA_VERSION_V3,
+        "schema_version": CHECKPOINT_SCHEMA_VERSION_V4,
         "format": TRAIN_STATE_FORMAT,
         "state_file": STATE_FILE,
         "state_file_sha256": file_sha256(state_path),
@@ -157,7 +157,7 @@ def save_vqbc_checkpoint(
 
 
 def assert_reference_ownership(
-    metadata: CheckpointMetadataV3,
+    metadata: CheckpointMetadataV4,
     expected_reference: VQBCCheckpointRef,
     *,
     expected_outer_unit_id: int | None,
@@ -189,7 +189,7 @@ def load_vqbc_checkpoint(
     *,
     target_state: Any,
     expected_config: VQBCConfig,
-) -> tuple[Any, CheckpointMetadataV3, Mapping[str, Any]]:
+) -> tuple[Any, CheckpointMetadataV4, Mapping[str, Any]]:
     try:
         from flax import serialization
     except ImportError as error:  # pragma: no cover - remote runtime dependency
@@ -211,7 +211,7 @@ def load_vqbc_checkpoint(
     if (
         not isinstance(manifest, Mapping)
         or set(manifest) != fields
-        or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION_V3
+        or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION_V4
         or manifest.get("format") != TRAIN_STATE_FORMAT
         or manifest.get("state_file") != STATE_FILE
         or manifest.get("deployment_file") != DEPLOYMENT_FILE
@@ -231,7 +231,7 @@ def load_vqbc_checkpoint(
     ):
         raise ValueError("Fourth-model checkpoint deployment bytes changed.")
     serialized = state_path.read_bytes()
-    metadata = CheckpointMetadataV3.from_mapping(manifest["metadata"])
+    metadata = CheckpointMetadataV4.from_mapping(manifest["metadata"])
     if metadata.state_sha256 != state_sha256(serialized):
         raise ValueError("Fourth-model checkpoint state hash changed.")
     if metadata.config_sha256 != expected_config.config_sha256:
@@ -256,7 +256,7 @@ def load_vqbc_deployment(
     directory: str | Path,
     *,
     expected_config: VQBCConfig,
-) -> tuple[Mapping[str, Any], CheckpointMetadataV3, Mapping[str, Any]]:
+) -> tuple[Mapping[str, Any], CheckpointMetadataV4, Mapping[str, Any]]:
     """Load only policy parameters, codebook, and two deployment temperatures."""
 
     try:
@@ -270,7 +270,7 @@ def load_vqbc_deployment(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if (
         not isinstance(manifest, Mapping)
-        or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION_V3
+        or manifest.get("schema_version") != CHECKPOINT_SCHEMA_VERSION_V4
         or manifest.get("deployment_file") != DEPLOYMENT_FILE
     ):
         raise ValueError("Fourth-model deployment manifest changed.")
@@ -281,7 +281,7 @@ def load_vqbc_deployment(
         != manifest.get("deployment_file_sha256")
     ):
         raise ValueError("Fourth-model deployment bytes changed.")
-    metadata = CheckpointMetadataV3.from_mapping(manifest.get("metadata", {}))
+    metadata = CheckpointMetadataV4.from_mapping(manifest.get("metadata", {}))
     if metadata.config_sha256 != expected_config.config_sha256:
         raise ValueError("Fourth-model deployment belongs to another config.")
     expected_outer = (
@@ -308,10 +308,10 @@ def load_vqbc_deployment(
 
 def assert_pairing_reference_ownership(
     *,
-    left_metadata: CheckpointMetadataV3,
+    left_metadata: CheckpointMetadataV4,
     left_reference: VQBCCheckpointRef,
     left_outer_unit_id: int,
-    right_metadata: CheckpointMetadataV3,
+    right_metadata: CheckpointMetadataV4,
     right_reference: VQBCCheckpointRef,
     right_outer_unit_id: int,
 ) -> None:
@@ -328,7 +328,7 @@ def assert_pairing_reference_ownership(
 
 
 __all__ = [
-    "CHECKPOINT_SCHEMA_VERSION_V3",
+    "CHECKPOINT_SCHEMA_VERSION_V4",
     "assert_pairing_reference_ownership",
     "assert_reference_ownership",
     "checkpoint_metadata",

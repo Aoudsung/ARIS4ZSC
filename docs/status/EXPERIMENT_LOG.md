@@ -4,6 +4,34 @@
 record; latest recorded scientific state = Link-A round 2 failed on 2026-07-09,
 and the active project line is now Path C.
 
+### 2026-07-26 Path C VQBC V4.2 行为一致反事实修复完成（静态/本地；未运行远端训练）
+
+- **修订边界：** V4.1 的槽分化、持久后验和远端 50 项测试继续作为历史证据。V4.2 修改了
+  Q 输入、outcome target、use/mask 反事实、checkpoint、population、evaluation 和 response-contrast
+  schema，因此不能继承 V4.1 的 `tested` 状态。当前登记为 `implemented`，全部产物保持
+  `scientific_readout_allowed: false`。
+- **统一根因修复：** Q experts 现在显式读取停止梯度的 controller belief；use 与 mask 使用相同
+  `b(m)p_m(y|a)` 物理联合权重，只在 continuation controller belief 上不同；无约束下一动作
+  `max` 和完整 next-Q tensor 已删除，改为由 target network、真实下一 reference logits、同一温度
+  和实际 KL-regularized policy生成的 raw-return continuation scalar。
+- **随机策略级读数：** runtime 同时计算 use/mask policy，记录 predicted response effect、policy cost、
+  raw net effect、regularized objective difference 和 policy total variation。回应屏蔽触发和分箱改用
+  policy-level raw net effect；A1 与 A2-mask 均屏蔽触发回应，A2-mask 与 A2-use 在 fork 时执行相同
+  动作。原始行新增触发后 belief L1、首次动作/观测/回应码/奖励分歧位置及计数。
+- **后验与 quotient：** slot posterior 继续持久保存；只有 posterior 支持达到登记 floor 的 value
+  classes 进入活动 quotient 计数。回应码 target 在 canonical uniform belief 下生成，避免同一物理
+  transition 因 counterfactual controller belief 不同而改变 token；该 target 只训练 encoder/codebook，
+  outcome、stale-belief target 与 E-step 固定读取 rollout 实际执行时记录的 response code，避免码本
+  更新后对同一 transition 进行事后重编码。
+- **版本边界：** config schema 为 `path_c_model_v4_2`，checkpoint manifest 为
+  `path_c_flax_checkpoint_v4`，metadata 为 `path_c_model_checkpoint_metadata_v4`；配置文件更名为
+  `path_c_vqbc_v4_2_*`。V4/V4.1 checkpoint 和旧 rows 均失败关闭。
+- **本地验证：** 当前容器缺少 Flax、Optax 和 JaxMARL。纯 JAX 数学、配置、评估、objective、
+  codebook 和 minibatch合同已运行；依赖缺失的完整模型、optimizer、checkpoint serialization和真实
+  environment tests明确保留为远端门。十单元正式训练继续关闭；下一次仅允许相同预算、相同
+  seed-100 和相同 500 个 seed 的开发复跑。详细说明见
+  `docs/status/PATH_C_VQBC_V4_2_BEHAVIOR_CONSISTENT_REPAIR.md`。
+
 ### 2026-07-26 Path C VQBC V4.1 回应屏蔽控制路径追踪完成（开发诊断；不具备科学结论权限）
 
 - **追踪范围与预算：** 使用首开发单元的最终 checkpoint，在同一远端隔离目录和 GPU 4 上
