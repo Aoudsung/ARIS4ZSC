@@ -15,16 +15,21 @@ from src.path_c.experiment import (
     load_population,
     write_population,
 )
+from src.path_c.method import empty_codebook
 from src.path_c.storage import (
     CompleteConsoleLog,
     ensure_run_identity,
     evaluation_identity,
+    orbax_manager,
     read_array_chunks,
     read_run_identity,
+    restore_latest_checkpoint,
+    save_checkpoint,
     training_identity,
     write_array_chunks,
     write_jsonl,
 )
+from src.path_c.training import TrainState
 
 ROOT = Path(__file__).resolve().parents[3]
 SIMPLE_CONFIG = ROOT / "experiments/overcooked_v2/configs/path_c_simple.yaml"
@@ -147,3 +152,34 @@ def test_console_log_keeps_exception_trace(tmp_path: Path) -> None:
     stderr = (tmp_path / "logs/stderr.log").read_text(encoding="utf-8")
     assert "Traceback" in stderr
     assert "RuntimeError: 完整异常消息" in stderr
+
+
+def test_orbax_restores_the_explicit_train_state_type(tmp_path: Path) -> None:
+    jax = pytest.importorskip("jax")
+    jnp = pytest.importorskip("jax.numpy")
+    pytest.importorskip("orbax.checkpoint")
+
+    state = TrainState(
+        online_params={"weight": jnp.asarray([1.0, 2.0])},
+        target_params={"weight": jnp.asarray([3.0, 4.0])},
+        bellman_optimizer_state={"count": jnp.asarray(5)},
+        outcome_optimizer_state={"count": jnp.asarray(6)},
+        codebook=empty_codebook(code_count=2, signature_dim=3),
+        runner_state={"effective_environment_steps": jnp.asarray(400)},
+        random_key=jax.random.PRNGKey(9),
+        update_count=jnp.asarray(7),
+    )
+    manager = orbax_manager(tmp_path / "checkpoints")
+    save_checkpoint(manager, step=400, state=state)
+    step, restored = restore_latest_checkpoint(manager, item=state)
+    assert step == 400
+    assert isinstance(restored, TrainState)
+    assert type(restored.codebook) is type(state.codebook)
+    np.testing.assert_array_equal(
+        np.asarray(restored.online_params["weight"]), [1.0, 2.0]
+    )
+    assert (
+        int(np.asarray(restored.runner_state["effective_environment_steps"]))
+        == 400
+    )
+    assert int(np.asarray(restored.update_count)) == 7

@@ -6,9 +6,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from experiments.overcooked_v2.official_adapter import OfficialNetwork, restore_official_checkpoint
+from experiments.overcooked_v2.official_adapter import (
+    OfficialNetwork,
+    restore_official_checkpoint,
+)
 from src.path_c.experiment import METHOD_VERSION, PopulationEntry
 from src.path_c.method import (
+    CodebookState,
     deployment_belief_after_response,
     slot_bayes_update,
     uniform_slot_log_belief,
@@ -20,6 +24,7 @@ from src.path_c.storage import (
     read_run_identity,
     restore_latest_checkpoint,
 )
+
 
 @dataclass(frozen=True, slots=True)
 class Deployment:
@@ -127,8 +132,25 @@ def load_deployment(
         raise FileNotFoundError(
             f"No Orbax step in {entry.run_directory / 'checkpoints'}."
         )
-    unused_step, train_state = restored
+    unused_step, checkpoint = restored
     del unused_step
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Orbax deployment checkpoint must restore as a mapping.")
+    required = {"online_params", "codebook", "runner_state"}
+    if not required.issubset(checkpoint):
+        raise ValueError("Orbax deployment checkpoint is missing training fields.")
+    online_params = checkpoint["online_params"]
+    codebook_values = checkpoint["codebook"]
+    runner_values = checkpoint["runner_state"]
+    if not all(
+        isinstance(value, Mapping)
+        for value in (online_params, codebook_values, runner_values)
+    ):
+        raise TypeError("Orbax deployment fields must be mappings.")
+    policy_values = runner_values.get("ego_policy")
+    if not isinstance(policy_values, Mapping):
+        raise TypeError("Orbax checkpoint lacks the ego policy state.")
+    codebook = CodebookState(**codebook_values)
     heads = build_model(
         hidden_dim=config.model.hidden_dim,
         slot_count=config.model.slot_count,
@@ -147,15 +169,16 @@ def load_deployment(
         outer_unit_id=entry.outer_unit_id,
         network=network,
         reference_params=reference_params,
-        online_params=train_state.online_params["official"],
+        online_params=online_params["official"],
         heads=heads,
-        head_params=train_state.online_params["heads"],
-        codebook=train_state.codebook,
-        log_temperature=train_state.runner_state.ego_policy.log_temperature,
+        head_params=online_params["heads"],
+        codebook=codebook,
+        log_temperature=policy_values["log_temperature"],
         generic_log_temperature=(
-            train_state.runner_state.ego_policy.generic_log_temperature
+            policy_values["generic_log_temperature"]
         ),
     )
+
 
 def reset_deployment_state(
     deployment: Deployment,

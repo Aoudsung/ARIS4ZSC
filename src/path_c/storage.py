@@ -139,13 +139,19 @@ def save_checkpoint(manager: Any, *, step: int, state: Any) -> None:
     manager.wait_until_finished()
 
 
-def restore_latest_checkpoint(manager: Any) -> tuple[int, Any] | None:
+def restore_latest_checkpoint(
+    manager: Any, *, item: Any | None = None
+) -> tuple[int, Any] | None:
+    """Restore the latest Orbax tree, optionally into its concrete state type."""
+
     import orbax.checkpoint as ocp
 
     step = manager.latest_step()
     if step is None:
         return None
-    state = manager.restore(int(step), args=ocp.args.PyTreeRestore())
+    state = manager.restore(
+        int(step), args=ocp.args.PyTreeRestore(item=item)
+    )
     return int(step), state
 
 

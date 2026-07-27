@@ -506,7 +506,7 @@ def run_training(args: argparse.Namespace) -> None:
             "The output already contains a checkpoint; use --resume or a new directory."
         )
     if args.resume:
-        restored = restore_latest_checkpoint(manager)
+        restored = restore_latest_checkpoint(manager, item=state)
         if restored is not None:
             unused_step, state = restored
             del unused_step
