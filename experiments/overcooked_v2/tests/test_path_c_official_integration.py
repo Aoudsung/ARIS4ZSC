@@ -238,6 +238,12 @@ def test_recorded_rollout_matches_official_public_rollout_return(
     tmp_path: Path,
 ) -> None:
     config = _small_config()
+    # The preceding test covers a complete 400-step episode.  This parity test
+    # needs only enough steps to compare the two public evaluator loops.
+    config = replace(
+        config,
+        environment=replace(config.environment, episode_steps=8),
+    )
     official_config = compose_official_config(
         config,
         algorithm="rnn-sp",
