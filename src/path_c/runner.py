@@ -751,6 +751,7 @@ def partner_callbacks(
     initial_temperature: float,
     gamma: float,
     terminal_response: int,
+    behavior_support: float,
 ) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
     """Build frozen-current and frozen-official partner behavior.
 
@@ -816,7 +817,7 @@ def partner_callbacks(
             key=jax.random.split(dynamic_key, observations.shape[0]),
             deployment_mode="posterior_use",
             gamma=gamma,
-            behavior_support=0.0,
+            behavior_support=behavior_support,
         )
         del unused_record, unused_generic
         return (
