@@ -18,7 +18,7 @@ from experiments.overcooked_v2.official_adapter import (
     recorded_rollout,
     restore_official_checkpoint,
 )
-from src.path_c.storage import load_config
+from src.path_c.experiment import load_config
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -26,7 +26,7 @@ CONFIG = ROOT / "experiments/overcooked_v2/configs/path_c_simple.yaml"
 
 
 def _small_config():
-    config = load_config(CONFIG)
+    config = load_config(CONFIG, run_kind="development")
     return replace(
         config,
         environment=replace(config.environment, num_envs=2),

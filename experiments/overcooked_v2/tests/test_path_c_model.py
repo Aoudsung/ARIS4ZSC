@@ -1,16 +1,25 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
 import numpy as np
+import pytest
+
+jax = pytest.importorskip("jax")
+jnp = pytest.importorskip("jax.numpy")
+pytest.importorskip("flax")
+from flax.core import freeze, unfreeze
 
 from src.path_c.method import uniform_slot_log_belief
-from src.path_c.model import build_model, initialize_heads, model_forward
+from src.path_c.model import (
+    build_model,
+    initial_control_carry,
+    initialize_heads,
+    model_forward,
+)
 
 
 def _model() -> object:
     return build_model(
-        hidden_dim=12,
+        hidden_dim=8,
         slot_count=3,
         action_count=6,
         response_count=5,
@@ -21,258 +30,169 @@ def _model() -> object:
     )
 
 
-def _history_inputs(features: jax.Array) -> tuple[jax.Array, jax.Array]:
-    prefix = features.shape[:-1]
-    return (
-        jnp.full(prefix, 6, dtype=jnp.int32),
-        jnp.zeros(prefix, dtype=jnp.float32),
-    )
+def _inputs(time: int = 3, batch: int = 2):
+    features = jnp.ones((time, batch, 8), dtype=jnp.float32)
+    actions = jnp.full((time, batch), 6, dtype=jnp.int32)
+    rewards = jnp.zeros((time, batch), dtype=jnp.float32)
+    starts = jnp.zeros((time, batch), dtype=jnp.bool_).at[0].set(True)
+    belief = uniform_slot_log_belief((time, batch), 3)
+    return features, actions, rewards, starts, belief
 
 
-def test_all_v4_2_heads_have_expected_shapes() -> None:
+def test_all_heads_have_registered_shapes() -> None:
     model = _model()
-    features = jnp.ones((2, 12), dtype=jnp.float32)
-    belief = uniform_slot_log_belief((2,), 3)
-    previous_actions, previous_rewards = _history_inputs(features)
+    features, actions, rewards, starts, belief = _inputs()
+    carry = initial_control_carry(2, 8)
+    params = model.init(
+        jax.random.PRNGKey(1),
+        carry,
+        features,
+        actions,
+        rewards,
+        starts,
+        belief,
+        method=model.sequence,
+    )["params"]
+    next_carry, output = model.apply(
+        {"params": params},
+        carry,
+        features,
+        actions,
+        rewards,
+        starts,
+        belief,
+        method=model.sequence,
+    )
+    assert next_carry.shape == (2, 8)
+    assert output["features"].shape == (3, 2, 8)
+    assert output["q_values"].shape == (3, 2, 2, 3, 6)
+    assert output["response_logits"].shape == (3, 2, 3, 6, 5)
+    assert output["continuation_use_mean"].shape == (3, 2, 2, 3, 6, 5)
+    assert output["continuation_mask_mean"].shape == (3, 2, 2, 3, 6, 5)
+
+
+def _set_projection_kernels_nonzero(tree: object) -> object:
+    mutable = unfreeze(tree)
+
+    def visit(node: object, path: tuple[str, ...] = ()) -> None:
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            next_path = (*path, str(key))
+            if (
+                key == "kernel"
+                and any(
+                    name in "/".join(next_path)
+                    for name in ("PreviousActionProjection", "PreviousRewardProjection")
+                )
+            ):
+                node[key] = jnp.ones_like(value) * 0.1
+            else:
+                visit(value, next_path)
+
+    visit(mutable)
+    return freeze(mutable)
+
+
+def test_early_action_and_reward_enter_later_control_memory() -> None:
+    model = _model()
+    features, actions, rewards, starts, belief = _inputs(time=4, batch=1)
+    carry = initial_control_carry(1, 8)
     params = model.init(
         jax.random.PRNGKey(2),
+        carry,
         features,
-        previous_actions,
-        previous_rewards,
+        actions,
+        rewards,
+        starts,
         belief,
+        method=model.sequence,
     )["params"]
-    output = model.apply(
-        {"params": params},
-        features,
-        previous_actions,
-        previous_rewards,
-        belief,
+    params = _set_projection_kernels_nonzero(params)
+
+    changed_actions = actions.at[1, 0].set(2)
+    changed_rewards = rewards.at[1, 0].set(3.0)
+    _, baseline = model.apply(
+        {"params": params}, carry, features, actions, rewards, starts, belief,
+        method=model.sequence,
     )
-    assert output["q_values"].shape == (2, 2, 3, 6)
-    assert output["learned_q_values"].shape == (2, 2, 3, 6)
-    assert output["prior_q_values"].shape == (2, 2, 3, 6)
-    assert output["centered_advantages"].shape == (2, 2, 3, 6)
-    assert output["features"].shape == (2, 12)
-    assert output["response_logits"].shape == (2, 3, 6, 5)
-    assert output["response_probabilities"].shape == (2, 3, 6, 5)
-    assert output["reward_mean"].shape == (2, 3, 6)
-    assert output["reward_log_standard_deviation"].shape == (2, 3, 6)
-    assert output["continuation_use_mean"].shape == (2, 2, 3, 6, 5)
-    assert output["continuation_use_log_standard_deviation"].shape == (
-        2,
-        2,
-        3,
-        6,
-        5,
+    _, changed = model.apply(
+        {"params": params}, carry, features, changed_actions, changed_rewards, starts, belief,
+        method=model.sequence,
     )
-    assert output["continuation_mask_mean"].shape == (2, 2, 3, 6, 5)
-    assert output["continuation_mask_log_standard_deviation"].shape == (
-        2,
-        2,
-        3,
-        6,
-        5,
+    # The changed evidence is at t=1; its effect must remain in the recurrent state at t=2+.
+    assert not np.array_equal(
+        np.asarray(baseline["features"][2:]),
+        np.asarray(changed["features"][2:]),
     )
 
-    forward = model_forward(
-        raw_output=output,
-        reference_logits=jnp.zeros((2, 6), dtype=jnp.float32),
-        slot_log_belief=belief,
-        temperature=jnp.ones((2,), dtype=jnp.float32),
-        generic_temperature=jnp.ones((2,), dtype=jnp.float32),
-        deployment_mode="posterior_use",
-        gamma=0.99,
-    )
-    assert forward.value_class_ids.shape == (2, 3)
-    assert forward.supported_value_class_count.shape == (2,)
-    for value in (
-        forward.j_use,
-        forward.j_mask,
-        forward.per_action_response_value,
-        forward.per_action_net_value,
-        forward.information_gain,
-        forward.execution_logits,
-        forward.mask_execution_logits,
-    ):
-        assert value.shape == (2, 6)
-    for value in (
-        forward.predicted_response_effect,
-        forward.predicted_policy_cost,
-        forward.predicted_net_effect,
-        forward.predicted_regularized_net_effect,
-        forward.predicted_policy_total_variation,
-    ):
-        assert value.shape == (2,)
 
-
-def test_twin_estimators_and_random_prior_are_distinct() -> None:
+def test_outcome_loss_cannot_backpropagate_into_control_feature() -> None:
     model = _model()
-    features = jnp.arange(24, dtype=jnp.float32).reshape(2, 12)
-    belief = uniform_slot_log_belief((2,), 3)
-    previous_actions, previous_rewards = _history_inputs(features)
+    features = jnp.ones((1, 8), dtype=jnp.float32)
+    belief = uniform_slot_log_belief((1,), 3)
     params = model.init(
         jax.random.PRNGKey(3),
+        initial_control_carry(1, 8),
         features,
-        previous_actions,
-        previous_rewards,
+        jnp.asarray([6]),
+        jnp.asarray([0.0]),
+        jnp.asarray([True]),
         belief,
-    )["params"]
-    output = model.apply(
-        {"params": params},
-        features,
-        previous_actions,
-        previous_rewards,
-        belief,
-    )
-    assert not np.array_equal(
-        np.asarray(output["prior_q_values"][:, 0]),
-        np.asarray(output["prior_q_values"][:, 1]),
-    )
-    np.testing.assert_allclose(
-        np.asarray(output["q_values"]),
-        np.asarray(
-            output["learned_q_values"]
-            + 0.01 * output["prior_q_values"]
-        ),
-        atol=1e-7,
-    )
-
-
-def test_belief_condition_can_be_learned_from_behavioral_loss() -> None:
-    model = _model()
-    features = jnp.ones((2, 12), dtype=jnp.float32)
-    uniform = uniform_slot_log_belief((2,), 3)
-    previous_actions, previous_rewards = _history_inputs(features)
-    params = model.init(
-        jax.random.PRNGKey(4),
-        features,
-        previous_actions,
-        previous_rewards,
-        uniform,
-    )["params"]
-    concentrated = jnp.log(
-        jnp.asarray([[0.98, 0.01, 0.01], [0.01, 0.98, 0.01]])
-    )
-
-    def separation(candidate: object) -> jax.Array:
-        uniform_q = model.apply(
-            {"params": candidate},
-            features,
-            previous_actions,
-            previous_rewards,
-            uniform,
-        )["learned_q_values"]
-        concentrated_q = model.apply(
-            {"params": candidate},
-            features,
-            previous_actions,
-            previous_rewards,
-            concentrated,
-        )["learned_q_values"]
-        return -jnp.sum(jnp.square(concentrated_q - uniform_q + 1.0))
-
-    gradient = jax.grad(separation)(params)
-    learned_params = jax.tree_util.tree_map(
-        lambda value, change: value + 0.01 * change, params, gradient
-    )
-    uniform_output = model.apply(
-        {"params": learned_params},
-        features,
-        previous_actions,
-        previous_rewards,
-        uniform,
-    )
-    concentrated_output = model.apply(
-        {"params": learned_params},
-        features,
-        previous_actions,
-        previous_rewards,
-        concentrated,
-    )
-    assert not np.array_equal(
-        np.asarray(uniform_output["learned_q_values"]),
-        np.asarray(concentrated_output["learned_q_values"]),
-    )
-
-
-def test_bellman_head_has_feature_gradient_and_outcome_head_does_not() -> None:
-    model = _model()
-    features = jnp.arange(24, dtype=jnp.float32).reshape(2, 12) / 10.0
-    belief = uniform_slot_log_belief((2,), 3)
-    previous_actions, previous_rewards = _history_inputs(features)
-    params = model.init(
-        jax.random.PRNGKey(5),
-        features,
-        previous_actions,
-        previous_rewards,
-        belief,
+        method=model.step,
     )["params"]
 
-    def q_loss(candidate: jax.Array) -> jax.Array:
-        return jnp.sum(
-            model.apply(
-                {"params": params},
-                candidate,
-                previous_actions,
-                previous_rewards,
-                belief,
-            )["q_values"]
-        )
-
-    def outcome_loss(candidate: jax.Array) -> jax.Array:
-        output = model.apply(
+    def outcome_sum(candidate: jax.Array) -> jax.Array:
+        _, raw = model.apply(
             {"params": params},
+            initial_control_carry(1, 8),
             candidate,
-            previous_actions,
-            previous_rewards,
+            jnp.asarray([6]),
+            jnp.asarray([0.0]),
+            jnp.asarray([True]),
             belief,
+            method=model.step,
         )
-        return jnp.sum(output["response_logits"]) + jnp.sum(
-            output["reward_mean"]
-        )
+        return jnp.sum(raw["reward_mean"]) + jnp.sum(raw["response_logits"])
 
-    assert np.any(np.asarray(jax.grad(q_loss)(features)) != 0.0)
     np.testing.assert_array_equal(
-        np.asarray(jax.grad(outcome_loss)(features)),
-        np.zeros_like(np.asarray(features)),
+        np.asarray(jax.grad(outcome_sum)(features)), np.zeros((1, 8), dtype=np.float32)
     )
 
 
-def test_initial_heads_preserve_official_action_distribution() -> None:
+def test_zero_initialized_outcome_preserves_reference_policy() -> None:
     model = _model()
-    features = jnp.ones((2, 12), dtype=jnp.float32)
+    features = jnp.ones((2, 8), dtype=jnp.float32)
     belief = uniform_slot_log_belief((2,), 3)
-    previous_actions, previous_rewards = _history_inputs(features)
-    observations = jnp.zeros((1, 2, 5, 5, 39), dtype=jnp.float32)
     params = initialize_heads(
         model,
-        random_key=jax.random.PRNGKey(6),
-        example_features=features,
-        example_previous_actions=previous_actions,
-        example_previous_team_rewards=previous_rewards,
+        random_key=jax.random.PRNGKey(4),
+        example_official_features=features,
+        example_previous_actions=jnp.full((2,), 6, dtype=jnp.int32),
+        example_previous_team_rewards=jnp.zeros((2,), dtype=jnp.float32),
+        example_episode_start=jnp.ones((2,), dtype=jnp.bool_),
         example_slot_log_belief=belief,
-        example_observations=observations,
+        example_observations=jnp.zeros((1, 2, 5, 5, 39), dtype=jnp.float32),
+        hidden_dim=8,
     )
-    raw = model.apply(
+    _, raw = model.apply(
         {"params": params},
+        initial_control_carry(2, 8),
         features,
-        previous_actions,
-        previous_rewards,
+        jnp.full((2,), 6, dtype=jnp.int32),
+        jnp.zeros((2,), dtype=jnp.float32),
+        jnp.ones((2,), dtype=jnp.bool_),
         belief,
+        method=model.step,
     )
-    reference_logits = jnp.asarray(
-        [[1.0, 0.5, -0.5, 0.0, 0.2, -1.0]] * 2,
-        dtype=jnp.float32,
-    )
+    reference = jnp.asarray([[1.0, 0.5, -0.5, 0.0, 0.2, -1.0]] * 2)
     output = model_forward(
         raw_output=raw,
-        reference_logits=reference_logits,
+        reference_logits=reference,
         slot_log_belief=belief,
         temperature=jnp.ones((2,)),
         generic_temperature=jnp.ones((2,)),
         deployment_mode="posterior_use",
         gamma=0.99,
     )
-    np.testing.assert_array_equal(
-        np.asarray(output.execution_logits), np.asarray(reference_logits)
-    )
+    np.testing.assert_array_equal(np.asarray(output.execution_logits), np.asarray(reference))

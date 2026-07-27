@@ -1,8 +1,10 @@
-"""Path C V4.2 heads attached to the official recurrent feature.
+"""Path C V4.2 control memory and value/outcome heads.
 
-The official OvercookedV2 network remains the sole observation encoder and
-recurrent model.  This module receives the recurrent feature returned by that
-public network interface and adds only the research heads.
+The official network supplies an observation-recurrent feature.  A small
+trainable control memory then integrates that feature with the ego's previous
+action and raw team reward before any Path C head is evaluated.  This keeps the
+complete ego history in the Bellman-trained state without copying the official
+network implementation.
 """
 
 from __future__ import annotations
@@ -54,11 +56,76 @@ class ModelOutput(NamedTuple):
 _MODEL_CLASS: Any | None = None
 
 
-def _head_classes() -> tuple[Any, Any, Any, Any]:
+def initial_control_carry(batch_size: int, hidden_dim: int) -> Any:
+    import jax.numpy as jnp
+
+    return jnp.zeros((int(batch_size), int(hidden_dim)), dtype=jnp.float32)
+
+
+def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
     import flax.linen as nn
     import jax
     import jax.numpy as jnp
     from flax.linen.initializers import normal, orthogonal, zeros
+
+    class ControlMemoryCell(nn.Module):
+        hidden_dim: int
+        action_count: int
+        action_embedding_dim: int
+
+        @nn.compact
+        def __call__(
+            self,
+            carry: Any,
+            inputs: tuple[Any, Any, Any, Any],
+        ) -> tuple[Any, Any]:
+            official_feature, previous_action, previous_reward, episode_start = inputs
+            feature = jnp.asarray(official_feature, dtype=jnp.float32)
+            action = jnp.asarray(previous_action, dtype=jnp.int32)
+            reward = jnp.asarray(previous_reward, dtype=jnp.float32)
+            start = jnp.asarray(episode_start, dtype=jnp.bool_)
+            if (
+                action.shape != feature.shape[:-1]
+                or reward.shape != action.shape
+                or start.shape != action.shape
+            ):
+                raise ValueError("Control-memory inputs must share the batch axes.")
+            sentinel_action = jnp.where(start, self.action_count, action)
+            action_embedding = nn.Embed(
+                num_embeddings=self.action_count + 1,
+                features=self.action_embedding_dim,
+                embedding_init=normal(0.02),
+                name="PreviousActionEmbedding",
+            )(sentinel_action)
+            action_feature = nn.Dense(
+                self.hidden_dim,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="PreviousActionProjection",
+            )(action_embedding)
+            reward_feature = nn.Dense(
+                self.hidden_dim,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="PreviousRewardProjection",
+            )(reward[..., None])
+            joined = nn.LayerNorm(name="ControlLayerNorm")(
+                feature + action_feature + reward_feature
+            )
+            reset_carry = jnp.zeros_like(carry)
+            carry = jnp.where(start[..., None], reset_carry, carry)
+            return nn.GRUCell(
+                features=self.hidden_dim,
+                name="ControlGRUCell",
+            )(carry, joined)
+
+    ScannedControlMemory = nn.scan(
+        ControlMemoryCell,
+        variable_broadcast="params",
+        split_rngs={"params": False},
+        in_axes=0,
+        out_axes=0,
+    )
 
     class IndependentDuelingEstimator(nn.Module):
         slot_count: int
@@ -239,7 +306,6 @@ def _head_classes() -> tuple[Any, Any, Any, Any]:
             posterior = physical_joint / jnp.maximum(
                 marginal[..., None, :, :], 1.0e-8
             )
-            # [..., slot, action, response] -> [..., action, response, slot]
             use_belief = jnp.moveaxis(posterior, -3, -1)
             mask_belief = jnp.broadcast_to(
                 belief[..., None, None, :], use_belief.shape
@@ -297,8 +363,6 @@ def _head_classes() -> tuple[Any, Any, Any, Any]:
                 mask_std_slots.append(evaluate(std_parameters, mask_features))
 
             def arrange(values: list[Any]) -> Any:
-                # slot items [..., action, estimator, response] ->
-                # [..., estimator, slot, action, response]
                 return jnp.moveaxis(jnp.stack(values, axis=-2), -4, -2)
 
             use_mean = arrange(use_mean_slots)
@@ -375,7 +439,13 @@ def _head_classes() -> tuple[Any, Any, Any, Any]:
                 name="signature",
             )(hidden)
 
-    return IndependentDuelingEstimator, TwinDuelingQ, OutcomeHead, ResponseEncoder
+    return (
+        ScannedControlMemory,
+        IndependentDuelingEstimator,
+        TwinDuelingQ,
+        OutcomeHead,
+        ResponseEncoder,
+    )
 
 
 def _model_class() -> Any:
@@ -386,10 +456,16 @@ def _model_class() -> Any:
     import flax.linen as nn
     import jax.numpy as jnp
 
-    unused_estimator, TwinDuelingQ, OutcomeHead, ResponseEncoder = _head_classes()
+    (
+        ScannedControlMemory,
+        unused_estimator,
+        TwinDuelingQ,
+        OutcomeHead,
+        ResponseEncoder,
+    ) = _head_classes()
     del unused_estimator
 
-    class PathCHeads(nn.Module):
+    class PathCModel(nn.Module):
         hidden_dim: int
         slot_count: int
         action_count: int
@@ -400,20 +476,10 @@ def _model_class() -> Any:
         log_standard_deviation_maximum: float
 
         def setup(self) -> None:
-            self.previous_action_embedding = nn.Embed(
-                num_embeddings=self.action_count + 1,
-                features=self.action_embedding_dim,
-                embedding_init=nn.initializers.normal(0.02),
-            )
-            self.previous_action_to_hidden = nn.Dense(
-                self.hidden_dim,
-                kernel_init=nn.initializers.zeros,
-                bias_init=nn.initializers.zeros,
-            )
-            self.previous_reward_to_hidden = nn.Dense(
-                self.hidden_dim,
-                kernel_init=nn.initializers.zeros,
-                bias_init=nn.initializers.zeros,
+            self.control_memory = ScannedControlMemory(
+                hidden_dim=self.hidden_dim,
+                action_count=self.action_count,
+                action_embedding_dim=self.action_embedding_dim,
             )
             self.q_heads = TwinDuelingQ(
                 slot_count=self.slot_count,
@@ -435,25 +501,6 @@ def _model_class() -> Any:
                 hidden_dim=self.hidden_dim,
             )
 
-        def history_features(
-            self,
-            official_features: Any,
-            previous_actions: Any,
-            previous_team_rewards: Any,
-        ) -> Any:
-            features = jnp.asarray(official_features, dtype=jnp.float32)
-            actions = jnp.asarray(previous_actions, dtype=jnp.int32)
-            rewards = jnp.asarray(previous_team_rewards, dtype=jnp.float32)
-            if actions.shape != features.shape[:-1] or rewards.shape != actions.shape:
-                raise ValueError(
-                    "Previous actions and rewards must share the feature prefix axes."
-                )
-            action_features = self.previous_action_to_hidden(
-                self.previous_action_embedding(actions)
-            )
-            reward_features = self.previous_reward_to_hidden(rewards[..., None])
-            return features + action_features + reward_features
-
         def from_features(
             self, features: Any, slot_log_belief: Any
         ) -> Mapping[str, Any]:
@@ -469,19 +516,62 @@ def _model_class() -> Any:
                 **self.outcome(features, slot_log_belief),
             }
 
-        def __call__(
+        def sequence(
             self,
+            control_carry: Any,
             official_features: Any,
             previous_actions: Any,
             previous_team_rewards: Any,
+            episode_start: Any,
             slot_log_belief: Any,
-        ) -> Mapping[str, Any]:
-            features = self.history_features(
+        ) -> tuple[Any, Mapping[str, Any]]:
+            next_carry, features = self.control_memory(
+                control_carry,
+                (
+                    official_features,
+                    previous_actions,
+                    previous_team_rewards,
+                    episode_start,
+                ),
+            )
+            return next_carry, self.from_features(features, slot_log_belief)
+
+        def step(
+            self,
+            control_carry: Any,
+            official_feature: Any,
+            previous_action: Any,
+            previous_team_reward: Any,
+            episode_start: Any,
+            slot_log_belief: Any,
+        ) -> tuple[Any, Mapping[str, Any]]:
+            next_carry, output = self.sequence(
+                control_carry,
+                official_feature[None, ...],
+                previous_action[None, ...],
+                previous_team_reward[None, ...],
+                episode_start[None, ...],
+                slot_log_belief[None, ...],
+            )
+            return next_carry, jax.tree_util.tree_map(lambda value: value[0], output)
+
+        def __call__(
+            self,
+            control_carry: Any,
+            official_features: Any,
+            previous_actions: Any,
+            previous_team_rewards: Any,
+            episode_start: Any,
+            slot_log_belief: Any,
+        ) -> tuple[Any, Mapping[str, Any]]:
+            return self.sequence(
+                control_carry,
                 official_features,
                 previous_actions,
                 previous_team_rewards,
+                episode_start,
+                slot_log_belief,
             )
-            return self.from_features(features, slot_log_belief)
 
         def encode_response(
             self,
@@ -494,8 +584,10 @@ def _model_class() -> Any:
                 observations, actions, next_observations, dones
             )
 
-    _MODEL_CLASS = PathCHeads
-    return PathCHeads
+    import jax
+
+    _MODEL_CLASS = PathCModel
+    return PathCModel
 
 
 def build_model(
@@ -509,8 +601,6 @@ def build_model(
     log_standard_deviation_minimum: float,
     log_standard_deviation_maximum: float,
 ) -> Any:
-    """Construct only the heads; the official adapter owns the recurrent net."""
-
     return _model_class()(
         hidden_dim=int(hidden_dim),
         slot_count=int(slot_count),
@@ -518,12 +608,8 @@ def build_model(
         response_count=int(response_count),
         prior_scale=float(prior_scale),
         action_embedding_dim=int(action_embedding_dim),
-        log_standard_deviation_minimum=float(
-            log_standard_deviation_minimum
-        ),
-        log_standard_deviation_maximum=float(
-            log_standard_deviation_maximum
-        ),
+        log_standard_deviation_minimum=float(log_standard_deviation_minimum),
+        log_standard_deviation_maximum=float(log_standard_deviation_maximum),
     )
 
 
@@ -531,24 +617,28 @@ def initialize_heads(
     model: Any,
     *,
     random_key: Any,
-    example_features: Any,
+    example_official_features: Any,
     example_previous_actions: Any,
     example_previous_team_rewards: Any,
+    example_episode_start: Any,
     example_slot_log_belief: Any,
     example_observations: Any,
+    hidden_dim: int,
 ) -> Mapping[str, Any]:
-    """Initialize research heads without copying or remapping official leaves."""
-
     import jax
     import jax.numpy as jnp
 
     head_key, response_key = jax.random.split(random_key)
+    carry = initial_control_carry(example_official_features.shape[0], hidden_dim)
     head_variables = model.init(
         head_key,
-        example_features,
+        carry,
+        example_official_features,
         example_previous_actions,
         example_previous_team_rewards,
+        example_episode_start,
         example_slot_log_belief,
+        method=model.step,
     )
     time_batch = example_observations.shape[:2]
     response_variables = model.init(
@@ -687,6 +777,7 @@ __all__ = [
     "ModelOutput",
     "build_model",
     "encode_response_codes",
+    "initial_control_carry",
     "initialize_heads",
     "model_forward",
     "response_logits_from_codebook",

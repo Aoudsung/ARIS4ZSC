@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Mapping, Sequence
 
-from src.path_c.storage import RunConfig
+from src.path_c.experiment import RunConfig
 
 
 ACTION_ORDER = ("right", "down", "left", "up", "stay", "interact")
@@ -76,6 +76,10 @@ def compose_official_config(
         "TUNE=false",
         "wandb.WANDB_MODE=disabled",
         f"model.TOTAL_TIMESTEPS={int(config.upstream.total_timesteps)}",
+        (
+            "model.REW_SHAPING_HORIZON="
+            f"{int(config.upstream.reward_shaping_horizon)}"
+        ),
     ]
     with initialize_config_dir(
         version_base=None,
@@ -87,12 +91,80 @@ def compose_official_config(
         raise ValueError("Official Hydra configuration did not resolve to a mapping.")
     result = dict(resolved)
     result["RUN_BASE_DIR"] = str(Path(output_directory).resolve())
+    _validate_official_config(result, config=config, algorithm=algorithm, seed=seed)
     return result
+
+
+def _validate_official_config(
+    resolved: Mapping[str, Any],
+    *,
+    config: RunConfig,
+    algorithm: str,
+    seed: int,
+) -> None:
+    model = resolved.get("model")
+    environment = resolved.get("env")
+    if not isinstance(model, Mapping) or not isinstance(environment, Mapping):
+        raise ValueError("Official Hydra config lacks model or environment sections.")
+    expected = {
+        "TYPE": "RNN",
+        "FC_DIM_SIZE": 128,
+        "GRU_HIDDEN_DIM": 128,
+        "TOTAL_TIMESTEPS": config.upstream.total_timesteps,
+        "REW_SHAPING_HORIZON": config.upstream.reward_shaping_horizon,
+        "NUM_STEPS": 256,
+        "UPDATE_EPOCHS": 4,
+        "NUM_MINIBATCHES": 64,
+        "GAMMA": 0.99,
+        "GAE_LAMBDA": 0.95,
+    }
+    for name, value in expected.items():
+        if model.get(name) != value:
+            raise ValueError(f"Official training config changed {name}: {model.get(name)!r}.")
+    variant = (
+        {"NUM_ENVS": 256, "ENT_COEF": 0.01}
+        if algorithm == "rnn-sp"
+        else {"NUM_ENVS": 64, "ENT_COEF": 0.02}
+    )
+    for name, value in variant.items():
+        if model.get(name) != value:
+            raise ValueError(f"Official {algorithm} config changed {name}.")
+    kwargs = environment.get("ENV_KWARGS")
+    if not isinstance(kwargs, Mapping):
+        raise ValueError("Official environment kwargs are missing.")
+    for name, value in {
+        "layout": config.environment.layout,
+        "agent_view_size": config.environment.agent_view_size,
+        "negative_rewards": True,
+        "random_agent_positions": True,
+        "sample_recipe_on_delivery": True,
+        "indicate_successful_delivery": config.environment.indicate_successful_delivery,
+    }.items():
+        if kwargs.get(name) != value:
+            raise ValueError(f"Official environment config changed {name}.")
+    if algorithm == "rnn-op" and list(kwargs.get("op_ingredient_permutations", ())) != [0, 1]:
+        raise ValueError("Official Other-Play symmetry is not enabled.")
+    if int(resolved.get("SEED", -1)) != int(seed) or int(resolved.get("NUM_SEEDS", -1)) != 1:
+        raise ValueError("Official seed resolution differs from the requested run.")
+
+
+def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
+    environment = config.get("env")
+    if not isinstance(environment, Mapping):
+        raise ValueError("Official checkpoint config lacks its environment section.")
+    kwargs = environment.get("ENV_KWARGS")
+    if not isinstance(kwargs, Mapping) or not kwargs.get("layout"):
+        raise ValueError("Official checkpoint config lacks its layout.")
+    return str(kwargs["layout"])
 
 
 @dataclass(frozen=True, slots=True)
 class OfficialNetwork:
     config: Mapping[str, Any]
+
+    @property
+    def layout(self) -> str:
+        return official_checkpoint_layout(self.config)
 
     def network(self) -> Any:
         get_actor_critic = _official_symbol(
@@ -464,6 +536,19 @@ class FrozenPartnerPool:
             raise ValueError("The frozen partner pool cannot be empty.")
         configs = [item[0] for item in restored]
         params = [item[1] for item in restored]
+        layouts = [official_checkpoint_layout(config) for config in configs]
+        if len(set(layouts)) != 1:
+            raise ValueError("Frozen partner checkpoints mix different layouts.")
+        model_signatures = [
+            (
+                config.get("model", {}).get("TYPE"),
+                config.get("model", {}).get("GRU_HIDDEN_DIM"),
+                config.get("model", {}).get("FC_DIM_SIZE"),
+            )
+            for config in configs
+        ]
+        if len(set(model_signatures)) != 1:
+            raise ValueError("Frozen partner checkpoints use different network shapes.")
         stacked = jax.tree_util.tree_map(
             lambda *values: jnp.stack(values), *params
         )
@@ -608,6 +693,7 @@ __all__ = [
     "VectorEnvironment",
     "compose_official_config",
     "initialize_official_parameters",
+    "official_checkpoint_layout",
     "official_policy",
     "official_rollout",
     "recorded_rollout",

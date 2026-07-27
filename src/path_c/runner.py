@@ -12,7 +12,7 @@ from .method import (
     slot_bayes_update,
     uniform_slot_log_belief,
 )
-from .model import model_forward
+from .model import initial_control_carry, model_forward
 from .training import TransitionBatch
 
 
@@ -114,6 +114,7 @@ def initialize_policy_state(
     batch_size: int,
     slot_count: int,
     action_count: int,
+    hidden_dim: int,
     initial_temperature: float,
 ) -> PolicyState:
     import jax.numpy as jnp
@@ -121,6 +122,7 @@ def initialize_policy_state(
     return PolicyState(
         reference_carry=official_initial_carry(batch_size),
         trainable_carry=official_initial_carry(batch_size),
+        control_carry=initial_control_carry(batch_size, hidden_dim),
         slot_log_belief=uniform_slot_log_belief((batch_size,), slot_count),
         previous_action=jnp.full((batch_size,), action_count, dtype=jnp.int32),
         previous_team_reward=jnp.zeros((batch_size,), dtype=jnp.float32),
@@ -142,6 +144,7 @@ def initialize_runner(
     random_key: Any,
     slot_count: int,
     action_count: int,
+    hidden_dim: int,
     partner_member_count: int,
     initial_temperature: float,
 ) -> RunnerState:
@@ -163,6 +166,7 @@ def initialize_runner(
             batch_size=count,
             slot_count=slot_count,
             action_count=action_count,
+            hidden_dim=hidden_dim,
             initial_temperature=initial_temperature,
         ),
         partner_state=partner_initial_state(count),
@@ -221,11 +225,13 @@ def policy_action(
         policy_state.episode_start,
     )
     del unused_online_logits, unused_online_value
-    raw = functions.heads_apply(
+    next_control_carry, raw = functions.heads_apply(
         params["heads"],
+        policy_state.control_carry,
         features,
         policy_state.previous_action,
         policy_state.previous_team_reward,
+        policy_state.episode_start,
         belief,
     )
     output = model_forward(
@@ -269,6 +275,7 @@ def policy_action(
     next_state = policy_state._replace(
         reference_carry=next_reference_carry,
         trainable_carry=next_trainable_carry,
+        control_carry=next_control_carry,
         slot_log_belief=belief,
     )
     record = DecisionRecord(
@@ -321,6 +328,7 @@ def collect_rollout(
         raise ValueError("A training rollout must contain one complete episode.")
     count = int(environment.num_envs)
     initial_official_carry = state.ego_policy.trainable_carry
+    initial_control_carry_value = state.ego_policy.control_carry
 
     def one_step(
         current: RunnerState, unused: Any
@@ -587,6 +595,7 @@ def collect_rollout(
             axis=0,
         ),
         initial_official_carry=initial_official_carry,
+        initial_control_carry=initial_control_carry_value,
         reference_logits=jnp.concatenate(
             (recorded["reference_logits"], final_reference_logits[None, ...]),
             axis=0,
@@ -646,6 +655,7 @@ def partner_callbacks(
     static_partner_step: Callable[..., tuple[Any, Any]],
     slot_count: int,
     action_count: int,
+    hidden_dim: int,
     initial_temperature: float,
     gamma: float,
     terminal_response: int,
@@ -676,6 +686,7 @@ def partner_callbacks(
                 batch_size=batch_size,
                 slot_count=slot_count,
                 action_count=action_count,
+                hidden_dim=hidden_dim,
                 initial_temperature=initial_temperature,
             ),
             static_carry=official_initial_carry(batch_size),

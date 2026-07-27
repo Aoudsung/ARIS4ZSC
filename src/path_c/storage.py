@@ -1,229 +1,119 @@
-"""Configuration, Orbax checkpoints, complete records, and resume state."""
+"""Checkpoint, run identity, and lossless record I/O.
+
+There is one identity file per run directory.  Resume and evaluation reuse it
+verbatim; no second registry, content-addressed projection, or fallback path is
+maintained.
+"""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import importlib.metadata
 import json
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence, TextIO, cast
 
-from .method import DEPLOYMENT_MODES
+from .experiment import METHOD_VERSION, RunConfig
+
+IDENTITY_FILE = "run_identity.json"
 
 
-CONFIG_VERSION = 1
-LAYOUTS = ("test_time_simple", "test_time_wide")
+def training_identity(
+    *,
+    config: RunConfig,
+    seed: int,
+    outer_unit_id: int,
+    reference_checkpoint: str | Path,
+    partner_checkpoints: Sequence[str | Path],
+) -> Mapping[str, Any]:
+    return {
+        "stage": "train",
+        "method": METHOD_VERSION,
+        "run_kind": config.run_kind,
+        "layout": config.environment.layout,
+        "config": config.to_mapping(),
+        "seed": int(seed),
+        "outer_unit_id": int(outer_unit_id),
+        "reference_checkpoint": str(Path(reference_checkpoint).resolve()),
+        "partner_checkpoints": [
+            str(Path(path).resolve()) for path in partner_checkpoints
+        ],
+    }
 
 
-@dataclass(frozen=True, slots=True)
-class EnvironmentConfig:
-    layout: str
-    agent_view_size: int
-    indicate_successful_delivery: bool
-    episode_steps: int
-    num_envs: int
+def upstream_identity(
+    *, config: RunConfig, seed: int, algorithm: str
+) -> Mapping[str, Any]:
+    return {
+        "stage": "upstream",
+        "method": "official_overcooked_v2_locked",
+        "run_kind": config.run_kind,
+        "layout": config.environment.layout,
+        "config": config.to_mapping(),
+        "seed": int(seed),
+        "algorithm": str(algorithm),
+    }
 
 
-@dataclass(frozen=True, slots=True)
-class ModelConfig:
-    hidden_dim: int
-    action_embedding_dim: int
-    slot_count: int
-    response_count: int
-    action_count: int
-    prior_scale: float
-    log_standard_deviation_minimum: float
-    log_standard_deviation_maximum: float
+def evaluation_identity(
+    *,
+    config: RunConfig,
+    seed: int,
+    population: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    return {
+        "stage": "evaluate",
+        "method": METHOD_VERSION,
+        "run_kind": config.run_kind,
+        "layout": config.environment.layout,
+        "config": config.to_mapping(),
+        "seed": int(seed),
+        "population": dict(population),
+    }
 
 
-@dataclass(frozen=True, slots=True)
-class TrainingConfig:
-    environment_steps: int
-    update_epochs: int
-    minibatches_per_epoch: int
-    bellman_learning_rate: float
-    outcome_learning_rate: float
-    gradient_clip_norm: float
-    gamma: float
-    responsibility_temperature: float
-    bootstrap_probability: float
-    polyak_coefficient: float
-    codebook_decay: float
-    code_replacement_rollouts: int
-    checkpoint_interval_environment_steps: int
+def ensure_run_identity(directory: str | Path, expected: Mapping[str, Any]) -> Path:
+    """Create the run identity once, then require exact equality on reuse."""
 
-
-@dataclass(frozen=True, slots=True)
-class KLConfig:
-    target_per_step: float
-    initial_temperature: float
-    dual_learning_rate: float
-    minimum_temperature: float
-    maximum_temperature: float
-
-
-@dataclass(frozen=True, slots=True)
-class EvaluationConfig:
-    episodes_per_pairing: int
-    deployment_modes: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class UpstreamConfig:
-    total_timesteps: int
-    checkpoint_progress: tuple[float, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class RunConfig:
-    environment: EnvironmentConfig
-    model: ModelConfig
-    training: TrainingConfig
-    kl: KLConfig
-    evaluation: EvaluationConfig
-    upstream: UpstreamConfig
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {"version": CONFIG_VERSION, **asdict(self)}
-
-
-def load_config(path: str | Path) -> RunConfig:
-    """Load the one active configuration for a layout."""
-
-    import yaml
-
-    config_path = Path(path).resolve()
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError("The configuration must be a mapping.")
-    _require_fields(
-        payload,
-        {"version", "environment", "model", "training", "kl", "evaluation", "upstream"},
-        "configuration",
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / IDENTITY_FILE
+    normalized = json.loads(json.dumps(dict(expected), sort_keys=True))
+    if path.is_file():
+        observed = json.loads(path.read_text(encoding="utf-8"))
+        if observed != normalized:
+            differing = sorted(
+                key
+                for key in set(observed) | set(normalized)
+                if observed.get(key) != normalized.get(key)
+            )
+            raise RuntimeError(
+                "Run directory belongs to a different experiment; "
+                f"different fields={differing}."
+            )
+        return path
+    existing = sorted(
+        child.name for child in root.iterdir() if child.name != "logs"
     )
-    if int(payload["version"]) != CONFIG_VERSION:
-        raise ValueError("The active Path C configuration version is 1.")
-
-    _require_fields(payload["environment"], set(EnvironmentConfig.__dataclass_fields__), "environment")
-    _require_fields(payload["model"], set(ModelConfig.__dataclass_fields__), "model")
-    _require_fields(payload["training"], set(TrainingConfig.__dataclass_fields__), "training")
-    _require_fields(payload["kl"], set(KLConfig.__dataclass_fields__), "kl")
-    environment = EnvironmentConfig(**payload["environment"])
-    model = ModelConfig(**payload["model"])
-    training = TrainingConfig(**payload["training"])
-    kl = KLConfig(**payload["kl"])
-    raw_evaluation = dict(payload["evaluation"])
-    _require_fields(raw_evaluation, set(EvaluationConfig.__dataclass_fields__), "evaluation")
-    evaluation = EvaluationConfig(
-        episodes_per_pairing=int(raw_evaluation["episodes_per_pairing"]),
-        deployment_modes=tuple(raw_evaluation["deployment_modes"]),
-    )
-    raw_upstream = dict(payload["upstream"])
-    _require_fields(raw_upstream, set(UpstreamConfig.__dataclass_fields__), "upstream")
-    upstream = UpstreamConfig(
-        total_timesteps=int(raw_upstream["total_timesteps"]),
-        checkpoint_progress=tuple(raw_upstream["checkpoint_progress"]),
-    )
-    result = RunConfig(
-        environment=environment,
-        model=model,
-        training=training,
-        kl=kl,
-        evaluation=evaluation,
-        upstream=upstream,
-    )
-    validate_config(result)
-    return result
-
-
-def _require_fields(
-    payload: Any, expected: set[str], location: str
-) -> None:
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"{location} must be a mapping.")
-    present = set(payload)
-    if present != expected:
-        raise ValueError(
-            f"{location} fields differ: missing={sorted(expected - present)}, "
-            f"unknown={sorted(present - expected)}."
+    if existing:
+        raise RuntimeError(
+            "Existing run data has no identity and cannot be adopted; "
+            f"entries={existing}."
         )
-
-
-def validate_config(config: RunConfig) -> None:
-    if config.environment.layout not in LAYOUTS:
-        raise ValueError(f"Unknown OvercookedV2 layout: {config.environment.layout}")
-    if config.environment.episode_steps != 400:
-        raise ValueError("Standard OvercookedV2 evaluation uses 400-step episodes.")
-    if config.environment.num_envs <= 0:
-        raise ValueError("The vector environment count must be positive.")
-    if config.model.action_count != 6:
-        raise ValueError("JaxMARL OvercookedV2 exposes six actions.")
-    if (
-        config.model.hidden_dim <= 0
-        or config.model.action_embedding_dim <= 0
-        or config.model.slot_count < 2
-        or config.model.response_count < 2
-    ):
-        raise ValueError("The method needs multiple slots and response codes.")
-    if (
-        config.model.log_standard_deviation_minimum
-        >= config.model.log_standard_deviation_maximum
-    ):
-        raise ValueError("The outcome standard-deviation bounds are reversed.")
-    if config.training.environment_steps <= 0:
-        raise ValueError("Training environment steps must be positive.")
-    if (
-        config.training.update_epochs <= 0
-        or config.training.minibatches_per_epoch <= 0
-    ):
-        raise ValueError("Training epochs and minibatches must be positive.")
-    if (
-        config.training.bellman_learning_rate <= 0.0
-        or config.training.outcome_learning_rate <= 0.0
-        or config.training.gradient_clip_norm <= 0.0
-        or config.training.responsibility_temperature <= 0.0
-    ):
-        raise ValueError("Training rates, clipping, and responsibility temperature must be positive.")
-    if not 0.0 <= config.training.gamma <= 1.0:
-        raise ValueError("The return discount must lie in [0, 1].")
-    for name, value in (
-        ("bootstrap_probability", config.training.bootstrap_probability),
-        ("polyak_coefficient", config.training.polyak_coefficient),
-        ("codebook_decay", config.training.codebook_decay),
-    ):
-        if not 0.0 <= value <= 1.0:
-            raise ValueError(f"{name} must lie in [0, 1].")
-    if (
-        config.training.code_replacement_rollouts <= 0
-        or config.training.checkpoint_interval_environment_steps <= 0
-    ):
-        raise ValueError("Code replacement and checkpoint intervals must be positive.")
-    rollout_steps = (
-        config.environment.num_envs * config.environment.episode_steps
+    path.write_text(
+        json.dumps(normalized, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
     )
-    if config.training.environment_steps % rollout_steps:
-        raise ValueError("Training must contain whole vectorized episodes.")
-    if config.environment.num_envs % config.training.minibatches_per_epoch:
-        raise ValueError("Environment lanes must divide into whole minibatches.")
-    if config.evaluation.episodes_per_pairing != 500:
-        raise ValueError("Standard evaluation uses 500 episodes per pairing.")
-    if tuple(config.evaluation.deployment_modes) != DEPLOYMENT_MODES:
-        raise ValueError("The active evaluation contains all four deployment modes.")
-    if (
-        config.kl.target_per_step < 0.0
-        or config.kl.initial_temperature <= 0.0
-        or config.kl.dual_learning_rate <= 0.0
-        or config.kl.minimum_temperature <= 0.0
-        or config.kl.maximum_temperature < config.kl.minimum_temperature
-    ):
-        raise ValueError("Kullback–Leibler temperature settings are invalid.")
-    if config.upstream.total_timesteps <= 0:
-        raise ValueError("Official upstream training steps must be positive.")
-    progress = config.upstream.checkpoint_progress
-    if tuple(progress) != (0.0, 0.5, 1.0):
-        raise ValueError("Upstream training saves start, midpoint, and final checkpoints.")
+    return path
+
+
+def read_run_identity(directory: str | Path) -> Mapping[str, Any]:
+    path = Path(directory).resolve() / IDENTITY_FILE
+    if not path.is_file():
+        raise FileNotFoundError(f"Run identity is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("Run identity must be a JSON mapping.")
+    return payload
 
 
 def orbax_manager(directory: str | Path, *, create: bool = True) -> Any:
@@ -240,12 +130,7 @@ def orbax_manager(directory: str | Path, *, create: bool = True) -> Any:
     )
 
 
-def save_checkpoint(
-    manager: Any,
-    *,
-    step: int,
-    state: Any,
-) -> None:
+def save_checkpoint(manager: Any, *, step: int, state: Any) -> None:
     import orbax.checkpoint as ocp
 
     saved = manager.save(int(step), args=ocp.args.PyTreeSave(state))
@@ -269,7 +154,6 @@ def write_run_metadata(
     *,
     config: RunConfig,
     seed: int,
-    run_kind: str,
     effective_environment_steps: int,
     update_count: int,
     completed_episodes: int,
@@ -277,10 +161,8 @@ def write_run_metadata(
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "run_kind": str(run_kind),
+        "method": METHOD_VERSION,
         "config": config.to_mapping(),
-        "git_commit": current_git_commit(),
-        "dependencies": dependency_versions(),
         "seed": int(seed),
         "effective_environment_steps": int(effective_environment_steps),
         "update_count": int(update_count),
@@ -291,30 +173,6 @@ def write_run_metadata(
         encoding="utf-8",
     )
     return target
-
-
-def current_git_commit() -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def dependency_versions() -> Mapping[str, str]:
-    names = (
-        "jax",
-        "jaxlib",
-        "flax",
-        "optax",
-        "orbax-checkpoint",
-        "jaxmarl",
-        "overcooked_v2_experiments",
-        "numpy",
-        "pyarrow",
-    )
-    return {name: importlib.metadata.version(name) for name in names}
 
 
 def write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
@@ -328,8 +186,6 @@ def write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
 
 
 def write_jsonl(path: str | Path, rows: Iterable[Mapping[str, Any]]) -> Path:
-    """Write every row supplied by the caller."""
-
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as handle:
@@ -361,8 +217,6 @@ def write_array_chunks(
     values: Any,
     rows_per_chunk: int,
 ) -> tuple[Path, ...]:
-    """Save a lossless sequence of compressed NumPy chunks."""
-
     import numpy as np
 
     array = np.asarray(values)
@@ -392,8 +246,6 @@ def read_array_chunks(paths: Sequence[str | Path]) -> Any:
 
 
 class Tee(TextIO):
-    """Write complete console output to both the terminal and one file."""
-
     def __init__(self, terminal: TextIO, log: TextIO) -> None:
         self._terminal = terminal
         self._log = log
@@ -447,22 +299,16 @@ class CompleteConsoleLog:
 
 __all__ = [
     "CompleteConsoleLog",
-    "DEPLOYMENT_MODES",
-    "EnvironmentConfig",
-    "EvaluationConfig",
-    "KLConfig",
-    "ModelConfig",
-    "RunConfig",
-    "TrainingConfig",
-    "UpstreamConfig",
-    "dependency_versions",
-    "load_config",
+    "ensure_run_identity",
+    "evaluation_identity",
     "orbax_manager",
     "read_array_chunks",
     "read_parquet",
+    "read_run_identity",
     "restore_latest_checkpoint",
     "save_checkpoint",
-    "validate_config",
+    "training_identity",
+    "upstream_identity",
     "write_array_chunks",
     "write_json",
     "write_jsonl",

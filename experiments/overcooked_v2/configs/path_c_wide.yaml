@@ -1,11 +1,10 @@
-version: 1
+version: 2
 
 environment:
   layout: test_time_wide
   agent_view_size: 2
   indicate_successful_delivery: true
   episode_steps: 400
-  num_envs: 250
 
 model:
   hidden_dim: 128
@@ -18,9 +17,7 @@ model:
   log_standard_deviation_maximum: 2.0
 
 training:
-  environment_steps: 11000000
   update_epochs: 4
-  minibatches_per_epoch: 50
   bellman_learning_rate: 0.0001
   outcome_learning_rate: 0.00025
   gradient_clip_norm: 0.25
@@ -30,7 +27,6 @@ training:
   polyak_coefficient: 0.005
   codebook_decay: 0.99
   code_replacement_rollouts: 10
-  checkpoint_interval_environment_steps: 100000
 
 kl:
   target_per_step: 0.02
@@ -49,4 +45,5 @@ evaluation:
 
 upstream:
   total_timesteps: 30000000
+  reward_shaping_horizon: 15000000
   checkpoint_progress: [0.0, 0.5, 1.0]

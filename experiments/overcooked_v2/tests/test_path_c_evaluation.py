@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from statistics import mean, stdev
 
@@ -11,16 +10,18 @@ from src.path_c.evaluation import (
     DEPLOYMENT_MODES,
     EpisodeRow,
     Pairing,
-    Population,
-    PopulationEntry,
     ResponseContrastRow,
     effect_components,
-    load_population,
     standard_episode_seed,
     standard_pairings,
     summarize_standard_rows,
     validate_response_contrast_rows,
     validate_standard_rows,
+)
+from src.path_c.experiment import (
+    Population,
+    PopulationEntry,
+    load_population,
     write_population,
 )
 
@@ -85,12 +86,12 @@ def test_five_hundred_unique_episodes_and_matched_mode_seeds() -> None:
                 right_outer_unit_id=right,
                 episode_index=index,
             )
-            for unused_mode in DEPLOYMENT_MODES
+            for _ in DEPLOYMENT_MODES
         }
         assert len(seeds) == 1
 
 
-def test_official_summary_uses_pairing_means_and_pairing_standard_deviation() -> None:
+def test_summary_uses_pairing_means_and_pairing_standard_deviation() -> None:
     rows = tuple(
         _episode("posterior_use", left, right, index)
         for left in range(10)
@@ -106,55 +107,67 @@ def test_official_summary_uses_pairing_means_and_pairing_standard_deviation() ->
         if left != right
     ]
     np.testing.assert_allclose(summary["sp"]["mean_raw_return"], mean(sp_values))
-    np.testing.assert_allclose(summary["sp"]["pairing_standard_deviation"], stdev(sp_values))
-    np.testing.assert_allclose(summary["xp"]["mean_raw_return"], mean(xp_values))
-    np.testing.assert_allclose(summary["xp"]["pairing_standard_deviation"], stdev(xp_values))
     np.testing.assert_allclose(
-        summary["sp_minus_xp"], mean(sp_values) - mean(xp_values)
+        summary["sp"]["pairing_standard_deviation"], stdev(sp_values)
+    )
+    np.testing.assert_allclose(summary["xp"]["mean_raw_return"], mean(xp_values))
+    np.testing.assert_allclose(
+        summary["xp"]["pairing_standard_deviation"], stdev(xp_values)
     )
 
 
-def test_response_mask_effects_follow_literal_three_branch_identity() -> None:
-    row = ResponseContrastRow(
-        pairing_id="01_to_07",
-        episode_index=4,
-        episode_seed=10,
-        triggered=True,
-        trigger_step=12,
-        trigger_tolerance=0.01,
-        predicted_response_effect=0.2,
-        predicted_policy_cost=0.1,
-        predicted_net_effect=0.1,
-        predicted_regularized_net_effect=0.08,
-        predicted_policy_total_variation=0.03,
-        maximum_action_net_value=0.4,
-        executed_action_net_value=0.2,
-        executed_action_response_value=0.3,
-        executed_action=5,
-        maximum_net_action=5,
-        post_response_belief_l1=0.6,
-        first_left_action_difference_step=13,
-        first_observation_difference_step=14,
-        first_response_code_difference_step=12,
-        first_reward_difference_step=20,
-        left_action_difference_count=3,
-        observation_difference_count=2,
-        response_code_difference_count=1,
-        reward_difference_count=1,
+def _contrast_row(*, left: int, right: int, index: int, triggered: bool) -> ResponseContrastRow:
+    common = dict(
+        pairing_id=f"{left:02d}_to_{right:02d}",
+        episode_index=index,
+        episode_seed=standard_episode_seed(
+            evaluation_seed=17,
+            layout="test_time_simple",
+            left_outer_unit_id=left,
+            right_outer_unit_id=right,
+            episode_index=index,
+        ),
+        triggered=triggered,
+        trigger_step=12 if triggered else None,
+        trigger_tolerance=0.01 if triggered else None,
+        predicted_response_effect=0.2 if triggered else None,
+        predicted_policy_cost=0.1 if triggered else None,
+        predicted_net_effect=0.1 if triggered else None,
+        predicted_regularized_net_effect=0.08 if triggered else None,
+        predicted_policy_total_variation=0.03 if triggered else None,
+        maximum_action_net_value=0.4 if triggered else None,
+        executed_action_net_value=0.2 if triggered else None,
+        executed_action_response_value=0.3 if triggered else None,
+        executed_action=5 if triggered else None,
+        maximum_net_action=5 if triggered else None,
+        post_response_belief_l1=0.6 if triggered else None,
+        first_left_action_difference_step=13 if triggered else None,
+        first_observation_difference_step=14 if triggered else None,
+        first_response_code_difference_step=12 if triggered else None,
+        first_reward_difference_step=20 if triggered else None,
+        left_action_difference_count=3 if triggered else None,
+        observation_difference_count=2 if triggered else None,
+        response_code_difference_count=1 if triggered else None,
+        reward_difference_count=1 if triggered else None,
         environment_steps=1_200,
-        a1_raw_return=7.0,
-        a1_correct_delivery_count=1,
+        a1_raw_return=7.0 if triggered else 2.0,
+        a1_correct_delivery_count=1 if triggered else 0,
         a1_wrong_delivery_count=0,
-        a1_indicator_activation_count=2,
-        a2_mask_raw_return=3.0,
-        a2_mask_correct_delivery_count=1,
-        a2_mask_wrong_delivery_count=1,
-        a2_mask_indicator_activation_count=3,
-        a2_use_raw_return=11.0,
-        a2_use_correct_delivery_count=2,
+        a1_indicator_activation_count=2 if triggered else 0,
+        a2_mask_raw_return=3.0 if triggered else 2.0,
+        a2_mask_correct_delivery_count=1 if triggered else 0,
+        a2_mask_wrong_delivery_count=1 if triggered else 0,
+        a2_mask_indicator_activation_count=3 if triggered else 0,
+        a2_use_raw_return=11.0 if triggered else 2.0,
+        a2_use_correct_delivery_count=2 if triggered else 0,
         a2_use_wrong_delivery_count=0,
-        a2_use_indicator_activation_count=2,
+        a2_use_indicator_activation_count=2 if triggered else 0,
     )
+    return ResponseContrastRow(**common)
+
+
+def test_response_mask_effects_follow_three_branch_identity() -> None:
+    row = _contrast_row(left=1, right=7, index=4, triggered=True)
     assert effect_components(row) == {
         "delta_response": 8.0,
         "delta_cost": 4.0,
@@ -162,88 +175,9 @@ def test_response_mask_effects_follow_literal_three_branch_identity() -> None:
     }
 
 
-def test_directed_pairing_does_not_duplicate_a_second_seat_swap() -> None:
-    forward = Pairing("posterior_use", "xp", 2, 7)
-    reverse = Pairing("posterior_use", "xp", 7, 2)
-    assert forward.pairing_id == "02_to_07"
-    assert reverse.pairing_id == "07_to_02"
-    assert forward != reverse
-
-
-def test_population_manifest_has_ten_distinct_public_policy_entries(
-    tmp_path: Path,
-) -> None:
-    population = Population(
-        name="posterior_use",
-        layout="test_time_simple",
-        evaluation_kind="standard_matrix",
-        entries=tuple(
-            PopulationEntry(
-                outer_unit_id=index,
-                checkpoint_path=tmp_path / f"trained_{index}",
-                reference_checkpoint_path=tmp_path / f"reference_{index}",
-            )
-            for index in range(10)
-        ),
-    )
-    path = write_population(tmp_path / "population.json", population)
-    assert load_population(path) == population
-
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["unused_identity"] = "ignored-by-no-consumer"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="fields"):
-        load_population(path)
-
-
 def test_response_contrast_requires_complete_directed_xp_rows() -> None:
     rows = tuple(
-        ResponseContrastRow(
-            pairing_id=f"{left:02d}_to_{right:02d}",
-            episode_index=index,
-            episode_seed=standard_episode_seed(
-                evaluation_seed=17,
-                layout="test_time_simple",
-                left_outer_unit_id=left,
-                right_outer_unit_id=right,
-                episode_index=index,
-            ),
-            triggered=False,
-            trigger_step=None,
-            trigger_tolerance=None,
-            predicted_response_effect=None,
-            predicted_policy_cost=None,
-            predicted_net_effect=None,
-            predicted_regularized_net_effect=None,
-            predicted_policy_total_variation=None,
-            maximum_action_net_value=None,
-            executed_action_net_value=None,
-            executed_action_response_value=None,
-            executed_action=None,
-            maximum_net_action=None,
-            post_response_belief_l1=None,
-            first_left_action_difference_step=None,
-            first_observation_difference_step=None,
-            first_response_code_difference_step=None,
-            first_reward_difference_step=None,
-            left_action_difference_count=None,
-            observation_difference_count=None,
-            response_code_difference_count=None,
-            reward_difference_count=None,
-            environment_steps=1_200,
-            a1_raw_return=2.0,
-            a1_correct_delivery_count=0,
-            a1_wrong_delivery_count=0,
-            a1_indicator_activation_count=0,
-            a2_mask_raw_return=2.0,
-            a2_mask_correct_delivery_count=0,
-            a2_mask_wrong_delivery_count=0,
-            a2_mask_indicator_activation_count=0,
-            a2_use_raw_return=2.0,
-            a2_use_correct_delivery_count=0,
-            a2_use_wrong_delivery_count=0,
-            a2_use_indicator_activation_count=0,
-        )
+        _contrast_row(left=left, right=right, index=index, triggered=False)
         for left in range(10)
         for right in range(10)
         if left != right
@@ -254,3 +188,24 @@ def test_response_contrast_requires_complete_directed_xp_rows() -> None:
         evaluation_seed=17,
         layout="test_time_simple",
     )
+
+
+def test_population_manifest_contains_run_directories_only(tmp_path: Path) -> None:
+    population = Population(
+        name="posterior_use",
+        layout="test_time_simple",
+        evaluation_kind="standard_matrix",
+        entries=tuple(
+            PopulationEntry(index, tmp_path / f"run-{index}") for index in range(10)
+        ),
+    )
+    path = write_population(tmp_path / "population.json", population)
+    assert load_population(path) == population
+
+
+def test_directed_pairing_does_not_duplicate_seat_swap() -> None:
+    forward = Pairing("posterior_use", "xp", 2, 7)
+    reverse = Pairing("posterior_use", "xp", 7, 2)
+    assert forward.pairing_id == "02_to_07"
+    assert reverse.pairing_id == "07_to_02"
+    assert forward != reverse

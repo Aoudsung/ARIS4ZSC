@@ -1,35 +1,36 @@
-# Path C V4.2 当前执行计划
+# Path C control-memory r1 执行计划
 
-最后更新：2026-07-26。
+当前状态：`implemented`，尚未在锁定远端环境运行。
 
-## 当前状态
+## 入口
 
-- 重构前基线保存在 Git 提交 `f0ba51c`。
-- 简化实现已写入 `codex/path-c-simplification` 工作树，尚未运行测试或实验。
-- 当前远端旧版本 Test Time Wide 不受本地修改影响。新实现不得在旧版本最终审计前部署或覆盖。
+```bash
+python -m experiments.overcooked_v2.path_c upstream ...
+python -m experiments.overcooked_v2.path_c build-units ...
+python -m experiments.overcooked_v2.path_c train ...
+python -m experiments.overcooked_v2.path_c build-population ...
+python -m experiments.overcooked_v2.path_c evaluate ...
+```
 
-## 已完成的静态工作
+## 首次机械验证
 
-- 删除旧 PyTorch、R015、Path C V1–V4.1、旧标准链、`src/aris_bellman` 和 toy factor game 执行代码。
-- 将 V4.2 收敛为六个核心模块、一个 OvercookedV2 适配器、一个命令入口和两份布局配置。
-- 用官方公开网络、训练器、环境和 Orbax checkpoint 接口替代复制网络、参数映射和自定义恢复格式；项目评估循环以官方公开评估器的可观察结果作对照。
-- 重建数学、模型、官方集成、训练、评估和数据六类行为测试。
-- 改为完整保存决策、回合、指标、评估分支、数组和控制台日志。
+1. 安装锁定依赖并运行六个测试文件，要求零失败、零错误、零跳过。
+2. 比较官方适配器与官方公开网络在固定非零carry输入上的下一carry、logits和value。
+3. 运行一个400步环境回合，核对终止观测、自动重置和交付事件。
+4. 执行一次完整训练更新，核对参数有限、伙伴无梯度、记录行数完整。
+5. 保存并恢复真实 `TrainState`，核对环境步、更新数、runner state、optimizer和codebook。
+6. 执行一个微型有向标准配对和一个三分支回应屏蔽配对。
 
-## 下一次获授权后的远端验证
+任何失败直接保留异常并修复根因；不增加fallback、静默裁剪或替代实现。机械验证不授权科研训练。
 
-在新的远端目录使用锁定依赖，顺序固定为：
+## 开发复跑
 
-1. 运行六个测试文件，要求零失败、零错误、零跳过。
-2. 用固定观测和非零循环状态比较适配器与官方网络的下一循环状态、动作对数概率和价值。
-3. 在真实环境完成一个 400 步回合，并核对终止观测、自动重置和交付计数。
-4. 完成一次 V4.2 训练更新，核对伙伴参数无梯度、参数有限和完整记录数量。
-5. 保存 Orbax checkpoint，恢复最新完整 step，并核对实际环境步、更新数和完整回合数。
-6. 完成一个微型有向配对和一个三分支回应屏蔽回合，核对完整行数与效应恒等式。
-7. 对固定迁移输入比较提交 `f0ba51c` 与新结构的数学输出。该比较只用于本次迁移，不进入永久测试。
+机械验证通过后，使用新输出目录重复seed-100、1,228,800步开发训练。回读：
 
-任何失败都直接保留异常和对应 step，先修复根因，再从受影响的最早步骤重跑。不得增加默认值、裁剪、静默广播或自动替代实现。
+- responsibility质量和有效slot数；
+- posterior熵与posterior-to-action变化；
+- use/mask policy TV；
+- policy-level predicted raw effect与真实A2-use/A2-mask回报差；
+- `posterior_use`相对`prior_only`、`reference_only`的匹配结果。
 
-## 验证完成后的决定
-
-远端机械验证通过只把状态从 `implemented` 改为 `tested`，不自动授权科研训练。新的开发训练或正式评估由用户单独授权，必须使用新输出目录，不恢复旧 checkpoint，并从产物回读实际预算。
+机制未成立时，不启动十单元正式训练。

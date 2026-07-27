@@ -24,6 +24,7 @@ class PolicyState(NamedTuple):
 
     reference_carry: Any
     trainable_carry: Any
+    control_carry: Any
     slot_log_belief: Any
     previous_action: Any
     previous_team_reward: Any

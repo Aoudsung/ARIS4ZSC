@@ -32,6 +32,7 @@ class TransitionBatch(NamedTuple):
     previous_actions: Any
     previous_team_rewards: Any
     initial_official_carry: Any
+    initial_control_carry: Any
     reference_logits: Any
     execution_logits: Any
     generic_execution_logits: Any
@@ -504,11 +505,7 @@ def _head_labels(params: Mapping[str, Any], *, loss: str) -> Any:
     import jax
 
     if loss == "bellman":
-        selected = {
-            "previous_action_embedding",
-            "previous_action_to_hidden",
-            "previous_reward_to_hidden",
-        }
+        selected = {"control_memory"}
     elif loss == "outcome":
         selected = {"outcome", "response_encoder"}
     else:
@@ -585,7 +582,7 @@ def apply_model_sequence(
     params: Mapping[str, Any],
     batch: TransitionBatch,
 ) -> Mapping[str, Any]:
-    unused_final_carry, features, unused_logits, unused_values = (
+    unused_final_carry, official_features, unused_logits, unused_values = (
         functions.official_sequence(
             params["official"],
             batch.initial_official_carry,
@@ -594,13 +591,18 @@ def apply_model_sequence(
         )
     )
     del unused_final_carry, unused_logits, unused_values
-    return functions.heads.apply(
+    unused_control_carry, output = functions.heads.apply(
         {"params": params["heads"]},
-        features,
+        batch.initial_control_carry,
+        official_features,
         batch.previous_actions,
         batch.previous_team_rewards,
+        batch.episode_start,
         batch.slot_log_beliefs,
+        method=functions.heads.sequence,
     )
+    del unused_control_carry
+    return output
 
 
 def apply_heads_from_features(
@@ -625,7 +627,7 @@ def slice_environment_lanes(
         **{
             name: (
                 value[indexes]
-                if name == "initial_official_carry"
+                if name in {"initial_official_carry", "initial_control_carry"}
                 else value[:, indexes]
             )
             for name, value in batch._asdict().items()

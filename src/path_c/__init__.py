@@ -1,13 +1,14 @@
-"""Active Path C V4.2 research implementation."""
+"""Active Path C behavior-consistent VQBC implementation."""
 
+from .experiment import METHOD_VERSION, RunConfig, load_config
 from .method import DEPLOYMENT_MODES, PolicyState
 from .model import ModelOutput, build_model
 from .runner import RunnerState
-from .storage import RunConfig, load_config
 from .training import TrainState, TransitionBatch
 
 __all__ = [
     "DEPLOYMENT_MODES",
+    "METHOD_VERSION",
     "ModelOutput",
     "PolicyState",
     "RunConfig",

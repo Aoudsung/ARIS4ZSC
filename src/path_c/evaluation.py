@@ -5,9 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import hashlib
-import json
 import math
-from pathlib import Path
 from statistics import mean, stdev
 from typing import Any, Mapping, Sequence
 
@@ -16,21 +14,6 @@ from .method import DEPLOYMENT_MODES, policy_effect_trigger_tolerance
 OUTER_UNIT_COUNT = 10
 EPISODES_PER_PAIRING = 500
 RESPONSE_CONTRAST_BRANCHES = ("A1", "A2-mask", "A2-use")
-
-
-@dataclass(frozen=True, slots=True)
-class PopulationEntry:
-    outer_unit_id: int
-    checkpoint_path: Path
-    reference_checkpoint_path: Path
-
-
-@dataclass(frozen=True, slots=True)
-class Population:
-    name: str
-    layout: str
-    evaluation_kind: str
-    entries: tuple[PopulationEntry, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,94 +103,6 @@ class ResponseContrastRow:
 
     def to_mapping(self) -> dict[str, Any]:
         return asdict(self)
-
-
-def load_population(path: str | Path) -> Population:
-    """Load paths and unit numbers; Orbax validates checkpoint readability."""
-
-    manifest_path = Path(path).resolve()
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    expected_fields = {"name", "layout", "evaluation_kind", "policies"}
-    if not isinstance(payload, Mapping) or set(payload) != expected_fields:
-        raise ValueError(
-            "Population manifest fields must be name, layout, "
-            "evaluation_kind, and policies."
-        )
-    if payload["layout"] not in {"test_time_simple", "test_time_wide"}:
-        raise ValueError("Population manifest has an unknown layout.")
-    if not isinstance(payload["policies"], list):
-        raise ValueError("Population policies must be a list.")
-    policy_fields = {
-        "outer_unit_id",
-        "checkpoint_path",
-        "reference_checkpoint_path",
-    }
-    if any(
-        not isinstance(item, Mapping) or set(item) != policy_fields
-        for item in payload["policies"]
-    ):
-        raise ValueError("Every population policy must use the three public fields.")
-    entries = tuple(
-        PopulationEntry(
-            outer_unit_id=int(item["outer_unit_id"]),
-            checkpoint_path=_relative_path(
-                manifest_path.parent, item["checkpoint_path"]
-            ),
-            reference_checkpoint_path=_relative_path(
-                manifest_path.parent, item["reference_checkpoint_path"]
-            ),
-        )
-        for item in payload["policies"]
-    )
-    if len(entries) != OUTER_UNIT_COUNT:
-        raise ValueError("A standard population contains ten policies.")
-    if tuple(entry.outer_unit_id for entry in entries) != tuple(
-        range(OUTER_UNIT_COUNT)
-    ):
-        raise ValueError("Population entries must be ordered by training unit.")
-    if len({entry.checkpoint_path for entry in entries}) != OUTER_UNIT_COUNT:
-        raise ValueError("Each training unit must load a different final policy.")
-    if len({entry.reference_checkpoint_path for entry in entries}) != OUTER_UNIT_COUNT:
-        raise ValueError("Each training unit must load a different reference policy.")
-    evaluation_kind = str(payload["evaluation_kind"])
-    if evaluation_kind not in {"standard_matrix", "response_contrast"}:
-        raise ValueError("Unknown evaluation kind in population manifest.")
-    return Population(
-        name=str(payload["name"]),
-        layout=str(payload["layout"]),
-        evaluation_kind=evaluation_kind,
-        entries=entries,
-    )
-
-
-def write_population(path: str | Path, population: Population) -> Path:
-    target = Path(path).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "name": population.name,
-        "layout": population.layout,
-        "evaluation_kind": population.evaluation_kind,
-        "policies": [
-            {
-                "outer_unit_id": entry.outer_unit_id,
-                "checkpoint_path": str(entry.checkpoint_path),
-                "reference_checkpoint_path": str(
-                    entry.reference_checkpoint_path
-                ),
-            }
-            for entry in population.entries
-        ],
-    }
-    target.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    return target
-
-
-def _relative_path(base: Path, value: Any) -> Path:
-    path = Path(str(value))
-    return (path if path.is_absolute() else base / path).resolve()
 
 
 def standard_pairings(
@@ -562,19 +457,15 @@ __all__ = [
     "EpisodeRow",
     "OUTER_UNIT_COUNT",
     "Pairing",
-    "Population",
-    "PopulationEntry",
     "RESPONSE_CONTRAST_BRANCHES",
     "ResponseContrastRow",
     "effect_components",
     "equal_frequency_bins",
-    "load_population",
     "policy_effect_trigger_tolerance",
     "standard_episode_seed",
     "standard_pairings",
     "summarize_response_contrast",
     "summarize_standard_rows",
-    "validate_standard_rows",
     "validate_response_contrast_rows",
-    "write_population",
+    "validate_standard_rows",
 ]
