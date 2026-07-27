@@ -5,7 +5,7 @@
 ## 当前实现
 
 - 方法版本：`path_c_v4_2_control_memory_r1`。
-- 状态：`implemented`；本代码包未在当前环境执行远端依赖测试、训练或评估。
+- 状态：远端软件验证和一个 Test Time Simple 开发训练单元已经完成；正式训练仍未授权启动。
 - 活跃源码：`src/path_c/`。
 - OvercookedV2 接入：`experiments/overcooked_v2/official_adapter.py`。
 - 唯一入口：`python -m experiments.overcooked_v2.path_c`。
@@ -43,4 +43,18 @@ layout config + run kind
 
 ## 下一步
 
-在锁定依赖的远端新目录依次完成：六类测试、官方接口对照、一个完整环境回合、一次训练更新、真实 `TrainState` Orbax 保存恢复、一个微型标准配对和一个回应屏蔽配对。机械接线全部通过后，才决定是否重复 seed-100 开发训练。
+2026-07-27 已在隔离远端目录完成六类测试、官方接口对照、完整环境回合、真实训练更新、
+`TrainState` 的 Orbax 保存恢复、微型真实配对以及 seed-100 参考策略对应的完整开发训练与评估。
+最终为 42 项测试通过、0 失败、0 错误、0 跳过；开发训练完成 1,228,800 个环境步、
+3,072 个完整回合和 96 次更新。
+
+四种部署模式各完成 500 个匹配 seed 的单策略自配对诊断。`posterior_use`、`prior_only`、
+`reference_only` 和 `generic_response_information` 的平均原始团队回报依次为 168.28、
+168.20、168.20 和 168.20。该诊断不是标准零样本协作（zero-shot coordination）矩阵。
+回应屏蔽对照完成 500 个匹配回合；全部触发，但回应使用效应、任务成本和净效应的实际平均值
+均为 0。最终 rollout 的 use/mask 策略总变差均值为 `1.85e-5`，回应改变后验却很少改变动作，
+所以当前机制仍未通过正式训练前的开发判据。
+
+下一项唯一优先工作是根据完整决策行定位为何 control memory 已接收历史证据但 use/mask 动作
+分布仍几乎相同；在该问题解决前不启动十单元正式训练。独立审计位于远端
+`.codex_remote_validation/path_c_control_memory_r1_20260727/development_simple_seed100/independent_audit.json`。
