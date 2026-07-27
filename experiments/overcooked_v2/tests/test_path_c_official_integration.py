@@ -18,7 +18,12 @@ from experiments.overcooked_v2.official_adapter import (
     recorded_rollout,
     restore_official_checkpoint,
 )
+from experiments.overcooked_v2.deployment import Deployment
+from experiments.overcooked_v2.standard_evaluation_app import pairing_batch
+from src.path_c.evaluation import Pairing
 from src.path_c.experiment import load_config
+from src.path_c.method import empty_codebook, uniform_slot_log_belief
+from src.path_c.model import build_model, initialize_heads
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -281,3 +286,92 @@ def test_recorded_rollout_matches_official_public_rollout_return(
         np.asarray(recorded_return), np.asarray(official.total_reward)
     )
     assert len(recorded_rows) == environment.max_steps
+
+
+def test_two_episode_method_pairing_runs_through_the_real_environment(
+    tmp_path: Path,
+) -> None:
+    config = _small_config()
+    config = replace(
+        config,
+        environment=replace(config.environment, episode_steps=8),
+        evaluation=replace(config.evaluation, episodes_per_pairing=2),
+    )
+    official_config = compose_official_config(
+        config,
+        algorithm="rnn-sp",
+        seed=19,
+        output_directory=tmp_path,
+    )
+    environment = VectorEnvironment.create(config)
+    network = OfficialNetwork(official_config)
+    official_params = initialize_official_parameters(
+        network,
+        random_key=jax.random.PRNGKey(40),
+        observation_shape=environment.observation_shape,
+        batch_size=2,
+    )
+    unused_state, observations = environment.reset(jax.random.PRNGKey(41))
+    del unused_state
+    starts = jnp.ones((2,), dtype=jnp.bool_)
+    unused_carry, features, unused_logits, unused_value = network.step(
+        official_params,
+        network.initial_carry(2),
+        observations[:, 0],
+        starts,
+    )
+    del unused_carry, unused_logits, unused_value
+    heads = build_model(
+        hidden_dim=config.model.hidden_dim,
+        slot_count=config.model.slot_count,
+        action_count=config.model.action_count,
+        response_count=config.model.response_count,
+        prior_scale=config.model.prior_scale,
+        action_embedding_dim=config.model.action_embedding_dim,
+        log_standard_deviation_minimum=(
+            config.model.log_standard_deviation_minimum
+        ),
+        log_standard_deviation_maximum=(
+            config.model.log_standard_deviation_maximum
+        ),
+    )
+    head_params = initialize_heads(
+        heads,
+        random_key=jax.random.PRNGKey(42),
+        example_official_features=features,
+        example_previous_actions=jnp.full(
+            (2,), config.model.action_count, dtype=jnp.int32
+        ),
+        example_previous_team_rewards=jnp.zeros((2,), dtype=jnp.float32),
+        example_episode_start=starts,
+        example_slot_log_belief=uniform_slot_log_belief(
+            (2,), config.model.slot_count
+        ),
+        example_observations=observations[:, 0][None, ...],
+        hidden_dim=config.model.hidden_dim,
+    )
+    deployment = Deployment(
+        outer_unit_id=0,
+        network=network,
+        reference_params=official_params,
+        online_params=official_params,
+        heads=heads,
+        head_params=head_params,
+        codebook=empty_codebook(
+            code_count=config.model.response_count - 1,
+            signature_dim=config.model.action_count,
+        ),
+        log_temperature=jnp.asarray(0.0),
+        generic_log_temperature=jnp.asarray(0.0),
+    )
+    rows, decisions = pairing_batch(
+        config=config,
+        left=deployment,
+        right=deployment,
+        pairing=Pairing("posterior_use", "sp", 0, 0),
+        population_name="mechanical-test",
+        evaluation_seed=43,
+    )
+    assert len(rows) == 2
+    assert all(row.environment_steps == 8 for row in rows)
+    assert len(list(decisions)) == 2 * 2 * 8
