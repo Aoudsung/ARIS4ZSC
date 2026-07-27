@@ -43,16 +43,19 @@ def test_all_v4_3_heads_have_registered_shapes() -> None:
     model = _model()
     features, actions, rewards, starts, belief = _inputs()
     carry = initial_control_carry(2, 8)
-    params = model.init(
-        jax.random.PRNGKey(1),
-        carry,
-        features,
-        actions,
-        rewards,
-        starts,
-        belief,
-        method=model.sequence,
-    )["params"]
+    params = initialize_heads(
+        model,
+        random_key=jax.random.PRNGKey(1),
+        example_official_features=features[0],
+        example_previous_actions=actions[0],
+        example_previous_team_rewards=rewards[0],
+        example_episode_start=starts[0],
+        example_slot_log_belief=belief[0],
+        example_observations=jnp.zeros(
+            (3, 2, 5, 5, 39), dtype=jnp.float32
+        ),
+        hidden_dim=8,
+    )
     next_carry, output = model.apply(
         {"params": params},
         carry,
@@ -100,7 +103,10 @@ def _set_projection_kernels_nonzero(tree: object) -> object:
                     )
                 )
             ):
-                node[key] = jnp.ones_like(value) * 0.1
+                values = jnp.arange(
+                    1, value.size + 1, dtype=value.dtype
+                ).reshape(value.shape)
+                node[key] = values * 0.01
             else:
                 visit(value, next_path)
 

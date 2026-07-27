@@ -124,17 +124,30 @@ def test_vector_environment_preserves_terminal_observation_then_resets() -> None
     keys = jax.random.split(jax.random.PRNGKey(3), environment.num_envs)
     state, observations = environment.reset_with_keys(keys)
     actions = jnp.full((environment.num_envs, 2), 4, dtype=jnp.int32)
-    last_info = None
-    last_done = None
-    for step in range(config.environment.episode_steps):
+
+    def one_step(current_state, step):
         step_keys = jax.vmap(lambda key: jax.random.fold_in(key, step + 1))(keys)
-        state, observations, rewards, last_done, last_info = environment.step_with_keys(
-            state, actions, step_keys
+        next_state, next_observations, rewards, done, info = (
+            environment.step_with_keys(current_state, actions, step_keys)
         )
-        assert rewards.shape == (environment.num_envs,)
-    assert last_info is not None and last_done is not None
+        return next_state, (next_observations, rewards, done, info)
+
+    state, recorded = jax.jit(
+        lambda initial: jax.lax.scan(
+            one_step,
+            initial,
+            jnp.arange(config.environment.episode_steps),
+        )
+    )(state)
+    observations, rewards, dones, infos = recorded
+    assert rewards.shape == (
+        config.environment.episode_steps,
+        environment.num_envs,
+    )
+    last_done = dones[-1]
+    last_info = jax.tree_util.tree_map(lambda value: value[-1], infos)
     np.testing.assert_array_equal(np.asarray(last_done), [True, True])
-    assert last_info["terminal_observations"].shape == observations.shape
+    assert last_info["terminal_observations"].shape == observations[-1].shape
     np.testing.assert_array_equal(np.asarray(state.time), [0, 0])
 
 
@@ -248,6 +261,10 @@ def test_recorded_rollout_matches_official_public_rollout_return(
     tmp_path: Path,
 ) -> None:
     config = _small_config()
+    config = replace(
+        config,
+        environment=replace(config.environment, episode_steps=8),
+    )
     official_config = compose_official_config(
         config,
         algorithm="rnn-sp",

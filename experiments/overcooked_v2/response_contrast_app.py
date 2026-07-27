@@ -17,6 +17,7 @@ from src.path_c.evaluation import (
     ResponseContrastRow,
     standard_episode_seed,
     summarize_response_contrast,
+    validate_development_response_contrast_rows,
     validate_response_contrast_rows,
 )
 from src.path_c.method import policy_effect_trigger_tolerance
@@ -740,4 +741,57 @@ def evaluate_response_contrast(
     return len(rows), sum(row.environment_steps for row in rows)
 
 
-__all__ = ["contrast_pairing_batch", "evaluate_response_contrast"]
+def evaluate_development_response_contrast(
+    *,
+    config: Any,
+    population: Any,
+    output: Path,
+    evaluation_seed: int,
+    resume: bool,
+) -> tuple[int, int]:
+    """Run matched response branches on one self-paired development policy."""
+
+    path = output / "branches.parquet"
+    if resume and path.is_file():
+        if len(read_parquet(path)) != config.evaluation.episodes_per_pairing:
+            raise RuntimeError(
+                f"Incomplete development response contrast exists: {path}"
+            )
+    else:
+        if path.exists():
+            raise RuntimeError(
+                f"Development response contrast already exists: {path}"
+            )
+        deployment = load_deployment(population.entries[0], config)
+        rows = contrast_pairing_batch(
+            config=config,
+            left=deployment,
+            right=deployment,
+            pairing=Pairing("posterior_use", "sp", 0, 0),
+            evaluation_seed=evaluation_seed,
+        )
+        write_parquet(path, [row.to_mapping() for row in rows])
+    rows = [ResponseContrastRow(**row) for row in read_parquet(path)]
+    validate_development_response_contrast_rows(
+        rows,
+        evaluation_seed=evaluation_seed,
+        layout=config.environment.layout,
+        episodes_per_pairing=config.evaluation.episodes_per_pairing,
+    )
+    write_json(
+        output / "summary.json",
+        {
+            "run_kind": "development",
+            "scientific_readout_allowed": False,
+            "evaluation_protocol": "single_policy_self_pair_response_contrast",
+            **summarize_response_contrast(rows),
+        },
+    )
+    return len(rows), sum(row.environment_steps for row in rows)
+
+
+__all__ = [
+    "contrast_pairing_batch",
+    "evaluate_development_response_contrast",
+    "evaluate_response_contrast",
+]

@@ -406,7 +406,11 @@ def load_population(path: str | Path) -> Population:
         raise ValueError("Unknown population-manifest version.")
     if payload["layout"] not in LAYOUTS:
         raise ValueError("Population manifest has an unknown layout.")
-    if payload["evaluation_kind"] not in {"standard_matrix", "response_contrast"}:
+    if payload["evaluation_kind"] not in {
+        "standard_matrix",
+        "response_contrast",
+        "development_diagnostic",
+    }:
         raise ValueError("Unknown evaluation kind.")
     if not isinstance(payload["policies"], Sequence):
         raise ValueError("Population policies must be a sequence.")
@@ -419,10 +423,22 @@ def load_population(path: str | Path) -> Population:
                 run_directory=_resolve(manifest_path.parent, raw["run_directory"]),
             )
         )
-    if len(entries) != 10 or [entry.outer_unit_id for entry in entries] != list(range(10)):
-        raise ValueError("A standard population contains ordered outer units 0 through 9.")
-    if len({entry.run_directory for entry in entries}) != 10:
-        raise ValueError("Each outer unit must use a distinct training run directory.")
+    if payload["evaluation_kind"] == "development_diagnostic":
+        if len(entries) != 1 or entries[0].outer_unit_id != 0:
+            raise ValueError(
+                "A development diagnostic contains only outer unit zero."
+            )
+    else:
+        if len(entries) != 10 or [
+            entry.outer_unit_id for entry in entries
+        ] != list(range(10)):
+            raise ValueError(
+                "A standard population contains ordered outer units 0 through 9."
+            )
+        if len({entry.run_directory for entry in entries}) != 10:
+            raise ValueError(
+                "Each outer unit must use a distinct training run directory."
+            )
     return Population(
         name=str(payload["name"]),
         layout=str(payload["layout"]),

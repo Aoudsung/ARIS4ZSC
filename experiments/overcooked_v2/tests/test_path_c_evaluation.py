@@ -14,7 +14,10 @@ from src.path_c.evaluation import (
     effect_components,
     standard_episode_seed,
     standard_pairings,
+    summarize_development_rows,
     summarize_standard_rows,
+    validate_development_response_contrast_rows,
+    validate_development_rows,
     validate_response_contrast_rows,
     validate_standard_rows,
 )
@@ -117,6 +120,19 @@ def test_summary_uses_pairing_means_and_pairing_standard_deviation() -> None:
     )
 
 
+def test_development_diagnostic_uses_one_matched_self_pairing() -> None:
+    rows = tuple(
+        _episode(mode, 0, 0, index)
+        for mode in DEPLOYMENT_MODES
+        for index in range(3)
+    )
+    validate_development_rows(rows, episodes_per_mode=3)
+    summary = summarize_development_rows(rows)
+    assert summary["run_kind"] == "development"
+    assert summary["scientific_readout_allowed"] is False
+    assert set(summary["deployment_modes"]) == set(DEPLOYMENT_MODES)
+
+
 def _contrast_row(*, left: int, right: int, index: int, triggered: bool) -> ResponseContrastRow:
     common = dict(
         pairing_id=f"{left:02d}_to_{right:02d}",
@@ -196,6 +212,19 @@ def test_response_contrast_requires_complete_directed_xp_rows() -> None:
     )
 
 
+def test_development_response_contrast_uses_the_same_self_pairing_seed() -> None:
+    rows = tuple(
+        _contrast_row(left=0, right=0, index=index, triggered=False)
+        for index in range(3)
+    )
+    validate_development_response_contrast_rows(
+        rows,
+        evaluation_seed=17,
+        layout="test_time_simple",
+        episodes_per_pairing=3,
+    )
+
+
 def test_population_manifest_contains_run_directories_only(tmp_path: Path) -> None:
     population = Population(
         name="posterior_use",
@@ -206,6 +235,19 @@ def test_population_manifest_contains_run_directories_only(tmp_path: Path) -> No
         ),
     )
     path = write_population(tmp_path / "population.json", population)
+    assert load_population(path) == population
+
+
+def test_development_population_contains_only_outer_unit_zero(
+    tmp_path: Path,
+) -> None:
+    population = Population(
+        name="seed-100-development",
+        layout="test_time_simple",
+        evaluation_kind="development_diagnostic",
+        entries=(PopulationEntry(0, tmp_path / "run-0"),),
+    )
+    path = write_population(tmp_path / "development-population.json", population)
     assert load_population(path) == population
 
 
