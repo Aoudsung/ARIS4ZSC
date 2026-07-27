@@ -1,10 +1,9 @@
-"""Path C V4.2 control memory and value/outcome heads.
+"""Path C V4.3 control memory, Bellman experts, and outcome models.
 
-The official network supplies an observation-recurrent feature.  A small
-trainable control memory then integrates that feature with the ego's previous
-action and raw team reward before any Path C head is evaluated.  This keeps the
-complete ego history in the Bellman-trained state without copying the official
-network implementation.
+The official recurrent network supplies an observation-history feature.  A
+Bellman-trained control memory integrates that feature with the ego's previous
+action and raw team reward.  Latent Q experts receive Bellman gradients only;
+response and physical-outcome heads read a stopped control feature.
 """
 
 from __future__ import annotations
@@ -33,16 +32,19 @@ class ModelOutput(NamedTuple):
     response_probabilities: Any
     reward_mean: Any
     reward_log_standard_deviation: Any
-    continuation_use_mean: Any
-    continuation_use_log_standard_deviation: Any
-    continuation_mask_mean: Any
-    continuation_mask_log_standard_deviation: Any
+    next_q_use_mean: Any
+    next_q_use_log_standard_deviation: Any
+    next_q_mask_mean: Any
+    next_q_mask_log_standard_deviation: Any
+    next_reference_logits_mean: Any
     value_class_ids: Any
     supported_value_class_count: Any
     j_use: Any
     j_mask: Any
     per_action_response_value: Any
     per_action_net_value: Any
+    per_action_policy_mediated_gain: Any
+    per_action_expected_next_policy_tv: Any
     information_gain: Any
     execution_logits: Any
     mask_execution_logits: Any
@@ -51,6 +53,8 @@ class ModelOutput(NamedTuple):
     predicted_net_effect: Any
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
+    predicted_policy_mediated_effect: Any
+    predicted_next_policy_total_variation: Any
 
 
 _MODEL_CLASS: Any | None = None
@@ -89,7 +93,7 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
                 or reward.shape != action.shape
                 or start.shape != action.shape
             ):
-                raise ValueError("Control-memory inputs must share the batch axes.")
+                raise ValueError("Control-memory inputs must share batch axes.")
             sentinel_action = jnp.where(start, self.action_count, action)
             action_embedding = nn.Embed(
                 num_embeddings=self.action_count + 1,
@@ -112,8 +116,7 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
             joined = nn.LayerNorm(name="ControlLayerNorm")(
                 feature + action_feature + reward_feature
             )
-            reset_carry = jnp.zeros_like(carry)
-            carry = jnp.where(start[..., None], reset_carry, carry)
+            carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
             return nn.GRUCell(
                 features=self.hidden_dim,
                 name="ControlGRUCell",
@@ -143,24 +146,24 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
                 jax.nn.softmax(jnp.asarray(slot_log_belief), axis=-1)
             )
             if belief.shape != features.shape[:-1] + (self.slot_count,):
-                raise ValueError("Q heads require [..., slot] belief axes.")
+                raise ValueError("Q heads require [...,slot] belief axes.")
             values = []
             advantages = []
             for slot in range(self.slot_count):
-                base_hidden = nn.Dense(
+                hidden_input = nn.Dense(
                     self.hidden_dim,
                     kernel_init=orthogonal(2.0),
                     bias_init=zeros,
                     name=f"{self.prefix}_slot_{slot}_hidden",
                 )(features)
                 if self.condition_on_belief:
-                    base_hidden = base_hidden + nn.Dense(
+                    hidden_input = hidden_input + nn.Dense(
                         self.hidden_dim,
                         kernel_init=zeros,
                         bias_init=zeros,
                         name=f"{self.prefix}_slot_{slot}_belief_to_hidden",
                     )(belief)
-                hidden = nn.relu(base_hidden)
+                hidden = nn.relu(hidden_input)
                 value = nn.Dense(
                     1,
                     kernel_init=orthogonal(1.0),
@@ -218,11 +221,11 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
             learned_values = jnp.stack(learned, axis=-3)
             prior_values = jnp.stack(priors, axis=-3)
             q_values = learned_values + self.prior_scale * prior_values
-            signatures = q_values - jnp.max(q_values, axis=-1, keepdims=True)
-            return q_values, learned_values, prior_values, signatures
+            centered = q_values - jnp.max(q_values, axis=-1, keepdims=True)
+            return q_values, learned_values, prior_values, centered
 
     class OutcomeHead(nn.Module):
-        """Physical outcomes and behavior-consistent continuation scalars."""
+        """Response, reward, and response-conditioned next-control vectors."""
 
         slot_count: int
         action_count: int
@@ -242,6 +245,7 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
             )
             if belief.shape != detached.shape[:-1] + (self.slot_count,):
                 raise ValueError("Outcome model requires one posterior per feature.")
+
             action_embedding = self.param(
                 "action_embedding",
                 normal(0.02),
@@ -256,6 +260,32 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
                 action_embedding, prefix + action_embedding.shape
             )
             joined = jnp.concatenate((feature_grid, action_grid), axis=-1)
+
+            shared_reference_hidden = nn.relu(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="next_reference_hidden",
+                )(joined)
+            )
+            next_reference_logits = nn.Dense(
+                self.response_count * self.action_count,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="next_reference_logits",
+            )(shared_reference_hidden).reshape(
+                prefix
+                + (
+                    self.action_count,
+                    self.response_count,
+                    self.action_count,
+                )
+            )
+            # Fix the additive-logit gauge so the target is uniquely defined.
+            next_reference_logits = next_reference_logits - jnp.mean(
+                next_reference_logits, axis=-1, keepdims=True
+            )
 
             response_logits_by_slot = []
             reward_mean_by_slot = []
@@ -323,13 +353,20 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
             use_features = belief_features(use_belief)
             mask_features = belief_features(mask_belief)
             belief_width = 3 * self.slot_count + 1
-            parameter_width = 2 * self.response_count * (belief_width + 1)
+            parameter_width = (
+                2
+                * self.response_count
+                * self.action_count
+                * (belief_width + 1)
+            )
 
             def evaluate(parameters: Any, branch_features: Any) -> Any:
                 bias = parameters[..., 0]
                 coefficients = parameters[..., 1:]
                 return bias + jnp.einsum(
-                    "...aeyf,...ayf->...aey", coefficients, branch_features
+                    "...aeyuf,...ayf->...aeyu",
+                    coefficients,
+                    branch_features,
                 )
 
             use_mean_slots = []
@@ -337,41 +374,46 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
             use_std_slots = []
             mask_std_slots = []
             for slot, hidden in enumerate(hidden_by_slot):
+                shape = prefix + (
+                    self.action_count,
+                    2,
+                    self.response_count,
+                    self.action_count,
+                    belief_width + 1,
+                )
                 mean_parameters = nn.Dense(
                     parameter_width,
                     kernel_init=zeros,
                     bias_init=zeros,
-                    name=f"slot_{slot}_continuation_mean_parameters",
-                )(hidden).reshape(
-                    prefix
-                    + (
-                        self.action_count,
-                        2,
-                        self.response_count,
-                        belief_width + 1,
-                    )
-                )
+                    name=f"slot_{slot}_next_q_mean_parameters",
+                )(hidden).reshape(shape)
                 std_parameters = nn.Dense(
                     parameter_width,
                     kernel_init=zeros,
                     bias_init=zeros,
-                    name=f"slot_{slot}_continuation_log_std_parameters",
-                )(hidden).reshape(mean_parameters.shape)
+                    name=f"slot_{slot}_next_q_log_std_parameters",
+                )(hidden).reshape(shape)
                 use_mean_slots.append(evaluate(mean_parameters, use_features))
                 mask_mean_slots.append(evaluate(mean_parameters, mask_features))
                 use_std_slots.append(evaluate(std_parameters, use_features))
                 mask_std_slots.append(evaluate(std_parameters, mask_features))
 
             def arrange(values: list[Any]) -> Any:
-                return jnp.moveaxis(jnp.stack(values, axis=-2), -4, -2)
+                # slot item [...,current_action,estimator,response,next_action]
+                # -> [...,estimator,slot,current_action,response,next_action]
+                stacked = jnp.stack(values, axis=-5)
+                return jnp.moveaxis(stacked, -3, -5)
 
             use_mean = arrange(use_mean_slots)
             mask_mean = arrange(mask_mean_slots)
             use_log_std = arrange(use_std_slots)
             mask_log_std = arrange(mask_std_slots)
             terminal = self.response_count - 1
-            use_mean = use_mean.at[..., terminal].set(0.0)
-            mask_mean = mask_mean.at[..., terminal].set(0.0)
+            use_mean = use_mean.at[..., terminal, :].set(0.0)
+            mask_mean = mask_mean.at[..., terminal, :].set(0.0)
+            next_reference_logits = next_reference_logits.at[..., terminal, :].set(
+                0.0
+            )
             lower = self.log_standard_deviation_minimum
             upper = self.log_standard_deviation_maximum
             return {
@@ -381,14 +423,15 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
                 "reward_log_standard_deviation": jnp.clip(
                     reward_log_std, lower, upper
                 ),
-                "continuation_use_mean": use_mean,
-                "continuation_use_log_standard_deviation": jnp.clip(
+                "next_q_use_mean": use_mean,
+                "next_q_use_log_standard_deviation": jnp.clip(
                     use_log_std, lower, upper
                 ),
-                "continuation_mask_mean": mask_mean,
-                "continuation_mask_log_standard_deviation": jnp.clip(
+                "next_q_mask_mean": mask_mean,
+                "next_q_mask_log_standard_deviation": jnp.clip(
                     mask_log_std, lower, upper
                 ),
+                "next_reference_logits_mean": next_reference_logits,
             }
 
     class ResponseEncoder(nn.Module):
@@ -433,7 +476,7 @@ def _head_classes() -> tuple[Any, Any, Any, Any, Any]:
                 )(joined)
             )
             return nn.Dense(
-                self.action_count,
+                2 * self.action_count,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="signature",
@@ -454,7 +497,7 @@ def _model_class() -> Any:
         return _MODEL_CLASS
 
     import flax.linen as nn
-    import jax.numpy as jnp
+    import jax
 
     (
         ScannedControlMemory,
@@ -493,8 +536,12 @@ def _model_class() -> Any:
                 response_count=self.response_count,
                 hidden_dim=self.hidden_dim,
                 action_embedding_dim=self.action_embedding_dim,
-                log_standard_deviation_minimum=self.log_standard_deviation_minimum,
-                log_standard_deviation_maximum=self.log_standard_deviation_maximum,
+                log_standard_deviation_minimum=(
+                    self.log_standard_deviation_minimum
+                ),
+                log_standard_deviation_maximum=(
+                    self.log_standard_deviation_maximum
+                ),
             )
             self.response_encoder = ResponseEncoder(
                 action_count=self.action_count,
@@ -553,7 +600,9 @@ def _model_class() -> Any:
                 episode_start[None, ...],
                 slot_log_belief[None, ...],
             )
-            return next_carry, jax.tree_util.tree_map(lambda value: value[0], output)
+            return next_carry, jax.tree_util.tree_map(
+                lambda value: value[0], output
+            )
 
         def __call__(
             self,
@@ -584,8 +633,6 @@ def _model_class() -> Any:
                 observations, actions, next_observations, dones
             )
 
-    import jax
-
     _MODEL_CLASS = PathCModel
     return PathCModel
 
@@ -608,8 +655,12 @@ def build_model(
         response_count=int(response_count),
         prior_scale=float(prior_scale),
         action_embedding_dim=int(action_embedding_dim),
-        log_standard_deviation_minimum=float(log_standard_deviation_minimum),
-        log_standard_deviation_maximum=float(log_standard_deviation_maximum),
+        log_standard_deviation_minimum=float(
+            log_standard_deviation_minimum
+        ),
+        log_standard_deviation_maximum=float(
+            log_standard_deviation_maximum
+        ),
     )
 
 
@@ -629,7 +680,9 @@ def initialize_heads(
     import jax.numpy as jnp
 
     head_key, response_key = jax.random.split(random_key)
-    carry = initial_control_carry(example_official_features.shape[0], hidden_dim)
+    carry = initial_control_carry(
+        example_official_features.shape[0], hidden_dim
+    )
     head_variables = model.init(
         head_key,
         carry,
@@ -650,7 +703,9 @@ def initialize_heads(
         method=model.encode_response,
     )
     params = dict(head_variables["params"])
-    params["response_encoder"] = response_variables["params"]["response_encoder"]
+    params["response_encoder"] = response_variables["params"][
+        "response_encoder"
+    ]
     return params
 
 
@@ -689,7 +744,9 @@ def encode_response_codes(
     )
     logits = response_logits_from_codebook(signatures, codebook_embeddings)
     codes = jnp.argmax(logits, axis=-1)
-    codes = jnp.where(jnp.asarray(dones, dtype=jnp.bool_), terminal_response, codes)
+    codes = jnp.where(
+        jnp.asarray(dones, dtype=jnp.bool_), terminal_response, codes
+    )
     return codes, logits, signatures
 
 
@@ -712,8 +769,12 @@ def model_forward(
         slot_belief=slot_probabilities,
         response_probabilities=raw_output["response_probabilities"],
         reward_mean=raw_output["reward_mean"],
-        continuation_use_mean=raw_output["continuation_use_mean"],
-        continuation_mask_mean=raw_output["continuation_mask_mean"],
+        next_q_use_mean=raw_output["next_q_use_mean"],
+        next_q_mask_mean=raw_output["next_q_mask_mean"],
+        next_reference_logits_mean=raw_output[
+            "next_reference_logits_mean"
+        ],
+        temperature=temperature,
         gamma=gamma,
     )
     information = generic_response_information(
@@ -734,6 +795,14 @@ def model_forward(
         temperature=temperature,
         generic_temperature=generic_temperature,
     )
+    mediated = jnp.sum(
+        policy.probabilities * control.per_action_policy_mediated_gain,
+        axis=-1,
+    )
+    next_tv = jnp.sum(
+        policy.probabilities * control.per_action_expected_next_policy_tv,
+        axis=-1,
+    )
     return ModelOutput(
         features=raw_output["features"],
         q_values=raw_output["q_values"],
@@ -746,13 +815,16 @@ def model_forward(
         reward_log_standard_deviation=raw_output[
             "reward_log_standard_deviation"
         ],
-        continuation_use_mean=raw_output["continuation_use_mean"],
-        continuation_use_log_standard_deviation=raw_output[
-            "continuation_use_log_standard_deviation"
+        next_q_use_mean=raw_output["next_q_use_mean"],
+        next_q_use_log_standard_deviation=raw_output[
+            "next_q_use_log_standard_deviation"
         ],
-        continuation_mask_mean=raw_output["continuation_mask_mean"],
-        continuation_mask_log_standard_deviation=raw_output[
-            "continuation_mask_log_standard_deviation"
+        next_q_mask_mean=raw_output["next_q_mask_mean"],
+        next_q_mask_log_standard_deviation=raw_output[
+            "next_q_mask_log_standard_deviation"
+        ],
+        next_reference_logits_mean=raw_output[
+            "next_reference_logits_mean"
         ],
         value_class_ids=class_ids,
         supported_value_class_count=posterior_supported_value_class_count(
@@ -762,6 +834,12 @@ def model_forward(
         j_mask=control.j_mask,
         per_action_response_value=control.per_action_response_value,
         per_action_net_value=control.information_net_value,
+        per_action_policy_mediated_gain=(
+            control.per_action_policy_mediated_gain
+        ),
+        per_action_expected_next_policy_tv=(
+            control.per_action_expected_next_policy_tv
+        ),
         information_gain=information,
         execution_logits=policy.logits,
         mask_execution_logits=effects.mask_policy.logits,
@@ -770,6 +848,8 @@ def model_forward(
         predicted_net_effect=effects.raw_net_effect,
         predicted_regularized_net_effect=effects.regularized_net_effect,
         predicted_policy_total_variation=effects.total_variation,
+        predicted_policy_mediated_effect=mediated,
+        predicted_next_policy_total_variation=next_tv,
     )
 
 

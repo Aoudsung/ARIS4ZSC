@@ -6,10 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from experiments.overcooked_v2.official_adapter import (
-    OfficialNetwork,
-    restore_official_checkpoint,
-)
+from experiments.overcooked_v2.official_adapter import OfficialNetwork, restore_official_checkpoint
 from src.path_c.experiment import METHOD_VERSION, PopulationEntry
 from src.path_c.method import (
     CodebookState,
@@ -24,7 +21,6 @@ from src.path_c.storage import (
     read_run_identity,
     restore_latest_checkpoint,
 )
-
 
 @dataclass(frozen=True, slots=True)
 class Deployment:
@@ -174,11 +170,8 @@ def load_deployment(
         head_params=online_params["heads"],
         codebook=codebook,
         log_temperature=policy_values["log_temperature"],
-        generic_log_temperature=(
-            policy_values["generic_log_temperature"]
-        ),
+        generic_log_temperature=policy_values["generic_log_temperature"],
     )
-
 
 def reset_deployment_state(
     deployment: Deployment,

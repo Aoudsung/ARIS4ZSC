@@ -47,11 +47,12 @@ class EpisodeRow:
     correct_delivery_count: int
     wrong_delivery_count: int
     indicator_activation_count: int
-    positive_predicted_response_effect_count: int
+    positive_policy_mediated_effect_count: int
     cumulative_kl: float
     reference_action_deviation_count: int
     mean_value_class_count: float
     mean_belief_entropy: float
+    mean_predicted_next_policy_tv: float
     response_code_counts: tuple[int, ...]
 
     def to_mapping(self) -> dict[str, Any]:
@@ -73,9 +74,14 @@ class ResponseContrastRow:
     predicted_net_effect: float | None
     predicted_regularized_net_effect: float | None
     predicted_policy_total_variation: float | None
+    predicted_policy_mediated_effect: float | None
+    predicted_next_policy_total_variation: float | None
     maximum_action_net_value: float | None
+    maximum_action_policy_mediated_gain: float | None
     executed_action_net_value: float | None
     executed_action_response_value: float | None
+    executed_action_policy_mediated_gain: float | None
+    executed_action_expected_next_policy_tv: float | None
     executed_action: int | None
     maximum_net_action: int | None
     post_response_belief_l1: float | None
@@ -203,6 +209,7 @@ def validate_standard_rows(
                 row.cumulative_kl,
                 row.mean_value_class_count,
                 row.mean_belief_entropy,
+                row.mean_predicted_next_policy_tv,
             )
         ):
             raise ValueError("Evaluation statistics must be finite.")
@@ -259,147 +266,6 @@ def summarize_standard_rows(
     return {"deployment_modes": modes}
 
 
-def validate_development_rows(
-    rows: Sequence[EpisodeRow],
-    *,
-    deployment_modes: Sequence[str] = DEPLOYMENT_MODES,
-    episodes_per_mode: int = EPISODES_PER_PAIRING,
-) -> None:
-    """Validate one-policy matched self-pairing development diagnostics."""
-
-    modes = tuple(deployment_modes)
-    expected = len(modes) * int(episodes_per_mode)
-    if len(rows) != expected:
-        raise ValueError(
-            f"Expected {expected} development rows, received {len(rows)}."
-        )
-    keys = {
-        (row.deployment_mode, row.episode_index)
-        for row in rows
-    }
-    if len(keys) != expected:
-        raise ValueError("Development rows contain duplicate episodes.")
-    seeds: dict[int, set[int]] = defaultdict(set)
-    for row in rows:
-        if (
-            row.deployment_mode not in modes
-            or row.split != "sp"
-            or row.pairing_id != "00_to_00"
-            or row.left_outer_unit_id != 0
-            or row.right_outer_unit_id != 0
-            or not 0 <= row.episode_index < int(episodes_per_mode)
-        ):
-            raise ValueError(
-                "A development row is outside the single-policy self pairing."
-            )
-        if row.environment_steps <= 0:
-            raise ValueError("A development row has no environment steps.")
-        if min(
-            row.correct_delivery_count,
-            row.wrong_delivery_count,
-            row.indicator_activation_count,
-        ) < 0:
-            raise ValueError("Development delivery counts cannot be negative.")
-        if not all(
-            math.isfinite(value)
-            for value in (
-                row.raw_return,
-                row.cumulative_kl,
-                row.mean_value_class_count,
-                row.mean_belief_entropy,
-            )
-        ):
-            raise ValueError("Development statistics must be finite.")
-        seeds[row.episode_index].add(row.episode_seed)
-    if len(seeds) != int(episodes_per_mode) or any(
-        len(values) != 1 for values in seeds.values()
-    ):
-        raise ValueError("Development modes must use matched environment seeds.")
-
-
-def summarize_development_rows(
-    rows: Sequence[EpisodeRow],
-) -> Mapping[str, Any]:
-    """Summarize matched self pairing without calling it standard ZSC."""
-
-    values = tuple(rows)
-    modes = tuple(sorted({row.deployment_mode for row in values}))
-    per_mode: dict[str, Any] = {}
-    returns: dict[str, dict[int, float]] = {}
-    for mode in modes:
-        selected = [row for row in values if row.deployment_mode == mode]
-        by_episode = {
-            row.episode_index: float(row.raw_return) for row in selected
-        }
-        returns[mode] = by_episode
-        per_mode[mode] = {
-            "episode_count": len(selected),
-            "environment_steps": sum(row.environment_steps for row in selected),
-            "mean_raw_return": mean(by_episode.values()),
-            "mean_correct_delivery_count": mean(
-                row.correct_delivery_count for row in selected
-            ),
-            "mean_wrong_delivery_count": mean(
-                row.wrong_delivery_count for row in selected
-            ),
-            "mean_kl_per_policy_step": (
-                sum(row.cumulative_kl for row in selected)
-                / (2 * sum(row.environment_steps for row in selected))
-            ),
-            "mean_value_class_count": mean(
-                row.mean_value_class_count for row in selected
-            ),
-            "mean_belief_entropy": mean(
-                row.mean_belief_entropy for row in selected
-            ),
-        }
-    posterior = returns["posterior_use"]
-    matched = {}
-    for mode in modes:
-        if mode == "posterior_use":
-            continue
-        matched[f"posterior_use_minus_{mode}"] = mean(
-            posterior[index] - returns[mode][index]
-            for index in sorted(posterior)
-        )
-    return {
-        "run_kind": "development",
-        "scientific_readout_allowed": False,
-        "evaluation_protocol": "single_policy_matched_self_pairing_diagnostic",
-        "deployment_modes": per_mode,
-        "matched_mean_raw_return_differences": matched,
-    }
-
-
-def validate_development_response_contrast_rows(
-    rows: Sequence[ResponseContrastRow],
-    *,
-    evaluation_seed: int,
-    layout: str,
-    episodes_per_pairing: int = EPISODES_PER_PAIRING,
-) -> None:
-    """Validate the single-policy response contrast used only in development."""
-
-    if len(rows) != int(episodes_per_pairing):
-        raise ValueError("Development response contrast has the wrong row count.")
-    indexes = {row.episode_index for row in rows}
-    if indexes != set(range(int(episodes_per_pairing))):
-        raise ValueError("Development response contrast episodes are incomplete.")
-    for row in rows:
-        if row.pairing_id != "00_to_00":
-            raise ValueError("Development response contrast must be self paired.")
-        expected_seed = standard_episode_seed(
-            evaluation_seed=evaluation_seed,
-            layout=layout,
-            left_outer_unit_id=0,
-            right_outer_unit_id=0,
-            episode_index=row.episode_index,
-        )
-        if row.episode_seed != expected_seed:
-            raise ValueError("Development response contrast has the wrong seed.")
-        _validate_response_contrast_content(row)
-
-
 def effect_components(row: ResponseContrastRow) -> Mapping[str, float]:
     response = row.a2_use_raw_return - row.a2_mask_raw_return
     cost = row.a1_raw_return - row.a2_mask_raw_return
@@ -411,86 +277,6 @@ def effect_components(row: ResponseContrastRow) -> Mapping[str, float]:
         "delta_cost": cost,
         "delta_net": net,
     }
-
-
-def _validate_response_contrast_content(row: ResponseContrastRow) -> None:
-    branch_returns = (
-        row.a1_raw_return,
-        row.a2_mask_raw_return,
-        row.a2_use_raw_return,
-    )
-    if not all(math.isfinite(value) for value in branch_returns):
-        raise ValueError("Response contrast returns must be finite.")
-    if not row.triggered:
-        if not (
-            row.a1_raw_return
-            == row.a2_mask_raw_return
-            == row.a2_use_raw_return
-        ):
-            raise ValueError("Untriggered response branches must be identical.")
-        if any(
-            value is not None
-            for value in (
-                row.trigger_step,
-                row.trigger_tolerance,
-                row.predicted_response_effect,
-                row.predicted_policy_cost,
-                row.predicted_net_effect,
-            )
-        ):
-            raise ValueError("Untriggered response rows cannot report a trigger.")
-    else:
-        required_trigger_fields = (
-            row.trigger_step,
-            row.trigger_tolerance,
-            row.predicted_response_effect,
-            row.predicted_policy_cost,
-            row.predicted_net_effect,
-            row.predicted_regularized_net_effect,
-            row.predicted_policy_total_variation,
-            row.maximum_action_net_value,
-            row.executed_action_net_value,
-            row.executed_action_response_value,
-            row.executed_action,
-            row.maximum_net_action,
-            row.post_response_belief_l1,
-            row.left_action_difference_count,
-            row.observation_difference_count,
-            row.response_code_difference_count,
-            row.reward_difference_count,
-        )
-        if any(value is None for value in required_trigger_fields):
-            raise ValueError("Triggered response rows must retain every result.")
-        trigger_values = (
-            row.trigger_tolerance,
-            row.predicted_response_effect,
-            row.predicted_policy_cost,
-            row.predicted_net_effect,
-            row.predicted_regularized_net_effect,
-            row.predicted_policy_total_variation,
-            row.maximum_action_net_value,
-            row.executed_action_net_value,
-            row.executed_action_response_value,
-            row.post_response_belief_l1,
-        )
-        if not all(math.isfinite(float(value)) for value in trigger_values):
-            raise ValueError("Triggered response values must be finite.")
-    if row.environment_steps <= 0:
-        raise ValueError("A response contrast row has no environment steps.")
-    branch_counts = (
-        row.a1_correct_delivery_count,
-        row.a1_wrong_delivery_count,
-        row.a1_indicator_activation_count,
-        row.a2_mask_correct_delivery_count,
-        row.a2_mask_wrong_delivery_count,
-        row.a2_mask_indicator_activation_count,
-        row.a2_use_correct_delivery_count,
-        row.a2_use_wrong_delivery_count,
-        row.a2_use_indicator_activation_count,
-    )
-    if any(value < 0 for value in branch_counts):
-        raise ValueError("Response contrast counts cannot be negative.")
-    effect_components(row)
 
 
 def validate_response_contrast_rows(
@@ -533,7 +319,95 @@ def validate_response_contrast_rows(
         )
         if row.episode_seed != expected_seed:
             raise ValueError("Response contrast row has the wrong environment seed.")
-        _validate_response_contrast_content(row)
+        branch_returns = (
+            row.a1_raw_return,
+            row.a2_mask_raw_return,
+            row.a2_use_raw_return,
+        )
+        if not all(math.isfinite(value) for value in branch_returns):
+            raise ValueError("Response contrast returns must be finite.")
+        if not row.triggered:
+            if not (
+                row.a1_raw_return
+                == row.a2_mask_raw_return
+                == row.a2_use_raw_return
+            ):
+                raise ValueError("Untriggered response branches must be identical.")
+            if any(
+                value is not None
+                for value in (
+                    row.trigger_step,
+                    row.trigger_tolerance,
+                    row.predicted_response_effect,
+                    row.predicted_policy_cost,
+                    row.predicted_net_effect,
+                    row.predicted_policy_mediated_effect,
+                    row.predicted_next_policy_total_variation,
+                )
+            ):
+                raise ValueError("Untriggered response rows cannot report a trigger.")
+        else:
+            required_trigger_fields = (
+                row.trigger_step,
+                row.trigger_tolerance,
+                row.predicted_response_effect,
+                row.predicted_policy_cost,
+                row.predicted_net_effect,
+                row.predicted_regularized_net_effect,
+                row.predicted_policy_total_variation,
+                row.predicted_policy_mediated_effect,
+                row.predicted_next_policy_total_variation,
+                row.maximum_action_net_value,
+                row.maximum_action_policy_mediated_gain,
+                row.executed_action_net_value,
+                row.executed_action_response_value,
+                row.executed_action_policy_mediated_gain,
+                row.executed_action_expected_next_policy_tv,
+                row.executed_action,
+                row.maximum_net_action,
+                row.post_response_belief_l1,
+                row.left_action_difference_count,
+                row.observation_difference_count,
+                row.response_code_difference_count,
+                row.reward_difference_count,
+            )
+            if any(value is None for value in required_trigger_fields):
+                raise ValueError("Triggered response rows must retain every result.")
+            trigger_values = (
+                row.trigger_tolerance,
+                row.predicted_response_effect,
+                row.predicted_policy_cost,
+                row.predicted_net_effect,
+                row.predicted_regularized_net_effect,
+                row.predicted_policy_total_variation,
+                row.predicted_policy_mediated_effect,
+                row.predicted_next_policy_total_variation,
+                row.maximum_action_net_value,
+                row.maximum_action_policy_mediated_gain,
+                row.executed_action_net_value,
+                row.executed_action_response_value,
+                row.executed_action_policy_mediated_gain,
+                row.executed_action_expected_next_policy_tv,
+                row.post_response_belief_l1,
+            )
+            if not all(math.isfinite(float(value)) for value in trigger_values):
+                raise ValueError("Triggered response values must be finite.")
+        if row.environment_steps <= 0:
+            raise ValueError("A response contrast row has no environment steps.")
+        branch_counts = (
+            row.a1_correct_delivery_count,
+            row.a1_wrong_delivery_count,
+            row.a1_indicator_activation_count,
+            row.a2_mask_correct_delivery_count,
+            row.a2_mask_wrong_delivery_count,
+            row.a2_mask_indicator_activation_count,
+            row.a2_use_correct_delivery_count,
+            row.a2_use_wrong_delivery_count,
+            row.a2_use_indicator_activation_count,
+        )
+        if any(value < 0 for value in branch_counts):
+            raise ValueError("Response contrast counts cannot be negative.")
+        effect_components(row)
 
 
 def equal_frequency_bins(
@@ -542,7 +416,7 @@ def equal_frequency_bins(
     triggered = sorted(
         (row for row in rows if row.triggered),
         key=lambda row: (
-            float(row.predicted_net_effect),
+            float(row.predicted_policy_mediated_effect),
             row.pairing_id,
             row.episode_index,
         ),
@@ -561,11 +435,11 @@ def equal_frequency_bins(
                 "source_start": start,
                 "source_end": end,
                 "count": len(members),
-                "minimum_predicted_net_effect": float(
-                    members[0].predicted_net_effect
+                "minimum_predicted_policy_mediated_effect": float(
+                    members[0].predicted_policy_mediated_effect
                 ),
-                "maximum_predicted_net_effect": float(
-                    members[-1].predicted_net_effect
+                "maximum_predicted_policy_mediated_effect": float(
+                    members[-1].predicted_policy_mediated_effect
                 ),
                 "effects": {
                     name: mean(item[name] for item in effects)
@@ -584,6 +458,30 @@ def summarize_response_contrast(
         raise ValueError("Response contrast summary requires episode rows.")
     effects = [effect_components(row) for row in values]
     triggered = [row for row in values if row.triggered]
+    trigger_diagnostics = (
+        {
+            "mean_predicted_policy_mediated_effect": mean(
+                float(row.predicted_policy_mediated_effect) for row in triggered
+            ),
+            "mean_predicted_next_policy_total_variation": mean(
+                float(row.predicted_next_policy_total_variation) for row in triggered
+            ),
+            "mean_executed_action_policy_mediated_gain": mean(
+                float(row.executed_action_policy_mediated_gain) for row in triggered
+            ),
+            "mean_executed_action_expected_next_policy_tv": mean(
+                float(row.executed_action_expected_next_policy_tv) for row in triggered
+            ),
+            "episodes_with_left_action_difference": sum(
+                int(row.left_action_difference_count or 0) > 0 for row in triggered
+            ),
+            "episodes_with_reward_difference": sum(
+                int(row.reward_difference_count or 0) > 0 for row in triggered
+            ),
+        }
+        if triggered
+        else {}
+    )
     return {
         "row_count": len(values),
         "trigger_count": len(triggered),
@@ -592,6 +490,7 @@ def summarize_response_contrast(
             name: mean(item[name] for item in effects)
             for name in effects[0]
         },
+        "trigger_diagnostics": trigger_diagnostics,
         "equal_frequency_bins": list(equal_frequency_bins(values)),
     }
 
@@ -610,10 +509,7 @@ __all__ = [
     "standard_episode_seed",
     "standard_pairings",
     "summarize_response_contrast",
-    "summarize_development_rows",
     "summarize_standard_rows",
-    "validate_development_response_contrast_rows",
-    "validate_development_rows",
     "validate_response_contrast_rows",
     "validate_standard_rows",
 ]

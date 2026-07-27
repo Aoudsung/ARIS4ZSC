@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 environment:
   layout: test_time_simple
@@ -24,6 +24,7 @@ training:
   gamma: 0.99
   responsibility_temperature: 1.0
   bootstrap_probability: 0.8
+  behavior_support: 0.1
   polyak_coefficient: 0.005
   codebook_decay: 0.99
   code_replacement_rollouts: 10
@@ -31,7 +32,7 @@ training:
 kl:
   target_per_step: 0.02
   initial_temperature: 1.0
-  dual_learning_rate: 0.001
+  bisection_iterations: 24
   minimum_temperature: 0.05
   maximum_temperature: 20.0
 
@@ -42,6 +43,7 @@ evaluation:
     - reference_only
     - generic_response_information
   episodes_per_pairing: 500
+  response_policy_tv_minimum: 0.001
 
 upstream:
   total_timesteps: 30000000

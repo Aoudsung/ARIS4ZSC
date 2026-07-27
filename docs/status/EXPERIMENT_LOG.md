@@ -4,45 +4,23 @@
 record; latest recorded scientific state = Link-A round 2 failed on 2026-07-09,
 and the active project line is now Path C.
 
+### 2026-07-27 Path C V4.3 executable-response-value r1 统一修订完成（本地；未运行远端训练）
+
+- **触发原因：** V4.2 control-memory r1 完成 42 项远端测试、1,228,800 环境步训练、3,072 个回合和 96 次更新；回应使 use/mask 后验平均 L1 距离达到 0.338，但 use/mask 策略总变差均值只有 `1.85e-5`，500 个回应屏蔽回合的回应效应、任务成本和净效应均为 0。正式十单元训练按机制判据关闭。
+- **latent assignment：** responsibility 现在只读取完整回合 Bellman/TD evidence。response、reward、next-Q 和 next-reference likelihood 只训练 outcome model并完整写入审计，不再定义 slot。
+- **可执行回应价值：** 标量 continuation head 已替换为回应条件的 use/mask 下一动作 Q 向量和下一 reference logits。use/mask 通过与 runtime 相同的 KL policy形成下一动作分布，再在共同物理 posterior 下计算原始回报 continuation。
+- **平移不变读数：** 新增 executed-action policy-mediated gain和expected next-policy TV；回应屏蔽不再由动作无关的绝对 value shift 触发。
+- **数据支持与温度：** 训练行为使用登记的 `0.1` 均匀 support mixture；评估不混合。每个 rollout后通过24次log-space bisection直接求解目标KL，删除96次更新中几乎不移动的dual step。
+- **回应表示与审计：** response signature 改为 centered-advantage current-to-next delta 的均值与标准差，共12维。每个update、epoch、lane和slot保存responsibility、TD energy、四类outcome energy与bootstrap availability。
+- **版本边界：** 方法版本为 `path_c_v4_3_executable_response_value_r1`，配置版本为3。模型tree、response code、TransitionBatch和evaluation rows均改变，旧checkpoint不能恢复。当前仅完成代码和本地可执行检查，`scientific_readout_allowed: false`。
+
 ### 2026-07-27 Path C control-memory r1 开发训练与评估完成
 
-- **远端软件验证：** 活跃提交 `72bb021` 在隔离目录
-  `/apps/users/cxw/Document/CodeSpace/Selfs/CPR_REPO/.codex_remote_validation/path_c_control_memory_r1_20260727/repo`
-  使用锁定的 JAX 0.4.38、Flax 0.10.3 和 Optax 0.2.5 完成六个目标测试文件。最终为
-  42 项通过、0 失败、0 错误、0 跳过。真实环境测试包括官方循环网络对照、400 步终止与自动
-  重置、交付事件、两个八步真实方法配对，以及 Orbax 对具体 `TrainState` 类型的保存恢复。
-  测试日志和 JUnit 测试报告的 SHA-256 分别为
-  `6909071ac80782fcd59f6988a18748363cb3f7b7632c15bc566bd2e73b936fac` 和
-  `0059a1d5155c4a86901782c32baf41a5312f05c518bf9ab3de2aedc22a2a9e67`。
-- **运行中发现并修复的真实缺陷：** 第一次评估暴露 Orbax 在没有目标对象时恢复为字典树，
-  部署代码却按 `TrainState` 属性读取；恢复入口现已在训练恢复时显式传入目标状态，并在部署时
-  显式读取 Orbax 字典树。第二次评估暴露真实配对入口缺少探查阈值函数导入；已经补充真实环境
-  两回合回归测试。两次失败日志均保留，训练 checkpoint 没有重写或重训。
-- **开发训练预算：** 官方 Self-Play seed 100 为参考策略；Self-Play seed 101、102 和
-  Other-Play seed 201、202 为四个冻结伙伴，当前策略另在每个 rollout 起点冻结为伙伴。
-  模型随机 seed 为 10101。训练从产物回读 1,228,800 个有效环境步、3,072 个完整回合、
-  96 次更新、1,228,800 条决策记录、3,072 条回合记录和 96 条指标记录。完整状态随后以
-  `--resume` 成功恢复，且没有再次执行训练更新。
-- **开发评估口径：** 评估 seed 为 10103。四种部署模式各运行 500 个完全匹配 seed 的
-  单策略自配对回合；该口径只诊断一个训练 checkpoint，不是标准零样本协作矩阵，也不产生
-  跨策略配对结论。`posterior_use`、`prior_only`、`reference_only` 和
-  `generic_response_information` 的平均原始团队回报依次为 168.28、168.20、168.20 和
-  168.20；后验使用模式相对三种替代模式的匹配平均差均为 +0.08。四种模式共保存
-  2,000 条回合行和 1,600,000 条逐步决策行。
-- **机制读数：** 最终 rollout 的平均信念熵为 0.138，对应平均有效后验槽数 1.23；平均活动
-  动作价值等价类别数为 1.60。use/mask 策略总变差均值为 `1.85e-5`，第 95 百分位数为
-  `1.00e-4`。500 个回应屏蔽回合全部触发，触发后 use/mask 后验的平均 L1 距离为 0.338，
-  但只有 4 个回合出现左侧动作差异；回应使用效应、任务成本和净效应的实际平均值全部为 0，
-  效应恒等式最大残差为 0。当前输出没有采集责任分配张量，因此责任分配质量明确登记为
-  “未采集”。
-- **完整性与边界：** 独立脚本从原始 Parquet 和 JSONL 行重算全部回报、匹配差、事件计数、
-  回应屏蔽效应和预算。训练与评估合计 2,628,800 个有效环境步；所有交付和指示器计数非负，
-  四种模式的环境 seed 完全匹配。独立审计 SHA-256 为
-  `00c20d28259a4a15ba9907b3e86220e1cc676d10825634db67116324d7795b53`；覆盖 760 个文件的
-  归档清单 SHA-256 为
-  `9d1aca6bb38b7630b213edef246689c647882eca51155de52729820c8630a033`。
-  全部结果保持 `run_kind: development` 与 `scientific_readout_allowed: false`。当前回应通道
-  没有形成可测量的增量任务价值，因此按既定计划不启动十单元正式训练。
+- 远端六类测试共42项通过，0失败、0错误、0跳过；真实`TrainState`完成Orbax保存与恢复。
+- 训练从产物回读1,228,800个环境步、3,072个完整回合和96次更新。
+- 四种模式各完成500个匹配自配对开发回合；`posterior_use`、`prior_only`、`reference_only`和`generic_response_information`平均回报依次为168.28、168.20、168.20、168.20。该入口不是标准ZSC矩阵。
+- 最终rollout平均信念熵0.138，平均活动价值类1.60；use/mask策略TV均值`1.85e-5`、95分位`1.00e-4`。回应屏蔽后验L1均值0.338，但500回合只有4回合出现左侧动作差异，三个实际效应平均值均为0。
+- 当前输出没有保存responsibility tensor，明确登记为未采集。全部结果为development，`scientific_readout_allowed: false`。
 
 ### 2026-07-26 Path C V4.2 全仓库简化（静态实现；未运行）
 

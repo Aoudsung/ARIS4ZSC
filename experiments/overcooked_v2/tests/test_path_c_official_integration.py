@@ -6,6 +6,12 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
+
+pytest.importorskip("hydra")
+pytest.importorskip("jaxmarl")
+pytest.importorskip("orbax.checkpoint")
+pytest.importorskip("overcooked_v2_experiments")
 
 from experiments.overcooked_v2.official_adapter import (
     ACTION_ORDER,
@@ -118,12 +124,11 @@ def test_vector_environment_preserves_terminal_observation_then_resets() -> None
     keys = jax.random.split(jax.random.PRNGKey(3), environment.num_envs)
     state, observations = environment.reset_with_keys(keys)
     actions = jnp.full((environment.num_envs, 2), 4, dtype=jnp.int32)
-    compiled_step = jax.jit(environment.step_with_keys)
     last_info = None
     last_done = None
     for step in range(config.environment.episode_steps):
         step_keys = jax.vmap(lambda key: jax.random.fold_in(key, step + 1))(keys)
-        state, observations, rewards, last_done, last_info = compiled_step(
+        state, observations, rewards, last_done, last_info = environment.step_with_keys(
             state, actions, step_keys
         )
         assert rewards.shape == (environment.num_envs,)
@@ -243,12 +248,6 @@ def test_recorded_rollout_matches_official_public_rollout_return(
     tmp_path: Path,
 ) -> None:
     config = _small_config()
-    # The preceding test covers a complete 400-step episode.  This parity test
-    # needs only enough steps to compare the two public evaluator loops.
-    config = replace(
-        config,
-        environment=replace(config.environment, episode_steps=8),
-    )
     official_config = compose_official_config(
         config,
         algorithm="rnn-sp",
@@ -286,6 +285,7 @@ def test_recorded_rollout_matches_official_public_rollout_return(
         np.asarray(recorded_return), np.asarray(official.total_reward)
     )
     assert len(recorded_rows) == environment.max_steps
+
 
 
 def test_two_episode_method_pairing_runs_through_the_real_environment(
@@ -359,7 +359,7 @@ def test_two_episode_method_pairing_runs_through_the_real_environment(
         head_params=head_params,
         codebook=empty_codebook(
             code_count=config.model.response_count - 1,
-            signature_dim=config.model.action_count,
+            signature_dim=2 * config.model.action_count,
         ),
         log_temperature=jnp.asarray(0.0),
         generic_log_temperature=jnp.asarray(0.0),

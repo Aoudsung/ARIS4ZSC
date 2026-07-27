@@ -39,10 +39,10 @@
 
 ## 5. 活跃实现和部署隔离
 
-- 活跃实现是 `path_c_v4_2_control_memory_r1`，结构见 `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md`。
+- 活跃实现是 `path_c_v4_3_executable_response_value_r1`，结构见 `idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md`。
 - 历史执行代码已从工作树删除，历史提交、实验结果、论文材料和远端产物不删除。
-- 当前 control-memory 修订包尚未在锁定远端依赖中完成测试或实验，状态只能写为 `implemented`。
-- 当前远端旧版本作业在其最终审计完成前不得被新实现覆盖。新实现必须使用新目录，且不得恢复旧 V4.2 checkpoint。
+- 当前 V4.3 executable-response-value 修订包尚未在锁定远端依赖中完成测试或实验，状态只能写为 `implemented`。
+- 当前远端旧版本作业在其最终审计完成前不得被新实现覆盖。新实现必须使用新目录，且不得恢复旧 V4.2/control-memory checkpoint。
 
 ## 6. 恢复、记录和错误处理
 

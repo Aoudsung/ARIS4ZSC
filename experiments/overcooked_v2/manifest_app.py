@@ -104,11 +104,8 @@ def build_population(
     output_path: str | Path,
 ) -> Path:
     runs = tuple(Path(value).resolve() for value in run_directories)
-    expected_count = 1 if evaluation_kind == "development_diagnostic" else 10
-    if len(runs) != expected_count:
-        raise ValueError(
-            f"{evaluation_kind} requires {expected_count} training run directories."
-        )
+    if len(runs) != 10:
+        raise ValueError("A standard population requires ten training run directories.")
     identities = [read_run_identity(path) for path in runs]
     if any(
         identity.get("stage") != "train" or identity.get("method") != METHOD_VERSION
@@ -118,14 +115,8 @@ def build_population(
     layouts = {str(identity.get("layout")) for identity in identities}
     configs = {json.dumps(identity.get("config"), sort_keys=True) for identity in identities}
     outer_units = [int(identity.get("outer_unit_id", -1)) for identity in identities]
-    if (
-        len(layouts) != 1
-        or len(configs) != 1
-        or outer_units != list(range(expected_count))
-    ):
-        raise ValueError(
-            "Population runs must share one config and use ordered outer units."
-        )
+    if len(layouts) != 1 or len(configs) != 1 or outer_units != list(range(10)):
+        raise ValueError("Population runs must share one config and be ordered outer units 0 through 9.")
     population = Population(
         name=str(name),
         layout=next(iter(layouts)),
@@ -158,14 +149,10 @@ def add_manifest_commands(commands: argparse._SubParsersAction) -> None:
     population.add_argument("--name", required=True)
     population.add_argument(
         "--evaluation-kind",
-        choices=(
-            "standard_matrix",
-            "response_contrast",
-            "development_diagnostic",
-        ),
+        choices=("standard_matrix", "response_contrast"),
         required=True,
     )
-    population.add_argument("--runs", nargs="+", required=True)
+    population.add_argument("--runs", nargs=10, required=True)
     population.add_argument("--output", required=True)
     population.set_defaults(
         function=lambda args: print(

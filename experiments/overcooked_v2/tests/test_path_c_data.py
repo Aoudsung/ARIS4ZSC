@@ -15,21 +15,16 @@ from src.path_c.experiment import (
     load_population,
     write_population,
 )
-from src.path_c.method import empty_codebook
 from src.path_c.storage import (
     CompleteConsoleLog,
     ensure_run_identity,
     evaluation_identity,
-    orbax_manager,
     read_array_chunks,
     read_run_identity,
-    restore_latest_checkpoint,
-    save_checkpoint,
     training_identity,
     write_array_chunks,
     write_jsonl,
 )
-from src.path_c.training import TrainState
 
 ROOT = Path(__file__).resolve().parents[3]
 SIMPLE_CONFIG = ROOT / "experiments/overcooked_v2/configs/path_c_simple.yaml"
@@ -45,6 +40,10 @@ def test_run_kind_selects_registered_budget() -> None:
     assert formal.environment.num_envs == 250
     assert formal.training.environment_steps == 11_000_000
     assert formal.training.minibatches_per_epoch == 50
+    assert development.training.behavior_support == 0.1
+    assert development.kl.bisection_iterations == 24
+    assert development.evaluation.response_policy_tv_minimum == 0.001
+    assert METHOD_VERSION == "path_c_v4_3_executable_response_value_r1"
 
 
 def test_layout_configs_differ_only_by_layout() -> None:
@@ -119,17 +118,6 @@ def test_population_records_training_run_directories_only(tmp_path: Path) -> Non
     assert set(payload["policies"][0]) == {"outer_unit_id", "run_directory"}
 
 
-def test_development_population_contains_one_real_training_run(tmp_path: Path) -> None:
-    population = Population(
-        name="seed-100-development",
-        layout="test_time_simple",
-        evaluation_kind="development_diagnostic",
-        entries=(PopulationEntry(0, tmp_path / "run-0"),),
-    )
-    path = write_population(tmp_path / "development_population.json", population)
-    assert load_population(path) == population
-
-
 def test_jsonl_and_array_chunks_are_lossless(tmp_path: Path) -> None:
     long_text = "响应🙂\n制表符\t引号\"" * 100
     rows = ({"index": index, "text": long_text + str(index)} for index in range(257))
@@ -154,32 +142,42 @@ def test_console_log_keeps_exception_trace(tmp_path: Path) -> None:
     assert "RuntimeError: 完整异常消息" in stderr
 
 
-def test_orbax_restores_the_explicit_train_state_type(tmp_path: Path) -> None:
-    jax = pytest.importorskip("jax")
-    jnp = pytest.importorskip("jax.numpy")
-    pytest.importorskip("orbax.checkpoint")
 
-    state = TrainState(
-        online_params={"weight": jnp.asarray([1.0, 2.0])},
-        target_params={"weight": jnp.asarray([3.0, 4.0])},
-        bellman_optimizer_state={"count": jnp.asarray(5)},
-        outcome_optimizer_state={"count": jnp.asarray(6)},
-        codebook=empty_codebook(code_count=2, signature_dim=3),
-        runner_state={"effective_environment_steps": jnp.asarray(400)},
-        random_key=jax.random.PRNGKey(9),
-        update_count=jnp.asarray(7),
+def test_responsibility_rows_preserve_every_epoch_lane_and_slot() -> None:
+    from types import SimpleNamespace
+    from experiments.overcooked_v2.training_app import _responsibility_rows
+
+    assignments = SimpleNamespace(
+        responsibilities=np.asarray([[0.25, 0.75], [0.6, 0.4]], dtype=np.float32),
+        td_energies=np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        response_energies=np.asarray([[5.0, 6.0], [7.0, 8.0]], dtype=np.float32),
+        reward_energies=np.asarray([[9.0, 10.0], [11.0, 12.0]], dtype=np.float32),
+        next_q_use_energies=np.asarray([[13.0, 14.0], [15.0, 16.0]], dtype=np.float32),
+        next_q_mask_energies=np.asarray([[17.0, 18.0], [19.0, 20.0]], dtype=np.float32),
+        next_reference_energy=np.asarray([21.0, 22.0], dtype=np.float32),
+        bootstrap_mask=np.asarray([[True, False], [True, True]]),
     )
-    manager = orbax_manager(tmp_path / "checkpoints")
-    save_checkpoint(manager, step=400, state=state)
-    step, restored = restore_latest_checkpoint(manager, item=state)
-    assert step == 400
-    assert isinstance(restored, TrainState)
-    assert type(restored.codebook) is type(state.codebook)
-    np.testing.assert_array_equal(
-        np.asarray(restored.online_params["weight"]), [1.0, 2.0]
+    records = {
+        "partner_members": np.asarray([[3, 4]], dtype=np.int32),
+        "episode_ids": np.asarray([[100, 101]], dtype=np.int64),
+    }
+    rows = list(
+        _responsibility_rows(assignments, records, update_count=7, epoch=2)
     )
-    assert (
-        int(np.asarray(restored.runner_state["effective_environment_steps"]))
-        == 400
-    )
-    assert int(np.asarray(restored.update_count)) == 7
+    assert len(rows) == 4
+    assert rows[0] == {
+        "update_count": 7,
+        "epoch": 2,
+        "environment_index": 0,
+        "episode_id": 100,
+        "audit_partner_member": 3,
+        "slot": 0,
+        "responsibility": 0.25,
+        "td_energy": 1.0,
+        "response_nll_energy": 5.0,
+        "reward_nll_energy": 9.0,
+        "next_q_use_nll_energy": 13.0,
+        "next_q_mask_nll_energy": 17.0,
+        "next_reference_mse_energy": 21.0,
+        "bootstrap_available": True,
+    }

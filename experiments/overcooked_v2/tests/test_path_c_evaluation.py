@@ -15,9 +15,6 @@ from src.path_c.evaluation import (
     standard_episode_seed,
     standard_pairings,
     summarize_standard_rows,
-    summarize_development_rows,
-    validate_development_response_contrast_rows,
-    validate_development_rows,
     validate_response_contrast_rows,
     validate_standard_rows,
 )
@@ -51,11 +48,12 @@ def _episode(mode: str, left: int, right: int, index: int) -> EpisodeRow:
         correct_delivery_count=left,
         wrong_delivery_count=right,
         indicator_activation_count=0,
-        positive_predicted_response_effect_count=0,
+        positive_policy_mediated_effect_count=0,
         cumulative_kl=0.0,
         reference_action_deviation_count=0,
         mean_value_class_count=1.0,
         mean_belief_entropy=0.0,
+        mean_predicted_next_policy_tv=0.0,
         response_code_counts=(400, 0),
     )
 
@@ -138,9 +136,14 @@ def _contrast_row(*, left: int, right: int, index: int, triggered: bool) -> Resp
         predicted_net_effect=0.1 if triggered else None,
         predicted_regularized_net_effect=0.08 if triggered else None,
         predicted_policy_total_variation=0.03 if triggered else None,
+        predicted_policy_mediated_effect=0.06 if triggered else None,
+        predicted_next_policy_total_variation=0.04 if triggered else None,
         maximum_action_net_value=0.4 if triggered else None,
+        maximum_action_policy_mediated_gain=0.08 if triggered else None,
         executed_action_net_value=0.2 if triggered else None,
         executed_action_response_value=0.3 if triggered else None,
+        executed_action_policy_mediated_gain=0.06 if triggered else None,
+        executed_action_expected_next_policy_tv=0.04 if triggered else None,
         executed_action=5 if triggered else None,
         maximum_net_action=5 if triggered else None,
         post_response_belief_l1=0.6 if triggered else None,
@@ -212,35 +215,3 @@ def test_directed_pairing_does_not_duplicate_seat_swap() -> None:
     assert forward.pairing_id == "02_to_07"
     assert reverse.pairing_id == "07_to_02"
     assert forward != reverse
-
-
-def test_development_diagnostic_is_matched_self_pairing_only() -> None:
-    rows = tuple(
-        _episode(mode, 0, 0, index)
-        for mode in DEPLOYMENT_MODES
-        for index in range(3)
-    )
-    validate_development_rows(rows, episodes_per_mode=3)
-    summary = summarize_development_rows(rows)
-    assert summary["evaluation_protocol"] == (
-        "single_policy_matched_self_pairing_diagnostic"
-    )
-    assert summary["scientific_readout_allowed"] is False
-    assert summary["matched_mean_raw_return_differences"] == {
-        "posterior_use_minus_generic_response_information": 0.0,
-        "posterior_use_minus_prior_only": 0.0,
-        "posterior_use_minus_reference_only": 0.0,
-    }
-
-
-def test_development_response_contrast_uses_literal_self_pair_seeds() -> None:
-    rows = tuple(
-        _contrast_row(left=0, right=0, index=index, triggered=index == 1)
-        for index in range(3)
-    )
-    validate_development_response_contrast_rows(
-        rows,
-        evaluation_seed=17,
-        layout="test_time_simple",
-        episodes_per_pairing=3,
-    )

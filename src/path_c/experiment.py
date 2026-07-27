@@ -14,8 +14,8 @@ from typing import Any, Mapping, Sequence
 
 from .method import DEPLOYMENT_MODES
 
-CONFIG_VERSION = 2
-METHOD_VERSION = "path_c_v4_2_control_memory_r1"
+CONFIG_VERSION = 3
+METHOD_VERSION = "path_c_v4_3_executable_response_value_r1"
 MANIFEST_VERSION = 1
 POPULATION_VERSION = 1
 RUN_KINDS = ("development", "formal")
@@ -78,6 +78,7 @@ class TrainingConfig:
     gamma: float
     responsibility_temperature: float
     bootstrap_probability: float
+    behavior_support: float
     polyak_coefficient: float
     codebook_decay: float
     code_replacement_rollouts: int
@@ -88,7 +89,7 @@ class TrainingConfig:
 class KLConfig:
     target_per_step: float
     initial_temperature: float
-    dual_learning_rate: float
+    bisection_iterations: int
     minimum_temperature: float
     maximum_temperature: float
 
@@ -97,6 +98,7 @@ class KLConfig:
 class EvaluationConfig:
     episodes_per_pairing: int
     deployment_modes: tuple[str, ...]
+    response_policy_tv_minimum: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +224,7 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
             "gamma",
             "responsibility_temperature",
             "bootstrap_probability",
+            "behavior_support",
             "polyak_coefficient",
             "codebook_decay",
             "code_replacement_rollouts",
@@ -256,6 +259,9 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         evaluation=EvaluationConfig(
             episodes_per_pairing=int(evaluation_payload["episodes_per_pairing"]),
             deployment_modes=tuple(evaluation_payload["deployment_modes"]),
+            response_policy_tv_minimum=float(
+                evaluation_payload["response_policy_tv_minimum"]
+            ),
         ),
         upstream=UpstreamConfig(
             total_timesteps=int(upstream_payload["total_timesteps"]),
@@ -304,6 +310,8 @@ def validate_config(config: RunConfig) -> None:
     ):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must lie in [0, 1].")
+    if not 0.0 <= config.training.behavior_support < 1.0:
+        raise ValueError("Training behavior support must lie in [0, 1).")
     rollout_steps = config.environment.num_envs * config.environment.episode_steps
     if config.training.environment_steps % rollout_steps:
         raise ValueError("Training must contain whole vectorized episodes.")
@@ -318,11 +326,13 @@ def validate_config(config: RunConfig) -> None:
     if (
         config.kl.target_per_step < 0.0
         or config.kl.initial_temperature <= 0.0
-        or config.kl.dual_learning_rate <= 0.0
+        or config.kl.bisection_iterations <= 0
         or config.kl.minimum_temperature <= 0.0
         or config.kl.maximum_temperature < config.kl.minimum_temperature
     ):
         raise ValueError("Kullback–Leibler temperature settings are invalid.")
+    if not 0.0 <= config.evaluation.response_policy_tv_minimum <= 1.0:
+        raise ValueError("Response-policy TV minimum must lie in [0, 1].")
     if (
         config.upstream.total_timesteps != 30_000_000
         or config.upstream.reward_shaping_horizon != 15_000_000
@@ -396,11 +406,7 @@ def load_population(path: str | Path) -> Population:
         raise ValueError("Unknown population-manifest version.")
     if payload["layout"] not in LAYOUTS:
         raise ValueError("Population manifest has an unknown layout.")
-    if payload["evaluation_kind"] not in {
-        "standard_matrix",
-        "response_contrast",
-        "development_diagnostic",
-    }:
+    if payload["evaluation_kind"] not in {"standard_matrix", "response_contrast"}:
         raise ValueError("Unknown evaluation kind.")
     if not isinstance(payload["policies"], Sequence):
         raise ValueError("Population policies must be a sequence.")
@@ -413,23 +419,10 @@ def load_population(path: str | Path) -> Population:
                 run_directory=_resolve(manifest_path.parent, raw["run_directory"]),
             )
         )
-    if payload["evaluation_kind"] == "development_diagnostic":
-        if len(entries) != 1 or entries[0].outer_unit_id != 0:
-            raise ValueError(
-                "A development diagnostic contains only outer unit zero."
-            )
-    else:
-        if (
-            len(entries) != 10
-            or [entry.outer_unit_id for entry in entries] != list(range(10))
-        ):
-            raise ValueError(
-                "A standard population contains ordered outer units 0 through 9."
-            )
-        if len({entry.run_directory for entry in entries}) != 10:
-            raise ValueError(
-                "Each outer unit must use a distinct training run directory."
-            )
+    if len(entries) != 10 or [entry.outer_unit_id for entry in entries] != list(range(10)):
+        raise ValueError("A standard population contains ordered outer units 0 through 9.")
+    if len({entry.run_directory for entry in entries}) != 10:
+        raise ValueError("Each outer unit must use a distinct training run directory.")
     return Population(
         name=str(payload["name"]),
         layout=str(payload["layout"]),

@@ -1,4 +1,4 @@
-"""Path C V4.2 transition batches, losses, and parameter updates."""
+"""Path C V4.3 transition batches, Bellman assignment, and updates."""
 
 from __future__ import annotations
 
@@ -8,23 +8,21 @@ from .method import (
     CodebookState,
     nearest_codes,
     slot_bayes_update,
+    solve_temperature_for_target_kl,
     target_response_signatures,
     uniform_slot_log_belief,
     update_codebook,
-    update_log_temperature,
 )
 from .model import model_forward
 
 
 class ModelFunctions(NamedTuple):
-    """Public official forward function plus the Path C heads."""
-
     heads: Any
     official_sequence: Callable[..., tuple[Any, Any, Any, Any]]
 
 
 class TransitionBatch(NamedTuple):
-    """All tensors consumed by the losses; partner identity is absent."""
+    """All loss inputs.  Partner identity is deliberately absent."""
 
     observations: Any
     response_next_observations: Any
@@ -36,6 +34,9 @@ class TransitionBatch(NamedTuple):
     reference_logits: Any
     execution_logits: Any
     generic_execution_logits: Any
+    behavior_logits: Any
+    posterior_scores: Any
+    generic_scores: Any
     slot_log_beliefs: Any
     actions: Any
     rewards: Any
@@ -44,8 +45,6 @@ class TransitionBatch(NamedTuple):
 
 
 class TrainState(NamedTuple):
-    """All mutable training state, including the runner state."""
-
     online_params: Any
     target_params: Any
     bellman_optimizer_state: Any
@@ -80,8 +79,15 @@ class FrozenAssignments(NamedTuple):
     stale_current_beliefs: Any
     response_signature_targets: Any
     response_code_targets: Any
-    continuation_use_targets: Any
-    continuation_mask_targets: Any
+    next_q_use_targets: Any
+    next_q_mask_targets: Any
+    next_reference_logits_targets: Any
+    td_energies: Any
+    response_energies: Any
+    reward_energies: Any
+    next_q_use_energies: Any
+    next_q_mask_energies: Any
+    next_reference_energy: Any
 
 
 class LossBundle(NamedTuple):
@@ -109,7 +115,9 @@ def huber(error: Any, delta: float = 1.0) -> Any:
 
     absolute = jnp.abs(jnp.asarray(error))
     quadratic = jnp.minimum(absolute, float(delta))
-    return 0.5 * jnp.square(quadratic) + float(delta) * (absolute - quadratic)
+    return 0.5 * jnp.square(quadratic) + float(delta) * (
+        absolute - quadratic
+    )
 
 
 def gaussian_negative_log_likelihood(
@@ -120,29 +128,6 @@ def gaussian_negative_log_likelihood(
     log_std = jnp.asarray(log_standard_deviation)
     normalized = (jnp.asarray(value) - jnp.asarray(mean)) * jnp.exp(-log_std)
     return 0.5 * jnp.square(normalized) + log_std
-
-
-def raw_policy_continuation_targets(
-    *, execution_probabilities: Any, target_q_values: Any, dones: Any
-) -> Any:
-    """Raw expected Q under the exact target execution distribution."""
-
-    import jax.numpy as jnp
-
-    probabilities = jnp.asarray(execution_probabilities, dtype=jnp.float32)
-    q_values = jnp.asarray(target_q_values, dtype=jnp.float32)
-    if q_values.shape[-3] != 2:
-        raise ValueError("Continuation targets require two Q estimators.")
-    if q_values.shape[:-3] != probabilities.shape[:-1]:
-        raise ValueError("Policy and target Q prefix axes differ.")
-    if q_values.shape[-1] != probabilities.shape[-1]:
-        raise ValueError("Policy and target Q action axes differ.")
-    expected = jnp.einsum("...a,...ema->...em", probabilities, q_values)
-    return jnp.where(
-        jnp.asarray(dones, dtype=jnp.bool_)[..., None, None],
-        jnp.zeros_like(expected),
-        expected,
-    )
 
 
 def bellman_targets(
@@ -157,7 +142,9 @@ def bellman_targets(
 
     target_q = jnp.min(jnp.asarray(target_next_q_values), axis=-3)
     expected = jnp.einsum(
-        "...a,...ma->...m", jnp.asarray(next_execution_probabilities), target_q
+        "...a,...ma->...m",
+        jnp.asarray(next_execution_probabilities),
+        target_q,
     )
     return jnp.asarray(rewards)[..., None] + float(gamma) * (
         1.0 - jnp.asarray(dones, dtype=jnp.float32)
@@ -178,17 +165,23 @@ def _selected_outcome_items(
     response_logits: Any,
     reward_mean: Any,
     reward_log_standard_deviation: Any,
-    continuation_use_mean: Any,
-    continuation_use_log_standard_deviation: Any,
-    continuation_mask_mean: Any,
-    continuation_mask_log_standard_deviation: Any,
+    next_q_use_mean: Any,
+    next_q_use_log_standard_deviation: Any,
+    next_q_mask_mean: Any,
+    next_q_mask_log_standard_deviation: Any,
+    next_reference_logits_mean: Any,
     response_codes: Any,
     rewards: Any,
-    continuation_use_targets: Any,
-    continuation_mask_targets: Any,
+    next_q_use_targets: Any,
+    next_q_mask_targets: Any,
+    next_reference_logits_targets: Any,
     actions: Any,
-) -> tuple[Any, Mapping[str, Any]]:
-    """Joint per-transition control evidence with shape [T,B,slot]."""
+) -> Mapping[str, Any]:
+    """Per-transition physical-model evidence.
+
+    Slot-specific items have shape ``[T,B,M]``.  The next-reference item has
+    shape ``[T,B]`` and is never used to assign a latent slot.
+    """
 
     import jax
     import jax.numpy as jnp
@@ -202,6 +195,7 @@ def _selected_outcome_items(
         response_target[..., None, None],
         axis=-1,
     )[..., 0]
+
     selected_reward_mean = gather_actions(reward_mean, actions, action_axis=-1)
     selected_reward_log_std = gather_actions(
         reward_log_standard_deviation, actions, action_axis=-1
@@ -212,35 +206,50 @@ def _selected_outcome_items(
         selected_reward_log_std,
     )
 
-    def continuation_items(mean: Any, log_std: Any, target: Any) -> Any:
-        selected_action_mean = gather_actions(mean, actions, action_axis=-2)
-        selected_action_std = gather_actions(log_std, actions, action_axis=-2)
+    def q_items(mean: Any, log_std: Any, target: Any) -> Any:
+        selected_action_mean = gather_actions(mean, actions, action_axis=-3)
+        selected_action_std = gather_actions(log_std, actions, action_axis=-3)
         selected_mean = gather_actions(
-            selected_action_mean, response_codes, action_axis=-1
+            selected_action_mean, response_codes, action_axis=-2
         )
         selected_std = gather_actions(
-            selected_action_std, response_codes, action_axis=-1
+            selected_action_std, response_codes, action_axis=-2
         )
-        return jnp.mean(
-            gaussian_negative_log_likelihood(target, selected_mean, selected_std),
-            axis=-2,
+        items = gaussian_negative_log_likelihood(
+            jnp.asarray(target), selected_mean, selected_std
         )
+        # [T,B,E,M,U] -> [T,B,M]
+        return jnp.mean(items, axis=(-3, -1))
 
-    use_nll = continuation_items(
-        continuation_use_mean,
-        continuation_use_log_standard_deviation,
-        continuation_use_targets,
+    use_nll = q_items(
+        next_q_use_mean,
+        next_q_use_log_standard_deviation,
+        next_q_use_targets,
     )
-    mask_nll = continuation_items(
-        continuation_mask_mean,
-        continuation_mask_log_standard_deviation,
-        continuation_mask_targets,
+    mask_nll = q_items(
+        next_q_mask_mean,
+        next_q_mask_log_standard_deviation,
+        next_q_mask_targets,
     )
-    return response_nll + reward_nll + use_nll + mask_nll, {
-        "response_nll_items": response_nll,
-        "reward_nll_items": reward_nll,
-        "continuation_use_nll_items": use_nll,
-        "continuation_mask_nll_items": mask_nll,
+
+    selected_reference = gather_actions(
+        next_reference_logits_mean, actions, action_axis=-3
+    )
+    selected_reference = gather_actions(
+        selected_reference, response_codes, action_axis=-2
+    )
+    reference_error = jnp.mean(
+        jnp.square(
+            selected_reference - jnp.asarray(next_reference_logits_targets)
+        ),
+        axis=-1,
+    )
+    return {
+        "response": response_nll,
+        "reward": reward_nll,
+        "next_q_use": use_nll,
+        "next_q_mask": mask_nll,
+        "next_reference": reference_error,
     }
 
 
@@ -250,73 +259,24 @@ def episode_responsibility_evidence(
     actions: Any,
     targets: Any,
     temperature: float,
-    response_logits: Any | None = None,
-    reward_mean: Any | None = None,
-    reward_log_standard_deviation: Any | None = None,
-    continuation_use_mean: Any | None = None,
-    continuation_use_log_standard_deviation: Any | None = None,
-    continuation_mask_mean: Any | None = None,
-    continuation_mask_log_standard_deviation: Any | None = None,
-    response_codes: Any | None = None,
-    rewards: Any | None = None,
-    continuation_use_targets: Any | None = None,
-    continuation_mask_targets: Any | None = None,
     availability_mask: Any | None = None,
 ) -> tuple[Any, Any]:
-    """Infer stopped slot responsibilities from full-episode evidence."""
+    """Assign latent slots from complete-episode Bellman evidence only."""
 
     import jax
     import jax.numpy as jnp
 
-    evidence_items = _td_evidence_items(
-        q_values=q_values, actions=actions, targets=targets
+    energies = jnp.sum(
+        _td_evidence_items(q_values=q_values, actions=actions, targets=targets),
+        axis=0,
     )
-    optional = (
-        response_logits,
-        reward_mean,
-        reward_log_standard_deviation,
-        continuation_use_mean,
-        continuation_use_log_standard_deviation,
-        continuation_mask_mean,
-        continuation_mask_log_standard_deviation,
-        response_codes,
-        rewards,
-        continuation_use_targets,
-        continuation_mask_targets,
-    )
-    if any(value is not None for value in optional):
-        if any(value is None for value in optional):
-            raise ValueError(
-                "Joint responsibility evidence requires every outcome tensor."
-            )
-        outcome_items, unused = _selected_outcome_items(
-            response_logits=response_logits,
-            reward_mean=reward_mean,
-            reward_log_standard_deviation=reward_log_standard_deviation,
-            continuation_use_mean=continuation_use_mean,
-            continuation_use_log_standard_deviation=(
-                continuation_use_log_standard_deviation
-            ),
-            continuation_mask_mean=continuation_mask_mean,
-            continuation_mask_log_standard_deviation=(
-                continuation_mask_log_standard_deviation
-            ),
-            response_codes=response_codes,
-            rewards=rewards,
-            continuation_use_targets=continuation_use_targets,
-            continuation_mask_targets=continuation_mask_targets,
-            actions=actions,
-        )
-        del unused
-        evidence_items = evidence_items + outcome_items
-    energies = jnp.sum(evidence_items, axis=0)
     available = (
         jnp.ones_like(energies, dtype=jnp.bool_)
         if availability_mask is None
         else jnp.asarray(availability_mask, dtype=jnp.bool_)
     )
     if available.shape != energies.shape:
-        raise ValueError("Responsibility availability must be [environment, slot].")
+        raise ValueError("Responsibility availability must be [environment,slot].")
     minimum = jnp.min(
         jnp.where(available, energies, jnp.inf), axis=-1, keepdims=True
     )
@@ -338,8 +298,6 @@ def sample_bootstrap_mask(
     slot_count: int,
     probability: float,
 ) -> Any:
-    """Sample independent estimator membership conditioned on a nonempty row."""
-
     import jax
     import jax.numpy as jnp
 
@@ -397,38 +355,41 @@ def outcome_loss(
     response_logits: Any,
     reward_mean: Any,
     reward_log_standard_deviation: Any,
-    continuation_use_mean: Any,
-    continuation_use_log_standard_deviation: Any,
-    continuation_mask_mean: Any,
-    continuation_mask_log_standard_deviation: Any,
+    next_q_use_mean: Any,
+    next_q_use_log_standard_deviation: Any,
+    next_q_mask_mean: Any,
+    next_q_mask_log_standard_deviation: Any,
+    next_reference_logits_mean: Any,
     response_codes: Any,
     rewards: Any,
-    continuation_use_targets: Any,
-    continuation_mask_targets: Any,
+    next_q_use_targets: Any,
+    next_q_mask_targets: Any,
+    next_reference_logits_targets: Any,
     actions: Any,
     stopped_responsibilities: Any,
     bootstrap_mask: Any | None = None,
-    terminal_response: int = 15,
 ) -> LossBundle:
     import jax
     import jax.numpy as jnp
 
-    terms, parts = _selected_outcome_items(
+    parts = _selected_outcome_items(
         response_logits=response_logits,
         reward_mean=reward_mean,
         reward_log_standard_deviation=reward_log_standard_deviation,
-        continuation_use_mean=continuation_use_mean,
-        continuation_use_log_standard_deviation=(
-            continuation_use_log_standard_deviation
+        next_q_use_mean=next_q_use_mean,
+        next_q_use_log_standard_deviation=(
+            next_q_use_log_standard_deviation
         ),
-        continuation_mask_mean=continuation_mask_mean,
-        continuation_mask_log_standard_deviation=(
-            continuation_mask_log_standard_deviation
+        next_q_mask_mean=next_q_mask_mean,
+        next_q_mask_log_standard_deviation=(
+            next_q_mask_log_standard_deviation
         ),
+        next_reference_logits_mean=next_reference_logits_mean,
         response_codes=response_codes,
         rewards=rewards,
-        continuation_use_targets=continuation_use_targets,
-        continuation_mask_targets=continuation_mask_targets,
+        next_q_use_targets=next_q_use_targets,
+        next_q_mask_targets=next_q_mask_targets,
+        next_reference_logits_targets=next_reference_logits_targets,
         actions=actions,
     )
     weights = jnp.asarray(stopped_responsibilities)
@@ -436,30 +397,28 @@ def outcome_loss(
         weights = weights * jnp.asarray(bootstrap_mask, dtype=jnp.float32)
     weights = jax.lax.stop_gradient(weights)[None, ...]
     denominator = response_logits.shape[0] * jnp.sum(weights) + 1.0e-8
-    fitted = jnp.sum(terms * weights) / denominator
-    terminal_use = continuation_use_mean[..., int(terminal_response)]
-    terminal_mask = continuation_mask_mean[..., int(terminal_response)]
-    terminal_penalty = 0.5 * (
-        jnp.mean(jnp.square(terminal_use))
-        + jnp.mean(jnp.square(terminal_mask))
+
+    slot_terms = (
+        parts["response"]
+        + parts["reward"]
+        + parts["next_q_use"]
+        + parts["next_q_mask"]
     )
+    fitted_slots = jnp.sum(slot_terms * weights) / denominator
+    reference_loss = jnp.mean(parts["next_reference"])
+    total = fitted_slots + reference_loss
     return LossBundle(
-        total=fitted + terminal_penalty,
+        total=total,
         metrics={
-            "slot_outcome": fitted,
-            "response_nll": jnp.sum(parts["response_nll_items"] * weights)
+            "slot_outcome": fitted_slots,
+            "response_nll": jnp.sum(parts["response"] * weights)
             / denominator,
-            "reward_nll": jnp.sum(parts["reward_nll_items"] * weights)
+            "reward_nll": jnp.sum(parts["reward"] * weights) / denominator,
+            "next_q_use_nll": jnp.sum(parts["next_q_use"] * weights)
             / denominator,
-            "continuation_use_nll": jnp.sum(
-                parts["continuation_use_nll_items"] * weights
-            )
+            "next_q_mask_nll": jnp.sum(parts["next_q_mask"] * weights)
             / denominator,
-            "continuation_mask_nll": jnp.sum(
-                parts["continuation_mask_nll_items"] * weights
-            )
-            / denominator,
-            "terminal_continuation_penalty": terminal_penalty,
+            "next_reference_mse": reference_loss,
         },
     )
 
@@ -482,7 +441,9 @@ def response_encoder_loss(
     valid = targets < codebook.shape[0]
     safe_targets = jnp.where(valid, targets, 0)
     items = -jnp.take_along_axis(
-        jax.nn.log_softmax(logits, axis=-1), safe_targets[..., None], axis=-1
+        jax.nn.log_softmax(logits, axis=-1),
+        safe_targets[..., None],
+        axis=-1,
     )[..., 0]
     denominator = jnp.sum(valid.astype(jnp.float32)) + 1.0e-8
     classification = jnp.sum(items * valid.astype(jnp.float32)) / denominator
@@ -500,8 +461,6 @@ def response_encoder_loss(
 
 
 def _head_labels(params: Mapping[str, Any], *, loss: str) -> Any:
-    """Partition by mathematical consumer, not by checkpoint provenance."""
-
     import jax
 
     if loss == "bellman":
@@ -540,17 +499,19 @@ def make_optimizers(
     outcome_learning_rate: float,
     gradient_clip_norm: float,
 ) -> OptimizerBundle:
-    """Train the official recurrent representation only through Bellman loss."""
-
     import jax
     import optax
 
     bellman_labels = {
-        "official": jax.tree_util.tree_map(lambda unused: "train", params["official"]),
+        "official": jax.tree_util.tree_map(
+            lambda unused: "train", params["official"]
+        ),
         "heads": _head_labels(params["heads"], loss="bellman"),
     }
     outcome_labels = {
-        "official": jax.tree_util.tree_map(lambda unused: "frozen", params["official"]),
+        "official": jax.tree_util.tree_map(
+            lambda unused: "frozen", params["official"]
+        ),
         "heads": _head_labels(params["heads"], loss="outcome"),
     }
 
@@ -661,24 +622,13 @@ def _branch_targets(
     target_params: Mapping[str, Any],
     target_output: Mapping[str, Any],
     batch: TransitionBatch,
-    temperature: Any,
-    generic_temperature: Any,
-    gamma: float,
-) -> tuple[Any, Any]:
-    """Compute use and response-mask targets from the same physical transition."""
+) -> tuple[Any, Any, Any]:
+    """Exact next-Q vectors for updated and one-response-stale beliefs."""
 
     import jax
     import jax.numpy as jnp
 
-    use_raw = {name: value[1:] for name, value in target_output.items()}
-    use_forward = _forward(
-        raw_output=use_raw,
-        reference_logits=batch.reference_logits[1:],
-        slot_log_belief=batch.slot_log_beliefs[1:],
-        temperature=temperature,
-        generic_temperature=generic_temperature,
-        gamma=gamma,
-    )
+    use_q = jnp.asarray(target_output["q_values"][1:])
     mask_raw = jax.tree_util.tree_map(
         jax.lax.stop_gradient,
         apply_heads_from_features(
@@ -688,27 +638,16 @@ def _branch_targets(
             slot_log_beliefs=batch.slot_log_beliefs[:-1],
         ),
     )
-    mask_forward = _forward(
-        raw_output=mask_raw,
-        reference_logits=batch.reference_logits[1:],
-        slot_log_belief=batch.slot_log_beliefs[:-1],
-        temperature=temperature,
-        generic_temperature=generic_temperature,
-        gamma=gamma,
+    mask_q = jnp.asarray(mask_raw["q_values"])
+    done = jnp.asarray(batch.dones, dtype=jnp.bool_)
+    use_q = jnp.where(done[..., None, None, None], 0.0, use_q)
+    mask_q = jnp.where(done[..., None, None, None], 0.0, mask_q)
+    next_reference = jax.nn.log_softmax(batch.reference_logits[1:], axis=-1)
+    next_reference = next_reference - jnp.mean(
+        next_reference, axis=-1, keepdims=True
     )
-    use_probabilities = jax.nn.softmax(use_forward.execution_logits, axis=-1)
-    mask_probabilities = jax.nn.softmax(mask_forward.execution_logits, axis=-1)
-    use_targets = raw_policy_continuation_targets(
-        execution_probabilities=use_probabilities,
-        target_q_values=use_raw["q_values"],
-        dones=batch.dones,
-    )
-    mask_targets = raw_policy_continuation_targets(
-        execution_probabilities=mask_probabilities,
-        target_q_values=mask_raw["q_values"],
-        dones=batch.dones,
-    )
-    return jnp.asarray(use_targets), jnp.asarray(mask_targets)
+    next_reference = jnp.where(done[..., None], 0.0, next_reference)
+    return use_q, mask_q, next_reference
 
 
 def prepare_frozen_assignments(
@@ -726,7 +665,7 @@ def prepare_frozen_assignments(
     terminal_response: int,
     bootstrap_mask: Any | None = None,
 ) -> FrozenAssignments:
-    """Infer one stopped responsibility vector per complete environment lane."""
+    """Run a target-network E-step for complete environment lanes."""
 
     import jax
     import jax.numpy as jnp
@@ -735,14 +674,11 @@ def prepare_frozen_assignments(
         jax.lax.stop_gradient,
         apply_model_sequence(functions=functions, params=target_params, batch=batch),
     )
-    use_targets, mask_targets = _branch_targets(
+    use_q_targets, mask_q_targets, reference_targets = _branch_targets(
         functions=functions,
         target_params=target_params,
         target_output=target,
         batch=batch,
-        temperature=temperature,
-        generic_temperature=generic_temperature,
-        gamma=gamma,
     )
     next_forward = _forward(
         raw_output={name: value[1:] for name, value in target.items()},
@@ -752,37 +688,51 @@ def prepare_frozen_assignments(
         generic_temperature=generic_temperature,
         gamma=gamma,
     )
-    next_probabilities = jax.nn.softmax(
-        next_forward.execution_logits, axis=-1
-    )
     targets = jax.lax.stop_gradient(
         bellman_targets(
             rewards=batch.rewards,
             dones=batch.dones,
-            next_execution_probabilities=next_probabilities,
+            next_execution_probabilities=jax.nn.softmax(
+                next_forward.execution_logits, axis=-1
+            ),
             target_next_q_values=target["q_values"][1:],
             gamma=gamma,
         )
     )
 
     slot_count = int(batch.slot_log_beliefs.shape[-1])
-    uniform_belief_for_response_targets = uniform_slot_log_belief(
+    uniform_current = uniform_slot_log_belief(
+        target["features"][:-1].shape[:-1], slot_count
+    )
+    uniform_next = uniform_slot_log_belief(
         target["features"][1:].shape[:-1], slot_count
     )
-    response_target_heads = jax.tree_util.tree_map(
+    current_response_heads = jax.tree_util.tree_map(
+        jax.lax.stop_gradient,
+        apply_heads_from_features(
+            functions=functions,
+            params=target_params,
+            features=target["features"][:-1],
+            slot_log_beliefs=uniform_current,
+        ),
+    )
+    next_response_heads = jax.tree_util.tree_map(
         jax.lax.stop_gradient,
         apply_heads_from_features(
             functions=functions,
             params=target_params,
             features=target["features"][1:],
-            slot_log_beliefs=uniform_belief_for_response_targets,
+            slot_log_beliefs=uniform_next,
         ),
     )
     signatures = jax.lax.stop_gradient(
         target_response_signatures(
-            target_centered_advantages=response_target_heads[
+            current_centered_advantages=current_response_heads[
                 "centered_advantages"
-            ]
+            ],
+            next_centered_advantages=next_response_heads[
+                "centered_advantages"
+            ],
         )
     )
     code_targets, unused_quantization_error = nearest_codes(
@@ -847,44 +797,60 @@ def prepare_frozen_assignments(
         mask = jnp.asarray(bootstrap_mask, dtype=jnp.bool_)
         if mask.shape != (environment_count, slot_count):
             raise ValueError(
-                "Bootstrap mask must have one row per environment lane "
-                "and one column per partner slot."
+                "Bootstrap mask must be [environment,slot]."
             )
-    responsibilities, energies = episode_responsibility_evidence(
+
+    responsibilities, td_energies = episode_responsibility_evidence(
         q_values=target["q_values"][:-1],
         actions=batch.actions,
         targets=targets,
         temperature=responsibility_temperature,
+        availability_mask=mask,
+    )
+    audit_items = _selected_outcome_items(
         response_logits=target["response_logits"][:-1],
         reward_mean=target["reward_mean"][:-1],
         reward_log_standard_deviation=target[
             "reward_log_standard_deviation"
         ][:-1],
-        continuation_use_mean=target["continuation_use_mean"][:-1],
-        continuation_use_log_standard_deviation=target[
-            "continuation_use_log_standard_deviation"
+        next_q_use_mean=target["next_q_use_mean"][:-1],
+        next_q_use_log_standard_deviation=target[
+            "next_q_use_log_standard_deviation"
         ][:-1],
-        continuation_mask_mean=target["continuation_mask_mean"][:-1],
-        continuation_mask_log_standard_deviation=target[
-            "continuation_mask_log_standard_deviation"
+        next_q_mask_mean=target["next_q_mask_mean"][:-1],
+        next_q_mask_log_standard_deviation=target[
+            "next_q_mask_log_standard_deviation"
+        ][:-1],
+        next_reference_logits_mean=target[
+            "next_reference_logits_mean"
         ][:-1],
         response_codes=batch.response_codes,
         rewards=batch.rewards,
-        continuation_use_targets=use_targets,
-        continuation_mask_targets=mask_targets,
-        availability_mask=mask,
+        next_q_use_targets=use_q_targets,
+        next_q_mask_targets=mask_q_targets,
+        next_reference_logits_targets=reference_targets,
+        actions=batch.actions,
     )
     return FrozenAssignments(
         responsibilities=responsibilities,
-        responsibility_energies=energies,
+        responsibility_energies=td_energies,
         bootstrap_mask=mask,
         bellman_targets=targets,
         stale_bellman_targets=stale_targets,
         stale_current_beliefs=jax.lax.stop_gradient(stale_current),
         response_signature_targets=signatures,
         response_code_targets=code_targets,
-        continuation_use_targets=jax.lax.stop_gradient(use_targets),
-        continuation_mask_targets=jax.lax.stop_gradient(mask_targets),
+        next_q_use_targets=jax.lax.stop_gradient(use_q_targets),
+        next_q_mask_targets=jax.lax.stop_gradient(mask_q_targets),
+        next_reference_logits_targets=jax.lax.stop_gradient(reference_targets),
+        td_energies=td_energies,
+        response_energies=jnp.sum(audit_items["response"], axis=0),
+        reward_energies=jnp.sum(audit_items["reward"], axis=0),
+        next_q_use_energies=jnp.sum(audit_items["next_q_use"], axis=0),
+        next_q_mask_energies=jnp.sum(audit_items["next_q_mask"], axis=0),
+        next_reference_energy=jnp.sum(
+            audit_items["next_reference"], axis=0
+        ),
     )
 
 
@@ -902,8 +868,17 @@ def slice_assignments(
         stale_current_beliefs=assignments.stale_current_beliefs[:, indexes],
         response_signature_targets=assignments.response_signature_targets[:, indexes],
         response_code_targets=assignments.response_code_targets[:, indexes],
-        continuation_use_targets=assignments.continuation_use_targets[:, indexes],
-        continuation_mask_targets=assignments.continuation_mask_targets[:, indexes],
+        next_q_use_targets=assignments.next_q_use_targets[:, indexes],
+        next_q_mask_targets=assignments.next_q_mask_targets[:, indexes],
+        next_reference_logits_targets=(
+            assignments.next_reference_logits_targets[:, indexes]
+        ),
+        td_energies=assignments.td_energies[indexes],
+        response_energies=assignments.response_energies[indexes],
+        reward_energies=assignments.reward_energies[indexes],
+        next_q_use_energies=assignments.next_q_use_energies[indexes],
+        next_q_mask_energies=assignments.next_q_mask_energies[indexes],
+        next_reference_energy=assignments.next_reference_energy[indexes],
     )
     return jax.tree_util.tree_map(jax.lax.stop_gradient, sliced)
 
@@ -973,18 +948,24 @@ def _losses(
         reward_log_standard_deviation=output[
             "reward_log_standard_deviation"
         ][:-1],
-        continuation_use_mean=output["continuation_use_mean"][:-1],
-        continuation_use_log_standard_deviation=output[
-            "continuation_use_log_standard_deviation"
+        next_q_use_mean=output["next_q_use_mean"][:-1],
+        next_q_use_log_standard_deviation=output[
+            "next_q_use_log_standard_deviation"
         ][:-1],
-        continuation_mask_mean=output["continuation_mask_mean"][:-1],
-        continuation_mask_log_standard_deviation=output[
-            "continuation_mask_log_standard_deviation"
+        next_q_mask_mean=output["next_q_mask_mean"][:-1],
+        next_q_mask_log_standard_deviation=output[
+            "next_q_mask_log_standard_deviation"
+        ][:-1],
+        next_reference_logits_mean=output[
+            "next_reference_logits_mean"
         ][:-1],
         response_codes=batch.response_codes,
         rewards=batch.rewards,
-        continuation_use_targets=assignments.continuation_use_targets,
-        continuation_mask_targets=assignments.continuation_mask_targets,
+        next_q_use_targets=assignments.next_q_use_targets,
+        next_q_mask_targets=assignments.next_q_mask_targets,
+        next_reference_logits_targets=(
+            assignments.next_reference_logits_targets
+        ),
         actions=batch.actions,
         stopped_responsibilities=assignments.responsibilities,
         bootstrap_mask=assignments.bootstrap_mask,
@@ -1142,6 +1123,30 @@ def polyak_update(target_params: Any, online_params: Any, coefficient: float) ->
     )
 
 
+def recompute_policy_scores(
+    *,
+    functions: ModelFunctions,
+    params: Mapping[str, Any],
+    batch: TransitionBatch,
+    temperature: Any,
+    generic_temperature: Any,
+    gamma: float,
+) -> tuple[Any, Any]:
+    """Recompute current online scores after the rollout's parameter updates."""
+
+    output = apply_model_sequence(functions=functions, params=params, batch=batch)
+    forward = model_forward(
+        raw_output={name: value[:-1] for name, value in output.items()},
+        reference_logits=batch.reference_logits[:-1],
+        slot_log_belief=batch.slot_log_beliefs[:-1],
+        temperature=temperature,
+        generic_temperature=generic_temperature,
+        deployment_mode="posterior_use",
+        gamma=gamma,
+    )
+    return forward.j_use, forward.information_gain
+
+
 def rollout_kl_means(batch: TransitionBatch) -> tuple[Any, Any]:
     import jax
     import jax.numpy as jnp
@@ -1152,7 +1157,9 @@ def rollout_kl_means(batch: TransitionBatch) -> tuple[Any, Any]:
         log_probabilities = jax.nn.log_softmax(logits, axis=-1)
         probabilities = jnp.exp(log_probabilities)
         return jnp.mean(
-            jnp.sum(probabilities * (log_probabilities - reference), axis=-1)
+            jnp.sum(
+                probabilities * (log_probabilities - reference), axis=-1
+            )
         )
 
     return mean_kl(batch.execution_logits), mean_kl(
@@ -1160,42 +1167,49 @@ def rollout_kl_means(batch: TransitionBatch) -> tuple[Any, Any]:
     )
 
 
-def update_policy_temperatures(
+def solve_policy_temperatures(
     policy_state: Any,
     *,
-    posterior_mean_kl: Any,
-    generic_mean_kl: Any,
+    batch: TransitionBatch,
     target_kl: float,
-    learning_rate: float,
     minimum_temperature: float,
     maximum_temperature: float,
-) -> Any:
+    iterations: int,
+) -> tuple[Any, Mapping[str, Any]]:
+    """Replace the ineffective dual step with exact batchwise KL solves."""
+
     import jax.numpy as jnp
 
-    posterior_log_temperature = update_log_temperature(
-        log_temperature=jnp.ravel(policy_state.log_temperature)[0],
-        mean_kl=posterior_mean_kl,
+    posterior_temperature, posterior_kl = solve_temperature_for_target_kl(
+        reference_logits=batch.reference_logits[:-1],
+        score=batch.posterior_scores,
         target_kl=target_kl,
-        learning_rate=learning_rate,
         minimum_temperature=minimum_temperature,
         maximum_temperature=maximum_temperature,
+        iterations=iterations,
     )
-    generic_log_temperature = update_log_temperature(
-        log_temperature=jnp.ravel(policy_state.generic_log_temperature)[0],
-        mean_kl=generic_mean_kl,
+    generic_temperature, generic_kl = solve_temperature_for_target_kl(
+        reference_logits=batch.reference_logits[:-1],
+        score=batch.generic_scores,
         target_kl=target_kl,
-        learning_rate=learning_rate,
         minimum_temperature=minimum_temperature,
         maximum_temperature=maximum_temperature,
+        iterations=iterations,
     )
-    return policy_state._replace(
+    state = policy_state._replace(
         log_temperature=jnp.full_like(
-            policy_state.log_temperature, posterior_log_temperature
+            policy_state.log_temperature, jnp.log(posterior_temperature)
         ),
         generic_log_temperature=jnp.full_like(
-            policy_state.generic_log_temperature, generic_log_temperature
+            policy_state.generic_log_temperature, jnp.log(generic_temperature)
         ),
     )
+    return state, {
+        "temperature": posterior_temperature,
+        "generic_temperature": generic_temperature,
+        "posterior_solved_kl": posterior_kl,
+        "generic_solved_kl": generic_kl,
+    }
 
 
 def update_codebook_from_assignments(
@@ -1232,14 +1246,17 @@ __all__ = [
     "bellman_targets",
     "environment_minibatch_schedule",
     "episode_responsibility_evidence",
+    "gaussian_negative_log_likelihood",
+    "gather_actions",
+    "huber",
     "make_optimizers",
     "outcome_loss",
     "polyak_update",
     "prepare_frozen_assignments",
-    "raw_policy_continuation_targets",
+    "recompute_policy_scores",
     "response_encoder_loss",
     "rollout_kl_means",
     "sample_bootstrap_mask",
+    "solve_policy_temperatures",
     "update_codebook_from_assignments",
-    "update_policy_temperatures",
 ]

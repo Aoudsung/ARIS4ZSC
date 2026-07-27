@@ -1,8 +1,8 @@
-"""Path C V4.2 belief, value-class, response-code, and policy mathematics.
+"""Path C V4.3 belief, value quotient, response, and policy mathematics.
 
-Every function in this module implements a mathematical operation used by the
-model, trainer, or evaluator.  Checkpoint identity, source hashing, and
-compatibility aliases deliberately do not live here.
+The module contains only mathematical operations consumed by the model, trainer,
+or evaluator.  Latent slot assignment is based on Bellman evidence; response and
+outcome models never define the slot semantics.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ DEPLOYMENT_MODES = (
 
 
 class PolicyState(NamedTuple):
-    """The complete recurrent state consumed by one deployed policy."""
+    """Complete recurrent state consumed by one deployed policy."""
 
     reference_carry: Any
     trainable_carry: Any
@@ -54,6 +54,11 @@ class ControlValues(NamedTuple):
     response_marginal: Any
     updated_belief: Any
     physical_joint: Any
+    next_use_policy_probabilities: Any
+    next_mask_policy_probabilities: Any
+    per_action_expected_next_policy_tv: Any
+    policy_gain_by_estimator: Any
+    per_action_policy_mediated_gain: Any
 
 
 class PolicyValues(NamedTuple):
@@ -107,26 +112,153 @@ def deployment_belief_after_response(
     return normalized_log_belief(updated_log_belief)
 
 
+def _temperature_axes(temperature: Any, action_values: Any) -> tuple[Any, Any]:
+    """Broadcast a positive temperature over all non-action axes."""
+
+    import jax.numpy as jnp
+
+    score = jnp.asarray(action_values)
+    alpha = jnp.asarray(temperature, dtype=score.dtype)
+    if alpha.ndim == score.ndim and alpha.shape[-1] == 1:
+        alpha = alpha[..., 0]
+    try:
+        scalar = jnp.broadcast_to(alpha, score.shape[:-1])
+    except ValueError as error:
+        raise ValueError("Temperature cannot broadcast to action-value prefixes.") from error
+    if jnp.issubdtype(score.dtype, jnp.floating):
+        scalar = jnp.maximum(scalar, jnp.finfo(score.dtype).tiny)
+    return scalar[..., None], scalar
+
+
+def regularized_policy(
+    reference_logits: Any, score: Any, temperature: Any
+) -> PolicyValues:
+    """KL-regularized policy with the reference distribution as the prior."""
+
+    import jax
+    import jax.numpy as jnp
+
+    reference_raw = jnp.asarray(reference_logits)
+    score_values = jnp.asarray(score, dtype=reference_raw.dtype)
+    if reference_raw.shape != score_values.shape:
+        raise ValueError("Reference logits and policy scores must share shape.")
+    reference_log = jax.nn.log_softmax(reference_raw, axis=-1)
+    alpha, unused_scalar = _temperature_axes(temperature, score_values)
+    del unused_scalar
+    logits = reference_log + score_values / alpha
+    log_probabilities = jax.nn.log_softmax(logits, axis=-1)
+    probabilities = jnp.exp(log_probabilities)
+    kl = jnp.sum(
+        probabilities * (log_probabilities - reference_log), axis=-1
+    )
+    return PolicyValues(
+        logits=logits,
+        probabilities=probabilities,
+        kl_divergence=jnp.maximum(kl, 0.0),
+    )
+
+
+def regularized_objective_value(
+    reference_logits: Any, score: Any, temperature: Any
+) -> Any:
+    """Return E[score] - alpha KL under the optimal regularized policy."""
+
+    import jax
+    import jax.numpy as jnp
+
+    reference = jax.nn.log_softmax(jnp.asarray(reference_logits), axis=-1)
+    score_values = jnp.asarray(score, dtype=reference.dtype)
+    alpha, scalar_alpha = _temperature_axes(temperature, score_values)
+    return scalar_alpha * jax.scipy.special.logsumexp(
+        reference + score_values / alpha, axis=-1
+    )
+
+
+def mean_regularized_policy_kl(
+    reference_logits: Any, score: Any, temperature: Any
+) -> Any:
+    import jax.numpy as jnp
+
+    return jnp.mean(
+        regularized_policy(reference_logits, score, temperature).kl_divergence
+    )
+
+
+def solve_temperature_for_target_kl(
+    *,
+    reference_logits: Any,
+    score: Any,
+    target_kl: float,
+    minimum_temperature: float,
+    maximum_temperature: float,
+    iterations: int,
+) -> tuple[Any, Any]:
+    """Solve the scalar KL temperature by deterministic log-space bisection."""
+
+    import jax
+    import jax.numpy as jnp
+
+    if target_kl < 0.0:
+        raise ValueError("Target KL must be non-negative.")
+    if minimum_temperature <= 0.0 or maximum_temperature < minimum_temperature:
+        raise ValueError("Temperature bounds are invalid.")
+    if iterations <= 0:
+        raise ValueError("Temperature bisection needs at least one iteration.")
+
+    lower = jnp.log(jnp.asarray(minimum_temperature, dtype=jnp.float32))
+    upper = jnp.log(jnp.asarray(maximum_temperature, dtype=jnp.float32))
+    target = jnp.asarray(target_kl, dtype=jnp.float32)
+
+    def kl_at(log_alpha: Any) -> Any:
+        return mean_regularized_policy_kl(
+            reference_logits, score, jnp.exp(log_alpha)
+        )
+
+    kl_lower = kl_at(lower)
+    kl_upper = kl_at(upper)
+
+    def body(unused_index: int, bounds: tuple[Any, Any]) -> tuple[Any, Any]:
+        del unused_index
+        lo, hi = bounds
+        middle = 0.5 * (lo + hi)
+        middle_kl = kl_at(middle)
+        # KL decreases monotonically as temperature increases.
+        return (
+            jnp.where(middle_kl > target, middle, lo),
+            jnp.where(middle_kl > target, hi, middle),
+        )
+
+    solved_lower, solved_upper = jax.lax.fori_loop(
+        0, int(iterations), body, (lower, upper)
+    )
+    interior = 0.5 * (solved_lower + solved_upper)
+    chosen = jnp.where(
+        kl_lower <= target,
+        lower,
+        jnp.where(kl_upper >= target, upper, interior),
+    )
+    temperature = jnp.exp(chosen)
+    return temperature, kl_at(chosen)
+
+
 def bellman_control_values(
     *,
     slot_belief: Any,
     response_probabilities: Any,
     reward_mean: Any,
-    continuation_use_mean: Any,
-    continuation_mask_mean: Any,
+    next_q_use_mean: Any,
+    next_q_mask_mean: Any,
+    next_reference_logits_mean: Any,
+    temperature: Any,
     gamma: float,
     probability_floor: float = 1.0e-8,
 ) -> ControlValues:
-    """Compute raw-return use/mask values with common physical weighting.
+    """Compute behavior-consistent use/mask values with common physical weights.
 
-    Shapes:
-      belief ``[..., M]``;
-      response ``[..., M, A, Y]``;
-      reward ``[..., M, A]``;
-      continuation ``[..., E, M, A, Y]``.
-
-    Both branches integrate with ``b(m) p(y|m,a)``.  The continuation tensors
-    differ only because their controller received the updated or masked belief.
+    Shapes are ``belief [...,M]``, ``response [...,M,A,Y]``, reward
+    ``[...,M,A]``, next Q ``[...,E,M,A,Y,U]`` and next reference logits
+    ``[...,A,Y,U]``.  Use and mask share the physical conditional posterior;
+    only the controller belief used to construct the next action policy differs.
     """
 
     import jax.numpy as jnp
@@ -134,26 +266,35 @@ def bellman_control_values(
     belief = jnp.asarray(slot_belief, dtype=jnp.float32)
     response = jnp.asarray(response_probabilities, dtype=jnp.float32)
     rewards = jnp.asarray(reward_mean, dtype=jnp.float32)
-    use_continuation = jnp.asarray(continuation_use_mean, dtype=jnp.float32)
-    mask_continuation = jnp.asarray(continuation_mask_mean, dtype=jnp.float32)
-    if use_continuation.shape != mask_continuation.shape:
-        raise ValueError("Use and mask continuation predictions must share shape.")
-    if use_continuation.shape[-4] != 2:
+    use_q = jnp.asarray(next_q_use_mean, dtype=jnp.float32)
+    mask_q = jnp.asarray(next_q_mask_mean, dtype=jnp.float32)
+    next_reference = jnp.asarray(next_reference_logits_mean, dtype=jnp.float32)
+    if use_q.shape != mask_q.shape:
+        raise ValueError("Use and mask next-Q predictions must share shape.")
+    if use_q.shape[-5] != 2:
         raise ValueError("Behavior-consistent control requires two estimators.")
     if response.shape[-3] != belief.shape[-1]:
         raise ValueError("Response slots and belief slots differ.")
     if rewards.shape != response.shape[:-1]:
-        raise ValueError("Reward means require [..., slot, action] axes.")
-    expected_shape = (
+        raise ValueError("Reward means require [...,slot,action] axes.")
+    expected_q_shape = (
         *response.shape[:-3],
         2,
         response.shape[-3],
         response.shape[-2],
         response.shape[-1],
+        next_reference.shape[-1],
     )
-    if use_continuation.shape != expected_shape:
+    if use_q.shape != expected_q_shape:
         raise ValueError(
-            "Continuation means require [..., estimator, slot, action, response]."
+            "Next-Q means require [...,estimator,slot,action,response,next_action]."
+        )
+    if next_reference.shape[:-3] != response.shape[:-3] or (
+        next_reference.shape[-3] != response.shape[-2]
+        or next_reference.shape[-2] != response.shape[-1]
+    ):
+        raise ValueError(
+            "Next reference logits require [...,action,response,next_action]."
         )
 
     response = jnp.clip(response, float(probability_floor), 1.0)
@@ -171,30 +312,84 @@ def bellman_control_values(
         response_marginal[..., None, :, :], float(probability_floor)
     )
 
-    immediate = jnp.einsum("...m,...ma->...a", belief, rewards)
+    use_controller_by_estimator = jnp.einsum(
+        "...may,...emayu->...eayu", updated, use_q
+    )
+    mask_controller_by_estimator = jnp.einsum(
+        "...m,...emayu->...eayu", belief, mask_q
+    )
+    use_controller_score = jnp.min(use_controller_by_estimator, axis=-4)
+    mask_controller_score = jnp.min(mask_controller_by_estimator, axis=-4)
+    alpha = jnp.asarray(temperature)
+    next_alpha = alpha if alpha.ndim == 0 else alpha[..., None, None]
+    use_policy = regularized_policy(
+        next_reference, use_controller_score, next_alpha
+    )
+    mask_policy = regularized_policy(
+        next_reference, mask_controller_score, next_alpha
+    )
+
+    use_slot_value = jnp.einsum(
+        "...ayu,...emayu->...emay", use_policy.probabilities, use_q
+    )
+    mask_slot_value = jnp.einsum(
+        "...ayu,...emayu->...emay", mask_policy.probabilities, mask_q
+    )
+    use_conditional = jnp.einsum(
+        "...may,...emay->...eay", updated, use_slot_value
+    )
+    mask_conditional = jnp.einsum(
+        "...may,...emay->...eay", updated, mask_slot_value
+    )
     use_expected = jnp.einsum(
-        "...may,...emay->...ea", physical_joint, use_continuation
+        "...ay,...eay->...ea", response_marginal, use_conditional
     )
     mask_expected = jnp.einsum(
-        "...may,...emay->...ea", physical_joint, mask_continuation
+        "...ay,...eay->...ea", response_marginal, mask_conditional
     )
+
+    immediate = jnp.einsum("...m,...ma->...a", belief, rewards)
     j_use_by_estimator = immediate[..., None, :] + float(gamma) * use_expected
     j_mask_by_estimator = immediate[..., None, :] + float(gamma) * mask_expected
     j_use = jnp.min(j_use_by_estimator, axis=-2)
     j_mask = jnp.min(j_mask_by_estimator, axis=-2)
     value_mask = jnp.max(j_mask, axis=-1)
-    response_value = j_use - j_mask
+
+    delta_policy = use_policy.probabilities - mask_policy.probabilities
+    common_q = 0.5 * (use_q + mask_q)
+    gain_by_slot = jnp.einsum(
+        "...ayu,...emayu->...emay", delta_policy, common_q
+    )
+    gain_conditional = jnp.einsum(
+        "...may,...emay->...eay", updated, gain_by_slot
+    )
+    policy_gain_by_estimator = float(gamma) * jnp.einsum(
+        "...ay,...eay->...ea", response_marginal, gain_conditional
+    )
+    policy_mediated_gain = jnp.min(policy_gain_by_estimator, axis=-2)
+    next_policy_tv_by_response = 0.5 * jnp.sum(
+        jnp.abs(delta_policy), axis=-1
+    )
+    expected_next_policy_tv = jnp.sum(
+        response_marginal * next_policy_tv_by_response, axis=-1
+    )
+
     return ControlValues(
         j_use_by_estimator=j_use_by_estimator,
         j_mask_by_estimator=j_mask_by_estimator,
         j_use=j_use,
         j_mask=j_mask,
         value_mask=value_mask,
-        per_action_response_value=response_value,
+        per_action_response_value=j_use - j_mask,
         information_net_value=j_use - value_mask[..., None],
         response_marginal=response_marginal,
         updated_belief=updated,
         physical_joint=physical_joint,
+        next_use_policy_probabilities=use_policy.probabilities,
+        next_mask_policy_probabilities=mask_policy.probabilities,
+        per_action_expected_next_policy_tv=expected_next_policy_tv,
+        policy_gain_by_estimator=policy_gain_by_estimator,
+        per_action_policy_mediated_gain=policy_mediated_gain,
     )
 
 
@@ -221,66 +416,10 @@ def generic_response_information(
     return jnp.maximum(mixture_entropy - expected_slot_entropy, 0.0)
 
 
-def _temperature_axes(temperature: Any, action_values: Any) -> tuple[Any, Any]:
-    import jax.numpy as jnp
-
-    score = jnp.asarray(action_values)
-    alpha = jnp.asarray(temperature, dtype=score.dtype)
-    if alpha.ndim == score.ndim:
-        if alpha.shape[-1] != 1:
-            raise ValueError("Action-axis temperature must end in one element.")
-        return alpha, alpha[..., 0]
-    if alpha.ndim == score.ndim - 1:
-        return alpha[..., None], alpha
-    if alpha.ndim == 0:
-        return alpha, alpha
-    raise ValueError("Temperature cannot broadcast to action values.")
-
-
-def regularized_policy(
-    reference_logits: Any, score: Any, temperature: Any
-) -> PolicyValues:
-    import jax
-    import jax.numpy as jnp
-
-    reference_raw = jnp.asarray(reference_logits)
-    score_values = jnp.asarray(score, dtype=reference_raw.dtype)
-    if reference_raw.shape != score_values.shape:
-        raise ValueError("Reference logits and policy scores must share shape.")
-    reference = jax.nn.log_softmax(reference_raw, axis=-1)
-    alpha, unused_scalar = _temperature_axes(temperature, score_values)
-    del unused_scalar
-    logits = reference_raw + score_values / alpha
-    log_probabilities = jax.nn.log_softmax(logits, axis=-1)
-    probabilities = jnp.exp(log_probabilities)
-    kl = jnp.sum(probabilities * (log_probabilities - reference), axis=-1)
-    return PolicyValues(
-        logits=logits,
-        probabilities=probabilities,
-        kl_divergence=jnp.maximum(kl, 0.0),
-    )
-
-
-def regularized_objective_value(
-    reference_logits: Any, score: Any, temperature: Any
-) -> Any:
-    """Return E[score] - alpha KL under the optimal regularized policy."""
-
-    import jax
-    import jax.numpy as jnp
-
-    reference = jax.nn.log_softmax(jnp.asarray(reference_logits), axis=-1)
-    score_values = jnp.asarray(score, dtype=reference.dtype)
-    alpha, scalar_alpha = _temperature_axes(temperature, score_values)
-    return scalar_alpha * jax.scipy.special.logsumexp(
-        reference + score_values / alpha, axis=-1
-    )
-
-
 def policy_effect_decomposition(
     *, reference_logits: Any, j_use: Any, j_mask: Any, temperature: Any
 ) -> PolicyEffectValues:
-    """Predict raw-return effects for the exact stochastic runtime policies."""
+    """Predict raw-return effects for the exact current-step policies."""
 
     import jax.numpy as jnp
 
@@ -330,7 +469,7 @@ def deployment_policy(
     if mode == "reference_only":
         reference = jax.numpy.asarray(reference_logits)
         return PolicyValues(
-            logits=reference,
+            logits=jax.nn.log_softmax(reference, axis=-1),
             probabilities=jax.nn.softmax(reference, axis=-1),
             kl_divergence=jax.numpy.zeros(reference.shape[:-1]),
         )
@@ -343,29 +482,8 @@ def deployment_policy(
     return regularized_policy(reference_logits, control_values.j_use, temperature)
 
 
-def update_log_temperature(
-    *,
-    log_temperature: Any,
-    mean_kl: Any,
-    target_kl: float,
-    learning_rate: float,
-    minimum_temperature: float,
-    maximum_temperature: float,
-) -> Any:
-    import jax.numpy as jnp
-
-    lower = jnp.log(jnp.asarray(minimum_temperature, dtype=jnp.float32))
-    upper = jnp.log(jnp.asarray(maximum_temperature, dtype=jnp.float32))
-    return jnp.clip(
-        jnp.asarray(log_temperature)
-        + float(learning_rate) * (jnp.asarray(mean_kl) - float(target_kl)),
-        lower,
-        upper,
-    )
-
-
 def policy_effect_trigger_tolerance(j_use: Any, j_mask: Any) -> Any:
-    """Numerical floor used to identify a positive raw policy effect."""
+    """Float32 numerical floor for a predicted raw-return effect."""
 
     import jax.numpy as jnp
 
@@ -383,7 +501,6 @@ def policy_effect_trigger_tolerance(j_use: Any, j_mask: Any) -> Any:
         * jnp.finfo(jnp.float32).eps
         * scale
     )
-
 
 VALUE_EQUIVALENCE_TOLERANCE = 1.0e-3
 POSTERIOR_SUPPORT_FLOOR = 1.0e-3
@@ -738,25 +855,32 @@ def update_codebook(
     )
 
 
-def target_response_signatures(*, target_centered_advantages: Any) -> Any:
-    """Return an assignment-independent next-control response signature.
+def target_response_signatures(
+    *,
+    current_centered_advantages: Any,
+    next_centered_advantages: Any,
+) -> Any:
+    """Encode the value-relevant change induced by one physical transition.
 
-    The response alphabet must not depend on the latent E-step that it later
-    helps evaluate. We therefore average the two target estimators and then
-    average over the permutation-symmetric slot bank. Partner-dependent public
-    transitions can still change this value signature through the next history,
-    but no current responsibility or identity label enters the code target.
+    Both tensors have tail axes ``[estimator, slot, action]`` and are evaluated
+    at the same canonical uniform belief.  The response signature concatenates
+    the mean and standard deviation of the centered-advantage delta across the
+    permutation-symmetric estimator/slot bank.  No responsibility or identity
+    label enters the response alphabet.
     """
 
     import jax.numpy as jnp
 
-    advantages = jnp.asarray(target_centered_advantages)
-    if advantages.shape[-3] != 2:
-        raise ValueError("Target response signatures require two Q estimators.")
-    mean_advantage = 0.5 * (
-        advantages[..., 0, :, :] + advantages[..., 1, :, :]
-    )
-    return jnp.mean(mean_advantage, axis=-2)
+    current = jnp.asarray(current_centered_advantages)
+    following = jnp.asarray(next_centered_advantages)
+    if current.shape != following.shape or current.shape[-3] != 2:
+        raise ValueError(
+            "Response targets require matching [..,2,slot,action] tensors."
+        )
+    delta = following - current
+    mean = jnp.mean(delta, axis=(-3, -2))
+    standard_deviation = jnp.std(delta, axis=(-3, -2))
+    return jnp.concatenate((mean, standard_deviation), axis=-1)
 
 
 __all__ = [
@@ -764,6 +888,7 @@ __all__ = [
     "CodebookUpdate",
     "ControlValues",
     "DEPLOYMENT_MODES",
+    "INFORMATION_TRIGGER_FLOAT32_ULPS",
     "PolicyEffectValues",
     "PolicyState",
     "PolicyValues",
@@ -778,6 +903,7 @@ __all__ = [
     "empty_codebook",
     "farthest_point_initialization",
     "generic_response_information",
+    "mean_regularized_policy_kl",
     "nearest_codes",
     "normalized_advantages",
     "normalized_log_belief",
@@ -788,9 +914,9 @@ __all__ = [
     "regularized_objective_value",
     "regularized_policy",
     "slot_bayes_update",
+    "solve_temperature_for_target_kl",
     "target_response_signatures",
     "uniform_slot_log_belief",
     "update_codebook",
-    "update_log_temperature",
     "value_signatures",
 ]

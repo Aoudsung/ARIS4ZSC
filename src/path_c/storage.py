@@ -173,6 +173,7 @@ def write_run_metadata(
         "effective_environment_steps": int(effective_environment_steps),
         "update_count": int(update_count),
         "completed_episodes": int(completed_episodes),
+        "scientific_readout_allowed": False,
     }
     target.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",

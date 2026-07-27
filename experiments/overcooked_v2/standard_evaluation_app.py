@@ -18,9 +18,7 @@ from src.path_c.evaluation import (
     Pairing,
     standard_episode_seed,
     standard_pairings,
-    summarize_development_rows,
     summarize_standard_rows,
-    validate_development_rows,
     validate_standard_rows,
 )
 from src.path_c.method import policy_effect_trigger_tolerance
@@ -196,11 +194,19 @@ def pairing_batch(
         left_codes,
         right_codes,
     ) = recorded
-    trigger_left = left_records.predicted_net_effect > policy_effect_trigger_tolerance(
-        left_records.j_use, left_records.j_mask
+    trigger_left = (
+        left_records.executed_action_policy_mediated_gain
+        > policy_effect_trigger_tolerance(left_records.j_use, left_records.j_mask)
+    ) & (
+        left_records.executed_action_expected_next_policy_tv
+        >= config.evaluation.response_policy_tv_minimum
     )
-    trigger_right = right_records.predicted_net_effect > policy_effect_trigger_tolerance(
-        right_records.j_use, right_records.j_mask
+    trigger_right = (
+        right_records.executed_action_policy_mediated_gain
+        > policy_effect_trigger_tolerance(right_records.j_use, right_records.j_mask)
+    ) & (
+        right_records.executed_action_expected_next_policy_tv
+        >= config.evaluation.response_policy_tv_minimum
     )
     response_count = config.model.response_count
 
@@ -248,6 +254,16 @@ def pairing_batch(
             axis=0,
         )
     )
+    next_policy_tv_means = np.asarray(
+        jnp.mean(
+            0.5
+            * (
+                left_records.predicted_next_policy_total_variation
+                + right_records.predicted_next_policy_total_variation
+            ),
+            axis=0,
+        )
+    )
     trigger_counts = np.asarray(
         jnp.sum(
             trigger_left.astype(jnp.int32) + trigger_right.astype(jnp.int32),
@@ -271,13 +287,16 @@ def pairing_batch(
             correct_delivery_count=int(correct_totals[index]),
             wrong_delivery_count=int(wrong_totals[index]),
             indicator_activation_count=int(indicator_totals[index]),
-            positive_predicted_response_effect_count=int(
+            positive_policy_mediated_effect_count=int(
                 trigger_counts[index]
             ),
             cumulative_kl=float(cumulative_kl[index]),
             reference_action_deviation_count=int(deviations[index]),
             mean_value_class_count=float(class_means[index]),
             mean_belief_entropy=float(entropy_means[index]),
+            mean_predicted_next_policy_tv=float(
+                next_policy_tv_means[index]
+            ),
             response_code_counts=tuple(
                 int(value) for value in counts_host[index]
             ),
@@ -313,6 +332,9 @@ def pairing_batch(
                         "execution_logits": record.execution_logits[
                             step, episode_index
                         ].tolist(),
+                        "behavior_logits": record.behavior_logits[
+                            step, episode_index
+                        ].tolist(),
                         "mask_execution_logits": record.mask_execution_logits[
                             step, episode_index
                         ].tolist(),
@@ -324,6 +346,19 @@ def pairing_batch(
                             ].tolist()
                         ),
                         "per_action_net_value": record.per_action_net_value[
+                            step, episode_index
+                        ].tolist(),
+                        "per_action_policy_mediated_gain": (
+                            record.per_action_policy_mediated_gain[
+                                step, episode_index
+                            ].tolist()
+                        ),
+                        "per_action_expected_next_policy_tv": (
+                            record.per_action_expected_next_policy_tv[
+                                step, episode_index
+                            ].tolist()
+                        ),
+                        "information_gain": record.information_gain[
                             step, episode_index
                         ].tolist(),
                         "response_code": int(
@@ -368,6 +403,16 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
+                        "predicted_policy_mediated_effect": float(
+                            record.predicted_policy_mediated_effect[
+                                step, episode_index
+                            ]
+                        ),
+                        "predicted_next_policy_total_variation": float(
+                            record.predicted_next_policy_total_variation[
+                                step, episode_index
+                            ]
+                        ),
                         "executed_action_response_value": float(
                             record.executed_action_response_value[
                                 step, episode_index
@@ -378,8 +423,23 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
+                        "executed_action_policy_mediated_gain": float(
+                            record.executed_action_policy_mediated_gain[
+                                step, episode_index
+                            ]
+                        ),
+                        "executed_action_expected_next_policy_tv": float(
+                            record.executed_action_expected_next_policy_tv[
+                                step, episode_index
+                            ]
+                        ),
                         "maximum_action_net_value": float(
                             record.maximum_action_net_value[
+                                step, episode_index
+                            ]
+                        ),
+                        "maximum_action_policy_mediated_gain": float(
+                            record.maximum_action_policy_mediated_gain[
                                 step, episode_index
                             ]
                         ),
@@ -463,74 +523,5 @@ def evaluate_standard(
     return len(all_rows), sum(row.environment_steps for row in all_rows)
 
 
-def evaluate_development_self_pairing(
-    *,
-    config: Any,
-    population: Any,
-    output: Path,
-    evaluation_seed: int,
-    resume: bool,
-) -> tuple[int, int]:
-    """Run four matched modes for one policy without claiming standard ZSC."""
 
-    entry = population.entries[0]
-    deployment = load_deployment(entry, config)
-    row_paths = []
-    for mode in config.evaluation.deployment_modes:
-        root = output / mode
-        row_path = root / "episodes.parquet"
-        decision_path = root / "decisions.jsonl"
-        if resume and row_path.is_file() and decision_path.is_file():
-            if (
-                len(read_parquet(row_path))
-                != config.evaluation.episodes_per_pairing
-                or _jsonl_row_count(decision_path)
-                != 2
-                * config.environment.episode_steps
-                * config.evaluation.episodes_per_pairing
-            ):
-                raise RuntimeError(
-                    f"Incomplete development output exists in {root}."
-                )
-            row_paths.append(row_path)
-            continue
-        if row_path.exists() or decision_path.exists():
-            raise RuntimeError(
-                f"Development output already exists in {root}."
-            )
-        rows, decisions = pairing_batch(
-            config=config,
-            left=deployment,
-            right=deployment,
-            pairing=Pairing(mode, "sp", 0, 0),
-            population_name=population.name,
-            evaluation_seed=evaluation_seed,
-        )
-        write_parquet(row_path, [row.to_mapping() for row in rows])
-        write_jsonl(decision_path, decisions)
-        row_paths.append(row_path)
-    all_rows = [
-        EpisodeRow(
-            **{
-                **row,
-                "response_code_counts": tuple(row["response_code_counts"]),
-            }
-        )
-        for path in row_paths
-        for row in read_parquet(path)
-    ]
-    validate_development_rows(
-        all_rows,
-        deployment_modes=config.evaluation.deployment_modes,
-        episodes_per_mode=config.evaluation.episodes_per_pairing,
-    )
-    write_json(output / "summary.json", summarize_development_rows(all_rows))
-    return len(all_rows), sum(row.environment_steps for row in all_rows)
-
-
-
-__all__ = [
-    "evaluate_development_self_pairing",
-    "evaluate_standard",
-    "pairing_batch",
-]
+__all__ = ["evaluate_standard", "pairing_batch"]

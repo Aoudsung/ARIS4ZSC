@@ -1,4 +1,4 @@
-"""Device-side environment loop for Path C V4.2."""
+"""Device-side environment loop for Path C V4.3."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .training import TransitionBatch
 class RunnerFunctions(NamedTuple):
     online_step: Callable[..., tuple[Any, Any, Any, Any]]
     reference_step: Callable[..., tuple[Any, Any, Any]]
-    heads_apply: Callable[..., Mapping[str, Any]]
+    heads_apply: Callable[..., tuple[Any, Mapping[str, Any]]]
     encode_response: Callable[..., tuple[Any, Any, Any]]
     partner_step: Callable[..., Any]
     partner_observe: Callable[..., Any]
@@ -28,11 +28,16 @@ class RunnerFunctions(NamedTuple):
 class DecisionRecord(NamedTuple):
     reference_logits: Any
     execution_logits: Any
+    behavior_logits: Any
+    behavior_action_probability: Any
     mask_execution_logits: Any
     j_use: Any
     j_mask: Any
     per_action_response_value: Any
     per_action_net_value: Any
+    per_action_policy_mediated_gain: Any
+    per_action_expected_next_policy_tv: Any
+    information_gain: Any
     kl_divergence: Any
     action: Any
     reference_greedy_action: Any
@@ -44,9 +49,14 @@ class DecisionRecord(NamedTuple):
     predicted_net_effect: Any
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
+    predicted_policy_mediated_effect: Any
+    predicted_next_policy_total_variation: Any
     executed_action_response_value: Any
     executed_action_net_value: Any
+    executed_action_policy_mediated_gain: Any
+    executed_action_expected_next_policy_tv: Any
     maximum_action_net_value: Any
+    maximum_action_policy_mediated_gain: Any
 
 
 class RunnerState(NamedTuple):
@@ -195,6 +205,7 @@ def policy_action(
     key: Any,
     deployment_mode: str,
     gamma: float,
+    behavior_support: float = 0.0,
 ) -> tuple[PolicyState, Any, Any, DecisionRecord, Any]:
     import jax
     import jax.numpy as jnp
@@ -248,19 +259,27 @@ def policy_action(
         output.information_gain,
         jnp.exp(policy_state.generic_log_temperature),
     )
+    support = float(behavior_support)
+    if not 0.0 <= support < 1.0:
+        raise ValueError("Behavior support must lie in [0, 1).")
+    execution_log = jax.nn.log_softmax(output.execution_logits, axis=-1)
+    execution_probability = jnp.exp(execution_log)
+    action_count = int(output.execution_logits.shape[-1])
+    behavior_probability = (
+        (1.0 - support) * execution_probability + support / action_count
+    )
+    behavior_logits = jnp.log(jnp.maximum(behavior_probability, 1.0e-12))
     keys = jnp.asarray(key)
     if keys.ndim == 2:
         action = jax.vmap(
             lambda lane_key, lane_logits: jax.random.categorical(
                 lane_key, lane_logits
             )
-        )(keys, output.execution_logits)
+        )(keys, behavior_logits)
     else:
-        action = jax.random.categorical(keys, output.execution_logits)
+        action = jax.random.categorical(keys, behavior_logits)
 
-    execution_log = jax.nn.log_softmax(output.execution_logits, axis=-1)
     reference_log = jax.nn.log_softmax(reference_logits, axis=-1)
-    execution_probability = jnp.exp(execution_log)
     kl = jnp.sum(
         execution_probability * (execution_log - reference_log), axis=-1
     )
@@ -272,6 +291,19 @@ def policy_action(
     executed_net = jnp.take_along_axis(
         output.per_action_net_value, action[..., None], axis=-1
     )[..., 0]
+    selected_behavior_probability = jnp.take_along_axis(
+        behavior_probability, action[..., None], axis=-1
+    )[..., 0]
+    executed_policy_gain = jnp.take_along_axis(
+        output.per_action_policy_mediated_gain,
+        action[..., None],
+        axis=-1,
+    )[..., 0]
+    executed_next_policy_tv = jnp.take_along_axis(
+        output.per_action_expected_next_policy_tv,
+        action[..., None],
+        axis=-1,
+    )[..., 0]
     next_state = policy_state._replace(
         reference_carry=next_reference_carry,
         trainable_carry=next_trainable_carry,
@@ -281,11 +313,20 @@ def policy_action(
     record = DecisionRecord(
         reference_logits=reference_logits,
         execution_logits=output.execution_logits,
+        behavior_logits=behavior_logits,
+        behavior_action_probability=selected_behavior_probability,
         mask_execution_logits=output.mask_execution_logits,
         j_use=output.j_use,
         j_mask=output.j_mask,
         per_action_response_value=output.per_action_response_value,
         per_action_net_value=output.per_action_net_value,
+        per_action_policy_mediated_gain=(
+            output.per_action_policy_mediated_gain
+        ),
+        per_action_expected_next_policy_tv=(
+            output.per_action_expected_next_policy_tv
+        ),
+        information_gain=output.information_gain,
         kl_divergence=kl,
         action=action,
         reference_greedy_action=jnp.argmax(reference_logits, axis=-1),
@@ -301,9 +342,20 @@ def policy_action(
         predicted_policy_total_variation=(
             output.predicted_policy_total_variation
         ),
+        predicted_policy_mediated_effect=(
+            output.predicted_policy_mediated_effect
+        ),
+        predicted_next_policy_total_variation=(
+            output.predicted_next_policy_total_variation
+        ),
         executed_action_response_value=executed_response,
         executed_action_net_value=executed_net,
+        executed_action_policy_mediated_gain=executed_policy_gain,
+        executed_action_expected_next_policy_tv=executed_next_policy_tv,
         maximum_action_net_value=jnp.max(output.per_action_net_value, axis=-1),
+        maximum_action_policy_mediated_gain=jnp.max(
+            output.per_action_policy_mediated_gain, axis=-1
+        ),
     )
     return next_state, action, output, record, generic.logits
 
@@ -320,6 +372,7 @@ def collect_rollout(
     deployment_mode: str,
     gamma: float,
     terminal_response: int,
+    behavior_support: float = 0.0,
 ) -> tuple[RunnerState, TransitionBatch, Mapping[str, Any]]:
     import jax
     import jax.numpy as jnp
@@ -355,6 +408,7 @@ def collect_rollout(
                 key=action_keys,
                 deployment_mode=deployment_mode,
                 gamma=gamma,
+                behavior_support=behavior_support,
             )
         )
         partner_action, tentative_partner_state, partner_context = (
@@ -507,6 +561,10 @@ def collect_rollout(
             "previous_team_rewards": current.ego_policy.previous_team_reward,
             "reference_logits": decision.reference_logits,
             "execution_logits": decision.execution_logits,
+            "behavior_logits": decision.behavior_logits,
+            "behavior_action_probabilities": (
+                decision.behavior_action_probability
+            ),
             "mask_execution_logits": decision.mask_execution_logits,
             "generic_execution_logits": generic_logits,
             "slot_log_beliefs": stepped_policy.slot_log_belief,
@@ -536,6 +594,13 @@ def collect_rollout(
             "j_mask": decision.j_mask,
             "per_action_response_values": decision.per_action_response_value,
             "per_action_net_values": decision.per_action_net_value,
+            "per_action_policy_mediated_gains": (
+                decision.per_action_policy_mediated_gain
+            ),
+            "per_action_expected_next_policy_tvs": (
+                decision.per_action_expected_next_policy_tv
+            ),
+            "information_gains": decision.information_gain,
             "predicted_response_effects": decision.predicted_response_effect,
             "predicted_policy_costs": decision.predicted_policy_cost,
             "predicted_net_effects": decision.predicted_net_effect,
@@ -545,6 +610,12 @@ def collect_rollout(
             "predicted_policy_total_variations": (
                 decision.predicted_policy_total_variation
             ),
+            "predicted_policy_mediated_effects": (
+                decision.predicted_policy_mediated_effect
+            ),
+            "predicted_next_policy_total_variations": (
+                decision.predicted_next_policy_total_variation
+            ),
             "kl_divergences": decision.kl_divergence,
             "reference_greedy_actions": decision.reference_greedy_action,
             "belief_entropies": decision.belief_entropy,
@@ -552,7 +623,16 @@ def collect_rollout(
                 decision.executed_action_response_value
             ),
             "executed_action_net_values": decision.executed_action_net_value,
+            "executed_action_policy_mediated_gains": (
+                decision.executed_action_policy_mediated_gain
+            ),
+            "executed_action_expected_next_policy_tvs": (
+                decision.executed_action_expected_next_policy_tv
+            ),
             "maximum_action_net_values": decision.maximum_action_net_value,
+            "maximum_action_policy_mediated_gains": (
+                decision.maximum_action_policy_mediated_gain
+            ),
         }
 
     final_state, recorded = jax.lax.scan(
@@ -602,6 +682,9 @@ def collect_rollout(
         ),
         execution_logits=recorded["execution_logits"],
         generic_execution_logits=recorded["generic_execution_logits"],
+        behavior_logits=recorded["behavior_logits"],
+        posterior_scores=recorded["j_use"],
+        generic_scores=recorded["information_gains"],
         slot_log_beliefs=jnp.concatenate(
             (
                 recorded["slot_log_beliefs"],
@@ -632,17 +715,26 @@ def collect_rollout(
             "j_mask",
             "per_action_response_values",
             "per_action_net_values",
+            "per_action_policy_mediated_gains",
+            "per_action_expected_next_policy_tvs",
+            "information_gains",
+            "behavior_action_probabilities",
             "predicted_response_effects",
             "predicted_policy_costs",
             "predicted_net_effects",
             "predicted_regularized_net_effects",
             "predicted_policy_total_variations",
+            "predicted_policy_mediated_effects",
+            "predicted_next_policy_total_variations",
             "kl_divergences",
             "reference_greedy_actions",
             "belief_entropies",
             "executed_action_response_values",
             "executed_action_net_values",
+            "executed_action_policy_mediated_gains",
+            "executed_action_expected_next_policy_tvs",
             "maximum_action_net_values",
+            "maximum_action_policy_mediated_gains",
         )
     }
     return final_state, batch, records
@@ -724,6 +816,7 @@ def partner_callbacks(
             key=jax.random.split(dynamic_key, observations.shape[0]),
             deployment_mode="posterior_use",
             gamma=gamma,
+            behavior_support=0.0,
         )
         del unused_record, unused_generic
         return (

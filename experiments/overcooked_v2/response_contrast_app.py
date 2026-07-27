@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, NamedTuple
 
 from experiments.overcooked_v2.deployment import (
@@ -16,12 +17,12 @@ from src.path_c.evaluation import (
     ResponseContrastRow,
     standard_episode_seed,
     summarize_response_contrast,
-    validate_development_response_contrast_rows,
     validate_response_contrast_rows,
 )
 from src.path_c.method import policy_effect_trigger_tolerance
 from src.path_c.runner import policy_action
 from src.path_c.storage import read_parquet, write_json, write_parquet
+
 
 class DeploymentStep(NamedTuple):
     state: Any
@@ -56,9 +57,14 @@ class _ContrastState(NamedTuple):
     predicted_net_effect: Any
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
+    predicted_policy_mediated_effect: Any
+    predicted_next_policy_total_variation: Any
     maximum_action_net_value: Any
+    maximum_action_policy_mediated_gain: Any
     executed_action_net_value: Any
     executed_action_response_value: Any
+    executed_action_policy_mediated_gain: Any
+    executed_action_expected_next_policy_tv: Any
     executed_action: Any
     maximum_net_action: Any
     post_response_belief_l1: Any
@@ -91,6 +97,7 @@ def _deployment_step(
         key=keys,
         deployment_mode="posterior_use",
         gamma=config.training.gamma,
+        behavior_support=0.0,
     )
     del unused_generic
     return DeploymentStep(next_state, action, output, record)
@@ -184,7 +191,7 @@ def _advance_contrast_branch(
     )
 
 
-def _contrast_pairing_batch(
+def contrast_pairing_batch(
     *,
     config: Any,
     left: Deployment,
@@ -251,9 +258,14 @@ def _contrast_pairing_batch(
         predicted_net_effect=zeros_float,
         predicted_regularized_net_effect=zeros_float,
         predicted_policy_total_variation=zeros_float,
+        predicted_policy_mediated_effect=zeros_float,
+        predicted_next_policy_total_variation=zeros_float,
         maximum_action_net_value=zeros_float,
+        maximum_action_policy_mediated_gain=zeros_float,
         executed_action_net_value=zeros_float,
         executed_action_response_value=zeros_float,
+        executed_action_policy_mediated_gain=zeros_float,
+        executed_action_expected_next_policy_tv=zeros_float,
         executed_action=minus_one,
         maximum_net_action=minus_one,
         post_response_belief_l1=zeros_float,
@@ -320,12 +332,18 @@ def _contrast_pairing_batch(
             keys=right_keys,
             config=config,
         )
+
         tolerance = policy_effect_trigger_tolerance(
             use_left.output.j_use, use_left.output.j_mask
         )
-        newly_triggered = (~current.triggered) & (
-            use_left.output.predicted_net_effect > tolerance
+        actionable = (
+            use_left.record.executed_action_policy_mediated_gain > tolerance
+        ) & (
+            use_left.record.executed_action_expected_next_policy_tv
+            >= config.evaluation.response_policy_tv_minimum
         )
+        newly_triggered = (~current.triggered) & actionable
+
         masked_reference = _masked_action_step(use_left, left_keys)
         a1_left = a1_left._replace(
             action=jnp.where(
@@ -372,6 +390,7 @@ def _contrast_pairing_batch(
             config=config,
             mask_left_response=False,
         )
+
         active = current.triggered | newly_triggered
         action_difference = active & (
             next_mask.last_left_action != next_use.last_left_action
@@ -428,9 +447,21 @@ def _contrast_pairing_batch(
                 current.predicted_policy_total_variation,
                 use_left.output.predicted_policy_total_variation,
             ),
+            predicted_policy_mediated_effect=capture(
+                current.predicted_policy_mediated_effect,
+                use_left.output.predicted_policy_mediated_effect,
+            ),
+            predicted_next_policy_total_variation=capture(
+                current.predicted_next_policy_total_variation,
+                use_left.output.predicted_next_policy_total_variation,
+            ),
             maximum_action_net_value=capture(
                 current.maximum_action_net_value,
                 use_left.record.maximum_action_net_value,
+            ),
+            maximum_action_policy_mediated_gain=capture(
+                current.maximum_action_policy_mediated_gain,
+                use_left.record.maximum_action_policy_mediated_gain,
             ),
             executed_action_net_value=capture(
                 current.executed_action_net_value,
@@ -440,14 +471,20 @@ def _contrast_pairing_batch(
                 current.executed_action_response_value,
                 use_left.record.executed_action_response_value,
             ),
+            executed_action_policy_mediated_gain=capture(
+                current.executed_action_policy_mediated_gain,
+                use_left.record.executed_action_policy_mediated_gain,
+            ),
+            executed_action_expected_next_policy_tv=capture(
+                current.executed_action_expected_next_policy_tv,
+                use_left.record.executed_action_expected_next_policy_tv,
+            ),
             executed_action=capture(
                 current.executed_action, use_left.action
             ),
             maximum_net_action=capture(
                 current.maximum_net_action,
-                jnp.argmax(
-                    use_left.output.per_action_net_value, axis=-1
-                ),
+                jnp.argmax(use_left.output.per_action_net_value, axis=-1),
             ),
             post_response_belief_l1=capture(
                 current.post_response_belief_l1,
@@ -535,14 +572,29 @@ def _contrast_pairing_batch(
                 predicted_policy_total_variation=optional_float(
                     final.predicted_policy_total_variation
                 ),
+                predicted_policy_mediated_effect=optional_float(
+                    final.predicted_policy_mediated_effect
+                ),
+                predicted_next_policy_total_variation=optional_float(
+                    final.predicted_next_policy_total_variation
+                ),
                 maximum_action_net_value=optional_float(
                     final.maximum_action_net_value
+                ),
+                maximum_action_policy_mediated_gain=optional_float(
+                    final.maximum_action_policy_mediated_gain
                 ),
                 executed_action_net_value=optional_float(
                     final.executed_action_net_value
                 ),
                 executed_action_response_value=optional_float(
                     final.executed_action_response_value
+                ),
+                executed_action_policy_mediated_gain=optional_float(
+                    final.executed_action_policy_mediated_gain
+                ),
+                executed_action_expected_next_policy_tv=optional_float(
+                    final.executed_action_expected_next_policy_tv
                 ),
                 executed_action=optional_int(final.executed_action),
                 maximum_net_action=optional_int(final.maximum_net_action),
@@ -662,7 +714,7 @@ def evaluate_response_contrast(
                 raise RuntimeError(
                     f"Response contrast output already exists: {path}"
                 )
-            rows = _contrast_pairing_batch(
+            rows = contrast_pairing_batch(
                 config=config,
                 left=deployments[left_id],
                 right=deployments[right_id],
@@ -688,58 +740,4 @@ def evaluate_response_contrast(
     return len(rows), sum(row.environment_steps for row in rows)
 
 
-def evaluate_development_response_contrast(
-    *,
-    config: Any,
-    population: Any,
-    output: Path,
-    evaluation_seed: int,
-    resume: bool,
-) -> tuple[int, int]:
-    """Run the three response branches on one self-paired development policy."""
-
-    path = output / "branches.parquet"
-    if resume and path.is_file():
-        if len(read_parquet(path)) != config.evaluation.episodes_per_pairing:
-            raise RuntimeError(
-                f"Incomplete development response contrast exists: {path}"
-            )
-    else:
-        if path.exists():
-            raise RuntimeError(
-                f"Development response contrast already exists: {path}"
-            )
-        entry = population.entries[0]
-        deployment = load_deployment(entry, config)
-        rows = _contrast_pairing_batch(
-            config=config,
-            left=deployment,
-            right=deployment,
-            pairing=Pairing("posterior_use", "sp", 0, 0),
-            evaluation_seed=evaluation_seed,
-        )
-        write_parquet(path, [row.to_mapping() for row in rows])
-    rows = [ResponseContrastRow(**row) for row in read_parquet(path)]
-    validate_development_response_contrast_rows(
-        rows,
-        evaluation_seed=evaluation_seed,
-        layout=config.environment.layout,
-        episodes_per_pairing=config.evaluation.episodes_per_pairing,
-    )
-    write_json(
-        output / "summary.json",
-        {
-            "run_kind": "development",
-            "scientific_readout_allowed": False,
-            "evaluation_protocol": "single_policy_self_pair_response_contrast",
-            **summarize_response_contrast(rows),
-        },
-    )
-    return len(rows), sum(row.environment_steps for row in rows)
-
-
-
-__all__ = [
-    "evaluate_development_response_contrast",
-    "evaluate_response_contrast",
-]
+__all__ = ["contrast_pairing_batch", "evaluate_response_contrast"]

@@ -39,10 +39,11 @@ from src.path_c.training import (
     environment_minibatch_schedule,
     make_optimizers,
     prepare_frozen_assignments,
+    recompute_policy_scores,
     rollout_kl_means,
     sample_bootstrap_mask,
+    solve_policy_temperatures,
     update_codebook_from_assignments,
-    update_policy_temperatures,
 )
 
 def _host(value: Any) -> Any:
@@ -114,6 +115,14 @@ def _decision_rows(
                 "execution_logits": arrays["execution_logits"][
                     time_index, environment_index
                 ].tolist(),
+                "behavior_logits": arrays["behavior_logits"][
+                    time_index, environment_index
+                ].tolist(),
+                "behavior_action_probability": float(
+                    arrays["behavior_action_probabilities"][
+                        time_index, environment_index
+                    ]
+                ),
                 "mask_execution_logits": arrays["mask_execution_logits"][
                     time_index, environment_index
                 ].tolist(),
@@ -140,6 +149,15 @@ def _decision_rows(
                 "per_action_net_value": arrays["per_action_net_values"][
                     time_index, environment_index
                 ].tolist(),
+                "per_action_policy_mediated_gain": arrays[
+                    "per_action_policy_mediated_gains"
+                ][time_index, environment_index].tolist(),
+                "per_action_expected_next_policy_tv": arrays[
+                    "per_action_expected_next_policy_tvs"
+                ][time_index, environment_index].tolist(),
+                "information_gain": arrays["information_gains"][
+                    time_index, environment_index
+                ].tolist(),
                 "predicted_response_effect": float(
                     arrays["predicted_response_effects"][
                         time_index, environment_index
@@ -162,6 +180,16 @@ def _decision_rows(
                 ),
                 "predicted_policy_total_variation": float(
                     arrays["predicted_policy_total_variations"][
+                        time_index, environment_index
+                    ]
+                ),
+                "predicted_policy_mediated_effect": float(
+                    arrays["predicted_policy_mediated_effects"][
+                        time_index, environment_index
+                    ]
+                ),
+                "predicted_next_policy_total_variation": float(
+                    arrays["predicted_next_policy_total_variations"][
                         time_index, environment_index
                     ]
                 ),
@@ -190,8 +218,23 @@ def _decision_rows(
                         time_index, environment_index
                     ]
                 ),
+                "executed_action_policy_mediated_gain": float(
+                    arrays["executed_action_policy_mediated_gains"][
+                        time_index, environment_index
+                    ]
+                ),
+                "executed_action_expected_next_policy_tv": float(
+                    arrays["executed_action_expected_next_policy_tvs"][
+                        time_index, environment_index
+                    ]
+                ),
                 "maximum_action_net_value": float(
                     arrays["maximum_action_net_values"][
+                        time_index, environment_index
+                    ]
+                ),
+                "maximum_action_policy_mediated_gain": float(
+                    arrays["maximum_action_policy_mediated_gains"][
                         time_index, environment_index
                     ]
                 ),
@@ -243,6 +286,62 @@ def _episode_rows(
                 ]
             ),
         }
+
+
+def _responsibility_rows(
+    assignments: Any,
+    records: Mapping[str, Any],
+    *,
+    update_count: int,
+    epoch: int,
+) -> Iterable[Mapping[str, Any]]:
+    """Persist the complete E-step; audit labels never enter the losses."""
+
+    import numpy as np
+
+    responsibilities = np.asarray(assignments.responsibilities)
+    td = np.asarray(assignments.td_energies)
+    response = np.asarray(assignments.response_energies)
+    reward = np.asarray(assignments.reward_energies)
+    use = np.asarray(assignments.next_q_use_energies)
+    mask = np.asarray(assignments.next_q_mask_energies)
+    reference = np.asarray(assignments.next_reference_energy)
+    available = np.asarray(assignments.bootstrap_mask, dtype=np.bool_)
+    partner = np.asarray(records["partner_members"])[0]
+    episode = np.asarray(records["episode_ids"])[0]
+    environment_count, slot_count = responsibilities.shape
+    for environment_index in range(environment_count):
+        for slot in range(slot_count):
+            yield {
+                "update_count": int(update_count),
+                "epoch": int(epoch),
+                "environment_index": int(environment_index),
+                "episode_id": int(episode[environment_index]),
+                "audit_partner_member": int(partner[environment_index]),
+                "slot": int(slot),
+                "responsibility": float(
+                    responsibilities[environment_index, slot]
+                ),
+                "td_energy": float(td[environment_index, slot]),
+                "response_nll_energy": float(
+                    response[environment_index, slot]
+                ),
+                "reward_nll_energy": float(
+                    reward[environment_index, slot]
+                ),
+                "next_q_use_nll_energy": float(
+                    use[environment_index, slot]
+                ),
+                "next_q_mask_nll_energy": float(
+                    mask[environment_index, slot]
+                ),
+                "next_reference_mse_energy": float(
+                    reference[environment_index]
+                ),
+                "bootstrap_available": bool(
+                    available[environment_index, slot]
+                ),
+            }
 
 
 def _assert_finite(tree: Any, *, step: int) -> None:
@@ -358,6 +457,7 @@ def _training_functions(
         initial_temperature=config.kl.initial_temperature,
         gamma=config.training.gamma,
         terminal_response=config.model.response_count - 1,
+        behavior_support=config.training.behavior_support,
     )
     runner_functions = base._replace(
         partner_step=partner_step,
@@ -492,7 +592,7 @@ def run_training(args: argparse.Namespace) -> None:
         outcome_optimizer_state=optimizers.outcome_state,
         codebook=empty_codebook(
             code_count=config.model.response_count - 1,
-            signature_dim=config.model.action_count,
+            signature_dim=2 * config.model.action_count,
         ),
         runner_state=runner_state,
         random_key=state_key,
@@ -519,6 +619,7 @@ def run_training(args: argparse.Namespace) -> None:
         deployment_mode="posterior_use",
         gamma=config.training.gamma,
         terminal_response=config.model.response_count - 1,
+        behavior_support=config.training.behavior_support,
     )
 
     def assignment_step(
@@ -580,6 +681,7 @@ def run_training(args: argparse.Namespace) -> None:
     decisions_path = output / "records" / "decisions"
     episodes_path = output / "records" / "episodes"
     metrics_path = output / "records" / "metrics"
+    responsibilities_path = output / "records" / "responsibilities"
     write_json(output / "resolved_config.json", config.to_mapping())
 
     rollout_steps = (
@@ -666,6 +768,16 @@ def run_training(args: argparse.Namespace) -> None:
                 ),
                 bootstrap_mask,
             )
+            write_jsonl(
+                responsibilities_path
+                / f"update_{int(np.asarray(state.update_count)) + 1:08d}_epoch_{epoch:02d}.jsonl",
+                _responsibility_rows(
+                    assignments,
+                    rollout_records,
+                    update_count=int(np.asarray(state.update_count)) + 1,
+                    epoch=epoch,
+                ),
+            )
             update = compiled_updates(
                 online_params,
                 target_params,
@@ -681,14 +793,31 @@ def run_training(args: argparse.Namespace) -> None:
             bellman_state = update.bellman_optimizer_state
             outcome_state = update.outcome_optimizer_state
         posterior_kl, generic_kl = rollout_kl_means(batch)
-        policy_state = update_policy_temperatures(
+        updated_posterior_scores, updated_generic_scores = recompute_policy_scores(
+            functions=model_functions,
+            params=update.params,
+            batch=batch,
+            temperature=jnp.exp(
+                jnp.ravel(state.runner_state.ego_policy.log_temperature)[0]
+            ),
+            generic_temperature=jnp.exp(
+                jnp.ravel(
+                    state.runner_state.ego_policy.generic_log_temperature
+                )[0]
+            ),
+            gamma=config.training.gamma,
+        )
+        temperature_batch = batch._replace(
+            posterior_scores=updated_posterior_scores,
+            generic_scores=updated_generic_scores,
+        )
+        policy_state, solved_temperature_metrics = solve_policy_temperatures(
             runner_state.ego_policy,
-            posterior_mean_kl=posterior_kl,
-            generic_mean_kl=generic_kl,
+            batch=temperature_batch,
             target_kl=config.kl.target_per_step,
-            learning_rate=config.kl.dual_learning_rate,
             minimum_temperature=config.kl.minimum_temperature,
             maximum_temperature=config.kl.maximum_temperature,
+            iterations=config.kl.bisection_iterations,
         )
         runner_state = runner_state._replace(ego_policy=policy_state)
         state = TrainState(
@@ -730,8 +859,22 @@ def run_training(args: argparse.Namespace) -> None:
                         np.asarray(state.runner_state.completed_episodes)
                     ),
                     "update_count": int(np.asarray(state.update_count)),
-                    "posterior_mean_kl": float(np.asarray(posterior_kl)),
-                    "generic_mean_kl": float(np.asarray(generic_kl)),
+                    "rollout_posterior_mean_kl": float(
+                        np.asarray(posterior_kl)
+                    ),
+                    "rollout_generic_mean_kl": float(
+                        np.asarray(generic_kl)
+                    ),
+                    "solved_posterior_mean_kl": float(
+                        np.asarray(
+                            solved_temperature_metrics["posterior_solved_kl"]
+                        )
+                    ),
+                    "solved_generic_mean_kl": float(
+                        np.asarray(
+                            solved_temperature_metrics["generic_solved_kl"]
+                        )
+                    ),
                     "temperature": float(
                         np.exp(
                             np.asarray(
@@ -773,5 +916,6 @@ def run_training(args: argparse.Namespace) -> None:
     print(f"Complete decision records: {decisions_path}")
     print(f"Complete episode records: {episodes_path}")
     print(f"Complete metric records: {metrics_path}")
+    print(f"Complete responsibility records: {responsibilities_path}")
 
 __all__ = ["run_training"]
