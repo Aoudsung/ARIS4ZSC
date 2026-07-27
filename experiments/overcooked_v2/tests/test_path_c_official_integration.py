@@ -113,11 +113,12 @@ def test_vector_environment_preserves_terminal_observation_then_resets() -> None
     keys = jax.random.split(jax.random.PRNGKey(3), environment.num_envs)
     state, observations = environment.reset_with_keys(keys)
     actions = jnp.full((environment.num_envs, 2), 4, dtype=jnp.int32)
+    compiled_step = jax.jit(environment.step_with_keys)
     last_info = None
     last_done = None
     for step in range(config.environment.episode_steps):
         step_keys = jax.vmap(lambda key: jax.random.fold_in(key, step + 1))(keys)
-        state, observations, rewards, last_done, last_info = environment.step_with_keys(
+        state, observations, rewards, last_done, last_info = compiled_step(
             state, actions, step_keys
         )
         assert rewards.shape == (environment.num_envs,)

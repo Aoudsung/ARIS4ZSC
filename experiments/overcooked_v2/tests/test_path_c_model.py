@@ -6,7 +6,6 @@ import pytest
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 pytest.importorskip("flax")
-from flax.core import freeze, unfreeze
 
 from src.path_c.method import uniform_slot_log_belief
 from src.path_c.model import (
@@ -32,7 +31,7 @@ def _model() -> object:
 
 def _inputs(time: int = 3, batch: int = 2):
     features = jnp.ones((time, batch, 8), dtype=jnp.float32)
-    actions = jnp.full((time, batch), 6, dtype=jnp.int32)
+    actions = jnp.zeros((time, batch), dtype=jnp.int32).at[0].set(6)
     rewards = jnp.zeros((time, batch), dtype=jnp.float32)
     starts = jnp.zeros((time, batch), dtype=jnp.bool_).at[0].set(True)
     belief = uniform_slot_log_belief((time, batch), 3)
@@ -71,29 +70,6 @@ def test_all_heads_have_registered_shapes() -> None:
     assert output["continuation_mask_mean"].shape == (3, 2, 2, 3, 6, 5)
 
 
-def _set_projection_kernels_nonzero(tree: object) -> object:
-    mutable = unfreeze(tree)
-
-    def visit(node: object, path: tuple[str, ...] = ()) -> None:
-        if not isinstance(node, dict):
-            return
-        for key, value in node.items():
-            next_path = (*path, str(key))
-            if (
-                key == "kernel"
-                and any(
-                    name in "/".join(next_path)
-                    for name in ("PreviousActionProjection", "PreviousRewardProjection")
-                )
-            ):
-                node[key] = jnp.ones_like(value) * 0.1
-            else:
-                visit(value, next_path)
-
-    visit(mutable)
-    return freeze(mutable)
-
-
 def test_early_action_and_reward_enter_later_control_memory() -> None:
     model = _model()
     features, actions, rewards, starts, belief = _inputs(time=4, batch=1)
@@ -108,22 +84,62 @@ def test_early_action_and_reward_enter_later_control_memory() -> None:
         belief,
         method=model.sequence,
     )["params"]
-    params = _set_projection_kernels_nonzero(params)
-
     changed_actions = actions.at[1, 0].set(2)
     changed_rewards = rewards.at[1, 0].set(3.0)
+    feature_weights = jnp.arange(1, 9, dtype=jnp.float32)
+
+    def later_feature(candidate: object) -> jax.Array:
+        _, output = model.apply(
+            {"params": candidate},
+            carry,
+            features,
+            changed_actions,
+            changed_rewards,
+            starts,
+            belief,
+            method=model.sequence,
+        )
+        return jnp.sum(output["features"][2] * feature_weights)
+
+    gradient = jax.grad(later_feature)(params)
+    learned_params = jax.tree_util.tree_map(
+        lambda value, change: value + 0.05 * change,
+        params,
+        gradient,
+    )
     _, baseline = model.apply(
-        {"params": params}, carry, features, actions, rewards, starts, belief,
+        {"params": learned_params}, carry, features, actions, rewards, starts, belief,
         method=model.sequence,
     )
-    _, changed = model.apply(
-        {"params": params}, carry, features, changed_actions, changed_rewards, starts, belief,
+    _, action_changed = model.apply(
+        {"params": learned_params},
+        carry,
+        features,
+        changed_actions,
+        rewards,
+        starts,
+        belief,
         method=model.sequence,
     )
-    # The changed evidence is at t=1; its effect must remain in the recurrent state at t=2+.
+    _, reward_changed = model.apply(
+        {"params": learned_params},
+        carry,
+        features,
+        actions,
+        changed_rewards,
+        starts,
+        belief,
+        method=model.sequence,
+    )
+    # One public gradient step makes both history channels behaviorally observable.
+    # Evidence changed at t=1 must remain in the recurrent state at t=2+.
     assert not np.array_equal(
         np.asarray(baseline["features"][2:]),
-        np.asarray(changed["features"][2:]),
+        np.asarray(action_changed["features"][2:]),
+    )
+    assert not np.array_equal(
+        np.asarray(baseline["features"][2:]),
+        np.asarray(reward_changed["features"][2:]),
     )
 
 
