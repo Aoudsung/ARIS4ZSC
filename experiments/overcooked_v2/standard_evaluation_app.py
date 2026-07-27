@@ -18,7 +18,9 @@ from src.path_c.evaluation import (
     Pairing,
     standard_episode_seed,
     standard_pairings,
+    summarize_development_rows,
     summarize_standard_rows,
+    validate_development_rows,
     validate_standard_rows,
 )
 from src.path_c.runner import policy_action
@@ -460,5 +462,74 @@ def evaluate_standard(
     return len(all_rows), sum(row.environment_steps for row in all_rows)
 
 
+def evaluate_development_self_pairing(
+    *,
+    config: Any,
+    population: Any,
+    output: Path,
+    evaluation_seed: int,
+    resume: bool,
+) -> tuple[int, int]:
+    """Run four matched modes for one policy without claiming standard ZSC."""
 
-__all__ = ["evaluate_standard", "pairing_batch"]
+    entry = population.entries[0]
+    deployment = load_deployment(entry, config)
+    row_paths = []
+    for mode in config.evaluation.deployment_modes:
+        root = output / mode
+        row_path = root / "episodes.parquet"
+        decision_path = root / "decisions.jsonl"
+        if resume and row_path.is_file() and decision_path.is_file():
+            if (
+                len(read_parquet(row_path))
+                != config.evaluation.episodes_per_pairing
+                or _jsonl_row_count(decision_path)
+                != 2
+                * config.environment.episode_steps
+                * config.evaluation.episodes_per_pairing
+            ):
+                raise RuntimeError(
+                    f"Incomplete development output exists in {root}."
+                )
+            row_paths.append(row_path)
+            continue
+        if row_path.exists() or decision_path.exists():
+            raise RuntimeError(
+                f"Development output already exists in {root}."
+            )
+        rows, decisions = pairing_batch(
+            config=config,
+            left=deployment,
+            right=deployment,
+            pairing=Pairing(mode, "sp", 0, 0),
+            population_name=population.name,
+            evaluation_seed=evaluation_seed,
+        )
+        write_parquet(row_path, [row.to_mapping() for row in rows])
+        write_jsonl(decision_path, decisions)
+        row_paths.append(row_path)
+    all_rows = [
+        EpisodeRow(
+            **{
+                **row,
+                "response_code_counts": tuple(row["response_code_counts"]),
+            }
+        )
+        for path in row_paths
+        for row in read_parquet(path)
+    ]
+    validate_development_rows(
+        all_rows,
+        deployment_modes=config.evaluation.deployment_modes,
+        episodes_per_mode=config.evaluation.episodes_per_pairing,
+    )
+    write_json(output / "summary.json", summarize_development_rows(all_rows))
+    return len(all_rows), sum(row.environment_steps for row in all_rows)
+
+
+
+__all__ = [
+    "evaluate_development_self_pairing",
+    "evaluate_standard",
+    "pairing_batch",
+]

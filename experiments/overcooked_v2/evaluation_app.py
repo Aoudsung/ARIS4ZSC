@@ -6,9 +6,13 @@ import argparse
 from pathlib import Path
 
 from experiments.overcooked_v2.response_contrast_app import (
+    evaluate_development_response_contrast,
     evaluate_response_contrast,
 )
-from experiments.overcooked_v2.standard_evaluation_app import evaluate_standard
+from experiments.overcooked_v2.standard_evaluation_app import (
+    evaluate_development_self_pairing,
+    evaluate_standard,
+)
 from src.path_c.experiment import load_config, load_population
 from src.path_c.storage import (
     ensure_run_identity,
@@ -23,6 +27,13 @@ def run_evaluation(args: argparse.Namespace) -> None:
     population = load_population(args.manifest)
     if population.layout != config.environment.layout:
         raise ValueError("Population and configuration layouts differ.")
+    if (
+        population.evaluation_kind == "development_diagnostic"
+        and config.run_kind != "development"
+    ):
+        raise ValueError(
+            "The single-policy diagnostic is available only for development runs."
+        )
 
     output = Path(args.output).resolve()
     ensure_run_identity(
@@ -36,7 +47,24 @@ def run_evaluation(args: argparse.Namespace) -> None:
     write_json(output / "resolved_config.json", config.to_mapping())
     write_json(output / "resolved_population.json", population.to_mapping())
 
-    if population.evaluation_kind == "standard_matrix":
+    if population.evaluation_kind == "development_diagnostic":
+        self_pair_episodes, self_pair_steps = evaluate_development_self_pairing(
+            config=config,
+            population=population,
+            output=output / "self_pairing",
+            evaluation_seed=int(args.seed),
+            resume=bool(args.resume),
+        )
+        contrast_rows, contrast_steps = evaluate_development_response_contrast(
+            config=config,
+            population=population,
+            output=output / "response_contrast",
+            evaluation_seed=int(args.seed),
+            resume=bool(args.resume),
+        )
+        completed_episodes = self_pair_episodes + 3 * contrast_rows
+        effective_environment_steps = self_pair_steps + contrast_steps
+    elif population.evaluation_kind == "standard_matrix":
         completed_episodes, effective_environment_steps = evaluate_standard(
             config=config,
             population=population,

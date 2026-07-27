@@ -15,6 +15,9 @@ from src.path_c.evaluation import (
     standard_episode_seed,
     standard_pairings,
     summarize_standard_rows,
+    summarize_development_rows,
+    validate_development_response_contrast_rows,
+    validate_development_rows,
     validate_response_contrast_rows,
     validate_standard_rows,
 )
@@ -209,3 +212,35 @@ def test_directed_pairing_does_not_duplicate_seat_swap() -> None:
     assert forward.pairing_id == "02_to_07"
     assert reverse.pairing_id == "07_to_02"
     assert forward != reverse
+
+
+def test_development_diagnostic_is_matched_self_pairing_only() -> None:
+    rows = tuple(
+        _episode(mode, 0, 0, index)
+        for mode in DEPLOYMENT_MODES
+        for index in range(3)
+    )
+    validate_development_rows(rows, episodes_per_mode=3)
+    summary = summarize_development_rows(rows)
+    assert summary["evaluation_protocol"] == (
+        "single_policy_matched_self_pairing_diagnostic"
+    )
+    assert summary["scientific_readout_allowed"] is False
+    assert summary["matched_mean_raw_return_differences"] == {
+        "posterior_use_minus_generic_response_information": 0.0,
+        "posterior_use_minus_prior_only": 0.0,
+        "posterior_use_minus_reference_only": 0.0,
+    }
+
+
+def test_development_response_contrast_uses_literal_self_pair_seeds() -> None:
+    rows = tuple(
+        _contrast_row(left=0, right=0, index=index, triggered=index == 1)
+        for index in range(3)
+    )
+    validate_development_response_contrast_rows(
+        rows,
+        evaluation_seed=17,
+        layout="test_time_simple",
+        episodes_per_pairing=3,
+    )

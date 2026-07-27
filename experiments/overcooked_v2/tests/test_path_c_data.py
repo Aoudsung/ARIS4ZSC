@@ -114,6 +114,17 @@ def test_population_records_training_run_directories_only(tmp_path: Path) -> Non
     assert set(payload["policies"][0]) == {"outer_unit_id", "run_directory"}
 
 
+def test_development_population_contains_one_real_training_run(tmp_path: Path) -> None:
+    population = Population(
+        name="seed-100-development",
+        layout="test_time_simple",
+        evaluation_kind="development_diagnostic",
+        entries=(PopulationEntry(0, tmp_path / "run-0"),),
+    )
+    path = write_population(tmp_path / "development_population.json", population)
+    assert load_population(path) == population
+
+
 def test_jsonl_and_array_chunks_are_lossless(tmp_path: Path) -> None:
     long_text = "响应🙂\n制表符\t引号\"" * 100
     rows = ({"index": index, "text": long_text + str(index)} for index in range(257))
