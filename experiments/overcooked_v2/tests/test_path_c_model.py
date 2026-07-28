@@ -53,6 +53,17 @@ def test_all_v4_4_heads_have_registered_shapes() -> None:
         belief,
         method=model.sequence,
     )["params"]
+    response_params = model.init(
+        jax.random.PRNGKey(11),
+        jnp.zeros((3, 2, 5, 5, 39), dtype=jnp.float32),
+        jnp.zeros((3, 2), dtype=jnp.int32),
+        jnp.zeros((3, 2, 5, 5, 39), dtype=jnp.float32),
+        jnp.zeros((3, 2), dtype=jnp.bool_),
+        method=model.encode_response,
+    )["params"]["response_encoder"]
+    mutable_params = unfreeze(params)
+    mutable_params["response_encoder"] = response_params
+    params = freeze(mutable_params)
     next_carry, output = model.apply(
         {"params": params},
         carry,
@@ -100,7 +111,10 @@ def _set_projection_kernels_nonzero(tree: object) -> object:
                     )
                 )
             ):
-                node[key] = jnp.ones_like(value) * 0.1
+                node[key] = (
+                    jnp.arange(value.size, dtype=value.dtype).reshape(value.shape)
+                    + 1
+                ) * 0.01
             else:
                 visit(value, next_path)
 
