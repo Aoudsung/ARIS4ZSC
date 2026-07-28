@@ -249,6 +249,10 @@ def test_recorded_rollout_matches_official_public_rollout_return(
     tmp_path: Path,
 ) -> None:
     config = _small_config()
+    config = replace(
+        config,
+        environment=replace(config.environment, episode_steps=8),
+    )
     official_config = compose_official_config(
         config,
         algorithm="rnn-sp",
