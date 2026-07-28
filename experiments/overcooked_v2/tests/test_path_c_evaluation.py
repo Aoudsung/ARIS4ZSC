@@ -14,7 +14,6 @@ from src.path_c.evaluation import (
     effect_components,
     standard_episode_seed,
     standard_pairings,
-    summarize_development_rows,
     summarize_standard_rows,
     validate_development_response_contrast_rows,
     validate_development_rows,
@@ -95,6 +94,18 @@ def test_five_hundred_unique_episodes_and_matched_mode_seeds() -> None:
         assert len(seeds) == 1
 
 
+def test_development_self_pairing_is_complete_and_seed_matched() -> None:
+    rows = tuple(
+        _episode(mode, 0, 0, index)
+        for mode in DEPLOYMENT_MODES
+        for index in range(2)
+    )
+    validate_development_rows(rows, episodes_per_mode=2)
+    assert {
+        row.episode_seed for row in rows if row.episode_index == 1
+    } == {rows[1].episode_seed}
+
+
 def test_summary_uses_pairing_means_and_pairing_standard_deviation() -> None:
     rows = tuple(
         _episode("posterior_use", left, right, index)
@@ -120,19 +131,6 @@ def test_summary_uses_pairing_means_and_pairing_standard_deviation() -> None:
     )
 
 
-def test_development_diagnostic_uses_one_matched_self_pairing() -> None:
-    rows = tuple(
-        _episode(mode, 0, 0, index)
-        for mode in DEPLOYMENT_MODES
-        for index in range(3)
-    )
-    validate_development_rows(rows, episodes_per_mode=3)
-    summary = summarize_development_rows(rows)
-    assert summary["run_kind"] == "development"
-    assert summary["scientific_readout_allowed"] is False
-    assert set(summary["deployment_modes"]) == set(DEPLOYMENT_MODES)
-
-
 def _contrast_row(*, left: int, right: int, index: int, triggered: bool) -> ResponseContrastRow:
     common = dict(
         pairing_id=f"{left:02d}_to_{right:02d}",
@@ -153,12 +151,17 @@ def _contrast_row(*, left: int, right: int, index: int, triggered: bool) -> Resp
         predicted_regularized_net_effect=0.08 if triggered else None,
         predicted_policy_total_variation=0.03 if triggered else None,
         predicted_policy_mediated_effect=0.06 if triggered else None,
+        predicted_policy_mediated_effect_lcb=0.04 if triggered else None,
+        predicted_policy_gain_uncertainty=0.02 if triggered else None,
         predicted_next_policy_total_variation=0.04 if triggered else None,
         maximum_action_net_value=0.4 if triggered else None,
         maximum_action_policy_mediated_gain=0.08 if triggered else None,
+        maximum_action_policy_mediated_gain_lcb=0.05 if triggered else None,
         executed_action_net_value=0.2 if triggered else None,
         executed_action_response_value=0.3 if triggered else None,
         executed_action_policy_mediated_gain=0.06 if triggered else None,
+        executed_action_policy_mediated_gain_lcb=0.04 if triggered else None,
+        executed_action_policy_gain_uncertainty=0.02 if triggered else None,
         executed_action_expected_next_policy_tv=0.04 if triggered else None,
         executed_action=5 if triggered else None,
         maximum_net_action=5 if triggered else None,
@@ -212,16 +215,16 @@ def test_response_contrast_requires_complete_directed_xp_rows() -> None:
     )
 
 
-def test_development_response_contrast_uses_the_same_self_pairing_seed() -> None:
+def test_development_response_contrast_accepts_one_complete_self_pair() -> None:
     rows = tuple(
-        _contrast_row(left=0, right=0, index=index, triggered=False)
-        for index in range(3)
+        _contrast_row(left=0, right=0, index=index, triggered=bool(index % 2))
+        for index in range(2)
     )
     validate_development_response_contrast_rows(
         rows,
         evaluation_seed=17,
         layout="test_time_simple",
-        episodes_per_pairing=3,
+        episodes_per_pairing=2,
     )
 
 
@@ -238,16 +241,14 @@ def test_population_manifest_contains_run_directories_only(tmp_path: Path) -> No
     assert load_population(path) == population
 
 
-def test_development_population_contains_only_outer_unit_zero(
-    tmp_path: Path,
-) -> None:
+def test_development_population_contains_only_outer_unit_zero(tmp_path: Path) -> None:
     population = Population(
         name="seed-100-development",
         layout="test_time_simple",
         evaluation_kind="development_diagnostic",
         entries=(PopulationEntry(0, tmp_path / "run-0"),),
     )
-    path = write_population(tmp_path / "development-population.json", population)
+    path = write_population(tmp_path / "development.json", population)
     assert load_population(path) == population
 
 
@@ -257,3 +258,27 @@ def test_directed_pairing_does_not_duplicate_seat_swap() -> None:
     assert forward.pairing_id == "02_to_07"
     assert reverse.pairing_id == "07_to_02"
     assert forward != reverse
+
+
+def test_fixed_partner_panel_selects_final_checkpoints_and_matches_mode_seeds(
+    tmp_path: Path,
+) -> None:
+    from experiments.overcooked_v2.partner_panel_app import (
+        panel_episode_seed,
+        select_panel_checkpoints,
+    )
+
+    checkpoints = tuple(tmp_path / f"checkpoint-{index}" for index in range(12))
+    selected = select_panel_checkpoints(checkpoints, final_only=True)
+    assert selected == tuple(path.resolve() for path in checkpoints[2::3])
+    seeds = {
+        panel_episode_seed(
+            evaluation_seed=91,
+            layout="test_time_simple",
+            ego_outer_unit_id=0,
+            partner_index=2,
+            episode_index=19,
+        )
+        for _mode in DEPLOYMENT_MODES
+    }
+    assert len(seeds) == 1

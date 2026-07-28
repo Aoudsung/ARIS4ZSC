@@ -1,34 +1,39 @@
-# V4.3 delivery notes
+# V4.4 delivery notes
 
 This package contains the complete repository tree for:
 
 ```text
-path_c_v4_3_executable_response_value_r1
+path_c_v4_4_retrace_calibrated_control_r1
 ```
 
-## Root repair
+## Evidence motivating the repair
 
-The previous development run showed posterior changes without executable task value. V4.3 replaces the complete latent-assignment-to-execution path:
+The completed V4.3 development run established that response use can change the deployed trajectory, but did not establish positive task value. In 500 matched response-contrast episodes, 230 produced action-trajectory differences, 498 produced identical returns, two were worse under response use, and none improved. The V4.3 checkpoint therefore remains a development diagnostic and the formal ten-unit run remains closed.
 
-- slot responsibility is computed only from full-episode Bellman evidence;
-- response, reward, next-Q, and next-reference errors are retained as audit evidence and outcome losses, but never assign latent slots;
-- the outcome model predicts response-conditioned next-action Q vectors for use and mask beliefs, plus the next reference logits;
-- `J_use` and `J_mask` use the same physical posterior and the same KL-regularized policy operator as runtime;
-- the primary actionable score is a shift-invariant policy-mediated gain together with expected next-policy total variation;
-- training behavior uses a registered 0.1 uniform support mixture, while deployment remains unchanged;
-- KL temperatures are solved by deterministic log-space bisection instead of a nearly static dual update;
-- response codes represent current-to-next centered-advantage changes;
-- every E-step responsibility and evidence component is written without truncation.
+## Unified repair
+
+V4.4 changes the complete credit-and-calibration path while retaining TD-only latent semantics:
+
+- one-step Bellman targets are replaced by full-episode off-policy Retrace targets;
+- the behavior probability of every recorded action is used in the importance ratio;
+- one latent `(estimator, slot)` hypothesis is sampled per episode and supplies a coherent exploratory policy;
+- a small uniform floor retains non-zero support for all six primitive actions;
+- the outcome model's predicted standard deviations define lower-confidence next-action values;
+- runtime control, response-contrast triggering, and gain binning use uncertainty-calibrated values;
+- response contrast triggers on the executed action's shift-invariant policy-gain LCB plus the registered next-policy-TV floor;
+- a development-only fixed-partner panel evaluates one trained ego against the registered frozen official partners;
+- slot responsibility remains based only on full-episode TD evidence;
+- every E-step row records responsibility, TD and outcome evidence, bootstrap support, mean importance ratio, and mean trace coefficient.
 
 ## Version boundary
 
-V4.3 changes the model tree, response signature width, transition batch, checkpoint state, evaluation rows, and configuration schema. V4.2 checkpoints and output directories are intentionally incompatible.
+V4.4 changes the configuration schema, Bellman target, behavior policy, checkpoint state, decision rows, response-contrast rows, and evaluation surface. V4.3 checkpoints and output directories are intentionally incompatible.
 
-## Local validation in this packaging environment
+## Validation in this packaging environment
 
-- every active Python file compiled successfully;
-- pure-JAX/config/evaluation/data tests passed;
-- model and official-integration suites are collected but require the locked Flax, Optax, Orbax, Hydra, JaxMARL, and official-experiments dependencies;
-- no training or environment evaluation was run while assembling this artifact.
+- all active Python files compile;
+- 40 locally executable tests pass;
+- two dependency suites are skipped because this container lacks Flax and Hydra/JaxMARL;
+- no V4.4 training or environment evaluation was run while assembling this package.
 
-Run the complete test suite in the locked remote environment before any development training.
+The locked remote environment must run the complete suite with zero skips before any V4.4 development training.

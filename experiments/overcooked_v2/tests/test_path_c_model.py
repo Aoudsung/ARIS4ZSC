@@ -39,23 +39,20 @@ def _inputs(time: int = 3, batch: int = 2):
     return features, actions, rewards, starts, belief
 
 
-def test_all_v4_3_heads_have_registered_shapes() -> None:
+def test_all_v4_4_heads_have_registered_shapes() -> None:
     model = _model()
     features, actions, rewards, starts, belief = _inputs()
     carry = initial_control_carry(2, 8)
-    params = initialize_heads(
-        model,
-        random_key=jax.random.PRNGKey(1),
-        example_official_features=features[0],
-        example_previous_actions=actions[0],
-        example_previous_team_rewards=rewards[0],
-        example_episode_start=starts[0],
-        example_slot_log_belief=belief[0],
-        example_observations=jnp.zeros(
-            (3, 2, 5, 5, 39), dtype=jnp.float32
-        ),
-        hidden_dim=8,
-    )
+    params = model.init(
+        jax.random.PRNGKey(1),
+        carry,
+        features,
+        actions,
+        rewards,
+        starts,
+        belief,
+        method=model.sequence,
+    )["params"]
     next_carry, output = model.apply(
         {"params": params},
         carry,
@@ -103,10 +100,7 @@ def _set_projection_kernels_nonzero(tree: object) -> object:
                     )
                 )
             ):
-                values = jnp.arange(
-                    1, value.size + 1, dtype=value.dtype
-                ).reshape(value.shape)
-                node[key] = values * 0.01
+                node[key] = jnp.ones_like(value) * 0.1
             else:
                 visit(value, next_path)
 
@@ -224,6 +218,7 @@ def test_zero_initialized_outcome_preserves_reference_policy() -> None:
         generic_temperature=jnp.ones((2,)),
         deployment_mode="posterior_use",
         gamma=0.99,
+        uncertainty_penalty=1.0,
     )
     np.testing.assert_allclose(
         np.asarray(jax.nn.softmax(output.execution_logits, axis=-1)),

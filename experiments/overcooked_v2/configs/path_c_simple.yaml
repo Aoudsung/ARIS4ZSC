@@ -1,4 +1,4 @@
-version: 3
+version: 4
 
 environment:
   layout: test_time_simple
@@ -15,6 +15,7 @@ model:
   prior_scale: 0.01
   log_standard_deviation_minimum: -5.0
   log_standard_deviation_maximum: 2.0
+  uncertainty_penalty: 1.0
 
 training:
   update_epochs: 4
@@ -24,7 +25,11 @@ training:
   gamma: 0.99
   responsibility_temperature: 1.0
   bootstrap_probability: 0.8
-  behavior_support: 0.1
+  retrace_lambda: 0.9
+  importance_ratio_clip: 1.0
+  behavior_exploration_mix: 0.25
+  behavior_exploration_temperature: 0.5
+  behavior_uniform_floor: 0.02
   polyak_coefficient: 0.005
   codebook_decay: 0.99
   code_replacement_rollouts: 10

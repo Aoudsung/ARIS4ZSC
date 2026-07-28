@@ -14,11 +14,11 @@ from typing import Any, Mapping, Sequence
 
 from .method import DEPLOYMENT_MODES
 
-CONFIG_VERSION = 3
-METHOD_VERSION = "path_c_v4_3_executable_response_value_r1"
+CONFIG_VERSION = 4
+METHOD_VERSION = "path_c_v4_4_retrace_calibrated_control_r1"
 MANIFEST_VERSION = 1
 POPULATION_VERSION = 1
-RUN_KINDS = ("development", "formal")
+RUN_KINDS = ("mechanical", "development", "formal")
 LAYOUTS = ("test_time_simple", "test_time_wide")
 
 
@@ -31,6 +31,12 @@ class RunBudget:
 
 
 RUN_BUDGETS: Mapping[str, RunBudget] = {
+    "mechanical": RunBudget(
+        num_envs=4,
+        environment_steps=1_600,
+        minibatches_per_epoch=1,
+        checkpoint_interval_environment_steps=1_600,
+    ),
     "development": RunBudget(
         num_envs=32,
         environment_steps=1_228_800,
@@ -65,6 +71,7 @@ class ModelConfig:
     prior_scale: float
     log_standard_deviation_minimum: float
     log_standard_deviation_maximum: float
+    uncertainty_penalty: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +85,11 @@ class TrainingConfig:
     gamma: float
     responsibility_temperature: float
     bootstrap_probability: float
-    behavior_support: float
+    retrace_lambda: float
+    importance_ratio_clip: float
+    behavior_exploration_mix: float
+    behavior_exploration_temperature: float
+    behavior_uniform_floor: float
     polyak_coefficient: float
     codebook_decay: float
     code_replacement_rollouts: int
@@ -224,7 +235,11 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
             "gamma",
             "responsibility_temperature",
             "bootstrap_probability",
-            "behavior_support",
+            "retrace_lambda",
+            "importance_ratio_clip",
+            "behavior_exploration_mix",
+            "behavior_exploration_temperature",
+            "behavior_uniform_floor",
             "polyak_coefficient",
             "codebook_decay",
             "code_replacement_rollouts",
@@ -310,8 +325,24 @@ def validate_config(config: RunConfig) -> None:
     ):
         if not 0.0 <= value <= 1.0:
             raise ValueError(f"{name} must lie in [0, 1].")
-    if not 0.0 <= config.training.behavior_support < 1.0:
-        raise ValueError("Training behavior support must lie in [0, 1).")
+    if not 0.0 <= config.training.retrace_lambda <= 1.0:
+        raise ValueError("Retrace lambda must lie in [0, 1].")
+    if not 0.0 < config.training.importance_ratio_clip <= 1.0:
+        raise ValueError("Retrace importance-ratio clip must lie in (0, 1].")
+    if not 0.0 <= config.training.behavior_exploration_mix < 1.0:
+        raise ValueError("Behavior exploration mix must lie in [0, 1).")
+    if config.training.behavior_exploration_temperature <= 0.0:
+        raise ValueError("Behavior exploration temperature must be positive.")
+    if not 0.0 <= config.training.behavior_uniform_floor < 1.0:
+        raise ValueError("Behavior uniform floor must lie in [0, 1).")
+    if (
+        config.training.behavior_exploration_mix
+        + config.training.behavior_uniform_floor
+        >= 1.0
+    ):
+        raise ValueError("Behavior mixtures must leave positive execution-policy mass.")
+    if config.model.uncertainty_penalty < 0.0:
+        raise ValueError("Outcome uncertainty penalty must be non-negative.")
     rollout_steps = config.environment.num_envs * config.environment.episode_steps
     if config.training.environment_steps % rollout_steps:
         raise ValueError("Training must contain whole vectorized episodes.")

@@ -32,18 +32,26 @@ WIDE_CONFIG = ROOT / "experiments/overcooked_v2/configs/path_c_wide.yaml"
 
 
 def test_run_kind_selects_registered_budget() -> None:
+    mechanical = load_config(SIMPLE_CONFIG, run_kind="mechanical")
     development = load_config(SIMPLE_CONFIG, run_kind="development")
     formal = load_config(SIMPLE_CONFIG, run_kind="formal")
+    assert mechanical.environment.num_envs == 4
+    assert mechanical.training.environment_steps == 1_600
+    assert mechanical.training.minibatches_per_epoch == 1
+    assert mechanical.training.checkpoint_interval_environment_steps == 1_600
     assert development.environment.num_envs == 32
     assert development.training.environment_steps == 1_228_800
     assert development.training.minibatches_per_epoch == 8
     assert formal.environment.num_envs == 250
     assert formal.training.environment_steps == 11_000_000
     assert formal.training.minibatches_per_epoch == 50
-    assert development.training.behavior_support == 0.1
+    assert development.training.behavior_exploration_mix == 0.25
+    assert development.training.behavior_uniform_floor == 0.02
+    assert development.training.retrace_lambda == 0.9
+    assert development.model.uncertainty_penalty == 1.0
     assert development.kl.bisection_iterations == 24
     assert development.evaluation.response_policy_tv_minimum == 0.001
-    assert METHOD_VERSION == "path_c_v4_3_executable_response_value_r1"
+    assert METHOD_VERSION == "path_c_v4_4_retrace_calibrated_control_r1"
 
 
 def test_layout_configs_differ_only_by_layout() -> None:
@@ -156,6 +164,8 @@ def test_responsibility_rows_preserve_every_epoch_lane_and_slot() -> None:
         next_q_mask_energies=np.asarray([[17.0, 18.0], [19.0, 20.0]], dtype=np.float32),
         next_reference_energy=np.asarray([21.0, 22.0], dtype=np.float32),
         bootstrap_mask=np.asarray([[True, False], [True, True]]),
+        importance_ratio_mean=np.asarray([0.9, 1.1], dtype=np.float32),
+        trace_coefficient_mean=np.asarray([0.8, 0.7], dtype=np.float32),
     )
     records = {
         "partner_members": np.asarray([[3, 4]], dtype=np.int32),
@@ -165,7 +175,7 @@ def test_responsibility_rows_preserve_every_epoch_lane_and_slot() -> None:
         _responsibility_rows(assignments, records, update_count=7, epoch=2)
     )
     assert len(rows) == 4
-    assert rows[0] == {
+    expected = {
         "update_count": 7,
         "epoch": 2,
         "environment_index": 0,
@@ -180,4 +190,12 @@ def test_responsibility_rows_preserve_every_epoch_lane_and_slot() -> None:
         "next_q_mask_nll_energy": 17.0,
         "next_reference_mse_energy": 21.0,
         "bootstrap_available": True,
+        "mean_importance_ratio": 0.9,
+        "mean_trace_coefficient": 0.8,
     }
+    assert set(rows[0]) == set(expected)
+    for key, value in expected.items():
+        if isinstance(value, float):
+            assert rows[0][key] == pytest.approx(value)
+        else:
+            assert rows[0][key] == value

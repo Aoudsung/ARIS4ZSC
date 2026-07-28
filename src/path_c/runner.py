@@ -1,4 +1,4 @@
-"""Device-side environment loop for Path C V4.3."""
+"""Device-side environment loop for Path C V4.4."""
 
 from __future__ import annotations
 
@@ -29,13 +29,18 @@ class DecisionRecord(NamedTuple):
     reference_logits: Any
     execution_logits: Any
     behavior_logits: Any
+    exploration_logits: Any
     behavior_action_probability: Any
+    behavior_slot: Any
+    behavior_estimator: Any
     mask_execution_logits: Any
     j_use: Any
     j_mask: Any
     per_action_response_value: Any
     per_action_net_value: Any
     per_action_policy_mediated_gain: Any
+    per_action_policy_mediated_gain_lcb: Any
+    per_action_policy_gain_uncertainty: Any
     per_action_expected_next_policy_tv: Any
     information_gain: Any
     kl_divergence: Any
@@ -50,13 +55,18 @@ class DecisionRecord(NamedTuple):
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
     predicted_policy_mediated_effect: Any
+    predicted_policy_mediated_effect_lcb: Any
+    predicted_policy_gain_uncertainty: Any
     predicted_next_policy_total_variation: Any
     executed_action_response_value: Any
     executed_action_net_value: Any
     executed_action_policy_mediated_gain: Any
+    executed_action_policy_mediated_gain_lcb: Any
+    executed_action_policy_gain_uncertainty: Any
     executed_action_expected_next_policy_tv: Any
     maximum_action_net_value: Any
     maximum_action_policy_mediated_gain: Any
+    maximum_action_policy_mediated_gain_lcb: Any
 
 
 class RunnerState(NamedTuple):
@@ -66,6 +76,8 @@ class RunnerState(NamedTuple):
     partner_state: Any
     partner_member: Any
     ego_seat: Any
+    behavior_slot: Any
+    behavior_estimator: Any
     episode_step: Any
     episode_id: Any
     episode_return: Any
@@ -163,9 +175,14 @@ def initialize_runner(
 
     if partner_member_count <= 0:
         raise ValueError("Training requires at least one frozen partner.")
-    next_key, environment_key, partner_key, seat_key = jax.random.split(
-        random_key, 4
-    )
+    (
+        next_key,
+        environment_key,
+        partner_key,
+        seat_key,
+        behavior_slot_key,
+        behavior_estimator_key,
+    ) = jax.random.split(random_key, 6)
     environment_state, observations = environment.reset(environment_key)
     count = int(environment.num_envs)
     return RunnerState(
@@ -184,6 +201,12 @@ def initialize_runner(
             partner_key, (count,), 0, partner_member_count + 1
         ),
         ego_seat=jax.random.bernoulli(seat_key, shape=(count,)).astype(jnp.int32),
+        behavior_slot=jax.random.randint(
+            behavior_slot_key, (count,), 0, slot_count
+        ),
+        behavior_estimator=jax.random.randint(
+            behavior_estimator_key, (count,), 0, 2
+        ),
         episode_step=jnp.zeros((count,), dtype=jnp.int32),
         episode_id=jnp.arange(count, dtype=jnp.int64),
         episode_return=jnp.zeros((count,), dtype=jnp.float32),
@@ -205,7 +228,12 @@ def policy_action(
     key: Any,
     deployment_mode: str,
     gamma: float,
-    behavior_support: float = 0.0,
+    uncertainty_penalty: float,
+    behavior_slot: Any | None = None,
+    behavior_estimator: Any | None = None,
+    behavior_exploration_mix: float = 0.0,
+    behavior_exploration_temperature: float = 1.0,
+    behavior_uniform_floor: float = 0.0,
 ) -> tuple[PolicyState, Any, Any, DecisionRecord, Any]:
     import jax
     import jax.numpy as jnp
@@ -253,20 +281,52 @@ def policy_action(
         generic_temperature=jnp.exp(policy_state.generic_log_temperature),
         deployment_mode=deployment_mode,
         gamma=gamma,
+        uncertainty_penalty=uncertainty_penalty,
     )
     generic = regularized_policy(
         reference_logits,
         output.information_gain,
         jnp.exp(policy_state.generic_log_temperature),
     )
-    support = float(behavior_support)
-    if not 0.0 <= support < 1.0:
-        raise ValueError("Behavior support must lie in [0, 1).")
+    exploration_mix = float(behavior_exploration_mix)
+    uniform_floor = float(behavior_uniform_floor)
+    if not 0.0 <= exploration_mix < 1.0:
+        raise ValueError("Behavior exploration mix must lie in [0, 1).")
+    if not 0.0 <= uniform_floor < 1.0:
+        raise ValueError("Behavior uniform floor must lie in [0, 1).")
+    if exploration_mix + uniform_floor >= 1.0:
+        raise ValueError("Behavior mixtures must leave execution-policy mass.")
+    if behavior_exploration_temperature <= 0.0:
+        raise ValueError("Behavior exploration temperature must be positive.")
+
     execution_log = jax.nn.log_softmax(output.execution_logits, axis=-1)
     execution_probability = jnp.exp(execution_log)
     action_count = int(output.execution_logits.shape[-1])
+    batch_count = int(output.q_values.shape[0])
+    if behavior_slot is None:
+        selected_slot = jnp.zeros((batch_count,), dtype=jnp.int32)
+    else:
+        selected_slot = jnp.asarray(behavior_slot, dtype=jnp.int32)
+    if behavior_estimator is None:
+        selected_estimator = jnp.zeros((batch_count,), dtype=jnp.int32)
+    else:
+        selected_estimator = jnp.asarray(behavior_estimator, dtype=jnp.int32)
+    if selected_slot.shape != (batch_count,) or selected_estimator.shape != (batch_count,):
+        raise ValueError("Behavior expert indexes must align with the policy batch.")
+    batch_indexes = jnp.arange(batch_count, dtype=jnp.int32)
+    sampled_q = output.q_values[
+        batch_indexes, selected_estimator, selected_slot, :
+    ]
+    exploration_policy = regularized_policy(
+        reference_logits,
+        sampled_q,
+        jnp.asarray(behavior_exploration_temperature, dtype=jnp.float32),
+    )
+    exploration_probability = exploration_policy.probabilities
     behavior_probability = (
-        (1.0 - support) * execution_probability + support / action_count
+        (1.0 - exploration_mix - uniform_floor) * execution_probability
+        + exploration_mix * exploration_probability
+        + uniform_floor / action_count
     )
     behavior_logits = jnp.log(jnp.maximum(behavior_probability, 1.0e-12))
     keys = jnp.asarray(key)
@@ -299,6 +359,16 @@ def policy_action(
         action[..., None],
         axis=-1,
     )[..., 0]
+    executed_policy_gain_lcb = jnp.take_along_axis(
+        output.per_action_policy_mediated_gain_lcb,
+        action[..., None],
+        axis=-1,
+    )[..., 0]
+    executed_policy_gain_uncertainty = jnp.take_along_axis(
+        output.per_action_policy_gain_uncertainty,
+        action[..., None],
+        axis=-1,
+    )[..., 0]
     executed_next_policy_tv = jnp.take_along_axis(
         output.per_action_expected_next_policy_tv,
         action[..., None],
@@ -314,7 +384,10 @@ def policy_action(
         reference_logits=reference_logits,
         execution_logits=output.execution_logits,
         behavior_logits=behavior_logits,
+        exploration_logits=exploration_policy.logits,
         behavior_action_probability=selected_behavior_probability,
+        behavior_slot=selected_slot,
+        behavior_estimator=selected_estimator,
         mask_execution_logits=output.mask_execution_logits,
         j_use=output.j_use,
         j_mask=output.j_mask,
@@ -322,6 +395,12 @@ def policy_action(
         per_action_net_value=output.per_action_net_value,
         per_action_policy_mediated_gain=(
             output.per_action_policy_mediated_gain
+        ),
+        per_action_policy_mediated_gain_lcb=(
+            output.per_action_policy_mediated_gain_lcb
+        ),
+        per_action_policy_gain_uncertainty=(
+            output.per_action_policy_gain_uncertainty
         ),
         per_action_expected_next_policy_tv=(
             output.per_action_expected_next_policy_tv
@@ -345,16 +424,29 @@ def policy_action(
         predicted_policy_mediated_effect=(
             output.predicted_policy_mediated_effect
         ),
+        predicted_policy_mediated_effect_lcb=(
+            output.predicted_policy_mediated_effect_lcb
+        ),
+        predicted_policy_gain_uncertainty=(
+            output.predicted_policy_gain_uncertainty
+        ),
         predicted_next_policy_total_variation=(
             output.predicted_next_policy_total_variation
         ),
         executed_action_response_value=executed_response,
         executed_action_net_value=executed_net,
         executed_action_policy_mediated_gain=executed_policy_gain,
+        executed_action_policy_mediated_gain_lcb=executed_policy_gain_lcb,
+        executed_action_policy_gain_uncertainty=(
+            executed_policy_gain_uncertainty
+        ),
         executed_action_expected_next_policy_tv=executed_next_policy_tv,
         maximum_action_net_value=jnp.max(output.per_action_net_value, axis=-1),
         maximum_action_policy_mediated_gain=jnp.max(
             output.per_action_policy_mediated_gain, axis=-1
+        ),
+        maximum_action_policy_mediated_gain_lcb=jnp.max(
+            output.per_action_policy_mediated_gain_lcb, axis=-1
         ),
     )
     return next_state, action, output, record, generic.logits
@@ -371,8 +463,11 @@ def collect_rollout(
     partner_member_count: int,
     deployment_mode: str,
     gamma: float,
+    uncertainty_penalty: float,
     terminal_response: int,
-    behavior_support: float = 0.0,
+    behavior_exploration_mix: float = 0.0,
+    behavior_exploration_temperature: float = 1.0,
+    behavior_uniform_floor: float = 0.0,
 ) -> tuple[RunnerState, TransitionBatch, Mapping[str, Any]]:
     import jax
     import jax.numpy as jnp
@@ -394,7 +489,9 @@ def collect_rollout(
             partner_key,
             next_partner_key,
             next_seat_key,
-        ) = jax.random.split(current.random_key, 6)
+            next_behavior_slot_key,
+            next_behavior_estimator_key,
+        ) = jax.random.split(current.random_key, 8)
         action_keys = jax.random.split(action_root_key, count)
         ego_observation, partner_observation = seat_observations(
             current.observations, current.ego_seat
@@ -408,7 +505,14 @@ def collect_rollout(
                 key=action_keys,
                 deployment_mode=deployment_mode,
                 gamma=gamma,
-                behavior_support=behavior_support,
+                uncertainty_penalty=uncertainty_penalty,
+                behavior_slot=current.behavior_slot,
+                behavior_estimator=current.behavior_estimator,
+                behavior_exploration_mix=behavior_exploration_mix,
+                behavior_exploration_temperature=(
+                    behavior_exploration_temperature
+                ),
+                behavior_uniform_floor=behavior_uniform_floor,
             )
         )
         partner_action, tentative_partner_state, partner_context = (
@@ -528,6 +632,12 @@ def collect_rollout(
         sampled_seat = jax.random.bernoulli(
             next_seat_key, shape=(count,)
         ).astype(jnp.int32)
+        sampled_behavior_slot = jax.random.randint(
+            next_behavior_slot_key, (count,), 0, int(updated_belief.shape[-1])
+        )
+        sampled_behavior_estimator = jax.random.randint(
+            next_behavior_estimator_key, (count,), 0, 2
+        )
         next_state = RunnerState(
             environment_state=next_environment_state,
             observations=next_observations,
@@ -537,6 +647,12 @@ def collect_rollout(
                 dones, sampled_partner, current.partner_member
             ),
             ego_seat=jnp.where(dones, sampled_seat, current.ego_seat),
+            behavior_slot=jnp.where(
+                dones, sampled_behavior_slot, current.behavior_slot
+            ),
+            behavior_estimator=jnp.where(
+                dones, sampled_behavior_estimator, current.behavior_estimator
+            ),
             episode_step=jnp.where(dones, 0, current.episode_step + 1),
             episode_id=jnp.where(dones, next_episode_id, current.episode_id),
             episode_return=jnp.where(dones, 0.0, completed_return),
@@ -565,6 +681,9 @@ def collect_rollout(
             "behavior_action_probabilities": (
                 decision.behavior_action_probability
             ),
+            "exploration_logits": decision.exploration_logits,
+            "behavior_slots": decision.behavior_slot,
+            "behavior_estimators": decision.behavior_estimator,
             "mask_execution_logits": decision.mask_execution_logits,
             "generic_execution_logits": generic_logits,
             "slot_log_beliefs": stepped_policy.slot_log_belief,
@@ -597,6 +716,12 @@ def collect_rollout(
             "per_action_policy_mediated_gains": (
                 decision.per_action_policy_mediated_gain
             ),
+            "per_action_policy_mediated_gain_lcbs": (
+                decision.per_action_policy_mediated_gain_lcb
+            ),
+            "per_action_policy_gain_uncertainties": (
+                decision.per_action_policy_gain_uncertainty
+            ),
             "per_action_expected_next_policy_tvs": (
                 decision.per_action_expected_next_policy_tv
             ),
@@ -613,6 +738,12 @@ def collect_rollout(
             "predicted_policy_mediated_effects": (
                 decision.predicted_policy_mediated_effect
             ),
+            "predicted_policy_mediated_effect_lcbs": (
+                decision.predicted_policy_mediated_effect_lcb
+            ),
+            "predicted_policy_gain_uncertainties": (
+                decision.predicted_policy_gain_uncertainty
+            ),
             "predicted_next_policy_total_variations": (
                 decision.predicted_next_policy_total_variation
             ),
@@ -626,12 +757,21 @@ def collect_rollout(
             "executed_action_policy_mediated_gains": (
                 decision.executed_action_policy_mediated_gain
             ),
+            "executed_action_policy_mediated_gain_lcbs": (
+                decision.executed_action_policy_mediated_gain_lcb
+            ),
+            "executed_action_policy_gain_uncertainties": (
+                decision.executed_action_policy_gain_uncertainty
+            ),
             "executed_action_expected_next_policy_tvs": (
                 decision.executed_action_expected_next_policy_tv
             ),
             "maximum_action_net_values": decision.maximum_action_net_value,
             "maximum_action_policy_mediated_gains": (
                 decision.maximum_action_policy_mediated_gain
+            ),
+            "maximum_action_policy_mediated_gain_lcbs": (
+                decision.maximum_action_policy_mediated_gain_lcb
             ),
         }
 
@@ -716,15 +856,22 @@ def collect_rollout(
             "per_action_response_values",
             "per_action_net_values",
             "per_action_policy_mediated_gains",
+            "per_action_policy_mediated_gain_lcbs",
+            "per_action_policy_gain_uncertainties",
             "per_action_expected_next_policy_tvs",
             "information_gains",
             "behavior_action_probabilities",
+            "behavior_slots",
+            "behavior_estimators",
+            "exploration_logits",
             "predicted_response_effects",
             "predicted_policy_costs",
             "predicted_net_effects",
             "predicted_regularized_net_effects",
             "predicted_policy_total_variations",
             "predicted_policy_mediated_effects",
+            "predicted_policy_mediated_effect_lcbs",
+            "predicted_policy_gain_uncertainties",
             "predicted_next_policy_total_variations",
             "kl_divergences",
             "reference_greedy_actions",
@@ -732,9 +879,12 @@ def collect_rollout(
             "executed_action_response_values",
             "executed_action_net_values",
             "executed_action_policy_mediated_gains",
+            "executed_action_policy_mediated_gain_lcbs",
+            "executed_action_policy_gain_uncertainties",
             "executed_action_expected_next_policy_tvs",
             "maximum_action_net_values",
             "maximum_action_policy_mediated_gains",
+            "maximum_action_policy_mediated_gain_lcbs",
         )
     }
     return final_state, batch, records
@@ -750,8 +900,8 @@ def partner_callbacks(
     hidden_dim: int,
     initial_temperature: float,
     gamma: float,
+    uncertainty_penalty: float,
     terminal_response: int,
-    behavior_support: float,
 ) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
     """Build frozen-current and frozen-official partner behavior.
 
@@ -817,7 +967,9 @@ def partner_callbacks(
             key=jax.random.split(dynamic_key, observations.shape[0]),
             deployment_mode="posterior_use",
             gamma=gamma,
-            behavior_support=behavior_support,
+            uncertainty_penalty=uncertainty_penalty,
+            behavior_exploration_mix=0.0,
+            behavior_uniform_floor=0.0,
         )
         del unused_record, unused_generic
         return (

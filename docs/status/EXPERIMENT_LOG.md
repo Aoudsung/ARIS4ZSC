@@ -4,6 +4,25 @@
 record; latest recorded scientific state = Link-A round 2 failed on 2026-07-09,
 and the active project line is now Path C.
 
+
+### 2026-07-28 Path C V4.4 retrace-calibrated-control r1 统一修订完成（本地；未运行远端训练）
+
+- **触发原因：** V4.3 已使回应改变真实策略和动作轨迹，但500个回应屏蔽回合中498个回报相同，2个下降、0个改善；回应使用效应为−0.08。四模式平均回报为`posterior_use=168.24`、`prior_only=167.96`、`reference_only=168.20`、`generic_response_information=168.44`。训练伙伴回报没有随96次更新改善。
+- **长时信用：** 一步Bellman target替换为使用记录behavior probability的完整回合Retrace；登记`lambda=0.9`、重要性比率截断1.0。
+- **行为支持：** 每个episode固定一个latent `(estimator, slot)`，训练behavior混合deployment policy、该expert policy和0.02均匀floor；该expert在回合内保持不变。
+- **不确定性校准：** next-Q均值与log standard deviation共同构造lower-confidence control；回应屏蔽触发与分箱使用实际执行动作的policy-gain LCB及next-policy TV，不再只使用mean gain。
+- **开发评估：** 新增一个训练ego对登记冻结官方伙伴的`evaluate-panel`入口，以区分自我配对饱和和外部伙伴适应失败。
+- **语义保持：** slot responsibility仍只读取完整回合TD evidence；response/reward/next-Q/next-reference误差只训练outcome model并写入审计。
+- **版本边界：** 方法标识为`path_c_v4_4_retrace_calibrated_control_r1`，配置version为4。V4.3 checkpoint和输出目录不能恢复。当前状态为`implemented`，`scientific_readout_allowed: false`。
+
+### 2026-07-27 Path C V4.3 seed-100 开发训练与评估完成
+
+- **工程完成：** 49项远端测试全部通过；训练完成1,228,800环境步、3,072回合和96次更新；责任分配共保存98,304行；四模式评估2,000回合，回应屏蔽500组三分支回合。
+- **执行机制：** `posterior_use`平均预测下一策略TV为0.00739，触发点均值为0.05450；230/500个回应屏蔽回合产生实际动作轨迹差异，后验触发后平均L1变化0.1605。V4.2的“动作无关平移”问题已经修复。
+- **任务结果：** 四模式平均回报依次为`posterior_use=168.24`、`prior_only=167.96`、`reference_only=168.20`、`generic_response_information=168.44`。回应屏蔽的response effect为−0.08、cost为0、net为−0.08；498回合相同，2回合下降，0回合改善。
+- **责任与温度：** TD-only责任概率均有限且最大槽与最小可用TD能量完全一致；KL二分在posterior分支达到0.02。
+- **剩余问题：** 高预测增益未与真实收益单调对应，训练伙伴回报未改善；单checkpoint自我配对不能代表标准ZSC矩阵。十单元正式训练继续关闭，全部结果保持development和`scientific_readout_allowed: false`。
+
 ### 2026-07-27 Path C V4.3 executable-response-value r1 统一修订完成（本地；未运行远端训练）
 
 - **触发原因：** V4.2 control-memory r1 完成 42 项远端测试、1,228,800 环境步训练、3,072 个回合和 96 次更新；回应使 use/mask 后验平均 L1 距离达到 0.338，但 use/mask 策略总变差均值只有 `1.85e-5`，500 个回应屏蔽回合的回应效应、任务成本和净效应均为 0。正式十单元训练按机制判据关闭。

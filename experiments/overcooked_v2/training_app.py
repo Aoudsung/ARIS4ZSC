@@ -1,4 +1,4 @@
-"""Upstream and Path C training workflows for OvercookedV2."""
+"""Upstream and Path C V4.4 training workflows for OvercookedV2."""
 
 from __future__ import annotations
 
@@ -118,6 +118,15 @@ def _decision_rows(
                 "behavior_logits": arrays["behavior_logits"][
                     time_index, environment_index
                 ].tolist(),
+                "exploration_logits": arrays["exploration_logits"][
+                    time_index, environment_index
+                ].tolist(),
+                "behavior_slot": int(
+                    arrays["behavior_slots"][time_index, environment_index]
+                ),
+                "behavior_estimator": int(
+                    arrays["behavior_estimators"][time_index, environment_index]
+                ),
                 "behavior_action_probability": float(
                     arrays["behavior_action_probabilities"][
                         time_index, environment_index
@@ -152,6 +161,12 @@ def _decision_rows(
                 "per_action_policy_mediated_gain": arrays[
                     "per_action_policy_mediated_gains"
                 ][time_index, environment_index].tolist(),
+                "per_action_policy_mediated_gain_lcb": arrays[
+                    "per_action_policy_mediated_gain_lcbs"
+                ][time_index, environment_index].tolist(),
+                "per_action_policy_gain_uncertainty": arrays[
+                    "per_action_policy_gain_uncertainties"
+                ][time_index, environment_index].tolist(),
                 "per_action_expected_next_policy_tv": arrays[
                     "per_action_expected_next_policy_tvs"
                 ][time_index, environment_index].tolist(),
@@ -185,6 +200,16 @@ def _decision_rows(
                 ),
                 "predicted_policy_mediated_effect": float(
                     arrays["predicted_policy_mediated_effects"][
+                        time_index, environment_index
+                    ]
+                ),
+                "predicted_policy_mediated_effect_lcb": float(
+                    arrays["predicted_policy_mediated_effect_lcbs"][
+                        time_index, environment_index
+                    ]
+                ),
+                "predicted_policy_gain_uncertainty": float(
+                    arrays["predicted_policy_gain_uncertainties"][
                         time_index, environment_index
                     ]
                 ),
@@ -223,6 +248,16 @@ def _decision_rows(
                         time_index, environment_index
                     ]
                 ),
+                "executed_action_policy_mediated_gain_lcb": float(
+                    arrays["executed_action_policy_mediated_gain_lcbs"][
+                        time_index, environment_index
+                    ]
+                ),
+                "executed_action_policy_gain_uncertainty": float(
+                    arrays["executed_action_policy_gain_uncertainties"][
+                        time_index, environment_index
+                    ]
+                ),
                 "executed_action_expected_next_policy_tv": float(
                     arrays["executed_action_expected_next_policy_tvs"][
                         time_index, environment_index
@@ -235,6 +270,11 @@ def _decision_rows(
                 ),
                 "maximum_action_policy_mediated_gain": float(
                     arrays["maximum_action_policy_mediated_gains"][
+                        time_index, environment_index
+                    ]
+                ),
+                "maximum_action_policy_mediated_gain_lcb": float(
+                    arrays["maximum_action_policy_mediated_gain_lcbs"][
                         time_index, environment_index
                     ]
                 ),
@@ -307,6 +347,8 @@ def _responsibility_rows(
     mask = np.asarray(assignments.next_q_mask_energies)
     reference = np.asarray(assignments.next_reference_energy)
     available = np.asarray(assignments.bootstrap_mask, dtype=np.bool_)
+    importance_ratio = np.asarray(assignments.importance_ratio_mean)
+    trace_coefficient = np.asarray(assignments.trace_coefficient_mean)
     partner = np.asarray(records["partner_members"])[0]
     episode = np.asarray(records["episode_ids"])[0]
     environment_count, slot_count = responsibilities.shape
@@ -340,6 +382,12 @@ def _responsibility_rows(
                 ),
                 "bootstrap_available": bool(
                     available[environment_index, slot]
+                ),
+                "mean_importance_ratio": float(
+                    importance_ratio[environment_index]
+                ),
+                "mean_trace_coefficient": float(
+                    trace_coefficient[environment_index]
                 ),
             }
 
@@ -456,8 +504,8 @@ def _training_functions(
         hidden_dim=config.model.hidden_dim,
         initial_temperature=config.kl.initial_temperature,
         gamma=config.training.gamma,
+        uncertainty_penalty=config.model.uncertainty_penalty,
         terminal_response=config.model.response_count - 1,
-        behavior_support=config.training.behavior_support,
     )
     runner_functions = base._replace(
         partner_step=partner_step,
@@ -618,8 +666,15 @@ def run_training(args: argparse.Namespace) -> None:
         partner_member_count=partner_pool.member_count,
         deployment_mode="posterior_use",
         gamma=config.training.gamma,
+        uncertainty_penalty=config.model.uncertainty_penalty,
         terminal_response=config.model.response_count - 1,
-        behavior_support=config.training.behavior_support,
+        behavior_exploration_mix=(
+            config.training.behavior_exploration_mix
+        ),
+        behavior_exploration_temperature=(
+            config.training.behavior_exploration_temperature
+        ),
+        behavior_uniform_floor=config.training.behavior_uniform_floor,
     )
 
     def assignment_step(
@@ -644,6 +699,9 @@ def run_training(args: argparse.Namespace) -> None:
                 config.training.responsibility_temperature
             ),
             bootstrap_probability=config.training.bootstrap_probability,
+            retrace_lambda=config.training.retrace_lambda,
+            importance_ratio_clip=config.training.importance_ratio_clip,
+            uncertainty_penalty=config.model.uncertainty_penalty,
             terminal_response=config.model.response_count - 1,
             bootstrap_mask=bootstrap_mask,
         )
@@ -806,6 +864,7 @@ def run_training(args: argparse.Namespace) -> None:
                 )[0]
             ),
             gamma=config.training.gamma,
+            uncertainty_penalty=config.model.uncertainty_penalty,
         )
         temperature_batch = batch._replace(
             posterior_scores=updated_posterior_scores,

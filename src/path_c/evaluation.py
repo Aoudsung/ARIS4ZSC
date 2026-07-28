@@ -1,4 +1,4 @@
-"""Standard zero-shot coordination evaluation and response-use contrast."""
+"""V4.4 zero-shot coordination evaluation and response-use contrast."""
 
 from __future__ import annotations
 
@@ -75,12 +75,17 @@ class ResponseContrastRow:
     predicted_regularized_net_effect: float | None
     predicted_policy_total_variation: float | None
     predicted_policy_mediated_effect: float | None
+    predicted_policy_mediated_effect_lcb: float | None
+    predicted_policy_gain_uncertainty: float | None
     predicted_next_policy_total_variation: float | None
     maximum_action_net_value: float | None
     maximum_action_policy_mediated_gain: float | None
+    maximum_action_policy_mediated_gain_lcb: float | None
     executed_action_net_value: float | None
     executed_action_response_value: float | None
     executed_action_policy_mediated_gain: float | None
+    executed_action_policy_mediated_gain_lcb: float | None
+    executed_action_policy_gain_uncertainty: float | None
     executed_action_expected_next_policy_tv: float | None
     executed_action: int | None
     maximum_net_action: int | None
@@ -411,12 +416,17 @@ def _validate_response_contrast_content(row: ResponseContrastRow) -> None:
         row.predicted_regularized_net_effect,
         row.predicted_policy_total_variation,
         row.predicted_policy_mediated_effect,
+        row.predicted_policy_mediated_effect_lcb,
+        row.predicted_policy_gain_uncertainty,
         row.predicted_next_policy_total_variation,
         row.maximum_action_net_value,
         row.maximum_action_policy_mediated_gain,
+        row.maximum_action_policy_mediated_gain_lcb,
         row.executed_action_net_value,
         row.executed_action_response_value,
         row.executed_action_policy_mediated_gain,
+        row.executed_action_policy_mediated_gain_lcb,
+        row.executed_action_policy_gain_uncertainty,
         row.executed_action_expected_next_policy_tv,
         row.executed_action,
         row.maximum_net_action,
@@ -446,12 +456,17 @@ def _validate_response_contrast_content(row: ResponseContrastRow) -> None:
             row.predicted_regularized_net_effect,
             row.predicted_policy_total_variation,
             row.predicted_policy_mediated_effect,
+            row.predicted_policy_mediated_effect_lcb,
+            row.predicted_policy_gain_uncertainty,
             row.predicted_next_policy_total_variation,
             row.maximum_action_net_value,
             row.maximum_action_policy_mediated_gain,
+            row.maximum_action_policy_mediated_gain_lcb,
             row.executed_action_net_value,
             row.executed_action_response_value,
             row.executed_action_policy_mediated_gain,
+            row.executed_action_policy_mediated_gain_lcb,
+            row.executed_action_policy_gain_uncertainty,
             row.executed_action_expected_next_policy_tv,
             row.post_response_belief_l1,
         )
@@ -554,7 +569,7 @@ def equal_frequency_bins(
     triggered = sorted(
         (row for row in rows if row.triggered),
         key=lambda row: (
-            float(row.predicted_policy_mediated_effect),
+            float(row.predicted_policy_mediated_effect_lcb),
             row.pairing_id,
             row.episode_index,
         ),
@@ -573,11 +588,11 @@ def equal_frequency_bins(
                 "source_start": start,
                 "source_end": end,
                 "count": len(members),
-                "minimum_predicted_policy_mediated_effect": float(
-                    members[0].predicted_policy_mediated_effect
+                "minimum_predicted_policy_mediated_effect_lcb": float(
+                    members[0].predicted_policy_mediated_effect_lcb
                 ),
-                "maximum_predicted_policy_mediated_effect": float(
-                    members[-1].predicted_policy_mediated_effect
+                "maximum_predicted_policy_mediated_effect_lcb": float(
+                    members[-1].predicted_policy_mediated_effect_lcb
                 ),
                 "effects": {
                     name: mean(item[name] for item in effects)
@@ -601,11 +616,23 @@ def summarize_response_contrast(
             "mean_predicted_policy_mediated_effect": mean(
                 float(row.predicted_policy_mediated_effect) for row in triggered
             ),
+            "mean_predicted_policy_mediated_effect_lcb": mean(
+                float(row.predicted_policy_mediated_effect_lcb) for row in triggered
+            ),
+            "mean_predicted_policy_gain_uncertainty": mean(
+                float(row.predicted_policy_gain_uncertainty) for row in triggered
+            ),
             "mean_predicted_next_policy_total_variation": mean(
                 float(row.predicted_next_policy_total_variation) for row in triggered
             ),
             "mean_executed_action_policy_mediated_gain": mean(
                 float(row.executed_action_policy_mediated_gain) for row in triggered
+            ),
+            "mean_executed_action_policy_mediated_gain_lcb": mean(
+                float(row.executed_action_policy_mediated_gain_lcb) for row in triggered
+            ),
+            "mean_executed_action_policy_gain_uncertainty": mean(
+                float(row.executed_action_policy_gain_uncertainty) for row in triggered
             ),
             "mean_executed_action_expected_next_policy_tv": mean(
                 float(row.executed_action_expected_next_policy_tv) for row in triggered

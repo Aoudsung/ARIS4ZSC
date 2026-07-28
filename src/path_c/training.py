@@ -1,4 +1,4 @@
-"""Path C V4.3 transition batches, Bellman assignment, and updates."""
+"""Path C V4.4 transition batches, Bellman assignment, and updates."""
 
 from __future__ import annotations
 
@@ -75,7 +75,10 @@ class FrozenAssignments(NamedTuple):
     responsibility_energies: Any
     bootstrap_mask: Any
     bellman_targets: Any
+    one_step_bellman_targets: Any
     stale_bellman_targets: Any
+    importance_ratio_mean: Any
+    trace_coefficient_mean: Any
     stale_current_beliefs: Any
     response_signature_targets: Any
     response_code_targets: Any
@@ -149,6 +152,109 @@ def bellman_targets(
     return jnp.asarray(rewards)[..., None] + float(gamma) * (
         1.0 - jnp.asarray(dones, dtype=jnp.float32)
     )[..., None] * expected
+
+
+def retrace_targets(
+    *,
+    rewards: Any,
+    dones: Any,
+    actions: Any,
+    behavior_logits: Any,
+    target_execution_probabilities: Any,
+    target_q_values: Any,
+    gamma: float,
+    trace_lambda: float,
+    importance_ratio_clip: float,
+) -> tuple[Any, Any, Any]:
+    """Full-episode Retrace targets for off-policy recurrent action values.
+
+    ``target_q_values`` and ``target_execution_probabilities`` include the final
+    bootstrap state and therefore have length ``T+1``.  The returned target has
+    shape ``[T,B,M]``.  Importance ratios are computed from the action actually
+    sampled from the recorded behavior distribution; clipped trace coefficients
+    propagate sparse reward information backward without changing the deployed
+    target policy.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    reward = jnp.asarray(rewards, dtype=jnp.float32)
+    done = jnp.asarray(dones, dtype=jnp.bool_)
+    action = jnp.asarray(actions, dtype=jnp.int32)
+    behavior_log = jax.nn.log_softmax(
+        jnp.asarray(behavior_logits, dtype=jnp.float32), axis=-1
+    )
+    target_probability = jnp.asarray(
+        target_execution_probabilities, dtype=jnp.float32
+    )
+    q_values = jnp.min(jnp.asarray(target_q_values, dtype=jnp.float32), axis=-3)
+    if target_probability.shape[0] != reward.shape[0] + 1:
+        raise ValueError("Retrace target policies must include T+1 states.")
+    if q_values.shape[0] != reward.shape[0] + 1:
+        raise ValueError("Retrace Q values must include T+1 states.")
+    if action.shape != reward.shape or done.shape != reward.shape:
+        raise ValueError("Retrace actions and done flags must align with rewards.")
+    if behavior_log.shape[:-1] != reward.shape:
+        raise ValueError("Behavior logits must align with the reward prefix axes.")
+    if target_probability.shape[1:-1] != reward.shape[1:]:
+        raise ValueError("Retrace target-policy prefixes do not align with rewards.")
+    if q_values.shape[1:-2] != reward.shape[1:]:
+        raise ValueError("Retrace Q prefixes do not align with rewards.")
+    if q_values.shape[-1] != target_probability.shape[-1]:
+        raise ValueError("Retrace policy and Q action axes differ.")
+    if not 0.0 <= float(trace_lambda) <= 1.0:
+        raise ValueError("Retrace lambda must lie in [0, 1].")
+    if not 0.0 < float(importance_ratio_clip) <= 1.0:
+        raise ValueError("Retrace importance clip must lie in (0, 1].")
+
+    selected_q = gather_actions(q_values[:-1], action, action_axis=-1)
+    next_value = jnp.sum(
+        target_probability[1:, ..., None, :] * q_values[1:], axis=-1
+    )
+    delta = reward[..., None] + float(gamma) * (
+        1.0 - done.astype(jnp.float32)
+    )[..., None] * next_value - selected_q
+
+    selected_target_probability = gather_actions(
+        target_probability[:-1], action, action_axis=-1
+    )
+    selected_behavior_probability = jnp.exp(
+        gather_actions(behavior_log, action, action_axis=-1)
+    )
+    ratio = selected_target_probability / jnp.maximum(
+        selected_behavior_probability, 1.0e-12
+    )
+    coefficient = float(trace_lambda) * jnp.minimum(
+        ratio, float(importance_ratio_clip)
+    )
+    next_coefficient = jnp.concatenate(
+        (coefficient[1:], jnp.zeros_like(coefficient[:1])), axis=0
+    )
+
+    def backward(correction_next: Any, values: tuple[Any, ...]) -> tuple[Any, Any]:
+        q_at_time, delta_at_time, terminal, c_next = values
+        target = q_at_time + delta_at_time + float(gamma) * (
+            1.0 - terminal.astype(jnp.float32)
+        )[..., None] * c_next[..., None] * correction_next
+        return target - q_at_time, target
+
+    unused_correction, reversed_target = jax.lax.scan(
+        backward,
+        jnp.zeros_like(selected_q[-1]),
+        (
+            selected_q[::-1],
+            delta[::-1],
+            done[::-1],
+            next_coefficient[::-1],
+        ),
+    )
+    del unused_correction
+    return (
+        jax.lax.stop_gradient(reversed_target[::-1]),
+        jax.lax.stop_gradient(ratio),
+        jax.lax.stop_gradient(coefficient),
+    )
 
 
 def _td_evidence_items(*, q_values: Any, actions: Any, targets: Any) -> Any:
@@ -604,6 +710,7 @@ def _forward(
     temperature: Any,
     generic_temperature: Any,
     gamma: float,
+    uncertainty_penalty: float,
 ) -> Any:
     return model_forward(
         raw_output=raw_output,
@@ -613,6 +720,7 @@ def _forward(
         generic_temperature=generic_temperature,
         deployment_mode="posterior_use",
         gamma=gamma,
+        uncertainty_penalty=uncertainty_penalty,
     )
 
 
@@ -662,6 +770,9 @@ def prepare_frozen_assignments(
     gamma: float,
     responsibility_temperature: float,
     bootstrap_probability: float,
+    retrace_lambda: float,
+    importance_ratio_clip: float,
+    uncertainty_penalty: float,
     terminal_response: int,
     bootstrap_mask: Any | None = None,
 ) -> FrozenAssignments:
@@ -680,24 +791,37 @@ def prepare_frozen_assignments(
         target_output=target,
         batch=batch,
     )
-    next_forward = _forward(
-        raw_output={name: value[1:] for name, value in target.items()},
-        reference_logits=batch.reference_logits[1:],
-        slot_log_belief=batch.slot_log_beliefs[1:],
+    all_forward = _forward(
+        raw_output=target,
+        reference_logits=batch.reference_logits,
+        slot_log_belief=batch.slot_log_beliefs,
         temperature=temperature,
         generic_temperature=generic_temperature,
         gamma=gamma,
+        uncertainty_penalty=uncertainty_penalty,
     )
-    targets = jax.lax.stop_gradient(
+    target_execution_probabilities = jax.nn.softmax(
+        all_forward.execution_logits, axis=-1
+    )
+    one_step_targets = jax.lax.stop_gradient(
         bellman_targets(
             rewards=batch.rewards,
             dones=batch.dones,
-            next_execution_probabilities=jax.nn.softmax(
-                next_forward.execution_logits, axis=-1
-            ),
+            next_execution_probabilities=target_execution_probabilities[1:],
             target_next_q_values=target["q_values"][1:],
             gamma=gamma,
         )
+    )
+    targets, importance_ratios, trace_coefficients = retrace_targets(
+        rewards=batch.rewards,
+        dones=batch.dones,
+        actions=batch.actions,
+        behavior_logits=batch.behavior_logits,
+        target_execution_probabilities=target_execution_probabilities,
+        target_q_values=target["q_values"],
+        gamma=gamma,
+        trace_lambda=retrace_lambda,
+        importance_ratio_clip=importance_ratio_clip,
     )
 
     slot_count = int(batch.slot_log_beliefs.shape[-1])
@@ -772,6 +896,7 @@ def prepare_frozen_assignments(
         temperature=temperature,
         generic_temperature=generic_temperature,
         gamma=gamma,
+        uncertainty_penalty=uncertainty_penalty,
     )
     stale_targets = jax.lax.stop_gradient(
         bellman_targets(
@@ -836,7 +961,10 @@ def prepare_frozen_assignments(
         responsibility_energies=td_energies,
         bootstrap_mask=mask,
         bellman_targets=targets,
+        one_step_bellman_targets=one_step_targets,
         stale_bellman_targets=stale_targets,
+        importance_ratio_mean=jnp.mean(importance_ratios, axis=0),
+        trace_coefficient_mean=jnp.mean(trace_coefficients, axis=0),
         stale_current_beliefs=jax.lax.stop_gradient(stale_current),
         response_signature_targets=signatures,
         response_code_targets=code_targets,
@@ -864,7 +992,12 @@ def slice_assignments(
         responsibility_energies=assignments.responsibility_energies[indexes],
         bootstrap_mask=assignments.bootstrap_mask[indexes],
         bellman_targets=assignments.bellman_targets[:, indexes],
+        one_step_bellman_targets=(
+            assignments.one_step_bellman_targets[:, indexes]
+        ),
         stale_bellman_targets=assignments.stale_bellman_targets[:, indexes],
+        importance_ratio_mean=assignments.importance_ratio_mean[indexes],
+        trace_coefficient_mean=assignments.trace_coefficient_mean[indexes],
         stale_current_beliefs=assignments.stale_current_beliefs[:, indexes],
         response_signature_targets=assignments.response_signature_targets[:, indexes],
         response_code_targets=assignments.response_code_targets[:, indexes],
@@ -1131,6 +1264,7 @@ def recompute_policy_scores(
     temperature: Any,
     generic_temperature: Any,
     gamma: float,
+    uncertainty_penalty: float,
 ) -> tuple[Any, Any]:
     """Recompute current online scores after the rollout's parameter updates."""
 
@@ -1143,6 +1277,7 @@ def recompute_policy_scores(
         generic_temperature=generic_temperature,
         deployment_mode="posterior_use",
         gamma=gamma,
+        uncertainty_penalty=uncertainty_penalty,
     )
     return forward.j_use, forward.information_gain
 
@@ -1254,6 +1389,7 @@ __all__ = [
     "polyak_update",
     "prepare_frozen_assignments",
     "recompute_policy_scores",
+    "retrace_targets",
     "response_encoder_loss",
     "rollout_kl_means",
     "sample_bootstrap_mask",

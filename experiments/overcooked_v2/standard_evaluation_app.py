@@ -107,6 +107,9 @@ def pairing_batch(
                 key=left_keys,
                 deployment_mode=pairing.deployment_mode,
                 gamma=config.training.gamma,
+                uncertainty_penalty=config.model.uncertainty_penalty,
+                behavior_exploration_mix=0.0,
+                behavior_uniform_floor=0.0,
             )
         )
         stepped_right, right_action, right_output, right_record, unused_right_generic = (
@@ -118,6 +121,9 @@ def pairing_batch(
                 key=right_keys,
                 deployment_mode=pairing.deployment_mode,
                 gamma=config.training.gamma,
+                uncertainty_penalty=config.model.uncertainty_penalty,
+                behavior_exploration_mix=0.0,
+                behavior_uniform_floor=0.0,
             )
         )
         del unused_left_generic, unused_right_generic
@@ -197,14 +203,14 @@ def pairing_batch(
         right_codes,
     ) = recorded
     trigger_left = (
-        left_records.executed_action_policy_mediated_gain
+        left_records.executed_action_policy_mediated_gain_lcb
         > policy_effect_trigger_tolerance(left_records.j_use, left_records.j_mask)
     ) & (
         left_records.executed_action_expected_next_policy_tv
         >= config.evaluation.response_policy_tv_minimum
     )
     trigger_right = (
-        right_records.executed_action_policy_mediated_gain
+        right_records.executed_action_policy_mediated_gain_lcb
         > policy_effect_trigger_tolerance(right_records.j_use, right_records.j_mask)
     ) & (
         right_records.executed_action_expected_next_policy_tv
@@ -355,6 +361,16 @@ def pairing_batch(
                                 step, episode_index
                             ].tolist()
                         ),
+                        "per_action_policy_mediated_gain_lcb": (
+                            record.per_action_policy_mediated_gain_lcb[
+                                step, episode_index
+                            ].tolist()
+                        ),
+                        "per_action_policy_gain_uncertainty": (
+                            record.per_action_policy_gain_uncertainty[
+                                step, episode_index
+                            ].tolist()
+                        ),
                         "per_action_expected_next_policy_tv": (
                             record.per_action_expected_next_policy_tv[
                                 step, episode_index
@@ -410,6 +426,16 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
+                        "predicted_policy_mediated_effect_lcb": float(
+                            record.predicted_policy_mediated_effect_lcb[
+                                step, episode_index
+                            ]
+                        ),
+                        "predicted_policy_gain_uncertainty": float(
+                            record.predicted_policy_gain_uncertainty[
+                                step, episode_index
+                            ]
+                        ),
                         "predicted_next_policy_total_variation": float(
                             record.predicted_next_policy_total_variation[
                                 step, episode_index
@@ -430,6 +456,16 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
+                        "executed_action_policy_mediated_gain_lcb": float(
+                            record.executed_action_policy_mediated_gain_lcb[
+                                step, episode_index
+                            ]
+                        ),
+                        "executed_action_policy_gain_uncertainty": float(
+                            record.executed_action_policy_gain_uncertainty[
+                                step, episode_index
+                            ]
+                        ),
                         "executed_action_expected_next_policy_tv": float(
                             record.executed_action_expected_next_policy_tv[
                                 step, episode_index
@@ -442,6 +478,11 @@ def pairing_batch(
                         ),
                         "maximum_action_policy_mediated_gain": float(
                             record.maximum_action_policy_mediated_gain[
+                                step, episode_index
+                            ]
+                        ),
+                        "maximum_action_policy_mediated_gain_lcb": float(
+                            record.maximum_action_policy_mediated_gain_lcb[
                                 step, episode_index
                             ]
                         ),

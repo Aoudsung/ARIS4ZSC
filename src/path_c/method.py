@@ -1,4 +1,4 @@
-"""Path C V4.3 belief, value quotient, response, and policy mathematics.
+"""Path C V4.4 belief, value quotient, response, and policy mathematics.
 
 The module contains only mathematical operations consumed by the model, trainer,
 or evaluator.  Latent slot assignment is based on Bellman evidence; response and
@@ -46,8 +46,12 @@ class CodebookState(NamedTuple):
 class ControlValues(NamedTuple):
     j_use_by_estimator: Any
     j_mask_by_estimator: Any
+    j_use_mean_by_estimator: Any
+    j_mask_mean_by_estimator: Any
     j_use: Any
     j_mask: Any
+    j_use_mean: Any
+    j_mask_mean: Any
     value_mask: Any
     per_action_response_value: Any
     information_net_value: Any
@@ -58,7 +62,10 @@ class ControlValues(NamedTuple):
     next_mask_policy_probabilities: Any
     per_action_expected_next_policy_tv: Any
     policy_gain_by_estimator: Any
+    policy_gain_standard_deviation_by_estimator: Any
     per_action_policy_mediated_gain: Any
+    per_action_policy_mediated_gain_lcb: Any
+    per_action_policy_gain_uncertainty: Any
 
 
 class PolicyValues(NamedTuple):
@@ -247,18 +254,23 @@ def bellman_control_values(
     response_probabilities: Any,
     reward_mean: Any,
     next_q_use_mean: Any,
+    next_q_use_log_standard_deviation: Any,
     next_q_mask_mean: Any,
+    next_q_mask_log_standard_deviation: Any,
     next_reference_logits_mean: Any,
     temperature: Any,
+    uncertainty_penalty: float,
     gamma: float,
     probability_floor: float = 1.0e-8,
 ) -> ControlValues:
-    """Compute behavior-consistent use/mask values with common physical weights.
+    """Compute behavior-consistent, uncertainty-calibrated response values.
 
-    Shapes are ``belief [...,M]``, ``response [...,M,A,Y]``, reward
-    ``[...,M,A]``, next Q ``[...,E,M,A,Y,U]`` and next reference logits
-    ``[...,A,Y,U]``.  Use and mask share the physical conditional posterior;
-    only the controller belief used to construct the next action policy differs.
+    Use and mask share the physical joint ``b(m)p(y|m,a)``.  The controller
+    policies are constructed from lower-confidence next-action values, while
+    the reported policy-mediated gain retains a mean estimate and a propagated
+    uncertainty lower bound.  Action-independent value shifts cannot create a
+    positive mediated gain because the gain is evaluated through the difference
+    between the two next-action distributions.
     """
 
     import jax.numpy as jnp
@@ -266,12 +278,20 @@ def bellman_control_values(
     belief = jnp.asarray(slot_belief, dtype=jnp.float32)
     response = jnp.asarray(response_probabilities, dtype=jnp.float32)
     rewards = jnp.asarray(reward_mean, dtype=jnp.float32)
-    use_q = jnp.asarray(next_q_use_mean, dtype=jnp.float32)
-    mask_q = jnp.asarray(next_q_mask_mean, dtype=jnp.float32)
+    use_mean = jnp.asarray(next_q_use_mean, dtype=jnp.float32)
+    mask_mean = jnp.asarray(next_q_mask_mean, dtype=jnp.float32)
+    use_log_std = jnp.asarray(
+        next_q_use_log_standard_deviation, dtype=jnp.float32
+    )
+    mask_log_std = jnp.asarray(
+        next_q_mask_log_standard_deviation, dtype=jnp.float32
+    )
     next_reference = jnp.asarray(next_reference_logits_mean, dtype=jnp.float32)
-    if use_q.shape != mask_q.shape:
-        raise ValueError("Use and mask next-Q predictions must share shape.")
-    if use_q.shape[-5] != 2:
+    if use_mean.shape != mask_mean.shape or use_mean.shape != use_log_std.shape:
+        raise ValueError("Use/mask next-Q means and deviations must share shape.")
+    if mask_mean.shape != mask_log_std.shape:
+        raise ValueError("Mask next-Q mean and deviation shapes differ.")
+    if use_mean.shape[-5] != 2:
         raise ValueError("Behavior-consistent control requires two estimators.")
     if response.shape[-3] != belief.shape[-1]:
         raise ValueError("Response slots and belief slots differ.")
@@ -285,9 +305,9 @@ def bellman_control_values(
         response.shape[-1],
         next_reference.shape[-1],
     )
-    if use_q.shape != expected_q_shape:
+    if use_mean.shape != expected_q_shape:
         raise ValueError(
-            "Next-Q means require [...,estimator,slot,action,response,next_action]."
+            "Next-Q predictions require [...,estimator,slot,action,response,next_action]."
         )
     if next_reference.shape[:-3] != response.shape[:-3] or (
         next_reference.shape[-3] != response.shape[-2]
@@ -296,6 +316,9 @@ def bellman_control_values(
         raise ValueError(
             "Next reference logits require [...,action,response,next_action]."
         )
+    beta = float(uncertainty_penalty)
+    if beta < 0.0:
+        raise ValueError("Uncertainty penalty must be non-negative.")
 
     response = jnp.clip(response, float(probability_floor), 1.0)
     response = response / jnp.sum(response, axis=-1, keepdims=True)
@@ -312,11 +335,20 @@ def bellman_control_values(
         response_marginal[..., None, :, :], float(probability_floor)
     )
 
+    use_std = jnp.exp(use_log_std)
+    mask_std = jnp.exp(mask_log_std)
+    # The registered terminal response is the final code and has exactly zero
+    # continuation value; model uncertainty must not introduce a terminal cost.
+    use_std = use_std.at[..., -1, :].set(0.0)
+    mask_std = mask_std.at[..., -1, :].set(0.0)
+    use_control_q = use_mean - beta * use_std
+    mask_control_q = mask_mean - beta * mask_std
+
     use_controller_by_estimator = jnp.einsum(
-        "...may,...emayu->...eayu", updated, use_q
+        "...may,...emayu->...eayu", updated, use_control_q
     )
     mask_controller_by_estimator = jnp.einsum(
-        "...m,...emayu->...eayu", belief, mask_q
+        "...m,...emayu->...eayu", belief, mask_control_q
     )
     use_controller_score = jnp.min(use_controller_by_estimator, axis=-4)
     mask_controller_score = jnp.min(mask_controller_by_estimator, axis=-4)
@@ -329,44 +361,75 @@ def bellman_control_values(
         next_reference, mask_controller_score, next_alpha
     )
 
-    use_slot_value = jnp.einsum(
-        "...ayu,...emayu->...emay", use_policy.probabilities, use_q
-    )
-    mask_slot_value = jnp.einsum(
-        "...ayu,...emayu->...emay", mask_policy.probabilities, mask_q
-    )
-    use_conditional = jnp.einsum(
-        "...may,...emay->...eay", updated, use_slot_value
-    )
-    mask_conditional = jnp.einsum(
-        "...may,...emay->...eay", updated, mask_slot_value
-    )
-    use_expected = jnp.einsum(
-        "...ay,...eay->...ea", response_marginal, use_conditional
-    )
-    mask_expected = jnp.einsum(
-        "...ay,...eay->...ea", response_marginal, mask_conditional
-    )
+    def expected_slot_value(policy_probability: Any, q_values: Any) -> Any:
+        slot_value = jnp.einsum(
+            "...ayu,...emayu->...emay", policy_probability, q_values
+        )
+        conditional = jnp.einsum(
+            "...may,...emay->...eay", updated, slot_value
+        )
+        return jnp.einsum(
+            "...ay,...eay->...ea", response_marginal, conditional
+        )
+
+    use_expected = expected_slot_value(use_policy.probabilities, use_control_q)
+    mask_expected = expected_slot_value(mask_policy.probabilities, mask_control_q)
+    use_mean_expected = expected_slot_value(use_policy.probabilities, use_mean)
+    mask_mean_expected = expected_slot_value(mask_policy.probabilities, mask_mean)
 
     immediate = jnp.einsum("...m,...ma->...a", belief, rewards)
     j_use_by_estimator = immediate[..., None, :] + float(gamma) * use_expected
     j_mask_by_estimator = immediate[..., None, :] + float(gamma) * mask_expected
+    j_use_mean_by_estimator = (
+        immediate[..., None, :] + float(gamma) * use_mean_expected
+    )
+    j_mask_mean_by_estimator = (
+        immediate[..., None, :] + float(gamma) * mask_mean_expected
+    )
     j_use = jnp.min(j_use_by_estimator, axis=-2)
     j_mask = jnp.min(j_mask_by_estimator, axis=-2)
+    j_use_mean = jnp.min(j_use_mean_by_estimator, axis=-2)
+    j_mask_mean = jnp.min(j_mask_mean_by_estimator, axis=-2)
     value_mask = jnp.max(j_mask, axis=-1)
 
     delta_policy = use_policy.probabilities - mask_policy.probabilities
-    common_q = 0.5 * (use_q + mask_q)
+    common_mean = 0.5 * (use_mean + mask_mean)
+    common_variance = 0.25 * (jnp.square(use_std) + jnp.square(mask_std))
     gain_by_slot = jnp.einsum(
-        "...ayu,...emayu->...emay", delta_policy, common_q
+        "...ayu,...emayu->...emay", delta_policy, common_mean
+    )
+    gain_variance_by_slot = jnp.einsum(
+        "...ayu,...emayu->...emay",
+        jnp.square(delta_policy),
+        common_variance,
     )
     gain_conditional = jnp.einsum(
         "...may,...emay->...eay", updated, gain_by_slot
     )
+    gain_variance_conditional = jnp.einsum(
+        "...may,...emay->...eay",
+        jnp.square(updated),
+        gain_variance_by_slot,
+    )
     policy_gain_by_estimator = float(gamma) * jnp.einsum(
         "...ay,...eay->...ea", response_marginal, gain_conditional
     )
-    policy_mediated_gain = jnp.min(policy_gain_by_estimator, axis=-2)
+    policy_gain_variance_by_estimator = jnp.square(float(gamma)) * jnp.einsum(
+        "...ay,...eay->...ea",
+        jnp.square(response_marginal),
+        gain_variance_conditional,
+    )
+    policy_gain_std_by_estimator = jnp.sqrt(
+        jnp.maximum(policy_gain_variance_by_estimator, 0.0)
+    )
+    policy_gain = jnp.min(policy_gain_by_estimator, axis=-2)
+    policy_gain_uncertainty = jnp.max(
+        policy_gain_std_by_estimator, axis=-2
+    )
+    policy_gain_lcb = jnp.min(
+        policy_gain_by_estimator - beta * policy_gain_std_by_estimator,
+        axis=-2,
+    )
     next_policy_tv_by_response = 0.5 * jnp.sum(
         jnp.abs(delta_policy), axis=-1
     )
@@ -377,10 +440,14 @@ def bellman_control_values(
     return ControlValues(
         j_use_by_estimator=j_use_by_estimator,
         j_mask_by_estimator=j_mask_by_estimator,
+        j_use_mean_by_estimator=j_use_mean_by_estimator,
+        j_mask_mean_by_estimator=j_mask_mean_by_estimator,
         j_use=j_use,
         j_mask=j_mask,
+        j_use_mean=j_use_mean,
+        j_mask_mean=j_mask_mean,
         value_mask=value_mask,
-        per_action_response_value=j_use - j_mask,
+        per_action_response_value=j_use_mean - j_mask_mean,
         information_net_value=j_use - value_mask[..., None],
         response_marginal=response_marginal,
         updated_belief=updated,
@@ -389,7 +456,12 @@ def bellman_control_values(
         next_mask_policy_probabilities=mask_policy.probabilities,
         per_action_expected_next_policy_tv=expected_next_policy_tv,
         policy_gain_by_estimator=policy_gain_by_estimator,
-        per_action_policy_mediated_gain=policy_mediated_gain,
+        policy_gain_standard_deviation_by_estimator=(
+            policy_gain_std_by_estimator
+        ),
+        per_action_policy_mediated_gain=policy_gain,
+        per_action_policy_mediated_gain_lcb=policy_gain_lcb,
+        per_action_policy_gain_uncertainty=policy_gain_uncertainty,
     )
 
 
@@ -417,16 +489,29 @@ def generic_response_information(
 
 
 def policy_effect_decomposition(
-    *, reference_logits: Any, j_use: Any, j_mask: Any, temperature: Any
+    *,
+    reference_logits: Any,
+    j_use: Any,
+    j_mask: Any,
+    temperature: Any,
+    j_use_mean: Any | None = None,
+    j_mask_mean: Any | None = None,
 ) -> PolicyEffectValues:
-    """Predict raw-return effects for the exact current-step policies."""
+    """Predict raw-return effects for the exact current-step policies.
+
+    The policies are selected from conservative scores ``j_use`` and ``j_mask``.
+    Raw-return diagnostics may be evaluated with the corresponding posterior
+    means so uncertainty penalties are not mistaken for environmental reward.
+    """
 
     import jax.numpy as jnp
 
     use_policy = regularized_policy(reference_logits, j_use, temperature)
     mask_policy = regularized_policy(reference_logits, j_mask, temperature)
-    use_values = jnp.asarray(j_use)
-    mask_values = jnp.asarray(j_mask)
+    use_values = jnp.asarray(j_use if j_use_mean is None else j_use_mean)
+    mask_values = jnp.asarray(j_mask if j_mask_mean is None else j_mask_mean)
+    if use_values.shape != jnp.asarray(j_use).shape or mask_values.shape != jnp.asarray(j_mask).shape:
+        raise ValueError("Mean and conservative action values must share shape.")
     response_effect = jnp.sum(
         use_policy.probabilities * (use_values - mask_values), axis=-1
     )

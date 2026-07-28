@@ -18,6 +18,7 @@ from src.path_c.training import (
     polyak_update,
     response_encoder_loss,
     sample_bootstrap_mask,
+    retrace_targets,
 )
 
 
@@ -198,7 +199,70 @@ def test_codebook_update_uses_literal_signatures() -> None:
     } == {(0.0, 0.0, 1.0, 1.0), (4.0, 0.0, 2.0, 1.0)}
 
 
-def test_training_behavior_support_is_a_literal_uniform_mixture() -> None:
+def test_retrace_propagates_terminal_reward_and_lambda_zero_is_one_step() -> None:
+    rewards = jnp.asarray([[0.0], [1.0]], dtype=jnp.float32)
+    dones = jnp.asarray([[False], [True]])
+    actions = jnp.asarray([[0], [0]], dtype=jnp.int32)
+    behavior_logits = jnp.zeros((2, 1, 2), dtype=jnp.float32)
+    target_probabilities = jnp.full((3, 1, 2), 0.5, dtype=jnp.float32)
+    target_q = jnp.zeros((3, 1, 2, 1, 2), dtype=jnp.float32)
+
+    traced, ratios, coefficients = retrace_targets(
+        rewards=rewards,
+        dones=dones,
+        actions=actions,
+        behavior_logits=behavior_logits,
+        target_execution_probabilities=target_probabilities,
+        target_q_values=target_q,
+        gamma=0.5,
+        trace_lambda=1.0,
+        importance_ratio_clip=1.0,
+    )
+    np.testing.assert_allclose(np.asarray(traced[:, 0, 0]), [0.5, 1.0], atol=1e-6)
+    np.testing.assert_allclose(np.asarray(ratios), 1.0, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(coefficients), 1.0, atol=1e-6)
+
+    one_step, unused_ratio, unused_coeff = retrace_targets(
+        rewards=rewards,
+        dones=dones,
+        actions=actions,
+        behavior_logits=behavior_logits,
+        target_execution_probabilities=target_probabilities,
+        target_q_values=target_q,
+        gamma=0.5,
+        trace_lambda=0.0,
+        importance_ratio_clip=1.0,
+    )
+    del unused_ratio, unused_coeff
+    np.testing.assert_allclose(np.asarray(one_step[:, 0, 0]), [0.0, 1.0], atol=1e-6)
+
+
+def test_retrace_uses_recorded_behavior_probability() -> None:
+    rewards = jnp.zeros((1, 1), dtype=jnp.float32)
+    dones = jnp.asarray([[True]])
+    actions = jnp.asarray([[0]], dtype=jnp.int32)
+    behavior_logits = jnp.log(jnp.asarray([[[0.25, 0.75]]], dtype=jnp.float32))
+    target_probabilities = jnp.asarray(
+        [[[0.5, 0.5]], [[0.5, 0.5]]], dtype=jnp.float32
+    )
+    target_q = jnp.zeros((2, 1, 2, 1, 2), dtype=jnp.float32)
+    unused_targets, ratios, coefficients = retrace_targets(
+        rewards=rewards,
+        dones=dones,
+        actions=actions,
+        behavior_logits=behavior_logits,
+        target_execution_probabilities=target_probabilities,
+        target_q_values=target_q,
+        gamma=0.99,
+        trace_lambda=0.9,
+        importance_ratio_clip=1.0,
+    )
+    del unused_targets
+    np.testing.assert_allclose(np.asarray(ratios), [[2.0]], atol=1e-6)
+    np.testing.assert_allclose(np.asarray(coefficients), [[0.9]], atol=1e-6)
+
+
+def test_training_behavior_is_a_literal_persistent_expert_mixture() -> None:
     from src.path_c.method import PolicyState, uniform_slot_log_belief
     from src.path_c.runner import RunnerFunctions, policy_action
 
@@ -219,6 +283,7 @@ def test_training_behavior_support_is_a_literal_uniform_mixture() -> None:
     def heads_apply(params, control_carry, features, previous_action, previous_reward, episode_start, belief):
         del params, features, previous_action, previous_reward, episode_start, belief
         zeros_q = jnp.zeros((batch, 2, slot_count, action_count), dtype=jnp.float32)
+        q_values = zeros_q.at[0, 1, 1].set(jnp.asarray([-1.0, 2.0, 0.5]))
         response = jnp.full(
             (batch, slot_count, action_count, response_count),
             1.0 / response_count,
@@ -230,8 +295,8 @@ def test_training_behavior_support_is_a_literal_uniform_mixture() -> None:
         )
         return control_carry, {
             "features": jnp.zeros((batch, 4), dtype=jnp.float32),
-            "q_values": zeros_q,
-            "learned_q_values": zeros_q,
+            "q_values": q_values,
+            "learned_q_values": q_values,
             "prior_q_values": zeros_q,
             "centered_advantages": zeros_q,
             "response_logits": jnp.zeros_like(response),
@@ -274,12 +339,21 @@ def test_training_behavior_support_is_a_literal_uniform_mixture() -> None:
         key=jax.random.split(jax.random.PRNGKey(33), batch),
         deployment_mode="posterior_use",
         gamma=0.99,
-        behavior_support=0.1,
+        uncertainty_penalty=0.0,
+        behavior_slot=jnp.asarray([1]),
+        behavior_estimator=jnp.asarray([1]),
+        behavior_exploration_mix=0.25,
+        behavior_exploration_temperature=0.5,
+        behavior_uniform_floor=0.02,
     )
     del unused_state, unused_action, unused_generic
-    target = 0.9 * jax.nn.softmax(output.execution_logits, axis=-1) + 0.1 / action_count
+    execution = jax.nn.softmax(output.execution_logits, axis=-1)
+    exploration = jax.nn.softmax(record.exploration_logits, axis=-1)
+    target = 0.73 * execution + 0.25 * exploration + 0.02 / action_count
     np.testing.assert_allclose(
         np.asarray(jax.nn.softmax(record.behavior_logits, axis=-1)),
         np.asarray(target),
         atol=1e-7,
     )
+    np.testing.assert_array_equal(np.asarray(record.behavior_slot), [1])
+    np.testing.assert_array_equal(np.asarray(record.behavior_estimator), [1])

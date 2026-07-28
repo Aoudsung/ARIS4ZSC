@@ -59,12 +59,17 @@ class _ContrastState(NamedTuple):
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
     predicted_policy_mediated_effect: Any
+    predicted_policy_mediated_effect_lcb: Any
+    predicted_policy_gain_uncertainty: Any
     predicted_next_policy_total_variation: Any
     maximum_action_net_value: Any
     maximum_action_policy_mediated_gain: Any
+    maximum_action_policy_mediated_gain_lcb: Any
     executed_action_net_value: Any
     executed_action_response_value: Any
     executed_action_policy_mediated_gain: Any
+    executed_action_policy_mediated_gain_lcb: Any
+    executed_action_policy_gain_uncertainty: Any
     executed_action_expected_next_policy_tv: Any
     executed_action: Any
     maximum_net_action: Any
@@ -98,7 +103,9 @@ def _deployment_step(
         key=keys,
         deployment_mode="posterior_use",
         gamma=config.training.gamma,
-        behavior_support=0.0,
+        uncertainty_penalty=config.model.uncertainty_penalty,
+        behavior_exploration_mix=0.0,
+        behavior_uniform_floor=0.0,
     )
     del unused_generic
     return DeploymentStep(next_state, action, output, record)
@@ -260,12 +267,17 @@ def contrast_pairing_batch(
         predicted_regularized_net_effect=zeros_float,
         predicted_policy_total_variation=zeros_float,
         predicted_policy_mediated_effect=zeros_float,
+        predicted_policy_mediated_effect_lcb=zeros_float,
+        predicted_policy_gain_uncertainty=zeros_float,
         predicted_next_policy_total_variation=zeros_float,
         maximum_action_net_value=zeros_float,
         maximum_action_policy_mediated_gain=zeros_float,
+        maximum_action_policy_mediated_gain_lcb=zeros_float,
         executed_action_net_value=zeros_float,
         executed_action_response_value=zeros_float,
         executed_action_policy_mediated_gain=zeros_float,
+        executed_action_policy_mediated_gain_lcb=zeros_float,
+        executed_action_policy_gain_uncertainty=zeros_float,
         executed_action_expected_next_policy_tv=zeros_float,
         executed_action=minus_one,
         maximum_net_action=minus_one,
@@ -338,7 +350,7 @@ def contrast_pairing_batch(
             use_left.output.j_use, use_left.output.j_mask
         )
         actionable = (
-            use_left.record.executed_action_policy_mediated_gain > tolerance
+            use_left.record.executed_action_policy_mediated_gain_lcb > tolerance
         ) & (
             use_left.record.executed_action_expected_next_policy_tv
             >= config.evaluation.response_policy_tv_minimum
@@ -452,6 +464,14 @@ def contrast_pairing_batch(
                 current.predicted_policy_mediated_effect,
                 use_left.output.predicted_policy_mediated_effect,
             ),
+            predicted_policy_mediated_effect_lcb=capture(
+                current.predicted_policy_mediated_effect_lcb,
+                use_left.output.predicted_policy_mediated_effect_lcb,
+            ),
+            predicted_policy_gain_uncertainty=capture(
+                current.predicted_policy_gain_uncertainty,
+                use_left.output.predicted_policy_gain_uncertainty,
+            ),
             predicted_next_policy_total_variation=capture(
                 current.predicted_next_policy_total_variation,
                 use_left.output.predicted_next_policy_total_variation,
@@ -464,6 +484,10 @@ def contrast_pairing_batch(
                 current.maximum_action_policy_mediated_gain,
                 use_left.record.maximum_action_policy_mediated_gain,
             ),
+            maximum_action_policy_mediated_gain_lcb=capture(
+                current.maximum_action_policy_mediated_gain_lcb,
+                use_left.record.maximum_action_policy_mediated_gain_lcb,
+            ),
             executed_action_net_value=capture(
                 current.executed_action_net_value,
                 use_left.record.executed_action_net_value,
@@ -475,6 +499,14 @@ def contrast_pairing_batch(
             executed_action_policy_mediated_gain=capture(
                 current.executed_action_policy_mediated_gain,
                 use_left.record.executed_action_policy_mediated_gain,
+            ),
+            executed_action_policy_mediated_gain_lcb=capture(
+                current.executed_action_policy_mediated_gain_lcb,
+                use_left.record.executed_action_policy_mediated_gain_lcb,
+            ),
+            executed_action_policy_gain_uncertainty=capture(
+                current.executed_action_policy_gain_uncertainty,
+                use_left.record.executed_action_policy_gain_uncertainty,
             ),
             executed_action_expected_next_policy_tv=capture(
                 current.executed_action_expected_next_policy_tv,
@@ -576,6 +608,12 @@ def contrast_pairing_batch(
                 predicted_policy_mediated_effect=optional_float(
                     final.predicted_policy_mediated_effect
                 ),
+                predicted_policy_mediated_effect_lcb=optional_float(
+                    final.predicted_policy_mediated_effect_lcb
+                ),
+                predicted_policy_gain_uncertainty=optional_float(
+                    final.predicted_policy_gain_uncertainty
+                ),
                 predicted_next_policy_total_variation=optional_float(
                     final.predicted_next_policy_total_variation
                 ),
@@ -585,6 +623,9 @@ def contrast_pairing_batch(
                 maximum_action_policy_mediated_gain=optional_float(
                     final.maximum_action_policy_mediated_gain
                 ),
+                maximum_action_policy_mediated_gain_lcb=optional_float(
+                    final.maximum_action_policy_mediated_gain_lcb
+                ),
                 executed_action_net_value=optional_float(
                     final.executed_action_net_value
                 ),
@@ -593,6 +634,12 @@ def contrast_pairing_batch(
                 ),
                 executed_action_policy_mediated_gain=optional_float(
                     final.executed_action_policy_mediated_gain
+                ),
+                executed_action_policy_mediated_gain_lcb=optional_float(
+                    final.executed_action_policy_mediated_gain_lcb
+                ),
+                executed_action_policy_gain_uncertainty=optional_float(
+                    final.executed_action_policy_gain_uncertainty
                 ),
                 executed_action_expected_next_policy_tv=optional_float(
                     final.executed_action_expected_next_policy_tv

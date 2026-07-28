@@ -1,4 +1,4 @@
-"""Path C V4.3 control memory, Bellman experts, and outcome models.
+"""Path C V4.4 control memory, Bellman experts, and outcome models.
 
 The official recurrent network supplies an observation-history feature.  A
 Bellman-trained control memory integrates that feature with the ego's previous
@@ -41,9 +41,13 @@ class ModelOutput(NamedTuple):
     supported_value_class_count: Any
     j_use: Any
     j_mask: Any
+    j_use_mean: Any
+    j_mask_mean: Any
     per_action_response_value: Any
     per_action_net_value: Any
     per_action_policy_mediated_gain: Any
+    per_action_policy_mediated_gain_lcb: Any
+    per_action_policy_gain_uncertainty: Any
     per_action_expected_next_policy_tv: Any
     information_gain: Any
     execution_logits: Any
@@ -54,6 +58,8 @@ class ModelOutput(NamedTuple):
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
     predicted_policy_mediated_effect: Any
+    predicted_policy_mediated_effect_lcb: Any
+    predicted_policy_gain_uncertainty: Any
     predicted_next_policy_total_variation: Any
 
 
@@ -759,6 +765,7 @@ def model_forward(
     generic_temperature: Any,
     deployment_mode: str,
     gamma: float,
+    uncertainty_penalty: float,
 ) -> ModelOutput:
     import jax.numpy as jnp
 
@@ -770,11 +777,18 @@ def model_forward(
         response_probabilities=raw_output["response_probabilities"],
         reward_mean=raw_output["reward_mean"],
         next_q_use_mean=raw_output["next_q_use_mean"],
+        next_q_use_log_standard_deviation=raw_output[
+            "next_q_use_log_standard_deviation"
+        ],
         next_q_mask_mean=raw_output["next_q_mask_mean"],
+        next_q_mask_log_standard_deviation=raw_output[
+            "next_q_mask_log_standard_deviation"
+        ],
         next_reference_logits_mean=raw_output[
             "next_reference_logits_mean"
         ],
         temperature=temperature,
+        uncertainty_penalty=uncertainty_penalty,
         gamma=gamma,
     )
     information = generic_response_information(
@@ -785,6 +799,8 @@ def model_forward(
         reference_logits=reference_logits,
         j_use=control.j_use,
         j_mask=control.j_mask,
+        j_use_mean=control.j_use_mean,
+        j_mask_mean=control.j_mask_mean,
         temperature=temperature,
     )
     policy = deployment_policy(
@@ -797,6 +813,14 @@ def model_forward(
     )
     mediated = jnp.sum(
         policy.probabilities * control.per_action_policy_mediated_gain,
+        axis=-1,
+    )
+    mediated_lcb = jnp.sum(
+        policy.probabilities * control.per_action_policy_mediated_gain_lcb,
+        axis=-1,
+    )
+    mediated_uncertainty = jnp.sum(
+        policy.probabilities * control.per_action_policy_gain_uncertainty,
         axis=-1,
     )
     next_tv = jnp.sum(
@@ -832,10 +856,18 @@ def model_forward(
         ),
         j_use=control.j_use,
         j_mask=control.j_mask,
+        j_use_mean=control.j_use_mean,
+        j_mask_mean=control.j_mask_mean,
         per_action_response_value=control.per_action_response_value,
         per_action_net_value=control.information_net_value,
         per_action_policy_mediated_gain=(
             control.per_action_policy_mediated_gain
+        ),
+        per_action_policy_mediated_gain_lcb=(
+            control.per_action_policy_mediated_gain_lcb
+        ),
+        per_action_policy_gain_uncertainty=(
+            control.per_action_policy_gain_uncertainty
         ),
         per_action_expected_next_policy_tv=(
             control.per_action_expected_next_policy_tv
@@ -849,6 +881,8 @@ def model_forward(
         predicted_regularized_net_effect=effects.regularized_net_effect,
         predicted_policy_total_variation=effects.total_variation,
         predicted_policy_mediated_effect=mediated,
+        predicted_policy_mediated_effect_lcb=mediated_lcb,
+        predicted_policy_gain_uncertainty=mediated_uncertainty,
         predicted_next_policy_total_variation=next_tv,
     )
 

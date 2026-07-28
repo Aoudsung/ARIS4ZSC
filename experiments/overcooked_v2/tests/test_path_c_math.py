@@ -74,9 +74,12 @@ def test_use_and_mask_share_physical_posterior_but_choose_distinct_next_policies
         response_probabilities=jnp.asarray(response),
         reward_mean=jnp.asarray(reward),
         next_q_use_mean=jnp.asarray(use_q),
+        next_q_use_log_standard_deviation=jnp.full_like(jnp.asarray(use_q), -20.0),
         next_q_mask_mean=jnp.asarray(mask_q),
+        next_q_mask_log_standard_deviation=jnp.full_like(jnp.asarray(mask_q), -20.0),
         next_reference_logits_mean=jnp.asarray(next_reference),
         temperature=jnp.asarray([1.0]),
+        uncertainty_penalty=0.0,
         gamma=0.9,
     )
 
@@ -160,9 +163,12 @@ def test_action_independent_next_q_shift_cannot_create_policy_mediated_gain() ->
         response_probabilities=response,
         reward_mean=jnp.zeros((1, 2, 1)),
         next_q_use_mean=shifted,
+        next_q_use_log_standard_deviation=jnp.full_like(shifted, -20.0),
         next_q_mask_mean=base,
+        next_q_mask_log_standard_deviation=jnp.full_like(base, -20.0),
         next_reference_logits_mean=jnp.zeros((1, 1, 2, 2)),
         temperature=jnp.asarray([1.0]),
+        uncertainty_penalty=0.0,
         gamma=0.99,
     )
     np.testing.assert_allclose(
@@ -275,3 +281,60 @@ def test_non_bellman_response_loss_cannot_move_feature() -> None:
 
     gradient = jax.grad(outcome_sum)(features)
     np.testing.assert_array_equal(np.asarray(gradient), np.zeros((1, 8)))
+
+
+def test_uncertainty_penalty_lowers_policy_gain_bound_without_changing_mean() -> None:
+    belief = jnp.asarray([[0.6, 0.4]], dtype=jnp.float32)
+    response = jnp.asarray(
+        [[[[0.8, 0.2]], [[0.2, 0.8]]]], dtype=jnp.float32
+    )
+    use = jnp.asarray(
+        [[[[[[2.0, 0.0], [0.0, 2.0]]], [[[0.0, 1.0], [2.0, 0.0]]]],
+           [[[[1.8, 0.2], [0.2, 1.8]]], [[[0.2, 0.8], [1.8, 0.2]]]]]],
+        dtype=jnp.float32,
+    )
+    mask = jnp.zeros_like(use)
+    log_std = jnp.full_like(use, -1.0)
+    common = dict(
+        slot_belief=belief,
+        response_probabilities=response,
+        reward_mean=jnp.zeros((1, 2, 1), dtype=jnp.float32),
+        next_q_use_mean=use,
+        next_q_use_log_standard_deviation=log_std,
+        next_q_mask_mean=mask,
+        next_q_mask_log_standard_deviation=log_std,
+        next_reference_logits_mean=jnp.zeros((1, 1, 2, 2), dtype=jnp.float32),
+        temperature=jnp.asarray([1.0]),
+        gamma=0.99,
+    )
+    unpenalized = bellman_control_values(**common, uncertainty_penalty=0.0)
+    penalized = bellman_control_values(**common, uncertainty_penalty=1.0)
+    np.testing.assert_allclose(
+        np.asarray(unpenalized.per_action_policy_mediated_gain),
+        np.asarray(penalized.per_action_policy_mediated_gain),
+        atol=1e-6,
+    )
+    assert np.all(
+        np.asarray(penalized.per_action_policy_mediated_gain_lcb)
+        <= np.asarray(penalized.per_action_policy_mediated_gain) + 1e-7
+    )
+
+
+def test_terminal_response_has_exactly_zero_continuation_uncertainty() -> None:
+    response = jnp.asarray([[[[0.0, 1.0]], [[0.0, 1.0]]]], dtype=jnp.float32)
+    shape = (1, 2, 2, 1, 2, 2)
+    values = bellman_control_values(
+        slot_belief=jnp.asarray([[0.5, 0.5]], dtype=jnp.float32),
+        response_probabilities=response,
+        reward_mean=jnp.zeros((1, 2, 1), dtype=jnp.float32),
+        next_q_use_mean=jnp.zeros(shape, dtype=jnp.float32),
+        next_q_use_log_standard_deviation=jnp.zeros(shape, dtype=jnp.float32),
+        next_q_mask_mean=jnp.zeros(shape, dtype=jnp.float32),
+        next_q_mask_log_standard_deviation=jnp.zeros(shape, dtype=jnp.float32),
+        next_reference_logits_mean=jnp.zeros((1, 1, 2, 2), dtype=jnp.float32),
+        temperature=jnp.asarray([1.0]),
+        uncertainty_penalty=10.0,
+        gamma=0.99,
+    )
+    np.testing.assert_allclose(np.asarray(values.j_use), 0.0, atol=1e-7)
+    np.testing.assert_allclose(np.asarray(values.j_mask), 0.0, atol=1e-7)
