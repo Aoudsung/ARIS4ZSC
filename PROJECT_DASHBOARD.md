@@ -5,16 +5,38 @@
 ## 当前实现
 
 - 方法版本：`path_c_v4_4_retrace_calibrated_control_r1`。
-- 状态：远端 54 项测试、机械恢复检查、seed-100 开发训练、自我配对、回应屏蔽和固定伙伴面板均已完成。
+- 状态：seed-100 开发训练和评估已完成；冻结 checkpoint 的反事实任务价值审计已完成，最终 69 项远端测试全部通过。
 - 活跃源码：`src/path_c/`。
 - OvercookedV2 接入：`experiments/overcooked_v2/official_adapter.py`。
 - 唯一入口：`python -m experiments.overcooked_v2.path_c`。
 - 布局配置：`path_c_simple.yaml` 与 `path_c_wide.yaml`，schema version 4。
 - 十单元正式训练：关闭。
 
+## 冻结 checkpoint 反事实任务价值审计裁决
+
+V4.4 第 1,228,800 环境步 checkpoint 已完成只读审计。47 个自我配对触发点和 178 个固定
+伙伴触发点均使用 128 组共同随机数重放，完整保存 403,200 条 continuation。审计实际执行
+101,149,120 个环境步；原训练、评估、固定伙伴产物和 checkpoint 均未改写。
+
+主要结果是：预测下界分数覆盖率只有 29.33%，低于登记的 95%；预测与经验动作排序的平均
+Spearman 等级相关系数为 +0.01287；高分一半的经验回应前收益为 −0.01687，低分一半为
++0.00527。自我配对能力仍为 168.48，但当前预测器没有把更有价值的触发状态排到更高位置。
+
+八项正式训练解除条件中，动作价值重复估计、严格正的排序相关、多个固定伙伴出现正的重复
+回应前收益以及能力保持四项满足；其中排序相关接近 0，不能解释为强相关。预测下界覆盖率和
+高分组收益两项未满足；Other-Play seed 202 的负效应根因及槽语义两项证据不足。正式十单元
+训练继续关闭。
+
+完整结果、口径和证据哈希见
+[`PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md`](docs/status/PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md#9-冻结-checkpoint-的反事实任务价值审计)。
+最终远端清单摘要为 `bf4416fa2a323769882f4ad19a6f9937e627c1e44ba15db97707e756d18d25ac`。
+
 ## V4.4 seed-100 开发裁决
 
 V4.4 在 Test Time Simple 完成 1,228,800 个训练环境步、3,072 个训练回合和 96 次更新。四种部署模式各完成 500 个匹配自我配对回合；回应屏蔽完成 500 个匹配回合；四个固定伙伴与四种部署模式共完成 8,000 个回合。全部产物仍为开发诊断，`scientific_readout_allowed: false`。
+
+完整的原始行重算、训练过程、固定伙伴结果和证据哈希见
+[`PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md`](docs/status/PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md)。
 
 训练后的自我配对能力保持在参考策略量级：`posterior_use`、`prior_only`、`reference_only` 和 `generic_response_information` 的平均原始回报分别为 168.48、168.76、168.20 和 168.20。
 

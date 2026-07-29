@@ -39,7 +39,7 @@ class DecisionRecord(NamedTuple):
     per_action_response_value: Any
     per_action_net_value: Any
     per_action_policy_mediated_gain: Any
-    per_action_policy_mediated_gain_lcb: Any
+    per_action_predicted_gain_lower_score: Any
     per_action_policy_gain_uncertainty: Any
     per_action_expected_next_policy_tv: Any
     information_gain: Any
@@ -55,18 +55,18 @@ class DecisionRecord(NamedTuple):
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
     predicted_policy_mediated_effect: Any
-    predicted_policy_mediated_effect_lcb: Any
+    predicted_policy_gain_lower_score: Any
     predicted_policy_gain_uncertainty: Any
     predicted_next_policy_total_variation: Any
     executed_action_response_value: Any
     executed_action_net_value: Any
     executed_action_policy_mediated_gain: Any
-    executed_action_policy_mediated_gain_lcb: Any
+    executed_action_predicted_gain_lower_score: Any
     executed_action_policy_gain_uncertainty: Any
     executed_action_expected_next_policy_tv: Any
     maximum_action_net_value: Any
     maximum_action_policy_mediated_gain: Any
-    maximum_action_policy_mediated_gain_lcb: Any
+    maximum_action_predicted_gain_lower_score: Any
 
 
 class RunnerState(NamedTuple):
@@ -359,8 +359,8 @@ def policy_action(
         action[..., None],
         axis=-1,
     )[..., 0]
-    executed_policy_gain_lcb = jnp.take_along_axis(
-        output.per_action_policy_mediated_gain_lcb,
+    executed_gain_lower_score = jnp.take_along_axis(
+        output.per_action_predicted_gain_lower_score,
         action[..., None],
         axis=-1,
     )[..., 0]
@@ -396,8 +396,8 @@ def policy_action(
         per_action_policy_mediated_gain=(
             output.per_action_policy_mediated_gain
         ),
-        per_action_policy_mediated_gain_lcb=(
-            output.per_action_policy_mediated_gain_lcb
+        per_action_predicted_gain_lower_score=(
+            output.per_action_predicted_gain_lower_score
         ),
         per_action_policy_gain_uncertainty=(
             output.per_action_policy_gain_uncertainty
@@ -424,8 +424,8 @@ def policy_action(
         predicted_policy_mediated_effect=(
             output.predicted_policy_mediated_effect
         ),
-        predicted_policy_mediated_effect_lcb=(
-            output.predicted_policy_mediated_effect_lcb
+        predicted_policy_gain_lower_score=(
+            output.predicted_policy_gain_lower_score
         ),
         predicted_policy_gain_uncertainty=(
             output.predicted_policy_gain_uncertainty
@@ -436,7 +436,7 @@ def policy_action(
         executed_action_response_value=executed_response,
         executed_action_net_value=executed_net,
         executed_action_policy_mediated_gain=executed_policy_gain,
-        executed_action_policy_mediated_gain_lcb=executed_policy_gain_lcb,
+        executed_action_predicted_gain_lower_score=executed_gain_lower_score,
         executed_action_policy_gain_uncertainty=(
             executed_policy_gain_uncertainty
         ),
@@ -445,8 +445,8 @@ def policy_action(
         maximum_action_policy_mediated_gain=jnp.max(
             output.per_action_policy_mediated_gain, axis=-1
         ),
-        maximum_action_policy_mediated_gain_lcb=jnp.max(
-            output.per_action_policy_mediated_gain_lcb, axis=-1
+        maximum_action_predicted_gain_lower_score=jnp.max(
+            output.per_action_predicted_gain_lower_score, axis=-1
         ),
     )
     return next_state, action, output, record, generic.logits
@@ -716,8 +716,8 @@ def collect_rollout(
             "per_action_policy_mediated_gains": (
                 decision.per_action_policy_mediated_gain
             ),
-            "per_action_policy_mediated_gain_lcbs": (
-                decision.per_action_policy_mediated_gain_lcb
+            "per_action_predicted_gain_lower_scores": (
+                decision.per_action_predicted_gain_lower_score
             ),
             "per_action_policy_gain_uncertainties": (
                 decision.per_action_policy_gain_uncertainty
@@ -738,8 +738,8 @@ def collect_rollout(
             "predicted_policy_mediated_effects": (
                 decision.predicted_policy_mediated_effect
             ),
-            "predicted_policy_mediated_effect_lcbs": (
-                decision.predicted_policy_mediated_effect_lcb
+            "predicted_policy_gain_lower_scores": (
+                decision.predicted_policy_gain_lower_score
             ),
             "predicted_policy_gain_uncertainties": (
                 decision.predicted_policy_gain_uncertainty
@@ -757,8 +757,8 @@ def collect_rollout(
             "executed_action_policy_mediated_gains": (
                 decision.executed_action_policy_mediated_gain
             ),
-            "executed_action_policy_mediated_gain_lcbs": (
-                decision.executed_action_policy_mediated_gain_lcb
+            "executed_action_predicted_gain_lower_scores": (
+                decision.executed_action_predicted_gain_lower_score
             ),
             "executed_action_policy_gain_uncertainties": (
                 decision.executed_action_policy_gain_uncertainty
@@ -770,8 +770,8 @@ def collect_rollout(
             "maximum_action_policy_mediated_gains": (
                 decision.maximum_action_policy_mediated_gain
             ),
-            "maximum_action_policy_mediated_gain_lcbs": (
-                decision.maximum_action_policy_mediated_gain_lcb
+            "maximum_action_predicted_gain_lower_scores": (
+                decision.maximum_action_predicted_gain_lower_score
             ),
         }
 
@@ -856,7 +856,7 @@ def collect_rollout(
             "per_action_response_values",
             "per_action_net_values",
             "per_action_policy_mediated_gains",
-            "per_action_policy_mediated_gain_lcbs",
+            "per_action_predicted_gain_lower_scores",
             "per_action_policy_gain_uncertainties",
             "per_action_expected_next_policy_tvs",
             "information_gains",
@@ -870,7 +870,7 @@ def collect_rollout(
             "predicted_regularized_net_effects",
             "predicted_policy_total_variations",
             "predicted_policy_mediated_effects",
-            "predicted_policy_mediated_effect_lcbs",
+            "predicted_policy_gain_lower_scores",
             "predicted_policy_gain_uncertainties",
             "predicted_next_policy_total_variations",
             "kl_divergences",
@@ -879,12 +879,12 @@ def collect_rollout(
             "executed_action_response_values",
             "executed_action_net_values",
             "executed_action_policy_mediated_gains",
-            "executed_action_policy_mediated_gain_lcbs",
+            "executed_action_predicted_gain_lower_scores",
             "executed_action_policy_gain_uncertainties",
             "executed_action_expected_next_policy_tvs",
             "maximum_action_net_values",
             "maximum_action_policy_mediated_gains",
-            "maximum_action_policy_mediated_gain_lcbs",
+            "maximum_action_predicted_gain_lower_scores",
         )
     }
     return final_state, batch, records

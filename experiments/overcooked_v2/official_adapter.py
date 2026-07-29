@@ -572,6 +572,21 @@ class FrozenPartnerPool:
         import jax
 
         keys = jax.random.split(key, observations.shape[0])
+        return self.step_with_keys(
+            member_indexes, observations, carry, episode_start, keys
+        )
+
+    def step_with_keys(
+        self,
+        member_indexes: Any,
+        observations: Any,
+        carry: Any,
+        episode_start: Any,
+        keys: Any,
+    ) -> tuple[Any, Any]:
+        """Advance each frozen partner with an explicitly paired action key."""
+
+        import jax
 
         def one(
             member: Any,

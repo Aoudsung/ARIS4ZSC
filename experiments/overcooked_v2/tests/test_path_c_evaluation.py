@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from statistics import mean, stdev
 
@@ -11,12 +12,16 @@ from src.path_c.evaluation import (
     EpisodeRow,
     Pairing,
     ResponseContrastRow,
+    equal_frequency_bins,
     effect_components,
+    spearman_rank_correlation,
     standard_episode_seed,
     standard_pairings,
     summarize_standard_rows,
+    summarize_counterfactual_trigger_values,
     validate_development_response_contrast_rows,
     validate_development_rows,
+    validate_counterfactual_continuation_index,
     validate_response_contrast_rows,
     validate_standard_rows,
 )
@@ -151,16 +156,16 @@ def _contrast_row(*, left: int, right: int, index: int, triggered: bool) -> Resp
         predicted_regularized_net_effect=0.08 if triggered else None,
         predicted_policy_total_variation=0.03 if triggered else None,
         predicted_policy_mediated_effect=0.06 if triggered else None,
-        predicted_policy_mediated_effect_lcb=0.04 if triggered else None,
+        predicted_policy_gain_lower_score=0.04 if triggered else None,
         predicted_policy_gain_uncertainty=0.02 if triggered else None,
         predicted_next_policy_total_variation=0.04 if triggered else None,
         maximum_action_net_value=0.4 if triggered else None,
         maximum_action_policy_mediated_gain=0.08 if triggered else None,
-        maximum_action_policy_mediated_gain_lcb=0.05 if triggered else None,
+        maximum_action_predicted_gain_lower_score=0.05 if triggered else None,
         executed_action_net_value=0.2 if triggered else None,
         executed_action_response_value=0.3 if triggered else None,
         executed_action_policy_mediated_gain=0.06 if triggered else None,
-        executed_action_policy_mediated_gain_lcb=0.04 if triggered else None,
+        executed_action_predicted_gain_lower_score=0.04 if triggered else None,
         executed_action_policy_gain_uncertainty=0.02 if triggered else None,
         executed_action_expected_next_policy_tv=0.04 if triggered else None,
         executed_action=5 if triggered else None,
@@ -198,6 +203,96 @@ def test_response_mask_effects_follow_three_branch_identity() -> None:
         "delta_cost": 4.0,
         "delta_net": 4.0,
     }
+
+
+def test_response_bins_use_the_executed_action_lower_score() -> None:
+    rows = []
+    for index in range(10):
+        row = _contrast_row(left=0, right=0, index=index, triggered=True)
+        rows.append(
+            replace(
+                row,
+                predicted_policy_gain_lower_score=float(index),
+                executed_action_predicted_gain_lower_score=float(9 - index),
+                a2_use_raw_return=float(index),
+                a2_mask_raw_return=0.0,
+            )
+        )
+    bins = equal_frequency_bins(rows, bin_count=2)
+    assert bins[0]["minimum_executed_action_predicted_gain_lower_score"] == 0.0
+    assert bins[0]["maximum_executed_action_predicted_gain_lower_score"] == 4.0
+    assert bins[0]["effects"]["delta_response"] == pytest.approx(7.0)
+
+
+def test_counterfactual_summary_never_uses_post_response_gain_for_coverage() -> None:
+    rows = (
+        {
+            "trigger_id": "a",
+            "executed_action_predicted_gain_lower_score": 1.0,
+            "empirical_pre_response_discounted_gain": 0.5,
+            "empirical_post_response_gain": 100.0,
+            "use_action_rank_correlation": 1.0,
+            "mask_action_rank_correlation": -1.0,
+            "use_optimal_action_match": True,
+            "mask_optimal_action_match": False,
+        },
+        {
+            "trigger_id": "b",
+            "executed_action_predicted_gain_lower_score": 0.0,
+            "empirical_pre_response_discounted_gain": 0.25,
+            "empirical_post_response_gain": -100.0,
+            "use_action_rank_correlation": 0.5,
+            "mask_action_rank_correlation": 0.5,
+            "use_optimal_action_match": True,
+            "mask_optimal_action_match": True,
+        },
+    )
+    summary = summarize_counterfactual_trigger_values(rows)
+    assert summary["pre_response_coverage"] == 0.5
+    assert summary["mean_empirical_post_response_gain"] == 0.0
+    assert spearman_rank_correlation(
+        (3.0, 1.0, 2.0), (30.0, 10.0, 20.0)
+    ) == pytest.approx(1.0)
+
+
+def test_response_reconstruction_rejects_any_saved_field_difference() -> None:
+    from experiments.overcooked_v2.counterfactual_audit_app import (
+        validate_response_replay,
+    )
+
+    expected = _contrast_row(left=0, right=0, index=0, triggered=True)
+    validate_response_replay((expected,), (expected,))
+    changed = replace(expected, a2_use_raw_return=expected.a2_use_raw_return + 1.0)
+    with pytest.raises(RuntimeError, match="a2_use_raw_return"):
+        validate_response_replay((expected,), (changed,))
+
+
+def test_counterfactual_index_pairs_six_actions_two_branches_and_replicas() -> None:
+    replicas = 128
+    rows = [
+        {
+            "estimand": "pre_response",
+            "forced_action": 5,
+            "replica_index": replica,
+            "branch": branch,
+        }
+        for replica in range(replicas)
+        for branch in ("use", "mask")
+    ]
+    rows.extend(
+        {
+            "estimand": "post_response",
+            "forced_action": action,
+            "replica_index": replica,
+            "branch": branch,
+        }
+        for action in range(6)
+        for replica in range(replicas)
+        for branch in ("use", "mask")
+    )
+    validate_counterfactual_continuation_index(rows, replicas=replicas)
+    with pytest.raises(ValueError, match="incomplete"):
+        validate_counterfactual_continuation_index(rows[:-1], replicas=replicas)
 
 
 def test_response_contrast_requires_complete_directed_xp_rows() -> None:
@@ -282,3 +377,124 @@ def test_fixed_partner_panel_selects_final_checkpoints_and_matches_mode_seeds(
         for _mode in DEPLOYMENT_MODES
     }
     assert len(seeds) == 1
+
+
+def test_slot_semantics_summary_uses_recorded_phase_partner_and_slot() -> None:
+    from experiments.overcooked_v2.counterfactual_audit_app import (
+        _summarize_slot_semantics,
+    )
+
+    rows = [
+        {
+            "source": "self_pairing",
+            "partner_index": None,
+            "dominant_use_slot": 0,
+            "task_phase_before_action": "fetch_plate",
+            "use_slot_pairwise_l2": [2.0],
+            "use_slot_optimal_actions": [1, 2],
+            "use_slot_centered_q": [[0.0, 1.0], [1.0, 0.0]],
+        },
+        {
+            "source": "fixed_partner_00",
+            "partner_index": 0,
+            "dominant_use_slot": 1,
+            "task_phase_before_action": "final_delivery",
+            "use_slot_pairwise_l2": [4.0],
+            "use_slot_optimal_actions": [2, 2],
+            "use_slot_centered_q": [[2.0, 0.0], [0.0, 2.0]],
+        },
+    ]
+    summary = _summarize_slot_semantics(rows)
+    assert summary["state_count"] == 2
+    assert summary["mean_between_slot_centered_q_distance"] == 3.0
+    assert summary["states_with_different_slot_optimal_actions"] == 1
+    assert summary["dominant_slot_by_task_phase"] == {
+        "fetch_plate": {"0": 1},
+        "final_delivery": {"1": 1},
+    }
+    assert summary["dominant_slot_by_partner"] == {
+        "None": {"0": 1},
+        "0": {"1": 1},
+    }
+
+
+def test_same_action_a1_reuses_the_exact_a2_mask_branch() -> None:
+    from types import SimpleNamespace
+    from experiments.overcooked_v2.counterfactual_audit_app import (
+        AuditWorld,
+        TriggerIdentity,
+        _panel_contrast_row,
+    )
+
+    zeros = np.asarray([0], dtype=np.int32)
+    world = AuditWorld(
+        environment_state=zeros,
+        observations=np.zeros((1, 2, 1), dtype=np.float32),
+        ego_state=zeros,
+        partner_state=zeros,
+        raw_return=np.asarray([10.0], dtype=np.float32),
+        discounted_return=np.asarray([0.0], dtype=np.float32),
+        correct_delivery_count=np.asarray([1], dtype=np.int32),
+        wrong_delivery_count=zeros,
+        indicator_activation_count=zeros,
+        last_ego_action=zeros,
+        last_response_code=zeros,
+        last_reward=np.asarray([0.0], dtype=np.float32),
+    )
+    capture = SimpleNamespace(
+        pre_world=world,
+        trigger_action=np.asarray([2], dtype=np.int32),
+    )
+    continuations = [
+        {
+            "estimand": "pre_response",
+            "replica_index": 0,
+            "branch": "mask",
+            "remaining_raw_return": 5.0,
+            "remaining_correct_deliveries": 2,
+            "remaining_wrong_deliveries": 0,
+            "remaining_indicator_activations": 0,
+        },
+        {
+            "estimand": "pre_response",
+            "replica_index": 0,
+            "branch": "use",
+            "remaining_raw_return": 8.0,
+            "remaining_correct_deliveries": 3,
+            "remaining_wrong_deliveries": 0,
+            "remaining_indicator_activations": 0,
+        },
+    ]
+    row = _panel_contrast_row(
+        identity=TriggerIdentity(
+            source="fixed_partner_00",
+            partner_index=0,
+            episode_index=0,
+            episode_seed=17,
+            trigger_step=9,
+        ),
+        capture=capture,
+        lane=0,
+        pre_continuation_rows=continuations,
+        a1_action=2,
+        a1_world=None,
+    )
+    assert row["a1"] == row["a2_mask"]
+    assert row["delta_cost"] == 0.0
+    assert row["delta_net"] == row["delta_response"] == 3.0
+
+    with pytest.raises(RuntimeError, match="distinct A1 action"):
+        _panel_contrast_row(
+            identity=TriggerIdentity(
+                source="fixed_partner_00",
+                partner_index=0,
+                episode_index=0,
+                episode_seed=17,
+                trigger_step=9,
+            ),
+            capture=capture,
+            lane=0,
+            pre_continuation_rows=continuations,
+            a1_action=3,
+            a1_world=None,
+        )

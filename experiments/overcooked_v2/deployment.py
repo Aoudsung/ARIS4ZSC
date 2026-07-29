@@ -18,6 +18,7 @@ from src.path_c.model import build_model, encode_response_codes
 from src.path_c.runner import RunnerFunctions, initialize_policy_state
 from src.path_c.storage import (
     orbax_manager,
+    restore_checkpoint_step,
     read_run_identity,
     restore_latest_checkpoint,
 )
@@ -108,7 +109,10 @@ class Deployment:
 
 
 def load_deployment(
-    entry: PopulationEntry, config: Any
+    entry: PopulationEntry,
+    config: Any,
+    *,
+    checkpoint_step: int | None = None,
 ) -> Deployment:
     identity = read_run_identity(entry.run_directory)
     if identity.get("stage") != "train" or identity.get("method") != METHOD_VERSION:
@@ -123,13 +127,18 @@ def load_deployment(
     if network.layout != config.environment.layout:
         raise ValueError("Training reference and evaluation layout differ.")
     manager = orbax_manager(entry.run_directory / "checkpoints", create=False)
-    restored = restore_latest_checkpoint(manager)
-    if restored is None:
-        raise FileNotFoundError(
-            f"No Orbax step in {entry.run_directory / 'checkpoints'}."
+    if checkpoint_step is None:
+        restored = restore_latest_checkpoint(manager)
+        if restored is None:
+            raise FileNotFoundError(
+                f"No Orbax step in {entry.run_directory / 'checkpoints'}."
+            )
+        unused_step, checkpoint = restored
+        del unused_step
+    else:
+        checkpoint = restore_checkpoint_step(
+            manager, step=int(checkpoint_step)
         )
-    unused_step, checkpoint = restored
-    del unused_step
     if not isinstance(checkpoint, Mapping):
         raise TypeError("Orbax deployment checkpoint must restore as a mapping.")
     required = {"online_params", "codebook", "runner_state"}

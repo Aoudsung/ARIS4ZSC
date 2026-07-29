@@ -203,14 +203,14 @@ def pairing_batch(
         right_codes,
     ) = recorded
     trigger_left = (
-        left_records.executed_action_policy_mediated_gain_lcb
+        left_records.executed_action_predicted_gain_lower_score
         > policy_effect_trigger_tolerance(left_records.j_use, left_records.j_mask)
     ) & (
         left_records.executed_action_expected_next_policy_tv
         >= config.evaluation.response_policy_tv_minimum
     )
     trigger_right = (
-        right_records.executed_action_policy_mediated_gain_lcb
+        right_records.executed_action_predicted_gain_lower_score
         > policy_effect_trigger_tolerance(right_records.j_use, right_records.j_mask)
     ) & (
         right_records.executed_action_expected_next_policy_tv
@@ -361,8 +361,8 @@ def pairing_batch(
                                 step, episode_index
                             ].tolist()
                         ),
-                        "per_action_policy_mediated_gain_lcb": (
-                            record.per_action_policy_mediated_gain_lcb[
+                        "per_action_predicted_gain_lower_score": (
+                            record.per_action_predicted_gain_lower_score[
                                 step, episode_index
                             ].tolist()
                         ),
@@ -426,8 +426,8 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
-                        "predicted_policy_mediated_effect_lcb": float(
-                            record.predicted_policy_mediated_effect_lcb[
+                        "predicted_policy_gain_lower_score": float(
+                            record.predicted_policy_gain_lower_score[
                                 step, episode_index
                             ]
                         ),
@@ -456,8 +456,8 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
-                        "executed_action_policy_mediated_gain_lcb": float(
-                            record.executed_action_policy_mediated_gain_lcb[
+                        "executed_action_predicted_gain_lower_score": float(
+                            record.executed_action_predicted_gain_lower_score[
                                 step, episode_index
                             ]
                         ),
@@ -481,8 +481,8 @@ def pairing_batch(
                                 step, episode_index
                             ]
                         ),
-                        "maximum_action_policy_mediated_gain_lcb": float(
-                            record.maximum_action_policy_mediated_gain_lcb[
+                        "maximum_action_predicted_gain_lower_score": float(
+                            record.maximum_action_predicted_gain_lower_score[
                                 step, episode_index
                             ]
                         ),

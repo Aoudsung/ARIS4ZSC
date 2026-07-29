@@ -1,9 +1,18 @@
 # Path C V4.4 Retrace-Calibrated Control Repair
 
 **日期：** 2026-07-28  
-**状态：** `implemented`；尚未完成锁定远端依赖测试或开发训练  
+**状态：** seed-100 开发训练、评估和冻结 checkpoint 反事实任务价值审计已完成；正式十单元训练关闭
 **方法标识：** `path_c_v4_4_retrace_calibrated_control_r1`  
 **科学读数：** `scientific_readout_allowed: false`
+
+完整运行结果见
+[`PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md`](PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md)。
+
+冻结 checkpoint 审计恢复第 1,228,800 环境步参数，对 225 个真实触发状态分别执行 128 次
+回应前配对延续，以及六动作、两信念分支、128 次回应后延续。最终 69 项远端测试全部通过。
+预测下界分数的经验覆盖率为 29.33%，预测与经验动作排序的平均 Spearman 等级相关系数为
++0.01287；高分一半的经验回应前收益为 −0.01687，低分一半为 +0.00527。该结果说明当前
+动作价值排序与不确定性分数尚不足以支持正式扩展，十单元训练继续关闭。
 
 ## 1. 触发证据
 

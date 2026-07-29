@@ -15,6 +15,7 @@ pytest.importorskip("overcooked_v2_experiments")
 
 from experiments.overcooked_v2.official_adapter import (
     ACTION_ORDER,
+    FrozenPartnerPool,
     OfficialNetwork,
     VectorEnvironment,
     compose_official_config,
@@ -25,6 +26,9 @@ from experiments.overcooked_v2.official_adapter import (
     restore_official_checkpoint,
 )
 from experiments.overcooked_v2.deployment import Deployment
+from experiments.overcooked_v2.response_contrast_app import (
+    contrast_pairing_batch,
+)
 from experiments.overcooked_v2.standard_evaluation_app import pairing_batch
 from src.path_c.evaluation import Pairing
 from src.path_c.experiment import load_config
@@ -116,6 +120,54 @@ def test_recurrent_adapter_matches_official_public_apply_with_nonzero_carry(
     np.testing.assert_array_equal(
         np.asarray(adapted_value), np.asarray(expected_value[0])
     )
+
+
+def test_frozen_partner_accepts_explicit_common_random_keys(tmp_path: Path) -> None:
+    config = _small_config()
+    official_config = compose_official_config(
+        config,
+        algorithm="rnn-sp",
+        seed=14,
+        output_directory=tmp_path,
+    )
+    environment = VectorEnvironment.create(config)
+    network = OfficialNetwork(official_config)
+    params = initialize_official_parameters(
+        network,
+        random_key=jax.random.PRNGKey(15),
+        observation_shape=environment.observation_shape,
+        batch_size=2,
+    )
+    pool = FrozenPartnerPool(
+        network=network,
+        stacked_params=jax.tree_util.tree_map(
+            lambda value: jnp.stack((value, value)), params
+        ),
+        member_count=2,
+    )
+    unused_state, observations = environment.reset(jax.random.PRNGKey(16))
+    del unused_state
+    members = jnp.asarray([0, 1], dtype=jnp.int32)
+    starts = jnp.asarray([True, False])
+    carry = pool.initial_carry(2)
+    root = jax.random.PRNGKey(17)
+    expected_action, expected_carry = pool.step(
+        members, observations[:, 1], carry, starts, root
+    )
+    observed_action, observed_carry = pool.step_with_keys(
+        members,
+        observations[:, 1],
+        carry,
+        starts,
+        jax.random.split(root, 2),
+    )
+    np.testing.assert_array_equal(observed_action, expected_action)
+    for observed, expected in zip(
+        jax.tree_util.tree_leaves(observed_carry),
+        jax.tree_util.tree_leaves(expected_carry),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(observed, expected)
 
 
 def test_vector_environment_preserves_terminal_observation_then_resets() -> None:
@@ -380,3 +432,20 @@ def test_two_episode_method_pairing_runs_through_the_real_environment(
     assert len(rows) == 2
     assert all(row.environment_steps == 8 for row in rows)
     assert len(list(decisions)) == 2 * 2 * 8
+    plain_contrast = contrast_pairing_batch(
+        config=config,
+        left=deployment,
+        right=deployment,
+        pairing=Pairing("posterior_use", "sp", 0, 0),
+        evaluation_seed=44,
+    )
+    captured_contrast, capture = contrast_pairing_batch(
+        config=config,
+        left=deployment,
+        right=deployment,
+        pairing=Pairing("posterior_use", "sp", 0, 0),
+        evaluation_seed=44,
+        include_trigger_capture=True,
+    )
+    assert captured_contrast == plain_contrast
+    assert capture.triggered.shape == (2,)

@@ -64,7 +64,7 @@ class ControlValues(NamedTuple):
     policy_gain_by_estimator: Any
     policy_gain_standard_deviation_by_estimator: Any
     per_action_policy_mediated_gain: Any
-    per_action_policy_mediated_gain_lcb: Any
+    per_action_predicted_gain_lower_score: Any
     per_action_policy_gain_uncertainty: Any
 
 
@@ -426,7 +426,7 @@ def bellman_control_values(
     policy_gain_uncertainty = jnp.max(
         policy_gain_std_by_estimator, axis=-2
     )
-    policy_gain_lcb = jnp.min(
+    predicted_gain_lower_score = jnp.min(
         policy_gain_by_estimator - beta * policy_gain_std_by_estimator,
         axis=-2,
     )
@@ -460,7 +460,7 @@ def bellman_control_values(
             policy_gain_std_by_estimator
         ),
         per_action_policy_mediated_gain=policy_gain,
-        per_action_policy_mediated_gain_lcb=policy_gain_lcb,
+        per_action_predicted_gain_lower_score=predicted_gain_lower_score,
         per_action_policy_gain_uncertainty=policy_gain_uncertainty,
     )
 

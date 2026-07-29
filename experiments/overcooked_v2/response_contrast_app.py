@@ -21,7 +21,7 @@ from src.path_c.evaluation import (
     validate_response_contrast_rows,
 )
 from src.path_c.method import policy_effect_trigger_tolerance
-from src.path_c.runner import policy_action
+from src.path_c.runner import policy_action, tree_select
 from src.path_c.storage import read_parquet, write_json, write_parquet
 
 
@@ -59,16 +59,16 @@ class _ContrastState(NamedTuple):
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
     predicted_policy_mediated_effect: Any
-    predicted_policy_mediated_effect_lcb: Any
+    predicted_policy_gain_lower_score: Any
     predicted_policy_gain_uncertainty: Any
     predicted_next_policy_total_variation: Any
     maximum_action_net_value: Any
     maximum_action_policy_mediated_gain: Any
-    maximum_action_policy_mediated_gain_lcb: Any
+    maximum_action_predicted_gain_lower_score: Any
     executed_action_net_value: Any
     executed_action_response_value: Any
     executed_action_policy_mediated_gain: Any
-    executed_action_policy_mediated_gain_lcb: Any
+    executed_action_predicted_gain_lower_score: Any
     executed_action_policy_gain_uncertainty: Any
     executed_action_expected_next_policy_tv: Any
     executed_action: Any
@@ -82,6 +82,30 @@ class _ContrastState(NamedTuple):
     observation_difference_count: Any
     response_code_difference_count: Any
     reward_difference_count: Any
+    trigger_pre_branch: _ContrastBranch
+    trigger_post_use_branch: _ContrastBranch
+    trigger_post_mask_branch: _ContrastBranch
+    per_action_predicted_gain: Any
+    per_action_predicted_gain_lower_score: Any
+    trigger_response_code: Any
+
+
+class ResponseTriggerCapture(NamedTuple):
+    triggered: Any
+    trigger_step: Any
+    pre_branch: Any
+    post_use_branch: Any
+    post_mask_branch: Any
+    trigger_action: Any
+    trigger_tolerance: Any
+    predicted_policy_mediated_effect: Any
+    predicted_policy_gain_lower_score: Any
+    executed_action_policy_mediated_gain: Any
+    executed_action_predicted_gain_lower_score: Any
+    executed_action_expected_next_policy_tv: Any
+    per_action_predicted_gain: Any
+    per_action_predicted_gain_lower_score: Any
+    response_code: Any
 
 
 def _deployment_step(
@@ -206,7 +230,8 @@ def contrast_pairing_batch(
     right: Deployment,
     pairing: Pairing,
     evaluation_seed: int,
-) -> tuple[ResponseContrastRow, ...]:
+    include_trigger_capture: bool = False,
+) -> Any:
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -237,6 +262,9 @@ def contrast_pairing_batch(
     minus_one = jnp.full((count,), -1, dtype=jnp.int32)
     zeros_int = jnp.zeros((count,), dtype=jnp.int32)
     zeros_float = jnp.zeros((count,), dtype=jnp.float32)
+    zeros_action = jnp.zeros(
+        (count, config.model.action_count), dtype=jnp.float32
+    )
     initial_branch = _ContrastBranch(
         environment_state=environment_state,
         observations=observations,
@@ -267,16 +295,16 @@ def contrast_pairing_batch(
         predicted_regularized_net_effect=zeros_float,
         predicted_policy_total_variation=zeros_float,
         predicted_policy_mediated_effect=zeros_float,
-        predicted_policy_mediated_effect_lcb=zeros_float,
+        predicted_policy_gain_lower_score=zeros_float,
         predicted_policy_gain_uncertainty=zeros_float,
         predicted_next_policy_total_variation=zeros_float,
         maximum_action_net_value=zeros_float,
         maximum_action_policy_mediated_gain=zeros_float,
-        maximum_action_policy_mediated_gain_lcb=zeros_float,
+        maximum_action_predicted_gain_lower_score=zeros_float,
         executed_action_net_value=zeros_float,
         executed_action_response_value=zeros_float,
         executed_action_policy_mediated_gain=zeros_float,
-        executed_action_policy_mediated_gain_lcb=zeros_float,
+        executed_action_predicted_gain_lower_score=zeros_float,
         executed_action_policy_gain_uncertainty=zeros_float,
         executed_action_expected_next_policy_tv=zeros_float,
         executed_action=minus_one,
@@ -290,6 +318,12 @@ def contrast_pairing_batch(
         observation_difference_count=zeros_int,
         response_code_difference_count=zeros_int,
         reward_difference_count=zeros_int,
+        trigger_pre_branch=initial_branch,
+        trigger_post_use_branch=initial_branch,
+        trigger_post_mask_branch=initial_branch,
+        per_action_predicted_gain=zeros_action,
+        per_action_predicted_gain_lower_score=zeros_action,
+        trigger_response_code=minus_one,
     )
 
     def one_step(current: _ContrastState, step: Any) -> tuple[Any, None]:
@@ -350,7 +384,7 @@ def contrast_pairing_batch(
             use_left.output.j_use, use_left.output.j_mask
         )
         actionable = (
-            use_left.record.executed_action_policy_mediated_gain_lcb > tolerance
+            use_left.record.executed_action_predicted_gain_lower_score > tolerance
         ) & (
             use_left.record.executed_action_expected_next_policy_tv
             >= config.evaluation.response_policy_tv_minimum
@@ -464,9 +498,9 @@ def contrast_pairing_batch(
                 current.predicted_policy_mediated_effect,
                 use_left.output.predicted_policy_mediated_effect,
             ),
-            predicted_policy_mediated_effect_lcb=capture(
-                current.predicted_policy_mediated_effect_lcb,
-                use_left.output.predicted_policy_mediated_effect_lcb,
+            predicted_policy_gain_lower_score=capture(
+                current.predicted_policy_gain_lower_score,
+                use_left.output.predicted_policy_gain_lower_score,
             ),
             predicted_policy_gain_uncertainty=capture(
                 current.predicted_policy_gain_uncertainty,
@@ -484,9 +518,9 @@ def contrast_pairing_batch(
                 current.maximum_action_policy_mediated_gain,
                 use_left.record.maximum_action_policy_mediated_gain,
             ),
-            maximum_action_policy_mediated_gain_lcb=capture(
-                current.maximum_action_policy_mediated_gain_lcb,
-                use_left.record.maximum_action_policy_mediated_gain_lcb,
+            maximum_action_predicted_gain_lower_score=capture(
+                current.maximum_action_predicted_gain_lower_score,
+                use_left.record.maximum_action_predicted_gain_lower_score,
             ),
             executed_action_net_value=capture(
                 current.executed_action_net_value,
@@ -500,9 +534,9 @@ def contrast_pairing_batch(
                 current.executed_action_policy_mediated_gain,
                 use_left.record.executed_action_policy_mediated_gain,
             ),
-            executed_action_policy_mediated_gain_lcb=capture(
-                current.executed_action_policy_mediated_gain_lcb,
-                use_left.record.executed_action_policy_mediated_gain_lcb,
+            executed_action_predicted_gain_lower_score=capture(
+                current.executed_action_predicted_gain_lower_score,
+                use_left.record.executed_action_predicted_gain_lower_score,
             ),
             executed_action_policy_gain_uncertainty=capture(
                 current.executed_action_policy_gain_uncertainty,
@@ -554,6 +588,35 @@ def contrast_pairing_batch(
             reward_difference_count=(
                 current.reward_difference_count
                 + reward_difference.astype(jnp.int32)
+            ),
+            trigger_pre_branch=tree_select(
+                newly_triggered,
+                current.a2_use,
+                current.trigger_pre_branch,
+            ),
+            trigger_post_use_branch=tree_select(
+                newly_triggered,
+                next_use,
+                current.trigger_post_use_branch,
+            ),
+            trigger_post_mask_branch=tree_select(
+                newly_triggered,
+                next_mask,
+                current.trigger_post_mask_branch,
+            ),
+            per_action_predicted_gain=tree_select(
+                newly_triggered,
+                use_left.record.per_action_policy_mediated_gain,
+                current.per_action_predicted_gain,
+            ),
+            per_action_predicted_gain_lower_score=tree_select(
+                newly_triggered,
+                use_left.record.per_action_predicted_gain_lower_score,
+                current.per_action_predicted_gain_lower_score,
+            ),
+            trigger_response_code=capture(
+                current.trigger_response_code,
+                next_use.last_left_response,
             ),
         ), None
 
@@ -608,8 +671,8 @@ def contrast_pairing_batch(
                 predicted_policy_mediated_effect=optional_float(
                     final.predicted_policy_mediated_effect
                 ),
-                predicted_policy_mediated_effect_lcb=optional_float(
-                    final.predicted_policy_mediated_effect_lcb
+                predicted_policy_gain_lower_score=optional_float(
+                    final.predicted_policy_gain_lower_score
                 ),
                 predicted_policy_gain_uncertainty=optional_float(
                     final.predicted_policy_gain_uncertainty
@@ -623,8 +686,8 @@ def contrast_pairing_batch(
                 maximum_action_policy_mediated_gain=optional_float(
                     final.maximum_action_policy_mediated_gain
                 ),
-                maximum_action_policy_mediated_gain_lcb=optional_float(
-                    final.maximum_action_policy_mediated_gain_lcb
+                maximum_action_predicted_gain_lower_score=optional_float(
+                    final.maximum_action_predicted_gain_lower_score
                 ),
                 executed_action_net_value=optional_float(
                     final.executed_action_net_value
@@ -635,8 +698,8 @@ def contrast_pairing_batch(
                 executed_action_policy_mediated_gain=optional_float(
                     final.executed_action_policy_mediated_gain
                 ),
-                executed_action_policy_mediated_gain_lcb=optional_float(
-                    final.executed_action_policy_mediated_gain_lcb
+                executed_action_predicted_gain_lower_score=optional_float(
+                    final.executed_action_predicted_gain_lower_score
                 ),
                 executed_action_policy_gain_uncertainty=optional_float(
                     final.executed_action_policy_gain_uncertainty
@@ -724,7 +787,38 @@ def contrast_pairing_batch(
                 ),
             )
         )
-    return tuple(rows)
+    result = tuple(rows)
+    if not include_trigger_capture:
+        return result
+    return result, ResponseTriggerCapture(
+        triggered=final.triggered,
+        trigger_step=final.trigger_step,
+        pre_branch=final.trigger_pre_branch,
+        post_use_branch=final.trigger_post_use_branch,
+        post_mask_branch=final.trigger_post_mask_branch,
+        trigger_action=final.executed_action,
+        trigger_tolerance=final.trigger_tolerance,
+        predicted_policy_mediated_effect=(
+            final.predicted_policy_mediated_effect
+        ),
+        predicted_policy_gain_lower_score=(
+            final.predicted_policy_gain_lower_score
+        ),
+        executed_action_policy_mediated_gain=(
+            final.executed_action_policy_mediated_gain
+        ),
+        executed_action_predicted_gain_lower_score=(
+            final.executed_action_predicted_gain_lower_score
+        ),
+        executed_action_expected_next_policy_tv=(
+            final.executed_action_expected_next_policy_tv
+        ),
+        per_action_predicted_gain=final.per_action_predicted_gain,
+        per_action_predicted_gain_lower_score=(
+            final.per_action_predicted_gain_lower_score
+        ),
+        response_code=final.trigger_response_code,
+    )
 
 
 def evaluate_response_contrast(
@@ -838,6 +932,7 @@ def evaluate_development_response_contrast(
 
 
 __all__ = [
+    "ResponseTriggerCapture",
     "contrast_pairing_batch",
     "evaluate_development_response_contrast",
     "evaluate_response_contrast",

@@ -46,7 +46,7 @@ class ModelOutput(NamedTuple):
     per_action_response_value: Any
     per_action_net_value: Any
     per_action_policy_mediated_gain: Any
-    per_action_policy_mediated_gain_lcb: Any
+    per_action_predicted_gain_lower_score: Any
     per_action_policy_gain_uncertainty: Any
     per_action_expected_next_policy_tv: Any
     information_gain: Any
@@ -58,7 +58,7 @@ class ModelOutput(NamedTuple):
     predicted_regularized_net_effect: Any
     predicted_policy_total_variation: Any
     predicted_policy_mediated_effect: Any
-    predicted_policy_mediated_effect_lcb: Any
+    predicted_policy_gain_lower_score: Any
     predicted_policy_gain_uncertainty: Any
     predicted_next_policy_total_variation: Any
 
@@ -815,8 +815,8 @@ def model_forward(
         policy.probabilities * control.per_action_policy_mediated_gain,
         axis=-1,
     )
-    mediated_lcb = jnp.sum(
-        policy.probabilities * control.per_action_policy_mediated_gain_lcb,
+    policy_gain_lower_score = jnp.sum(
+        policy.probabilities * control.per_action_predicted_gain_lower_score,
         axis=-1,
     )
     mediated_uncertainty = jnp.sum(
@@ -863,8 +863,8 @@ def model_forward(
         per_action_policy_mediated_gain=(
             control.per_action_policy_mediated_gain
         ),
-        per_action_policy_mediated_gain_lcb=(
-            control.per_action_policy_mediated_gain_lcb
+        per_action_predicted_gain_lower_score=(
+            control.per_action_predicted_gain_lower_score
         ),
         per_action_policy_gain_uncertainty=(
             control.per_action_policy_gain_uncertainty
@@ -881,7 +881,7 @@ def model_forward(
         predicted_regularized_net_effect=effects.regularized_net_effect,
         predicted_policy_total_variation=effects.total_variation,
         predicted_policy_mediated_effect=mediated,
-        predicted_policy_mediated_effect_lcb=mediated_lcb,
+        predicted_policy_gain_lower_score=policy_gain_lower_score,
         predicted_policy_gain_uncertainty=mediated_uncertainty,
         predicted_next_policy_total_variation=next_tv,
     )

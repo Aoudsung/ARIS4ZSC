@@ -161,8 +161,8 @@ def _decision_rows(
                 "per_action_policy_mediated_gain": arrays[
                     "per_action_policy_mediated_gains"
                 ][time_index, environment_index].tolist(),
-                "per_action_policy_mediated_gain_lcb": arrays[
-                    "per_action_policy_mediated_gain_lcbs"
+                "per_action_predicted_gain_lower_score": arrays[
+                    "per_action_predicted_gain_lower_scores"
                 ][time_index, environment_index].tolist(),
                 "per_action_policy_gain_uncertainty": arrays[
                     "per_action_policy_gain_uncertainties"
@@ -203,8 +203,8 @@ def _decision_rows(
                         time_index, environment_index
                     ]
                 ),
-                "predicted_policy_mediated_effect_lcb": float(
-                    arrays["predicted_policy_mediated_effect_lcbs"][
+                "predicted_policy_gain_lower_score": float(
+                    arrays["predicted_policy_gain_lower_scores"][
                         time_index, environment_index
                     ]
                 ),
@@ -248,8 +248,8 @@ def _decision_rows(
                         time_index, environment_index
                     ]
                 ),
-                "executed_action_policy_mediated_gain_lcb": float(
-                    arrays["executed_action_policy_mediated_gain_lcbs"][
+                "executed_action_predicted_gain_lower_score": float(
+                    arrays["executed_action_predicted_gain_lower_scores"][
                         time_index, environment_index
                     ]
                 ),
@@ -273,8 +273,8 @@ def _decision_rows(
                         time_index, environment_index
                     ]
                 ),
-                "maximum_action_policy_mediated_gain_lcb": float(
-                    arrays["maximum_action_policy_mediated_gain_lcbs"][
+                "maximum_action_predicted_gain_lower_score": float(
+                    arrays["maximum_action_predicted_gain_lower_scores"][
                         time_index, environment_index
                     ]
                 ),

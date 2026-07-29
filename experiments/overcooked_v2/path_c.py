@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from experiments.overcooked_v2.counterfactual_audit_app import (
+    run_counterfactual_value_audit,
+)
 from experiments.overcooked_v2.evaluation_app import run_evaluation
 from experiments.overcooked_v2.manifest_app import add_manifest_commands
 from experiments.overcooked_v2.partner_panel_app import run_partner_panel
@@ -74,6 +77,19 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     panel.set_defaults(function=run_partner_panel, manages_output=True)
+
+    audit = commands.add_parser("audit-counterfactual-value")
+    audit.add_argument("--config", required=True)
+    audit.add_argument("--run-directory", required=True)
+    audit.add_argument("--checkpoint-step", type=int, required=True)
+    audit.add_argument("--response-contrast", required=True)
+    audit.add_argument("--panel-manifest", required=True)
+    audit.add_argument("--replicas", type=int, default=128)
+    audit.add_argument("--output", required=True)
+    audit.add_argument("--resume", action="store_true")
+    audit.set_defaults(
+        function=run_counterfactual_value_audit, manages_output=True
+    )
 
     add_manifest_commands(commands)
     return parser

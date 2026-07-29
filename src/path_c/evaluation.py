@@ -75,16 +75,16 @@ class ResponseContrastRow:
     predicted_regularized_net_effect: float | None
     predicted_policy_total_variation: float | None
     predicted_policy_mediated_effect: float | None
-    predicted_policy_mediated_effect_lcb: float | None
+    predicted_policy_gain_lower_score: float | None
     predicted_policy_gain_uncertainty: float | None
     predicted_next_policy_total_variation: float | None
     maximum_action_net_value: float | None
     maximum_action_policy_mediated_gain: float | None
-    maximum_action_policy_mediated_gain_lcb: float | None
+    maximum_action_predicted_gain_lower_score: float | None
     executed_action_net_value: float | None
     executed_action_response_value: float | None
     executed_action_policy_mediated_gain: float | None
-    executed_action_policy_mediated_gain_lcb: float | None
+    executed_action_predicted_gain_lower_score: float | None
     executed_action_policy_gain_uncertainty: float | None
     executed_action_expected_next_policy_tv: float | None
     executed_action: int | None
@@ -114,6 +114,299 @@ class ResponseContrastRow:
 
     def to_mapping(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def rank_values(values: Sequence[float]) -> tuple[float, ...]:
+    """Return average ranks for tied literal values."""
+
+    indexed = sorted(
+        enumerate(float(value) for value in values), key=lambda item: item[1]
+    )
+    ranks = [0.0] * len(indexed)
+    start = 0
+    while start < len(indexed):
+        end = start + 1
+        while end < len(indexed) and indexed[end][1] == indexed[start][1]:
+            end += 1
+        average_rank = 0.5 * (start + end - 1)
+        for position in range(start, end):
+            ranks[indexed[position][0]] = average_rank
+        start = end
+    return tuple(ranks)
+
+
+def spearman_rank_correlation(
+    predicted: Sequence[float], empirical: Sequence[float]
+) -> float | None:
+    """Compute a tie-aware rank correlation from independent inputs."""
+
+    if len(predicted) != len(empirical) or len(predicted) < 2:
+        raise ValueError(
+            "Rank correlation requires equal sequences of length at least two."
+        )
+    left = rank_values(predicted)
+    right = rank_values(empirical)
+    left_mean = mean(left)
+    right_mean = mean(right)
+    numerator = sum(
+        (a - left_mean) * (b - right_mean)
+        for a, b in zip(left, right, strict=True)
+    )
+    left_scale = sum((value - left_mean) ** 2 for value in left) ** 0.5
+    right_scale = sum((value - right_mean) ** 2 for value in right) ** 0.5
+    if left_scale == 0.0 or right_scale == 0.0:
+        return None
+    return numerator / (left_scale * right_scale)
+
+
+def wilson_interval(
+    successes: int, total: int, *, z: float = 1.959963984540054
+) -> tuple[float, float]:
+    """Return a descriptive Wilson interval for a binary state-level rate."""
+
+    if total <= 0 or not 0 <= successes <= total or z <= 0.0:
+        raise ValueError(
+            "Wilson inputs require 0 <= successes <= total and total > 0."
+        )
+    rate = successes / total
+    denominator = 1.0 + z * z / total
+    center = (rate + z * z / (2.0 * total)) / denominator
+    half = (
+        z
+        * (
+            rate * (1.0 - rate) / total
+            + z * z / (4.0 * total * total)
+        )
+        ** 0.5
+        / denominator
+    )
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def summarize_responsibility_records(
+    rows: Sequence[Mapping[str, Any]],
+    episode_returns: Mapping[tuple[int, int, int], float],
+) -> Mapping[str, Any]:
+    """Summarize recorded E-step evidence without inventing absent contexts."""
+
+    if not rows:
+        raise ValueError("Responsibility audit requires recorded rows.")
+    grouped: dict[tuple[int, int, int, int], list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (
+            int(row["update_count"]),
+            int(row["epoch"]),
+            int(row["environment_index"]),
+            int(row["episode_id"]),
+        )
+        grouped.setdefault(key, []).append(row)
+    slot_mass: dict[int, float] = {}
+    slot_return_weight: dict[int, float] = {}
+    slot_return_square_weight: dict[int, float] = {}
+    slot_return_minimum: dict[int, float] = {}
+    slot_return_maximum: dict[int, float] = {}
+    slot_partner_mass: dict[int, dict[int, float]] = {}
+    dominant_partner_counts: dict[int, dict[int, int]] = {}
+    entropies = []
+    energy_margins = []
+    for key, members in grouped.items():
+        ordered = sorted(members, key=lambda row: int(row["slot"]))
+        probabilities = [float(row["responsibility"]) for row in ordered]
+        if abs(sum(probabilities) - 1.0) > 1.0e-5:
+            raise ValueError(f"Responsibility mass does not sum to one for {key}.")
+        energies = sorted(float(row["td_energy"]) for row in ordered)
+        if len(energies) < 2:
+            raise ValueError("Responsibility audit requires at least two slots.")
+        energy_margins.append(energies[1] - energies[0])
+        entropies.append(
+            -sum(value * math.log(value) for value in probabilities if value > 0.0)
+        )
+        partner = int(ordered[0]["audit_partner_member"])
+        episode_key = (key[0], key[2], key[3])
+        if episode_key not in episode_returns:
+            raise ValueError(
+                f"Episode return is missing for responsibility row {episode_key}."
+            )
+        episode_return = float(episode_returns[episode_key])
+        dominant_position = max(
+            range(len(probabilities)), key=probabilities.__getitem__
+        )
+        dominant = int(ordered[dominant_position]["slot"])
+        counts = dominant_partner_counts.setdefault(dominant, {})
+        counts[partner] = counts.get(partner, 0) + 1
+        for row, probability in zip(ordered, probabilities, strict=True):
+            slot = int(row["slot"])
+            slot_mass[slot] = slot_mass.get(slot, 0.0) + probability
+            slot_return_weight[slot] = (
+                slot_return_weight.get(slot, 0.0)
+                + probability * episode_return
+            )
+            slot_return_square_weight[slot] = (
+                slot_return_square_weight.get(slot, 0.0)
+                + probability * episode_return * episode_return
+            )
+            if probability > 0.0:
+                slot_return_minimum[slot] = min(
+                    slot_return_minimum.get(slot, episode_return),
+                    episode_return,
+                )
+                slot_return_maximum[slot] = max(
+                    slot_return_maximum.get(slot, episode_return),
+                    episode_return,
+                )
+            partner_mass = slot_partner_mass.setdefault(slot, {})
+            partner_mass[partner] = partner_mass.get(partner, 0.0) + probability
+    return {
+        "record_count": len(rows),
+        "assignment_count": len(grouped),
+        "mean_responsibility_entropy": mean(entropies),
+        "mean_td_energy_margin": mean(energy_margins),
+        "slots": {
+            str(slot): {
+                "responsibility_mass": mass,
+                "responsibility_weighted_mean_return": (
+                    slot_return_weight[slot] / mass
+                ),
+                "responsibility_weighted_return_standard_deviation": (
+                    max(
+                        0.0,
+                        slot_return_square_weight[slot] / mass
+                        - (slot_return_weight[slot] / mass) ** 2,
+                    )
+                    ** 0.5
+                ),
+                "responsibility_weighted_return_minimum": (
+                    slot_return_minimum.get(slot)
+                ),
+                "responsibility_weighted_return_maximum": (
+                    slot_return_maximum.get(slot)
+                ),
+                "partner_mass": {
+                    str(partner): value
+                    for partner, value in sorted(
+                        slot_partner_mass[slot].items()
+                    )
+                },
+                "dominant_partner_counts": {
+                    str(partner): value
+                    for partner, value in sorted(
+                        dominant_partner_counts.get(slot, {}).items()
+                    )
+                },
+            }
+            for slot, mass in sorted(slot_mass.items())
+        },
+        "historical_task_stage": "not_collected",
+        "historical_per_slot_action_values": "not_collected",
+    }
+
+
+def summarize_counterfactual_trigger_values(
+    rows: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any]:
+    """Keep pre-response coverage separate from post-response action values."""
+
+    if not rows:
+        raise ValueError("Counterfactual value summary requires trigger rows.")
+    pre_gains = [
+        float(row["empirical_pre_response_discounted_gain"]) for row in rows
+    ]
+    lower_scores = [
+        float(row["executed_action_predicted_gain_lower_score"]) for row in rows
+    ]
+    covered = [
+        gain >= lower
+        for gain, lower in zip(pre_gains, lower_scores, strict=True)
+    ]
+    post_gains = [float(row["empirical_post_response_gain"]) for row in rows]
+    correlations = [
+        float(value)
+        for row in rows
+        for value in (
+            row.get("use_action_rank_correlation"),
+            row.get("mask_action_rank_correlation"),
+        )
+        if value is not None
+    ]
+    ordered = sorted(
+        range(len(rows)),
+        key=lambda index: (lower_scores[index], str(rows[index]["trigger_id"])),
+    )
+    midpoint = len(ordered) // 2
+    low = ordered[:midpoint]
+    high = ordered[midpoint:]
+    interval = wilson_interval(sum(covered), len(covered))
+    return {
+        "trigger_count": len(rows),
+        "mean_empirical_pre_response_discounted_gain": mean(pre_gains),
+        "pre_response_coverage": sum(covered) / len(covered),
+        "pre_response_coverage_wilson_interval": list(interval),
+        "mean_empirical_post_response_gain": mean(post_gains),
+        "mean_action_rank_correlation": (
+            mean(correlations) if correlations else None
+        ),
+        "optimal_action_match_rate": mean(
+            float(bool(row[field]))
+            for row in rows
+            for field in (
+                "use_optimal_action_match",
+                "mask_optimal_action_match",
+            )
+        ),
+        "lower_score_split": {
+            "low_count": len(low),
+            "high_count": len(high),
+            "low_mean_empirical_pre_response_gain": (
+                mean(pre_gains[index] for index in low) if low else None
+            ),
+            "high_mean_empirical_pre_response_gain": (
+                mean(pre_gains[index] for index in high) if high else None
+            ),
+        },
+    }
+
+
+def validate_counterfactual_continuation_index(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    replicas: int,
+    action_count: int = 6,
+) -> None:
+    """Require complete paired indexes for both counterfactual estimands."""
+
+    if replicas <= 0 or action_count <= 0:
+        raise ValueError("Continuation dimensions must be positive.")
+    observed = {
+        (
+            str(row["estimand"]),
+            None if row["forced_action"] is None else int(row["forced_action"]),
+            int(row["replica_index"]),
+            str(row["branch"]),
+        )
+        for row in rows
+    }
+    if len(observed) != len(rows):
+        raise ValueError("Counterfactual continuation index contains duplicates.")
+    pre_actions = {
+        action
+        for estimand, action, unused_replica, unused_branch in observed
+        if estimand == "pre_response"
+    }
+    if len(pre_actions) != 1 or None in pre_actions:
+        raise ValueError("Pre-response rows must fix one registered action.")
+    expected_pre = {
+        ("pre_response", next(iter(pre_actions)), replica, branch)
+        for replica in range(replicas)
+        for branch in ("use", "mask")
+    }
+    expected_post = {
+        ("post_response", action, replica, branch)
+        for action in range(action_count)
+        for replica in range(replicas)
+        for branch in ("use", "mask")
+    }
+    if observed != expected_pre | expected_post:
+        raise ValueError("Counterfactual continuation index is incomplete.")
 
 
 def standard_pairings(
@@ -416,16 +709,16 @@ def _validate_response_contrast_content(row: ResponseContrastRow) -> None:
         row.predicted_regularized_net_effect,
         row.predicted_policy_total_variation,
         row.predicted_policy_mediated_effect,
-        row.predicted_policy_mediated_effect_lcb,
+        row.predicted_policy_gain_lower_score,
         row.predicted_policy_gain_uncertainty,
         row.predicted_next_policy_total_variation,
         row.maximum_action_net_value,
         row.maximum_action_policy_mediated_gain,
-        row.maximum_action_policy_mediated_gain_lcb,
+        row.maximum_action_predicted_gain_lower_score,
         row.executed_action_net_value,
         row.executed_action_response_value,
         row.executed_action_policy_mediated_gain,
-        row.executed_action_policy_mediated_gain_lcb,
+        row.executed_action_predicted_gain_lower_score,
         row.executed_action_policy_gain_uncertainty,
         row.executed_action_expected_next_policy_tv,
         row.executed_action,
@@ -456,16 +749,16 @@ def _validate_response_contrast_content(row: ResponseContrastRow) -> None:
             row.predicted_regularized_net_effect,
             row.predicted_policy_total_variation,
             row.predicted_policy_mediated_effect,
-            row.predicted_policy_mediated_effect_lcb,
+            row.predicted_policy_gain_lower_score,
             row.predicted_policy_gain_uncertainty,
             row.predicted_next_policy_total_variation,
             row.maximum_action_net_value,
             row.maximum_action_policy_mediated_gain,
-            row.maximum_action_policy_mediated_gain_lcb,
+            row.maximum_action_predicted_gain_lower_score,
             row.executed_action_net_value,
             row.executed_action_response_value,
             row.executed_action_policy_mediated_gain,
-            row.executed_action_policy_mediated_gain_lcb,
+            row.executed_action_predicted_gain_lower_score,
             row.executed_action_policy_gain_uncertainty,
             row.executed_action_expected_next_policy_tv,
             row.post_response_belief_l1,
@@ -569,7 +862,7 @@ def equal_frequency_bins(
     triggered = sorted(
         (row for row in rows if row.triggered),
         key=lambda row: (
-            float(row.predicted_policy_mediated_effect_lcb),
+            float(row.executed_action_predicted_gain_lower_score),
             row.pairing_id,
             row.episode_index,
         ),
@@ -588,11 +881,11 @@ def equal_frequency_bins(
                 "source_start": start,
                 "source_end": end,
                 "count": len(members),
-                "minimum_predicted_policy_mediated_effect_lcb": float(
-                    members[0].predicted_policy_mediated_effect_lcb
+                "minimum_executed_action_predicted_gain_lower_score": float(
+                    members[0].executed_action_predicted_gain_lower_score
                 ),
-                "maximum_predicted_policy_mediated_effect_lcb": float(
-                    members[-1].predicted_policy_mediated_effect_lcb
+                "maximum_executed_action_predicted_gain_lower_score": float(
+                    members[-1].executed_action_predicted_gain_lower_score
                 ),
                 "effects": {
                     name: mean(item[name] for item in effects)
@@ -616,8 +909,8 @@ def summarize_response_contrast(
             "mean_predicted_policy_mediated_effect": mean(
                 float(row.predicted_policy_mediated_effect) for row in triggered
             ),
-            "mean_predicted_policy_mediated_effect_lcb": mean(
-                float(row.predicted_policy_mediated_effect_lcb) for row in triggered
+            "mean_predicted_policy_gain_lower_score": mean(
+                float(row.predicted_policy_gain_lower_score) for row in triggered
             ),
             "mean_predicted_policy_gain_uncertainty": mean(
                 float(row.predicted_policy_gain_uncertainty) for row in triggered
@@ -628,8 +921,8 @@ def summarize_response_contrast(
             "mean_executed_action_policy_mediated_gain": mean(
                 float(row.executed_action_policy_mediated_gain) for row in triggered
             ),
-            "mean_executed_action_policy_mediated_gain_lcb": mean(
-                float(row.executed_action_policy_mediated_gain_lcb) for row in triggered
+            "mean_executed_action_predicted_gain_lower_score": mean(
+                float(row.executed_action_predicted_gain_lower_score) for row in triggered
             ),
             "mean_executed_action_policy_gain_uncertainty": mean(
                 float(row.executed_action_policy_gain_uncertainty) for row in triggered
@@ -671,13 +964,19 @@ __all__ = [
     "effect_components",
     "equal_frequency_bins",
     "policy_effect_trigger_tolerance",
+    "rank_values",
+    "spearman_rank_correlation",
     "standard_episode_seed",
     "standard_pairings",
     "summarize_development_rows",
     "summarize_response_contrast",
+    "summarize_counterfactual_trigger_values",
+    "summarize_responsibility_records",
     "summarize_standard_rows",
     "validate_development_response_contrast_rows",
+    "validate_counterfactual_continuation_index",
     "validate_development_rows",
     "validate_response_contrast_rows",
     "validate_standard_rows",
+    "wilson_interval",
 ]

@@ -315,7 +315,7 @@ def test_uncertainty_penalty_lowers_policy_gain_bound_without_changing_mean() ->
         atol=1e-6,
     )
     assert np.all(
-        np.asarray(penalized.per_action_policy_mediated_gain_lcb)
+        np.asarray(penalized.per_action_predicted_gain_lower_score)
         <= np.asarray(penalized.per_action_policy_mediated_gain) + 1e-7
     )
 
@@ -338,3 +338,24 @@ def test_terminal_response_has_exactly_zero_continuation_uncertainty() -> None:
     )
     np.testing.assert_allclose(np.asarray(values.j_use), 0.0, atol=1e-7)
     np.testing.assert_allclose(np.asarray(values.j_mask), 0.0, atol=1e-7)
+
+
+def test_common_uniform_action_sampling_preserves_replica_indexes() -> None:
+    from experiments.overcooked_v2.counterfactual_audit_app import (
+        inverse_cdf_actions,
+    )
+
+    uniforms = jnp.asarray([0.0, 0.19, 0.2, 0.99], dtype=jnp.float32)
+    probabilities = jnp.asarray(
+        [
+            [0.2, 0.3, 0.5],
+            [0.2, 0.3, 0.5],
+            [0.2, 0.3, 0.5],
+            [0.2, 0.3, 0.5],
+        ],
+        dtype=jnp.float32,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(inverse_cdf_actions(probabilities, uniforms)),
+        np.asarray([0, 0, 1, 2]),
+    )

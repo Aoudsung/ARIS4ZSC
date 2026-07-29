@@ -47,7 +47,7 @@ class PartnerPanelRow:
     correct_delivery_count: int
     wrong_delivery_count: int
     indicator_activation_count: int
-    positive_policy_gain_lcb_count: int
+    positive_gain_lower_score_count: int
     cumulative_kl: float
     reference_action_deviation_count: int
     mean_value_class_count: float
@@ -95,7 +95,7 @@ def panel_episode_seed(
     return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
 
 
-def _panel_batch(
+def panel_batch(
     *,
     config: Any,
     deployment: Deployment,
@@ -256,7 +256,7 @@ def _panel_batch(
     ) = recorded
 
     trigger = (
-        records.executed_action_policy_mediated_gain_lcb
+        records.executed_action_predicted_gain_lower_score
         > policy_effect_trigger_tolerance(records.j_use, records.j_mask)
     ) & (
         records.executed_action_expected_next_policy_tv
@@ -298,7 +298,7 @@ def _panel_batch(
             correct_delivery_count=int(correct_totals[index]),
             wrong_delivery_count=int(wrong_totals[index]),
             indicator_activation_count=int(indicator_totals[index]),
-            positive_policy_gain_lcb_count=int(trigger_counts[index]),
+            positive_gain_lower_score_count=int(trigger_counts[index]),
             cumulative_kl=float(cumulative_kl[index]),
             reference_action_deviation_count=int(deviations[index]),
             mean_value_class_count=float(class_means[index]),
@@ -344,8 +344,8 @@ def _panel_batch(
                     "value_class_count": int(
                         host_records.value_class_count[step, episode_index]
                     ),
-                    "predicted_policy_mediated_effect_lcb": float(
-                        host_records.predicted_policy_mediated_effect_lcb[
+                    "predicted_policy_gain_lower_score": float(
+                        host_records.predicted_policy_gain_lower_score[
                             step, episode_index
                         ]
                     ),
@@ -359,8 +359,8 @@ def _panel_batch(
                             step, episode_index
                         ]
                     ),
-                    "executed_action_policy_mediated_gain_lcb": float(
-                        host_records.executed_action_policy_mediated_gain_lcb[
+                    "executed_action_predicted_gain_lower_score": float(
+                        host_records.executed_action_predicted_gain_lower_score[
                             step, episode_index
                         ]
                     ),
@@ -394,8 +394,8 @@ def _summary(rows: Sequence[PartnerPanelRow]) -> Mapping[str, Any]:
             "mean_wrong_deliveries": mean(
                 row.wrong_delivery_count for row in members
             ),
-            "mean_positive_policy_gain_lcb_count": mean(
-                row.positive_policy_gain_lcb_count for row in members
+            "mean_positive_gain_lower_score_count": mean(
+                row.positive_gain_lower_score_count for row in members
             ),
             "mean_kl": mean(row.cumulative_kl for row in members),
         }
@@ -492,7 +492,7 @@ def run_partner_panel(args: Any) -> None:
                 continue
             if row_path.exists() or decision_path.exists():
                 raise RuntimeError(f"Incomplete panel output exists in {root}.")
-            rows, decisions = _panel_batch(
+            rows, decisions = panel_batch(
                 config=config,
                 deployment=deployment,
                 partner_pool=pool,
@@ -547,6 +547,7 @@ def run_partner_panel(args: Any) -> None:
 
 __all__ = [
     "PartnerPanelRow",
+    "panel_batch",
     "panel_episode_seed",
     "run_partner_panel",
     "select_panel_checkpoints",

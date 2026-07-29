@@ -155,6 +155,22 @@ def restore_latest_checkpoint(
     return int(step), state
 
 
+def restore_checkpoint_step(manager: Any, *, step: int) -> Any:
+    """Restore exactly one registered Orbax step without selecting another."""
+
+    import orbax.checkpoint as ocp
+
+    requested = int(step)
+    available = {int(value) for value in manager.all_steps()}
+    if requested not in available:
+        raise FileNotFoundError(
+            f"Orbax checkpoint step {requested} is absent; available={sorted(available)}."
+        )
+    return manager.restore(
+        requested, args=ocp.args.PyTreeRestore()
+    )
+
+
 def write_run_metadata(
     path: str | Path,
     *,
@@ -313,6 +329,7 @@ __all__ = [
     "read_parquet",
     "read_run_identity",
     "restore_latest_checkpoint",
+    "restore_checkpoint_step",
     "save_checkpoint",
     "training_identity",
     "upstream_identity",
