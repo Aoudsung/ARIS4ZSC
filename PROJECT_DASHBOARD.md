@@ -1,16 +1,37 @@
 # Path C 项目状态
 
-最后更新：2026-07-28。
+最后更新：2026-07-29。
 
 ## 当前实现
 
 - 方法版本：`path_c_v4_4_retrace_calibrated_control_r1`。
-- 状态：seed-100 开发训练和评估已完成；冻结 checkpoint 的反事实任务价值审计已完成，最终 69 项远端测试全部通过。
+- 状态：seed-100 开发训练和评估、冻结 checkpoint 的反事实任务价值审计以及官方策略库固定伙伴交叉矩阵均已完成；最终 69 项远端测试全部通过。
 - 活跃源码：`src/path_c/`。
 - OvercookedV2 接入：`experiments/overcooked_v2/official_adapter.py`。
 - 唯一入口：`python -m experiments.overcooked_v2.path_c`。
 - 布局配置：`path_c_simple.yaml` 与 `path_c_wide.yaml`，schema version 4。
 - 十单元正式训练：关闭。
+
+## 官方策略库固定伙伴交叉矩阵
+
+五个官方最终 checkpoint 已在 Test Time Simple 中分别作为固定角色主体，与原四个冻结伙伴
+完成五乘四只读矩阵。每格 500 个回合；完整矩阵为 10,000 个回合和 4,000,000 个环境步，
+其中新执行 8,000 个回合和 3,200,000 个环境步。没有训练或 checkpoint 更新。
+
+五个主体跨四伙伴的平均原始回报依次为：Self-Play seed 100 `+19.82`、seed 101 `−7.34`、
+seed 102 `−2.47`、Other-Play seed 201 `−8.11`、seed 202 `−4.73`。矩阵内部同时存在超过
++100 的强配对和低于 −90 的弱配对，说明固定伙伴读数强烈依赖具体主体—伙伴组合。
+
+完整原始行已独立重算，20 个格各有 500 个唯一回合，同一伙伴的五个主体使用相同 episode
+seed，交付计数非负，旧训练和面板产物未改写。完整结果见
+[`PATH_C_V4_4_COUNTERFACTUAL_AND_LIBRARY_MATRIX_REPORT.md`](docs/status/PATH_C_V4_4_COUNTERFACTUAL_AND_LIBRARY_MATRIX_REPORT.md)；
+逐项原始结果见
+[`PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md`](docs/status/PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md#10-官方策略库与固定伙伴的交叉矩阵)。
+全部新产物清单 SHA-256 为
+`fe11b52601b55926d1e25d9c74b351211d1ce141ccfd93afde0899031e080164`。
+
+该矩阵是官方策略库对熟悉伙伴池的固定角色开发诊断，不是十训练单元标准自我配对与跨策略
+配对矩阵，不能作为官方 Table 2 指标。`scientific_readout_allowed: false`，十单元正式训练仍关闭。
 
 ## 冻结 checkpoint 反事实任务价值审计裁决
 

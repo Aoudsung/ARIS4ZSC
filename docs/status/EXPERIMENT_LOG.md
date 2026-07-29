@@ -5,6 +5,18 @@ record; latest recorded scientific state = Link-A round 2 failed on 2026-07-09,
 and the active project line is now Path C.
 
 
+### 2026-07-29 Path C V4.4 官方策略库固定伙伴交叉矩阵完成
+
+- **联合实验报告：** 冻结 checkpoint 反事实任务价值审计与官方策略库矩阵的联合结论、口径和证据见 [`PATH_C_V4_4_COUNTERFACTUAL_AND_LIBRARY_MATRIX_REPORT.md`](PATH_C_V4_4_COUNTERFACTUAL_AND_LIBRARY_MATRIX_REPORT.md)。
+- **完整报告：** 20 个固定角色有向配对、五乘四矩阵、实际预算和证据哈希见 [`PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md`](PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md#10-官方策略库与固定伙伴的交叉矩阵)。
+- **只读协议：** 五个官方最终 checkpoint 作为 `agent_0`，四个原固定伙伴作为 `agent_1`，每格 500 个 400 步回合。动作由官方策略按温度 1 分类采样；没有训练或 checkpoint 更新。
+- **实际预算：** 完整矩阵 10,000 个回合和 4,000,000 个环境步；复用 seed-100 的 2,000 个 `reference_only` 回合，新执行 8,000 个回合和 3,200,000 个环境步。16 份新增逐决策文件共 3,200,000 行。
+- **主要读数：** 五个主体跨四伙伴的平均回报为 Self-Play seed 100 `+19.82`、seed 101 `−7.34`、seed 102 `−2.47`、Other-Play seed 201 `−8.11`、seed 202 `−4.73`。同一 checkpoint 或相近惯例配对可超过 +100，而多组跨惯例配对低于 −90，说明该固定伙伴诊断对主体—伙伴组合高度敏感。
+- **完整性：** 20 个格均严格为 500 个唯一回合；同一伙伴的五个主体使用逐项相同的 episode seed；交付计数非负；独立原始行重算与汇总精确一致。旧面板和训练输入运行前后未改写。
+- **证据：** 合并原始行 SHA-256 为 `14a3c62b063f45df185d0d0ef2e083d6edc73605ce78785f91ac8463f785380a`；独立重算为 `911deaeb9bea3f4e58dfc018e8d305c4b4b3ccaf92e3413626ff3dec77aefeda`；全部新产物清单为 `fe11b52601b55926d1e25d9c74b351211d1ce141ccfd93afde0899031e080164`。
+- **边界：** 这是官方策略库对熟悉伙伴池的固定角色开发诊断，不是十训练单元标准自我配对与跨策略配对矩阵，不能作为官方 Table 2 指标。`scientific_readout_allowed: false`，十单元正式训练仍关闭。
+
+
 ### 2026-07-28 Path C V4.4 冻结 checkpoint 反事实任务价值审计完成
 
 - **完整报告：** 双重估计口径、225 个触发状态、403,200 条 continuation、固定伙伴三分支、责任分配和八项解除条件见 [`PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md`](PATH_C_V4_4_SEED100_DEVELOPMENT_RESULTS.md#9-冻结-checkpoint-的反事实任务价值审计)。
