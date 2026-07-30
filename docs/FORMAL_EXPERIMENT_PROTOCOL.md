@@ -13,6 +13,8 @@ This file is an implementation guide, not experimental evidence. The mathematica
 
 Formal software provenance is part of every run identity. An editable Official source is accepted only when it is a clean checkout at the exact fixed commit. The DELTA worktree must likewise be clean and committed: every identity records the full repository SHA, installed-distribution lock, Official SHA, runtime, backend and devices, so an uncommitted implementation is not an admissible formal run. Resume is allowed only with an identical run identity and restores model, optimizer, RNG, runner and generator state.
 
+The fixed Official PPO entrypoint imports its bundled behavior-cloning adapter even when SP, State-Augmented, OP, or FCP is selected. That adapter imports the stable `overcooked-ai` distribution, so the registered environment pins `overcooked-ai==1.1.0`; this dependency is required only to preserve the unmodified Official import path and is recorded in every distribution lock.
+
 Formal outputs therefore belong in the ignored `runs/`, `results/` or
 `reports/` trees (or outside the checkout). Writing artifacts into a new,
 non-ignored source-tree path intentionally makes the next formal command reject

@@ -15,6 +15,9 @@ dependencies = [
   "jaxlib==0.4.38",
   "jaxmarl @ git+https://github.com/overcookedv2/experiments.git@5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e#subdirectory=JaxMARL",
   "overcooked_v2_experiments @ git+https://github.com/overcookedv2/experiments.git@5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e#subdirectory=experiments",
+  # The fixed Official PPO entrypoint imports its bundled BC adapter even for
+  # SP/SA/OP/FCP, and that adapter imports the stable Overcooked-AI package.
+  "overcooked-ai==1.1.0",
   "chex>=0.1.86",
   "flax==0.10.3",
   "optax==0.2.5",

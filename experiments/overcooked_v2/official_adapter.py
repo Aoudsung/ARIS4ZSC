@@ -126,6 +126,12 @@ def validate_official_runtime() -> Mapping[str, Any]:
 
     experiment_source = _distribution_source("overcooked-v2-experiments")
     jaxmarl_source = _distribution_source("jaxmarl")
+    overcooked_ai = importlib.metadata.distribution("overcooked-ai")
+    if overcooked_ai.version != "1.1.0":
+        raise RuntimeError(
+            "The fixed Official PPO entrypoint requires overcooked-ai==1.1.0; "
+            f"observed {overcooked_ai.version}."
+        )
     spec = importlib.util.find_spec("jaxmarl")
     if spec is None or spec.submodule_search_locations is None:
         raise ModuleNotFoundError("The fixed JaxMARL source is not importable.")
@@ -163,6 +169,7 @@ def validate_official_runtime() -> Mapping[str, Any]:
         "correct_delivery_reward": delivery_reward,
         "experiments": experiment_source,
         "jaxmarl": jaxmarl_source,
+        "overcooked_ai_version": overcooked_ai.version,
     }
 
 

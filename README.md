@@ -59,6 +59,9 @@ python -m experiments.overcooked_v2.path_c --help
 The editable Official checkout is required because the wheel built by the
 fixed commit omits its Hydra configuration tree. Runtime validation checks the
 checkout commit, cleanliness, source provenance, and the configuration tree.
+The project also pins `overcooked-ai==1.1.0`: the fixed Official PPO entrypoint
+imports its bundled BC adapter unconditionally, including for non-BC baselines,
+and that adapter imports Overcooked-AI.
 
 Static or unit-test success does not establish ZSC effectiveness. Scientific conclusions require frozen, run-disjoint partner manifests, all ten runs on both layouts, complete calibration, both registered scoreboards, the capacity control, resource accounting, and preregistered ablations.
 

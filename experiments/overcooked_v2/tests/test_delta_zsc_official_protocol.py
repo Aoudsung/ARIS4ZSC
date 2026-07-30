@@ -11,6 +11,7 @@ jnp = pytest.importorskip("jax.numpy")
 optax = pytest.importorskip("optax")
 
 from experiments.overcooked_v2.official_adapter import (  # noqa: E402
+    _official_symbol,
     _validate_official_baseline_config,
     compose_official_baseline_config,
     compose_ippo_large_config,
@@ -43,6 +44,15 @@ def test_official_runtime_is_exact_fixed_commit() -> None:
     assert runtime["experiments"]["commit_id"] == OFFICIAL_SOURCE_COMMIT
     assert runtime["jaxmarl"]["commit_id"] == OFFICIAL_SOURCE_COMMIT
     assert runtime["correct_delivery_reward"] == OFFICIAL_CORRECT_DELIVERY_REWARD == 20.0
+    assert runtime["overcooked_ai_version"] == "1.1.0"
+
+
+def test_fixed_official_ppo_entrypoint_imports() -> None:
+    assert callable(
+        _official_symbol(
+            "overcooked_v2_experiments.ppo.main", "single_run_with_viz"
+        )
+    )
 
 
 @pytest.mark.parametrize("layout", ("test_time_simple", "test_time_wide"))
