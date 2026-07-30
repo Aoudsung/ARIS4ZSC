@@ -227,6 +227,7 @@ def collect_anchor_batch(
     partner_functions: Any,
     partner_parameters: Any,
     enable_quotient_interventions: bool = True,
+    microbatch_size: int | None = None,
 ) -> tuple[Any, Any, Any, Any]:
     """Collect split-replica all-action targets from rollout snapshots.
 
@@ -260,6 +261,7 @@ def collect_anchor_batch(
     partner_codes = gather_time_lanes(records["partner_code"], indexes)
     partner_sources = gather_time_lanes(records["partner_source"], indexes)
     partner_run_ids = gather_time_lanes(records["partner_run_ids"], indexes)
+    ego_roles = gather_time_lanes(records["ego_roles"], indexes)
     anchor_count = int(indexes.shape[0])
     # The real-return target must correspond to the frozen privileged target
     # controller specified by the method, not to the student's current belief.
@@ -309,6 +311,7 @@ def collect_anchor_batch(
         ego_state=anchor_ego_state,
         partner_state=partner_state,
         partner_episode_start=ego_state.episode_start,
+        ego_roles=ego_roles,
         done=jnp.zeros((anchor_count,), dtype=jnp.bool_),
         raw_return=jnp.zeros((anchor_count,), dtype=jnp.float32),
     )
@@ -410,7 +413,7 @@ def collect_anchor_batch(
         world=world,
         rollout_flat_indexes=indexes,
         policy_states=ego_state,
-        observations=observations[:, 0],
+        observations=gather_time_lanes(records["observations"], indexes),
         partner_codes=partner_codes,
         partner_sources=partner_sources,
         partner_run_ids=partner_run_ids,
@@ -425,6 +428,7 @@ def collect_anchor_batch(
         fit_replicas=config.anchors.fit_replicas,
         evaluation_replicas=config.anchors.evaluation_replicas,
         continuation_horizon=config.anchors.continuation_horizon,
+        microbatch_size=microbatch_size,
     )
     base_codes = gather_time_lanes(records["partner_code"], indexes)
     base_sources = gather_time_lanes(records["partner_source"], indexes)
@@ -478,6 +482,7 @@ def collect_anchor_batch(
         pair_partner_state = jax.tree_util.tree_map(
             lambda value: value[:pair_count], partner_state
         )
+        pair_ego_roles = ego_roles[:pair_count]
         state_a = _generator_intervention_state(pair_partner_state, code_a)
         state_b = _generator_intervention_state(pair_partner_state, code_b)
         variant_policy_state = jax.tree_util.tree_map(
@@ -516,6 +521,7 @@ def collect_anchor_batch(
                 lambda a, b: jnp.concatenate((a, b), axis=0), state_a, state_b
             ),
             partner_episode_start=jnp.ones((2 * pair_count,), dtype=jnp.bool_),
+            ego_roles=jnp.concatenate((pair_ego_roles, pair_ego_roles), axis=0),
             done=jnp.zeros((2 * pair_count,), dtype=jnp.bool_),
             raw_return=jnp.zeros((2 * pair_count,), dtype=jnp.float32),
         )
@@ -529,8 +535,11 @@ def collect_anchor_batch(
             lambda value: jnp.concatenate((value, value), axis=0),
             pair_ego_state,
         )
+        selected_ego_observations = gather_time_lanes(
+            records["observations"], indexes
+        )[:pair_count]
         variant_observations = jnp.concatenate(
-            (pair_observations[:, 0], pair_observations[:, 0]), axis=0
+            (selected_ego_observations, selected_ego_observations), axis=0
         )
         variant_codes = jnp.concatenate((code_a, code_b), axis=0)
         variant_sources = jnp.zeros((2 * pair_count,), dtype=jnp.int32)
@@ -561,6 +570,7 @@ def collect_anchor_batch(
             fit_replicas=config.anchors.fit_replicas,
             evaluation_replicas=config.anchors.evaluation_replicas,
             continuation_horizon=config.anchors.continuation_horizon,
+            microbatch_size=microbatch_size,
         )
         offset = int(anchors.anchor_ids.shape[0])
         anchors = _concatenate_anchor_batches(anchors, variant)

@@ -100,6 +100,9 @@ class RolloutBatch(NamedTuple):
     gate_overrides: Any
     actions: Any
     rewards: Any
+    official_shaped_rewards: Any
+    official_shaping_factors: Any
+    decision_regret_shaping: Any
     shaped_rewards: Any
     dones: Any
     old_log_probabilities: Any

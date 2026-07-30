@@ -21,6 +21,7 @@ from src.path_c.model import (  # noqa: E402
     initial_policy_state,
     initialize_model_parameters,
 )
+from src.path_c.runner import observe_policy_after_transition  # noqa: E402
 from src.path_c.storage import pytree_fingerprint  # noqa: E402
 from src.path_c.training import make_optimizer  # noqa: E402
 
@@ -78,6 +79,15 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
         example_observation=observation,
         partner_code_dim=config.partner_generator.code_dim,
     )
+    task = params["task_encoder"]
+    assert task["official_conv_0"]["kernel"].shape == (1, 1, 8, 128)
+    assert task["official_conv_1"]["kernel"].shape == (1, 1, 128, 128)
+    assert task["official_conv_2"]["kernel"].shape == (1, 1, 128, 8)
+    assert task["official_conv_3"]["kernel"].shape == (3, 3, 8, 16)
+    assert task["official_conv_4"]["kernel"].shape == (3, 3, 16, 32)
+    assert task["official_conv_5"]["kernel"].shape == (3, 3, 32, 32)
+    assert task["official_dense"]["kernel"].shape[-1] == 128
+    assert task["task_gru"]["ir"]["kernel"].shape == (128, 128)
     _, output = model.apply(
         {"params": params},
         state,
@@ -116,3 +126,33 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
 
     updated = optax.apply_updates(params, updates)
     assert pytree_fingerprint(updated) != pytree_fingerprint(params)
+
+
+def test_deployable_belief_never_consumes_unavailable_transition_reward() -> None:
+    config = load_config(
+        ROOT
+        / "experiments"
+        / "overcooked_v2"
+        / "configs"
+        / "delta_zsc_simple_development.yaml",
+        run_kind="mechanical",
+    )
+    observation_shape = (5, 5, 8)
+    state = initial_policy_state(
+        batch_size=2,
+        observation_shape=observation_shape,
+        action_count=6,
+        task_hidden_dim=config.model.task_hidden_dim,
+        belief_hidden_dim=config.model.belief_hidden_dim,
+        latent_dim=config.model.latent_dim,
+        mixture_components=config.model.mixture_components,
+    )
+    updated = observe_policy_after_transition(
+        stepped_state=state,
+        action=jnp.asarray([1, 2], dtype=jnp.int32),
+        reward=jnp.asarray([20.0, -10.0], dtype=jnp.float32),
+        done=jnp.asarray([False, False]),
+        next_observation=jnp.zeros((2,) + observation_shape, dtype=jnp.float32),
+        model_config=config.model,
+    )
+    np.testing.assert_array_equal(np.asarray(updated.previous_reward), [0.0, 0.0])

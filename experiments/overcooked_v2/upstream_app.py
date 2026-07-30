@@ -4,18 +4,29 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import time
 
 from experiments.overcooked_v2.official_adapter import (
     compose_official_config,
+    restore_official_checkpoint,
     train_upstream,
+    validate_official_runtime,
 )
-from src.path_c.experiment import load_config
+from src.path_c.experiment import load_config, official_training_key
+from src.path_c.resources import (
+    ResourceLedger,
+    gpu_hours_for_wall_seconds,
+    parameter_count,
+    peak_device_memory_bytes,
+)
 from src.path_c.storage import (
     ensure_run_identity,
     upstream_identity,
+    validate_formal_repository_state,
     write_array_chunks,
     write_json,
     write_run_metadata,
+    validate_registered_python_runtime,
 )
 
 
@@ -23,26 +34,39 @@ def run_upstream(args: argparse.Namespace) -> None:
     """Run one locked official upstream training job and preserve all outputs."""
 
     config = load_config(args.config, run_kind=args.run_kind)
+    if config.run_kind == "formal":
+        validate_formal_repository_state()
+        validate_registered_python_runtime()
+    runtime = validate_official_runtime()
+    seed_index = int(args.seed_index)
+    key_words = official_training_key(seed_index)
     output = Path(args.output).resolve()
     ensure_run_identity(
         output,
-        upstream_identity(
+        {
+            **upstream_identity(
             config=config,
-            seed=int(args.seed),
+            seed_index=seed_index,
+            jax_prng_key=key_words,
             algorithm=str(args.algorithm),
-        ),
+            ),
+            "official_runtime": runtime,
+        },
     )
     official = compose_official_config(
         config,
         algorithm=args.algorithm,
-        seed=int(args.seed),
+        seed_index=seed_index,
         output_directory=output,
     )
+    started = time.perf_counter()
     result = train_upstream(
         official,
-        seed=int(args.seed),
+        run_key=key_words,
+        seed_index=seed_index,
         checkpoint_progress=config.upstream.checkpoint_progress,
     )
+    wall_seconds = time.perf_counter() - started
     write_json(output / "resolved_config.json", config.to_mapping())
     write_json(output / "official_resolved_config.json", official)
 
@@ -61,7 +85,8 @@ def run_upstream(args: argparse.Namespace) -> None:
         output / "upstream_summary.json",
         {
             "algorithm": str(args.algorithm),
-            "seed": int(args.seed),
+            "seed_index": seed_index,
+            "jax_prng_key": list(key_words),
             "effective_environment_steps": int(
                 result["effective_environment_steps"]
             ),
@@ -76,10 +101,23 @@ def run_upstream(args: argparse.Namespace) -> None:
     write_run_metadata(
         output / "run_metadata.json",
         config=config,
-        seed=int(args.seed),
+        seed=seed_index,
         effective_environment_steps=int(result["effective_environment_steps"]),
         update_count=int(result["update_count"]),
         completed_episodes=int(result["completed_episodes"]),
+    )
+    unused_checkpoint_config, final_params = restore_official_checkpoint(
+        result["checkpoint_paths"][-1]
+    )
+    del unused_checkpoint_config
+    write_json(
+        output / "resource_ledger.json",
+        ResourceLedger(
+            partner_training_steps=int(result["effective_environment_steps"]),
+            gpu_hours=gpu_hours_for_wall_seconds(wall_seconds),
+            peak_memory_bytes=peak_device_memory_bytes(),
+            deployable_parameters=parameter_count(final_params),
+        ).to_mapping(),
     )
     print(f"Complete upstream metrics: {output / 'metrics'}")
 

@@ -41,24 +41,25 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
         return state, observations, reward, done, info
 
     world = AnchorWorld(
-        environment_state=jnp.zeros((1, 1)),
-        observations=jnp.zeros((1, 2, 1)),
-        ego_state=jnp.zeros((1, 1)),
-        partner_state=jnp.zeros((1, 1)),
-        partner_episode_start=jnp.ones((1,), dtype=jnp.bool_),
-        done=jnp.zeros((1,), dtype=jnp.bool_),
-        raw_return=jnp.zeros((1,), dtype=jnp.float32),
+        environment_state=jnp.zeros((2, 1)),
+        observations=jnp.zeros((2, 2, 1)),
+        ego_state=jnp.zeros((2, 1)),
+        partner_state=jnp.zeros((2, 1)),
+        partner_episode_start=jnp.ones((2,), dtype=jnp.bool_),
+        ego_roles=jnp.zeros((2,), dtype=jnp.int32),
+        done=jnp.zeros((2,), dtype=jnp.bool_),
+        raw_return=jnp.zeros((2,), dtype=jnp.float32),
     )
-    batch = collect_counterfactual_anchors(
-        anchor_ids=jnp.asarray([7]),
-        root_keys=jax.random.split(jax.random.PRNGKey(0), 1),
+    kwargs = dict(
+        anchor_ids=jnp.asarray([7, 8]),
+        root_keys=jax.random.split(jax.random.PRNGKey(0), 2),
         world=world,
-        rollout_flat_indexes=jnp.asarray([0]),
-        policy_states=jnp.zeros((1, 1)),
-        observations=jnp.zeros((1, 1)),
-        partner_codes=jnp.zeros((1, 2)),
-        partner_sources=jnp.zeros((1,), dtype=jnp.int32),
-        partner_run_ids=jnp.asarray([3]),
+        rollout_flat_indexes=jnp.asarray([0, 1]),
+        policy_states=jnp.zeros((2, 1)),
+        observations=jnp.zeros((2, 1)),
+        partner_codes=jnp.zeros((2, 2)),
+        partner_sources=jnp.zeros((2,), dtype=jnp.int32),
+        partner_run_ids=jnp.asarray([3, 4]),
         functions=AnchorFunctions(
             ego_policy_step=ego_policy_step,
             ego_observe=ego_observe,
@@ -71,6 +72,17 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
         evaluation_replicas=2,
         continuation_horizon=1,
     )
+    batch = collect_counterfactual_anchors(**kwargs)
+    microbatched = collect_counterfactual_anchors(
+        **kwargs,
+        microbatch_size=3 * (3 + 2),
+    )
+    for full, chunked in zip(
+        jax.tree_util.tree_leaves(batch),
+        jax.tree_util.tree_leaves(microbatched),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(full), np.asarray(chunked))
     fit = np.asarray(batch.fit_returns_by_action[0])
     evaluation = np.asarray(batch.evaluation_returns_by_action[0])
     np.testing.assert_allclose(np.diff(fit), [1.0, 1.0], atol=1e-6)
@@ -79,5 +91,8 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
     np.testing.assert_allclose(
         np.asarray(centered_fit_signature(batch)).mean(axis=-1), 0.0, atol=1e-6
     )
-    selected = evaluate_selected_actions(batch, jnp.asarray([2]))
-    np.testing.assert_allclose(np.asarray(selected), evaluation[[2]])
+    selected = evaluate_selected_actions(batch, jnp.asarray([2, 2]))
+    np.testing.assert_allclose(
+        np.asarray(selected),
+        np.asarray(batch.evaluation_returns_by_action)[:, 2],
+    )

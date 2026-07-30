@@ -30,13 +30,12 @@ def task_encoder_classes() -> tuple[Any, Any]:
         ) -> tuple[Any, Any]:
             observation, previous_action, previous_reward, episode_start = inputs
             obs = jnp.asarray(observation, dtype=jnp.float32)
-            flat = obs.reshape(previous_action.shape + (-1,))
             action = jnp.asarray(previous_action, dtype=jnp.int32)
             reward = jnp.asarray(previous_reward, dtype=jnp.float32)
             start = jnp.asarray(episode_start, dtype=jnp.bool_)
             if action.shape != reward.shape or action.shape != start.shape:
                 raise ValueError("Task encoder scalar inputs must share batch axes.")
-            if flat.shape[:-1] != action.shape:
+            if obs.shape[:-3] != action.shape:
                 raise ValueError("Observation batch axes do not match task inputs.")
 
             sentinel = jnp.where(start, self.action_count, action)
@@ -46,13 +45,33 @@ def task_encoder_classes() -> tuple[Any, Any]:
                 embedding_init=nn.initializers.normal(0.02),
                 name="previous_action_embedding",
             )(sentinel)
+            # This is the exact visual trunk used by the locked Official RNN:
+            # 128x1x1, 128x1x1, 8x1x1, 16x3x3, 32x3x3, 32x3x3,
+            # flatten, Dense-128, ReLU, LayerNorm, GRU-128.  DELTA-specific
+            # belief and low-rank residual modules are attached after this
+            # shared public-protocol backbone.
+            encoded = obs
+            for index, (features, kernel) in enumerate(
+                ((128, (1, 1)), (128, (1, 1)), (8, (1, 1)),
+                 (16, (3, 3)), (32, (3, 3)), (32, (3, 3)))
+            ):
+                encoded = nn.relu(
+                    nn.Conv(
+                        features=features,
+                        kernel_size=kernel,
+                        kernel_init=orthogonal(jnp.sqrt(2.0)),
+                        bias_init=zeros,
+                        name=f"official_conv_{index}",
+                    )(encoded)
+                )
+            encoded = encoded.reshape(action.shape + (-1,))
             encoded = nn.relu(
                 nn.Dense(
                     self.hidden_dim,
                     kernel_init=orthogonal(jnp.sqrt(2.0)),
                     bias_init=zeros,
-                    name="observation_projection",
-                )(flat)
+                    name="official_dense",
+                )(encoded)
             )
             encoded = encoded + nn.Dense(
                 self.hidden_dim,

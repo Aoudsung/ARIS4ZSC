@@ -18,6 +18,7 @@ class AnchorWorld(NamedTuple):
     ego_state: Any
     partner_state: Any
     partner_episode_start: Any
+    ego_roles: Any
     done: Any
     raw_return: Any
 
@@ -92,6 +93,27 @@ def _shared_lane_keys(
     return jax.vmap(one)(roots).reshape((-1, 2))
 
 
+def anchor_microbatch_candidates(
+    *,
+    maximum_anchor_worlds: int,
+    action_count: int,
+    replicas: int,
+) -> tuple[int, ...]:
+    """Return a fixed descending sequence aligned to complete anchor worlds."""
+
+    branches_per_world = int(action_count) * int(replicas)
+    if maximum_anchor_worlds <= 0 or branches_per_world <= 0:
+        raise ValueError("Anchor candidate dimensions must be positive.")
+    worlds = int(maximum_anchor_worlds)
+    candidates = []
+    while True:
+        candidates.append(worlds * branches_per_world)
+        if worlds == 1:
+            break
+        worlds = max(worlds // 2, 1)
+    return tuple(candidates)
+
+
 def collect_counterfactual_anchors(
     *,
     anchor_ids: Any,
@@ -109,6 +131,7 @@ def collect_counterfactual_anchors(
     evaluation_replicas: int,
     continuation_horizon: int,
     gate: float = 1.0,
+    microbatch_size: int | None = None,
 ) -> CounterfactualAnchorBatch:
     """Estimate all-action continuation returns from identical anchor worlds."""
 
@@ -124,6 +147,46 @@ def collect_counterfactual_anchors(
     anchor_count = int(jnp.asarray(world.done).shape[0])
     replicas = int(fit_replicas + evaluation_replicas)
     repeats = int(action_count * replicas)
+    if microbatch_size is not None:
+        limit = int(microbatch_size)
+        if limit < repeats:
+            raise ValueError(
+                "Anchor microbatch must fit every action/replica branch of one world."
+            )
+        anchors_per_batch = max(limit // repeats, 1)
+        if anchor_count > anchors_per_batch:
+            chunks = []
+            for start in range(0, anchor_count, anchors_per_batch):
+                stop = min(start + anchors_per_batch, anchor_count)
+
+                def sliced(tree: Any) -> Any:
+                    return jax.tree_util.tree_map(
+                        lambda value: jnp.asarray(value)[start:stop], tree
+                    )
+
+                chunks.append(
+                    collect_counterfactual_anchors(
+                        anchor_ids=jnp.asarray(anchor_ids)[start:stop],
+                        root_keys=jnp.asarray(root_keys)[start:stop],
+                        world=sliced(world),
+                        rollout_flat_indexes=jnp.asarray(rollout_flat_indexes)[start:stop],
+                        policy_states=sliced(policy_states),
+                        observations=jnp.asarray(observations)[start:stop],
+                        partner_codes=jnp.asarray(partner_codes)[start:stop],
+                        partner_sources=jnp.asarray(partner_sources)[start:stop],
+                        partner_run_ids=jnp.asarray(partner_run_ids)[start:stop],
+                        functions=functions,
+                        action_count=action_count,
+                        fit_replicas=fit_replicas,
+                        evaluation_replicas=evaluation_replicas,
+                        continuation_horizon=continuation_horizon,
+                        gate=gate,
+                        microbatch_size=None,
+                    )
+                )
+            return jax.tree_util.tree_map(
+                lambda *values: jnp.concatenate(values, axis=0), *chunks
+            )
     expanded = jax.tree_util.tree_map(
         lambda value: jnp.repeat(jnp.asarray(value), repeats, axis=0), world
     )
@@ -163,9 +226,16 @@ def collect_counterfactual_anchors(
         )(lane_keys)
         uniforms = jax.vmap(lambda key: jax.random.uniform(key))(uniform_key)
 
+        lane_indexes = jnp.arange(active.shape[0], dtype=jnp.int32)
+        ego_observation = current.observations[
+            lane_indexes, current.ego_roles
+        ]
+        partner_observation = current.observations[
+            lane_indexes, 1 - current.ego_roles
+        ]
         next_ego_pre, ego_probabilities = functions.ego_policy_step(
             current.ego_state,
-            current.observations[:, 0],
+            ego_observation,
             jnp.full(active.shape, float(gate), dtype=jnp.float32),
             ego_key,
         )
@@ -173,11 +243,15 @@ def collect_counterfactual_anchors(
         ego_action = sampled_ego if forced_action is None else jnp.asarray(forced_action)
         partner_action, next_partner_pre, partner_context = functions.partner_policy_step(
             current.partner_state,
-            current.observations[:, 1],
+            partner_observation,
             current.partner_episode_start,
             partner_key,
         )
-        joint = jnp.stack((ego_action, partner_action), axis=-1)
+        ego_first = jnp.stack((ego_action, partner_action), axis=-1)
+        partner_first = jnp.stack((partner_action, ego_action), axis=-1)
+        joint = jnp.where(
+            (current.ego_roles == 0)[:, None], ego_first, partner_first
+        )
         (
             next_environment,
             next_observations,
@@ -194,15 +268,17 @@ def collect_counterfactual_anchors(
             jnp.asarray(dones).shape
             + (1,) * (next_observations[:, 0].ndim - 1)
         )
-        ego_next_for_history = jnp.where(
-            obs_mask, terminal[:, 0], next_observations[:, 0]
-        )
+        ego_terminal = terminal[lane_indexes, current.ego_roles]
+        partner_terminal = terminal[lane_indexes, 1 - current.ego_roles]
+        ego_next = next_observations[lane_indexes, current.ego_roles]
+        partner_next = next_observations[lane_indexes, 1 - current.ego_roles]
+        ego_next_for_history = jnp.where(obs_mask, ego_terminal, ego_next)
         partner_next_for_history = jnp.where(
-            obs_mask, terminal[:, 1], next_observations[:, 1]
+            obs_mask, partner_terminal, partner_next
         )
         next_ego = functions.ego_observe(
             next_ego_pre,
-            current.observations[:, 0],
+            ego_observation,
             ego_action,
             rewards,
             dones,
@@ -211,7 +287,7 @@ def collect_counterfactual_anchors(
         next_partner = functions.partner_observe(
             next_partner_pre,
             partner_context,
-            current.observations[:, 1],
+            partner_observation,
             partner_action,
             rewards,
             dones,
@@ -223,6 +299,7 @@ def collect_counterfactual_anchors(
             ego_state=next_ego,
             partner_state=next_partner,
             partner_episode_start=dones,
+            ego_roles=current.ego_roles,
             done=jnp.asarray(dones, dtype=jnp.bool_),
             raw_return=current.raw_return + jnp.where(active, rewards, 0.0),
         )
@@ -277,6 +354,7 @@ def evaluate_selected_actions(
 __all__ = [
     "AnchorFunctions",
     "AnchorWorld",
+    "anchor_microbatch_candidates",
     "centered_fit_signature",
     "collect_counterfactual_anchors",
     "evaluate_selected_actions",

@@ -2,10 +2,10 @@
 
 ## Decision-Equivalent Latent Teammate Adaptation for Zero-Shot Coordination
 
-**文档性质：** 完整理论方案、算法规格、证明、训练协议、实验规约与代码重构依据
-**目标投稿层级：** ICLR / NeurIPS
-**主基准：** JaxMARL OvercookedV2 Test Time Simple / Wide
-**第二领域：** Hanabi
+**文档性质：** 完整理论方案、算法规格、证明、训练协议、实验规约与代码重构依据  
+**目标投稿层级：** ICLR / NeurIPS  
+**主基准：** JaxMARL OvercookedV2 Test Time Simple / Wide  
+**第二领域：** Hanabi  
 **方法约束：** 部署时只有一套共享 actor、一套共享 critic 和一套在线伙伴上下文推断器；参数规模不随伙伴类别或伙伴数量增长。
 
 ---
@@ -1705,7 +1705,7 @@ J_{\mathrm{oracle\ context}}-J_{\mathrm{base}}>0.
 
 ## 20.2 OvercookedV2
 
-主布局：Test Time Simple。
+主布局：Test Time Simple。  
 冻结复现：Test Time Wide。
 
 训练伙伴支持：

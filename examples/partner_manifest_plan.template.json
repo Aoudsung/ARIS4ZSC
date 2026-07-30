@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "layout": "test_time_simple",
   "runs": [
     {
@@ -8,7 +8,10 @@
       "checkpoint": "/ABSOLUTE/PATH/TO/TRAIN_EXTERNAL_000/ckpt_final",
       "parent_training_run_id": "train_external_parent_000",
       "generation_mechanism": "rnn-sp",
-      "seed": 1000,
+      "seed": 42,
+      "seed_index": 0,
+      "jax_prng_key": [1039196627, 2465224267],
+      "owner_seed_index": 0,
       "co_training_group_id": null,
       "partner_type_id": null
     },
@@ -18,7 +21,10 @@
       "checkpoint": "/ABSOLUTE/PATH/TO/TRAIN_EXTERNAL_001/ckpt_final",
       "parent_training_run_id": "train_external_parent_001",
       "generation_mechanism": "rnn-op",
-      "seed": 1001,
+      "seed": 42,
+      "seed_index": 0,
+      "jax_prng_key": [1039196627, 2465224267],
+      "owner_seed_index": 0,
       "co_training_group_id": null,
       "partner_type_id": null
     },
@@ -29,6 +35,9 @@
       "parent_training_run_id": "calibration_parent_000",
       "generation_mechanism": "heldout-mechanism-a",
       "seed": 2000,
+      "seed_index": null,
+      "jax_prng_key": [0, 2000],
+      "owner_seed_index": 0,
       "co_training_group_id": null,
       "partner_type_id": null
     },
@@ -39,6 +48,9 @@
       "parent_training_run_id": "calibration_parent_001",
       "generation_mechanism": "heldout-mechanism-a",
       "seed": 2001,
+      "seed_index": null,
+      "jax_prng_key": [0, 2001],
+      "owner_seed_index": 0,
       "co_training_group_id": null,
       "partner_type_id": null
     },
@@ -49,6 +61,9 @@
       "parent_training_run_id": "confirmatory_parent_000",
       "generation_mechanism": "heldout-mechanism-b",
       "seed": 3000,
+      "seed_index": null,
+      "jax_prng_key": [0, 3000],
+      "owner_seed_index": null,
       "co_training_group_id": null,
       "partner_type_id": null
     },
@@ -59,6 +74,9 @@
       "parent_training_run_id": "confirmatory_parent_001",
       "generation_mechanism": "heldout-mechanism-b",
       "seed": 3001,
+      "seed_index": null,
+      "jax_prng_key": [0, 3001],
+      "owner_seed_index": null,
       "co_training_group_id": null,
       "partner_type_id": null
     }

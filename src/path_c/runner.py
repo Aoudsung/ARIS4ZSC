@@ -27,10 +27,22 @@ class RunnerState(NamedTuple):
     observations: Any
     ego_policy: PolicyState
     partner_state: Any
+    ego_roles: Any
     episode_return: Any
     completed_episodes: Any
     effective_environment_steps: Any
     random_key: Any
+
+
+def official_ego_roles(environment_count: int) -> Any:
+    """Exact Official actor-axis mask: first half agent 0, second half agent 1."""
+
+    import jax.numpy as jnp
+
+    count = int(environment_count)
+    if count <= 0 or count % 2:
+        raise ValueError("Official role balancing requires a positive even lane count.")
+    return jnp.linspace(0, 2, count, endpoint=False, dtype=jnp.int32)
 
 
 
@@ -60,6 +72,7 @@ def initialize_runner(
             mixture_components=model_config.mixture_components,
         ),
         partner_state=partner_functions.initial_state(count, partner_key),
+        ego_roles=official_ego_roles(count),
         episode_return=jnp.zeros((count,), dtype=jnp.float32),
         completed_episodes=jnp.asarray(0, dtype=jnp.int64),
         effective_environment_steps=jnp.asarray(0, dtype=jnp.int64),
@@ -116,7 +129,11 @@ def observe_policy_after_transition(
     )
     candidate = stepped_state._replace(
         previous_action=jnp.asarray(action, dtype=jnp.int32),
-        previous_reward=jnp.asarray(reward, dtype=jnp.float32),
+        # Official AbstractPolicy does not receive reward.  The deployable
+        # student therefore never consumes this privileged transition field;
+        # raw reward remains available to PPO targets, the response objective,
+        # and the training-only full-trajectory teacher.
+        previous_reward=jnp.zeros_like(jnp.asarray(reward, dtype=jnp.float32)),
         episode_start=jnp.asarray(done, dtype=jnp.bool_),
     )
     return tree_select(jnp.asarray(done, dtype=jnp.bool_), fresh, candidate)
@@ -134,6 +151,7 @@ def collect_rollout(
     partner_parameters: Any,
     gate_values: Any,
     teacher_lane_mask: Any,
+    official_shaping_factor: float,
 ) -> tuple[RunnerState, RolloutBatch, Mapping[str, Any]]:
     import jax
     import jax.numpy as jnp
@@ -154,8 +172,11 @@ def collect_rollout(
         ego_keys = jax.random.split(ego_root, count)
         partner_keys = jax.random.split(partner_root, count)
         environment_keys = jax.random.split(environment_root, count)
-        ego_observation = current.observations[:, 0]
-        partner_observation = current.observations[:, 1]
+        lane_indexes = jnp.arange(count, dtype=jnp.int32)
+        ego_observation = current.observations[lane_indexes, current.ego_roles]
+        partner_observation = current.observations[
+            lane_indexes, 1 - current.ego_roles
+        ]
         gate = jnp.broadcast_to(
             jnp.asarray(gate_values, dtype=jnp.float32), (count,)
         )
@@ -200,7 +221,11 @@ def collect_rollout(
             current.ego_policy.episode_start,
             partner_keys,
         )
-        joint = jnp.stack((ego_action, partner_action), axis=-1)
+        ego_first = jnp.stack((ego_action, partner_action), axis=-1)
+        partner_first = jnp.stack((partner_action, ego_action), axis=-1)
+        joint = jnp.where(
+            (current.ego_roles == 0)[:, None], ego_first, partner_first
+        )
         (
             next_environment,
             next_observations,
@@ -214,18 +239,32 @@ def collect_rollout(
         observation_mask = dones.reshape(
             dones.shape + (1,) * (next_observations[:, 0].ndim - 1)
         )
+        terminal_ego = terminal[lane_indexes, current.ego_roles]
+        terminal_partner = terminal[lane_indexes, 1 - current.ego_roles]
+        next_ego_observation = next_observations[
+            lane_indexes, current.ego_roles
+        ]
+        next_partner_observation = next_observations[
+            lane_indexes, 1 - current.ego_roles
+        ]
         ego_response_next = jnp.where(
-            observation_mask, terminal[:, 0], next_observations[:, 0]
+            observation_mask, terminal_ego, next_ego_observation
         )
         partner_response_next = jnp.where(
-            observation_mask, terminal[:, 1], next_observations[:, 1]
+            observation_mask, terminal_partner, next_partner_observation
         )
+        raw_rewards_by_agent = info["raw_rewards_by_agent"]
+        raw_rewards = raw_rewards_by_agent[lane_indexes, current.ego_roles]
+        official_shaped_by_agent = info["official_shaped_rewards_by_agent"]
+        official_shaped_rewards = official_shaped_by_agent[
+            lane_indexes, current.ego_roles
+        ]
         next_ego = observe_policy_after_transition(
             stepped_state=stepped_ego,
             action=ego_action,
-            reward=rewards,
+            reward=raw_rewards,
             done=dones,
-            next_observation=next_observations[:, 0],
+            next_observation=next_ego_observation,
             model_config=model_config,
         )
         partner_diagnostics = partner_functions.diagnostics(
@@ -237,16 +276,17 @@ def collect_rollout(
             partner_context,
             partner_observation,
             partner_action,
-            rewards,
+            raw_rewards,
             dones,
             partner_response_next,
         )
-        completed_return = current.episode_return + rewards
+        completed_return = current.episode_return + raw_rewards
         next_state = RunnerState(
             environment_state=next_environment,
             observations=next_observations,
             ego_policy=next_ego,
             partner_state=next_partner,
+            ego_roles=current.ego_roles,
             episode_return=jnp.where(dones, 0.0, completed_return),
             completed_episodes=current.completed_episodes
             + jnp.sum(dones.astype(jnp.int64)),
@@ -262,7 +302,13 @@ def collect_rollout(
             "gate": gate,
             "action_key": ego_keys,
             "actions": ego_action,
-            "rewards": rewards,
+            "rewards": raw_rewards,
+            "official_shaped_rewards": official_shaped_rewards,
+            "official_shaping_factor": jnp.full(
+                raw_rewards.shape,
+                float(official_shaping_factor),
+                dtype=jnp.float32,
+            ),
             "dones": dones,
             "old_log_probabilities": log_probability,
             "old_values": output.state_value,
@@ -292,10 +338,15 @@ def collect_rollout(
             "ego_policy_state": current.ego_policy,
             "partner_state": current.partner_state,
             "joint_observations": current.observations,
+            "partner_observations": partner_observation,
+            "ego_roles": current.ego_roles,
         }
 
     final_state, recorded = jax.lax.scan(one_step, state, xs=None, length=int(length))
-    final_observation = final_state.observations[:, 0]
+    lane_indexes = jnp.arange(count, dtype=jnp.int32)
+    final_observation = final_state.observations[
+        lane_indexes, final_state.ego_roles
+    ]
     final_gate = jnp.broadcast_to(jnp.asarray(gate_values, dtype=jnp.float32), (count,))
     unused_state, final_output = model.apply(
         {"params": params},
@@ -339,7 +390,14 @@ def collect_rollout(
         ),
         actions=recorded["actions"],
         rewards=recorded["rewards"],
-        shaped_rewards=recorded["rewards"],
+        official_shaped_rewards=recorded["official_shaped_rewards"],
+        official_shaping_factors=recorded["official_shaping_factor"],
+        decision_regret_shaping=jnp.zeros_like(recorded["rewards"]),
+        shaped_rewards=(
+            recorded["rewards"]
+            + recorded["official_shaping_factor"]
+            * recorded["official_shaped_rewards"]
+        ),
         dones=recorded["dones"],
         old_log_probabilities=recorded["old_log_probabilities"],
         old_values=jnp.concatenate(
@@ -431,11 +489,17 @@ def attach_decision_regret_shaping(
         gamma=config.ppo.gamma,
         weight=config.loss.decision_regret_weight,
     )
-    shaped = batch.rewards + shaping
-    return batch._replace(shaped_rewards=shaped), {
+    shaped = batch.shaped_rewards + shaping
+    return batch._replace(
+        decision_regret_shaping=shaping,
+        shaped_rewards=shaped,
+    ), {
         "decision_regret_values": regrets[:-1],
         "mean_decision_regret": jnp.mean(regrets[:-1]),
         "mean_decision_regret_shaping": jnp.mean(shaping),
+        "mean_official_shaped_reward": jnp.mean(batch.official_shaped_rewards),
+        "official_shaping_factor": jnp.mean(batch.official_shaping_factors),
+        "mean_combined_training_reward": jnp.mean(shaped),
         "maximum_decision_regret": jnp.max(regrets[:-1]),
     }
 
@@ -446,6 +510,7 @@ __all__ = [
     "attach_decision_regret_shaping",
     "collect_rollout",
     "initialize_runner",
+    "official_ego_roles",
     "observe_policy_after_transition",
     "policy_action",
 ]

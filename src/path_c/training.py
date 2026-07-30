@@ -586,12 +586,77 @@ def compute_loss(
     return LossBundle(total=total, metrics=metrics)
 
 
-def make_optimizer(params: Any, *, learning_rate: float, gradient_clip_norm: float) -> tuple[Any, Any]:
+def official_learning_rate_schedule(
+    *,
+    learning_rate: float,
+    warmup_fraction: float,
+    update_count: int,
+    minibatches_per_epoch: int,
+    update_epochs: int,
+) -> Any:
+    """Exact warmup-plus-cosine schedule from Official ``ippo.py``."""
+
     import optax
 
+    warmup_updates = int(float(warmup_fraction) * int(update_count))
+    steps_per_update = int(minibatches_per_epoch) * int(update_epochs)
+    warmup = optax.linear_schedule(
+        init_value=0.0,
+        end_value=float(learning_rate),
+        transition_steps=warmup_updates * steps_per_update,
+    )
+    cosine_updates = max(int(update_count) - warmup_updates, 1)
+    cosine = optax.cosine_decay_schedule(
+        init_value=float(learning_rate),
+        decay_steps=cosine_updates * steps_per_update,
+    )
+    return optax.join_schedules(
+        schedules=(warmup, cosine),
+        boundaries=(warmup_updates * steps_per_update,),
+    )
+
+
+def official_reward_shaping_factor(
+    environment_step: int | Any,
+    *,
+    horizon: int,
+) -> Any:
+    """Exact clipped linear coefficient used by Official PPO collection."""
+
+    import jax.numpy as jnp
+
+    step = jnp.asarray(environment_step, dtype=jnp.float32)
+    return jnp.clip(1.0 - step / float(horizon), 0.0, 1.0)
+
+
+def make_optimizer(
+    params: Any,
+    *,
+    learning_rate: float,
+    gradient_clip_norm: float,
+    adam_epsilon: float = 1.0e-5,
+    anneal_learning_rate: bool = False,
+    warmup_fraction: float = 0.0,
+    update_count: int = 1,
+    minibatches_per_epoch: int = 1,
+    update_epochs: int = 1,
+) -> tuple[Any, Any]:
+    import optax
+
+    rate = (
+        official_learning_rate_schedule(
+            learning_rate=learning_rate,
+            warmup_fraction=warmup_fraction,
+            update_count=update_count,
+            minibatches_per_epoch=minibatches_per_epoch,
+            update_epochs=update_epochs,
+        )
+        if anneal_learning_rate
+        else float(learning_rate)
+    )
     optimizer = optax.chain(
         optax.clip_by_global_norm(float(gradient_clip_norm)),
-        optax.adam(float(learning_rate)),
+        optax.adam(rate, eps=float(adam_epsilon)),
     )
     return optimizer, optimizer.init(params)
 
@@ -840,6 +905,8 @@ __all__ = [
     "generator_score_function_loss",
     "huber",
     "make_optimizer",
+    "official_learning_rate_schedule",
+    "official_reward_shaping_factor",
     "polyak_update",
     "posterior_consistency_loss",
     "ppo_actor_loss",

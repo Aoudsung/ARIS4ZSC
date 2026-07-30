@@ -11,6 +11,7 @@ from src.path_c.experiment import (
     CONFIG_VERSION,
     MANIFEST_VERSION,
     METHOD_VERSION,
+    OFFICIAL_PROTOCOL_VERSION,
     PartnerManifest,
     PartnerRun,
     RUN_BUDGETS,
@@ -33,6 +34,9 @@ def _run(index: int, role: str, *, parent: str | None = None) -> PartnerRun:
         parent_training_run_id=parent or f"parent-{index}",
         generation_mechanism=f"mechanism-{index % 2}",
         seed=index,
+        seed_index=None,
+        jax_prng_key=(0, 10_000 + index),
+        owner_seed_index=None if role == "confirmatory" else index % 10,
         co_training_group_id=f"group-{index}",
         partner_type_id=None,
     )
@@ -56,10 +60,12 @@ def _valid_manifest() -> PartnerManifest:
 def test_registered_versions_and_run_budgets() -> None:
     assert CONFIG_VERSION == 5
     assert MANIFEST_VERSION == 2
-    assert METHOD_VERSION == "delta_zsc_v5_decision_equivalent_bayes_r1"
+    assert METHOD_VERSION == "delta_zsc_v5_decision_equivalent_bayes_r2_official"
+    assert OFFICIAL_PROTOCOL_VERSION == "overcooked_v2_iclr2025_5ce1707_v1"
     assert RUN_BUDGETS["mechanical"].num_envs == 4
     assert RUN_BUDGETS["development"].environment_steps == 1_228_800
-    assert RUN_BUDGETS["formal"].environment_steps == 11_000_000
+    assert RUN_BUDGETS["formal"].num_envs == 256
+    assert RUN_BUDGETS["formal"].environment_steps == 29_949_952
 
 
 @pytest.mark.parametrize(
@@ -67,8 +73,8 @@ def test_registered_versions_and_run_budgets() -> None:
     (
         ("delta_zsc_simple_development.yaml", "development", 32),
         ("delta_zsc_wide_development.yaml", "mechanical", 4),
-        ("delta_zsc_simple_formal.yaml", "formal", 250),
-        ("delta_zsc_wide_formal.yaml", "formal", 250),
+        ("delta_zsc_simple_formal.yaml", "formal", 256),
+        ("delta_zsc_wide_formal.yaml", "formal", 256),
     ),
 )
 def test_v5_configs_load_with_registered_budget(
@@ -76,7 +82,7 @@ def test_v5_configs_load_with_registered_budget(
 ) -> None:
     config = load_config(CONFIGS / filename, run_kind=run_kind)
     assert config.environment.num_envs == expected_envs
-    assert config.training.rollout_length == config.environment.episode_steps
+    assert config.training.rollout_length == 256
     assert len(config.fingerprint) == 64
 
 

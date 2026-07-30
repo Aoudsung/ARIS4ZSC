@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 from pathlib import Path
+import time
 from typing import Any, Mapping, Sequence
 
 from experiments.overcooked_v2.deployment import (
@@ -12,20 +13,40 @@ from experiments.overcooked_v2.deployment import (
     export_deployment_bundle,
     load_training_model,
 )
-from experiments.overcooked_v2.official_adapter import FrozenPartnerPool, VectorEnvironment
+from experiments.overcooked_v2.official_policy import OfficialDeltaPolicy
+from experiments.overcooked_v2.official_adapter import (
+    FrozenPartnerPool,
+    VectorEnvironment,
+    validate_official_runtime,
+)
 from src.path_c.anchor_sampling import collect_anchor_batch, gather_time_lanes
+from src.path_c.counterfactual_anchor import anchor_microbatch_candidates
 from src.path_c.belief_set_encoder import mixture_moments
 from src.path_c.decision_geometry import centered_action_values
 from src.path_c.calibration import calibrate_adaptation_gate, calibration_to_mapping
-from src.path_c.experiment import load_config, load_partner_manifest
+from src.path_c.experiment import (
+    METHOD_VERSION,
+    load_config,
+    load_partner_manifest,
+    official_training_domain_keys,
+)
 from src.path_c.external_partner import make_external_partner_functions
 from src.path_c.runner import collect_rollout, initialize_runner
+from src.path_c.resources import (
+    ResourceLedger,
+    gpu_hours_for_wall_seconds,
+    measure_policy_inference_latency_ms,
+    parameter_count,
+    peak_device_memory_bytes,
+)
 from src.path_c.storage import (
     calibration_identity,
     ensure_run_identity,
     pytree_fingerprint,
+    validate_formal_repository_state,
     write_json,
     write_parquet,
+    validate_registered_python_runtime,
 )
 
 
@@ -89,6 +110,7 @@ def _collect_fixed_partner_rollout(
         teacher_lane_mask=jnp.zeros(
             (config.environment.num_envs,), dtype=jnp.bool_
         ),
+        official_shaping_factor=0.0,
     )
     return environment, partner_functions, runner, batch, records
 
@@ -132,13 +154,33 @@ def run_calibration(args: argparse.Namespace) -> None:
     import jax.numpy as jnp
     import numpy as np
 
+    started = time.perf_counter()
     config = load_config(args.config, run_kind=args.run_kind)
+    if config.run_kind == "formal":
+        validate_formal_repository_state()
+        validate_registered_python_runtime()
+        validate_official_runtime()
     manifest = load_partner_manifest(
         args.partner_manifest,
         expected_layout=config.environment.layout,
         verify_files=not bool(args.skip_manifest_hash_check),
     )
-    calibration_runs = manifest.by_role("calibration")
+    calibration_runs = tuple(
+        run
+        for run in manifest.by_role("calibration")
+        if run.owner_seed_index == int(args.seed_index)
+    )
+    if config.run_kind == "formal":
+        unowned = [
+            run.run_id
+            for run in manifest.by_role("calibration")
+            if run.owner_seed_index is None
+        ]
+        if unowned:
+            raise ValueError(
+                "Formal calibration partners must bind one DELTA outer run: "
+                f"{unowned}"
+            )
     if len({run.parent_training_run_id for run in calibration_runs}) < config.calibration.minimum_run_count:
         raise ValueError("Partner manifest does not meet the calibration run count.")
     output = Path(args.output).resolve()
@@ -146,7 +188,7 @@ def run_calibration(args: argparse.Namespace) -> None:
         output,
         calibration_identity(
             config=config,
-            seed=int(args.seed),
+            seed_index=int(args.seed_index),
             training_run=args.training_run,
             manifest=manifest,
         ),
@@ -163,7 +205,18 @@ def run_calibration(args: argparse.Namespace) -> None:
     latent_rows = []
     run_labels: list[str] = []
     audit_rows: list[Mapping[str, Any]] = []
-    root = jax.random.PRNGKey(int(args.seed))
+    root = jnp.asarray(
+        official_training_domain_keys(int(args.seed_index))["calibration"],
+        dtype=jnp.uint32,
+    )
+    microbatch_size: int | None = None
+    candidates = anchor_microbatch_candidates(
+        maximum_anchor_worlds=config.calibration.anchors_per_run,
+        action_count=6,
+        replicas=config.anchors.fit_replicas + config.anchors.evaluation_replicas,
+    )
+    counterfactual_steps = 0
+    rollout_steps = 0
     for run_index, run in enumerate(calibration_runs):
         current = _batch_config(
             config,
@@ -180,7 +233,10 @@ def run_calibration(args: argparse.Namespace) -> None:
             )
         )
         del unused_runner, unused_batch
-        anchors, unused_quotient, unused_codes, indexes = collect_anchor_batch(
+        rollout_steps += (
+            config.calibration.episodes_per_run * config.environment.episode_steps
+        )
+        collection_kwargs = dict(
             anchor_domain=20_000 + run_index,
             key=jax.random.fold_in(root, 100_000 + run_index),
             records=records,
@@ -192,7 +248,57 @@ def run_calibration(args: argparse.Namespace) -> None:
             partner_parameters=None,
             enable_quotient_interventions=False,
         )
+        if microbatch_size is None:
+            failures = []
+            for candidate in candidates:
+                try:
+                    anchors, unused_quotient, unused_codes, indexes = (
+                        collect_anchor_batch(
+                            **collection_kwargs, microbatch_size=int(candidate)
+                        )
+                    )
+                    leaves = jax.tree_util.tree_leaves(anchors)
+                    if leaves:
+                        jax.block_until_ready(leaves[0])
+                    microbatch_size = int(candidate)
+                    break
+                except Exception as error:
+                    message = f"{type(error).__name__}: {error}".lower()
+                    if not any(
+                        token in message
+                        for token in (
+                            "out of memory",
+                            "resource exhausted",
+                            "resource_exhausted",
+                        )
+                    ):
+                        raise
+                    failures.append(f"{candidate}: {type(error).__name__}: {error}")
+                    jax.clear_caches()
+            else:
+                raise RuntimeError(
+                    "No registered calibration-anchor microbatch fits; budgets "
+                    "were not reduced. " + " | ".join(failures)
+                )
+            write_json(
+                output / "anchor_microbatch.json",
+                {
+                    "candidates": list(candidates),
+                    "selected": microbatch_size,
+                    "changes_scientific_samples": False,
+                },
+            )
+        else:
+            anchors, unused_quotient, unused_codes, indexes = collect_anchor_batch(
+                **collection_kwargs, microbatch_size=microbatch_size
+            )
         del unused_quotient, unused_codes
+        counterfactual_steps += (
+            int(anchors.anchor_ids.shape[0])
+            * 6
+            * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
+            * config.anchors.continuation_horizon
+        )
         predicted = centered_action_values(
             gather_time_lanes(records["action_values"], indexes)
         )
@@ -252,13 +358,31 @@ def run_calibration(args: argparse.Namespace) -> None:
         deployment=deployment,
         calibration=artifact,
     )
+    latency_observation = jnp.zeros(
+        tuple(deployment.model.observation_shape), dtype=jnp.float32
+    )
+    inference_latency_ms = measure_policy_inference_latency_ms(
+        OfficialDeltaPolicy(
+            deployment.__class__(
+                ego_run_id=deployment.ego_run_id,
+                config=deployment.config,
+                model=deployment.model,
+                params=deployable_parameters(deployment.params),
+                calibration=artifact,
+            )
+        ),
+        latency_observation,
+    )
     write_json(
         output / "run_metadata.json",
         {
-            "method": "delta_zsc_v5_decision_equivalent_bayes_r1",
+            "method": METHOD_VERSION,
+            "seed_index": int(args.seed_index),
             "calibration_partner_runs": len(calibration_runs),
             "calibration_anchor_rows": len(run_labels),
             "training_support_latent_rows": int(np.asarray(training_latents).shape[0]),
+            "calibration_rollout_steps": rollout_steps,
+            "calibration_counterfactual_steps": counterfactual_steps,
             "artifact": calibration_to_mapping(artifact),
             "deployment_bundle": str(deployment_bundle),
             "deployment_params_fingerprint": pytree_fingerprint(
@@ -266,6 +390,18 @@ def run_calibration(args: argparse.Namespace) -> None:
             ),
             "scientific_readout_allowed": False,
         },
+    )
+    write_json(
+        output / "resource_ledger.json",
+        ResourceLedger(
+            calibration_steps=rollout_steps + counterfactual_steps,
+            gpu_hours=gpu_hours_for_wall_seconds(time.perf_counter() - started),
+            peak_memory_bytes=peak_device_memory_bytes(),
+            deployable_parameters=parameter_count(
+                deployable_parameters(deployment.params)
+            ),
+            inference_latency_ms=inference_latency_ms,
+        ).to_mapping(),
     )
     print(f"Complete DELTA-ZSC calibration: {output / 'calibration.json'}")
     print(f"Pruned deployment bundle: {deployment_bundle}")

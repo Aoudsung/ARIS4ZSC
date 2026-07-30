@@ -86,7 +86,7 @@ def make_mixed_partner_functions(
             else jnp.zeros((batch_size,), dtype=jnp.int32)
         )
         external_member = (
-            jax.random.randint(external_key, (batch_size,), 0, external_count)
+            external_pool.sample_members(external_key, batch_size)
             if external_count > 0
             else jnp.zeros((batch_size,), dtype=jnp.int32)
         )

@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
-from experiments.overcooked_v2.official_adapter import FrozenPartnerPool, VectorEnvironment
+from experiments.overcooked_v2.deployment import deployable_parameters
+from experiments.overcooked_v2.official_adapter import (
+    FrozenPartnerPool,
+    VectorEnvironment,
+    validate_official_runtime,
+    validate_official_partner_checkpoint,
+)
 from src.path_c.anchor_sampling import collect_anchor_batch
+from src.path_c.counterfactual_anchor import anchor_microbatch_candidates
 from src.path_c.belief_set_encoder import mixture_moments
 from src.path_c.calibration import calibration_to_mapping, empty_calibration
 from src.path_c.decision_geometry import (
@@ -15,7 +24,12 @@ from src.path_c.decision_geometry import (
     centered_action_values,
     smoothness_marginal_penalties,
 )
-from src.path_c.experiment import load_config, load_partner_manifest
+from src.path_c.experiment import (
+    load_config,
+    load_partner_manifest,
+    official_training_domain_keys,
+    official_training_key,
+)
 from src.path_c.model import (
     build_model,
     initial_policy_state,
@@ -34,6 +48,12 @@ from src.path_c.runner import (
     collect_rollout,
     initialize_runner,
 )
+from src.path_c.resources import (
+    ResourceLedger,
+    gpu_hours_for_wall_seconds,
+    parameter_count,
+    peak_device_memory_bytes,
+)
 from src.path_c.snapshot_archive import (
     load_snapshot_archive,
     save_generator_snapshot,
@@ -46,7 +66,9 @@ from src.path_c.storage import (
     restore_latest_checkpoint,
     save_checkpoint,
     training_identity,
+    validate_formal_repository_state,
     write_json,
+    validate_registered_python_runtime,
     write_jsonl,
 )
 from src.path_c.training import (
@@ -54,6 +76,7 @@ from src.path_c.training import (
     environment_minibatch_schedule,
     generator_score_function_loss,
     make_optimizer,
+    official_reward_shaping_factor,
     polyak_update,
     slice_rollout_lanes,
     update_competence_multiplier,
@@ -79,6 +102,43 @@ def _host(tree: Any) -> Any:
     return float(array)
 
 
+def _collect_with_adaptive_microbatch(
+    *,
+    candidates: tuple[int, ...],
+    collection_kwargs: Mapping[str, Any],
+) -> tuple[Any, Any, Any, Any, int]:
+    """Choose the largest complete-world microbatch that the device accepts."""
+
+    import jax
+
+    failures = []
+    for candidate in candidates:
+        try:
+            result = collect_anchor_batch(
+                **collection_kwargs,
+                microbatch_size=int(candidate),
+            )
+            # Host-side bound validation in the collector already synchronizes
+            # returns; this explicit leaf barrier also covers future changes.
+            leaves = jax.tree_util.tree_leaves(result[0])
+            if leaves:
+                jax.block_until_ready(leaves[0])
+            return (*result, int(candidate))
+        except Exception as error:
+            message = f"{type(error).__name__}: {error}".lower()
+            if not any(
+                token in message
+                for token in ("out of memory", "resource exhausted", "resource_exhausted")
+            ):
+                raise
+            failures.append(f"{candidate}: {type(error).__name__}: {error}")
+            jax.clear_caches()
+    raise RuntimeError(
+        "No registered anchor microbatch fits the device; scientific budgets "
+        "were not reduced. Attempts=" + " | ".join(failures)
+    )
+
+
 def _generator_update(
     *,
     generator: Any,
@@ -97,7 +157,7 @@ def _generator_update(
     if float(jnp.sum(source_mask)) <= 0.0:
         return state, {"generator_update_skipped": jnp.asarray(1.0)}
     initial_carry = records["partner_state"].generator_carry[0]
-    partner_observations = records["joint_observations"][:, :, 1]
+    partner_observations = records["partner_observations"]
     codes = records["partner_code"]
     starts = records["episode_starts"]
     # Actions are fixed by the collected on-policy trajectory.  Keys only satisfy
@@ -221,6 +281,7 @@ def _write_final_support_latents(
         partner_parameters=partner_parameters,
         gate_values=jnp.ones((environment.num_envs,), dtype=jnp.float32),
         teacher_lane_mask=jnp.zeros((environment.num_envs,), dtype=jnp.bool_),
+        official_shaping_factor=0.0,
     )
     del unused_batch
     mean, variance = mixture_moments(
@@ -262,7 +323,14 @@ def run_training(args: argparse.Namespace) -> None:
     import jax.numpy as jnp
     import numpy as np
 
+    started = time.perf_counter()
     config = load_config(args.config, run_kind=args.run_kind)
+    if config.run_kind == "formal":
+        validate_formal_repository_state()
+        validate_registered_python_runtime()
+    official_runtime = (
+        validate_official_runtime() if config.run_kind == "formal" else None
+    )
     manifest = load_partner_manifest(
         args.partner_manifest,
         expected_layout=config.environment.layout,
@@ -271,25 +339,90 @@ def run_training(args: argparse.Namespace) -> None:
     output = Path(args.output).resolve()
     environment = VectorEnvironment.create(config)
     observation_shape = environment.observation_shape
+    outer_key = official_training_key(int(args.seed_index))
+    domain_keys = official_training_domain_keys(int(args.seed_index))
     identity = dict(
-        training_identity(config=config, seed=args.seed, partner_manifest=manifest)
+        training_identity(
+            config=config,
+            seed_index=int(args.seed_index),
+            jax_prng_key=outer_key,
+            partner_manifest=manifest,
+        )
     )
     identity.update(
         {
             "ego_run_id": str(args.ego_run_id),
             "observation_shape": list(observation_shape),
             "action_count": 6,
+            "official_runtime": official_runtime,
         }
     )
     ensure_run_identity(output, identity)
     write_json(output / "resolved_config.json", config.to_mapping())
     write_json(output / "resolved_partner_manifest.json", manifest.to_mapping())
 
-    external_paths = [
-        run.checkpoint for run in manifest.by_role("frozen_external_train")
-    ]
+    external_runs = tuple(
+        run
+        for run in manifest.by_role("frozen_external_train")
+        if run.owner_seed_index == int(args.seed_index)
+    )
+    if config.run_kind == "formal":
+        mechanisms = {run.generation_mechanism for run in external_runs}
+        if not {"rnn-sp", "rnn-op"}.issubset(mechanisms):
+            raise ValueError(
+                "Formal DELTA run requires its own Official SP and OP parent support."
+            )
+        unowned = [
+            run.run_id
+            for run in manifest.by_role("frozen_external_train")
+            if run.owner_seed_index is None
+        ]
+        if unowned:
+            raise ValueError(
+                "Formal frozen training partners must bind one owner seed: "
+                f"{unowned}"
+            )
+        parents = {}
+        for run in external_runs:
+            parents.setdefault(run.parent_training_run_id, []).append(run)
+        if len(parents) != 2 or {len(values) for values in parents.values()} != {3}:
+            raise ValueError(
+                "Each formal DELTA run requires exactly one SP parent and one OP "
+                "parent, with three frozen checkpoints per parent."
+            )
+        if {
+            values[0].generation_mechanism for values in parents.values()
+        } != {"rnn-sp", "rnn-op"}:
+            raise ValueError("Formal frozen parent mechanisms must be SP and OP.")
+        expected_key = tuple(official_training_key(int(args.seed_index)))
+        for parent, values in parents.items():
+            if (
+                {run.owner_seed_index for run in values} != {int(args.seed_index)}
+                or {run.seed_index for run in values} != {int(args.seed_index)}
+                or {tuple(run.jax_prng_key or ()) for run in values} != {expected_key}
+                or len({run.generation_mechanism for run in values}) != 1
+            ):
+                raise ValueError(
+                    f"Formal frozen parent provenance is inconsistent: {parent}."
+                )
+            algorithm = values[0].generation_mechanism
+            for run in values:
+                validate_official_partner_checkpoint(
+                    run.checkpoint,
+                    config=config,
+                    algorithm=algorithm,
+                    seed_index=int(args.seed_index),
+                )
+    external_paths = [run.checkpoint for run in external_runs]
     external_pool = (
-        FrozenPartnerPool.from_checkpoints(external_paths) if external_paths else None
+        FrozenPartnerPool.from_checkpoints(
+            external_paths,
+            parent_training_run_ids=[
+                run.parent_training_run_id for run in external_runs
+            ],
+        )
+        if external_paths
+        else None
     )
     model = build_model(
         observation_shape=observation_shape,
@@ -322,10 +455,11 @@ def run_training(args: argparse.Namespace) -> None:
         modulation_rank=config.partner_generator.modulation_rank,
     )
 
-    root = jax.random.PRNGKey(int(args.seed))
-    root, reset_key, model_key, generator_key, runner_key, state_key = jax.random.split(
-        root, 6
-    )
+    ego_root = jnp.asarray(domain_keys["ego"], dtype=jnp.uint32)
+    generator_root = jnp.asarray(domain_keys["generator"], dtype=jnp.uint32)
+    anchor_root = jnp.asarray(domain_keys["anchor"], dtype=jnp.uint32)
+    reset_key, model_key, runner_key, state_key = jax.random.split(ego_root, 4)
+    generator_key = jax.random.fold_in(generator_root, 0)
     unused_environment_state, observations = environment.reset(reset_key)
     del unused_environment_state
     example_state = initial_policy_state(
@@ -352,15 +486,27 @@ def run_training(args: argparse.Namespace) -> None:
         batch_size=environment.num_envs,
         hidden_dim=config.partner_generator.hidden_dim,
     )
+    total_updates = (
+        config.training.environment_steps
+        // config.environment.num_envs
+        // config.training.rollout_length
+    )
     optimizer, optimizer_state = make_optimizer(
         params,
         learning_rate=config.ppo.learning_rate,
         gradient_clip_norm=config.ppo.gradient_clip_norm,
+        adam_epsilon=config.ppo.adam_epsilon,
+        anneal_learning_rate=config.ppo.anneal_learning_rate,
+        warmup_fraction=config.ppo.lr_warmup_fraction,
+        update_count=total_updates,
+        minibatches_per_epoch=config.training.minibatches_per_epoch,
+        update_epochs=config.ppo.update_epochs,
     )
     generator_optimizer, generator_optimizer_state = make_optimizer(
         generator_params,
         learning_rate=config.ppo.learning_rate,
         gradient_clip_norm=config.ppo.gradient_clip_norm,
+        adam_epsilon=config.ppo.adam_epsilon,
     )
 
     snapshot_root = output / "generator_snapshots"
@@ -372,7 +518,11 @@ def run_training(args: argparse.Namespace) -> None:
     ):
         save_generator_snapshot(bootstrap_snapshot, generator_params)
     snapshot_paths = [
-        *(run.checkpoint for run in manifest.by_role("generator_snapshot")),
+        *(
+            run.checkpoint
+            for run in manifest.by_role("generator_snapshot")
+            if run.owner_seed_index == int(args.seed_index)
+        ),
         *sorted(snapshot_root.glob("snapshot_*")),
     ]
     snapshot_archive = (
@@ -434,15 +584,51 @@ def run_training(args: argparse.Namespace) -> None:
 
     metrics_path = output / "records" / "metrics"
     anchor_path = output / "records" / "anchors"
+    resource_progress_path = output / "resource_progress.json"
+    previous_gpu_hours = 0.0
+    if resource_progress_path.is_file():
+        previous_gpu_hours = float(
+            json.loads(resource_progress_path.read_text(encoding="utf-8")).get(
+                "gpu_hours", 0.0
+            )
+        )
+    anchor_microbatch_size: int | None = None
+    completed_anchor_triggers = (
+        int(np.asarray(state.update_count)) // config.anchors.interval_updates
+    )
+    matched_pair_count = min(
+        config.anchors.states_per_interval,
+        config.partner_generator.codes_per_update,
+    )
+    counterfactual_steps = (
+        completed_anchor_triggers
+        * (config.anchors.states_per_interval + 2 * matched_pair_count)
+        * 6
+        * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
+        * config.anchors.continuation_horizon
+    )
+    anchor_candidates = anchor_microbatch_candidates(
+        maximum_anchor_worlds=max(
+            config.anchors.states_per_interval,
+            2 * min(
+                config.anchors.states_per_interval,
+                config.partner_generator.codes_per_update,
+            ),
+        ),
+        action_count=6,
+        replicas=(
+            config.anchors.fit_replicas
+            + config.anchors.evaluation_replicas
+        ),
+    )
     while int(np.asarray(state.effective_environment_steps)) < config.training.environment_steps:
         (
             collection_key,
             shaping_key,
             schedule_key,
-            anchor_key,
             lane_key,
             next_key,
-        ) = jax.random.split(state.random_key, 6)
+        ) = jax.random.split(state.random_key, 5)
         if snapshot_archive:
             stacked_snapshots = stack_parameter_trees(snapshot_archive)
         else:
@@ -476,6 +662,12 @@ def run_training(args: argparse.Namespace) -> None:
             partner_parameters=partner_parameters,
             gate_values=gate_values,
             teacher_lane_mask=teacher_mask,
+            official_shaping_factor=float(
+                official_reward_shaping_factor(
+                    state.effective_environment_steps,
+                    horizon=config.upstream.reward_shaping_horizon,
+                )
+            ),
         )
         batch, shaping_metrics = attach_decision_regret_shaping(
             batch=batch,
@@ -495,9 +687,9 @@ def run_training(args: argparse.Namespace) -> None:
         quotient_pairs = None
         anchor_codes = None
         if update_number % config.anchors.interval_updates == 0:
-            anchors, quotient_pairs, anchor_codes, unused_anchor_indexes = collect_anchor_batch(
+            collection_kwargs = dict(
                 anchor_domain=update_number,
-                key=anchor_key,
+                key=jax.random.fold_in(anchor_root, update_number),
                 records=records,
                 environment=environment,
                 model=model,
@@ -506,7 +698,45 @@ def run_training(args: argparse.Namespace) -> None:
                 partner_functions=partner_functions,
                 partner_parameters=partner_parameters,
             )
+            if anchor_microbatch_size is None:
+                (
+                    anchors,
+                    quotient_pairs,
+                    anchor_codes,
+                    unused_anchor_indexes,
+                    anchor_microbatch_size,
+                ) = _collect_with_adaptive_microbatch(
+                    candidates=anchor_candidates,
+                    collection_kwargs=collection_kwargs,
+                )
+                write_json(
+                    output / "anchor_microbatch.json",
+                    {
+                        "candidates": list(anchor_candidates),
+                        "selected": anchor_microbatch_size,
+                        "changes_scientific_samples": False,
+                    },
+                )
+            else:
+                (
+                    anchors,
+                    quotient_pairs,
+                    anchor_codes,
+                    unused_anchor_indexes,
+                ) = collect_anchor_batch(
+                    **collection_kwargs,
+                    microbatch_size=anchor_microbatch_size,
+                )
             del unused_anchor_indexes
+            counterfactual_steps += (
+                int(anchors.anchor_ids.shape[0])
+                * 6
+                * (
+                    config.anchors.fit_replicas
+                    + config.anchors.evaluation_replicas
+                )
+                * config.anchors.continuation_horizon
+            )
             write_json(
                 anchor_path / f"update_{update_number:08d}.json",
                 {
@@ -527,7 +757,6 @@ def run_training(args: argparse.Namespace) -> None:
         )
         update_metrics = []
         first_minibatch = True
-        stop_for_kl = False
         for epoch in range(config.ppo.update_epochs):
             for minibatch in range(config.training.minibatches_per_epoch):
                 indexes = schedule[epoch, minibatch]
@@ -545,13 +774,6 @@ def run_training(args: argparse.Namespace) -> None:
                 state = update.state
                 update_metrics.append(update.metrics)
                 first_minibatch = False
-                if float(np.asarray(update.metrics["approx_kl"])) > float(
-                    config.ppo.max_approx_kl
-                ):
-                    stop_for_kl = True
-                    break
-            if stop_for_kl:
-                break
 
         generator_metrics: Mapping[str, Any] = {
             "generator_update_skipped": jnp.asarray(1.0)
@@ -612,7 +834,7 @@ def run_training(args: argparse.Namespace) -> None:
                     "losses": _host(mean_metrics),
                     "shaping": _host(shaping_metrics),
                     "generator": _host(generator_metrics),
-                    "ppo_early_stop_for_kl": bool(stop_for_kl),
+                    "ppo_early_stop_for_kl": False,
                     "calibration": calibration_to_mapping(state.calibration),
                 },
             ),
@@ -620,6 +842,15 @@ def run_training(args: argparse.Namespace) -> None:
         step = int(np.asarray(state.effective_environment_steps))
         if step % config.training.checkpoint_interval_environment_steps == 0:
             save_checkpoint(manager, step=step, state=state)
+        write_json(
+            resource_progress_path,
+            {
+                "effective_environment_steps": step,
+                "counterfactual_steps": counterfactual_steps,
+                "gpu_hours": previous_gpu_hours
+                + gpu_hours_for_wall_seconds(time.perf_counter() - started),
+            },
+        )
 
     final_step = int(np.asarray(state.effective_environment_steps))
     if manager.latest_step() != final_step:
@@ -642,13 +873,19 @@ def run_training(args: argparse.Namespace) -> None:
         state=state,
         partner_functions=partner_functions,
         partner_parameters=final_partner_parameters,
-        key=jax.random.fold_in(state.random_key, 900_001),
+        key=jax.random.fold_in(
+            jnp.asarray(domain_keys["snapshot"], dtype=jnp.uint32), 900_001
+        ),
     )
     write_json(
         output / "run_metadata.json",
         {
             "method": identity["method"],
-            "seed": int(args.seed),
+            "seed_index": int(args.seed_index),
+            "jax_prng_key": list(outer_key),
+            "domain_keys": {
+                name: list(value) for name, value in domain_keys.items()
+            },
             "ego_run_id": str(args.ego_run_id),
             "effective_environment_steps": final_step,
             "update_count": int(np.asarray(state.update_count)),
@@ -657,6 +894,34 @@ def run_training(args: argparse.Namespace) -> None:
             "scientific_readout_allowed": False,
         },
     )
+    parent_mechanisms = {
+        run.parent_training_run_id: run.generation_mechanism
+        for run in external_runs
+    }
+    partner_training_steps = sum(
+        {"rnn-sp": 29_949_952, "rnn-op": 49_987_584}.get(mechanism, 0)
+        for mechanism in parent_mechanisms.values()
+    )
+    deployable_count = parameter_count(deployable_parameters(state.params))
+    training_only_count = (
+        parameter_count(state.params)
+        - deployable_count
+        + parameter_count(state.target_params)
+        + parameter_count(state.generator_params)
+        + parameter_count(state.generator_target_params)
+    )
+    ledger = ResourceLedger(
+        ego_policy_steps=final_step,
+        partner_training_steps=partner_training_steps,
+        counterfactual_steps=counterfactual_steps,
+        calibration_steps=int(support_metadata["environment_steps"]),
+        gpu_hours=previous_gpu_hours
+        + gpu_hours_for_wall_seconds(time.perf_counter() - started),
+        peak_memory_bytes=peak_device_memory_bytes(),
+        deployable_parameters=deployable_count,
+        training_only_parameters=training_only_count,
+    )
+    write_json(output / "resource_ledger.json", ledger.to_mapping())
     print(f"Complete DELTA-ZSC training run: {output}")
 
 

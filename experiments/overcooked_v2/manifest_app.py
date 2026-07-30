@@ -15,7 +15,7 @@ from src.path_c.experiment import (
 )
 from src.path_c.storage import sha256_path, write_json
 
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 
 
 def _exact_mapping(value: Any, expected: set[str], location: str) -> Mapping[str, Any]:
@@ -56,6 +56,9 @@ def build_partner_manifest(
         "parent_training_run_id",
         "generation_mechanism",
         "seed",
+        "seed_index",
+        "jax_prng_key",
+        "owner_seed_index",
         "co_training_group_id",
         "partner_type_id",
     }
@@ -76,6 +79,19 @@ def build_partner_manifest(
                 parent_training_run_id=str(item["parent_training_run_id"]),
                 generation_mechanism=str(item["generation_mechanism"]),
                 seed=int(item["seed"]),
+                seed_index=(
+                    None if item["seed_index"] is None else int(item["seed_index"])
+                ),
+                jax_prng_key=(
+                    None
+                    if item["jax_prng_key"] is None
+                    else tuple(int(value) for value in item["jax_prng_key"])
+                ),
+                owner_seed_index=(
+                    None
+                    if item["owner_seed_index"] is None
+                    else int(item["owner_seed_index"])
+                ),
                 co_training_group_id=(
                     None
                     if item["co_training_group_id"] is None

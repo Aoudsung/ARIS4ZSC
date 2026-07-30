@@ -11,8 +11,24 @@ from typing import Any, Mapping, Sequence
 
 
 CONFIG_VERSION = 5
-METHOD_VERSION = "delta_zsc_v5_decision_equivalent_bayes_r1"
+METHOD_VERSION = "delta_zsc_v5_decision_equivalent_bayes_r2_official"
 MANIFEST_VERSION = 2
+OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
+OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
+OFFICIAL_TRAINING_ROOT_SEED = 42
+OFFICIAL_EVALUATION_ROOT_SEED = 0
+OFFICIAL_TRAINING_RUN_COUNT = 10
+OFFICIAL_EPISODES_PER_PAIRING = 500
+OFFICIAL_ACTION_COUNT = 6
+OFFICIAL_EPISODE_STEPS = 400
+OFFICIAL_CORRECT_DELIVERY_REWARD = 20.0
+OFFICIAL_ROLLOUT_LENGTH = 256
+OFFICIAL_SP_TOTAL_TIMESTEPS = 30_000_000
+OFFICIAL_OP_TOTAL_TIMESTEPS = 50_000_000
+OFFICIAL_SP_NUM_ENVS = 256
+OFFICIAL_OP_NUM_ENVS = 64
+OFFICIAL_NUM_MINIBATCHES = 64
+OFFICIAL_UPDATE_EPOCHS = 4
 RUN_KINDS = ("mechanical", "development", "formal")
 LAYOUTS = ("test_time_simple", "test_time_wide")
 PARTNER_ROLES = (
@@ -32,9 +48,9 @@ class RunBudget:
 
 
 RUN_BUDGETS: Mapping[str, RunBudget] = {
-    "mechanical": RunBudget(4, 1_600, 1, 1_600),
-    "development": RunBudget(32, 1_228_800, 8, 102_400),
-    "formal": RunBudget(250, 11_000_000, 50, 100_000),
+    "mechanical": RunBudget(4, 1_024, 1, 1_024),
+    "development": RunBudget(32, 1_228_800, 8, 98_304),
+    "formal": RunBudget(256, 29_949_952, 64, 29_949_952),
 }
 
 
@@ -43,6 +59,9 @@ class EnvironmentConfig:
     layout: str
     agent_view_size: int
     indicate_successful_delivery: bool
+    negative_rewards: bool
+    random_agent_positions: bool
+    sample_recipe_on_delivery: bool
     episode_steps: int
     num_envs: int
 
@@ -80,6 +99,9 @@ class PPOConfig:
     max_approx_kl: float
     normalize_advantages: bool
     polyak_coefficient: float
+    lr_warmup_fraction: float
+    anneal_learning_rate: bool
+    adam_epsilon: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +201,16 @@ class UpstreamConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class OfficialProtocolConfig:
+    protocol_version: str
+    source_commit: str
+    training_root_seed: int
+    training_run_count: int
+    evaluation_root_seed: int
+    evaluation_episodes_per_pairing: int
+
+
+@dataclass(frozen=True, slots=True)
 class RunConfig:
     run_kind: str
     environment: EnvironmentConfig
@@ -191,6 +223,7 @@ class RunConfig:
     training: TrainingConfig
     evaluation: EvaluationConfig
     upstream: UpstreamConfig
+    official_protocol: OfficialProtocolConfig
 
     def to_mapping(self) -> dict[str, Any]:
         return json.loads(
@@ -212,6 +245,9 @@ class PartnerRun:
     parent_training_run_id: str
     generation_mechanism: str
     seed: int
+    seed_index: int | None
+    jax_prng_key: tuple[int, int] | None
+    owner_seed_index: int | None
     co_training_group_id: str | None
     partner_type_id: str | None
 
@@ -274,6 +310,48 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def official_training_key(seed_index: int) -> tuple[int, int]:
+    """Return the exact indexed key from split(PRNGKey(42), 10)."""
+
+    import jax
+    import numpy as np
+
+    index = int(seed_index)
+    if not 0 <= index < OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("Official seed_index must lie in 0..9.")
+    key = np.asarray(
+        jax.random.split(
+            jax.random.PRNGKey(OFFICIAL_TRAINING_ROOT_SEED),
+            OFFICIAL_TRAINING_RUN_COUNT,
+        )[index],
+        dtype=np.uint32,
+    )
+    return int(key[0]), int(key[1])
+
+
+def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, int]]:
+    """Derive registered independent domains from one Official outer-run key.
+
+    Domain integers are not hand-selected hyperparameters: each is the first
+    unsigned 32-bit word of SHA-256(``delta-zsc-v5/<domain>``), recorded in the
+    run identity together with the resulting JAX key.
+    """
+
+    import jax
+    import numpy as np
+
+    root = np.asarray(official_training_key(seed_index), dtype=np.uint32)
+    result: dict[str, tuple[int, int]] = {}
+    for name in ("ego", "generator", "snapshot", "anchor", "calibration"):
+        tag = int.from_bytes(
+            hashlib.sha256(f"delta-zsc-v5/{name}".encode("utf-8")).digest()[:4],
+            "big",
+        )
+        key = np.asarray(jax.random.fold_in(root, tag), dtype=np.uint32)
+        result[name] = (int(key[0]), int(key[1]))
+    return result
+
+
 
 def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
     """Load config v5 and apply the registered run budget."""
@@ -298,6 +376,7 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
             "training",
             "evaluation",
             "upstream",
+            "official_protocol",
         },
         "configuration",
     )
@@ -306,7 +385,15 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
 
     environment_payload = _exact_fields(
         payload["environment"],
-        {"layout", "agent_view_size", "indicate_successful_delivery", "episode_steps"},
+        {
+            "layout",
+            "agent_view_size",
+            "indicate_successful_delivery",
+            "negative_rewards",
+            "random_agent_positions",
+            "sample_recipe_on_delivery",
+            "episode_steps",
+        },
         "environment",
     )
     model_payload = _exact_fields(payload["model"], set(ModelConfig.__dataclass_fields__), "model")
@@ -337,6 +424,11 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
     upstream_payload = _exact_fields(
         payload["upstream"], set(UpstreamConfig.__dataclass_fields__), "upstream"
     )
+    protocol_payload = _exact_fields(
+        payload["official_protocol"],
+        set(OfficialProtocolConfig.__dataclass_fields__),
+        "official_protocol",
+    )
 
     budget = RUN_BUDGETS[run_kind]
     config = RunConfig(
@@ -365,6 +457,7 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
             reward_shaping_horizon=int(upstream_payload["reward_shaping_horizon"]),
             checkpoint_progress=tuple(upstream_payload["checkpoint_progress"]),
         ),
+        official_protocol=OfficialProtocolConfig(**protocol_payload),
     )
     validate_config(config)
     return config
@@ -376,8 +469,15 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError(f"Unknown OvercookedV2 layout: {config.environment.layout}")
     if config.environment.agent_view_size != 2:
         raise ValueError("The registered public protocol uses view radius two.")
-    if config.environment.episode_steps != 400:
+    if config.environment.episode_steps != OFFICIAL_EPISODE_STEPS:
         raise ValueError("The registered public protocol uses 400-step episodes.")
+    if not (
+        config.environment.negative_rewards
+        and config.environment.random_agent_positions
+        and config.environment.sample_recipe_on_delivery
+        and config.environment.indicate_successful_delivery
+    ):
+        raise ValueError("Formal OvercookedV2 environment flags must match Official.")
     if config.model.latent_dim <= 0 or config.model.mixture_components <= 0:
         raise ValueError("Continuous belief dimensions must be positive.")
     if config.model.posterior_particles < config.model.mixture_components:
@@ -397,6 +497,10 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("PPO update count and learning rate must be positive.")
     if not 0.0 < config.ppo.polyak_coefficient <= 1.0:
         raise ValueError("Polyak coefficient must lie in (0, 1].")
+    if not 0.0 <= config.ppo.lr_warmup_fraction < 1.0:
+        raise ValueError("LR warmup fraction must lie in [0, 1).")
+    if config.ppo.adam_epsilon <= 0.0:
+        raise ValueError("Adam epsilon must be positive.")
 
     probabilities = (
         config.partner_generator.current_probability,
@@ -441,10 +545,8 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Student and teacher lane probabilities must sum to one.")
     if not 0.0 <= config.training.base_policy_lane_probability <= 1.0:
         raise ValueError("Base-policy lane probability must lie in [0, 1].")
-    if config.training.rollout_length != config.environment.episode_steps:
-        raise ValueError(
-            "DELTA-ZSC training rollouts must contain one complete episode."
-        )
+    if config.training.rollout_length <= 0:
+        raise ValueError("Training rollout length must be positive.")
     if config.evaluation.episodes_per_pairing <= 0:
         raise ValueError("Evaluation episodes_per_pairing must be positive.")
     if config.evaluation.bootstrap_replicates <= 0:
@@ -476,11 +578,68 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Evaluation independent-run minima must be positive.")
     if config.run_kind == "formal":
         if not config.calibration.enable_hard_gate_at_evaluation:
-            raise ValueError("Formal evaluation requires the frozen hard adaptation gate.")
+            raise ValueError(
+                "The DELTA-ZSC design requires the frozen run-block conformal "
+                "hard gate for formal confirmatory evaluation."
+            )
         if not config.evaluation.report_br_prox:
-            raise ValueError("Formal evaluation requires empirical held-out BR-Prox.")
-        if not config.evaluation.evaluate_both_roles:
-            raise ValueError("Formal evaluation must evaluate both agent roles.")
+            raise ValueError(
+                "The DELTA-ZSC design requires empirical BR-Prox in the formal "
+                "mechanism-disjoint confirmatory evaluation."
+            )
+        if config.training.rollout_length != OFFICIAL_ROLLOUT_LENGTH:
+            raise ValueError("Official formal recurrent rollouts contain 256 steps.")
+        official_ppo = {
+            "update_epochs": OFFICIAL_UPDATE_EPOCHS,
+            "learning_rate": 0.00025,
+            "gradient_clip_norm": 0.25,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "clip_epsilon": 0.2,
+            "value_clip_epsilon": 0.2,
+            "entropy_weight": 0.01,
+            "value_weight": 0.5,
+            "lr_warmup_fraction": 0.05,
+            "anneal_learning_rate": True,
+            "adam_epsilon": 1.0e-5,
+        }
+        for name, expected in official_ppo.items():
+            if getattr(config.ppo, name) != expected:
+                raise ValueError(f"Formal PPO field {name} must equal {expected!r}.")
+        if config.environment.num_envs != OFFICIAL_SP_NUM_ENVS:
+            raise ValueError("Official DELTA formal training uses 256 environments.")
+        if config.training.environment_steps != 29_949_952:
+            raise ValueError("Official DELTA formal training executes 29,949,952 steps.")
+        if config.training.minibatches_per_epoch != OFFICIAL_NUM_MINIBATCHES:
+            raise ValueError("Official DELTA formal training uses 64 minibatches.")
+        if config.evaluation.episodes_per_pairing != OFFICIAL_EPISODES_PER_PAIRING:
+            raise ValueError("Official evaluation uses 500 episodes per pairing.")
+        if config.evaluation.evaluation_seed != OFFICIAL_EVALUATION_ROOT_SEED:
+            raise ValueError("Repository-defined Official evaluation root key is zero.")
+        if config.evaluation.one_sided_alpha != 0.05:
+            raise ValueError("Formal scoreboards use the registered one-sided 95% bound.")
+        if config.evaluation.bootstrap_replicates != 9_999:
+            raise ValueError("Formal scoreboards use exactly 9,999 node bootstraps.")
+        if (
+            config.evaluation.minimum_ego_runs != 10
+            or config.evaluation.minimum_partner_runs_per_mechanism != 4
+            or config.evaluation.minimum_mechanisms != 4
+            or not config.evaluation.evaluate_both_roles
+        ):
+            raise ValueError("Formal Common-Partner support is fixed at 10 egos and 4x4 partners in both roles.")
+
+    protocol = config.official_protocol
+    expected_protocol = {
+        "protocol_version": OFFICIAL_PROTOCOL_VERSION,
+        "source_commit": OFFICIAL_SOURCE_COMMIT,
+        "training_root_seed": OFFICIAL_TRAINING_ROOT_SEED,
+        "training_run_count": OFFICIAL_TRAINING_RUN_COUNT,
+        "evaluation_root_seed": OFFICIAL_EVALUATION_ROOT_SEED,
+        "evaluation_episodes_per_pairing": OFFICIAL_EPISODES_PER_PAIRING,
+    }
+    for name, expected in expected_protocol.items():
+        if getattr(protocol, name) != expected:
+            raise ValueError(f"Official protocol field {name} must equal {expected!r}.")
 
     rollout_steps = config.environment.num_envs * config.training.rollout_length
     if config.training.environment_steps % rollout_steps:
@@ -520,6 +679,9 @@ def load_partner_manifest(
                 "parent_training_run_id",
                 "generation_mechanism",
                 "seed",
+                "seed_index",
+                "jax_prng_key",
+                "owner_seed_index",
                 "co_training_group_id",
                 "partner_type_id",
             },
@@ -539,6 +701,19 @@ def load_partner_manifest(
             parent_training_run_id=str(raw["parent_training_run_id"]),
             generation_mechanism=str(raw["generation_mechanism"]),
             seed=int(raw["seed"]),
+            seed_index=(
+                None if raw["seed_index"] is None else int(raw["seed_index"])
+            ),
+            jax_prng_key=(
+                None
+                if raw["jax_prng_key"] is None
+                else tuple(int(value) for value in raw["jax_prng_key"])
+            ),
+            owner_seed_index=(
+                None
+                if raw["owner_seed_index"] is None
+                else int(raw["owner_seed_index"])
+            ),
             co_training_group_id=(
                 None
                 if raw["co_training_group_id"] is None
@@ -548,6 +723,8 @@ def load_partner_manifest(
                 None if raw["partner_type_id"] is None else str(raw["partner_type_id"])
             ),
         )
+        if run.jax_prng_key is not None and len(run.jax_prng_key) != 2:
+            raise ValueError(f"JAX PRNG key must have two words for run {run.run_id}.")
         if verify_files:
             if not checkpoint.exists():
                 raise FileNotFoundError(f"Partner checkpoint is missing: {checkpoint}")
@@ -568,9 +745,83 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
     run_ids = [run.run_id for run in manifest.runs]
     if len(run_ids) != len(set(run_ids)):
         raise ValueError("Partner run IDs must be unique.")
+    for run in manifest.runs:
+        if run.owner_seed_index is not None and not (
+            0 <= run.owner_seed_index < OFFICIAL_TRAINING_RUN_COUNT
+        ):
+            raise ValueError(f"Partner owner_seed_index is outside 0..9: {run.run_id}")
+        if run.role == "confirmatory" and run.owner_seed_index is not None:
+            raise ValueError(
+                f"Common confirmatory partner cannot belong to one ego run: {run.run_id}"
+            )
+        official_parent = (
+            run.role == "frozen_external_train"
+            and run.generation_mechanism in {"rnn-sp", "rnn-op"}
+        )
+        if official_parent:
+            if run.seed_index is None or run.jax_prng_key is None:
+                raise ValueError(
+                    f"Official SP/OP partner lacks indexed PRNG provenance: {run.run_id}"
+                )
+            if not 0 <= run.seed_index < OFFICIAL_TRAINING_RUN_COUNT:
+                raise ValueError(f"Partner seed_index is outside 0..9: {run.run_id}")
+            if tuple(run.jax_prng_key) != official_training_key(run.seed_index):
+                raise ValueError(
+                    f"Official partner PRNG key differs from split(PRNGKey(42), 10): "
+                    f"{run.run_id}"
+                )
+        elif run.seed_index is not None and run.jax_prng_key is None:
+            raise ValueError(f"Indexed partner lacks its explicit JAX key: {run.run_id}")
+        if run.role in {"calibration", "confirmatory"} and run.jax_prng_key is None:
+            raise ValueError(
+                f"Run-disjoint evaluation partner lacks JAX key provenance: {run.run_id}"
+            )
+        if run.role in {"calibration", "confirmatory"}:
+            if run.seed_index is not None:
+                raise ValueError(
+                    "Fresh calibration/confirmatory partners cannot reuse Official "
+                    f"seed indexes: {run.run_id}"
+                )
+            official_keys = {
+                tuple(official_training_key(index))
+                for index in range(OFFICIAL_TRAINING_RUN_COUNT)
+            }
+            if tuple(run.jax_prng_key or ()) in official_keys:
+                raise ValueError(
+                    "Fresh calibration/confirmatory partner reuses a formal "
+                    f"training key: {run.run_id}"
+                )
+        if run.jax_prng_key is not None and len(run.jax_prng_key) != 2:
+            raise ValueError(f"Partner JAX PRNG key is malformed: {run.run_id}")
     hashes = [run.checkpoint_sha256 for run in manifest.runs]
     if len(hashes) != len(set(hashes)):
         raise ValueError("Exact checkpoint overlap is forbidden across manifest entries.")
+    evaluation_keys = [
+        tuple(run.jax_prng_key or ())
+        for run in manifest.runs
+        if run.role in {"calibration", "confirmatory"}
+    ]
+    if len(evaluation_keys) != len(set(evaluation_keys)):
+        raise ValueError(
+            "Fresh calibration/confirmatory partners must use distinct JAX keys."
+        )
+
+    for role in ("frozen_external_train", "generator_snapshot", "calibration"):
+        owners_by_parent: dict[str, set[int | None]] = {}
+        for run in manifest.by_role(role):
+            owners_by_parent.setdefault(run.parent_training_run_id, set()).add(
+                run.owner_seed_index
+            )
+        shared_parents = {
+            parent: owners
+            for parent, owners in owners_by_parent.items()
+            if len(owners) > 1
+        }
+        if shared_parents:
+            raise ValueError(
+                f"{role} parent runs cannot be shared across DELTA outer runs: "
+                f"{shared_parents}"
+            )
 
     train_roles = {"generator_snapshot", "frozen_external_train"}
     eval_roles = {"calibration", "confirmatory"}
@@ -620,7 +871,7 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
     external_train = manifest.by_role("frozen_external_train")
     calibration = manifest.by_role("calibration")
     confirmatory = manifest.by_role("confirmatory")
-    if len({run.parent_training_run_id for run in external_train}) < 2:
+    if external_train and len({run.parent_training_run_id for run in external_train}) < 2:
         raise ValueError("Training support requires at least two independent frozen external runs.")
     if calibration and len({run.parent_training_run_id for run in calibration}) < 2:
         raise ValueError("Calibration requires at least two independent parent runs.")
@@ -638,6 +889,23 @@ __all__ = [
     "LossConfig",
     "MANIFEST_VERSION",
     "METHOD_VERSION",
+    "OFFICIAL_ACTION_COUNT",
+    "OFFICIAL_EPISODE_STEPS",
+    "OFFICIAL_CORRECT_DELIVERY_REWARD",
+    "OFFICIAL_EPISODES_PER_PAIRING",
+    "OFFICIAL_EVALUATION_ROOT_SEED",
+    "OFFICIAL_NUM_MINIBATCHES",
+    "OFFICIAL_OP_NUM_ENVS",
+    "OFFICIAL_OP_TOTAL_TIMESTEPS",
+    "OFFICIAL_PROTOCOL_VERSION",
+    "OFFICIAL_ROLLOUT_LENGTH",
+    "OFFICIAL_SOURCE_COMMIT",
+    "OFFICIAL_SP_NUM_ENVS",
+    "OFFICIAL_SP_TOTAL_TIMESTEPS",
+    "OFFICIAL_TRAINING_ROOT_SEED",
+    "OFFICIAL_TRAINING_RUN_COUNT",
+    "OFFICIAL_UPDATE_EPOCHS",
+    "OfficialProtocolConfig",
     "ModelConfig",
     "PARTNER_ROLES",
     "PPOConfig",
@@ -651,6 +919,8 @@ __all__ = [
     "UpstreamConfig",
     "load_config",
     "load_partner_manifest",
+    "official_training_key",
+    "official_training_domain_keys",
     "validate_config",
     "validate_partner_manifest",
 ]

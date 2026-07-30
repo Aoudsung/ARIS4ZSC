@@ -4,6 +4,9 @@ environment:
   layout: test_time_wide
   agent_view_size: 2
   indicate_successful_delivery: true
+  negative_rewards: true
+  random_agent_positions: true
+  sample_recipe_on_delivery: true
   episode_steps: 400
 
 model:
@@ -26,7 +29,7 @@ model:
 ppo:
   update_epochs: 4
   learning_rate: 0.00025
-  gradient_clip_norm: 0.5
+  gradient_clip_norm: 0.25
   gamma: 0.99
   gae_lambda: 0.95
   clip_epsilon: 0.2
@@ -36,6 +39,9 @@ ppo:
   max_approx_kl: 0.03
   normalize_advantages: true
   polyak_coefficient: 0.005
+  lr_warmup_fraction: 0.05
+  anneal_learning_rate: true
+  adam_epsilon: 0.00001
 
 loss:
   response_weight: 1.0
@@ -90,7 +96,7 @@ calibration:
   anchors_per_run: 64
 
 training:
-  rollout_length: 400
+  rollout_length: 256
   student_lane_probability: 0.75
   teacher_lane_probability: 0.25
   base_policy_lane_probability: 0.25
@@ -98,7 +104,7 @@ training:
 evaluation:
   episodes_per_pairing: 500
   bootstrap_replicates: 9999
-  evaluation_seed: 20260801
+  evaluation_seed: 0
   enable_adaptation: true
   report_br_prox: true
   br_prox_anchors_per_pairing: 8
@@ -106,12 +112,20 @@ evaluation:
   br_prox_evaluation_replicas: 16
   br_prox_continuation_horizon: 400
   evaluate_both_roles: true
-  one_sided_alpha: 0.015
+  one_sided_alpha: 0.05
   minimum_ego_runs: 10
   minimum_partner_runs_per_mechanism: 4
-  minimum_mechanisms: 2
+  minimum_mechanisms: 4
 
 upstream:
   total_timesteps: 30000000
   reward_shaping_horizon: 15000000
   checkpoint_progress: [0.0, 0.5, 1.0]
+
+official_protocol:
+  protocol_version: overcooked_v2_iclr2025_5ce1707_v1
+  source_commit: 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e
+  training_root_seed: 42
+  training_run_count: 10
+  evaluation_root_seed: 0
+  evaluation_episodes_per_pairing: 500

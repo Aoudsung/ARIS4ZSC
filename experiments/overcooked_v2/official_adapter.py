@@ -11,20 +11,154 @@ public environment and evaluator.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ast
+import copy
 import importlib
+import importlib.metadata
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any, Callable, Mapping, Sequence
+from urllib.parse import unquote, urlparse
 
-from src.path_c.experiment import RunConfig
+from src.path_c.experiment import (
+    OFFICIAL_CORRECT_DELIVERY_REWARD,
+    OFFICIAL_SOURCE_COMMIT,
+    RunConfig,
+)
+from src.path_c.experiment import (
+    OFFICIAL_NUM_MINIBATCHES,
+    OFFICIAL_OP_NUM_ENVS,
+    OFFICIAL_OP_TOTAL_TIMESTEPS,
+    OFFICIAL_ROLLOUT_LENGTH,
+    OFFICIAL_SP_NUM_ENVS,
+    OFFICIAL_SP_TOTAL_TIMESTEPS,
+    OFFICIAL_TRAINING_ROOT_SEED,
+    OFFICIAL_TRAINING_RUN_COUNT,
+    OFFICIAL_UPDATE_EPOCHS,
+)
 
 
 ACTION_ORDER = ("right", "down", "left", "up", "stay", "interact")
 
 
+def _distribution_source(distribution_name: str) -> Mapping[str, Any]:
+    """Read PEP-610 provenance for one installed Official distribution."""
+
+    distribution = importlib.metadata.distribution(distribution_name)
+    raw = distribution.read_text("direct_url.json")
+    if raw is None:
+        raise RuntimeError(
+            f"{distribution_name} has no direct_url.json; its fixed Git source "
+            "cannot be established."
+        )
+    payload = json.loads(raw)
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"{distribution_name} direct_url.json is malformed.")
+    vcs = payload.get("vcs_info")
+    source_kind = "locked-git-install"
+    if isinstance(vcs, Mapping):
+        commit = str(vcs.get("commit_id", ""))
+        requested = str(vcs.get("requested_revision", ""))
+        if commit != OFFICIAL_SOURCE_COMMIT or requested != OFFICIAL_SOURCE_COMMIT:
+            raise RuntimeError(
+                f"{distribution_name} source differs from Official commit "
+                f"{OFFICIAL_SOURCE_COMMIT}: commit={commit!r}, requested={requested!r}."
+            )
+    else:
+        # An editable install from a local checkout is acceptable only when the
+        # checkout itself is an exact, clean copy of the registered commit.
+        # This path supports mechanical tests without weakening formal source
+        # provenance: both HEAD and worktree cleanliness are verified here.
+        parsed = urlparse(str(payload.get("url", "")))
+        if parsed.scheme != "file":
+            raise RuntimeError(
+                f"{distribution_name} was not installed from locked Git or an "
+                "auditable local Git checkout."
+            )
+        source = Path(unquote(parsed.path)).resolve()
+        repository = next(
+            (candidate for candidate in (source, *source.parents) if (candidate / ".git").exists()),
+            None,
+        )
+        if repository is None:
+            raise RuntimeError(f"{distribution_name} local source is not inside Git.")
+        commit = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ("git", "status", "--porcelain"),
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if commit != OFFICIAL_SOURCE_COMMIT or dirty:
+            raise RuntimeError(
+                f"{distribution_name} editable checkout is not the clean Official "
+                f"commit {OFFICIAL_SOURCE_COMMIT}: commit={commit!r}, dirty={bool(dirty)}."
+            )
+        requested = OFFICIAL_SOURCE_COMMIT
+        source_kind = "clean-local-git-checkout"
+        # Some editable installers do not activate their generated finder on
+        # every supported Python version.  After provenance is verified, make
+        # the exact checkout importable without copying or modifying it.
+        if str(source) not in sys.path:
+            sys.path.insert(0, str(source))
+    return {
+        "distribution": distribution_name,
+        "version": distribution.version,
+        "url": str(payload.get("url", "")),
+        "commit_id": commit,
+        "requested_revision": requested,
+        "source_kind": source_kind,
+    }
+
+
+def validate_official_runtime() -> Mapping[str, Any]:
+    """Require both Official packages to originate from the same fixed commit."""
+
+    experiment_source = _distribution_source("overcooked-v2-experiments")
+    jaxmarl_source = _distribution_source("jaxmarl")
+    spec = importlib.util.find_spec("jaxmarl")
+    if spec is None or spec.submodule_search_locations is None:
+        raise ModuleNotFoundError("The fixed JaxMARL source is not importable.")
+    settings_path = (
+        Path(next(iter(spec.submodule_search_locations)))
+        / "environments"
+        / "overcooked_v2"
+        / "settings.py"
+    )
+    delivery_reward = None
+    tree = ast.parse(settings_path.read_text(encoding="utf-8"), filename=str(settings_path))
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "DELIVERY_REWARD" for target in node.targets)
+        ):
+            delivery_reward = float(ast.literal_eval(node.value))
+            break
+    if delivery_reward != OFFICIAL_CORRECT_DELIVERY_REWARD:
+        raise RuntimeError("Official correct-delivery reward scale changed.")
+    return {
+        "source_commit": OFFICIAL_SOURCE_COMMIT,
+        "correct_delivery_reward": delivery_reward,
+        "experiments": experiment_source,
+        "jaxmarl": jaxmarl_source,
+    }
+
+
 def _official_package_root() -> Path:
     spec = importlib.util.find_spec("overcooked_v2_experiments")
+    if spec is None:
+        _distribution_source("overcooked-v2-experiments")
+        spec = importlib.util.find_spec("overcooked_v2_experiments")
     if spec is None or spec.submodule_search_locations is None:
         raise ModuleNotFoundError("overcooked_v2_experiments is not installed.")
     return Path(next(iter(spec.submodule_search_locations))).resolve()
@@ -50,7 +184,7 @@ def compose_official_config(
     config: RunConfig,
     *,
     algorithm: str,
-    seed: int,
+    seed_index: int,
     output_directory: str | Path,
 ) -> Mapping[str, Any]:
     """Compose the official recurrent Independent PPO configuration."""
@@ -69,17 +203,12 @@ def compose_official_config(
             "env.ENV_KWARGS.indicate_successful_delivery="
             f"{str(config.environment.indicate_successful_delivery).lower()}"
         ),
-        f"SEED={int(seed)}",
-        "NUM_SEEDS=1",
+        f"SEED={OFFICIAL_TRAINING_ROOT_SEED}",
+        f"NUM_SEEDS={OFFICIAL_TRAINING_RUN_COUNT}",
         f"NUM_CHECKPOINTS={len(config.upstream.checkpoint_progress)}",
         "VISUALIZE=false",
         "TUNE=false",
         "wandb.WANDB_MODE=disabled",
-        f"model.TOTAL_TIMESTEPS={int(config.upstream.total_timesteps)}",
-        (
-            "model.REW_SHAPING_HORIZON="
-            f"{int(config.upstream.reward_shaping_horizon)}"
-        ),
     ]
     with initialize_config_dir(
         version_base=None,
@@ -91,8 +220,170 @@ def compose_official_config(
         raise ValueError("Official Hydra configuration did not resolve to a mapping.")
     result = dict(resolved)
     result["RUN_BASE_DIR"] = str(Path(output_directory).resolve())
-    _validate_official_config(result, config=config, algorithm=algorithm, seed=seed)
+    _validate_official_config(
+        result, config=config, algorithm=algorithm, seed_index=seed_index
+    )
     return result
+
+
+OFFICIAL_BASELINE_EXPERIMENTS: Mapping[str, str] = {
+    "sp": "rnn-sp",
+    "state-augmented": "rnn-sa",
+    "op": "rnn-op",
+    "fcp": "rnn-fcp",
+}
+
+
+def compose_official_baseline_config(
+    *,
+    layout: str,
+    method: str,
+    fcp_population: str | Path | None = None,
+) -> Mapping[str, Any]:
+    """Resolve an unmodified Official baseline Hydra recipe.
+
+    This function validates, but does not normalize, algorithm-specific
+    hyperparameters.  In particular OP remains 50M/64 environments and FCP
+    retains its own learning rate, entropy coefficient, and GAE lambda.
+    """
+
+    if method not in OFFICIAL_BASELINE_EXPERIMENTS:
+        raise ValueError(f"Unknown Official baseline method: {method}")
+    if layout not in {"test_time_simple", "test_time_wide"}:
+        raise ValueError(f"Unknown Official layout: {layout}")
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
+
+    overrides = [
+        f"+experiment={OFFICIAL_BASELINE_EXPERIMENTS[method]}",
+        f"+env={layout}",
+        f"SEED={OFFICIAL_TRAINING_ROOT_SEED}",
+        "NUM_CHECKPOINTS=1",
+        "VISUALIZE=false",
+        "TUNE=false",
+        "wandb.WANDB_MODE=disabled",
+    ]
+    if method == "fcp":
+        if fcp_population is None:
+            raise ValueError("Official FCP requires an explicit population directory.")
+        overrides.append(f"+FCP={Path(fcp_population).resolve()}")
+    elif fcp_population is not None:
+        raise ValueError("fcp_population is only valid for Official FCP.")
+    if method != "fcp":
+        overrides.append(f"NUM_SEEDS={OFFICIAL_TRAINING_RUN_COUNT}")
+    with initialize_config_dir(
+        version_base=None,
+        config_dir=str(_official_package_root() / "ppo" / "config"),
+    ):
+        composed = compose(config_name="base", overrides=overrides)
+    payload = OmegaConf.to_container(composed, resolve=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError("Official baseline config did not resolve to a mapping.")
+    _validate_official_baseline_config(payload, layout=layout, method=method)
+    return dict(payload)
+
+
+def compose_ippo_large_config(
+    *, layout: str, hidden_dimension: int
+) -> Mapping[str, Any]:
+    """Capacity-control recipe using the fixed Official RNN-SP trainer.
+
+    Only the two width fields are changed.  Environment, optimizer, trajectory
+    budget, action-path recurrent depth, and evaluator remain the registered
+    Official SP recipe.
+    """
+
+    base = compose_official_baseline_config(layout=layout, method="sp")
+    dimension = int(hidden_dimension)
+    if dimension <= 0:
+        raise ValueError("IPPO-Large hidden_dimension must be positive.")
+    payload = copy.deepcopy(base)
+    payload["model"]["FC_DIM_SIZE"] = dimension
+    payload["model"]["GRU_HIDDEN_DIM"] = dimension
+    return payload
+
+
+def _validate_official_baseline_config(
+    payload: Mapping[str, Any], *, layout: str, method: str
+) -> None:
+    model = payload.get("model")
+    environment = payload.get("env")
+    if not isinstance(model, Mapping) or not isinstance(environment, Mapping):
+        raise ValueError("Official baseline config lacks model/environment sections.")
+    kwargs = environment.get("ENV_KWARGS")
+    if not isinstance(kwargs, Mapping):
+        raise ValueError("Official baseline environment kwargs are missing.")
+    environment_expected = {
+        "layout": layout,
+        "agent_view_size": 2,
+        "negative_rewards": True,
+        "random_agent_positions": True,
+        "sample_recipe_on_delivery": True,
+        "indicate_successful_delivery": True,
+    }
+    for name, expected in environment_expected.items():
+        if kwargs.get(name) != expected:
+            raise ValueError(
+                f"Official {method} environment field {name} changed: "
+                f"{kwargs.get(name)!r}."
+            )
+    shared = {
+        "TYPE": "RNN",
+        "FC_DIM_SIZE": 128,
+        "GRU_HIDDEN_DIM": 128,
+        "NUM_STEPS": 256,
+        "CLIP_EPS": 0.2,
+        "VF_COEF": 0.5,
+        "GAMMA": 0.99,
+    }
+    for name, expected in shared.items():
+        if model.get(name) != expected:
+            raise ValueError(f"Official {method} model field {name} changed.")
+    expected_by_method: Mapping[str, Mapping[str, Any]] = {
+        "sp": {
+            "TOTAL_TIMESTEPS": 30_000_000,
+            "NUM_ENVS": 256,
+            "LR": 0.00025,
+            "ENT_COEF": 0.01,
+            "GAE_LAMBDA": 0.95,
+        },
+        "state-augmented": {
+            "TOTAL_TIMESTEPS": 30_000_000,
+            "NUM_ENVS": 256,
+            "LR": 0.00025,
+            "ENT_COEF": 0.01,
+            "GAE_LAMBDA": 0.95,
+        },
+        "op": {
+            "TOTAL_TIMESTEPS": 50_000_000,
+            "NUM_ENVS": 64,
+            "LR": 0.00025,
+            "ENT_COEF": 0.02,
+            "GAE_LAMBDA": 0.95,
+        },
+        "fcp": {
+            "TOTAL_TIMESTEPS": 30_000_000,
+            "NUM_ENVS": 256,
+            "LR": 0.0007,
+            "ENT_COEF": 0.04,
+            "GAE_LAMBDA": 0.9,
+        },
+    }
+    for name, expected in expected_by_method[method].items():
+        if model.get(name) != expected:
+            raise ValueError(
+                f"Official {method} field {name} changed: {model.get(name)!r}."
+            )
+    if method == "state-augmented" and int(payload.get("NUM_ITERATIONS", -1)) != 10:
+        raise ValueError("Official State-Augmented must use ten iterations.")
+    if method == "op" and list(kwargs.get("op_ingredient_permutations", ())) != [0, 1]:
+        raise ValueError("Official Other-Play ingredient symmetry changed.")
+    if method == "fcp" and int(payload.get("NUM_SEEDS", -1)) != 1:
+        raise ValueError(
+            "Official FCP retains NUM_SEEDS=1; its ten runs are population-indexed."
+        )
+    if method != "fcp" and int(payload.get("NUM_SEEDS", -1)) != 10:
+        raise ValueError(f"Official {method} must train ten runs.")
 
 
 def _validate_official_config(
@@ -100,21 +391,33 @@ def _validate_official_config(
     *,
     config: RunConfig,
     algorithm: str,
-    seed: int,
+    seed_index: int,
 ) -> None:
     model = resolved.get("model")
     environment = resolved.get("env")
     if not isinstance(model, Mapping) or not isinstance(environment, Mapping):
         raise ValueError("Official Hydra config lacks model or environment sections.")
+    total_timesteps = (
+        OFFICIAL_SP_TOTAL_TIMESTEPS
+        if algorithm == "rnn-sp"
+        else OFFICIAL_OP_TOTAL_TIMESTEPS
+    )
+    reward_horizon = total_timesteps // 2
     expected = {
         "TYPE": "RNN",
         "FC_DIM_SIZE": 128,
         "GRU_HIDDEN_DIM": 128,
-        "TOTAL_TIMESTEPS": config.upstream.total_timesteps,
-        "REW_SHAPING_HORIZON": config.upstream.reward_shaping_horizon,
-        "NUM_STEPS": 256,
-        "UPDATE_EPOCHS": 4,
-        "NUM_MINIBATCHES": 64,
+        "TOTAL_TIMESTEPS": total_timesteps,
+        "REW_SHAPING_HORIZON": reward_horizon,
+        "NUM_STEPS": OFFICIAL_ROLLOUT_LENGTH,
+        "UPDATE_EPOCHS": OFFICIAL_UPDATE_EPOCHS,
+        "NUM_MINIBATCHES": OFFICIAL_NUM_MINIBATCHES,
+        "LR": 0.00025,
+        "LR_WARMUP": 0.05,
+        "ANNEAL_LR": True,
+        "MAX_GRAD_NORM": 0.25,
+        "CLIP_EPS": 0.2,
+        "VF_COEF": 0.5,
         "GAMMA": 0.99,
         "GAE_LAMBDA": 0.95,
     }
@@ -122,9 +425,9 @@ def _validate_official_config(
         if model.get(name) != value:
             raise ValueError(f"Official training config changed {name}: {model.get(name)!r}.")
     variant = (
-        {"NUM_ENVS": 256, "ENT_COEF": 0.01}
+        {"NUM_ENVS": OFFICIAL_SP_NUM_ENVS, "ENT_COEF": 0.01}
         if algorithm == "rnn-sp"
-        else {"NUM_ENVS": 64, "ENT_COEF": 0.02}
+        else {"NUM_ENVS": OFFICIAL_OP_NUM_ENVS, "ENT_COEF": 0.02}
     )
     for name, value in variant.items():
         if model.get(name) != value:
@@ -144,8 +447,12 @@ def _validate_official_config(
             raise ValueError(f"Official environment config changed {name}.")
     if algorithm == "rnn-op" and list(kwargs.get("op_ingredient_permutations", ())) != [0, 1]:
         raise ValueError("Official Other-Play symmetry is not enabled.")
-    if int(resolved.get("SEED", -1)) != int(seed) or int(resolved.get("NUM_SEEDS", -1)) != 1:
-        raise ValueError("Official seed resolution differs from the requested run.")
+    if int(resolved.get("SEED", -1)) != OFFICIAL_TRAINING_ROOT_SEED:
+        raise ValueError("Official training root seed must be 42.")
+    if int(resolved.get("NUM_SEEDS", -1)) != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("Official training population must contain ten keys.")
+    if not 0 <= int(seed_index) < OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("Official seed_index must lie in 0..9.")
 
 
 def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
@@ -156,6 +463,25 @@ def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
     if not isinstance(kwargs, Mapping) or not kwargs.get("layout"):
         raise ValueError("Official checkpoint config lacks its layout.")
     return str(kwargs["layout"])
+
+
+def validate_official_partner_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    config: RunConfig,
+    algorithm: str,
+    seed_index: int,
+) -> None:
+    """Bind one DELTA support checkpoint to its claimed Official recipe."""
+
+    checkpoint_config, unused_params = restore_official_checkpoint(checkpoint_path)
+    del unused_params
+    _validate_official_config(
+        checkpoint_config,
+        config=config,
+        algorithm=algorithm,
+        seed_index=int(seed_index),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,7 +609,8 @@ def store_official_checkpoint(
 def train_upstream(
     official_config: Mapping[str, Any],
     *,
-    seed: int,
+    run_key: Any,
+    seed_index: int,
     checkpoint_progress: Sequence[float],
 ) -> Mapping[str, Any]:
     """Run the official trainer and save its fixed-progress parameter trees."""
@@ -299,9 +626,7 @@ def train_upstream(
 
     train = make_train(official_config)
     mapped_train = mini_batch_pmap(jax.jit(train), 1)
-    output = mapped_train(
-        jax.random.split(jax.random.PRNGKey(int(seed)), 1)
-    )
+    output = mapped_train(jnp.asarray(run_key, dtype=jnp.uint32)[None, :])
     jax.block_until_ready(output["metrics"]["env_step"])
 
     metrics = jax.tree_util.tree_map(lambda value: value[0], output["metrics"])
@@ -334,7 +659,7 @@ def train_upstream(
             store_official_checkpoint(
                 config=official_config,
                 params=parameters,
-                run_number=0,
+                run_number=int(seed_index),
                 update_step=update_step,
                 final=index == checkpoint_count - 1,
             )
@@ -499,6 +824,17 @@ class VectorEnvironment:
             done, reset_observations, terminal_observations
         )
         next_state = _select_done(done, reset_state, terminal_state)
+        raw_by_agent = jnp.stack(
+            (rewards["agent_0"], rewards["agent_1"]), axis=-1
+        ).astype(jnp.float32)
+        shaped = environment_info.get("shaped_reward")
+        if not isinstance(shaped, Mapping):
+            raise RuntimeError(
+                "Locked OvercookedV2 environment did not return shaped_reward."
+            )
+        official_shaped_by_agent = jnp.stack(
+            (shaped["agent_0"], shaped["agent_1"]), axis=-1
+        ).astype(jnp.float32)
         return (
             next_state,
             _stack_observations(observations),
@@ -511,6 +847,8 @@ class VectorEnvironment:
                 "correct_delivery": jnp.asarray(correct, dtype=jnp.int32),
                 "wrong_delivery": jnp.asarray(wrong, dtype=jnp.int32),
                 "indicator_activation": indicator,
+                "raw_rewards_by_agent": raw_by_agent,
+                "official_shaped_rewards_by_agent": official_shaped_by_agent,
                 "environment": environment_info,
             },
         )
@@ -521,10 +859,16 @@ class FrozenPartnerPool:
     network: OfficialNetwork
     stacked_params: Any
     member_count: int
+    parent_members: Any
+    parent_count: int
+    checkpoints_per_parent: int
 
     @classmethod
     def from_checkpoints(
-        cls, checkpoint_paths: Sequence[str | Path]
+        cls,
+        checkpoint_paths: Sequence[str | Path],
+        *,
+        parent_training_run_ids: Sequence[str] | None = None,
     ) -> "FrozenPartnerPool":
         import jax
         import jax.numpy as jnp
@@ -552,11 +896,48 @@ class FrozenPartnerPool:
         stacked = jax.tree_util.tree_map(
             lambda *values: jnp.stack(values), *params
         )
+        if parent_training_run_ids is None:
+            parents = tuple(f"member-{index}" for index in range(len(params)))
+        else:
+            parents = tuple(str(value) for value in parent_training_run_ids)
+            if len(parents) != len(params):
+                raise ValueError("Frozen partner checkpoints and parent IDs do not align.")
+        parent_order = tuple(dict.fromkeys(parents))
+        member_groups = tuple(
+            tuple(index for index, parent in enumerate(parents) if parent == current)
+            for current in parent_order
+        )
+        group_sizes = {len(group) for group in member_groups}
+        if len(group_sizes) != 1:
+            raise ValueError(
+                "Every frozen parent run must contribute the same checkpoint count."
+            )
+        checkpoints_per_parent = next(iter(group_sizes))
         return cls(
             network=OfficialNetwork(configs[0]),
             stacked_params=stacked,
             member_count=len(params),
+            parent_members=jnp.asarray(member_groups, dtype=jnp.int32),
+            parent_count=len(member_groups),
+            checkpoints_per_parent=checkpoints_per_parent,
         )
+
+    def sample_members(self, key: Any, batch_size: int) -> Any:
+        """Sample parent uniformly, then checkpoint uniformly within parent."""
+
+        import jax
+
+        parent_key, checkpoint_key = jax.random.split(key)
+        parents = jax.random.randint(
+            parent_key, (int(batch_size),), 0, self.parent_count
+        )
+        checkpoints = jax.random.randint(
+            checkpoint_key,
+            (int(batch_size),),
+            0,
+            self.checkpoints_per_parent,
+        )
+        return self.parent_members[parents, checkpoints]
 
     def initial_carry(self, batch_size: int) -> Any:
         return self.network.initial_carry(batch_size)
@@ -643,6 +1024,85 @@ def official_rollout(
     )
 
 
+def official_pairing_rollouts(
+    *,
+    left_policy: Any,
+    right_policy: Any,
+    environment: Any,
+    root_key: Any,
+    episodes: int,
+) -> tuple[Any, Any]:
+    """Vectorize the fixed Official ``get_rollout`` without changing its loop."""
+
+    import jax
+
+    PolicyPairing = _official_symbol(
+        "overcooked_v2_experiments.eval.policy", "PolicyPairing"
+    )
+    get_rollout = _official_symbol(
+        "overcooked_v2_experiments.eval.rollout", "get_rollout"
+    )
+    episode_keys = jax.random.split(root_key, int(episodes))
+    pairing = PolicyPairing(left_policy, right_policy)
+    rollouts = jax.vmap(lambda key: get_rollout(pairing, environment, key))(
+        episode_keys
+    )
+    return rollouts, episode_keys
+
+
+def official_delivery_counts(
+    *, environment: Any, rollouts: Any, episode_keys: Any
+) -> tuple[Any, Any]:
+    """Read delivery events post hoc from exact Official rollout states/actions.
+
+    This function never calls a policy and cannot change a trajectory.  The
+    initial state is reconstructed from the reset half of each exact episode
+    key; later pre-transition states are the preceding Official ``state_seq``.
+    """
+
+    import jax
+    import jax.numpy as jnp
+    from jaxmarl.environments.overcooked_v2.common import (
+        Actions,
+        DynamicObject,
+        StaticObject,
+    )
+
+    reset_keys = jax.vmap(lambda key: jax.random.split(key, 2)[1])(episode_keys)
+    unused_observations, initial_states = jax.vmap(environment.reset)(reset_keys)
+    del unused_observations
+    pre_states = jax.tree_util.tree_map(
+        lambda initial, sequence: jnp.concatenate(
+            (initial[:, None, ...], sequence[:, :-1, ...]), axis=1
+        ),
+        initial_states,
+        rollouts.state_seq,
+    )
+    actions = jnp.stack(
+        (rollouts.actions_seq["agent_0"], rollouts.actions_seq["agent_1"]),
+        axis=-1,
+    )
+
+    def one(state: Any, current_actions: Any) -> tuple[Any, Any]:
+        forward = jax.vmap(lambda agent: agent.get_fwd_pos())(state.agents)
+        cells = state.grid[forward.y, forward.x]
+        interact = current_actions == int(Actions.interact)
+        delivery = (
+            interact
+            & (cells[:, 0] == int(StaticObject.GOAL))
+            & ((state.agents.inventory & int(DynamicObject.COOKED)) != 0)
+        )
+        plated_recipe = (
+            state.recipe | int(DynamicObject.PLATE) | int(DynamicObject.COOKED)
+        )
+        correct = delivery & (state.agents.inventory == plated_recipe)
+        wrong = delivery & ~correct
+        return jnp.sum(correct, dtype=jnp.int32), jnp.sum(wrong, dtype=jnp.int32)
+
+    correct, wrong = jax.vmap(jax.vmap(one))(pre_states, actions)
+    return jnp.sum(correct, axis=1), jnp.sum(wrong, axis=1)
+
+
 def recorded_rollout(
     *,
     policies: Sequence[Any],
@@ -707,12 +1167,18 @@ __all__ = [
     "FrozenPartnerPool",
     "VectorEnvironment",
     "compose_official_config",
+    "compose_official_baseline_config",
+    "compose_ippo_large_config",
     "initialize_official_parameters",
     "official_checkpoint_layout",
     "official_policy",
+    "official_pairing_rollouts",
+    "official_delivery_counts",
     "official_rollout",
     "recorded_rollout",
     "restore_official_checkpoint",
     "store_official_checkpoint",
     "train_upstream",
+    "validate_official_partner_checkpoint",
+    "validate_official_runtime",
 ]

@@ -8,20 +8,76 @@ maintained.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 from pathlib import Path
+import platform
+import subprocess
 import sys
 from typing import Any, Iterable, Mapping, Sequence, TextIO, cast
 
-from .experiment import METHOD_VERSION, PartnerManifest, RunConfig
+from .experiment import (
+    METHOD_VERSION,
+    OFFICIAL_PROTOCOL_VERSION,
+    OFFICIAL_SOURCE_COMMIT,
+    PartnerManifest,
+    RunConfig,
+    official_training_domain_keys,
+)
 
 IDENTITY_FILE = "run_identity.json"
+
+
+def _repository_state() -> tuple[str, bool]:
+    repository = Path(__file__).resolve().parents[2]
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(repository), "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            "Active DELTA code is not inside an auditable Git checkout."
+        ) from error
+    return commit, dirty
+
+
+def validate_registered_python_runtime() -> None:
+    if sys.version_info[:2] != (3, 10):
+        raise RuntimeError(
+            "Formal DELTA/Official runs require the Official Python 3.10 runtime; "
+            f"observed {sys.version_info.major}.{sys.version_info.minor}."
+        )
+
+
+def validate_formal_repository_state() -> None:
+    commit, dirty = _repository_state()
+    if len(commit) != 40 or any(
+        character not in "0123456789abcdef" for character in commit
+    ):
+        raise RuntimeError("Formal DELTA repository commit is not a full Git SHA.")
+    if dirty:
+        raise RuntimeError(
+            "Formal runs require a clean committed DELTA checkout; uncommitted "
+            "code cannot be reconstructed from run_identity.json."
+        )
 
 
 def training_identity(
     *,
     config: RunConfig,
-    seed: int,
+    seed_index: int,
+    jax_prng_key: Sequence[int],
     partner_manifest: PartnerManifest,
 ) -> Mapping[str, Any]:
     return {
@@ -31,13 +87,23 @@ def training_identity(
         "layout": config.environment.layout,
         "config": config.to_mapping(),
         "config_fingerprint": config.fingerprint,
-        "seed": int(seed),
+        "seed_index": int(seed_index),
+        "jax_prng_key": [int(value) for value in jax_prng_key],
+        "domain_keys": {
+            name: [int(value) for value in key]
+            for name, key in official_training_domain_keys(seed_index).items()
+        },
         "partner_manifest": partner_manifest.to_mapping(),
+        "runtime": runtime_provenance(),
     }
 
 
 def upstream_identity(
-    *, config: RunConfig, seed: int, algorithm: str
+    *,
+    config: RunConfig,
+    seed_index: int,
+    jax_prng_key: Sequence[int],
+    algorithm: str,
 ) -> Mapping[str, Any]:
     return {
         "stage": "upstream",
@@ -46,15 +112,60 @@ def upstream_identity(
         "layout": config.environment.layout,
         "config": config.to_mapping(),
         "config_fingerprint": config.fingerprint,
-        "seed": int(seed),
+        "seed_index": int(seed_index),
+        "jax_prng_key": [int(value) for value in jax_prng_key],
         "algorithm": str(algorithm),
+        "official_source_commit": OFFICIAL_SOURCE_COMMIT,
+        "official_protocol_version": OFFICIAL_PROTOCOL_VERSION,
+        "runtime": runtime_provenance(),
     }
+
+
+def runtime_provenance() -> Mapping[str, Any]:
+    """Capture immutable software and device facts without requiring a GPU."""
+
+    try:
+        repository_commit, repository_dirty = _repository_state()
+    except RuntimeError:
+        repository_commit, repository_dirty = "unavailable", True
+    distributions = sorted(
+        {
+            f"{distribution.metadata.get('Name', distribution.metadata.get('name', 'unknown'))}=={distribution.version}"
+            for distribution in importlib.metadata.distributions()
+        }
+    )
+    dependency_payload = "\n".join(distributions)
+    payload: dict[str, Any] = {
+        "repository_commit": repository_commit,
+        "repository_dirty": repository_dirty,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "official_source_commit": OFFICIAL_SOURCE_COMMIT,
+        "official_protocol_version": OFFICIAL_PROTOCOL_VERSION,
+        "installed_distribution_lock": distributions,
+        "installed_distribution_lock_sha256": hashlib.sha256(
+            dependency_payload.encode("utf-8")
+        ).hexdigest(),
+    }
+    try:
+        import jax
+
+        payload.update(
+            {
+                "jax_version": str(jax.__version__),
+                "jax_backend": str(jax.default_backend()),
+                "jax_devices": [str(device) for device in jax.devices()],
+            }
+        )
+    except Exception as error:  # pragma: no cover - installation diagnostics
+        payload["jax_runtime_error"] = f"{type(error).__name__}: {error}"
+    return payload
 
 
 def calibration_identity(
     *,
     config: RunConfig,
-    seed: int,
+    seed_index: int,
     training_run: str | Path,
     manifest: PartnerManifest,
 ) -> Mapping[str, Any]:
@@ -66,7 +177,10 @@ def calibration_identity(
         "layout": config.environment.layout,
         "config": config.to_mapping(),
         "config_fingerprint": config.fingerprint,
-        "seed": int(seed),
+        "seed_index": int(seed_index),
+        "jax_prng_key": list(
+            official_training_domain_keys(seed_index)["calibration"]
+        ),
         "training_run": str(source),
         "training_identity": read_run_identity(source),
         "partner_manifest": manifest.to_mapping(),
@@ -431,11 +545,14 @@ __all__ = [
     "read_array_chunks",
     "read_parquet",
     "read_run_identity",
+    "runtime_provenance",
     "restore_latest_checkpoint",
     "restore_checkpoint_step",
     "save_checkpoint",
     "sha256_path",
     "training_identity",
+    "validate_formal_repository_state",
+    "validate_registered_python_runtime",
     "upstream_identity",
     "write_array_chunks",
     "write_json",
