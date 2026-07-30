@@ -44,3 +44,21 @@
 
 - **2026-07-29** 工作流裁决：确立五阶段研究流水线与文档三层制，取代逐版本修复
   循环。证据：`docs/RESEARCH_PIPELINE.md`。
+
+- **2026-07-29** V4.4 artifact-only 真实回报读出：225 个触发状态的 128 个 replica
+  固定拆为 64 fit / 64 evaluation，四折 LOPO 与 10,000 次伙伴分层 bootstrap 得到
+  `L_oracle = −0.0135 [−0.1649,+0.1399]`、主历史 `L_probe =
+  −0.3597 [−0.9326,+0.0852]`、`tau_response = +0.0499
+  [−0.1795,+0.2715]`。三者区间均跨 0，登记裁决为 INCONCLUSIVE：当前注册回应、
+  触发与六动作候选分布既无正价值证书，也无限定范围内的无机会证书。V4.4 保持冻结，
+  不启动新 RL；该结果不改变 `119.65` 完全来自同 checkpoint 对角格的结论。证据：
+  `docs/status/PATH_C_V4_4_ARTIFACT_VALUE_READOUT_REPORT.md`。本条同时取代上文把
+  `119.65` 解释为可捕获策略模式差距或惯例粒度价值的两项旧叙述；run-disjoint
+  兼容性机会仍未测量。
+
+- **2026-07-30** V4.4 读出完整性复核：正式运行与独立复跑的 9 个确定性产物逐字节
+  一致，五个冻结输入及四个实现文件的运行前后 SHA-256 均不变；从逐状态产物独立复算
+  伙伴等权点估计和 10,000 次 bootstrap 分位数，与机器摘要完全一致。独立 reviewer
+  裁决 PASS，evaluation type 为 `simulation_only`；该结论不扩大证据范围，区间仍条件于
+  当前四伙伴面板和固定 continuation 样本。证据：`EXPERIMENT_AUDIT.md`、
+  `EXPERIMENT_AUDIT.json`。

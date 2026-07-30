@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from experiments.overcooked_v2.artifact_readout_app import (
+    run_artifact_value_readout,
+)
 from experiments.overcooked_v2.counterfactual_audit_app import (
     run_counterfactual_value_audit,
 )
@@ -89,6 +92,13 @@ def _parser() -> argparse.ArgumentParser:
     audit.add_argument("--resume", action="store_true")
     audit.set_defaults(
         function=run_counterfactual_value_audit, manages_output=True
+    )
+
+    artifact_readout = commands.add_parser("audit-artifact-readout")
+    artifact_readout.add_argument("--artifact-directory", required=True)
+    artifact_readout.add_argument("--output", required=True)
+    artifact_readout.set_defaults(
+        function=run_artifact_value_readout, manages_output=True
     )
 
     add_manifest_commands(commands)

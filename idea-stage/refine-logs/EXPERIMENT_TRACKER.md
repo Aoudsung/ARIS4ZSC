@@ -3,12 +3,12 @@
 self-play（SP）指同一次独立训练内的策略彼此协作；cross-play（XP）指不同独立训练运行
 得到的策略在测试时配对。
 
-**当前阶段：** 2026-07-19 用户裁决——完整模型优先。当前主线是按
-[PATH_C_MODULE_DESIGN.md](PATH_C_MODULE_DESIGN.md) §7 与
-[PATH_C_MODEL_IMPLEMENTATION_SPEC.md](PATH_C_MODEL_IMPLEMENTATION_SPEC.md) 实现完整模型链
-（伙伴池 → 预拟合 → 阈值校准 → 适应训练 → 配对评估），并通过开发诊断运行迭代
-（[OPERATING_CONSTRAINTS.md](../../OPERATING_CONSTRAINTS.md) §6.7）。R015 降为可选支持性
-测量，不再排在模型实现之前。下表保留 R015 与正式主实验各行，供正式阶段使用。
+**当前阶段：** 2026-07-29 裁决——V4.4 已冻结。既有 403,200 条 continuation 的
+64/64 split-replica、四折 LOPO 真实回报读出为 INCONCLUSIVE，不启动 V4.5、新 seed 或
+超参数实验。项目回到现象存在性测量：先用模式侧与伙伴侧训练运行完全分离的面板检验
+跨运行兼容性机会，再决定是否研究历史可恢复性。下表保留旧里程碑作为执行历史；当前证据
+以 [PROJECT_DASHBOARD.md](../../PROJECT_DASHBOARD.md) 和
+[PATH_C_PROPOSAL.md](PATH_C_PROPOSAL.md) 为准。
 **执行边界：** 本表不授权运行。所有项目执行只能在用户明确授权后于 `zsc-customer` 远端进行。
 
 | Run ID | 里程碑 | 目的 | 系统或制品 | 决定性读数 | 优先级 | 状态 | 备注 |
@@ -20,6 +20,7 @@ self-play（SP）指同一次独立训练内的策略彼此协作；cross-play�
 | R005 | M0 | 检查当前代码与标准 XP 协议的差距 | `OCV2Adapter`、策略训练接口、角色交换、XP 聚合器 | 差距清单与最小代码修改范围 | 必须 | 完成（2026-07-11） | 六项差距与修订方案见 EXPERIMENT_PLAN.md §9 与 EXPERIMENT_LOG 同日 R005 条目；纯静态，未运行代码 |
 | R010 | M1 | 检查标准公开协议接线 | `test_time_simple` 极小远端 smoke | Type-A pass/fail、SP/XP 行结构、双方角色均覆盖 | 必须 | 完成并再次复核（2026-07-12） | CUDA JAX GPU 0；修订二后 70 项回归通过；每 seed 两行指标和曲线、共 8 行评估；数值因架构和训练回报修订而重新生成；仅软件证据 |
 | R015 | M1.5 | 审计官方观测下的单次安全探查机会 | 回应屏蔽参照、探查后屏蔽注册回应通道、探查后使用该通道；两个伙伴族各两个原型 | `Delta_response`、`Delta_net` 的分布无关同时区间；可选完整信息保守上界 | 可选支持测量（2026-07-19 起） | 两族各两候选已登记，产物与正式控制器待实现 | `Delta_response` 只表示显式注册通道的增量使用效应；四个候选必须全部通过新来源核验与同一能力下限后才会一次性准入，普通负结果只否定注册控制器 |
+| R016 | M1.5 | 读取冻结 V4.4 continuation 中的真实回应与后续动作价值 | 225 状态 × 128 replica；64 fit / 64 evaluation；四伙伴 LOPO；10,000 bootstrap | `L_oracle`、`L_probe`、`tau_response` 的登记单侧区间 | 必须 | 完成（2026-07-29），INCONCLUSIVE | oracle `−0.0135 [−0.1649,+0.1399]`；history probe `−0.3597 [−0.9326,+0.0852]`；两次正式读出的 9 个确定性产物逐字节一致，完整性复核 PASS；V4.4 继续冻结 |
 | R020 | M2 | 训练 Path C 主方法群体 | Path C × 10 独立 seed；骨干形成与适应预算分开报告 | 每 seed 有效环境步、episode、晚期 return | 必须 | simple seed 101 完成；seed 102 骨干完成（2026-07-13） | seed 102 完成 30M 步、75,000 局和 19,200 次更新，累计 33,784 次正确交付；联合准入和后续适应尚未启动 |
 | R030 | M3 | 计算 Test Time Simple 主结果 | 10 seed、90 个有向 XP 配对、每配对 500 个 400 步 episode | 平均 XP return、标准差、训练单元节点重采样 95% CI、SP、SP−XP gap | 必须 | 阻塞 | 与同布局已发表 SP/State-Augmented/Other-Play/FCP 数字并列 |
 | R031 | M3 | 在 Test Time Wide 复现 | 同 R030 的冻结方法和配对规模 | `Delta_Wide` 的 98.5% 单侧下界 | H3 必须 | 阻塞 | H3 三项之一；预先指定的第二布局，不是独立领域 |
@@ -40,8 +41,7 @@ self-play（SP）指同一次独立训练内的策略彼此协作；cross-play�
 
 ## 当前单一步骤
 
-当前单一步骤是按 [PATH_C_MODULE_DESIGN.md](PATH_C_MODULE_DESIGN.md) §7 实现完整模型链，
-打通"训练 → 配对评估"回路；开发期训练与读数按
-[OPERATING_CONSTRAINTS.md](../../OPERATING_CONSTRAINTS.md) §6.7 的开发诊断运行记录（远端、
-经授权、回读有效数据预算、读数只作开发诊断）。R015 第二版线保留为可选支持测量，其实现
-与运行不阻塞模型链开发；R015 所需的第二伙伴族登记随该线另行推进，不再是项目的唯一动作。
+当前单一步骤是设计 run-disjoint 兼容性机会审计：模式库、开发伙伴和确认性伙伴不共享
+checkpoint、训练运行或直接共同训练关系，并让每个预定义类型包含多个独立实例。旧 20×500
+固定角色矩阵只保留为 checkpoint 重合诊断，不再训练基于其标签的在线路由器。R016 若要
+继续，只能增加独立触发状态与伙伴支持并重复真实回报读出；在 oracle 区间收窄前不训练控制器。

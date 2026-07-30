@@ -1,0 +1,79 @@
+{
+  "date": "2026-07-30",
+  "auditor": "gpt-5.6-sol-xhigh-independent-read-only",
+  "requested_auditor": "gpt-5.5-xhigh",
+  "reviewer_backend_note": "The preferred GPT-5.5 route was unavailable; the audit used a separate GPT-5.6-sol xhigh reviewer agent and is not represented as a GPT-5.5 cross-model audit.",
+  "overall_verdict": "pass",
+  "integrity_status": "pass",
+  "evaluation_type": "simulation_only",
+  "checks": {
+    "gt_provenance": {
+      "status": "pass",
+      "details": "Fit and evaluation targets are disjoint frozen simulator raw-return continuations; model Q is excluded as ground truth."
+    },
+    "score_normalization": {
+      "status": "pass",
+      "details": "Only training-fold feature scaling and target centering are used; final lifts remain in raw simulator-return units."
+    },
+    "result_existence_and_reproducibility": {
+      "status": "pass",
+      "details": "All nine deterministic artifacts exist and are byte-identical across the formal run, independent reproduction, and local read-only copy."
+    },
+    "dead_code": {
+      "status": "pass",
+      "details": "The command is reachable from the official CLI and covered by an end-to-end fixture; 78 remote CPU-only tests pass, including nine new readout tests."
+    },
+    "scope": {
+      "status": "pass",
+      "details": "Claims are limited to the current four-partner panel, current trigger states, response channel, and six-action candidate distribution."
+    },
+    "input_immutability": {
+      "status": "pass",
+      "details": "All five frozen input SHA-256 values match before and after both runs."
+    },
+    "implementation_provenance": {
+      "status": "pass",
+      "details": "Git HEAD, exact source SHA-256 values, and runtime versions are recorded; implementation hashes match before and after both runs."
+    },
+    "byte_reproduction": {
+      "status": "pass",
+      "details": "The formal and independent runs produced nine byte-identical deterministic top-level files."
+    },
+    "numeric_recomputation": {
+      "status": "pass",
+      "details": "Partner-equal point estimates and all 10000 bootstrap percentile bounds independently reproduce the machine summary."
+    },
+    "verdict_application": {
+      "status": "pass",
+      "details": "The preregistered ordered decision rule uniquely yields INCONCLUSIVE."
+    },
+    "conditional_interval_wording": {
+      "status": "pass",
+      "details": "The report states that intervals condition on the fixed four-partner panel and fixed evaluation continuation sample, without a second continuation-resampling layer."
+    }
+  },
+  "primary_verdict": {
+    "verdict": "INCONCLUSIVE",
+    "reason": "interval_or_partner_heterogeneity_not_resolved",
+    "significant_partner_conflict": false
+  },
+  "claims": [
+    {
+      "id": "current_registered_channel_value",
+      "impact": "supported_as_inconclusive"
+    },
+    {
+      "id": "no_new_rl_now",
+      "impact": "supported_as_project_gate_decision"
+    },
+    {
+      "id": "current_panel_only",
+      "impact": "required_and_correctly_stated"
+    },
+    {
+      "id": "gap_119_65",
+      "impact": "unchanged_external_prior_finding_not_reestimated_here"
+    }
+  ],
+  "substantive_open_integrity_issues": []
+}
