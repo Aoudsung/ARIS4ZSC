@@ -7,12 +7,13 @@ maintained.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import sys
 from typing import Any, Iterable, Mapping, Sequence, TextIO, cast
 
-from .experiment import METHOD_VERSION, RunConfig
+from .experiment import METHOD_VERSION, PartnerManifest, RunConfig
 
 IDENTITY_FILE = "run_identity.json"
 
@@ -21,9 +22,7 @@ def training_identity(
     *,
     config: RunConfig,
     seed: int,
-    outer_unit_id: int,
-    reference_checkpoint: str | Path,
-    partner_checkpoints: Sequence[str | Path],
+    partner_manifest: PartnerManifest,
 ) -> Mapping[str, Any]:
     return {
         "stage": "train",
@@ -31,12 +30,9 @@ def training_identity(
         "run_kind": config.run_kind,
         "layout": config.environment.layout,
         "config": config.to_mapping(),
+        "config_fingerprint": config.fingerprint,
         "seed": int(seed),
-        "outer_unit_id": int(outer_unit_id),
-        "reference_checkpoint": str(Path(reference_checkpoint).resolve()),
-        "partner_checkpoints": [
-            str(Path(path).resolve()) for path in partner_checkpoints
-        ],
+        "partner_manifest": partner_manifest.to_mapping(),
     }
 
 
@@ -49,8 +45,31 @@ def upstream_identity(
         "run_kind": config.run_kind,
         "layout": config.environment.layout,
         "config": config.to_mapping(),
+        "config_fingerprint": config.fingerprint,
         "seed": int(seed),
         "algorithm": str(algorithm),
+    }
+
+
+def calibration_identity(
+    *,
+    config: RunConfig,
+    seed: int,
+    training_run: str | Path,
+    manifest: PartnerManifest,
+) -> Mapping[str, Any]:
+    source = Path(training_run).resolve()
+    return {
+        "stage": "calibrate",
+        "method": METHOD_VERSION,
+        "run_kind": config.run_kind,
+        "layout": config.environment.layout,
+        "config": config.to_mapping(),
+        "config_fingerprint": config.fingerprint,
+        "seed": int(seed),
+        "training_run": str(source),
+        "training_identity": read_run_identity(source),
+        "partner_manifest": manifest.to_mapping(),
     }
 
 
@@ -58,17 +77,99 @@ def evaluation_identity(
     *,
     config: RunConfig,
     seed: int,
-    population: Mapping[str, Any],
+    deployment_bundles: Sequence[str | Path],
+    manifest: PartnerManifest,
 ) -> Mapping[str, Any]:
+    bundles = tuple(Path(path).resolve() for path in deployment_bundles)
     return {
         "stage": "evaluate",
         "method": METHOD_VERSION,
         "run_kind": config.run_kind,
         "layout": config.environment.layout,
         "config": config.to_mapping(),
+        "config_fingerprint": config.fingerprint,
         "seed": int(seed),
-        "population": dict(population),
+        "deployment_bundles": [
+            {"path": str(path), "sha256": sha256_path(path)} for path in bundles
+        ],
+        "partner_manifest": manifest.to_mapping(),
     }
+
+
+def sha256_path(path: str | Path) -> str:
+    """Return a deterministic SHA-256 for one file or directory tree."""
+
+    source = Path(path).resolve()
+    digest = hashlib.sha256()
+    if source.is_file():
+        with source.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+        return digest.hexdigest()
+    if not source.is_dir():
+        raise FileNotFoundError(source)
+    files = sorted(item for item in source.rglob("*") if item.is_file())
+    for child in files:
+        relative = child.relative_to(source).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        with child.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pytree_fingerprint(tree: Any) -> str:
+    """Hash a parameter tree by structure, array dtype, shape, and bytes."""
+
+    import numpy as np
+
+    digest = hashlib.sha256()
+
+    def update(value: Any, path: tuple[str, ...]) -> None:
+        location = "/".join(path).encode("utf-8")
+        digest.update(len(location).to_bytes(8, "big"))
+        digest.update(location)
+        if isinstance(value, Mapping):
+            digest.update(b"mapping")
+            for key in sorted(value, key=lambda item: str(item)):
+                update(value[key], (*path, str(key)))
+            return
+        if isinstance(value, tuple) and hasattr(value, "_fields"):
+            digest.update(f"namedtuple:{type(value).__qualname__}".encode("utf-8"))
+            for name in value._fields:
+                update(getattr(value, name), (*path, str(name)))
+            return
+        if isinstance(value, (tuple, list)):
+            digest.update(type(value).__name__.encode("utf-8"))
+            for index, child in enumerate(value):
+                update(child, (*path, str(index)))
+            return
+        if value is None:
+            digest.update(b"none")
+            return
+        if isinstance(value, str):
+            encoded = value.encode("utf-8")
+            digest.update(b"string")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            return
+        if isinstance(value, bytes):
+            digest.update(b"bytes")
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+            return
+        array = np.asarray(value)
+        if array.dtype.hasobject:
+            raise TypeError(f"Object arrays cannot be fingerprinted at {'/'.join(path)}")
+        contiguous = np.ascontiguousarray(array)
+        digest.update(b"array")
+        digest.update(contiguous.dtype.str.encode("ascii"))
+        digest.update(json.dumps(contiguous.shape).encode("ascii"))
+        digest.update(contiguous.tobytes(order="C"))
+
+    update(tree, ())
+    return digest.hexdigest()
 
 
 def ensure_run_identity(directory: str | Path, expected: Mapping[str, Any]) -> Path:
@@ -322,15 +423,18 @@ class CompleteConsoleLog:
 
 __all__ = [
     "CompleteConsoleLog",
+    "calibration_identity",
     "ensure_run_identity",
     "evaluation_identity",
     "orbax_manager",
+    "pytree_fingerprint",
     "read_array_chunks",
     "read_parquet",
     "read_run_identity",
     "restore_latest_checkpoint",
     "restore_checkpoint_step",
     "save_checkpoint",
+    "sha256_path",
     "training_identity",
     "upstream_identity",
     "write_array_chunks",

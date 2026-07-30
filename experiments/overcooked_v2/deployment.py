@@ -1,283 +1,329 @@
-"""Load one trained Path C policy and advance its deployment state."""
+"""Export, load, and execute frozen DELTA-ZSC deployment artifacts.
+
+Training checkpoints contain training-only teacher encoders and the continuous
+partner generator in ``TrainState``.  Confirmatory evaluation never loads those
+objects.  Calibration exports a pruned artifact containing only the legal-history
+model subtrees required by ``model.step`` plus the frozen conformal gate.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from experiments.overcooked_v2.official_adapter import OfficialNetwork, restore_official_checkpoint
-from src.path_c.experiment import METHOD_VERSION, PopulationEntry
-from src.path_c.method import (
-    CodebookState,
-    deployment_belief_after_response,
-    slot_bayes_update,
-    uniform_slot_log_belief,
+from src.path_c.belief_set_encoder import mixture_moments
+from src.path_c.calibration import (
+    calibration_from_mapping,
+    calibration_to_mapping,
+    hard_adaptation_gate,
+    latent_support_score,
+    predicted_policy_gain,
 )
-from src.path_c.model import build_model, encode_response_codes
-from src.path_c.runner import RunnerFunctions, initialize_policy_state
+from src.path_c.experiment import METHOD_VERSION, RunConfig
+from src.path_c.model import build_model, initial_policy_state
+from src.path_c.runner import observe_policy_after_transition
 from src.path_c.storage import (
     orbax_manager,
-    restore_checkpoint_step,
+    pytree_fingerprint,
     read_run_identity,
     restore_latest_checkpoint,
+    write_json,
 )
+from src.path_c.training import categorical_log_probability
+
+DEPLOYABLE_PARAM_NAMES = (
+    "task_encoder",
+    "belief_encoder",
+    "belief_set_encoder",
+    "universal_actor",
+    "universal_critic",
+    "response_decoder",
+)
+DEPLOYMENT_BUNDLE_VERSION = 1
+
 
 @dataclass(frozen=True, slots=True)
 class Deployment:
-    outer_unit_id: int
-    network: OfficialNetwork
-    reference_params: Any
-    online_params: Any
-    heads: Any
-    head_params: Any
-    codebook: Any
-    log_temperature: Any
-    generic_log_temperature: Any
+    ego_run_id: str
+    config: RunConfig
+    model: Any
+    params: Any
+    calibration: Any
 
-    def functions(self) -> RunnerFunctions:
-        def online_step(
-            params: Mapping[str, Any],
-            carry: Any,
-            observations: Any,
-            episode_start: Any,
-        ) -> tuple[Any, Any, Any, Any]:
-            return self.network.step(
-                params, carry, observations, episode_start
+
+def _build_model(config: RunConfig, observation_shape: tuple[int, ...], action_count: int) -> Any:
+    return build_model(
+        observation_shape=observation_shape,
+        action_count=action_count,
+        **{
+            name: getattr(config.model, name)
+            for name in (
+                "task_hidden_dim",
+                "belief_hidden_dim",
+                "latent_dim",
+                "mixture_components",
+                "belief_embedding_dim",
+                "actor_hidden_dim",
+                "critic_hidden_dim",
+                "response_hidden_dim",
+                "modulation_rank",
+                "action_embedding_dim",
+                "log_variance_minimum",
+                "log_variance_maximum",
+                "response_log_std_minimum",
+                "response_log_std_maximum",
             )
-
-        def reference_step(
-            carry: Any, observations: Any, episode_start: Any
-        ) -> tuple[Any, Any, Any]:
-            next_carry, unused_feature, logits, value = self.network.step(
-                self.reference_params,
-                carry,
-                observations,
-                episode_start,
-            )
-            del unused_feature
-            return next_carry, logits, value
-
-        def heads_apply(
-            params: Mapping[str, Any],
-            control_carry: Any,
-            features: Any,
-            previous_actions: Any,
-            previous_team_rewards: Any,
-            episode_start: Any,
-            belief: Any,
-        ) -> tuple[Any, Mapping[str, Any]]:
-            return self.heads.apply(
-                {"params": params},
-                control_carry,
-                features,
-                previous_actions,
-                previous_team_rewards,
-                episode_start,
-                belief,
-                method=self.heads.step,
-            )
-
-        def response_apply(
-            params: Mapping[str, Any],
-            observations: Any,
-            actions: Any,
-            next_observations: Any,
-            dones: Any,
-            embeddings: Any,
-            terminal_response: int,
-        ) -> tuple[Any, Any, Any]:
-            return encode_response_codes(
-                model=self.heads,
-                params=params,
-                observations=observations,
-                actions=actions,
-                next_observations=next_observations,
-                dones=dones,
-                codebook_embeddings=embeddings,
-                terminal_response=terminal_response,
-            )
-
-        return RunnerFunctions(
-            online_step=online_step,
-            reference_step=reference_step,
-            heads_apply=heads_apply,
-            encode_response=response_apply,
-            partner_step=lambda *unused: None,
-            partner_observe=lambda *unused: None,
-        )
+        },
+    )
 
 
-def load_deployment(
-    entry: PopulationEntry,
-    config: Any,
-    *,
-    checkpoint_step: int | None = None,
-) -> Deployment:
-    identity = read_run_identity(entry.run_directory)
-    if identity.get("stage") != "train" or identity.get("method") != METHOD_VERSION:
-        raise ValueError("Population entry does not point to this Path C training method.")
-    if int(identity.get("outer_unit_id", -1)) != entry.outer_unit_id:
-        raise ValueError("Population outer-unit identity differs from its training run.")
+def deployable_parameters(params: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return an exact whitelist; training-only subtrees cannot leak by accident."""
+
+    missing = [name for name in DEPLOYABLE_PARAM_NAMES if name not in params]
+    if missing:
+        raise ValueError(f"Model parameters lack deployable subtrees: {missing}.")
+    return {name: params[name] for name in DEPLOYABLE_PARAM_NAMES}
+
+
+def _fingerprint_words(fingerprint: str) -> Any:
+    import hashlib
+    import numpy as np
+
+    return np.frombuffer(
+        hashlib.sha256(str(fingerprint).encode("utf-8")).digest()[:8],
+        dtype=">u4",
+    ).astype(np.uint32)
+
+
+def load_training_model(run_directory: str | Path, config: RunConfig) -> Deployment:
+    """Load the full training model for calibration/anchor collection only."""
+
+    root = Path(run_directory).resolve()
+    identity = read_run_identity(root)
+    if identity.get("method") != METHOD_VERSION or identity.get("stage") != "train":
+        raise ValueError("Run directory is not a DELTA-ZSC v5 training run.")
     if identity.get("config") != config.to_mapping():
-        raise ValueError("Population training config differs from evaluation config.")
-    reference_path = Path(str(identity["reference_checkpoint"])).resolve()
-    reference_config, reference_params = restore_official_checkpoint(reference_path)
-    network = OfficialNetwork(reference_config)
-    if network.layout != config.environment.layout:
-        raise ValueError("Training reference and evaluation layout differ.")
-    manager = orbax_manager(entry.run_directory / "checkpoints", create=False)
-    if checkpoint_step is None:
-        restored = restore_latest_checkpoint(manager)
-        if restored is None:
-            raise FileNotFoundError(
-                f"No Orbax step in {entry.run_directory / 'checkpoints'}."
-            )
-        unused_step, checkpoint = restored
-        del unused_step
-    else:
-        checkpoint = restore_checkpoint_step(
-            manager, step=int(checkpoint_step)
-        )
-    if not isinstance(checkpoint, Mapping):
-        raise TypeError("Orbax deployment checkpoint must restore as a mapping.")
-    required = {"online_params", "codebook", "runner_state"}
-    if not required.issubset(checkpoint):
-        raise ValueError("Orbax deployment checkpoint is missing training fields.")
-    online_params = checkpoint["online_params"]
-    codebook_values = checkpoint["codebook"]
-    runner_values = checkpoint["runner_state"]
-    if not all(
-        isinstance(value, Mapping)
-        for value in (online_params, codebook_values, runner_values)
-    ):
-        raise TypeError("Orbax deployment fields must be mappings.")
-    policy_values = runner_values.get("ego_policy")
-    if not isinstance(policy_values, Mapping):
-        raise TypeError("Orbax checkpoint lacks the ego policy state.")
-    codebook = CodebookState(**codebook_values)
-    heads = build_model(
-        hidden_dim=config.model.hidden_dim,
-        slot_count=config.model.slot_count,
-        action_count=config.model.action_count,
-        response_count=config.model.response_count,
-        prior_scale=config.model.prior_scale,
-        action_embedding_dim=config.model.action_embedding_dim,
-        log_standard_deviation_minimum=(
-            config.model.log_standard_deviation_minimum
-        ),
-        log_standard_deviation_maximum=(
-            config.model.log_standard_deviation_maximum
-        ),
-    )
+        raise ValueError("Training model config differs from calibration config.")
+    manager = orbax_manager(root / "checkpoints", create=False)
+    restored = restore_latest_checkpoint(manager)
+    if restored is None:
+        raise FileNotFoundError(f"No checkpoint in {root / 'checkpoints'}")
+    unused_step, state = restored
+    del unused_step
+    values = state if isinstance(state, Mapping) else state._asdict()
+    params = values["params"]
+    observation_shape = tuple(int(value) for value in identity["observation_shape"])
+    action_count = int(identity.get("action_count", 6))
     return Deployment(
-        outer_unit_id=entry.outer_unit_id,
-        network=network,
-        reference_params=reference_params,
-        online_params=online_params["official"],
-        heads=heads,
-        head_params=online_params["heads"],
-        codebook=codebook,
-        log_temperature=policy_values["log_temperature"],
-        generic_log_temperature=policy_values["generic_log_temperature"],
+        ego_run_id=str(identity.get("ego_run_id", root.name)),
+        config=config,
+        model=_build_model(config, observation_shape, action_count),
+        params=params,
+        calibration=values["calibration"],
     )
+
+
+def export_deployment_bundle(
+    directory: str | Path,
+    *,
+    source_training_run: str | Path,
+    deployment: Deployment,
+    calibration: Any,
+) -> Path:
+    """Write a self-contained deployment artifact without teacher/generator state."""
+
+    import orbax.checkpoint as ocp
+
+    root = Path(directory).resolve()
+    if root.exists() and any(root.iterdir()):
+        raise RuntimeError(f"Deployment bundle directory is not empty: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    pruned = deployable_parameters(deployment.params)
+    params_path = root / "params"
+    ocp.PyTreeCheckpointer().save(str(params_path), pruned, force=True)
+    identity = read_run_identity(source_training_run)
+    payload = {
+        "version": DEPLOYMENT_BUNDLE_VERSION,
+        "method": METHOD_VERSION,
+        "ego_run_id": deployment.ego_run_id,
+        "config": deployment.config.to_mapping(),
+        "config_fingerprint": deployment.config.fingerprint,
+        "observation_shape": list(identity["observation_shape"]),
+        "action_count": int(identity.get("action_count", 6)),
+        "deployable_param_names": list(DEPLOYABLE_PARAM_NAMES),
+        "params_fingerprint": pytree_fingerprint(pruned),
+        "source_training_run": str(Path(source_training_run).resolve()),
+        "calibration": calibration_to_mapping(calibration),
+    }
+    write_json(root / "deployment_bundle.json", payload)
+    return root
+
+
+def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployment:
+    """Load only the pruned confirmatory deployment artifact."""
+
+    import orbax.checkpoint as ocp
+    import numpy as np
+
+    root = Path(bundle_directory).resolve()
+    payload_path = root / "deployment_bundle.json"
+    if not payload_path.is_file():
+        raise FileNotFoundError(
+            f"Pruned deployment bundle is missing: {payload_path}. Run calibration first."
+        )
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    required = {
+        "version",
+        "method",
+        "ego_run_id",
+        "config",
+        "config_fingerprint",
+        "observation_shape",
+        "action_count",
+        "deployable_param_names",
+        "params_fingerprint",
+        "source_training_run",
+        "calibration",
+    }
+    if set(payload) != required:
+        raise ValueError(
+            "Deployment bundle fields differ: "
+            f"missing={sorted(required-set(payload))}, "
+            f"unknown={sorted(set(payload)-required)}."
+        )
+    if int(payload["version"]) != DEPLOYMENT_BUNDLE_VERSION:
+        raise ValueError("Unknown deployment bundle version.")
+    if payload["method"] != METHOD_VERSION:
+        raise ValueError("Deployment bundle belongs to another method.")
+    if payload["config"] != config.to_mapping() or payload["config_fingerprint"] != config.fingerprint:
+        raise ValueError("Deployment bundle config differs from evaluation config.")
+    if tuple(payload["deployable_param_names"]) != DEPLOYABLE_PARAM_NAMES:
+        raise ValueError("Deployment parameter whitelist differs from the active method.")
+    params = ocp.PyTreeCheckpointer().restore(str(root / "params"))
+    if set(params) != set(DEPLOYABLE_PARAM_NAMES):
+        raise ValueError("Deployment artifact contains missing or training-only parameter subtrees.")
+    if pytree_fingerprint(params) != payload["params_fingerprint"]:
+        raise ValueError("Deployment parameter fingerprint differs from bundle metadata.")
+    calibration = calibration_from_mapping(payload["calibration"])
+    expected = _fingerprint_words(payload["params_fingerprint"])
+    observed = np.asarray(calibration.model_fingerprint, dtype=np.uint32)
+    if observed.shape != (2,) or not np.array_equal(observed, expected):
+        raise ValueError("Calibration artifact belongs to a different deployment parameter tree.")
+    observation_shape = tuple(int(value) for value in payload["observation_shape"])
+    action_count = int(payload["action_count"])
+    return Deployment(
+        ego_run_id=str(payload["ego_run_id"]),
+        config=config,
+        model=_build_model(config, observation_shape, action_count),
+        params=params,
+        calibration=calibration,
+    )
+
 
 def reset_deployment_state(
     deployment: Deployment,
     *,
     batch_size: int,
-    config: Any,
+    observation_shape: tuple[int, ...],
 ) -> Any:
-    import jax.numpy as jnp
-
-    state = initialize_policy_state(
-        official_initial_carry=deployment.network.initial_carry,
+    return initial_policy_state(
         batch_size=batch_size,
-        slot_count=config.model.slot_count,
-        action_count=config.model.action_count,
-        hidden_dim=config.model.hidden_dim,
-        initial_temperature=config.kl.initial_temperature,
-    )
-    return state._replace(
-        log_temperature=jnp.full(
-            (batch_size,),
-            jnp.ravel(deployment.log_temperature)[0],
-            dtype=jnp.float32,
-        ),
-        generic_log_temperature=jnp.full(
-            (batch_size,),
-            jnp.ravel(deployment.generic_log_temperature)[0],
-            dtype=jnp.float32,
-        ),
+        observation_shape=observation_shape,
+        action_count=6,
+        task_hidden_dim=deployment.config.model.task_hidden_dim,
+        belief_hidden_dim=deployment.config.model.belief_hidden_dim,
+        latent_dim=deployment.config.model.latent_dim,
+        mixture_components=deployment.config.model.mixture_components,
     )
 
 
-def update_deployment_after_transition(
+def deployment_action(
     *,
     deployment: Deployment,
-    functions: RunnerFunctions,
     state: Any,
-    output: Any,
-    observations: Any,
-    actions: Any,
-    next_observations: Any,
-    rewards: Any,
-    dones: Any,
-    deployment_mode: str,
-    terminal_response: int,
-    mask_response: Any = False,
-) -> tuple[Any, Any]:
+    observation: Any,
+    keys: Any,
+    force_base: bool = False,
+) -> tuple[Any, Any, Any, Any]:
+    import jax
     import jax.numpy as jnp
 
-    response_codes, unused_logits, unused_signatures = (
-        functions.encode_response(
-            deployment.head_params,
-            observations[None, ...],
-            actions[None, ...],
-            next_observations[None, ...],
-            dones[None, ...],
-            deployment.codebook.embeddings,
-            terminal_response,
+    stepped, provisional = deployment.model.apply(
+        {"params": deployment.params},
+        state,
+        observation,
+        jnp.ones(state.previous_action.shape, dtype=jnp.float32),
+        method=deployment.model.step,
+    )
+    conditional_logits = provisional.base_logits + provisional.residual_logits
+    gain = predicted_policy_gain(
+        provisional.action_values,
+        provisional.base_logits,
+        conditional_logits,
+    )
+    posterior_mean, unused_variance = mixture_moments(
+        provisional.mixture_logits,
+        provisional.mixture_means,
+        provisional.mixture_log_variances,
+    )
+    del unused_variance
+    support = latent_support_score(posterior_mean, deployment.calibration)
+    gate = (
+        hard_adaptation_gate(gain, support, deployment.calibration)
+        if deployment.config.calibration.enable_hard_gate_at_evaluation
+        else jnp.ones_like(gain, dtype=jnp.float32)
+    )
+    if force_base:
+        gate = jnp.zeros_like(gate)
+    execution_logits = provisional.base_logits + gate[..., None] * provisional.residual_logits
+    key_array = jnp.asarray(keys)
+    action = (
+        jax.vmap(lambda key, logits: jax.random.categorical(key, logits))(
+            key_array, execution_logits
         )
+        if key_array.ndim == 2
+        else jax.random.categorical(key_array, execution_logits)
     )
-    del unused_logits, unused_signatures
-    response_codes = response_codes[0]
-    posterior = slot_bayes_update(
-        slot_log_belief=state.slot_log_belief,
-        slot_response_probabilities=output.response_probabilities,
-        action=actions,
-        response_code=response_codes,
+    log_probability = categorical_log_probability(execution_logits, action)
+    output = provisional._replace(
+        gate=gate,
+        support_score=support,
+        execution_logits=execution_logits,
     )
-    mask = jnp.asarray(mask_response, dtype=jnp.bool_)
-    if mask.ndim == 0:
-        mask = jnp.broadcast_to(mask, posterior.shape[:-1])
-    posterior = jnp.where(
-        mask[..., None], state.slot_log_belief, posterior
-    )
-    posterior = deployment_belief_after_response(
-        mode=deployment_mode,
-        current_log_belief=state.slot_log_belief,
-        updated_log_belief=posterior,
-    )
-    uniform = uniform_slot_log_belief(
-        posterior.shape[:-1], int(posterior.shape[-1])
-    )
-    return state._replace(
-        slot_log_belief=jnp.where(dones[:, None], uniform, posterior),
-        previous_action=jnp.where(
-            dones,
-            jnp.full(dones.shape, output.q_values.shape[-1], dtype=jnp.int32),
-            actions,
-        ),
-        previous_team_reward=jnp.where(dones, 0.0, rewards),
-        episode_start=dones,
-    ), response_codes
+    return stepped, action, output, log_probability
 
+
+def update_after_transition(
+    *,
+    deployment: Deployment,
+    stepped_state: Any,
+    action: Any,
+    reward: Any,
+    done: Any,
+    next_observation: Any,
+) -> Any:
+    return observe_policy_after_transition(
+        stepped_state=stepped_state,
+        action=action,
+        reward=reward,
+        done=done,
+        next_observation=next_observation,
+        model_config=deployment.config.model,
+    )
 
 
 __all__ = [
+    "DEPLOYABLE_PARAM_NAMES",
+    "DEPLOYMENT_BUNDLE_VERSION",
     "Deployment",
+    "deployable_parameters",
+    "deployment_action",
+    "export_deployment_bundle",
     "load_deployment",
+    "load_training_model",
     "reset_deployment_state",
-    "update_deployment_after_transition",
+    "update_after_transition",
 ]

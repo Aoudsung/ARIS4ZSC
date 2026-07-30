@@ -1,20 +1,31 @@
-"""Active Path C behavior-consistent VQBC implementation."""
+"""Active DELTA-ZSC V5 implementation."""
 
-from .experiment import METHOD_VERSION, RunConfig, load_config
-from .method import DEPLOYMENT_MODES, PolicyState
-from .model import ModelOutput, build_model
+from .experiment import (
+    CONFIG_VERSION,
+    MANIFEST_VERSION,
+    METHOD_VERSION,
+    PartnerManifest,
+    PartnerRun,
+    RunConfig,
+    load_config,
+    load_partner_manifest,
+)
+from .model import build_model
 from .runner import RunnerState
-from .training import TrainState, TransitionBatch
+from .types import ModelOutput, PolicyState, TrainState
 
 __all__ = [
-    "DEPLOYMENT_MODES",
+    "CONFIG_VERSION",
+    "MANIFEST_VERSION",
     "METHOD_VERSION",
     "ModelOutput",
+    "PartnerManifest",
+    "PartnerRun",
     "PolicyState",
     "RunConfig",
     "RunnerState",
     "TrainState",
-    "TransitionBatch",
     "build_model",
     "load_config",
+    "load_partner_manifest",
 ]

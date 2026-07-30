@@ -1,0 +1,117 @@
+version: 5
+
+environment:
+  layout: test_time_wide
+  agent_view_size: 2
+  indicate_successful_delivery: true
+  episode_steps: 400
+
+model:
+  task_hidden_dim: 128
+  belief_hidden_dim: 128
+  latent_dim: 8
+  mixture_components: 4
+  posterior_particles: 16
+  belief_embedding_dim: 128
+  actor_hidden_dim: 128
+  critic_hidden_dim: 128
+  response_hidden_dim: 128
+  modulation_rank: 8
+  action_embedding_dim: 16
+  log_variance_minimum: -5.0
+  log_variance_maximum: 2.0
+  response_log_std_minimum: -5.0
+  response_log_std_maximum: 2.0
+
+ppo:
+  update_epochs: 4
+  learning_rate: 0.00025
+  gradient_clip_norm: 0.5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_clip_epsilon: 0.2
+  entropy_weight: 0.01
+  value_weight: 0.5
+  max_approx_kl: 0.03
+  normalize_advantages: true
+  polyak_coefficient: 0.005
+
+loss:
+  response_weight: 1.0
+  counterfactual_weight: 1.0
+  advantage_distill_weight: 0.5
+  policy_distill_weight: 0.25
+  quotient_weight: 0.25
+  consistency_weight: 0.25
+  information_bottleneck_weight: 0.001
+  information_bottleneck_free_bits: 1.0
+  decision_regret_weight: 0.1
+  quotient_equivalence_epsilon: 0.05
+  quotient_separation_epsilon: 0.25
+  quotient_margin: 1.0
+
+anchors:
+  interval_updates: 8
+  states_per_interval: 64
+  fit_replicas: 32
+  evaluation_replicas: 64
+  continuation_horizon: 400
+  sampling_time_bins: 8
+  sampling_regret_bins: 4
+  return_lower_bound: -400.0
+  return_upper_bound: 400.0
+
+partner_generator:
+  code_dim: 8
+  hidden_dim: 128
+  modulation_rank: 8
+  current_probability: 0.50
+  snapshot_probability: 0.25
+  frozen_external_probability: 0.25
+  update_interval: 8
+  snapshot_interval: 32
+  competence_threshold: 50.0
+  cvar_level: 0.20
+  brdiv_weight: 1.0
+  smoothness_weight: 0.05
+  lagrangian_learning_rate: 0.01
+  kernel_bandwidth: 20.0
+  kernel_jitter: 0.0001
+  codes_per_update: 32
+
+calibration:
+  alpha: 0.05
+  support_quantile: 0.05
+  minimum_run_count: 19
+  block_unit: partner_run
+  enable_hard_gate_at_evaluation: true
+  episodes_per_run: 128
+  anchors_per_run: 64
+
+training:
+  rollout_length: 400
+  student_lane_probability: 0.75
+  teacher_lane_probability: 0.25
+  base_policy_lane_probability: 0.25
+
+evaluation:
+  episodes_per_pairing: 500
+  bootstrap_replicates: 9999
+  evaluation_seed: 20260801
+  enable_adaptation: true
+  report_br_prox: true
+  br_prox_anchors_per_pairing: 8
+  br_prox_fit_replicas: 8
+  br_prox_evaluation_replicas: 16
+  br_prox_continuation_horizon: 400
+  evaluate_both_roles: true
+  one_sided_alpha: 0.015
+  minimum_ego_runs: 10
+  minimum_partner_runs_per_mechanism: 4
+  minimum_mechanisms: 2
+
+upstream:
+  total_timesteps: 30000000
+  reward_shaping_horizon: 15000000
+  checkpoint_progress: [0.0, 0.5, 1.0]

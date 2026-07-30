@@ -1,4 +1,4 @@
-"""Build the two manifests consumed by Path C from completed run directories."""
+"""Build immutable, hash-bound DELTA-ZSC partner manifests."""
 
 from __future__ import annotations
 
@@ -9,175 +9,101 @@ from typing import Any, Mapping, Sequence
 
 from src.path_c.experiment import (
     MANIFEST_VERSION,
-    METHOD_VERSION,
-    Population,
-    PopulationEntry,
-    load_training_unit_manifest,
-    write_population,
+    PartnerManifest,
+    PartnerRun,
+    validate_partner_manifest,
 )
-from src.path_c.storage import read_run_identity, write_json
+from src.path_c.storage import sha256_path, write_json
+
+PLAN_VERSION = 1
 
 
-def _load_json(path: Path) -> Mapping[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, Mapping):
-        raise ValueError(f"Expected a JSON mapping in {path}.")
-    return payload
-
-
-def _upstream_checkpoints(
-    run_directory: Path, *, layout: str, run_kind: str
-) -> tuple[Path, ...]:
-    identity = read_run_identity(run_directory)
-    if (
-        identity.get("stage") != "upstream"
-        or identity.get("layout") != layout
-        or identity.get("run_kind") != run_kind
-    ):
+def _exact_mapping(value: Any, expected: set[str], location: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{location} must be a mapping.")
+    fields = set(value)
+    if fields != expected:
         raise ValueError(
-            f"{run_directory} is not a {run_kind} upstream run for {layout}."
+            f"{location} fields differ: missing={sorted(expected-fields)}, "
+            f"unknown={sorted(fields-expected)}."
         )
-    summary = _load_json(run_directory / "upstream_summary.json")
-    checkpoints = tuple(Path(value).resolve() for value in summary.get("checkpoint_paths", ()))
-    if len(checkpoints) != 3:
-        raise ValueError(f"{run_directory} must expose start, midpoint, and final checkpoints.")
-    return checkpoints
+    return value
 
 
-def build_unit_manifest(
-    *, plan_path: str | Path, output_path: str | Path, run_kind: str
+def build_partner_manifest(
+    *, plan_path: str | Path, output_path: str | Path
 ) -> Path:
-    """Expand upstream run directories into the literal training-unit manifest."""
+    """Resolve checkpoint paths and bind their exact SHA-256 identities.
+
+    The plan intentionally omits ``checkpoint_sha256`` so users cannot copy an
+    unrelated digest.  The generated manifest is immediately passed through the
+    same lineage validator used by training, calibration, and evaluation.
+    """
 
     plan_file = Path(plan_path).resolve()
-    plan = _load_json(plan_file)
-    if set(plan) != {"version", "layout", "units"} or int(plan["version"]) != 1:
-        raise ValueError("Unit plan fields must be version, layout, and units.")
-    layout = str(plan["layout"])
-    if not isinstance(plan["units"], Sequence):
-        raise ValueError("Unit plan units must be a sequence.")
-    units = []
-    for index, raw in enumerate(plan["units"]):
-        if not isinstance(raw, Mapping) or set(raw) != {
-            "outer_unit_id",
-            "reference_run",
-            "partner_runs",
-        }:
-            raise ValueError(f"unit[{index}] has the wrong fields.")
-        reference_run = (plan_file.parent / str(raw["reference_run"])).resolve()
-        reference_checkpoints = _upstream_checkpoints(
-            reference_run, layout=layout, run_kind=run_kind
-        )
-        partner_runs = raw["partner_runs"]
-        if not isinstance(partner_runs, Sequence) or isinstance(partner_runs, (str, bytes)):
-            raise ValueError("partner_runs must be a sequence.")
-        partner_checkpoints = tuple(
-            checkpoint
-            for value in partner_runs
-            for checkpoint in _upstream_checkpoints(
-                (plan_file.parent / str(value)).resolve(),
-                layout=layout,
-                run_kind=run_kind,
+    payload = json.loads(plan_file.read_text(encoding="utf-8"))
+    payload = _exact_mapping(payload, {"version", "layout", "runs"}, "plan")
+    if int(payload["version"]) != PLAN_VERSION:
+        raise ValueError(f"Manifest plan version must be {PLAN_VERSION}.")
+    raw_runs = payload["runs"]
+    if not isinstance(raw_runs, Sequence) or isinstance(raw_runs, (str, bytes)):
+        raise ValueError("plan.runs must be a sequence.")
+
+    expected_run_fields = {
+        "run_id",
+        "role",
+        "checkpoint",
+        "parent_training_run_id",
+        "generation_mechanism",
+        "seed",
+        "co_training_group_id",
+        "partner_type_id",
+    }
+    runs: list[PartnerRun] = []
+    for index, raw in enumerate(raw_runs):
+        item = _exact_mapping(raw, expected_run_fields, f"plan.runs[{index}]")
+        checkpoint = Path(str(item["checkpoint"]))
+        if not checkpoint.is_absolute():
+            checkpoint = (plan_file.parent / checkpoint).resolve()
+        if not checkpoint.exists():
+            raise FileNotFoundError(checkpoint)
+        runs.append(
+            PartnerRun(
+                run_id=str(item["run_id"]),
+                role=str(item["role"]),
+                checkpoint=checkpoint,
+                checkpoint_sha256=sha256_path(checkpoint),
+                parent_training_run_id=str(item["parent_training_run_id"]),
+                generation_mechanism=str(item["generation_mechanism"]),
+                seed=int(item["seed"]),
+                co_training_group_id=(
+                    None
+                    if item["co_training_group_id"] is None
+                    else str(item["co_training_group_id"])
+                ),
+                partner_type_id=(
+                    None
+                    if item["partner_type_id"] is None
+                    else str(item["partner_type_id"])
+                ),
             )
         )
-        units.append(
-            {
-                "outer_unit_id": int(raw["outer_unit_id"]),
-                "reference_checkpoint": str(reference_checkpoints[-1]),
-                "partner_checkpoints": [str(path) for path in partner_checkpoints],
-            }
-        )
-    output = write_json(
-        output_path,
-        {"version": MANIFEST_VERSION, "layout": layout, "units": units},
-    )
-    # The same parser used by training is the final check; no parallel validation exists.
-    load_training_unit_manifest(output, expected_layout=layout, run_kind=run_kind)
-    return output
+    manifest = PartnerManifest(layout=str(payload["layout"]), runs=tuple(runs))
+    validate_partner_manifest(manifest)
+    target = write_json(output_path, manifest.to_mapping())
+    return target
 
 
-def build_population(
-    *,
-    run_directories: Sequence[str | Path],
-    name: str,
-    evaluation_kind: str,
-    output_path: str | Path,
-) -> Path:
-    runs = tuple(Path(value).resolve() for value in run_directories)
-    expected_count = 1 if evaluation_kind == "development_diagnostic" else 10
-    if len(runs) != expected_count:
-        raise ValueError(
-            f"{evaluation_kind} requires {expected_count} training run directories."
-        )
-    identities = [read_run_identity(path) for path in runs]
-    if any(
-        identity.get("stage") != "train" or identity.get("method") != METHOD_VERSION
-        for identity in identities
-    ):
-        raise ValueError("Every population member must be a completed run of this method.")
-    layouts = {str(identity.get("layout")) for identity in identities}
-    configs = {json.dumps(identity.get("config"), sort_keys=True) for identity in identities}
-    outer_units = [int(identity.get("outer_unit_id", -1)) for identity in identities]
-    if (
-        len(layouts) != 1
-        or len(configs) != 1
-        or outer_units != list(range(expected_count))
-    ):
-        raise ValueError(
-            "Population runs must share one config and use ordered outer units."
-        )
-    population = Population(
-        name=str(name),
-        layout=next(iter(layouts)),
-        evaluation_kind=str(evaluation_kind),
-        entries=tuple(
-            PopulationEntry(outer_unit_id=index, run_directory=path)
-            for index, path in enumerate(runs)
-        ),
-    )
-    return write_population(output_path, population)
-
-
-def add_manifest_commands(commands: argparse._SubParsersAction) -> None:
-    units = commands.add_parser("build-units")
-    units.add_argument("--plan", required=True)
-    units.add_argument("--run-kind", choices=("development", "formal"), required=True)
-    units.add_argument("--output", required=True)
-    units.set_defaults(
+def add_manifest_command(commands: argparse._SubParsersAction) -> None:
+    parser = commands.add_parser("build-partner-manifest")
+    parser.add_argument("--plan", required=True)
+    parser.add_argument("--output", required=True)
+    parser.set_defaults(
         function=lambda args: print(
-            build_unit_manifest(
-                plan_path=args.plan,
-                output_path=args.output,
-                run_kind=args.run_kind,
-            )
-        ),
-        manages_output=False,
-    )
-
-    population = commands.add_parser("build-population")
-    population.add_argument("--name", required=True)
-    population.add_argument(
-        "--evaluation-kind",
-        choices=(
-            "standard_matrix",
-            "response_contrast",
-            "development_diagnostic",
-        ),
-        required=True,
-    )
-    population.add_argument("--runs", nargs="+", required=True)
-    population.add_argument("--output", required=True)
-    population.set_defaults(
-        function=lambda args: print(
-            build_population(
-                run_directories=args.runs,
-                name=args.name,
-                evaluation_kind=args.evaluation_kind,
-                output_path=args.output,
-            )
+            build_partner_manifest(plan_path=args.plan, output_path=args.output)
         ),
         manages_output=False,
     )
 
 
-__all__ = ["add_manifest_commands", "build_population", "build_unit_manifest"]
+__all__ = ["PLAN_VERSION", "add_manifest_command", "build_partner_manifest"]

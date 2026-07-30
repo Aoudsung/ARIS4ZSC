@@ -1,0 +1,95 @@
+"""Deployable task-state encoder for DELTA-ZSC."""
+
+from __future__ import annotations
+
+from typing import Any
+
+_TASK_CELL: Any | None = None
+_TASK_SCAN: Any | None = None
+
+
+def task_encoder_classes() -> tuple[Any, Any]:
+    global _TASK_CELL, _TASK_SCAN
+    if _TASK_CELL is not None and _TASK_SCAN is not None:
+        return _TASK_CELL, _TASK_SCAN
+
+    import flax.linen as nn
+    import jax.numpy as jnp
+    from flax.linen.initializers import orthogonal, zeros
+
+    class TaskEncoderCell(nn.Module):
+        hidden_dim: int
+        action_count: int
+        action_embedding_dim: int
+
+        @nn.compact
+        def __call__(
+            self,
+            carry: Any,
+            inputs: tuple[Any, Any, Any, Any],
+        ) -> tuple[Any, Any]:
+            observation, previous_action, previous_reward, episode_start = inputs
+            obs = jnp.asarray(observation, dtype=jnp.float32)
+            flat = obs.reshape(previous_action.shape + (-1,))
+            action = jnp.asarray(previous_action, dtype=jnp.int32)
+            reward = jnp.asarray(previous_reward, dtype=jnp.float32)
+            start = jnp.asarray(episode_start, dtype=jnp.bool_)
+            if action.shape != reward.shape or action.shape != start.shape:
+                raise ValueError("Task encoder scalar inputs must share batch axes.")
+            if flat.shape[:-1] != action.shape:
+                raise ValueError("Observation batch axes do not match task inputs.")
+
+            sentinel = jnp.where(start, self.action_count, action)
+            action_embedding = nn.Embed(
+                num_embeddings=self.action_count + 1,
+                features=self.action_embedding_dim,
+                embedding_init=nn.initializers.normal(0.02),
+                name="previous_action_embedding",
+            )(sentinel)
+            encoded = nn.relu(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="observation_projection",
+                )(flat)
+            )
+            encoded = encoded + nn.Dense(
+                self.hidden_dim,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="action_projection",
+            )(action_embedding)
+            encoded = encoded + nn.Dense(
+                self.hidden_dim,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="reward_projection",
+            )(reward[..., None])
+            encoded = nn.LayerNorm(name="task_layer_norm")(encoded)
+            carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
+            next_carry, feature = nn.GRUCell(
+                features=self.hidden_dim,
+                name="task_gru",
+            )(carry, encoded)
+            return next_carry, feature
+
+    ScannedTaskEncoder = nn.scan(
+        TaskEncoderCell,
+        variable_broadcast="params",
+        split_rngs={"params": False},
+        in_axes=0,
+        out_axes=0,
+    )
+    _TASK_CELL = TaskEncoderCell
+    _TASK_SCAN = ScannedTaskEncoder
+    return TaskEncoderCell, ScannedTaskEncoder
+
+
+def initial_task_carry(batch_size: int, hidden_dim: int) -> Any:
+    import jax.numpy as jnp
+
+    return jnp.zeros((int(batch_size), int(hidden_dim)), dtype=jnp.float32)
+
+
+__all__ = ["initial_task_carry", "task_encoder_classes"]

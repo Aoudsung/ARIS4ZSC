@@ -1,0 +1,37 @@
+name: delta-zsc-ci
+
+on:
+  push:
+    branches: ["agent/delta-zsc-v5"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      JAX_PLATFORM_NAME: cpu
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pinned project
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Compile active implementation
+        run: python -m compileall -q src/path_c experiments/overcooked_v2
+      - name: Run DELTA-ZSC tests
+        run: pytest -q experiments/overcooked_v2/tests/test_delta_zsc_*.py
+      - name: Smoke test command entry
+        run: python -m experiments.overcooked_v2.path_c --help
+      - name: Reject legacy semantics in active source
+        run: |
+          ! grep -R -n -E 'slot_log_belief|TwinDuelingQ|CodebookState|next_q_use_targets|next_q_mask_targets|episode_responsibility_evidence|bellman_control_values|target_response_signatures' src/path_c
+      - name: Reject committed credentials
+        run: |
+          ! git ls-files | grep -E '(^|/)SSH_Document\.md$'
+          ! git grep -n -E 'SSH[[:space:]]+Password:|BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE KEY|gho_[A-Za-z0-9_]{20,}'

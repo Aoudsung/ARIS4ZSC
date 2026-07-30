@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "layout": "test_time_simple",
+  "runs": [
+    {
+      "run_id": "train_external_000",
+      "role": "frozen_external_train",
+      "checkpoint": "/ABSOLUTE/PATH/TO/TRAIN_EXTERNAL_000/ckpt_final",
+      "parent_training_run_id": "train_external_parent_000",
+      "generation_mechanism": "rnn-sp",
+      "seed": 1000,
+      "co_training_group_id": null,
+      "partner_type_id": null
+    },
+    {
+      "run_id": "train_external_001",
+      "role": "frozen_external_train",
+      "checkpoint": "/ABSOLUTE/PATH/TO/TRAIN_EXTERNAL_001/ckpt_final",
+      "parent_training_run_id": "train_external_parent_001",
+      "generation_mechanism": "rnn-op",
+      "seed": 1001,
+      "co_training_group_id": null,
+      "partner_type_id": null
+    },
+    {
+      "run_id": "calibration_000",
+      "role": "calibration",
+      "checkpoint": "/ABSOLUTE/PATH/TO/CALIBRATION_000/ckpt_final",
+      "parent_training_run_id": "calibration_parent_000",
+      "generation_mechanism": "heldout-mechanism-a",
+      "seed": 2000,
+      "co_training_group_id": null,
+      "partner_type_id": null
+    },
+    {
+      "run_id": "calibration_001",
+      "role": "calibration",
+      "checkpoint": "/ABSOLUTE/PATH/TO/CALIBRATION_001/ckpt_final",
+      "parent_training_run_id": "calibration_parent_001",
+      "generation_mechanism": "heldout-mechanism-a",
+      "seed": 2001,
+      "co_training_group_id": null,
+      "partner_type_id": null
+    },
+    {
+      "run_id": "confirmatory_000",
+      "role": "confirmatory",
+      "checkpoint": "/ABSOLUTE/PATH/TO/CONFIRMATORY_000/ckpt_final",
+      "parent_training_run_id": "confirmatory_parent_000",
+      "generation_mechanism": "heldout-mechanism-b",
+      "seed": 3000,
+      "co_training_group_id": null,
+      "partner_type_id": null
+    },
+    {
+      "run_id": "confirmatory_001",
+      "role": "confirmatory",
+      "checkpoint": "/ABSOLUTE/PATH/TO/CONFIRMATORY_001/ckpt_final",
+      "parent_training_run_id": "confirmatory_parent_001",
+      "generation_mechanism": "heldout-mechanism-b",
+      "seed": 3001,
+      "co_training_group_id": null,
+      "partner_type_id": null
+    }
+  ]
+}
