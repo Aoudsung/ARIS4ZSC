@@ -45,11 +45,20 @@ The complete mathematical design and proof obligations are documented in [`docs/
 The registered runtime is the Official repository's documented Python 3.10 environment with the pinned JAX/Flax/Optax versions in `pyproject.toml`.
 
 ```bash
+git clone https://github.com/overcookedv2/experiments.git /path/to/overcookedv2-official
+git -C /path/to/overcookedv2-official checkout 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e
 python -m pip install -e .
+python -m pip install --no-deps \
+  -e /path/to/overcookedv2-official/JaxMARL \
+  -e /path/to/overcookedv2-official/experiments
 python -m compileall -q src/path_c experiments/overcooked_v2
 pytest -q experiments/overcooked_v2/tests/test_delta_zsc_*.py
 python -m experiments.overcooked_v2.path_c --help
 ```
+
+The editable Official checkout is required because the wheel built by the
+fixed commit omits its Hydra configuration tree. Runtime validation checks the
+checkout commit, cleanliness, source provenance, and the configuration tree.
 
 Static or unit-test success does not establish ZSC effectiveness. Scientific conclusions require frozen, run-disjoint partner manifests, all ten runs on both layouts, complete calibration, both registered scoreboards, the capacity control, resource accounting, and preregistered ablations.
 

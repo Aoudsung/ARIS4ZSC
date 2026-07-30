@@ -146,6 +146,18 @@ def validate_official_runtime() -> Mapping[str, Any]:
             break
     if delivery_reward != OFFICIAL_CORRECT_DELIVERY_REWARD:
         raise RuntimeError("Official correct-delivery reward scale changed.")
+    experiment_spec = importlib.util.find_spec("overcooked_v2_experiments")
+    if experiment_spec is None or experiment_spec.submodule_search_locations is None:
+        raise ModuleNotFoundError("The fixed Official Experiment source is not importable.")
+    config_root = (
+        Path(next(iter(experiment_spec.submodule_search_locations))) / "ppo" / "config"
+    )
+    if not config_root.is_dir():
+        raise RuntimeError(
+            "The fixed Official wheel omits its Hydra configuration tree. Install "
+            "JaxMARL and experiments editably from one clean checkout of commit "
+            f"{OFFICIAL_SOURCE_COMMIT}."
+        )
     return {
         "source_commit": OFFICIAL_SOURCE_COMMIT,
         "correct_delivery_reward": delivery_reward,
