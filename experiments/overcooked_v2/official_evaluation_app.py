@@ -269,7 +269,12 @@ def _env_kwargs(config: RunConfig) -> Mapping[str, Any]:
     from jaxmarl.environments.overcooked_v2.overcooked import ObservationType
 
     return {
-        "observation_type": [ObservationType.DEFAULT, ObservationType.DEFAULT],
+        # The locked Official environment accepts a scalar observation type for
+        # the homogeneous two-policy evaluation used by Table 2.  Passing the
+        # same value as a two-element list exposes an upstream JaxMARL bug:
+        # ``OvercookedV2.obs_shape`` then becomes a list of shapes, which is not
+        # a legal ``lax.dynamic_slice`` size when partial observations are on.
+        "observation_type": ObservationType.DEFAULT,
         "agent_view_size": config.environment.agent_view_size,
         "negative_rewards": config.environment.negative_rewards,
         "random_agent_positions": config.environment.random_agent_positions,

@@ -66,7 +66,7 @@ def test_vectorized_pairing_wrapper_is_trajectory_identical_to_official_get_roll
 
     environment = OvercookedV2(
         layout="test_time_simple",
-        observation_type=[ObservationType.DEFAULT, ObservationType.DEFAULT],
+        observation_type=ObservationType.DEFAULT,
         agent_view_size=2,
         negative_rewards=True,
         random_agent_positions=True,

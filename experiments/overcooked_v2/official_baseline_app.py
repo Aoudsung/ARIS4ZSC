@@ -405,7 +405,7 @@ def run_official_baseline(args: argparse.Namespace) -> None:
     latency_environment = jaxmarl.make(
         latency_config["env"]["ENV_NAME"],
         **dict(latency_config["env"]["ENV_KWARGS"]),
-        observation_type=[ObservationType.DEFAULT, ObservationType.DEFAULT],
+        observation_type=ObservationType.DEFAULT,
     )
     latency_observations, unused_latency_state = latency_environment.reset(
         jax.random.PRNGKey(0)
