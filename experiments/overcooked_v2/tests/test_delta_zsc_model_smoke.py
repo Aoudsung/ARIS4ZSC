@@ -100,6 +100,19 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
     assert output.response_observation_delta_mean.shape == (2, 6) + observation_shape
     assert np.all(np.isfinite(np.asarray(output.execution_logits)))
 
+    final_state, sequence_output = model.apply(
+        {"params": params},
+        state,
+        jnp.zeros((3, 2) + observation_shape, dtype=jnp.int32),
+        jnp.zeros((3, 2), dtype=jnp.int32),
+        jnp.zeros((3, 2), dtype=jnp.float32),
+        jnp.zeros((3, 2), dtype=jnp.bool_),
+        jnp.ones((3, 2), dtype=jnp.float32),
+        method=model.sequence,
+    )
+    assert sequence_output.execution_logits.shape == (3, 2, 6)
+    assert final_state.previous_observation.dtype == jnp.float32
+
     assert set(DEPLOYABLE_PARAM_NAMES).issubset(params)
     assert "code_teacher" in params
     assert "full_trajectory_teacher" in params

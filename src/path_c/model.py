@@ -228,7 +228,13 @@ def _model_class() -> Any:
                     log_variances=log_variances,
                     support_score=support_score,
                 ),
-                previous_observation=jnp.asarray(observation),
+                # Official OvercookedV2 observations are integer tensors, while
+                # the recurrent history carry is initialized as float32.  Keep
+                # the carry dtype invariant across `lax.scan`; the belief and
+                # task encoders both consume observations in float32.
+                previous_observation=jnp.asarray(
+                    observation, dtype=state.previous_observation.dtype
+                ),
                 previous_action=state.previous_action,
                 previous_reward=state.previous_reward,
                 episode_start=state.episode_start,
