@@ -30,6 +30,15 @@ from src.path_c.storage import (
 )
 
 
+def _metric_with_row_axis(values: object) -> object:
+    """Normalize scalar Official diagnostics without changing array metrics."""
+
+    import numpy as np
+
+    array = np.asarray(values)
+    return array.reshape((1,)) if array.ndim == 0 else values
+
+
 def run_upstream(args: argparse.Namespace) -> None:
     """Run one locked official upstream training job and preserve all outputs."""
 
@@ -90,7 +99,7 @@ def run_upstream(args: argparse.Namespace) -> None:
             for path in write_array_chunks(
                 output / "metrics",
                 name=str(name),
-                values=values,
+                values=_metric_with_row_axis(values),
                 rows_per_chunk=1024,
             )
         ]
@@ -137,4 +146,4 @@ def run_upstream(args: argparse.Namespace) -> None:
     print(f"Complete upstream metrics: {output / 'metrics'}")
 
 
-__all__ = ["run_upstream"]
+__all__ = ["_metric_with_row_axis", "run_upstream"]

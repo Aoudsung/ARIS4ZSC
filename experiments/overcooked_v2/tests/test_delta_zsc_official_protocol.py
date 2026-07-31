@@ -39,6 +39,7 @@ from src.path_c.training import (  # noqa: E402
     official_learning_rate_schedule,
     official_reward_shaping_factor,
 )
+from experiments.overcooked_v2.upstream_app import _metric_with_row_axis  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -216,6 +217,15 @@ def test_mechanical_fixture_keys_are_deterministic_fresh_and_disjoint() -> None:
     assert len(set(keys)) == len(keys)
     formal = {tuple(official_training_key(index)) for index in range(10)}
     assert not formal.intersection(keys)
+
+
+def test_official_scalar_metrics_receive_a_lossless_row_axis() -> None:
+    scalar = np.asarray(_metric_with_row_axis(np.asarray(3.5)))
+    vector = np.asarray([1.0, 2.0])
+    observed_vector = _metric_with_row_axis(vector)
+    assert scalar.shape == (1,)
+    assert scalar[0] == pytest.approx(3.5)
+    assert observed_vector is vector
 
 
 def test_official_learning_rate_schedule_matches_registered_optax_composition() -> None:
