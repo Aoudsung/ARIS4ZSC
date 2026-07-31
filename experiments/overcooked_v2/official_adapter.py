@@ -642,11 +642,32 @@ def train_upstream(
     mini_batch_pmap = _official_symbol(
         "overcooked_v2_experiments.utils.utils", "mini_batch_pmap"
     )
+    import wandb
 
     train = make_train(official_config)
     mapped_train = mini_batch_pmap(jax.jit(train), 1)
-    output = mapped_train(jnp.asarray(run_key, dtype=jnp.uint32)[None, :])
-    jax.block_until_ready(output["metrics"]["env_step"])
+    model_name = str(official_config["model"]["TYPE"])
+    layout_name = str(official_config["env"]["ENV_KWARGS"]["layout"])
+    agent_view_size = official_config["env"]["ENV_KWARGS"].get(
+        "agent_view_size"
+    )
+    run_name = (
+        f"ippo_{model_name}_ov2_{layout_name}_avs-{agent_view_size}"
+    )
+    # The fixed Official ``single_run_with_viz`` entrypoint always surrounds
+    # ``single_run`` with this context.  ``ippo.make_train`` contains an
+    # unconditional ``jax.debug.callback(wandb.log, ...)``; calling it without
+    # the Official context fails even when WANDB_MODE is disabled.
+    with wandb.init(
+        entity=official_config["wandb"]["ENTITY"],
+        project=official_config["wandb"]["PROJECT"],
+        tags=["IPPO", model_name, "OvercookedV2"],
+        config=dict(official_config),
+        mode=official_config["wandb"]["WANDB_MODE"],
+        name=run_name,
+    ):
+        output = mapped_train(jnp.asarray(run_key, dtype=jnp.uint32)[None, :])
+        jax.block_until_ready(output["metrics"]["env_step"])
 
     metrics = jax.tree_util.tree_map(lambda value: value[0], output["metrics"])
     checkpoint_states = output["runner_state"][1]

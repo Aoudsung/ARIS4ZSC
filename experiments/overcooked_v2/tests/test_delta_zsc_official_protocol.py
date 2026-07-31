@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,7 @@ from experiments.overcooked_v2.official_adapter import (  # noqa: E402
     _validate_official_baseline_config,
     compose_official_baseline_config,
     compose_ippo_large_config,
+    train_upstream,
     validate_official_runtime,
 )
 from experiments.overcooked_v2.official_baseline_app import _official_command  # noqa: E402
@@ -213,3 +215,87 @@ def test_fixed_official_commands_preserve_fcp_population_indexing() -> None:
     assert "NUM_SEEDS=10" not in fcp
     assert "+FCP=/tmp/fcp-populations" in fcp
     assert "NUM_SEEDS=10" in sp
+
+
+def test_direct_upstream_trainer_preserves_official_wandb_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import experiments.overcooked_v2.official_adapter as adapter
+    import wandb
+
+    active = {"value": False}
+
+    @contextmanager
+    def fake_init(**kwargs):
+        assert kwargs["mode"] == "disabled"
+        active["value"] = True
+        try:
+            yield object()
+        finally:
+            active["value"] = False
+
+    def fake_make_train(config):
+        del config
+        return object()
+
+    output = {
+        "metrics": {
+            "env_step": jnp.asarray([[65_536]], dtype=jnp.int32),
+            "returned_episode": jnp.asarray([[0.0]], dtype=jnp.float32),
+        },
+        "runner_state": (
+            None,
+            {"params": jnp.zeros((1, 3, 1), dtype=jnp.float32)},
+        ),
+    }
+
+    def fake_pmap(train, batch_size):
+        del train
+        assert batch_size == 1
+
+        def mapped(keys):
+            assert keys.shape == (1, 2)
+            assert active["value"]
+            return output
+
+        return mapped
+
+    def fake_symbol(module, name):
+        if module.endswith(".ippo") and name == "make_train":
+            return fake_make_train
+        if module.endswith(".utils.utils") and name == "mini_batch_pmap":
+            return fake_pmap
+        raise AssertionError((module, name))
+
+    monkeypatch.setattr(wandb, "init", fake_init)
+    monkeypatch.setattr(adapter, "_official_symbol", fake_symbol)
+    monkeypatch.setattr(
+        adapter,
+        "store_official_checkpoint",
+        lambda **kwargs: Path(f"/tmp/ckpt-{kwargs['update_step']}"),
+    )
+    result = train_upstream(
+        {
+            "model": {
+                "TYPE": "RNN",
+                "NUM_ENVS": 256,
+                "NUM_STEPS": 256,
+            },
+            "env": {
+                "ENV_KWARGS": {
+                    "layout": "test_time_simple",
+                    "agent_view_size": 2,
+                }
+            },
+            "wandb": {
+                "ENTITY": "disabled",
+                "PROJECT": "disabled",
+                "WANDB_MODE": "disabled",
+            },
+        },
+        run_key=(1, 2),
+        seed_index=0,
+        checkpoint_progress=(0.0, 0.5, 1.0),
+    )
+    assert result["effective_environment_steps"] == 65_536
+    assert len(result["checkpoint_paths"]) == 3
