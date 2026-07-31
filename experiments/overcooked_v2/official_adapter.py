@@ -527,9 +527,12 @@ def _validate_official_config(
     if not 0 <= int(seed_index) < OFFICIAL_TRAINING_RUN_COUNT:
         raise ValueError("Official seed_index must lie in 0..9.")
     steps_per_update = int(model["NUM_ENVS"]) * int(model["NUM_STEPS"])
-    if total_timesteps < steps_per_update or total_timesteps % steps_per_update:
+    if mechanical and (
+        total_timesteps < steps_per_update
+        or total_timesteps % steps_per_update
+    ):
         raise ValueError(
-            "Official upstream budget must contain whole vectorized updates."
+            "Mechanical upstream budget must contain whole vectorized updates."
         )
 
 
