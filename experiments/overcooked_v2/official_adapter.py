@@ -238,6 +238,34 @@ def compose_official_config(
     if not isinstance(resolved, Mapping):
         raise ValueError("Official Hydra configuration did not resolve to a mapping.")
     result = dict(resolved)
+    if config.run_kind == "mechanical":
+        # Mechanical E2E runs exercise the unmodified Official trainer with a
+        # deliberately tiny budget.  This branch is never reachable from a
+        # formal config and does not alter the registered scientific recipe.
+        if (
+            int(config.upstream.total_timesteps)
+            != int(config.training.environment_steps)
+        ):
+            raise ValueError(
+                "Mechanical upstream and DELTA trajectory budgets must match; "
+                "use the dedicated mechanical E2E config."
+            )
+        model = dict(result["model"])
+        model.update(
+            {
+                "TOTAL_TIMESTEPS": int(config.upstream.total_timesteps),
+                "REW_SHAPING_HORIZON": int(
+                    config.upstream.reward_shaping_horizon
+                ),
+                "NUM_ENVS": int(config.environment.num_envs),
+                "NUM_STEPS": int(config.training.rollout_length),
+                "UPDATE_EPOCHS": int(config.ppo.update_epochs),
+                "NUM_MINIBATCHES": int(
+                    config.training.minibatches_per_epoch
+                ),
+            }
+        )
+        result["model"] = model
     result["RUN_BASE_DIR"] = str(Path(output_directory).resolve())
     _validate_official_config(
         result, config=config, algorithm=algorithm, seed_index=seed_index
@@ -416,21 +444,40 @@ def _validate_official_config(
     environment = resolved.get("env")
     if not isinstance(model, Mapping) or not isinstance(environment, Mapping):
         raise ValueError("Official Hydra config lacks model or environment sections.")
+    mechanical = config.run_kind == "mechanical"
     total_timesteps = (
-        OFFICIAL_SP_TOTAL_TIMESTEPS
-        if algorithm == "rnn-sp"
-        else OFFICIAL_OP_TOTAL_TIMESTEPS
+        int(config.upstream.total_timesteps)
+        if mechanical
+        else (
+            OFFICIAL_SP_TOTAL_TIMESTEPS
+            if algorithm == "rnn-sp"
+            else OFFICIAL_OP_TOTAL_TIMESTEPS
+        )
     )
-    reward_horizon = total_timesteps // 2
+    reward_horizon = (
+        int(config.upstream.reward_shaping_horizon)
+        if mechanical
+        else total_timesteps // 2
+    )
     expected = {
         "TYPE": "RNN",
         "FC_DIM_SIZE": 128,
         "GRU_HIDDEN_DIM": 128,
         "TOTAL_TIMESTEPS": total_timesteps,
         "REW_SHAPING_HORIZON": reward_horizon,
-        "NUM_STEPS": OFFICIAL_ROLLOUT_LENGTH,
-        "UPDATE_EPOCHS": OFFICIAL_UPDATE_EPOCHS,
-        "NUM_MINIBATCHES": OFFICIAL_NUM_MINIBATCHES,
+        "NUM_STEPS": (
+            config.training.rollout_length
+            if mechanical
+            else OFFICIAL_ROLLOUT_LENGTH
+        ),
+        "UPDATE_EPOCHS": (
+            config.ppo.update_epochs if mechanical else OFFICIAL_UPDATE_EPOCHS
+        ),
+        "NUM_MINIBATCHES": (
+            config.training.minibatches_per_epoch
+            if mechanical
+            else OFFICIAL_NUM_MINIBATCHES
+        ),
         "LR": 0.00025,
         "LR_WARMUP": 0.05,
         "ANNEAL_LR": True,
@@ -443,11 +490,18 @@ def _validate_official_config(
     for name, value in expected.items():
         if model.get(name) != value:
             raise ValueError(f"Official training config changed {name}: {model.get(name)!r}.")
-    variant = (
-        {"NUM_ENVS": OFFICIAL_SP_NUM_ENVS, "ENT_COEF": 0.01}
-        if algorithm == "rnn-sp"
-        else {"NUM_ENVS": OFFICIAL_OP_NUM_ENVS, "ENT_COEF": 0.02}
-    )
+    variant = {
+        "NUM_ENVS": (
+            config.environment.num_envs
+            if mechanical
+            else (
+                OFFICIAL_SP_NUM_ENVS
+                if algorithm == "rnn-sp"
+                else OFFICIAL_OP_NUM_ENVS
+            )
+        ),
+        "ENT_COEF": 0.01 if algorithm == "rnn-sp" else 0.02,
+    }
     for name, value in variant.items():
         if model.get(name) != value:
             raise ValueError(f"Official {algorithm} config changed {name}.")
@@ -472,6 +526,11 @@ def _validate_official_config(
         raise ValueError("Official training population must contain ten keys.")
     if not 0 <= int(seed_index) < OFFICIAL_TRAINING_RUN_COUNT:
         raise ValueError("Official seed_index must lie in 0..9.")
+    steps_per_update = int(model["NUM_ENVS"]) * int(model["NUM_STEPS"])
+    if total_timesteps < steps_per_update or total_timesteps % steps_per_update:
+        raise ValueError(
+            "Official upstream budget must contain whole vectorized updates."
+        )
 
 
 def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
@@ -610,8 +669,14 @@ def store_official_checkpoint(
         "overcooked_v2_experiments.ppo.utils.store", "store_checkpoint"
     )
 
+    # Keep the persisted resolved configuration JSON-serializable while
+    # restoring the pathlib contract used by the fixed Official implementation.
+    official_store_config = dict(config)
+    official_store_config["RUN_BASE_DIR"] = Path(
+        str(config["RUN_BASE_DIR"])
+    ).resolve()
     store_checkpoint(
-        config,
+        official_store_config,
         params,
         int(run_number),
         int(update_step),

@@ -12,6 +12,7 @@ from experiments.overcooked_v2.deployment import deployable_parameters
 from experiments.overcooked_v2.official_adapter import (
     FrozenPartnerPool,
     VectorEnvironment,
+    restore_official_checkpoint,
     validate_official_runtime,
     validate_official_partner_checkpoint,
 )
@@ -366,6 +367,21 @@ def run_training(args: argparse.Namespace) -> None:
         for run in manifest.by_role("frozen_external_train")
         if run.owner_seed_index == int(args.seed_index)
     )
+    parent_training_steps_by_id: dict[str, int] = {}
+    for run in external_runs:
+        if run.parent_training_run_id in parent_training_steps_by_id:
+            continue
+        checkpoint_config, unused_checkpoint_params = restore_official_checkpoint(
+            run.checkpoint
+        )
+        del unused_checkpoint_params
+        checkpoint_model = checkpoint_config["model"]
+        steps_per_update = int(checkpoint_model["NUM_ENVS"]) * int(
+            checkpoint_model["NUM_STEPS"]
+        )
+        parent_training_steps_by_id[run.parent_training_run_id] = (
+            int(checkpoint_model["TOTAL_TIMESTEPS"]) // steps_per_update
+        ) * steps_per_update
     if config.run_kind == "formal":
         mechanisms = {run.generation_mechanism for run in external_runs}
         if not {"rnn-sp", "rnn-op"}.issubset(mechanisms):
@@ -894,14 +910,7 @@ def run_training(args: argparse.Namespace) -> None:
             "scientific_readout_allowed": False,
         },
     )
-    parent_mechanisms = {
-        run.parent_training_run_id: run.generation_mechanism
-        for run in external_runs
-    }
-    partner_training_steps = sum(
-        {"rnn-sp": 29_949_952, "rnn-op": 49_987_584}.get(mechanism, 0)
-        for mechanism in parent_mechanisms.values()
-    )
+    partner_training_steps = sum(parent_training_steps_by_id.values())
     deployable_count = parameter_count(deployable_parameters(state.params))
     training_only_count = (
         parameter_count(state.params)

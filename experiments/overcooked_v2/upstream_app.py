@@ -39,7 +39,20 @@ def run_upstream(args: argparse.Namespace) -> None:
         validate_registered_python_runtime()
     runtime = validate_official_runtime()
     seed_index = int(args.seed_index)
-    key_words = official_training_key(seed_index)
+    explicit_key = getattr(args, "jax_prng_key", None)
+    if explicit_key is not None and config.run_kind != "mechanical":
+        raise ValueError(
+            "Explicit upstream PRNG keys are restricted to non-scientific "
+            "mechanical E2E fixtures."
+        )
+    if explicit_key is None:
+        key_words = official_training_key(seed_index)
+    else:
+        key_words = tuple(int(value) for value in explicit_key)
+        if len(key_words) != 2 or any(
+            value < 0 or value > 0xFFFF_FFFF for value in key_words
+        ):
+            raise ValueError("JAX PRNG keys contain exactly two uint32 words.")
     output = Path(args.output).resolve()
     ensure_run_identity(
         output,
@@ -87,6 +100,8 @@ def run_upstream(args: argparse.Namespace) -> None:
             "algorithm": str(args.algorithm),
             "seed_index": seed_index,
             "jax_prng_key": list(key_words),
+            "explicit_mechanical_key": explicit_key is not None,
+            "scientific_readout_allowed": False,
             "effective_environment_steps": int(
                 result["effective_environment_steps"]
             ),

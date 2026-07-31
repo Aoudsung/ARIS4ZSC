@@ -65,6 +65,23 @@ and that adapter imports Overcooked-AI.
 
 Static or unit-test success does not establish ZSC effectiveness. Scientific conclusions require frozen, run-disjoint partner manifests, all ten runs on both layouts, complete calibration, both registered scoreboards, the capacity control, resource accounting, and preregistered ablations.
 
+Before any full-budget run, execute the registered non-scientific acceptance
+flow on a fresh output directory:
+
+```bash
+python -m experiments.overcooked_v2.path_c mechanical-e2e \
+  --config experiments/overcooked_v2/configs/delta_zsc_simple_mechanical_e2e.yaml \
+  --output runs/mechanical/e2e-001
+```
+
+It runs the real Official upstream trainer, constructs a run-disjoint fixture
+manifest, performs 16 DELTA updates including real-return anchors and generator
+updates, calibrates and exports the pruned deployment, then executes a tiny
+confirmatory evaluation with empirical local BR-Prox. Its report is permanently
+marked `scientific_readout_allowed=false`; passing proves only that every
+implementation stage is mechanically reachable. Full formal dispatch is
+permitted only after this acceptance report is complete.
+
 ## Formal evidence protocol
 
 The benchmark runtime is fixed to OvercookedV2 Official Experiment commit [`5ce1707`](https://github.com/overcookedv2/experiments/tree/5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e). JaxMARL and `overcooked_v2_experiments` must both be installed from that exact clean source. Formal runs fail closed if provenance differs.
@@ -91,6 +108,7 @@ python -m experiments.overcooked_v2.path_c validate-manifest \
   --run-kind development
 
 python -m experiments.overcooked_v2.path_c upstream ...
+python -m experiments.overcooked_v2.path_c mechanical-e2e ...
 python -m experiments.overcooked_v2.path_c train-official-baseline ...
 python -m experiments.overcooked_v2.path_c train ...
 python -m experiments.overcooked_v2.path_c calibrate ...

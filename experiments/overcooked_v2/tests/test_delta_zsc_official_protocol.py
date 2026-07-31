@@ -14,12 +14,17 @@ optax = pytest.importorskip("optax")
 from experiments.overcooked_v2.official_adapter import (  # noqa: E402
     _official_symbol,
     _validate_official_baseline_config,
+    compose_official_config,
     compose_official_baseline_config,
     compose_ippo_large_config,
+    store_official_checkpoint,
     train_upstream,
     validate_official_runtime,
 )
 from experiments.overcooked_v2.official_baseline_app import _official_command  # noqa: E402
+from experiments.overcooked_v2.mechanical_e2e_app import (  # noqa: E402
+    mechanical_fixture_key,
+)
 from src.path_c.experiment import (  # noqa: E402
     OFFICIAL_CORRECT_DELIVERY_REWARD,
     OFFICIAL_OP_TOTAL_TIMESTEPS,
@@ -111,10 +116,106 @@ def test_formal_budget_is_exact_whole_official_updates() -> None:
     ) == 1_680_998_400
 
 
+@pytest.mark.parametrize(
+    ("algorithm", "timesteps", "num_envs"),
+    (
+        ("rnn-sp", OFFICIAL_SP_TOTAL_TIMESTEPS, 256),
+        ("rnn-op", OFFICIAL_OP_TOTAL_TIMESTEPS, 64),
+    ),
+)
+def test_formal_delta_upstream_recipe_remains_unmodified(
+    algorithm: str,
+    timesteps: int,
+    num_envs: int,
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        CONFIGS / "delta_zsc_simple_formal.yaml",
+        run_kind="formal",
+    )
+    observed = compose_official_config(
+        config,
+        algorithm=algorithm,
+        seed_index=0,
+        output_directory=tmp_path,
+    )
+    assert observed["model"]["TOTAL_TIMESTEPS"] == timesteps
+    assert observed["model"]["NUM_ENVS"] == num_envs
+    assert observed["model"]["NUM_STEPS"] == 256
+    assert observed["model"]["NUM_MINIBATCHES"] == 64
+    assert observed["model"]["UPDATE_EPOCHS"] == 4
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "entropy"),
+    (("rnn-sp", 0.01), ("rnn-op", 0.02)),
+)
+def test_mechanical_upstream_scales_only_execution_budget(
+    algorithm: str,
+    entropy: float,
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        CONFIGS / "delta_zsc_simple_mechanical_e2e.yaml",
+        run_kind="mechanical",
+    )
+    observed = compose_official_config(
+        config,
+        algorithm=algorithm,
+        seed_index=0,
+        output_directory=tmp_path,
+    )
+    model = observed["model"]
+    assert model["TYPE"] == "RNN"
+    assert model["FC_DIM_SIZE"] == 128
+    assert model["GRU_HIDDEN_DIM"] == 128
+    assert model["TOTAL_TIMESTEPS"] == 1_024
+    assert model["REW_SHAPING_HORIZON"] == 512
+    assert model["NUM_ENVS"] == 4
+    assert model["NUM_STEPS"] == 16
+    assert model["NUM_MINIBATCHES"] == 1
+    assert model["UPDATE_EPOCHS"] == 4
+    assert model["ENT_COEF"] == entropy
+    assert observed["RUN_BASE_DIR"] == str(tmp_path.resolve())
+
+
+def test_mechanical_config_exercises_every_delta_auxiliary_stage() -> None:
+    config = load_config(
+        CONFIGS / "delta_zsc_simple_mechanical_e2e.yaml",
+        run_kind="mechanical",
+    )
+    updates = (
+        config.training.environment_steps
+        // config.environment.num_envs
+        // config.training.rollout_length
+    )
+    assert updates == 16
+    assert updates // config.anchors.interval_updates == 8
+    assert updates // config.partner_generator.update_interval == 8
+    assert updates // config.partner_generator.snapshot_interval == 4
+    assert config.anchors.fit_replicas > 0
+    assert config.anchors.evaluation_replicas > 0
+    assert config.calibration.minimum_run_count == 2
+    assert config.calibration.enable_hard_gate_at_evaluation
+    assert config.evaluation.report_br_prox
+    assert config.evaluation.episodes_per_pairing == 2
+
+
 def test_training_keys_are_exact_split_of_prngkey_42() -> None:
     expected = np.asarray(jax.random.split(jax.random.PRNGKey(42), 10), dtype=np.uint32)
     observed = np.asarray([official_training_key(index) for index in range(10)], dtype=np.uint32)
     np.testing.assert_array_equal(observed, expected)
+
+
+def test_mechanical_fixture_keys_are_deterministic_fresh_and_disjoint() -> None:
+    labels = ("calibration_a", "calibration_b", "confirmatory_a", "confirmatory_b")
+    first = [mechanical_fixture_key(label) for label in labels]
+    second = [mechanical_fixture_key(label) for label in labels]
+    assert first == second
+    keys = [key for unused_seed, key in first]
+    assert len(set(keys)) == len(keys)
+    formal = {tuple(official_training_key(index)) for index in range(10)}
+    assert not formal.intersection(keys)
 
 
 def test_official_learning_rate_schedule_matches_registered_optax_composition() -> None:
@@ -299,3 +400,49 @@ def test_direct_upstream_trainer_preserves_official_wandb_context(
     )
     assert result["effective_environment_steps"] == 65_536
     assert len(result["checkpoint_paths"]) == 3
+
+
+def test_official_checkpoint_store_receives_path_run_base_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import experiments.overcooked_v2.official_adapter as adapter
+
+    observed = {}
+
+    def fake_store(config, params, run_number, update_step, *, final):
+        observed["config"] = config
+        observed["params"] = params
+        observed["run_number"] = run_number
+        observed["update_step"] = update_step
+        observed["final"] = final
+
+    monkeypatch.setattr(
+        adapter,
+        "_official_symbol",
+        lambda module, name: (
+            fake_store
+            if (
+                module == "overcooked_v2_experiments.ppo.utils.store"
+                and name == "store_checkpoint"
+            )
+            else pytest.fail(f"Unexpected Official symbol: {(module, name)}")
+        ),
+    )
+    config = {"RUN_BASE_DIR": str(tmp_path / "upstream")}
+    params = {"weight": jnp.asarray([1.0])}
+    path = store_official_checkpoint(
+        config=config,
+        params=params,
+        run_number=3,
+        update_step=17,
+        final=True,
+    )
+    assert isinstance(observed["config"]["RUN_BASE_DIR"], Path)
+    assert observed["config"]["RUN_BASE_DIR"] == (tmp_path / "upstream").resolve()
+    assert isinstance(config["RUN_BASE_DIR"], str)
+    assert observed["params"] is params
+    assert observed["run_number"] == 3
+    assert observed["update_step"] == 17
+    assert observed["final"] is True
+    assert path == (tmp_path / "upstream" / "run_3" / "ckpt_final").resolve()

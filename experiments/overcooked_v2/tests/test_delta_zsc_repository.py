@@ -46,6 +46,7 @@ def test_cli_help_imports_without_initializing_optional_runtime() -> None:
     assert result.returncode == 0, result.stderr
     for command in (
         "build-partner-manifest",
+        "mechanical-e2e",
         "validate-manifest",
         "upstream",
         "train-official-baseline",

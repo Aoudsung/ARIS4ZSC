@@ -9,6 +9,7 @@ from experiments.overcooked_v2.calibration_app import run_calibration
 from experiments.overcooked_v2.common_partner_app import run_common_partner_evaluation
 from experiments.overcooked_v2.evaluation_app import run_evaluation
 from experiments.overcooked_v2.manifest_app import add_manifest_command
+from experiments.overcooked_v2.mechanical_e2e_app import run_mechanical_e2e
 from experiments.overcooked_v2.official_baseline_app import run_official_baseline
 from experiments.overcooked_v2.official_br_prox_app import run_common_br_prox
 from experiments.overcooked_v2.official_evaluation_app import (
@@ -32,11 +33,32 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     add_manifest_command(commands)
 
+    mechanical = commands.add_parser("mechanical-e2e")
+    mechanical.add_argument(
+        "--config",
+        default=(
+            "experiments/overcooked_v2/configs/"
+            "delta_zsc_simple_mechanical_e2e.yaml"
+        ),
+    )
+    mechanical.add_argument("--output", required=True)
+    mechanical.set_defaults(function=run_mechanical_e2e, manages_output=True)
+
     upstream = commands.add_parser("upstream")
     upstream.add_argument("--config", required=True)
     upstream.add_argument("--algorithm", choices=("rnn-sp", "rnn-op"), required=True)
     upstream.add_argument("--seed-index", type=int, choices=range(10), required=True)
-    upstream.add_argument("--run-kind", choices=("development", "formal"), required=True)
+    upstream.add_argument("--run-kind", choices=RUN_KINDS, required=True)
+    upstream.add_argument(
+        "--jax-prng-key",
+        type=int,
+        nargs=2,
+        metavar=("WORD0", "WORD1"),
+        help=(
+            "Explicit two-word key for mechanical lineage fixtures only; "
+            "formal and development runs always use split(PRNGKey(42), 10)."
+        ),
+    )
     upstream.add_argument("--output", required=True)
     upstream.set_defaults(function=run_upstream, manages_output=True)
 

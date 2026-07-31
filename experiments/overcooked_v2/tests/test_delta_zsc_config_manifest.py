@@ -73,6 +73,7 @@ def test_registered_versions_and_run_budgets() -> None:
     (
         ("delta_zsc_simple_development.yaml", "development", 32),
         ("delta_zsc_wide_development.yaml", "mechanical", 4),
+        ("delta_zsc_simple_mechanical_e2e.yaml", "mechanical", 4),
         ("delta_zsc_simple_formal.yaml", "formal", 256),
         ("delta_zsc_wide_formal.yaml", "formal", 256),
     ),
@@ -82,7 +83,9 @@ def test_v5_configs_load_with_registered_budget(
 ) -> None:
     config = load_config(CONFIGS / filename, run_kind=run_kind)
     assert config.environment.num_envs == expected_envs
-    assert config.training.rollout_length == 256
+    assert config.training.rollout_length == (
+        16 if "mechanical_e2e" in filename else 256
+    )
     assert len(config.fingerprint) == 64
 
 
