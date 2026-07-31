@@ -19,6 +19,7 @@ from src.path_c.experiment import (
     load_partner_manifest,
     validate_partner_manifest,
 )
+from src.path_c.storage import sha256_path
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -152,3 +153,34 @@ def test_manifest_file_hash_is_verified(tmp_path: Path) -> None:
     runs[0].checkpoint.write_bytes(b"tampered")
     with pytest.raises(ValueError, match="SHA-256"):
         load_partner_manifest(path, expected_layout="test_time_simple")
+
+
+def test_manifest_directory_hash_uses_the_canonical_fingerprint(
+    tmp_path: Path,
+) -> None:
+    manifest = _valid_manifest()
+    runs = []
+    for index, run in enumerate(manifest.runs):
+        checkpoint = tmp_path / f"checkpoint-{index}"
+        checkpoint.mkdir()
+        (checkpoint / "metadata").write_text(
+            f"metadata-{index}", encoding="utf-8"
+        )
+        data = checkpoint / "nested" / "data.bin"
+        data.parent.mkdir()
+        data.write_bytes(bytes((index, index + 1)))
+        runs.append(
+            replace(
+                run,
+                checkpoint=checkpoint,
+                checkpoint_sha256=sha256_path(checkpoint),
+            )
+        )
+    materialized = replace(manifest, runs=tuple(runs))
+    path = tmp_path / "directory-manifest.json"
+    path.write_text(
+        json.dumps(materialized.to_mapping(), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    loaded = load_partner_manifest(path, expected_layout="test_time_simple")
+    assert loaded.to_mapping() == materialized.to_mapping()

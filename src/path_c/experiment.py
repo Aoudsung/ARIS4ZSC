@@ -291,23 +291,12 @@ def _exact_fields(payload: Any, expected: set[str], location: str) -> Mapping[st
 
 
 def _sha256(path: Path) -> str:
-    """Hash a checkpoint file or directory deterministically."""
+    """Use the one canonical file/directory fingerprint implementation."""
 
-    source = path.resolve()
-    digest = hashlib.sha256()
-    if source.is_file():
-        with source.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
-    if not source.is_dir():
-        raise FileNotFoundError(source)
-    for child in sorted(item for item in source.rglob("*") if item.is_file()):
-        digest.update(str(child.relative_to(source)).encode("utf-8"))
-        with child.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-    return digest.hexdigest()
+    # Local import avoids the experiment/storage module initialization cycle.
+    from .storage import sha256_path
+
+    return sha256_path(path)
 
 
 def official_training_key(seed_index: int) -> tuple[int, int]:
