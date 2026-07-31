@@ -236,7 +236,7 @@ def test_direct_upstream_trainer_preserves_official_wandb_context(
 
     def fake_make_train(config):
         del config
-        return object()
+        return lambda unused_key: unused_key
 
     output = {
         "metrics": {
