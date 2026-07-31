@@ -668,22 +668,36 @@ def store_official_checkpoint(
     update_step: int,
     final: bool,
 ) -> Path:
-    store_checkpoint = _official_symbol(
-        "overcooked_v2_experiments.ppo.utils.store", "store_checkpoint"
-    )
+    """Store the exact Official checkpoint tree with a serializable config.
 
-    # Keep the persisted resolved configuration JSON-serializable while
-    # restoring the pathlib contract used by the fixed Official implementation.
-    official_store_config = dict(config)
-    official_store_config["RUN_BASE_DIR"] = Path(
-        str(config["RUN_BASE_DIR"])
-    ).resolve()
-    store_checkpoint(
-        official_store_config,
-        params,
+    The fixed Official helper requires ``RUN_BASE_DIR`` to be a ``Path`` for
+    path construction, but then places that same object inside the Orbax tree.
+    Registered Orbax 0.11.5 intentionally has no ``pathlib.Path`` TypeHandler.
+    Resolve the directory with the Official helper and preserve the original
+    string-valued configuration in the otherwise identical checkpoint schema.
+    """
+
+    import orbax.checkpoint as ocp
+    from flax.training import orbax_utils
+
+    get_checkpoint_dir = _official_symbol(
+        "overcooked_v2_experiments.ppo.utils.store", "_get_checkpoint_dir"
+    )
+    checkpoint_directory = get_checkpoint_dir(
+        Path(str(config["RUN_BASE_DIR"])).resolve(),
         int(run_number),
         int(update_step),
         final=bool(final),
+    )
+    checkpoint = {
+        "config": dict(config),
+        "params": params,
+    }
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(
+        checkpoint_directory,
+        checkpoint,
+        save_args=orbax_utils.save_args_from_target(checkpoint),
     )
     name = "ckpt_final" if final else f"ckpt_{int(update_step)}"
     return (

@@ -402,32 +402,48 @@ def test_direct_upstream_trainer_preserves_official_wandb_context(
     assert len(result["checkpoint_paths"]) == 3
 
 
-def test_official_checkpoint_store_receives_path_run_base_directory(
+def test_official_checkpoint_store_uses_path_but_serializes_string_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     import experiments.overcooked_v2.official_adapter as adapter
+    import orbax.checkpoint as ocp
+    from flax.training import orbax_utils
 
     observed = {}
 
-    def fake_store(config, params, run_number, update_step, *, final):
-        observed["config"] = config
-        observed["params"] = params
+    def fake_get_directory(run_base, run_number, update_step, *, final):
+        observed["run_base"] = run_base
         observed["run_number"] = run_number
         observed["update_step"] = update_step
         observed["final"] = final
+        return run_base / f"run_{run_number}" / (
+            "ckpt_final" if final else f"ckpt_{update_step}"
+        )
+
+    class FakeCheckpointer:
+        def save(self, path, target, *, save_args):
+            observed["path"] = path
+            observed["target"] = target
+            observed["save_args"] = save_args
 
     monkeypatch.setattr(
         adapter,
         "_official_symbol",
         lambda module, name: (
-            fake_store
+            fake_get_directory
             if (
                 module == "overcooked_v2_experiments.ppo.utils.store"
-                and name == "store_checkpoint"
+                and name == "_get_checkpoint_dir"
             )
             else pytest.fail(f"Unexpected Official symbol: {(module, name)}")
         ),
+    )
+    monkeypatch.setattr(ocp, "PyTreeCheckpointer", FakeCheckpointer)
+    monkeypatch.setattr(
+        orbax_utils,
+        "save_args_from_target",
+        lambda target: ("save-args", target),
     )
     config = {"RUN_BASE_DIR": str(tmp_path / "upstream")}
     params = {"weight": jnp.asarray([1.0])}
@@ -438,11 +454,13 @@ def test_official_checkpoint_store_receives_path_run_base_directory(
         update_step=17,
         final=True,
     )
-    assert isinstance(observed["config"]["RUN_BASE_DIR"], Path)
-    assert observed["config"]["RUN_BASE_DIR"] == (tmp_path / "upstream").resolve()
+    assert isinstance(observed["run_base"], Path)
+    assert observed["run_base"] == (tmp_path / "upstream").resolve()
     assert isinstance(config["RUN_BASE_DIR"], str)
-    assert observed["params"] is params
+    assert isinstance(observed["target"]["config"]["RUN_BASE_DIR"], str)
+    assert observed["target"]["params"] is params
     assert observed["run_number"] == 3
     assert observed["update_step"] == 17
     assert observed["final"] is True
+    assert observed["save_args"] == ("save-args", observed["target"])
     assert path == (tmp_path / "upstream" / "run_3" / "ckpt_final").resolve()
