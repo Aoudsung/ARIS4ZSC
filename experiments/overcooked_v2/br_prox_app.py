@@ -40,6 +40,37 @@ class _AuditState(NamedTuple):
     partner_episode_start: Any
 
 
+def canonical_br_prox_anchor_world(
+    *,
+    environment_state: Any,
+    observations: Any,
+    ego_state: Any,
+    partner_state: Any,
+    partner_episode_start: Any,
+) -> AnchorWorld:
+    """Build an anchor world after observations were reordered ego-first.
+
+    ``empirical_local_br_prox_pairing`` canonicalizes both physical roles to
+    ``[ego, partner]`` before sampling anchor states.  The counterfactual
+    collector therefore must see ego role zero for every selected lane; the
+    physical role is restored exactly once by ``environment_step_ego_first``.
+    """
+
+    import jax.numpy as jnp
+
+    anchor_count = int(jnp.asarray(observations).shape[0])
+    return AnchorWorld(
+        environment_state=environment_state,
+        observations=observations,
+        ego_state=ego_state,
+        partner_state=partner_state,
+        partner_episode_start=partner_episode_start,
+        ego_roles=jnp.zeros((anchor_count,), dtype=jnp.int32),
+        done=jnp.zeros((anchor_count,), dtype=jnp.bool_),
+        raw_return=jnp.zeros((anchor_count,), dtype=jnp.float32),
+    )
+
+
 def _pairing_seed(
     *,
     root_seed: int,
@@ -252,14 +283,12 @@ def empirical_local_br_prox_pairing(
     selected_support = gather_time_lanes(records["support_score"], indexes)
     selected_gate = gather_time_lanes(records["gate"], indexes)
     anchor_count = int(indexes.shape[0])
-    world = AnchorWorld(
+    world = canonical_br_prox_anchor_world(
         environment_state=selected_environment,
         observations=selected_observations,
         ego_state=selected_ego,
         partner_state=selected_partner,
         partner_episode_start=selected_partner_start,
-        done=jnp.zeros((anchor_count,), dtype=jnp.bool_),
-        raw_return=jnp.zeros((anchor_count,), dtype=jnp.float32),
     )
 
     def ego_policy_step(

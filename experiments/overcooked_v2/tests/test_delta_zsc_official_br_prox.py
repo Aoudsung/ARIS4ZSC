@@ -10,6 +10,9 @@ jnp = pytest.importorskip("jax.numpy")
 from experiments.overcooked_v2.official_br_prox_app import (  # noqa: E402
     empirical_official_br_prox_pairing,
 )
+from experiments.overcooked_v2.br_prox_app import (  # noqa: E402
+    canonical_br_prox_anchor_world,
+)
 
 
 class _FixedPolicy:
@@ -49,6 +52,20 @@ class _TinyEnvironment:
         rewards = {"agent_0": reward, "agent_1": reward}
         dones = {"agent_0": done, "agent_1": done, "__all__": done}
         return observations, next_state, rewards, dones, {}
+
+
+def test_generic_br_prox_anchor_world_keeps_canonical_ego_first_roles() -> None:
+    observations = jnp.arange(12, dtype=jnp.float32).reshape((3, 2, 2))
+    world = canonical_br_prox_anchor_world(
+        environment_state=jnp.zeros((3, 1), dtype=jnp.float32),
+        observations=observations,
+        ego_state=jnp.zeros((3, 1), dtype=jnp.float32),
+        partner_state=jnp.zeros((3, 1), dtype=jnp.float32),
+        partner_episode_start=jnp.ones((3,), dtype=jnp.bool_),
+    )
+    np.testing.assert_array_equal(np.asarray(world.observations), observations)
+    np.testing.assert_array_equal(np.asarray(world.ego_roles), [0, 0, 0])
+    np.testing.assert_array_equal(np.asarray(world.done), [False, False, False])
 
 
 def test_empirical_br_prox_uses_independent_fit_and_evaluation_returns() -> None:
