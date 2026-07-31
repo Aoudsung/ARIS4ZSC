@@ -60,7 +60,24 @@ def _run(
             "scientific_readout_allowed": False,
         },
     )
-    subprocess.run(tuple(command), cwd=repository, check=True)
+    try:
+        subprocess.run(tuple(command), cwd=repository, check=True)
+    except subprocess.CalledProcessError as error:
+        write_json(
+            status_path,
+            {
+                "status": "failed",
+                "stage": stage,
+                "completed_stages": completed,
+                "exit_code": int(error.returncode),
+                "scientific_readout_allowed": False,
+                "note": (
+                    "The mechanical acceptance stopped at the first failing "
+                    "real application stage. No later stage was started."
+                ),
+            },
+        )
+        raise
     completed.append(stage)
 
 
