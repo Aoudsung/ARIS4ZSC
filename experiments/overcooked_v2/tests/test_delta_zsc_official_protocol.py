@@ -23,6 +23,7 @@ from experiments.overcooked_v2.official_adapter import (  # noqa: E402
 )
 from experiments.overcooked_v2.official_baseline_app import _official_command  # noqa: E402
 from experiments.overcooked_v2.mechanical_e2e_app import (  # noqa: E402
+    generator_update_executed,
     mechanical_fixture_key,
 )
 from src.path_c.experiment import (  # noqa: E402
@@ -283,6 +284,23 @@ def test_official_shaping_schedule_and_role_mask() -> None:
     roles = np.asarray(official_ego_roles(256))
     np.testing.assert_array_equal(roles[:128], np.zeros(128, dtype=np.int32))
     np.testing.assert_array_equal(roles[128:], np.ones(128, dtype=np.int32))
+
+
+def test_generator_update_telemetry_distinguishes_update_from_skip() -> None:
+    assert not generator_update_executed({"generator_update_skipped": 1.0})
+    assert generator_update_executed({"generator_update_skipped": 0.0})
+    assert generator_update_executed(
+        {
+            "generator_total_loss": 1.0,
+            "generator_active_lanes": 2.0,
+        }
+    )
+    assert not generator_update_executed(
+        {
+            "generator_total_loss": 1.0,
+            "generator_active_lanes": 0.0,
+        }
+    )
 
 
 def test_ippo_large_changes_only_the_registered_capacity_fields() -> None:

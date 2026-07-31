@@ -31,6 +31,19 @@ def _read_json(path: Path) -> Mapping[str, Any]:
     return value
 
 
+def generator_update_executed(metrics: Mapping[str, Any]) -> bool:
+    """Return whether telemetry proves that the real generator update ran."""
+
+    if float(metrics.get("generator_update_skipped", 1.0)) == 0.0:
+        return True
+    # Compatibility with run telemetry written before the explicit zero marker:
+    # the loss bundle exists only after evaluating the score-function objective.
+    return (
+        "generator_total_loss" in metrics
+        and float(metrics.get("generator_active_lanes", 0.0)) > 0.0
+    )
+
+
 def mechanical_fixture_key(label: str) -> tuple[int, tuple[int, int]]:
     """Derive one stable fixture key from a named, non-scientific domain."""
 
@@ -177,11 +190,7 @@ def _verify(output: Path) -> Mapping[str, Any]:
             for line in path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         )
-    if not any(
-        float(row["generator"]["generator_update_skipped"]) == 0.0
-        for row in metrics
-        if "generator_update_skipped" in row["generator"]
-    ):
+    if not any(generator_update_executed(row["generator"]) for row in metrics):
         raise RuntimeError("The continuous partner generator never updated.")
 
     calibration = _read_json(output / "calibration" / "run_metadata.json")

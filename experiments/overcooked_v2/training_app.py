@@ -235,6 +235,12 @@ def _generator_update(
         threshold=config.partner_generator.competence_threshold,
         learning_rate=config.partner_generator.lagrangian_learning_rate,
     )
+    completed_metrics = {
+        **metrics,
+        # Explicitly distinguish a completed score-function update from the
+        # early-return skip path in persisted run telemetry.
+        "generator_update_skipped": jnp.asarray(0.0),
+    }
     return state._replace(
         generator_params=generator_params,
         generator_target_params=polyak_update(
@@ -244,7 +250,7 @@ def _generator_update(
         ),
         generator_optimizer_state=optimizer_state,
         competence_multiplier=multiplier,
-    ), metrics
+    ), completed_metrics
 
 
 
