@@ -1337,6 +1337,8 @@ def run_training(args: argparse.Namespace) -> None:
                 "Formal CUDA preflight did not satisfy the registered device-memory "
                 f"bound: {peak_memory} bytes."
             )
+        update_wall_seconds = float(phase["wall_seconds"])
+        cold_start_through_update_wall_seconds = time.perf_counter() - started
         report = {
             "status": "complete",
             "scope": CUDA_PREFLIGHT_SCOPE,
@@ -1349,7 +1351,10 @@ def run_training(args: argparse.Namespace) -> None:
             "expected_environment_count": 256,
             "expected_rollout_length": 256,
             "expected_minibatch_updates": 256,
-            "wall_seconds": float(phase["wall_seconds"]),
+            "update_wall_seconds": update_wall_seconds,
+            "cold_start_through_update_wall_seconds": (
+                cold_start_through_update_wall_seconds
+            ),
             "phase_wall_seconds": phase["phase_wall_seconds"],
             "peak_memory_bytes": int(peak_memory),
             "jax_runtime": _jax_runtime_snapshot(),
