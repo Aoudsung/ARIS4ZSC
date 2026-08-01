@@ -187,39 +187,26 @@ def gaussian_mixture_kl_upper_bound(
 
 def response_prediction_loss(
     *,
-    output: Any,
+    prediction: Any,
     observations: Any,
     response_next_observations: Any,
-    actions: Any,
     rewards: Any,
     dones: Any,
 ) -> Any:
     import jax.numpy as jnp
 
-    action = jnp.asarray(actions, dtype=jnp.int32)
-    # Explicit action axis is immediately before the observation axes.
-    action_axis = output.response_observation_delta_mean[:-1].ndim - len(observations.shape[2:]) - 1
-    selected_delta_mean = gather_actions(
-        output.response_observation_delta_mean[:-1], action, action_axis=action_axis
-    )
-    selected_delta_log_std = gather_actions(
-        output.response_observation_delta_log_std[:-1], action, action_axis=action_axis
-    )
     target_delta = jnp.asarray(
         response_next_observations - observations[:-1], dtype=jnp.float32
     )
     observation_nll = gaussian_negative_log_likelihood(
-        target_delta, selected_delta_mean, selected_delta_log_std
+        target_delta,
+        prediction.observation_delta_mean,
+        prediction.observation_delta_log_std,
     )
-    selected_reward_mean = gather_actions(output.response_reward_mean[:-1], action, action_axis=-1)
-    selected_reward_log_std = gather_actions(
-        output.response_reward_log_std[:-1], action, action_axis=-1
-    )
-    selected_done_logit = gather_actions(output.response_done_logit[:-1], action, action_axis=-1)
     reward_nll = gaussian_negative_log_likelihood(
-        rewards, selected_reward_mean, selected_reward_log_std
+        rewards, prediction.reward_mean, prediction.reward_log_std
     )
-    done_nll = bernoulli_logit_loss(dones, selected_done_logit)
+    done_nll = bernoulli_logit_loss(dones, prediction.done_logit)
     obs_axes = tuple(range(observation_nll.ndim - len(observations.shape[2:]), observation_nll.ndim))
     observation_item = jnp.mean(observation_nll, axis=obs_axes) if obs_axes else observation_nll
     return jnp.mean(observation_item + reward_nll + done_nll)
@@ -247,9 +234,8 @@ def compute_teacher_latents(
         {"params": params},
         batch.partner_codes,
         task_features,
-        1.0,
-        method=model.teacher_from_code,
-    ).latent
+        method=model.latent_from_code,
+    )
     full_teacher = model.apply(
         {"params": params},
         batch.observations,
@@ -312,9 +298,8 @@ def counterfactual_anchor_loss(
         {"params": params},
         anchors.partner_codes,
         online.task_features,
-        1.0,
-        method=model.teacher_from_code,
-    ).latent
+        method=model.latent_from_code,
+    )
     external = jnp.asarray(anchors.partner_sources, dtype=jnp.int32) == 2
     anchor_teacher_latent = jnp.where(
         external[..., None], flat_teacher, code_teacher
@@ -486,11 +471,17 @@ def compute_loss(
     entropy = jnp.sum(entropy_items * batch.ppo_mask) / jnp.maximum(
         jnp.sum(batch.ppo_mask), 1.0e-8
     )
+    response_prediction = model.apply(
+        {"params": params},
+        output.task_features[:-1],
+        output.belief_embedding[:-1],
+        batch.actions,
+        method=model.response_from_context_and_action,
+    )
     response = response_prediction_loss(
-        output=output,
+        prediction=response_prediction,
         observations=batch.observations,
         response_next_observations=batch.response_next_observations,
-        actions=batch.actions,
         rewards=batch.rewards,
         dones=batch.dones,
     )

@@ -97,7 +97,14 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
     )
     assert output.execution_logits.shape == (2, 6)
     assert output.action_values.shape == (2, 6)
-    assert output.response_observation_delta_mean.shape == (2, 6) + observation_shape
+    response = model.apply(
+        {"params": params},
+        output.task_features,
+        output.belief_embedding,
+        jnp.asarray([0, 5], dtype=jnp.int32),
+        method=model.response_from_context_and_action,
+    )
+    assert response.observation_delta_mean.shape == (2,) + observation_shape
     assert np.all(np.isfinite(np.asarray(output.execution_logits)))
 
     final_state, sequence_output = model.apply(
@@ -112,6 +119,31 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
     )
     assert sequence_output.execution_logits.shape == (3, 2, 6)
     assert final_state.previous_observation.dtype == jnp.float32
+
+    context_state, context_output = model.apply(
+        {"params": params},
+        state,
+        jnp.zeros((3, 2) + observation_shape, dtype=jnp.int32),
+        jnp.zeros((3, 2), dtype=jnp.int32),
+        jnp.zeros((3, 2), dtype=jnp.float32),
+        jnp.zeros((3, 2), dtype=jnp.bool_),
+        method=model.context_sequence,
+    )
+    np.testing.assert_allclose(
+        np.asarray(context_output.task_features),
+        np.asarray(sequence_output.task_features),
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(context_output.mixture_means),
+        np.asarray(sequence_output.mixture_means),
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(context_state.task_carry),
+        np.asarray(final_state.task_carry),
+        atol=1.0e-6,
+    )
 
     assert set(DEPLOYABLE_PARAM_NAMES).issubset(params)
     assert "code_teacher" in params

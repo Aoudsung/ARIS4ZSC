@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Mapping
@@ -45,6 +46,7 @@ from src.path_c.partner_sources import (
     make_mixed_partner_functions,
 )
 from src.path_c.runner import (
+    DECISION_REGRET_STATE_CHUNK_SIZE,
     attach_decision_regret_shaping,
     collect_rollout,
     initialize_runner,
@@ -83,6 +85,9 @@ from src.path_c.training import (
     update_competence_multiplier,
 )
 from src.path_c.types import TrainState
+
+
+FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 2**20
 
 
 def _host(tree: Any) -> Any:
@@ -362,9 +367,30 @@ def run_training(args: argparse.Namespace) -> None:
             "observation_shape": list(observation_shape),
             "action_count": 6,
             "official_runtime": official_runtime,
+            "assigned_gpu_class": {
+                "name": os.environ.get("DELTA_GPU_NAME"),
+                "total_memory_mib": os.environ.get(
+                    "DELTA_GPU_TOTAL_MEMORY_MIB"
+                ),
+            },
         }
     )
     ensure_run_identity(output, identity)
+    write_json(
+        output / "runtime_gpu.json",
+        {
+            "physical_index": os.environ.get("DELTA_PHYSICAL_GPU_INDEX"),
+            "uuid": os.environ.get("DELTA_PHYSICAL_GPU_UUID"),
+            "name": os.environ.get("DELTA_GPU_NAME"),
+            "total_memory_mib": os.environ.get("DELTA_GPU_TOTAL_MEMORY_MIB"),
+            "start_memory_used_mib": os.environ.get(
+                "DELTA_GPU_START_MEMORY_USED_MIB"
+            ),
+            "volatile_uncorrectable_ecc": os.environ.get(
+                "DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC"
+            ),
+        },
+    )
     write_json(output / "resolved_config.json", config.to_mapping())
     write_json(output / "resolved_partner_manifest.json", manifest.to_mapping())
 
@@ -556,9 +582,8 @@ def run_training(args: argparse.Namespace) -> None:
             {"params": teacher_params},
             code,
             task_features,
-            1.0,
-            method=model.teacher_from_code,
-        ).latent
+            method=model.latent_from_code,
+        )
 
     partner_functions = make_mixed_partner_functions(
         generator=generator,
@@ -862,6 +887,17 @@ def run_training(args: argparse.Namespace) -> None:
             ),
         )
         step = int(np.asarray(state.effective_environment_steps))
+        peak_memory = peak_device_memory_bytes()
+        if config.run_kind == "formal":
+            if peak_memory <= 0:
+                raise RuntimeError(
+                    "Formal training requires an available JAX peak-memory counter."
+                )
+            if peak_memory > FORMAL_PEAK_MEMORY_LIMIT_BYTES:
+                raise RuntimeError(
+                    "Formal DELTA peak device memory exceeded the registered "
+                    f"40,000 MiB ceiling: {peak_memory} bytes."
+                )
         if step % config.training.checkpoint_interval_environment_steps == 0:
             save_checkpoint(manager, step=step, state=state)
         write_json(
@@ -871,6 +907,10 @@ def run_training(args: argparse.Namespace) -> None:
                 "counterfactual_steps": counterfactual_steps,
                 "gpu_hours": previous_gpu_hours
                 + gpu_hours_for_wall_seconds(time.perf_counter() - started),
+                "peak_memory_bytes": peak_memory,
+                "decision_regret_state_chunk_size": (
+                    DECISION_REGRET_STATE_CHUNK_SIZE
+                ),
             },
         )
 
@@ -912,6 +952,9 @@ def run_training(args: argparse.Namespace) -> None:
             "effective_environment_steps": final_step,
             "update_count": int(np.asarray(state.update_count)),
             "completed_episodes": int(np.asarray(runner_state.completed_episodes)),
+            "decision_regret_state_chunk_size": (
+                DECISION_REGRET_STATE_CHUNK_SIZE
+            ),
             "support_collection": support_metadata,
             "scientific_readout_allowed": False,
         },

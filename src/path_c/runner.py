@@ -12,6 +12,9 @@ from .training import categorical_log_probability
 from .types import PolicyState, RolloutBatch
 
 
+DECISION_REGRET_STATE_CHUNK_SIZE = 4_096
+
+
 class PartnerFunctions(NamedTuple):
     initial_state: Callable[[int], Any]
     step: Callable[..., tuple[Any, Any, Any, Any]]
@@ -412,6 +415,98 @@ def collect_rollout(
     return final_state, batch, recorded
 
 
+def chunked_decision_regret(
+    *,
+    model: Any,
+    target_params: Mapping[str, Any],
+    context: Any,
+    key: Any,
+    posterior_particles: int,
+    state_chunk_size: int = DECISION_REGRET_STATE_CHUNK_SIZE,
+) -> Any:
+    """Compute target-critic regret without actor/decoder materialization.
+
+    Real state keys are generated before padding, so changing the operational
+    chunking cannot change any scientific posterior sample.
+    """
+
+    import math
+
+    import jax
+    import jax.numpy as jnp
+
+    particle_count = int(posterior_particles)
+    chunk_size = int(state_chunk_size)
+    if particle_count <= 0 or chunk_size <= 0:
+        raise ValueError("Decision-regret particle and chunk counts must be positive.")
+
+    task_features = jax.lax.stop_gradient(jnp.asarray(context.task_features))
+    mixture_logits = jax.lax.stop_gradient(jnp.asarray(context.mixture_logits))
+    means = jax.lax.stop_gradient(jnp.asarray(context.mixture_means))
+    log_variances = jax.lax.stop_gradient(
+        jnp.asarray(context.mixture_log_variances)
+    )
+    prefix = task_features.shape[:-1]
+    state_count = int(math.prod(prefix))
+    if state_count <= 0:
+        raise ValueError("Decision-regret context must contain at least one state.")
+
+    real_keys = jax.random.split(key, state_count)
+    padded_count = ((state_count + chunk_size - 1) // chunk_size) * chunk_size
+    padding = padded_count - state_count
+
+    def flatten_and_pad(value: Any) -> Any:
+        array = jnp.asarray(value)
+        flat = array.reshape((state_count,) + array.shape[len(prefix) :])
+        pad_width = ((0, padding),) + ((0, 0),) * (flat.ndim - 1)
+        return jnp.pad(flat, pad_width).reshape(
+            (padded_count // chunk_size, chunk_size) + flat.shape[1:]
+        )
+
+    key_padding = ((0, padding), (0, 0))
+    chunk_keys = jnp.pad(real_keys, key_padding).reshape(
+        (padded_count // chunk_size, chunk_size, 2)
+    )
+    chunks = (
+        flatten_and_pad(task_features),
+        flatten_and_pad(mixture_logits),
+        flatten_and_pad(means),
+        flatten_and_pad(log_variances),
+        chunk_keys,
+    )
+
+    def one_chunk(values: tuple[Any, Any, Any, Any, Any]) -> Any:
+        features, logits, mu, log_var, sample_keys = values
+        samples, weights = jax.vmap(
+            lambda lane_key, lane_logits, lane_mu, lane_log_var: (
+                stratified_mixture_samples(
+                    lane_key,
+                    mixture_logits=lane_logits,
+                    means=lane_mu,
+                    log_variances=lane_log_var,
+                    sample_count=particle_count,
+                )
+            )
+        )(sample_keys, logits, mu, log_var)
+        particle_features = jnp.broadcast_to(
+            features[:, None, :],
+            (chunk_size, particle_count, features.shape[-1]),
+        )
+        action_values = model.apply(
+            {"params": target_params},
+            particle_features,
+            samples,
+            method=model.action_values_from_features_and_latent,
+        )
+        return decision_regret_from_action_values(
+            jax.lax.stop_gradient(action_values),
+            jax.lax.stop_gradient(weights),
+        )
+
+    chunked = jax.lax.map(one_chunk, chunks)
+    return chunked.reshape((padded_count,))[:state_count].reshape(prefix)
+
+
 def attach_decision_regret_shaping(
     *,
     batch: RolloutBatch,
@@ -422,65 +517,24 @@ def attach_decision_regret_shaping(
 ) -> tuple[RolloutBatch, Mapping[str, Any]]:
     """Compute a frozen-potential shaped reward on the collected batch."""
 
-    import jax
     import jax.numpy as jnp
 
-    unused_final, output = model.apply(
+    unused_final, context = model.apply(
         {"params": target_params},
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
         batch.previous_rewards,
         batch.episode_starts,
-        jnp.ones_like(batch.gate_overrides),
-        method=model.sequence,
+        method=model.context_sequence,
     )
     del unused_final
-    time_count, batch_count = output.task_features.shape[:2]
-    keys = jax.random.split(key, time_count * batch_count).reshape(
-        (time_count, batch_count, 2)
-    )
-
-    def one_time(
-        task_features: Any,
-        mixture_logits: Any,
-        means: Any,
-        log_variances: Any,
-        sample_key: Any,
-    ) -> Any:
-        def one_lane(feature: Any, logits: Any, mu: Any, log_var: Any, lane_key: Any) -> Any:
-            samples, weights = stratified_mixture_samples(
-                lane_key,
-                mixture_logits=logits,
-                means=mu,
-                log_variances=log_var,
-                sample_count=config.model.posterior_particles,
-            )
-            features = jnp.broadcast_to(
-                feature[None, :],
-                (config.model.posterior_particles, feature.shape[-1]),
-            )
-            teacher = model.apply(
-                {"params": target_params},
-                features,
-                samples,
-                1.0,
-                method=model.from_features_and_latent,
-            )
-            return decision_regret_from_action_values(
-                teacher.action_values, weights
-            )
-
-        return jax.vmap(one_lane)(
-            task_features, mixture_logits, means, log_variances, sample_key
-        )
-
-    regrets = jax.vmap(one_time)(
-        output.task_features,
-        output.mixture_logits,
-        output.mixture_means,
-        output.mixture_log_variances,
-        keys,
+    regrets = chunked_decision_regret(
+        model=model,
+        target_params=target_params,
+        context=context,
+        key=key,
+        posterior_particles=config.model.posterior_particles,
     )
     shaping = potential_shaping(
         regrets[:-1],
@@ -501,13 +555,18 @@ def attach_decision_regret_shaping(
         "official_shaping_factor": jnp.mean(batch.official_shaping_factors),
         "mean_combined_training_reward": jnp.mean(shaped),
         "maximum_decision_regret": jnp.max(regrets[:-1]),
+        "decision_regret_state_chunk_size": jnp.asarray(
+            DECISION_REGRET_STATE_CHUNK_SIZE, dtype=jnp.int32
+        ),
     }
 
 
 __all__ = [
     "PartnerFunctions",
     "RunnerState",
+    "DECISION_REGRET_STATE_CHUNK_SIZE",
     "attach_decision_regret_shaping",
+    "chunked_decision_regret",
     "collect_rollout",
     "initialize_runner",
     "official_ego_roles",

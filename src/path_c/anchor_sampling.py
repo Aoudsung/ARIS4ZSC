@@ -288,9 +288,8 @@ def collect_anchor_batch(
         {"params": target_params},
         records["partner_code"],
         records["task_features"],
-        1.0,
-        method=model.teacher_from_code,
-    ).latent
+        method=model.latent_from_code,
+    )
     rollout_teacher_latents = jnp.where(
         (records["partner_source"] == 2)[..., None],
         full_teacher_latents,
@@ -331,9 +330,8 @@ def collect_anchor_batch(
             {"params": target_params},
             state.partner_code,
             online.task_features,
-            1.0,
-            method=model.teacher_from_code,
-        ).latent
+            method=model.latent_from_code,
+        )
         teacher_latent = jnp.where(
             (state.partner_source == 2)[..., None],
             state.fixed_teacher_latent,
@@ -499,9 +497,8 @@ def collect_anchor_batch(
                 ),
                 axis=0,
             ),
-            1.0,
-            method=model.teacher_from_code,
-        ).latent
+            method=model.latent_from_code,
+        )
         variant_ego_state = AnchorEgoState(
             policy_state=variant_policy_state,
             partner_code=jnp.concatenate((code_a, code_b), axis=0),

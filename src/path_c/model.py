@@ -9,7 +9,14 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .types import GaussianMixtureBelief, ModelOutput, PolicyState, TeacherOutput
+from .types import (
+    ContextOutput,
+    GaussianMixtureBelief,
+    ModelOutput,
+    PolicyState,
+    ResponsePrediction,
+    TeacherOutput,
+)
 
 _MODEL_CLASS: Any | None = None
 
@@ -114,82 +121,47 @@ def _model_class() -> Any:
                 name="full_trajectory_teacher",
             )
 
-        def _outputs_from_belief(
+        def _outputs_from_context(
             self,
             *,
-            task_features: Any,
-            mixture_logits: Any,
-            means: Any,
-            log_variances: Any,
-            support_score: Any,
+            context: ContextOutput,
             gate: Any,
         ) -> ModelOutput:
             belief_embedding = self.belief_set(
-                mixture_logits, means, log_variances, support_score
+                context.mixture_logits,
+                context.mixture_means,
+                context.mixture_log_variances,
+                context.support_score,
             )
             # Actor gradients are deliberately blocked at the belief interface.
             actor_belief = jax.lax.stop_gradient(belief_embedding)
             base_logits, residual_logits, execution_logits = self.actor(
-                task_features, actor_belief, gate
+                context.task_features, actor_belief, gate
             )
             state_value, action_values = self.critic(
-                task_features, belief_embedding
+                context.task_features, belief_embedding
             )
-
-            prefix = task_features.shape[:-1]
-            all_actions = jnp.broadcast_to(
-                jnp.arange(self.action_count, dtype=jnp.int32),
-                prefix + (self.action_count,),
-            )
-            task_grid = jnp.broadcast_to(
-                task_features[..., None, :],
-                prefix + (self.action_count, task_features.shape[-1]),
-            )
-            belief_grid = jnp.broadcast_to(
-                belief_embedding[..., None, :],
-                prefix + (self.action_count, belief_embedding.shape[-1]),
-            )
-            (
-                response_delta_mean,
-                response_delta_log_std,
-                response_reward_mean,
-                response_reward_log_std,
-                response_done_logit,
-            ) = self.decoder(
-                jax.lax.stop_gradient(task_grid), belief_grid, all_actions
-            )
-            response_delta_mean = response_delta_mean.reshape(
-                prefix + (self.action_count,) + self.observation_shape
-            )
-            response_delta_log_std = response_delta_log_std.reshape(
-                prefix + (self.action_count,) + self.observation_shape
-            )
+            prefix = context.task_features.shape[:-1]
             return ModelOutput(
-                task_features=task_features,
+                task_features=context.task_features,
                 belief_embedding=belief_embedding,
-                mixture_logits=mixture_logits,
-                mixture_means=means,
-                mixture_log_variances=log_variances,
-                support_score=support_score,
+                mixture_logits=context.mixture_logits,
+                mixture_means=context.mixture_means,
+                mixture_log_variances=context.mixture_log_variances,
+                support_score=context.support_score,
                 base_logits=base_logits,
                 residual_logits=residual_logits,
                 gate=jnp.broadcast_to(jnp.asarray(gate), prefix),
                 execution_logits=execution_logits,
                 state_value=state_value,
                 action_values=action_values,
-                response_observation_delta_mean=response_delta_mean,
-                response_observation_delta_log_std=response_delta_log_std,
-                response_reward_mean=response_reward_mean,
-                response_reward_log_std=response_reward_log_std,
-                response_done_logit=response_done_logit,
             )
 
-        def step(
+        def _context_step(
             self,
             state: PolicyState,
             observation: Any,
-            gate_override: Any,
-        ) -> tuple[PolicyState, ModelOutput]:
+        ) -> tuple[PolicyState, ContextOutput]:
             next_task_carry, task_features = self.task_cell(
                 state.task_carry,
                 (
@@ -210,14 +182,12 @@ def _model_class() -> Any:
                 ),
             )
             mixture_logits, means, log_variances, support_score = belief_values
-            gate = jnp.asarray(gate_override, dtype=jnp.float32)
-            output = self._outputs_from_belief(
+            context = ContextOutput(
                 task_features=task_features,
                 mixture_logits=mixture_logits,
-                means=means,
-                log_variances=log_variances,
+                mixture_means=means,
+                mixture_log_variances=log_variances,
                 support_score=support_score,
-                gate=gate,
             )
             next_state = PolicyState(
                 task_carry=next_task_carry,
@@ -239,7 +209,60 @@ def _model_class() -> Any:
                 previous_reward=state.previous_reward,
                 episode_start=state.episode_start,
             )
+            return next_state, context
+
+        def step(
+            self,
+            state: PolicyState,
+            observation: Any,
+            gate_override: Any,
+        ) -> tuple[PolicyState, ModelOutput]:
+            next_state, context = self._context_step(state, observation)
+            output = self._outputs_from_context(
+                context=context,
+                gate=jnp.asarray(gate_override, dtype=jnp.float32),
+            )
             return next_state, output
+
+        def context_sequence(
+            self,
+            initial_state: PolicyState,
+            observations: Any,
+            previous_actions: Any,
+            previous_rewards: Any,
+            episode_starts: Any,
+        ) -> tuple[PolicyState, ContextOutput]:
+            """Replay legal history without evaluating actor, critic, or decoder."""
+
+            obs = jnp.asarray(observations)
+            actions = jnp.asarray(previous_actions, dtype=jnp.int32)
+            rewards = jnp.asarray(previous_rewards, dtype=jnp.float32)
+            starts = jnp.asarray(episode_starts, dtype=jnp.bool_)
+            if not (
+                obs.shape[0]
+                == actions.shape[0]
+                == rewards.shape[0]
+                == starts.shape[0]
+            ):
+                raise ValueError("Context sequence time axes differ.")
+
+            def one(
+                current: PolicyState,
+                values: tuple[Any, Any, Any, Any],
+            ) -> tuple[PolicyState, ContextOutput]:
+                observation, action, reward, start = values
+                current = current._replace(
+                    previous_action=action,
+                    previous_reward=reward,
+                    episode_start=start,
+                )
+                return self._context_step(current, observation)
+
+            return jax.lax.scan(
+                one,
+                initial_state,
+                (obs, actions, rewards, starts),
+            )
 
         def sequence(
             self,
@@ -285,30 +308,101 @@ def _model_class() -> Any:
                 (obs, actions, rewards, starts, gates),
             )
 
+        def response_from_context_and_action(
+            self,
+            task_features: Any,
+            belief_embedding: Any,
+            actions: Any,
+        ) -> ResponsePrediction:
+            """Predict only the observed action branch used by the response loss."""
+
+            prefix = task_features.shape[:-1]
+            action = jnp.asarray(actions, dtype=jnp.int32)
+            if action.shape != prefix:
+                raise ValueError("Selected response actions do not match context axes.")
+            (
+                delta_mean,
+                delta_log_std,
+                reward_mean,
+                reward_log_std,
+                done_logit,
+            ) = self.decoder(
+                jax.lax.stop_gradient(task_features),
+                belief_embedding,
+                action,
+            )
+            return ResponsePrediction(
+                observation_delta_mean=delta_mean.reshape(
+                    prefix + self.observation_shape
+                ),
+                observation_delta_log_std=delta_log_std.reshape(
+                    prefix + self.observation_shape
+                ),
+                reward_mean=reward_mean,
+                reward_log_std=reward_log_std,
+                done_logit=done_logit,
+            )
+
+        def _belief_embedding_from_latent(
+            self,
+            task_features: Any,
+            latent: Any,
+        ) -> Any:
+            logits, means, log_variances = degenerate_gaussian_mixture(
+                latent, mixture_components=self.mixture_components
+            )
+            support = jnp.ones(task_features.shape[:-1], dtype=jnp.float32)
+            return self.belief_set(logits, means, log_variances, support)
+
+        def action_values_from_features_and_latent(
+            self,
+            task_features: Any,
+            latent: Any,
+        ) -> Any:
+            """Evaluate the frozen full-information critic and nothing else."""
+
+            belief_embedding = self._belief_embedding_from_latent(
+                task_features, latent
+            )
+            unused_value, action_values = self.critic(
+                task_features, belief_embedding
+            )
+            del unused_value
+            return action_values
+
         def from_features_and_latent(
             self,
             task_features: Any,
             latent: Any,
             gate: Any = 1.0,
         ) -> TeacherOutput:
-            logits, means, log_variances = degenerate_gaussian_mixture(
-                latent, mixture_components=self.mixture_components
+            belief_embedding = self._belief_embedding_from_latent(
+                task_features, latent
             )
-            support = jnp.ones(task_features.shape[:-1], dtype=jnp.float32)
-            output = self._outputs_from_belief(
-                task_features=task_features,
-                mixture_logits=logits,
-                means=means,
-                log_variances=log_variances,
-                support_score=support,
-                gate=gate,
+            actor_belief = jax.lax.stop_gradient(belief_embedding)
+            unused_base, unused_residual, execution_logits = self.actor(
+                task_features, actor_belief, gate
             )
+            del unused_base, unused_residual
+            unused_value, action_values = self.critic(
+                task_features, belief_embedding
+            )
+            del unused_value
             return TeacherOutput(
                 latent=latent,
-                belief_embedding=output.belief_embedding,
-                logits=output.execution_logits,
-                action_values=output.action_values,
+                belief_embedding=belief_embedding,
+                logits=execution_logits,
+                action_values=action_values,
             )
+
+        def latent_from_code(
+            self,
+            partner_code: Any,
+            task_features: Any,
+        ) -> Any:
+            """Return the training-only continuous teacher context only."""
+
+            return self.code_teacher(partner_code, task_features)
 
         def teacher_from_code(
             self,
@@ -316,7 +410,7 @@ def _model_class() -> Any:
             task_features: Any,
             gate: Any = 1.0,
         ) -> TeacherOutput:
-            latent = self.code_teacher(partner_code, task_features)
+            latent = self.latent_from_code(partner_code, task_features)
             return self.from_features_and_latent(task_features, latent, gate)
 
         def full_trajectory_latents(
@@ -352,6 +446,11 @@ def _model_class() -> Any:
             teacher = self.teacher_from_code(
                 partner_code, output.task_features, 1.0
             )
+            response = self.response_from_context_and_action(
+                output.task_features,
+                output.belief_embedding,
+                jnp.zeros(batch_shape, dtype=jnp.int32),
+            )
             observations = jnp.stack((observation, observation), axis=0)
             response_next = observation[None, ...]
             actions = jnp.zeros((1,) + batch_shape, dtype=jnp.int32)
@@ -360,7 +459,7 @@ def _model_class() -> Any:
             full_latent = self.full_trajectory_latents(
                 observations, response_next, actions, rewards, dones
             )
-            return next_state, output, teacher, full_latent
+            return next_state, output, response, teacher, full_latent
 
         def __call__(
             self,

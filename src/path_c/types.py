@@ -36,8 +36,18 @@ class PolicyState(NamedTuple):
     episode_start: Any
 
 
+class ContextOutput(NamedTuple):
+    """Task and continuous-belief state without policy/decoder evaluation."""
+
+    task_features: Any
+    mixture_logits: Any
+    mixture_means: Any
+    mixture_log_variances: Any
+    support_score: Any
+
+
 class ModelOutput(NamedTuple):
-    """One-step or sequence output of the shared DELTA-ZSC model."""
+    """Compact policy/value output of the shared DELTA-ZSC model."""
 
     task_features: Any
     belief_embedding: Any
@@ -51,11 +61,16 @@ class ModelOutput(NamedTuple):
     execution_logits: Any
     state_value: Any
     action_values: Any
-    response_observation_delta_mean: Any
-    response_observation_delta_log_std: Any
-    response_reward_mean: Any
-    response_reward_log_std: Any
-    response_done_logit: Any
+
+
+class ResponsePrediction(NamedTuple):
+    """Response prediction for the single action executed in each lane."""
+
+    observation_delta_mean: Any
+    observation_delta_log_std: Any
+    reward_mean: Any
+    reward_log_std: Any
+    done_logit: Any
 
 
 class TeacherOutput(NamedTuple):
