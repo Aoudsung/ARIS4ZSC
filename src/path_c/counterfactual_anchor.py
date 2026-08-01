@@ -188,6 +188,20 @@ def collect_counterfactual_anchors(
             axis=0,
         )
         padded_world = pad_tree(world)
+        if padding:
+            # Padding is an operational fixed-shape device lane, not an
+            # additional counterfactual world.  Mark it terminal before the
+            # continuation kernel so every reward/state update is masked even
+            # though XLA still executes the statically shaped simulator body.
+            padded_world = padded_world._replace(
+                done=jnp.concatenate(
+                    (
+                        jnp.asarray(world.done, dtype=jnp.bool_),
+                        jnp.ones((padding,), dtype=jnp.bool_),
+                    ),
+                    axis=0,
+                )
+            )
         padded_indexes = pad_tree(jnp.asarray(rollout_flat_indexes))
         padded_policy = pad_tree(policy_states)
         padded_observations = pad_tree(jnp.asarray(observations))

@@ -51,6 +51,7 @@ def test_cli_help_imports_without_initializing_optional_runtime() -> None:
         "upstream",
         "train-official-baseline",
         "train",
+        "cuda-preflight",
         "calibrate",
         "evaluate",
         "build-delta-policy-manifest",

@@ -18,7 +18,7 @@ from experiments.overcooked_v2.official_evaluation_app import (
     run_official_evaluation,
     run_official_summary,
 )
-from experiments.overcooked_v2.training_app import run_training
+from experiments.overcooked_v2.training_app import run_cuda_preflight, run_training
 from experiments.overcooked_v2.upstream_app import run_upstream
 from experiments.overcooked_v2.resource_report_app import run_resource_report
 from experiments.overcooked_v2.formal_claim_app import run_formal_claim_report
@@ -109,6 +109,26 @@ def _parser() -> argparse.ArgumentParser:
         "--skip-manifest-hash-check", action="store_true", default=False
     )
     train.set_defaults(function=run_training, manages_output=True)
+
+    cuda_preflight = commands.add_parser("cuda-preflight")
+    cuda_preflight.add_argument("--config", required=True)
+    cuda_preflight.add_argument("--partner-manifest", required=True)
+    cuda_preflight.add_argument(
+        "--seed-index", type=int, choices=range(10), required=True
+    )
+    cuda_preflight.add_argument(
+        "--ego-run-id", default="delta-zsc-formal-cuda-preflight"
+    )
+    cuda_preflight.add_argument("--output", required=True)
+    cuda_preflight.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    cuda_preflight.set_defaults(
+        function=run_cuda_preflight,
+        manages_output=True,
+        run_kind="formal",
+        resume=False,
+    )
 
     calibrate = commands.add_parser("calibrate")
     calibrate.add_argument("--config", required=True)

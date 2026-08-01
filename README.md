@@ -82,6 +82,23 @@ marked `scientific_readout_allowed=false`; passing proves only that every
 implementation stage is mechanically reachable. Full formal dispatch is
 permitted only after this acceptance report is complete.
 
+After the mechanical flow passes, run one non-resumable update at the exact
+formal shape before releasing seed 0:
+
+```bash
+python -m experiments.overcooked_v2.path_c cuda-preflight \
+  --config experiments/overcooked_v2/configs/delta_zsc_simple_formal.yaml \
+  --partner-manifest manifests/simple-training-partners.json \
+  --seed-index 0 \
+  --output runs/preflight/simple-seed-0
+```
+
+This command retains 256 environments, a 256-step rollout, 16 posterior
+particles and the complete 4×64 minibatch sequence. It stops only after the
+full first update, records CUDA/kernel/timing/memory evidence, and is always
+marked non-scientific and non-resumable. It does not replace the eight-update
+seed-0 gate or its first real anchor.
+
 ## Formal evidence protocol
 
 The benchmark runtime is fixed to OvercookedV2 Official Experiment commit [`5ce1707`](https://github.com/overcookedv2/experiments/tree/5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e). JaxMARL and `overcooked_v2_experiments` must both be installed from that exact clean source. Formal runs fail closed if provenance differs.
@@ -110,6 +127,7 @@ python -m experiments.overcooked_v2.path_c validate-manifest \
 python -m experiments.overcooked_v2.path_c upstream ...
 python -m experiments.overcooked_v2.path_c mechanical-e2e ...
 python -m experiments.overcooked_v2.path_c train-official-baseline ...
+python -m experiments.overcooked_v2.path_c cuda-preflight ...
 python -m experiments.overcooked_v2.path_c train ...
 python -m experiments.overcooked_v2.path_c calibrate ...
 python -m experiments.overcooked_v2.path_c build-delta-policy-manifest ...

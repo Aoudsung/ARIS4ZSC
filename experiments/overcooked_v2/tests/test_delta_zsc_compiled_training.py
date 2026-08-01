@@ -202,3 +202,46 @@ def test_compiled_callable_reuses_abstract_signature() -> None:
     metadata = kernel.metadata()
     assert len(metadata) == 1
     assert metadata[0]["executable_fingerprint"]
+
+
+def test_donated_training_core_uses_distinct_online_and_target_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fixture_loss(*, params, batch, **unused):
+        total = jnp.square(params["weight"] * jnp.mean(batch.rewards))
+        return LossBundle(total=total, metrics={"total_loss": total})
+
+    monkeypatch.setattr(training, "compute_loss", fixture_loss)
+    params = {"weight": jnp.asarray(0.75, dtype=jnp.float32)}
+    target = jax.tree_util.tree_map(jnp.copy, params)
+    assert (
+        params["weight"].unsafe_buffer_pointer()
+        != target["weight"].unsafe_buffer_pointer()
+    )
+    optimizer = optax.adam(2.5e-4, eps=1.0e-5)
+    core = TrainingCoreState(
+        params=params,
+        target_params=target,
+        optimizer_state=optimizer.init(params),
+    )
+    config = SimpleNamespace(ppo=SimpleNamespace(polyak_coefficient=0.03))
+    batch = _batch()
+    schedule = jnp.asarray([[0, 1], [2, 3]], dtype=jnp.int32)
+    kernel = CompiledCallable(
+        "donated_training_core_fixture",
+        lambda value, current_batch, current_schedule: (
+            training.scan_training_updates(
+                model=None,
+                core=value,
+                optimizer=optimizer,
+                batch=current_batch,
+                schedule=current_schedule,
+                config=config,
+            )
+        ),
+        donate_argnums=(0,),
+    )
+    completed, metrics = kernel(core, batch, schedule)
+    for leaf in jax.tree_util.tree_leaves(completed):
+        leaf.block_until_ready()
+    assert np.isfinite(np.asarray(metrics["total_loss"])).all()

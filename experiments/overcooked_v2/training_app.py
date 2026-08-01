@@ -101,6 +101,7 @@ from src.path_c.types import GeneratorCoreState, TrainState
 
 
 FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 2**20
+CUDA_PREFLIGHT_SCOPE = "formal_cuda_single_update_preflight"
 
 
 def _utc_now() -> str:
@@ -549,6 +550,14 @@ def run_training(args: argparse.Namespace) -> None:
     import numpy as np
 
     started = time.perf_counter()
+    execution_scope = str(getattr(args, "_execution_scope", "training"))
+    if execution_scope not in {"training", CUDA_PREFLIGHT_SCOPE}:
+        raise ValueError(f"Unknown DELTA execution scope: {execution_scope}.")
+    preflight_update_limit = (
+        1 if execution_scope == CUDA_PREFLIGHT_SCOPE else None
+    )
+    if preflight_update_limit is not None and bool(args.resume):
+        raise ValueError("CUDA preflight artifacts cannot be resumed.")
     config = load_config(args.config, run_kind=args.run_kind)
     cuda_runtime = None
     if config.run_kind == "formal":
@@ -602,6 +611,8 @@ def run_training(args: argparse.Namespace) -> None:
                     "DELTA_GPU_TOTAL_MEMORY_MIB"
                 ),
             },
+            "execution_scope": execution_scope,
+            "scientific_readout_allowed": False,
         }
     )
     ensure_run_identity(output, identity)
@@ -858,10 +869,16 @@ def run_training(args: argparse.Namespace) -> None:
     )
     state = TrainState(
         params=params,
-        target_params=params,
+        # The first compiled PPO call donates the consumed TrainingCoreState.
+        # Target values are mathematically identical but must own distinct
+        # buffers; passing one physical buffer twice to a donated executable is
+        # rejected by XLA before the first Polyak update can separate them.
+        target_params=jax.tree_util.tree_map(jnp.copy, params),
         optimizer_state=optimizer_state,
         generator_params=generator_params,
-        generator_target_params=generator_params,
+        generator_target_params=jax.tree_util.tree_map(
+            jnp.copy, generator_params
+        ),
         generator_optimizer_state=generator_optimizer_state,
         competence_multiplier=jnp.asarray(0.0, dtype=jnp.float32),
         random_key=state_key,
@@ -922,7 +939,14 @@ def run_training(args: argparse.Namespace) -> None:
             + config.anchors.evaluation_replicas
         ),
     )
-    while int(np.asarray(state.effective_environment_steps)) < config.training.environment_steps:
+    while (
+        int(np.asarray(state.effective_environment_steps))
+        < config.training.environment_steps
+        and (
+            preflight_update_limit is None
+            or int(np.asarray(state.update_count)) < preflight_update_limit
+        )
+    ):
         update_started = time.perf_counter()
         update_number = int(np.asarray(state.update_count)) + 1
         anchor_trigger = update_number % config.anchors.interval_updates == 0
@@ -1294,6 +1318,62 @@ def run_training(args: argparse.Namespace) -> None:
             },
         )
 
+    if execution_scope == CUDA_PREFLIGHT_SCOPE:
+        final_update = int(np.asarray(state.update_count))
+        final_step = int(np.asarray(state.effective_environment_steps))
+        if final_update != 1:
+            raise RuntimeError(
+                "Formal CUDA preflight must complete exactly one full PPO update."
+            )
+        phase_path = (
+            output / "records" / "phases" / "update_00000001_update.json"
+        )
+        if not phase_path.is_file():
+            raise RuntimeError("Formal CUDA preflight update telemetry is missing.")
+        phase = json.loads(phase_path.read_text(encoding="utf-8"))
+        peak_memory = peak_device_memory_bytes()
+        if peak_memory <= 0 or peak_memory > FORMAL_PEAK_MEMORY_LIMIT_BYTES:
+            raise RuntimeError(
+                "Formal CUDA preflight did not satisfy the registered device-memory "
+                f"bound: {peak_memory} bytes."
+            )
+        report = {
+            "status": "complete",
+            "scope": CUDA_PREFLIGHT_SCOPE,
+            "scientific_readout_allowed": False,
+            "resume_allowed": False,
+            "seed_index": int(args.seed_index),
+            "jax_prng_key": list(outer_key),
+            "update_count": final_update,
+            "effective_environment_steps": final_step,
+            "expected_environment_count": 256,
+            "expected_rollout_length": 256,
+            "expected_minibatch_updates": 256,
+            "wall_seconds": float(phase["wall_seconds"]),
+            "phase_wall_seconds": phase["phase_wall_seconds"],
+            "peak_memory_bytes": int(peak_memory),
+            "jax_runtime": _jax_runtime_snapshot(),
+            "gpu": _gpu_snapshot(),
+            "compiled_kernels": kernels.metadata(),
+            "compilation_cache": compilation_cache,
+            "note": (
+                "This artifact verifies one formal-shape CUDA update only. It "
+                "is neither resumable training nor scientific evidence."
+            ),
+        }
+        write_json(output / "cuda_preflight_report.json", report)
+        write_json(
+            output / "run_metadata.json",
+            {
+                **report,
+                "method": identity["method"],
+                "ego_run_id": str(args.ego_run_id),
+                "model_structure_fingerprint": model_structure_fingerprint,
+            },
+        )
+        print(f"Complete formal-shape CUDA preflight: {output}")
+        return
+
     final_step = int(np.asarray(state.effective_environment_steps))
     if manager.latest_step() != final_step:
         save_checkpoint(manager, step=final_step, state=state)
@@ -1373,4 +1453,13 @@ def run_training(args: argparse.Namespace) -> None:
     print(f"Complete DELTA-ZSC training run: {output}")
 
 
-__all__ = ["run_training"]
+def run_cuda_preflight(args: argparse.Namespace) -> None:
+    """Execute exactly one non-resumable update with frozen formal dimensions."""
+
+    args._execution_scope = CUDA_PREFLIGHT_SCOPE
+    args.run_kind = "formal"
+    args.resume = False
+    run_training(args)
+
+
+__all__ = ["run_cuda_preflight", "run_training"]
