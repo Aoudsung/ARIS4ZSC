@@ -8,6 +8,7 @@ negative count or hide an auxiliary source inside ``ego_policy_steps``.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import os
 import statistics
 import time
 from typing import Any, Mapping, Sequence
@@ -156,6 +157,105 @@ def gpu_device_count() -> int:
         return 0
 
 
+def require_single_cuda_worker() -> Mapping[str, Any]:
+    """Fail closed unless a formal worker is bound to one healthy CUDA GPU.
+
+    The dispatcher-provided facts are checked before JAX is initialized.  The
+    JAX runtime is then checked independently, so environment variables alone
+    can never be mistaken for evidence that computation is actually executing
+    on CUDA.  Formal entry points call this before creating a run identity or
+    any training output.
+    """
+
+    required_environment = {
+        "physical_index": "DELTA_PHYSICAL_GPU_INDEX",
+        "uuid": "DELTA_PHYSICAL_GPU_UUID",
+        "name": "DELTA_GPU_NAME",
+        "total_memory_mib": "DELTA_GPU_TOTAL_MEMORY_MIB",
+        "start_memory_used_mib": "DELTA_GPU_START_MEMORY_USED_MIB",
+        "start_utilization_percent": "DELTA_GPU_START_UTILIZATION_PERCENT",
+        "volatile_uncorrectable_ecc": "DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC",
+    }
+    registered = {
+        name: os.environ.get(environment_name, "").strip()
+        for name, environment_name in required_environment.items()
+    }
+    missing = sorted(name for name, value in registered.items() if not value)
+    if missing:
+        raise RuntimeError(
+            "Formal CUDA worker metadata is incomplete: " + ", ".join(missing)
+        )
+
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not visible or "," in visible:
+        raise RuntimeError(
+            "Formal execution requires CUDA_VISIBLE_DEVICES to select exactly "
+            "one physical GPU."
+        )
+    if visible != registered["physical_index"]:
+        raise RuntimeError(
+            "CUDA_VISIBLE_DEVICES differs from the registered physical GPU index."
+        )
+    platforms = os.environ.get("JAX_PLATFORMS", "").strip().lower()
+    if platforms != "cuda":
+        raise RuntimeError("Formal workers require JAX_PLATFORMS=cuda.")
+
+    try:
+        total_memory_mib = int(registered["total_memory_mib"])
+        start_memory_used_mib = int(registered["start_memory_used_mib"])
+        start_utilization_percent = int(registered["start_utilization_percent"])
+        volatile_uncorrectable_ecc = int(
+            registered["volatile_uncorrectable_ecc"]
+        )
+    except ValueError as error:
+        raise RuntimeError("Formal CUDA worker metadata is not integral.") from error
+    if total_memory_mib <= 0:
+        raise RuntimeError("Registered CUDA total memory must be positive.")
+    if not 0 <= start_memory_used_mib <= 1_024:
+        raise RuntimeError(
+            "Formal CUDA worker started above the registered 1 GiB memory limit."
+        )
+    if not 0 <= start_utilization_percent <= 10:
+        raise RuntimeError(
+            "Formal CUDA worker started above the registered 10% utilization limit."
+        )
+    if volatile_uncorrectable_ecc != 0:
+        raise RuntimeError("Formal CUDA worker has volatile uncorrectable ECC errors.")
+
+    import jax
+
+    backend = str(jax.default_backend()).lower()
+    devices = tuple(jax.devices())
+    if backend != "gpu":
+        raise RuntimeError(
+            f"Formal worker did not initialize the JAX CUDA backend: {backend!r}."
+        )
+    if len(devices) != 1 or str(devices[0].platform).lower() != "gpu":
+        raise RuntimeError(
+            "Formal worker must expose exactly one JAX CUDA device; observed "
+            f"{len(devices)} devices."
+        )
+    device = devices[0]
+    return {
+        "cuda_visible_devices": visible,
+        "jax_platforms": platforms,
+        "jax_backend": backend,
+        "jax_device_count": 1,
+        "jax_device": {
+            "id": int(device.id),
+            "platform": str(device.platform),
+            "device_kind": str(device.device_kind),
+        },
+        "dispatcher_registration": {
+            **registered,
+            "total_memory_mib": total_memory_mib,
+            "start_memory_used_mib": start_memory_used_mib,
+            "start_utilization_percent": start_utilization_percent,
+            "volatile_uncorrectable_ecc": volatile_uncorrectable_ecc,
+        },
+    }
+
+
 def gpu_hours_for_wall_seconds(
     wall_seconds: float, *, device_count: int | None = None
 ) -> float:
@@ -258,4 +358,5 @@ __all__ = [
     "official_main_steps",
     "parameter_count",
     "peak_device_memory_bytes",
+    "require_single_cuda_worker",
 ]

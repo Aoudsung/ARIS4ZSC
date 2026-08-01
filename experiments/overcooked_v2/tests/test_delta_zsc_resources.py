@@ -7,6 +7,7 @@ from src.path_c.resources import (
     aggregate_resource_ledgers,
     gpu_hours_for_wall_seconds,
     measure_policy_inference_latency_ms,
+    require_single_cuda_worker,
 )
 
 
@@ -68,3 +69,60 @@ def test_latency_measurement_is_positive_for_compiled_recurrent_policy() -> None
         Policy(), jnp.ones((2,), dtype=jnp.float32), warmup_steps=1, measurement_steps=2
     )
     assert observed > 0.0
+
+
+def _registered_cuda_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    values = {
+        "CUDA_VISIBLE_DEVICES": "5",
+        "JAX_PLATFORMS": "cuda",
+        "DELTA_PHYSICAL_GPU_INDEX": "5",
+        "DELTA_PHYSICAL_GPU_UUID": "GPU-test",
+        "DELTA_GPU_NAME": "Test CUDA GPU",
+        "DELTA_GPU_TOTAL_MEMORY_MIB": "46068",
+        "DELTA_GPU_START_MEMORY_USED_MIB": "12",
+        "DELTA_GPU_START_UTILIZATION_PERCENT": "0",
+        "DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC": "0",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
+def test_formal_cuda_worker_requires_actual_single_jax_gpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jax
+
+    class Device:
+        id = 0
+        platform = "gpu"
+        device_kind = "Test CUDA GPU"
+
+    _registered_cuda_environment(monkeypatch)
+    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    monkeypatch.setattr(jax, "devices", lambda: [Device()])
+    observed = require_single_cuda_worker()
+    assert observed["jax_backend"] == "gpu"
+    assert observed["jax_device_count"] == 1
+    assert observed["dispatcher_registration"]["physical_index"] == "5"
+    assert observed["dispatcher_registration"]["volatile_uncorrectable_ecc"] == 0
+
+
+def test_formal_cuda_worker_rejects_cpu_fallback_and_unhealthy_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import jax
+
+    class Device:
+        id = 0
+        platform = "cpu"
+        device_kind = "CPU"
+
+    _registered_cuda_environment(monkeypatch)
+    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(jax, "devices", lambda: [Device()])
+    with pytest.raises(RuntimeError, match="CUDA backend"):
+        require_single_cuda_worker()
+
+    monkeypatch.setenv("DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC", "1")
+    with pytest.raises(RuntimeError, match="ECC"):
+        require_single_cuda_worker()

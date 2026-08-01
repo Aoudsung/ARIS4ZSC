@@ -18,6 +18,7 @@ from src.path_c.resources import (
     gpu_hours_for_wall_seconds,
     parameter_count,
     peak_device_memory_bytes,
+    require_single_cuda_worker,
 )
 from src.path_c.storage import (
     ensure_run_identity,
@@ -43,9 +44,11 @@ def run_upstream(args: argparse.Namespace) -> None:
     """Run one locked official upstream training job and preserve all outputs."""
 
     config = load_config(args.config, run_kind=args.run_kind)
+    cuda_runtime = None
     if config.run_kind == "formal":
         validate_formal_repository_state()
         validate_registered_python_runtime()
+        cuda_runtime = require_single_cuda_worker()
     runtime = validate_official_runtime()
     seed_index = int(args.seed_index)
     explicit_key = getattr(args, "jax_prng_key", None)
@@ -73,8 +76,11 @@ def run_upstream(args: argparse.Namespace) -> None:
             algorithm=str(args.algorithm),
             ),
             "official_runtime": runtime,
+            "formal_cuda_worker": cuda_runtime,
         },
     )
+    if cuda_runtime is not None:
+        write_json(output / "runtime_gpu.json", cuda_runtime)
     official = compose_official_config(
         config,
         algorithm=args.algorithm,

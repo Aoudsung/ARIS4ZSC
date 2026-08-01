@@ -56,6 +56,7 @@ from src.path_c.resources import (
     gpu_hours_for_wall_seconds,
     parameter_count,
     peak_device_memory_bytes,
+    require_single_cuda_worker,
 )
 from src.path_c.snapshot_archive import (
     load_snapshot_archive,
@@ -337,9 +338,11 @@ def run_training(args: argparse.Namespace) -> None:
 
     started = time.perf_counter()
     config = load_config(args.config, run_kind=args.run_kind)
+    cuda_runtime = None
     if config.run_kind == "formal":
         validate_formal_repository_state()
         validate_registered_python_runtime()
+        cuda_runtime = require_single_cuda_worker()
     official_runtime = (
         validate_official_runtime() if config.run_kind == "formal" else None
     )
@@ -367,6 +370,7 @@ def run_training(args: argparse.Namespace) -> None:
             "observation_shape": list(observation_shape),
             "action_count": 6,
             "official_runtime": official_runtime,
+            "formal_cuda_worker": cuda_runtime,
             "assigned_gpu_class": {
                 "name": os.environ.get("DELTA_GPU_NAME"),
                 "total_memory_mib": os.environ.get(
@@ -378,7 +382,8 @@ def run_training(args: argparse.Namespace) -> None:
     ensure_run_identity(output, identity)
     write_json(
         output / "runtime_gpu.json",
-        {
+        cuda_runtime
+        or {
             "physical_index": os.environ.get("DELTA_PHYSICAL_GPU_INDEX"),
             "uuid": os.environ.get("DELTA_PHYSICAL_GPU_UUID"),
             "name": os.environ.get("DELTA_GPU_NAME"),
