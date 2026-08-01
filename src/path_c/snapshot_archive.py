@@ -6,6 +6,24 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
+def immutable_parameter_snapshot(params: Any) -> Any:
+    """Return a device-resident copy that remains valid after live donation.
+
+    Generator parameters continue to be updated with donated buffers.  An
+    archive entry therefore must never retain the live parameter leaves: a
+    later donated update invalidates those leaves and makes the next archive
+    stack attempt access a deleted PjRt buffer.  Materialising and awaiting a
+    distinct copy preserves the exact values without changing any random key,
+    model operation, or training sample.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    snapshot = jax.tree_util.tree_map(jnp.copy, params)
+    return jax.block_until_ready(snapshot)
+
+
 def stack_parameter_trees(trees: Sequence[Any]) -> Any:
     import jax
     import jax.numpy as jnp
@@ -41,6 +59,7 @@ def load_snapshot_archive(paths: Sequence[str | Path]) -> tuple[Any, ...]:
 
 
 __all__ = [
+    "immutable_parameter_snapshot",
     "load_generator_snapshot",
     "load_snapshot_archive",
     "save_generator_snapshot",

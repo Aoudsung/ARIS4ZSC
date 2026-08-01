@@ -11,6 +11,10 @@ jnp = pytest.importorskip("jax.numpy")
 optax = pytest.importorskip("optax")
 
 from src.path_c.compiled_kernels import CompiledCallable  # noqa: E402
+from src.path_c.snapshot_archive import (  # noqa: E402
+    immutable_parameter_snapshot,
+    stack_parameter_trees,
+)
 import src.path_c.training as training  # noqa: E402
 from src.path_c.types import LossBundle, RolloutBatch, TrainingCoreState  # noqa: E402
 
@@ -245,3 +249,35 @@ def test_donated_training_core_uses_distinct_online_and_target_buffers(
     for leaf in jax.tree_util.tree_leaves(completed):
         leaf.block_until_ready()
     assert np.isfinite(np.asarray(metrics["total_loss"])).all()
+
+
+def test_generator_archive_copy_survives_later_live_buffer_donation() -> None:
+    live = {
+        "kernel": jnp.arange(12, dtype=jnp.float32).reshape((3, 4)),
+        "bias": jnp.asarray([0.25, -0.5], dtype=jnp.float32),
+    }
+    expected = jax.tree_util.tree_map(lambda value: np.asarray(value).copy(), live)
+    archived = immutable_parameter_snapshot(live)
+
+    for live_leaf, archived_leaf in zip(
+        jax.tree_util.tree_leaves(live),
+        jax.tree_util.tree_leaves(archived),
+        strict=True,
+    ):
+        assert live_leaf.unsafe_buffer_pointer() != archived_leaf.unsafe_buffer_pointer()
+
+    donated_update = jax.jit(
+        lambda params: jax.tree_util.tree_map(lambda value: value + 1.0, params),
+        donate_argnums=(0,),
+    )
+    updated = donated_update(live)
+    jax.block_until_ready(updated)
+
+    stacked = stack_parameter_trees((archived,))
+    jax.block_until_ready(stacked)
+    for actual, original in zip(
+        jax.tree_util.tree_leaves(stacked),
+        jax.tree_util.tree_leaves(expected),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(np.asarray(actual[0]), original)

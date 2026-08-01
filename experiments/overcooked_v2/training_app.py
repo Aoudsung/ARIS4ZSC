@@ -70,6 +70,7 @@ from src.path_c.resources import (
     require_single_cuda_worker,
 )
 from src.path_c.snapshot_archive import (
+    immutable_parameter_snapshot,
     load_snapshot_archive,
     save_generator_snapshot,
     stack_parameter_trees,
@@ -1197,7 +1198,13 @@ def run_training(args: argparse.Namespace) -> None:
                 snapshot_root / f"snapshot_{update_number:08d}",
                 state.generator_params,
             )
-            snapshot_archive.append(state.generator_params)
+            # Archive entries must own their buffers.  The live generator
+            # parameters are donated by future generator-update executables;
+            # retaining them here would leave the archive pointing at deleted
+            # PjRt buffers after the next update.
+            snapshot_archive.append(
+                immutable_parameter_snapshot(state.generator_params)
+            )
             # Rebuild static runtime so the next collector can address the new archive.
             partner_functions = make_mixed_partner_functions(
                 generator=generator,
