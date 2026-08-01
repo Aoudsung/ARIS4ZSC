@@ -30,6 +30,126 @@ class AnchorEgoState(NamedTuple):
     fixed_teacher_latent: Any
 
 
+class AnchorRuntime(NamedTuple):
+    """Dynamic parameters passed to a cached continuation executable."""
+
+    target_params: Any
+    partner_parameters: Any
+
+
+def make_anchor_functions(
+    *,
+    model: Any,
+    model_config: Any,
+    partner_functions: Any,
+    environment: Any,
+) -> AnchorFunctions:
+    """Create callbacks that close only static code, never checkpoint values."""
+
+    def ego_policy_step(
+        runtime: AnchorRuntime,
+        state: AnchorEgoState,
+        observation: Any,
+        gate: Any,
+        keys: Any,
+    ) -> tuple[AnchorEgoState, Any]:
+        import jax
+        import jax.numpy as jnp
+
+        del keys, gate
+        next_policy_state, online = model.apply(
+            {"params": runtime.target_params},
+            state.policy_state,
+            observation,
+            jnp.ones(state.partner_source.shape, dtype=jnp.float32),
+            method=model.step,
+        )
+        code_latent = model.apply(
+            {"params": runtime.target_params},
+            state.partner_code,
+            online.task_features,
+            method=model.latent_from_code,
+        )
+        teacher_latent = jnp.where(
+            (state.partner_source == 2)[..., None],
+            state.fixed_teacher_latent,
+            code_latent,
+        )
+        teacher = model.apply(
+            {"params": runtime.target_params},
+            online.task_features,
+            teacher_latent,
+            1.0,
+            method=model.from_features_and_latent,
+        )
+        next_state = state._replace(
+            policy_state=next_policy_state,
+            fixed_teacher_latent=teacher_latent,
+        )
+        return next_state, jax.nn.softmax(teacher.logits, axis=-1)
+
+    def ego_observe(
+        stepped: AnchorEgoState,
+        observations_at_time: Any,
+        actions: Any,
+        rewards: Any,
+        dones: Any,
+        next_observations: Any,
+    ) -> AnchorEgoState:
+        del observations_at_time
+        policy_state = observe_policy_after_transition(
+            stepped_state=stepped.policy_state,
+            action=actions,
+            reward=rewards,
+            done=dones,
+            next_observation=next_observations,
+            model_config=model_config,
+        )
+        return stepped._replace(policy_state=policy_state)
+
+    def partner_policy_step(
+        runtime: AnchorRuntime,
+        state: Any,
+        observation: Any,
+        episode_start: Any,
+        keys: Any,
+    ) -> tuple[Any, Any, Any]:
+        action, next_state, context, unused_log_probability = partner_functions.step(
+            runtime.partner_parameters, state, observation, episode_start, keys
+        )
+        del unused_log_probability
+        return action, next_state, context
+
+    def partner_observe(
+        runtime: AnchorRuntime,
+        state: Any,
+        context: Any,
+        observations_at_time: Any,
+        actions: Any,
+        rewards: Any,
+        dones: Any,
+        next_observations: Any,
+    ) -> Any:
+        return partner_functions.observe(
+            runtime.partner_parameters,
+            state,
+            context,
+            observations_at_time,
+            actions,
+            rewards,
+            dones,
+            next_observations,
+        )
+
+    return AnchorFunctions(
+        ego_policy_step=ego_policy_step,
+        ego_observe=ego_observe,
+        partner_policy_step=partner_policy_step,
+        partner_observe=partner_observe,
+        environment_step=environment.step_with_keys,
+    )
+
+
 def gather_time_lanes(tree: Any, indexes: Any) -> Any:
     import jax
     import jax.numpy as jnp
@@ -228,6 +348,8 @@ def collect_anchor_batch(
     partner_parameters: Any,
     enable_quotient_interventions: bool = True,
     microbatch_size: int | None = None,
+    anchor_functions: AnchorFunctions | None = None,
+    chunk_kernel: Any | None = None,
 ) -> tuple[Any, Any, Any, Any]:
     """Collect split-replica all-action targets from rollout snapshots.
 
@@ -315,91 +437,16 @@ def collect_anchor_batch(
         raw_return=jnp.zeros((anchor_count,), dtype=jnp.float32),
     )
 
-    def ego_policy_step(
-        state: AnchorEgoState, observation: Any, gate: Any, keys: Any
-    ) -> tuple[AnchorEgoState, Any]:
-        del keys, gate
-        next_policy_state, online = model.apply(
-            {"params": target_params},
-            state.policy_state,
-            observation,
-            jnp.ones(state.partner_source.shape, dtype=jnp.float32),
-            method=model.step,
-        )
-        code_latent = model.apply(
-            {"params": target_params},
-            state.partner_code,
-            online.task_features,
-            method=model.latent_from_code,
-        )
-        teacher_latent = jnp.where(
-            (state.partner_source == 2)[..., None],
-            state.fixed_teacher_latent,
-            code_latent,
-        )
-        teacher = model.apply(
-            {"params": target_params},
-            online.task_features,
-            teacher_latent,
-            1.0,
-            method=model.from_features_and_latent,
-        )
-        next_state = state._replace(
-            policy_state=next_policy_state,
-            fixed_teacher_latent=teacher_latent,
-        )
-        return next_state, jax.nn.softmax(teacher.logits, axis=-1)
-
-    def ego_observe(
-        stepped: AnchorEgoState,
-        observations_at_time: Any,
-        actions: Any,
-        rewards: Any,
-        dones: Any,
-        next_observations: Any,
-    ) -> AnchorEgoState:
-        del observations_at_time
-        policy_state = observe_policy_after_transition(
-            stepped_state=stepped.policy_state,
-            action=actions,
-            reward=rewards,
-            done=dones,
-            next_observation=next_observations,
-            model_config=config.model,
-        )
-        return stepped._replace(policy_state=policy_state)
-
-    def partner_policy_step(
-        state: Any,
-        observation: Any,
-        episode_start: Any,
-        keys: Any,
-    ) -> tuple[Any, Any, Any]:
-        action, next_state, context, unused_log_probability = partner_functions.step(
-            partner_parameters, state, observation, episode_start, keys
-        )
-        del unused_log_probability
-        return action, next_state, context
-
-    def partner_observe(
-        state: Any,
-        context: Any,
-        observations_at_time: Any,
-        actions: Any,
-        rewards: Any,
-        dones: Any,
-        next_observations: Any,
-    ) -> Any:
-        return partner_functions.observe(
-            partner_parameters,
-            state,
-            context,
-            observations_at_time,
-            actions,
-            rewards,
-            dones,
-            next_observations,
-        )
+    functions = anchor_functions or make_anchor_functions(
+        model=model,
+        model_config=config.model,
+        partner_functions=partner_functions,
+        environment=environment,
+    )
+    runtime = AnchorRuntime(
+        target_params=target_params,
+        partner_parameters=partner_parameters,
+    )
 
     root_keys = jax.random.split(continuation_key, anchor_count)
     anchors = collect_counterfactual_anchors(
@@ -415,18 +462,14 @@ def collect_anchor_batch(
         partner_codes=partner_codes,
         partner_sources=partner_sources,
         partner_run_ids=partner_run_ids,
-        functions=AnchorFunctions(
-            ego_policy_step=ego_policy_step,
-            ego_observe=ego_observe,
-            partner_policy_step=partner_policy_step,
-            partner_observe=partner_observe,
-            environment_step=environment.step_with_keys,
-        ),
+        functions=functions,
         action_count=6,
         fit_replicas=config.anchors.fit_replicas,
         evaluation_replicas=config.anchors.evaluation_replicas,
         continuation_horizon=config.anchors.continuation_horizon,
         microbatch_size=microbatch_size,
+        runtime=runtime,
+        chunk_kernel=chunk_kernel,
     )
     base_codes = gather_time_lanes(records["partner_code"], indexes)
     base_sources = gather_time_lanes(records["partner_source"], indexes)
@@ -556,18 +599,14 @@ def collect_anchor_batch(
             partner_run_ids=jnp.full(
                 (2 * pair_count,), -2, dtype=jnp.int32
             ),
-            functions=AnchorFunctions(
-                ego_policy_step=ego_policy_step,
-                ego_observe=ego_observe,
-                partner_policy_step=partner_policy_step,
-                partner_observe=partner_observe,
-                environment_step=environment.step_with_keys,
-            ),
+            functions=functions,
             action_count=6,
             fit_replicas=config.anchors.fit_replicas,
             evaluation_replicas=config.anchors.evaluation_replicas,
             continuation_horizon=config.anchors.continuation_horizon,
             microbatch_size=microbatch_size,
+            runtime=runtime,
+            chunk_kernel=chunk_kernel,
         )
         offset = int(anchors.anchor_ids.shape[0])
         anchors = _concatenate_anchor_batches(anchors, variant)
@@ -589,8 +628,10 @@ def collect_anchor_batch(
 
 __all__ = [
     "AnchorEgoState",
+    "AnchorRuntime",
     "collect_anchor_batch",
     "gather_time_lanes",
     "make_quotient_pairs",
+    "make_anchor_functions",
     "stratified_anchor_indexes",
 ]

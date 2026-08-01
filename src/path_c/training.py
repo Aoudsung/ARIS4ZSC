@@ -18,6 +18,7 @@ from .types import (
     QuotientPairBatch,
     RolloutBatch,
     TrainState,
+    TrainingCoreState,
     TrainingUpdate,
 )
 
@@ -673,6 +674,62 @@ def apply_training_update(
     anchors: CounterfactualAnchorBatch | None = None,
     quotient_pairs: QuotientPairBatch | None = None,
 ) -> TrainingUpdate:
+    core, metrics = apply_training_core_update(
+        model=model,
+        core=training_core_state(state),
+        optimizer=optimizer,
+        batch=batch,
+        config=config,
+        anchors=anchors,
+        quotient_pairs=quotient_pairs,
+    )
+    next_state = state._replace(
+        params=core.params,
+        target_params=core.target_params,
+        optimizer_state=core.optimizer_state,
+    )
+    return TrainingUpdate(state=next_state, metrics=metrics)
+
+
+def training_core_state(state: TrainState) -> TrainingCoreState:
+    """Project serializable run state onto the compiled PPO carry."""
+
+    return TrainingCoreState(
+        params=state.params,
+        target_params=state.target_params,
+        optimizer_state=state.optimizer_state,
+    )
+
+
+def merge_training_core(
+    state: TrainState,
+    core: TrainingCoreState,
+) -> TrainState:
+    """Merge a completed compiled PPO carry without touching run-level state."""
+
+    return state._replace(
+        params=core.params,
+        target_params=core.target_params,
+        optimizer_state=core.optimizer_state,
+    )
+
+
+def apply_training_core_update(
+    *,
+    model: Any,
+    core: TrainingCoreState,
+    optimizer: Any,
+    batch: RolloutBatch,
+    config: Any,
+    anchors: CounterfactualAnchorBatch | None = None,
+    quotient_pairs: QuotientPairBatch | None = None,
+) -> tuple[TrainingCoreState, Mapping[str, Any]]:
+    """Apply exactly one sequential Official PPO minibatch update.
+
+    This is deliberately free of runner, generator, RNG, calibration, and
+    accounting state so it can be used unchanged as a ``lax.scan`` body.
+    """
+
     import jax
     import optax
 
@@ -688,21 +745,78 @@ def apply_training_update(
         return loss.total, loss.metrics
 
     (unused, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(
-        state.params
+        core.params
     )
     del unused
     updates, optimizer_state = optimizer.update(
-        gradients, state.optimizer_state, state.params
+        gradients, core.optimizer_state, core.params
     )
-    params = optax.apply_updates(state.params, updates)
-    next_state = state._replace(
+    params = optax.apply_updates(core.params, updates)
+    return TrainingCoreState(
         params=params,
         target_params=polyak_update(
-            state.target_params, params, config.ppo.polyak_coefficient
+            core.target_params, params, config.ppo.polyak_coefficient
         ),
         optimizer_state=optimizer_state,
+    ), metrics
+
+
+def scan_training_updates(
+    *,
+    model: Any,
+    core: TrainingCoreState,
+    optimizer: Any,
+    batch: RolloutBatch,
+    schedule: Any,
+    config: Any,
+) -> tuple[TrainingCoreState, Mapping[str, Any]]:
+    """Run minibatches sequentially on device without duplicating the rollout."""
+
+    import jax
+    import jax.numpy as jnp
+
+    indexes = jnp.asarray(schedule, dtype=jnp.int32)
+    if indexes.ndim < 2:
+        raise ValueError("The PPO schedule must contain minibatch and lane axes.")
+    flat = indexes.reshape((-1, indexes.shape[-1]))
+
+    def one(
+        current: TrainingCoreState,
+        lane_indexes: Any,
+    ) -> tuple[TrainingCoreState, Mapping[str, Any]]:
+        return apply_training_core_update(
+            model=model,
+            core=current,
+            optimizer=optimizer,
+            batch=slice_rollout_lanes(batch, lane_indexes),
+            config=config,
+        )
+
+    return jax.lax.scan(one, core, flat)
+
+
+def apply_anchor_first_update(
+    *,
+    model: Any,
+    core: TrainingCoreState,
+    optimizer: Any,
+    batch: RolloutBatch,
+    lane_indexes: Any,
+    config: Any,
+    anchors: CounterfactualAnchorBatch,
+    quotient_pairs: QuotientPairBatch | None,
+) -> tuple[TrainingCoreState, Mapping[str, Any]]:
+    """Apply the registered anchor loss to only the first PPO minibatch."""
+
+    return apply_training_core_update(
+        model=model,
+        core=core,
+        optimizer=optimizer,
+        batch=slice_rollout_lanes(batch, lane_indexes),
+        config=config,
+        anchors=anchors,
+        quotient_pairs=quotient_pairs,
     )
-    return TrainingUpdate(state=next_state, metrics=metrics)
 
 
 def update_competence_multiplier(
@@ -882,7 +996,9 @@ def environment_minibatch_schedule(
 
 
 __all__ = [
+    "apply_anchor_first_update",
     "apply_training_update",
+    "apply_training_core_update",
     "categorical_entropy",
     "categorical_log_probability",
     "clipped_value_loss",
@@ -896,13 +1012,16 @@ __all__ = [
     "generator_score_function_loss",
     "huber",
     "make_optimizer",
+    "merge_training_core",
     "official_learning_rate_schedule",
     "official_reward_shaping_factor",
     "polyak_update",
     "posterior_consistency_loss",
     "ppo_actor_loss",
     "response_prediction_loss",
+    "scan_training_updates",
     "slice_rollout_lanes",
     "teacher_student_losses",
+    "training_core_state",
     "update_competence_multiplier",
 ]

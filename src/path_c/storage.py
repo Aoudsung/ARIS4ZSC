@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import platform
 import subprocess
@@ -423,6 +424,20 @@ def write_json(path: str | Path, payload: Mapping[str, Any]) -> Path:
     return target
 
 
+def write_json_atomic(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    """Atomically replace a small JSON status artifact on the same filesystem."""
+
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, target)
+    return target
+
+
 def write_jsonl(path: str | Path, rows: Iterable[Mapping[str, Any]]) -> Path:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -556,6 +571,7 @@ __all__ = [
     "upstream_identity",
     "write_array_chunks",
     "write_json",
+    "write_json_atomic",
     "write_jsonl",
     "write_parquet",
     "write_run_metadata",

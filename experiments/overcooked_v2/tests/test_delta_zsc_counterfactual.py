@@ -75,7 +75,9 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
     batch = collect_counterfactual_anchors(**kwargs)
     microbatched = collect_counterfactual_anchors(
         **kwargs,
-        microbatch_size=3 * (3 + 2),
+        # Three-world fixed executable for two real worlds exercises inactive
+        # padding without introducing a scientific root key or output row.
+        microbatch_size=3 * 3 * (3 + 2),
     )
     for full, chunked in zip(
         jax.tree_util.tree_leaves(batch),

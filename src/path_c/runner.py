@@ -155,12 +155,15 @@ def collect_rollout(
     gate_values: Any,
     teacher_lane_mask: Any,
     official_shaping_factor: float,
+    record_mode: str = "anchor_full",
 ) -> tuple[RunnerState, RolloutBatch, Mapping[str, Any]]:
     import jax
     import jax.numpy as jnp
 
     if length <= 0:
         raise ValueError("Rollout length must be positive.")
+    if record_mode not in {"minimal", "anchor_full", "support"}:
+        raise ValueError(f"Unknown rollout record mode: {record_mode!r}.")
     count = int(environment.num_envs)
     initial_policy = state.ego_policy
 
@@ -296,7 +299,7 @@ def collect_rollout(
             effective_environment_steps=current.effective_environment_steps + count,
             random_key=next_root,
         )
-        return next_state, {
+        batch_record = {
             "observations": ego_observation,
             "response_next_observations": ego_response_next,
             "previous_actions": current.ego_policy.previous_action,
@@ -309,7 +312,7 @@ def collect_rollout(
             "official_shaped_rewards": official_shaped_rewards,
             "official_shaping_factor": jnp.full(
                 raw_rewards.shape,
-                float(official_shaping_factor),
+                jnp.asarray(official_shaping_factor, dtype=jnp.float32),
                 dtype=jnp.float32,
             ),
             "dones": dones,
@@ -319,10 +322,25 @@ def collect_rollout(
             "partner_run_ids": partner_functions.run_id(
                 partner_parameters, current.partner_state, partner_context
             ),
+            # Compact partner context is consumed by registered auxiliary
+            # losses in every PPO update, so it belongs to the minimal batch.
+            "partner_code": partner_diagnostics["code"],
+            "partner_source": partner_diagnostics["source"],
+        }
+        if record_mode == "minimal":
+            return next_state, batch_record
+        if record_mode == "support":
+            return next_state, {
+                "partner_run_ids": batch_record["partner_run_ids"],
+                "partner_source": partner_diagnostics["source"],
+                "mixture_logits": output.mixture_logits,
+                "mixture_means": output.mixture_means,
+                "mixture_log_variances": output.mixture_log_variances,
+            }
+        return next_state, {
+            **batch_record,
             "partner_actions": partner_action,
             "partner_log_probabilities": partner_log_probability,
-            "partner_source": partner_diagnostics["source"],
-            "partner_code": partner_diagnostics["code"],
             "partner_generator_logits": partner_diagnostics["generator_logits"],
             "partner_generator_value": partner_diagnostics["generator_value"],
             "completed_returns": jnp.where(dones, completed_return, 0.0),
@@ -346,6 +364,8 @@ def collect_rollout(
         }
 
     final_state, recorded = jax.lax.scan(one_step, state, xs=None, length=int(length))
+    if record_mode == "support":
+        return final_state, None, recorded
     lane_indexes = jnp.arange(count, dtype=jnp.int32)
     final_observation = final_state.observations[
         lane_indexes, final_state.ego_roles
@@ -412,7 +432,19 @@ def collect_rollout(
         partner_run_ids=recorded["partner_run_ids"],
         initial_policy_state=initial_policy,
     )
-    return final_state, batch, recorded
+    return final_state, batch, (recorded if record_mode == "anchor_full" else {})
+
+
+def collect_rollout_minimal(**kwargs: Any) -> tuple[RunnerState, RolloutBatch, Mapping[str, Any]]:
+    """Collect a PPO rollout without materializing anchor-only scan outputs."""
+
+    return collect_rollout(**kwargs, record_mode="minimal")
+
+
+def collect_support_rollout(**kwargs: Any) -> tuple[RunnerState, None, Mapping[str, Any]]:
+    """Collect only final-model posterior/support records."""
+
+    return collect_rollout(**kwargs, record_mode="support")
 
 
 def chunked_decision_regret(
@@ -477,34 +509,127 @@ def chunked_decision_regret(
 
     def one_chunk(values: tuple[Any, Any, Any, Any, Any]) -> Any:
         features, logits, mu, log_var, sample_keys = values
-        samples, weights = jax.vmap(
-            lambda lane_key, lane_logits, lane_mu, lane_log_var: (
-                stratified_mixture_samples(
-                    lane_key,
-                    mixture_logits=lane_logits,
-                    means=lane_mu,
-                    log_variances=lane_log_var,
-                    sample_count=particle_count,
-                )
-            )
-        )(sample_keys, logits, mu, log_var)
-        particle_features = jnp.broadcast_to(
-            features[:, None, :],
-            (chunk_size, particle_count, features.shape[-1]),
-        )
-        action_values = model.apply(
-            {"params": target_params},
-            particle_features,
-            samples,
-            method=model.action_values_from_features_and_latent,
-        )
-        return decision_regret_from_action_values(
-            jax.lax.stop_gradient(action_values),
-            jax.lax.stop_gradient(weights),
+        return decision_regret_chunk(
+            model=model,
+            target_params=target_params,
+            task_features=features,
+            mixture_logits=logits,
+            mixture_means=mu,
+            mixture_log_variances=log_var,
+            sample_keys=sample_keys,
+            posterior_particles=particle_count,
         )
 
     chunked = jax.lax.map(one_chunk, chunks)
     return chunked.reshape((padded_count,))[:state_count].reshape(prefix)
+
+
+def decision_regret_chunk(
+    *,
+    model: Any,
+    target_params: Mapping[str, Any],
+    task_features: Any,
+    mixture_logits: Any,
+    mixture_means: Any,
+    mixture_log_variances: Any,
+    sample_keys: Any,
+    posterior_particles: int,
+) -> Any:
+    """Evaluate one fixed-size target-critic chunk and no other model heads."""
+
+    import jax
+    import jax.numpy as jnp
+
+    features = jax.lax.stop_gradient(jnp.asarray(task_features))
+    logits = jax.lax.stop_gradient(jnp.asarray(mixture_logits))
+    means = jax.lax.stop_gradient(jnp.asarray(mixture_means))
+    log_variances = jax.lax.stop_gradient(jnp.asarray(mixture_log_variances))
+    keys = jnp.asarray(sample_keys)
+    particle_count = int(posterior_particles)
+    chunk_size = int(features.shape[0])
+    samples, weights = jax.vmap(
+        lambda lane_key, lane_logits, lane_mu, lane_log_var: (
+            stratified_mixture_samples(
+                lane_key,
+                mixture_logits=lane_logits,
+                means=lane_mu,
+                log_variances=lane_log_var,
+                sample_count=particle_count,
+            )
+        )
+    )(keys, logits, means, log_variances)
+    particle_features = jnp.broadcast_to(
+        features[:, None, :],
+        (chunk_size, particle_count, features.shape[-1]),
+    )
+    action_values = model.apply(
+        {"params": target_params},
+        particle_features,
+        samples,
+        method=model.action_values_from_features_and_latent,
+    )
+    return decision_regret_from_action_values(
+        jax.lax.stop_gradient(action_values),
+        jax.lax.stop_gradient(weights),
+    )
+
+
+def target_context_sequence(
+    *,
+    model: Any,
+    target_params: Mapping[str, Any],
+    batch: RolloutBatch,
+) -> Any:
+    """Replay target task/belief recurrence without actor, critic, or decoder."""
+
+    unused_final, context = model.apply(
+        {"params": target_params},
+        batch.initial_policy_state,
+        batch.observations,
+        batch.previous_actions,
+        batch.previous_rewards,
+        batch.episode_starts,
+        method=model.context_sequence,
+    )
+    del unused_final
+    return context
+
+
+def finalize_decision_regret_shaping(
+    *,
+    batch: RolloutBatch,
+    regrets: Any,
+    gamma: float,
+    weight: float,
+) -> tuple[RolloutBatch, Mapping[str, Any]]:
+    """Apply the registered detached potential after chunk evaluation."""
+
+    import jax.numpy as jnp
+
+    values = jnp.asarray(regrets)
+    shaping = potential_shaping(
+        values[:-1],
+        values[1:],
+        batch.dones,
+        gamma=gamma,
+        weight=weight,
+    )
+    shaped = batch.shaped_rewards + shaping
+    return batch._replace(
+        decision_regret_shaping=shaping,
+        shaped_rewards=shaped,
+    ), {
+        "decision_regret_values": values[:-1],
+        "mean_decision_regret": jnp.mean(values[:-1]),
+        "mean_decision_regret_shaping": jnp.mean(shaping),
+        "mean_official_shaped_reward": jnp.mean(batch.official_shaped_rewards),
+        "official_shaping_factor": jnp.mean(batch.official_shaping_factors),
+        "mean_combined_training_reward": jnp.mean(shaped),
+        "maximum_decision_regret": jnp.max(values[:-1]),
+        "decision_regret_state_chunk_size": jnp.asarray(
+            DECISION_REGRET_STATE_CHUNK_SIZE, dtype=jnp.int32
+        ),
+    }
 
 
 def attach_decision_regret_shaping(
@@ -517,18 +642,11 @@ def attach_decision_regret_shaping(
 ) -> tuple[RolloutBatch, Mapping[str, Any]]:
     """Compute a frozen-potential shaped reward on the collected batch."""
 
-    import jax.numpy as jnp
-
-    unused_final, context = model.apply(
-        {"params": target_params},
-        batch.initial_policy_state,
-        batch.observations,
-        batch.previous_actions,
-        batch.previous_rewards,
-        batch.episode_starts,
-        method=model.context_sequence,
+    context = target_context_sequence(
+        model=model,
+        target_params=target_params,
+        batch=batch,
     )
-    del unused_final
     regrets = chunked_decision_regret(
         model=model,
         target_params=target_params,
@@ -536,29 +654,12 @@ def attach_decision_regret_shaping(
         key=key,
         posterior_particles=config.model.posterior_particles,
     )
-    shaping = potential_shaping(
-        regrets[:-1],
-        regrets[1:],
-        batch.dones,
+    return finalize_decision_regret_shaping(
+        batch=batch,
+        regrets=regrets,
         gamma=config.ppo.gamma,
         weight=config.loss.decision_regret_weight,
     )
-    shaped = batch.shaped_rewards + shaping
-    return batch._replace(
-        decision_regret_shaping=shaping,
-        shaped_rewards=shaped,
-    ), {
-        "decision_regret_values": regrets[:-1],
-        "mean_decision_regret": jnp.mean(regrets[:-1]),
-        "mean_decision_regret_shaping": jnp.mean(shaping),
-        "mean_official_shaped_reward": jnp.mean(batch.official_shaped_rewards),
-        "official_shaping_factor": jnp.mean(batch.official_shaping_factors),
-        "mean_combined_training_reward": jnp.mean(shaped),
-        "maximum_decision_regret": jnp.max(regrets[:-1]),
-        "decision_regret_state_chunk_size": jnp.asarray(
-            DECISION_REGRET_STATE_CHUNK_SIZE, dtype=jnp.int32
-        ),
-    }
 
 
 __all__ = [
@@ -568,8 +669,13 @@ __all__ = [
     "attach_decision_regret_shaping",
     "chunked_decision_regret",
     "collect_rollout",
+    "collect_rollout_minimal",
+    "collect_support_rollout",
+    "decision_regret_chunk",
+    "finalize_decision_regret_shaping",
     "initialize_runner",
     "official_ego_roles",
     "observe_policy_after_transition",
     "policy_action",
+    "target_context_sequence",
 ]

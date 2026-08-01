@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
+import traceback
 from typing import Any, Mapping
 
 from experiments.overcooked_v2.deployment import deployable_parameters
@@ -17,16 +21,25 @@ from experiments.overcooked_v2.official_adapter import (
     validate_official_runtime,
     validate_official_partner_checkpoint,
 )
-from src.path_c.anchor_sampling import collect_anchor_batch
+from src.path_c.anchor_sampling import collect_anchor_batch, make_anchor_functions
 from src.path_c.counterfactual_anchor import anchor_microbatch_candidates
 from src.path_c.belief_set_encoder import mixture_moments
 from src.path_c.calibration import calibration_to_mapping, empty_calibration
+from src.path_c.compiled_kernels import (
+    CompiledCallable,
+    CompiledMemoryLimitError,
+    attach_chunked_regret_with_kernels,
+    build_anchor_chunk_kernel,
+    build_training_kernels,
+    configure_persistent_compilation_cache,
+)
 from src.path_c.decision_geometry import (
     brdiv_marginal_contributions,
     centered_action_values,
     smoothness_marginal_penalties,
 )
 from src.path_c.experiment import (
+    OFFICIAL_SOURCE_COMMIT,
     load_config,
     load_partner_manifest,
     official_training_domain_keys,
@@ -47,8 +60,6 @@ from src.path_c.partner_sources import (
 )
 from src.path_c.runner import (
     DECISION_REGRET_STATE_CHUNK_SIZE,
-    attach_decision_regret_shaping,
-    collect_rollout,
     initialize_runner,
 )
 from src.path_c.resources import (
@@ -74,21 +85,182 @@ from src.path_c.storage import (
     write_json,
     validate_registered_python_runtime,
     write_jsonl,
+    write_json_atomic,
 )
 from src.path_c.training import (
-    apply_training_update,
     environment_minibatch_schedule,
     generator_score_function_loss,
     make_optimizer,
+    merge_training_core,
     official_reward_shaping_factor,
     polyak_update,
-    slice_rollout_lanes,
+    training_core_state,
     update_competence_multiplier,
 )
-from src.path_c.types import TrainState
+from src.path_c.types import GeneratorCoreState, TrainState
 
 
 FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 2**20
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _model_structure_fingerprint(config: Any, observation_shape: tuple[int, ...]) -> str:
+    payload = {
+        "model": config.to_mapping()["model"],
+        "observation_shape": list(observation_shape),
+        "action_count": 6,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _gpu_snapshot() -> Mapping[str, Any]:
+    """Read worker GPU telemetry without changing CUDA/JAX state."""
+
+    physical = os.environ.get("DELTA_PHYSICAL_GPU_INDEX", "").strip()
+    command = [
+        "nvidia-smi",
+        "--query-gpu=index,uuid,name,memory.total,memory.used,utilization.gpu,"
+        "ecc.errors.uncorrected.volatile.total",
+        "--format=csv,noheader,nounits",
+    ]
+    if physical:
+        command.append(f"--id={physical}")
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        row = completed.stdout.strip().splitlines()[0]
+        values = [value.strip() for value in row.split(",")]
+        if len(values) != 7:
+            raise ValueError("unexpected nvidia-smi column count")
+        return {
+            "physical_index": values[0],
+            "uuid": values[1],
+            "name": values[2],
+            "total_memory_mib": values[3],
+            "current_memory_used_mib": values[4],
+            "utilization_percent": values[5],
+            "volatile_uncorrectable_ecc": values[6],
+            "registered_start_memory_used_mib": os.environ.get(
+                "DELTA_GPU_START_MEMORY_USED_MIB"
+            ),
+            "jax_peak_memory_bytes": peak_device_memory_bytes(),
+        }
+    except Exception as error:
+        return {
+            "physical_index": physical or None,
+            "telemetry_error": f"{type(error).__name__}: {error}",
+            "registered_start_memory_used_mib": os.environ.get(
+                "DELTA_GPU_START_MEMORY_USED_MIB"
+            ),
+            "jax_peak_memory_bytes": peak_device_memory_bytes(),
+        }
+
+
+def _jax_runtime_snapshot() -> Mapping[str, Any]:
+    import jax
+
+    devices = tuple(jax.devices())
+    return {
+        "backend": str(jax.default_backend()),
+        "jax_platforms": os.environ.get("JAX_PLATFORMS"),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "local_device_count": int(jax.local_device_count()),
+        "devices": [
+            {
+                "id": int(device.id),
+                "platform": str(device.platform),
+                "device_kind": str(device.device_kind),
+            }
+            for device in devices
+        ],
+    }
+
+
+def _synchronize_tree(value: Any) -> None:
+    import jax
+
+    for leaf in jax.tree_util.tree_leaves(value):
+        if hasattr(leaf, "block_until_ready"):
+            leaf.block_until_ready()
+
+
+def _run_phase(
+    *,
+    output: Path,
+    phase: str,
+    update_number: int,
+    operation: Any,
+    synchronize: bool,
+    kernel_metadata: Any | None = None,
+) -> tuple[Any, float]:
+    """Run one observable phase and atomically publish its state."""
+
+    status_path = output / "runtime_phase.json"
+    started_at = _utc_now()
+    started = time.perf_counter()
+    initial = {
+        "status": "running",
+        "phase": str(phase),
+        "update_count": int(update_number),
+        "started_at": started_at,
+        "jax_runtime": _jax_runtime_snapshot(),
+        "gpu": _gpu_snapshot(),
+    }
+    write_json_atomic(status_path, initial)
+    try:
+        value = operation()
+        if synchronize:
+            _synchronize_tree(value)
+        duration = time.perf_counter() - started
+        completed = {
+            **initial,
+            "status": "complete",
+            "completed_at": _utc_now(),
+            "wall_seconds": duration,
+            "gpu": _gpu_snapshot(),
+            "kernels": {} if kernel_metadata is None else kernel_metadata(),
+        }
+        write_json_atomic(status_path, completed)
+        write_json(
+            output
+            / "records"
+            / "phases"
+            / f"update_{int(update_number):08d}_{phase}.json",
+            completed,
+        )
+        return value, duration
+    except Exception as error:
+        duration = time.perf_counter() - started
+        error_path = (
+            output
+            / "records"
+            / "phase_errors"
+            / f"update_{int(update_number):08d}_{phase}.json"
+        )
+        failure = {
+            **initial,
+            "status": "failed",
+            "failed_at": _utc_now(),
+            "wall_seconds": duration,
+            "error": f"{type(error).__name__}: {error}",
+            "traceback": traceback.format_exc(),
+            "error_log": str(error_path),
+            "gpu": _gpu_snapshot(),
+            "kernels": {} if kernel_metadata is None else kernel_metadata(),
+        }
+        write_json(error_path, failure)
+        write_json_atomic(status_path, failure)
+        raise
 
 
 def _host(tree: Any) -> Any:
@@ -133,7 +305,7 @@ def _collect_with_adaptive_microbatch(
             return (*result, int(candidate))
         except Exception as error:
             message = f"{type(error).__name__}: {error}".lower()
-            if not any(
+            if not isinstance(error, CompiledMemoryLimitError) and not any(
                 token in message
                 for token in ("out of memory", "resource exhausted", "resource_exhausted")
             ):
@@ -146,10 +318,90 @@ def _collect_with_adaptive_microbatch(
     )
 
 
-def _generator_update(
+def _build_generator_update_kernel(
     *,
     generator: Any,
     generator_optimizer: Any,
+    config: Any,
+) -> CompiledCallable:
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    def execute(
+        core: GeneratorCoreState,
+        initial_carry: Any,
+        partner_observations: Any,
+        initial_codes: Any,
+        episode_starts: Any,
+        keys: Any,
+        actions: Any,
+        source_mask: Any,
+        rewards: Any,
+        dones: Any,
+        diversity_bonus: Any,
+    ) -> tuple[GeneratorCoreState, Mapping[str, Any]]:
+        def objective(candidate: Any) -> tuple[Any, Mapping[str, Any]]:
+            unused_carry, output = generator.apply(
+                {"params": candidate},
+                initial_carry,
+                partner_observations,
+                initial_codes,
+                episode_starts,
+                keys,
+                method=generator.sequence,
+            )
+            del unused_carry
+            loss = generator_score_function_loss(
+                logits=output.logits,
+                values=output.value,
+                actions=actions,
+                source_mask=source_mask,
+                rewards=rewards,
+                dones=dones,
+                diversity_bonus=diversity_bonus,
+                value_weight=config.ppo.value_weight,
+                entropy_weight=config.ppo.entropy_weight,
+                competence_multiplier=core.competence_multiplier,
+                competence_threshold=config.partner_generator.competence_threshold,
+                cvar_level=config.partner_generator.cvar_level,
+            )
+            return loss.total, loss.metrics
+
+        (unused, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(
+            core.params
+        )
+        del unused
+        updates, optimizer_state = generator_optimizer.update(
+            gradients, core.optimizer_state, core.params
+        )
+        params = optax.apply_updates(core.params, updates)
+        multiplier = update_competence_multiplier(
+            core.competence_multiplier,
+            competence=metrics["generator_competence_cvar"],
+            threshold=config.partner_generator.competence_threshold,
+            learning_rate=config.partner_generator.lagrangian_learning_rate,
+        )
+        return GeneratorCoreState(
+            params=params,
+            target_params=polyak_update(
+                core.target_params,
+                params,
+                config.ppo.polyak_coefficient,
+            ),
+            optimizer_state=optimizer_state,
+            competence_multiplier=multiplier,
+        ), {
+            **metrics,
+            "generator_update_skipped": jnp.asarray(0.0),
+        }
+
+    return CompiledCallable("generator_update", execute, donate_argnums=(0,))
+
+
+def _generator_update(
+    *,
+    compiled_update: CompiledCallable,
     state: TrainState,
     records: Mapping[str, Any],
     anchors: Any,
@@ -158,7 +410,6 @@ def _generator_update(
 ) -> tuple[TrainState, Mapping[str, Any]]:
     import jax
     import jax.numpy as jnp
-    import optax
 
     source_mask = (records["partner_source"] == 0).astype(jnp.float32)
     if float(jnp.sum(source_mask)) <= 0.0:
@@ -167,8 +418,6 @@ def _generator_update(
     partner_observations = records["partner_observations"]
     codes = records["partner_code"]
     starts = records["episode_starts"]
-    # Actions are fixed by the collected on-policy trajectory.  Keys only satisfy
-    # the generator API; sampled candidate actions are ignored by the loss.
     keys = jnp.zeros(source_mask.shape + (2,), dtype=jnp.uint32)
 
     signatures = centered_action_values(anchors.fit_returns_by_action)
@@ -200,63 +449,30 @@ def _generator_update(
     else:
         diversity_bonus = jnp.zeros((lane_codes.shape[0],), dtype=jnp.float32)
 
-    def objective(candidate: Any) -> tuple[Any, Mapping[str, Any]]:
-        unused_carry, output = generator.apply(
-            {"params": candidate},
-            initial_carry,
-            partner_observations,
-            codes[0],
-            starts,
-            keys,
-            method=generator.sequence,
-        )
-        del unused_carry
-        loss = generator_score_function_loss(
-            logits=output.logits,
-            values=output.value,
-            actions=records["partner_actions"],
-            source_mask=source_mask,
-            rewards=records["rewards"],
-            dones=records["dones"],
-            diversity_bonus=diversity_bonus,
-            value_weight=config.ppo.value_weight,
-            entropy_weight=config.ppo.entropy_weight,
+    core, metrics = compiled_update(
+        GeneratorCoreState(
+            params=state.generator_params,
+            target_params=state.generator_target_params,
+            optimizer_state=state.generator_optimizer_state,
             competence_multiplier=state.competence_multiplier,
-            competence_threshold=config.partner_generator.competence_threshold,
-            cvar_level=config.partner_generator.cvar_level,
-        )
-        return loss.total, loss.metrics
-
-    (unused, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(
-        state.generator_params
-    )
-    del unused
-    updates, optimizer_state = generator_optimizer.update(
-        gradients, state.generator_optimizer_state, state.generator_params
-    )
-    generator_params = optax.apply_updates(state.generator_params, updates)
-    multiplier = update_competence_multiplier(
-        state.competence_multiplier,
-        competence=metrics["generator_competence_cvar"],
-        threshold=config.partner_generator.competence_threshold,
-        learning_rate=config.partner_generator.lagrangian_learning_rate,
-    )
-    completed_metrics = {
-        **metrics,
-        # Explicitly distinguish a completed score-function update from the
-        # early-return skip path in persisted run telemetry.
-        "generator_update_skipped": jnp.asarray(0.0),
-    }
-    return state._replace(
-        generator_params=generator_params,
-        generator_target_params=polyak_update(
-            state.generator_target_params,
-            generator_params,
-            config.ppo.polyak_coefficient,
         ),
-        generator_optimizer_state=optimizer_state,
-        competence_multiplier=multiplier,
-    ), completed_metrics
+        initial_carry,
+        partner_observations,
+        codes[0],
+        starts,
+        keys,
+        records["partner_actions"],
+        source_mask,
+        records["rewards"],
+        records["dones"],
+        diversity_bonus,
+    )
+    return state._replace(
+        generator_params=core.params,
+        generator_target_params=core.target_params,
+        generator_optimizer_state=core.optimizer_state,
+        competence_multiplier=core.competence_multiplier,
+    ), metrics
 
 
 
@@ -270,6 +486,7 @@ def _write_final_support_latents(
     state: TrainState,
     partner_functions: Any,
     partner_parameters: Any,
+    kernels: Any,
     key: Any,
 ) -> Mapping[str, Any]:
     """Collect final-model legal-history support from the complete train mixture."""
@@ -283,18 +500,13 @@ def _write_final_support_latents(
         partner_functions=partner_functions,
         random_key=key,
     )
-    runner, unused_batch, records = collect_rollout(
-        state=runner,
-        length=config.environment.episode_steps,
-        environment=environment,
-        model=model,
-        params=state.params,
-        model_config=config.model,
-        partner_functions=partner_functions,
-        partner_parameters=partner_parameters,
-        gate_values=jnp.ones((environment.num_envs,), dtype=jnp.float32),
-        teacher_lane_mask=jnp.zeros((environment.num_envs,), dtype=jnp.bool_),
-        official_shaping_factor=0.0,
+    runner, unused_batch, records = kernels.rollout_support(
+        runner,
+        state.params,
+        partner_parameters,
+        jnp.ones((environment.num_envs,), dtype=jnp.float32),
+        jnp.zeros((environment.num_envs,), dtype=jnp.bool_),
+        jnp.asarray(0.0, dtype=jnp.float32),
     )
     del unused_batch
     mean, variance = mixture_moments(
@@ -342,6 +554,7 @@ def run_training(args: argparse.Namespace) -> None:
     if config.run_kind == "formal":
         validate_formal_repository_state()
         validate_registered_python_runtime()
+    if config.run_kind == "formal" or os.environ.get("DELTA_REQUIRE_CUDA") == "1":
         cuda_runtime = require_single_cuda_worker()
     official_runtime = (
         validate_official_runtime() if config.run_kind == "formal" else None
@@ -354,6 +567,9 @@ def run_training(args: argparse.Namespace) -> None:
     output = Path(args.output).resolve()
     environment = VectorEnvironment.create(config)
     observation_shape = environment.observation_shape
+    model_structure_fingerprint = _model_structure_fingerprint(
+        config, observation_shape
+    )
     outer_key = official_training_key(int(args.seed_index))
     domain_keys = official_training_domain_keys(int(args.seed_index))
     identity = dict(
@@ -364,6 +580,13 @@ def run_training(args: argparse.Namespace) -> None:
             partner_manifest=manifest,
         )
     )
+    compilation_cache = configure_persistent_compilation_cache(
+        repository_commit=str(identity["runtime"]["repository_commit"]),
+        official_commit=OFFICIAL_SOURCE_COMMIT,
+        config_fingerprint=config.fingerprint,
+        model_structure_fingerprint=model_structure_fingerprint,
+        cache_root=os.environ.get("DELTA_JAX_COMPILATION_CACHE"),
+    )
     identity.update(
         {
             "ego_run_id": str(args.ego_run_id),
@@ -371,6 +594,8 @@ def run_training(args: argparse.Namespace) -> None:
             "action_count": 6,
             "official_runtime": official_runtime,
             "formal_cuda_worker": cuda_runtime,
+            "model_structure_fingerprint": model_structure_fingerprint,
+            "compilation_cache": compilation_cache,
             "assigned_gpu_class": {
                 "name": os.environ.get("DELTA_GPU_NAME"),
                 "total_memory_mib": os.environ.get(
@@ -601,6 +826,30 @@ def run_training(args: argparse.Namespace) -> None:
         frozen_external_probability=config.partner_generator.frozen_external_probability,
         teacher_latent_apply=teacher_latent_apply,
     )
+    kernels = build_training_kernels(
+        environment=environment,
+        model=model,
+        model_config=config.model,
+        partner_functions=partner_functions,
+        config=config,
+        optimizer=optimizer,
+    )
+    anchor_functions = make_anchor_functions(
+        model=model,
+        model_config=config.model,
+        partner_functions=partner_functions,
+        environment=environment,
+    )
+    anchor_chunk_kernel = build_anchor_chunk_kernel(
+        functions=anchor_functions,
+        config=config,
+        memory_limit_bytes=FORMAL_PEAK_MEMORY_LIMIT_BYTES,
+    )
+    generator_update_kernel = _build_generator_update_kernel(
+        generator=generator,
+        generator_optimizer=generator_optimizer,
+        config=config,
+    )
     runner_state = initialize_runner(
         environment=environment,
         model_config=config.model,
@@ -674,6 +923,11 @@ def run_training(args: argparse.Namespace) -> None:
         ),
     )
     while int(np.asarray(state.effective_environment_steps)) < config.training.environment_steps:
+        update_started = time.perf_counter()
+        update_number = int(np.asarray(state.update_count)) + 1
+        anchor_trigger = update_number % config.anchors.interval_updates == 0
+        synchronize_phases = update_number <= 8
+        phase_durations: dict[str, float] = {}
         (
             collection_key,
             shaping_key,
@@ -703,42 +957,58 @@ def run_training(args: argparse.Namespace) -> None:
         )
         gate_values = (~base_mask).astype(jnp.float32)
         runner_state = runner_state._replace(random_key=collection_key)
-        runner_state, batch, records = collect_rollout(
-            state=runner_state,
-            length=config.training.rollout_length,
-            environment=environment,
-            model=model,
-            params=state.params,
-            model_config=config.model,
-            partner_functions=partner_functions,
-            partner_parameters=partner_parameters,
-            gate_values=gate_values,
-            teacher_lane_mask=teacher_mask,
-            official_shaping_factor=float(
+        rollout_kernel = (
+            kernels.rollout_anchor_full
+            if anchor_trigger
+            else kernels.rollout_minimal
+        )
+        (
+            (runner_state, batch, records),
+            phase_durations["rollout"],
+        ) = _run_phase(
+            output=output,
+            phase="rollout",
+            update_number=update_number,
+            operation=lambda: rollout_kernel(
+                runner_state,
+                state.params,
+                partner_parameters,
+                gate_values,
+                teacher_mask,
                 official_reward_shaping_factor(
                     state.effective_environment_steps,
                     horizon=config.upstream.reward_shaping_horizon,
-                )
+                ),
             ),
+            synchronize=synchronize_phases,
+            kernel_metadata=kernels.metadata,
         )
-        batch, shaping_metrics = attach_decision_regret_shaping(
-            batch=batch,
-            model=model,
-            target_params=state.target_params,
-            config=config,
-            key=shaping_key,
+        (
+            (batch, shaping_metrics),
+            phase_durations["regret"],
+        ) = _run_phase(
+            output=output,
+            phase="regret",
+            update_number=update_number,
+            operation=lambda: attach_chunked_regret_with_kernels(
+                kernels=kernels,
+                batch=batch,
+                target_params=state.target_params,
+                key=shaping_key,
+            ),
+            synchronize=synchronize_phases,
+            kernel_metadata=kernels.metadata,
         )
         shaping_metrics = dict(shaping_metrics)
         records = dict(records)
-        records["decision_regret"] = shaping_metrics.pop(
-            "decision_regret_values"
-        )
+        decision_regret_values = shaping_metrics.pop("decision_regret_values")
+        if anchor_trigger:
+            records["decision_regret"] = decision_regret_values
 
-        update_number = int(np.asarray(state.update_count)) + 1
         anchors = None
         quotient_pairs = None
         anchor_codes = None
-        if update_number % config.anchors.interval_updates == 0:
+        if anchor_trigger:
             collection_kwargs = dict(
                 anchor_domain=update_number,
                 key=jax.random.fold_in(anchor_root, update_number),
@@ -749,36 +1019,59 @@ def run_training(args: argparse.Namespace) -> None:
                 config=config,
                 partner_functions=partner_functions,
                 partner_parameters=partner_parameters,
+                anchor_functions=anchor_functions,
+                chunk_kernel=anchor_chunk_kernel,
             )
-            if anchor_microbatch_size is None:
-                (
-                    anchors,
-                    quotient_pairs,
-                    anchor_codes,
-                    unused_anchor_indexes,
-                    anchor_microbatch_size,
-                ) = _collect_with_adaptive_microbatch(
-                    candidates=anchor_candidates,
-                    collection_kwargs=collection_kwargs,
-                )
-                write_json(
-                    output / "anchor_microbatch.json",
-                    {
-                        "candidates": list(anchor_candidates),
-                        "selected": anchor_microbatch_size,
-                        "changes_scientific_samples": False,
-                    },
-                )
-            else:
-                (
-                    anchors,
-                    quotient_pairs,
-                    anchor_codes,
-                    unused_anchor_indexes,
-                ) = collect_anchor_batch(
+
+            def collect_registered_anchors() -> tuple[Any, Any, Any, Any]:
+                nonlocal anchor_microbatch_size
+                if anchor_microbatch_size is None:
+                    (
+                        collected,
+                        quotient,
+                        codes,
+                        indexes,
+                        selected,
+                    ) = _collect_with_adaptive_microbatch(
+                        candidates=anchor_candidates,
+                        collection_kwargs=collection_kwargs,
+                    )
+                    anchor_microbatch_size = selected
+                    write_json(
+                        output / "anchor_microbatch.json",
+                        {
+                            "candidates": list(anchor_candidates),
+                            "selected": anchor_microbatch_size,
+                            "changes_scientific_samples": False,
+                        },
+                    )
+                    return collected, quotient, codes, indexes
+                return collect_anchor_batch(
                     **collection_kwargs,
                     microbatch_size=anchor_microbatch_size,
                 )
+
+            (
+                (
+                    anchors,
+                    quotient_pairs,
+                    anchor_codes,
+                    unused_anchor_indexes,
+                ),
+                phase_durations["anchor"],
+            ) = _run_phase(
+                output=output,
+                phase="anchor",
+                update_number=update_number,
+                operation=collect_registered_anchors,
+                synchronize=synchronize_phases,
+                kernel_metadata=lambda: {
+                    **kernels.metadata(),
+                    "anchor_continuation_chunk": list(
+                        anchor_chunk_kernel.metadata()
+                    ),
+                },
+            )
             del unused_anchor_indexes
             counterfactual_steps += (
                 int(anchors.anchor_ids.shape[0])
@@ -807,25 +1100,45 @@ def run_training(args: argparse.Namespace) -> None:
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
         )
-        update_metrics = []
-        first_minibatch = True
-        for epoch in range(config.ppo.update_epochs):
-            for minibatch in range(config.training.minibatches_per_epoch):
-                indexes = schedule[epoch, minibatch]
-                current_anchors = anchors if first_minibatch else None
-                current_quotient = quotient_pairs if first_minibatch else None
-                update = apply_training_update(
-                    model=model,
-                    state=state,
-                    optimizer=optimizer,
-                    batch=slice_rollout_lanes(batch, indexes),
-                    config=config,
-                    anchors=current_anchors,
-                    quotient_pairs=current_quotient,
-                )
-                state = update.state
-                update_metrics.append(update.metrics)
-                first_minibatch = False
+        flat_schedule = schedule.reshape((-1, schedule.shape[-1]))
+
+        def run_ppo_scan() -> tuple[Any, Any]:
+            core = training_core_state(state)
+            if anchors is None:
+                return kernels.ppo_normal_scan(core, batch, flat_schedule)
+            core, first_metrics = kernels.ppo_anchor_first(
+                core,
+                batch,
+                flat_schedule[0],
+                anchors,
+                quotient_pairs,
+            )
+            core, remaining_metrics = kernels.ppo_normal_scan(
+                core,
+                batch,
+                flat_schedule[1:],
+            )
+            metrics = jax.tree_util.tree_map(
+                lambda first, remaining: jnp.concatenate(
+                    (jnp.asarray(first)[None], jnp.asarray(remaining)), axis=0
+                ),
+                first_metrics,
+                remaining_metrics,
+            )
+            return core, metrics
+
+        (
+            (completed_core, update_metrics),
+            phase_durations["ppo"],
+        ) = _run_phase(
+            output=output,
+            phase="ppo",
+            update_number=update_number,
+            operation=run_ppo_scan,
+            synchronize=synchronize_phases,
+            kernel_metadata=kernels.metadata,
+        )
+        state = merge_training_core(state, completed_core)
 
         generator_metrics: Mapping[str, Any] = {
             "generator_update_skipped": jnp.asarray(1.0)
@@ -834,14 +1147,25 @@ def run_training(args: argparse.Namespace) -> None:
             anchors is not None
             and update_number % config.partner_generator.update_interval == 0
         ):
-            state, generator_metrics = _generator_update(
-                generator=generator,
-                generator_optimizer=generator_optimizer,
-                state=state,
-                records=records,
-                anchors=anchors,
-                anchor_codes=anchor_codes,
-                config=config,
+            (
+                (state, generator_metrics),
+                phase_durations["generator"],
+            ) = _run_phase(
+                output=output,
+                phase="generator",
+                update_number=update_number,
+                operation=lambda: _generator_update(
+                    compiled_update=generator_update_kernel,
+                    state=state,
+                    records=records,
+                    anchors=anchors,
+                    anchor_codes=anchor_codes,
+                    config=config,
+                ),
+                synchronize=synchronize_phases,
+                kernel_metadata=lambda: {
+                    "generator_update": list(generator_update_kernel.metadata())
+                },
             )
 
         if update_number % config.partner_generator.snapshot_interval == 0:
@@ -862,6 +1186,27 @@ def run_training(args: argparse.Namespace) -> None:
                 frozen_external_probability=config.partner_generator.frozen_external_probability,
                 teacher_latent_apply=teacher_latent_apply,
             )
+            # Snapshot count is structural.  Rebuild exactly one executable
+            # family; unchanged updates keep using the existing cache.
+            kernels = build_training_kernels(
+                environment=environment,
+                model=model,
+                model_config=config.model,
+                partner_functions=partner_functions,
+                config=config,
+                optimizer=optimizer,
+            )
+            anchor_functions = make_anchor_functions(
+                model=model,
+                model_config=config.model,
+                partner_functions=partner_functions,
+                environment=environment,
+            )
+            anchor_chunk_kernel = build_anchor_chunk_kernel(
+                functions=anchor_functions,
+                config=config,
+                memory_limit_bytes=FORMAL_PEAK_MEMORY_LIMIT_BYTES,
+            )
 
         state = state._replace(
             random_key=next_key,
@@ -869,9 +1214,7 @@ def run_training(args: argparse.Namespace) -> None:
             effective_environment_steps=runner_state.effective_environment_steps,
             runner_state=runner_state,
         )
-        mean_metrics = jax.tree_util.tree_map(
-            lambda *values: jnp.mean(jnp.stack(values)), *update_metrics
-        )
+        mean_metrics = jax.tree_util.tree_map(jnp.mean, update_metrics)
         write_jsonl(
             metrics_path / f"update_{update_number:08d}.jsonl",
             (
@@ -904,7 +1247,36 @@ def run_training(args: argparse.Namespace) -> None:
                     f"40,000 MiB ceiling: {peak_memory} bytes."
                 )
         if step % config.training.checkpoint_interval_environment_steps == 0:
-            save_checkpoint(manager, step=step, state=state)
+            unused_checkpoint_result, phase_durations["checkpoint"] = _run_phase(
+                output=output,
+                phase="checkpoint",
+                update_number=update_number,
+                operation=lambda: save_checkpoint(manager, step=step, state=state),
+                synchronize=False,
+                kernel_metadata=kernels.metadata,
+            )
+            del unused_checkpoint_result
+        update_summary = {
+            "status": "complete",
+            "phase": "update",
+            "update_count": update_number,
+            "effective_environment_steps": step,
+            "anchor_trigger": anchor_trigger,
+            "wall_seconds": time.perf_counter() - update_started,
+            "phase_wall_seconds": phase_durations,
+            "completed_at": _utc_now(),
+            "jax_runtime": _jax_runtime_snapshot(),
+            "gpu": _gpu_snapshot(),
+            "kernels": kernels.metadata(),
+        }
+        write_json(
+            output
+            / "records"
+            / "phases"
+            / f"update_{update_number:08d}_update.json",
+            update_summary,
+        )
+        write_json_atomic(output / "runtime_phase.json", update_summary)
         write_json(
             resource_progress_path,
             {
@@ -916,6 +1288,9 @@ def run_training(args: argparse.Namespace) -> None:
                 "decision_regret_state_chunk_size": (
                     DECISION_REGRET_STATE_CHUNK_SIZE
                 ),
+                "phase_wall_seconds": phase_durations,
+                "compilation_cache": compilation_cache,
+                "compiled_kernels": kernels.metadata(),
             },
         )
 
@@ -940,6 +1315,7 @@ def run_training(args: argparse.Namespace) -> None:
         state=state,
         partner_functions=partner_functions,
         partner_parameters=final_partner_parameters,
+        kernels=kernels,
         key=jax.random.fold_in(
             jnp.asarray(domain_keys["snapshot"], dtype=jnp.uint32), 900_001
         ),
@@ -959,6 +1335,15 @@ def run_training(args: argparse.Namespace) -> None:
             "completed_episodes": int(np.asarray(runner_state.completed_episodes)),
             "decision_regret_state_chunk_size": (
                 DECISION_REGRET_STATE_CHUNK_SIZE
+            ),
+            "model_structure_fingerprint": model_structure_fingerprint,
+            "compilation_cache": compilation_cache,
+            "compiled_kernels": kernels.metadata(),
+            "anchor_continuation_kernels": list(
+                anchor_chunk_kernel.metadata()
+            ),
+            "generator_update_kernels": list(
+                generator_update_kernel.metadata()
             ),
             "support_collection": support_metadata,
             "scientific_readout_allowed": False,

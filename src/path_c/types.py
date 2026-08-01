@@ -200,6 +200,28 @@ class TrainState(NamedTuple):
     calibration: CalibrationArtifact
 
 
+class TrainingCoreState(NamedTuple):
+    """The only state carried through the compiled PPO minibatch scan.
+
+    Generator, runner, RNG, calibration, and accounting state deliberately stay
+    outside the gradient executable.  This keeps the compiled signature stable
+    without changing the sequential optimizer or Polyak-update semantics.
+    """
+
+    params: Any
+    target_params: Any
+    optimizer_state: Any
+
+
+class GeneratorCoreState(NamedTuple):
+    """Training-only generator state carried by its compiled update."""
+
+    params: Any
+    target_params: Any
+    optimizer_state: Any
+    competence_multiplier: Any
+
+
 class LossBundle(NamedTuple):
     total: Any
     metrics: Mapping[str, Any]
@@ -231,6 +253,7 @@ __all__ = [
     "CounterfactualAnchorBatch",
     "EvaluationRow",
     "GaussianMixtureBelief",
+    "GeneratorCoreState",
     "LossBundle",
     "ModelOutput",
     "PartnerGeneratorOutput",
@@ -239,6 +262,7 @@ __all__ = [
     "QuotientPairBatch",
     "RolloutBatch",
     "TeacherOutput",
+    "TrainingCoreState",
     "TrainState",
     "TrainingUpdate",
 ]
