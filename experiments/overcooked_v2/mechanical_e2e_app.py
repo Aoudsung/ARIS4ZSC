@@ -21,6 +21,10 @@ from src.path_c.experiment import (
     load_config,
     official_training_key,
 )
+from src.path_c.curriculum import phase_from_qualification
+from src.path_c.fallback import deployment_tier
+from src.path_c.qualification import GateDecision, SignalQualification
+from src.path_c.signal_audit import fixture_contract_outcome
 from src.path_c.storage import write_json
 
 
@@ -54,6 +58,15 @@ def mechanical_fixture_key(label: str) -> tuple[int, tuple[int, int]]:
     seed = int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
     key = np.asarray(jax.random.PRNGKey(seed), dtype=np.uint32)
     return seed, (int(key[0]), int(key[1]))
+
+
+def mechanical_upstream_seed_slot(sequence_index: int) -> int:
+    """Map non-scientific fixtures onto the ten legal Official run slots."""
+
+    index = int(sequence_index)
+    if index < 0:
+        raise ValueError("Mechanical upstream sequence indexes are non-negative.")
+    return index % 10
 
 
 def _run(
@@ -152,8 +165,8 @@ def _plan_run(
 
 def _verify(output: Path) -> Mapping[str, Any]:
     upstream_summaries = sorted(output.glob("upstream/*/upstream_summary.json"))
-    if len(upstream_summaries) != 6:
-        raise RuntimeError("Mechanical E2E did not complete all six upstream fixtures.")
+    if len(upstream_summaries) != 11:
+        raise RuntimeError("Mechanical E2E did not complete all eleven upstream fixtures.")
     for path in upstream_summaries:
         summary = _read_json(path)
         if (
@@ -169,18 +182,16 @@ def _verify(output: Path) -> Mapping[str, Any]:
         or int(training["update_count"]) != 16
     ):
         raise RuntimeError("DELTA mechanical trajectory budget is incomplete.")
-    anchor_files = sorted(
-        (output / "delta_train" / "records" / "anchors").glob("update_*.json")
+    fixture = _read_json(output / "signal_contract_fixture.json")
+    if fixture["qualified_path"]["final_phase"] != "FULL_DELTA":
+        raise RuntimeError("Mechanical C0--C5 state-machine fixture did not complete.")
+    if fixture["fallback_path"]["deployment_tier"] != "owner_sp_source_fallback":
+        raise RuntimeError("Mechanical qualification-failure fallback was not exercised.")
+    checkpoint_identities = sorted(
+        (output / "delta_train" / "checkpoint_identity").glob("*.json")
     )
-    if len(anchor_files) != 8:
-        raise RuntimeError("Not every registered mechanical anchor trigger ran.")
-    if not (output / "delta_train" / "anchor_microbatch.json").is_file():
-        raise RuntimeError("Anchor microbatch selection artifact is missing.")
-    snapshots = sorted(
-        (output / "delta_train" / "generator_snapshots").glob("snapshot_*")
-    )
-    if len(snapshots) < 5:
-        raise RuntimeError("Generator snapshot schedule did not execute.")
+    if not checkpoint_identities:
+        raise RuntimeError("r3 checkpoint/resume identity sidecar is missing.")
     metrics = []
     for path in sorted(
         (output / "delta_train" / "records" / "metrics").glob("*.jsonl")
@@ -192,6 +203,9 @@ def _verify(output: Path) -> Mapping[str, Any]:
         )
     if not any(generator_update_executed(row["generator"]) for row in metrics):
         raise RuntimeError("The continuous partner generator never updated.")
+    ledger = _read_json(output / "delta_train" / "resource_ledger.json")
+    if int(ledger["generator_training_steps"]) != 16 * 4 * 400:
+        raise RuntimeError("Mechanical complete-episode generator budget is incomplete.")
 
     calibration = _read_json(output / "calibration" / "run_metadata.json")
     if int(calibration["calibration_partner_runs"]) != 2:
@@ -218,8 +232,8 @@ def _verify(output: Path) -> Mapping[str, Any]:
         "upstream_steps_per_run": 1_024,
         "delta_updates": int(training["update_count"]),
         "delta_trajectory_steps": int(training["effective_environment_steps"]),
-        "anchor_triggers": len(anchor_files),
-        "generator_snapshots": len(snapshots),
+        "signal_contract_fixture": str(output / "signal_contract_fixture.json"),
+        "checkpoint_identity_count": len(checkpoint_identities),
         "calibration_partner_runs": int(
             calibration["calibration_partner_runs"]
         ),
@@ -234,6 +248,71 @@ def _verify(output: Path) -> Mapping[str, Any]:
             "scientific hypothesis."
         ),
     }
+
+
+def _write_signal_contract_fixture(output: Path) -> None:
+    """Exercise every state-machine edge without manufacturing science data."""
+
+    def decision(name: str, passed: bool) -> GateDecision:
+        return GateDecision(
+            passed=passed,
+            statistic=1.0 if passed else -1.0,
+            lower_bound=0.5 if passed else -1.5,
+            upper_bound=1.5 if passed else -0.5,
+            sample_count=4,
+            random_domain=f"mechanical_fixture/{name}",
+            artifact_fingerprint=hashlib.sha256(name.encode("utf-8")).hexdigest(),
+            reason="synthetic path-coverage fixture; never a scientific decision",
+        )
+
+    qualification = SignalQualification()
+    phases = []
+    for name in ("C0", "C1", "C2", "C3", "C4"):
+        qualification = qualification.with_decision(name, decision(name, True))
+        phases.append(
+            phase_from_qualification(
+                qualification,
+                generator_admitted=(name == "C4"),
+            ).name
+        )
+    qualification = qualification.with_decision("C5", decision("C5", True))
+    phases.append(
+        phase_from_qualification(qualification, generator_admitted=True).name
+    )
+    failed = SignalQualification({"C0": decision("C0-failure", False)})
+    fixtures = {
+        "decision_irrelevant": fixture_contract_outcome(
+            decision_relevant=False,
+            history_identifiable=False,
+            regret_calibrated=False,
+        ),
+        "decision_relevant_unidentifiable": fixture_contract_outcome(
+            decision_relevant=True,
+            history_identifiable=False,
+            regret_calibrated=False,
+        ),
+        "decision_relevant_identifiable": fixture_contract_outcome(
+            decision_relevant=True,
+            history_identifiable=True,
+            regret_calibrated=True,
+        ),
+    }
+    write_json(output / "signal_contract_fixture.json", {
+        "qualified_path": {
+            "phases": phases,
+            "final_phase": phase_from_qualification(
+                qualification, generator_admitted=True
+            ).name,
+            "qualification": qualification.to_mapping(),
+        },
+        "fallback_path": {
+            "deployment_tier": deployment_tier(failed).value,
+            "qualification": failed.to_mapping(),
+        },
+        "three_registered_fixtures": fixtures,
+        "scientific_readout_allowed": False,
+        "note": "Path coverage only; no qualification statistic is inferred.",
+    })
 
 
 def run_mechanical_e2e(args: argparse.Namespace) -> None:
@@ -254,20 +333,31 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
             "choose a fresh output directory."
         )
     completed: list[str] = []
+    _write_signal_contract_fixture(output)
 
     upstream_root = output / "upstream"
     specifications = [
-        ("train_sp", "rnn-sp", 0, None),
-        ("train_op", "rnn-op", 0, None),
+        ("train_owner_sp", "rnn-sp", 0, None),
+        ("train_init_sp", "rnn-sp", 1, None),
+        ("train_init_op", "rnn-op", 2, None),
+        ("train_init_sa_surrogate", "rnn-sp", 3, None),
+        ("train_init_fcp_surrogate", "rnn-sp", 4, None),
+        ("train_development_sp", "rnn-sp", 5, None),
+        ("train_development_op", "rnn-op", 6, None),
     ]
     fixture_metadata: dict[str, tuple[int, tuple[int, int]]] = {}
     for index, label in enumerate(
         ("calibration_a", "calibration_b", "confirmatory_a", "confirmatory_b"),
-        start=2,
+        start=7,
     ):
         fixture_metadata[label] = mechanical_fixture_key(label)
         specifications.append(
-            (label, "rnn-sp", index, fixture_metadata[label][1])
+            (
+                label,
+                "rnn-sp",
+                mechanical_upstream_seed_slot(index),
+                fixture_metadata[label][1],
+            )
         )
     for label, algorithm, seed_index, key in specifications:
         _run(
@@ -286,22 +376,44 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
 
     train_key = tuple(official_training_key(0))
     train_runs: list[Mapping[str, Any]] = []
-    for label, mechanism in (("train_sp", "rnn-sp"), ("train_op", "rnn-op")):
+    owner_summary = _read_json(
+        upstream_root / "train_owner_sp" / "upstream_summary.json"
+    )
+    train_runs.append(
+        _plan_run(
+            run_id="mechanical_owner_sp",
+            role="owner_source",
+            checkpoint=str(owner_summary["checkpoint_paths"][-1]),
+            parent="mechanical_train_owner_sp_parent",
+            mechanism="rnn-sp",
+            seed=42,
+            seed_index=0,
+            key=train_key,
+            owner=None,
+        )
+    )
+    for label, mechanism, role, seed_index in (
+        ("train_init_sp", "rnn-sp", "generator_init_source", 1),
+        ("train_init_op", "rnn-op", "generator_init_source", 2),
+        ("train_init_sa_surrogate", "mechanical-sa-surrogate", "generator_init_source", 3),
+        ("train_init_fcp_surrogate", "mechanical-fcp-surrogate", "generator_init_source", 4),
+        ("train_development_sp", "rnn-sp", "development_support", 5),
+        ("train_development_op", "rnn-op", "development_support", 6),
+    ):
         summary = _read_json(upstream_root / label / "upstream_summary.json")
-        for checkpoint_index, checkpoint in enumerate(summary["checkpoint_paths"]):
-            train_runs.append(
-                _plan_run(
-                    run_id=f"mechanical_{label}_{checkpoint_index}",
-                    role="frozen_external_train",
-                    checkpoint=str(checkpoint),
-                    parent=f"mechanical_{label}_parent",
-                    mechanism=mechanism,
-                    seed=42,
-                    seed_index=0,
-                    key=train_key,
-                    owner=0,
-                )
+        train_runs.append(
+            _plan_run(
+                run_id=f"mechanical_{label}",
+                role=role,
+                checkpoint=str(summary["checkpoint_paths"][-1]),
+                parent=f"mechanical_{label}_parent",
+                mechanism=mechanism,
+                seed=42,
+                seed_index=seed_index,
+                key=tuple(official_training_key(seed_index)),
+                owner=None,
             )
+        )
     evaluation_runs: list[Mapping[str, Any]] = []
     for role, labels in (
         ("calibration", ("calibration_a", "calibration_b")),
@@ -320,7 +432,7 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
                     seed=seed,
                     seed_index=None,
                     key=key,
-                    owner=0 if role == "calibration" else None,
+                    owner=None,
                 )
             )
     plan = output / "partner_manifest_plan.json"
@@ -379,9 +491,9 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
             "--partner-manifest",
             str(manifest),
             "--ego-run-id",
-            "mechanical-e2e-seed-0",
+            "mechanical-e2e-engineering-seed",
             "--seed-index",
-            "0",
+            "-1",
             "--run-kind",
             "mechanical",
             "--output",
@@ -390,6 +502,31 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
         repository=repository,
         status_path=status_path,
         stage="delta-train",
+        completed=completed,
+    )
+    _run(
+        (
+            sys.executable,
+            "-m",
+            "experiments.overcooked_v2.path_c",
+            "train",
+            "--config",
+            str(config_path),
+            "--partner-manifest",
+            str(manifest),
+            "--ego-run-id",
+            "mechanical-e2e-engineering-seed",
+            "--seed-index",
+            "-1",
+            "--run-kind",
+            "mechanical",
+            "--output",
+            str(training),
+            "--resume",
+        ),
+        repository=repository,
+        status_path=status_path,
+        stage="delta-train-resume-noop",
         completed=completed,
     )
     calibration = output / "calibration"
@@ -406,7 +543,7 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
             "--training-run",
             str(training),
             "--seed-index",
-            "0",
+            "-1",
             "--run-kind",
             "mechanical",
             "--output",
@@ -454,4 +591,8 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
     print(f"Complete non-scientific mechanical E2E acceptance: {output}")
 
 
-__all__ = ["mechanical_fixture_key", "run_mechanical_e2e"]
+__all__ = [
+    "mechanical_fixture_key",
+    "mechanical_upstream_seed_slot",
+    "run_mechanical_e2e",
+]

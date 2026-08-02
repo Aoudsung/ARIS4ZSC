@@ -23,12 +23,17 @@ from src.path_c.anchor_sampling import collect_anchor_batch, gather_time_lanes
 from src.path_c.counterfactual_anchor import anchor_microbatch_candidates
 from src.path_c.belief_set_encoder import mixture_moments
 from src.path_c.decision_geometry import centered_action_values
-from src.path_c.calibration import calibrate_adaptation_gate, calibration_to_mapping
+from src.path_c.calibration import (
+    calibrate_adaptation_gate,
+    calibration_to_mapping,
+    empty_calibration,
+)
 from src.path_c.experiment import (
     METHOD_VERSION,
     load_config,
     load_partner_manifest,
     official_training_domain_keys,
+    validate_seed_signal_contract_manifest,
 )
 from src.path_c.external_partner import make_external_partner_functions
 from src.path_c.runner import collect_rollout, initialize_runner
@@ -59,12 +64,12 @@ def _host(value: Any) -> Any:
 
 def _batch_config(config: Any, *, num_envs: int, anchors: int | None = None) -> Any:
     environment = replace(config.environment, num_envs=int(num_envs))
-    anchor_config = (
-        config.anchors
+    calibration = (
+        config.calibration
         if anchors is None
-        else replace(config.anchors, states_per_interval=int(anchors))
+        else replace(config.calibration, anchors_per_run=int(anchors))
     )
-    return replace(config, environment=environment, anchors=anchor_config)
+    return replace(config, environment=environment, calibration=calibration)
 
 
 def _collect_fixed_partner_rollout(
@@ -103,13 +108,11 @@ def _collect_fixed_partner_rollout(
         environment=environment,
         model=deployment.model,
         params=deployment.params,
+        target_params=deployment.params,
         model_config=config.model,
         partner_functions=partner_functions,
         partner_parameters=None,
         gate_values=jnp.ones((config.environment.num_envs,), dtype=jnp.float32),
-        teacher_lane_mask=jnp.zeros(
-            (config.environment.num_envs,), dtype=jnp.bool_
-        ),
         official_shaping_factor=0.0,
     )
     return environment, partner_functions, runner, batch, records
@@ -165,10 +168,16 @@ def run_calibration(args: argparse.Namespace) -> None:
         expected_layout=config.environment.layout,
         verify_files=not bool(args.skip_manifest_hash_check),
     )
+    validate_seed_signal_contract_manifest(
+        manifest,
+        owner_seed_index=int(args.seed_index),
+        formal=(config.run_kind == "formal"),
+    )
     calibration_runs = tuple(
         run
         for run in manifest.by_role("calibration")
-        if run.owner_seed_index == int(args.seed_index)
+        if run.owner_seed_index
+        == (None if int(args.seed_index) < 0 else int(args.seed_index))
     )
     if config.run_kind == "formal":
         unowned = [
@@ -181,8 +190,10 @@ def run_calibration(args: argparse.Namespace) -> None:
                 "Formal calibration partners must bind one DELTA outer run: "
                 f"{unowned}"
             )
-    if len({run.parent_training_run_id for run in calibration_runs}) < config.calibration.minimum_run_count:
-        raise ValueError("Partner manifest does not meet the calibration run count.")
+    independent_run_count = len(
+        {run.parent_training_run_id for run in calibration_runs}
+    )
+    insufficient_blocks = independent_run_count < config.calibration.minimum_run_count
     output = Path(args.output).resolve()
     ensure_run_identity(
         output,
@@ -200,6 +211,42 @@ def run_calibration(args: argparse.Namespace) -> None:
         deployment=deployment,
     )
 
+    if insufficient_blocks:
+        deployable_fingerprint = pytree_fingerprint(
+            deployable_parameters(deployment.params)
+        )
+        artifact = empty_calibration(
+            latent_dim=config.model.latent_dim,
+            alpha=config.calibration.alpha,
+            model_fingerprint=deployable_fingerprint,
+        )
+        write_json(output / "calibration.json", calibration_to_mapping(artifact))
+        deployment_bundle = export_deployment_bundle(
+            output / "deployment",
+            source_training_run=args.training_run,
+            deployment=deployment,
+            calibration=artifact,
+        )
+        write_json(
+            output / "run_metadata.json",
+            {
+                "method": METHOD_VERSION,
+                "seed_index": int(args.seed_index),
+                "calibration_partner_runs": independent_run_count,
+                "calibration_anchor_rows": 0,
+                "artifact": calibration_to_mapping(artifact),
+                "deployment_bundle": str(deployment_bundle),
+                "abstained_to_base": True,
+                "reason": (
+                    f"effective partner-run blocks {independent_run_count} < "
+                    f"registered minimum {config.calibration.minimum_run_count}"
+                ),
+                "scientific_readout_allowed": False,
+            },
+        )
+        print(f"Insufficient calibration blocks; exported abstaining base: {deployment_bundle}")
+        return
+
     predicted_rows = []
     empirical_rows = []
     latent_rows = []
@@ -213,7 +260,10 @@ def run_calibration(args: argparse.Namespace) -> None:
     candidates = anchor_microbatch_candidates(
         maximum_anchor_worlds=config.calibration.anchors_per_run,
         action_count=6,
-        replicas=config.anchors.fit_replicas + config.anchors.evaluation_replicas,
+        replicas=(
+            config.anchors.audit_fit_replicas
+            + config.anchors.audit_evaluation_replicas
+        ),
     )
     counterfactual_steps = 0
     rollout_steps = 0
@@ -254,7 +304,9 @@ def run_calibration(args: argparse.Namespace) -> None:
                 try:
                     anchors, unused_quotient, unused_codes, indexes = (
                         collect_anchor_batch(
-                            **collection_kwargs, microbatch_size=int(candidate)
+                            **collection_kwargs,
+                            mode="calibration",
+                            microbatch_size=int(candidate),
                         )
                     )
                     leaves = jax.tree_util.tree_leaves(anchors)
@@ -290,14 +342,19 @@ def run_calibration(args: argparse.Namespace) -> None:
             )
         else:
             anchors, unused_quotient, unused_codes, indexes = collect_anchor_batch(
-                **collection_kwargs, microbatch_size=microbatch_size
+                **collection_kwargs,
+                mode="calibration",
+                microbatch_size=microbatch_size,
             )
         del unused_quotient, unused_codes
         counterfactual_steps += (
             int(anchors.anchor_ids.shape[0])
             * 6
-            * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
-            * config.anchors.continuation_horizon
+            * (
+                config.anchors.audit_fit_replicas
+                + config.anchors.audit_evaluation_replicas
+            )
+            * config.anchors.audit_continuation_horizon
         )
         predicted = centered_action_values(
             gather_time_lanes(records["action_values"], indexes)
@@ -344,7 +401,7 @@ def run_calibration(args: argparse.Namespace) -> None:
         support_quantile=config.calibration.support_quantile,
         return_lower_bound=config.anchors.return_lower_bound,
         return_upper_bound=config.anchors.return_upper_bound,
-        evaluation_replicas=config.anchors.evaluation_replicas,
+        evaluation_replicas=config.anchors.audit_evaluation_replicas,
         action_count=6,
         model_fingerprint=pytree_fingerprint(
             deployable_parameters(deployment.params)

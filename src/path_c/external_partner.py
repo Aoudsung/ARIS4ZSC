@@ -93,22 +93,6 @@ def make_external_partner_functions(
         )
         return tree_select(done, fresh, state)
 
-    def pre_teacher_latent(parameters: Any, state: Any, task_features: Any) -> Any:
-        del parameters, state
-        return jnp.full(
-            task_features.shape[:-1] + (int(latent_dim),),
-            jnp.nan,
-            dtype=jnp.float32,
-        )
-
-    def teacher_latent(parameters: Any, state: Any, context: Any, task_features: Any) -> Any:
-        del parameters, state, context
-        return jnp.full(
-            task_features.shape[:-1] + (int(latent_dim),),
-            jnp.nan,
-            dtype=jnp.float32,
-        )
-
     def run_id(parameters: Any, state: ExternalPartnerState, context: Any) -> Any:
         del parameters, context
         values = jnp.broadcast_to(run_template, state.member.shape)
@@ -130,8 +114,6 @@ def make_external_partner_functions(
         initial_state=initial_state,
         step=step,
         observe=observe,
-        pre_teacher_latent=pre_teacher_latent,
-        teacher_latent=teacher_latent,
         run_id=run_id,
         diagnostics=diagnostics,
     )

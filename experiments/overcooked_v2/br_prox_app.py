@@ -384,6 +384,11 @@ def empirical_local_br_prox_pairing(
             partner_policy_step=partner_policy_step,
             partner_observe=partner_observe,
             environment_step=environment_step_ego_first,
+            # BR-Prox uses full 400-step empirical continuations and therefore
+            # has no truncated target-policy bootstrap component.
+            ego_endpoint_value=lambda state, observation, gate: jnp.zeros(
+                (observation.shape[0],), dtype=jnp.float32
+            ),
         ),
         action_count=6,
         fit_replicas=config.evaluation.br_prox_fit_replicas,

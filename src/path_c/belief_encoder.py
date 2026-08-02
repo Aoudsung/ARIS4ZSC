@@ -6,13 +6,12 @@ from typing import Any
 
 _BELIEF_CELL: Any | None = None
 _BELIEF_SCAN: Any | None = None
-_FULL_TEACHER: Any | None = None
 
 
-def belief_encoder_classes() -> tuple[Any, Any, Any]:
-    global _BELIEF_CELL, _BELIEF_SCAN, _FULL_TEACHER
+def belief_encoder_classes() -> tuple[Any, Any]:
+    global _BELIEF_CELL, _BELIEF_SCAN
     if _BELIEF_CELL is not None:
-        return _BELIEF_CELL, _BELIEF_SCAN, _FULL_TEACHER
+        return _BELIEF_CELL, _BELIEF_SCAN
 
     import flax.linen as nn
     import jax.numpy as jnp
@@ -140,103 +139,9 @@ def belief_encoder_classes() -> tuple[Any, Any, Any]:
         out_axes=0,
     )
 
-    class TeacherGRUCell(nn.Module):
-        hidden_dim: int
-
-        @nn.compact
-        def __call__(self, carry: Any, item: Any) -> tuple[Any, Any]:
-            return nn.GRUCell(
-                features=self.hidden_dim,
-                name="cell",
-            )(carry, item)
-
-    ScannedTeacherGRU = nn.scan(
-        TeacherGRUCell,
-        variable_broadcast="params",
-        split_rngs={"params": False},
-        in_axes=0,
-        out_axes=0,
-    )
-
-    class FullTrajectoryTeacherEncoder(nn.Module):
-        """Training-only bidirectional full-trajectory context teacher."""
-
-        hidden_dim: int
-        latent_dim: int
-        action_count: int
-        action_embedding_dim: int
-
-        @nn.compact
-        def __call__(
-            self,
-            observations: Any,
-            response_next_observations: Any,
-            actions: Any,
-            rewards: Any,
-            dones: Any,
-        ) -> Any:
-            obs = jnp.asarray(observations, dtype=jnp.float32)
-            response_next = jnp.asarray(
-                response_next_observations, dtype=jnp.float32
-            )
-            action = jnp.asarray(actions, dtype=jnp.int32)
-            reward = jnp.asarray(rewards, dtype=jnp.float32)
-            done = jnp.asarray(dones, dtype=jnp.float32)
-            if obs.shape[0] != action.shape[0] + 1:
-                raise ValueError("Teacher recurrent observations require T+1 states.")
-            if response_next.shape[0] != action.shape[0]:
-                raise ValueError("Teacher response observations require T states.")
-            flat_current = obs[:-1].reshape(action.shape + (-1,))
-            flat_next = response_next.reshape(action.shape + (-1,))
-            action_embedding = nn.Embed(
-                num_embeddings=self.action_count,
-                features=self.action_embedding_dim,
-                embedding_init=nn.initializers.normal(0.02),
-                name="teacher_action_embedding",
-            )(action)
-            evidence = jnp.concatenate(
-                (
-                    flat_current,
-                    flat_next,
-                    flat_next - flat_current,
-                    action_embedding,
-                    reward[..., None],
-                    done[..., None],
-                ),
-                axis=-1,
-            )
-            evidence = nn.relu(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="teacher_evidence_projection",
-                )(evidence)
-            )
-            batch_shape = evidence.shape[1:-1]
-            initial = jnp.zeros(batch_shape + (self.hidden_dim,), dtype=jnp.float32)
-            unused_forward_carry, forward = ScannedTeacherGRU(
-                hidden_dim=self.hidden_dim,
-                name="teacher_forward_gru",
-            )(initial, evidence)
-            unused_backward_carry, backward_reversed = ScannedTeacherGRU(
-                hidden_dim=self.hidden_dim,
-                name="teacher_backward_gru",
-            )(initial, evidence[::-1])
-            del unused_forward_carry, unused_backward_carry
-            backward = backward_reversed[::-1]
-            joined = jnp.concatenate((forward, backward), axis=-1)
-            return nn.Dense(
-                self.latent_dim,
-                kernel_init=orthogonal(0.01),
-                bias_init=zeros,
-                name="teacher_latent",
-            )(joined)
-
     _BELIEF_CELL = PartnerBeliefCell
     _BELIEF_SCAN = ScannedPartnerBelief
-    _FULL_TEACHER = FullTrajectoryTeacherEncoder
-    return PartnerBeliefCell, ScannedPartnerBelief, FullTrajectoryTeacherEncoder
+    return PartnerBeliefCell, ScannedPartnerBelief
 
 
 def initial_belief_carry(batch_size: int, hidden_dim: int) -> Any:

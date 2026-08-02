@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, NamedTuple
+from typing import Any, NamedTuple
 
 from .counterfactual_anchor import tree_select
 from .partner_generator import initial_generator_carry, sample_partner_codes
@@ -12,7 +12,6 @@ from .runner import PartnerFunctions
 class MixedPartnerParameters(NamedTuple):
     generator_params: Any
     snapshot_params: Any
-    teacher_params: Any
 
 
 class MixedPartnerState(NamedTuple):
@@ -50,7 +49,6 @@ def make_mixed_partner_functions(
     current_probability: float,
     snapshot_probability: float,
     frozen_external_probability: float,
-    teacher_latent_apply: Callable[[Any, Any, Any], Any],
 ) -> PartnerFunctions:
     """Build one immutable partner runtime used by training rollouts."""
 
@@ -267,29 +265,6 @@ def make_mixed_partner_functions(
         )
         return tree_select(done, fresh, state)
 
-    def pre_teacher_latent(
-        parameters: MixedPartnerParameters,
-        state: MixedPartnerState,
-        task_features: Any,
-    ) -> Any:
-        latent = teacher_latent_apply(
-            parameters.teacher_params, state.code, task_features
-        )
-        valid = state.source != 2
-        return jnp.where(valid[..., None], latent, jnp.nan)
-
-    def teacher_latent(
-        parameters: MixedPartnerParameters,
-        state: MixedPartnerState,
-        context: MixedPartnerContext,
-        task_features: Any,
-    ) -> Any:
-        latent = teacher_latent_apply(
-            parameters.teacher_params, context.code, task_features
-        )
-        valid = context.source != 2
-        return jnp.where(valid[..., None], latent, jnp.nan)
-
     def run_id(
         parameters: MixedPartnerParameters,
         state: MixedPartnerState,
@@ -323,8 +298,6 @@ def make_mixed_partner_functions(
         initial_state=initial_state,
         step=step,
         observe=observe,
-        pre_teacher_latent=pre_teacher_latent,
-        teacher_latent=teacher_latent,
         run_id=run_id,
         diagnostics=diagnostics,
     )

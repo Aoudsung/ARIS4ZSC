@@ -52,12 +52,12 @@ def test_deployment_parameter_whitelist_excludes_training_only_subtrees() -> Non
         name: {"weight": np.asarray([index], dtype=np.float32)}
         for index, name in enumerate(DEPLOYABLE_PARAM_NAMES)
     }
-    params["code_teacher"] = {"secret": np.asarray([1.0])}
-    params["full_trajectory_teacher"] = {"secret": np.asarray([2.0])}
+    params["partner_generator"] = {"secret": np.asarray([1.0])}
+    params["optimizer_state"] = {"secret": np.asarray([2.0])}
     pruned = deployable_parameters(params)
     assert tuple(pruned) == DEPLOYABLE_PARAM_NAMES
-    assert "code_teacher" not in pruned
-    assert "full_trajectory_teacher" not in pruned
+    assert "partner_generator" not in pruned
+    assert "optimizer_state" not in pruned
 
     incomplete = dict(params)
     incomplete.pop("universal_actor")

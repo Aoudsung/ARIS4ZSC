@@ -66,6 +66,9 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
             partner_policy_step=partner_policy_step,
             partner_observe=partner_observe,
             environment_step=environment_step,
+            ego_endpoint_value=lambda state, observation, gate: jnp.zeros(
+                (observation.shape[0],), dtype=jnp.float32
+            ),
         ),
         action_count=3,
         fit_replicas=3,

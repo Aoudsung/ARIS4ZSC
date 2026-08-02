@@ -7,17 +7,18 @@ for a formal DELTA run.
 A formal manifest is generated separately for each layout and must bind, for
 each DELTA outer seed index `0..9`:
 
-- one independent Official RNN-SP parent and its three registered checkpoints;
-- one independent Official RNN-OP parent and its three registered checkpoints;
-- at least nineteen independent calibration parent runs owned only by that
-  outer seed;
+- one independent owner-SP source checkpoint;
+- one independent generator-initialization run from each of SP, OP,
+  State-Augmented and FCP;
+- four independent development/support runs from each of those mechanisms;
+- five independent calibration runs from each mechanism (20 blocks total);
 - the exact checkpoint SHA-256, parent-run lineage, generation mechanism, and
   real JAX key derived from `split(PRNGKey(42), 10)`.
 
 Plan schema version 2 requires the two-word `jax_prng_key` explicitly. The
-builder never derives or substitutes an unregistered seed. DELTA's frozen
-Official SP/OP support must use the matching split-of-42 key; fresh calibration
-and common-panel partners must record their independently registered keys.
+builder never derives or substitutes an unregistered seed. Owner and upstream
+sources must use their registered keys; development, calibration and common-panel
+partners must record independent frozen keys and lineage.
 
 The Common-Partner Scoreboard uses another manifest. It contains exactly four
 fresh parent runs from each of `sp`, `state-augmented`, `op`, and `fcp`; none may

@@ -38,7 +38,7 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
         / "delta_zsc_simple_development.yaml",
         run_kind="mechanical",
     )
-    observation_shape = (5, 5, 8)
+    observation_shape = (5, 5, 39)
     model = build_model(
         observation_shape=observation_shape,
         action_count=6,
@@ -57,8 +57,6 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
                 "action_embedding_dim",
                 "log_variance_minimum",
                 "log_variance_maximum",
-                "response_log_std_minimum",
-                "response_log_std_maximum",
             )
         },
     )
@@ -80,7 +78,7 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
         partner_code_dim=config.partner_generator.code_dim,
     )
     task = params["task_encoder"]
-    assert task["official_conv_0"]["kernel"].shape == (1, 1, 8, 128)
+    assert task["official_conv_0"]["kernel"].shape == (1, 1, 39, 128)
     assert task["official_conv_1"]["kernel"].shape == (1, 1, 128, 128)
     assert task["official_conv_2"]["kernel"].shape == (1, 1, 128, 8)
     assert task["official_conv_3"]["kernel"].shape == (3, 3, 8, 16)
@@ -97,6 +95,7 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
     )
     assert output.execution_logits.shape == (2, 6)
     assert output.action_values.shape == (2, 6)
+    assert output.raw_q1.shape == output.raw_q2.shape == (2, 6)
     response = model.apply(
         {"params": params},
         output.task_features,
@@ -104,7 +103,10 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
         jnp.asarray([0, 5], dtype=jnp.int32),
         method=model.response_from_context_and_action,
     )
-    assert response.observation_delta_mean.shape == (2,) + observation_shape
+    assert response.visibility_logit.shape == (2,)
+    assert response.relative_position_logits.shape == (2, 26)
+    assert response.direction_logits.shape == (2, 4)
+    assert response.inventory_logits.shape == (2, 5, 4)
     assert np.all(np.isfinite(np.asarray(output.execution_logits)))
 
     final_state, sequence_output = model.apply(
@@ -146,9 +148,13 @@ def test_model_initialization_forward_and_minimal_gradient_update() -> None:
     )
 
     assert set(DEPLOYABLE_PARAM_NAMES).issubset(params)
-    assert "code_teacher" in params
-    assert "full_trajectory_teacher" in params
+    assert "code_teacher" not in params
+    assert "full_trajectory_teacher" not in params
     assert set(deployable_parameters(params)) == set(DEPLOYABLE_PARAM_NAMES)
+
+    residual_output = params["universal_actor"]["context_residual"]["residual_logits"]
+    np.testing.assert_array_equal(np.asarray(residual_output["kernel"]), 0.0)
+    np.testing.assert_array_equal(np.asarray(residual_output["bias"]), 0.0)
 
     def objective(candidate):
         _, current = model.apply(
@@ -182,7 +188,7 @@ def test_deployable_belief_never_consumes_unavailable_transition_reward() -> Non
         / "delta_zsc_simple_development.yaml",
         run_kind="mechanical",
     )
-    observation_shape = (5, 5, 8)
+    observation_shape = (5, 5, 39)
     state = initial_policy_state(
         batch_size=2,
         observation_shape=observation_shape,

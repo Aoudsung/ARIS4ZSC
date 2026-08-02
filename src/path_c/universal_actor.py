@@ -52,7 +52,11 @@ def universal_actor_class() -> Any:
             )
             return nn.Dense(
                 self.output_dim,
-                kernel_init=orthogonal(0.01),
+                # C0 requires exact base equivalence before any conditional
+                # coupling.  Zeroing the last layer makes gate=0 and gate=1
+                # identical at initialization without disabling upstream
+                # representation learning.
+                kernel_init=zeros,
                 bias_init=zeros,
                 name="residual_logits",
             )(interaction)

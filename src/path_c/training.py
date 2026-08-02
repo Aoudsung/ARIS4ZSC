@@ -4,13 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .decision_geometry import (
-    centered_action_values,
-    quotient_geometry_loss,
-)
-from .response_decoder import (
-    bernoulli_logit_loss,
-    gaussian_negative_log_likelihood,
+from .response_targets import (
+    PartnerResponseTargets,
+    structured_partner_response_loss,
 )
 from .types import (
     CounterfactualAnchorBatch,
@@ -24,6 +20,7 @@ from .types import (
 
 
 def gather_actions(values: Any, actions: Any, *, action_axis: int = -1) -> Any:
+    import jax
     import jax.numpy as jnp
 
     source = jnp.asarray(values)
@@ -60,6 +57,49 @@ def categorical_entropy(logits: Any) -> Any:
     log_probs = jax.nn.log_softmax(logits, axis=-1)
     probabilities = jnp.exp(log_probs)
     return -jnp.sum(probabilities * log_probs, axis=-1)
+
+
+def stable_root_mean_square(values: Any) -> Any:
+    """Return an RMS with a finite derivative at the all-zero origin.
+
+    The conditional residual is deliberately initialized to exactly zero.
+    ``sqrt(mean(x**2))`` has an infinite derivative at that point; composing
+    it with an inactive hinge still produces ``0 * inf == NaN`` in reverse
+    mode.  Adding the smallest positive normal float preserves the RMS at all
+    scientifically relevant scales while making the zero-residual gradient
+    finite.  This is a numerical definition at a non-differentiable point,
+    not a loss, model, or budget change.
+    """
+
+    import jax.numpy as jnp
+
+    array = jnp.asarray(values, dtype=jnp.float32)
+    mean_square = jnp.mean(jnp.square(array))
+    return jnp.sqrt(mean_square + jnp.finfo(array.dtype).tiny)
+
+
+def conditional_entropy_noncollapse_penalty(
+    base_logits: Any,
+    conditional_logits: Any,
+    mask: Any,
+    *,
+    tolerance: float = 0.1,
+) -> Any:
+    """Relative entropy floor without any fixed high-entropy target."""
+
+    import jax.numpy as jnp
+
+    base_entropy = categorical_entropy(base_logits)
+    conditional_entropy = categorical_entropy(conditional_logits)
+    weight = jnp.asarray(mask, dtype=jnp.float32)
+    denominator = jnp.maximum(jnp.sum(weight), 1.0)
+    return jnp.sum(
+        weight
+        * jnp.maximum(
+            base_entropy - float(tolerance) - conditional_entropy,
+            0.0,
+        )
+    ) / denominator
 
 
 def generalized_advantage_estimation(
@@ -189,238 +229,46 @@ def gaussian_mixture_kl_upper_bound(
 def response_prediction_loss(
     *,
     prediction: Any,
-    observations: Any,
-    response_next_observations: Any,
-    rewards: Any,
-    dones: Any,
+    targets: PartnerResponseTargets,
 ) -> Any:
-    import jax.numpy as jnp
-
-    target_delta = jnp.asarray(
-        response_next_observations - observations[:-1], dtype=jnp.float32
-    )
-    observation_nll = gaussian_negative_log_likelihood(
-        target_delta,
-        prediction.observation_delta_mean,
-        prediction.observation_delta_log_std,
-    )
-    reward_nll = gaussian_negative_log_likelihood(
-        rewards, prediction.reward_mean, prediction.reward_log_std
-    )
-    done_nll = bernoulli_logit_loss(dones, prediction.done_logit)
-    obs_axes = tuple(range(observation_nll.ndim - len(observations.shape[2:]), observation_nll.ndim))
-    observation_item = jnp.mean(observation_nll, axis=obs_axes) if obs_axes else observation_nll
-    return jnp.mean(observation_item + reward_nll + done_nll)
+    return structured_partner_response_loss(prediction, targets).total
 
 
-def compute_teacher_latents(
+def base_behavior_distillation_loss(
     *,
     model: Any,
-    params: Mapping[str, Any],
+    params: Any,
     batch: RolloutBatch,
-    task_features: Any,
-) -> Any:
-    """Recompute privileged contexts under the candidate parameters.
+    owner_logits: Any,
+) -> tuple[Any, Mapping[str, Any]]:
+    """Distil the independent owner-SP using only its legal policy surface."""
 
-    Generator and snapshot lanes use the training-only code teacher.  Frozen
-    external lanes use the bidirectional full-trajectory teacher.  The returned
-    value is not a partner identity label; it is optimized only through real
-    return/action-value objectives and is detached when used as a posterior
-    target.
-    """
-
+    import jax
     import jax.numpy as jnp
 
-    code_teacher = model.apply(
+    _, output = model.apply(
         {"params": params},
-        batch.partner_codes,
-        task_features,
-        method=model.latent_from_code,
-    )
-    full_teacher = model.apply(
-        {"params": params},
+        batch.initial_policy_state,
         batch.observations,
-        batch.response_next_observations,
-        batch.actions,
-        batch.rewards,
-        batch.dones,
-        method=model.full_trajectory_latents,
+        batch.previous_actions,
+        batch.previous_rewards,
+        batch.episode_starts,
+        jnp.zeros_like(batch.gate_overrides),
+        method=model.sequence,
     )
-    external = jnp.asarray(batch.partner_sources, dtype=jnp.int32) == 2
-    return jnp.where(external[..., None], full_teacher, code_teacher)
-
-
-def _gather_flat_time_lanes(values: Any, indexes: Any) -> Any:
-    import jax
-    import jax.numpy as jnp
-
-    index = jnp.asarray(indexes, dtype=jnp.int32)
-
-    def one(value: Any) -> Any:
-        array = jnp.asarray(value)
-        flat = array.reshape((array.shape[0] * array.shape[1],) + array.shape[2:])
-        return flat[index]
-
-    return jax.tree_util.tree_map(one, values)
-
-
-def counterfactual_anchor_loss(
-    *,
-    model: Any,
-    params: Mapping[str, Any],
-    teacher_latents: Any,
-    anchors: CounterfactualAnchorBatch,
-) -> tuple[Any, Any, Mapping[str, Any]]:
-    """Real-return anchor loss for both online and privileged contexts.
-
-    Re-running ``model.step`` from the stored legal policy state gives gradients
-    to the task encoder, belief encoder, and critic.  The privileged branch gives
-    gradients to the code/full-trajectory teacher and the same shared critic.
-    """
-
-    import jax
-    import jax.numpy as jnp
-
-    unused_state, online = model.apply(
-        {"params": params},
-        anchors.policy_states,
-        anchors.observations,
-        jnp.ones(anchors.partner_sources.shape, dtype=jnp.float32),
-        method=model.step,
-    )
-    del unused_state
-    flat_teacher = _gather_flat_time_lanes(
-        teacher_latents, anchors.rollout_flat_indexes
-    )
-    # Intervention anchors may use codes that do not occur in the original
-    # rollout.  Recompute those contexts from their own code and online task
-    # feature; ordinary external anchors retain the full-trajectory teacher.
-    code_teacher = model.apply(
-        {"params": params},
-        anchors.partner_codes,
-        online.task_features,
-        method=model.latent_from_code,
-    )
-    external = jnp.asarray(anchors.partner_sources, dtype=jnp.int32) == 2
-    anchor_teacher_latent = jnp.where(
-        external[..., None], flat_teacher, code_teacher
-    )
-    teacher = model.apply(
-        {"params": params},
-        online.task_features,
-        anchor_teacher_latent,
-        1.0,
-        method=model.from_features_and_latent,
-    )
-    target = jax.lax.stop_gradient(
-        centered_action_values(anchors.fit_returns_by_action)
-    )
-    mask = jnp.asarray(anchors.action_mask, dtype=jnp.float32)
-    online_predicted = centered_action_values(online.action_values)
-    teacher_predicted = centered_action_values(teacher.action_values)
-    online_items = huber(online_predicted - target) * mask
-    teacher_items = huber(teacher_predicted - target) * mask
-    denominator = jnp.maximum(jnp.sum(mask), 1.0e-8)
-    online_loss = jnp.sum(online_items) / denominator
-    teacher_loss = jnp.sum(teacher_items) / denominator
-    loss = online_loss + teacher_loss
-
-    selected = jnp.argmax(online_predicted, axis=-1)
-    fit_selected = gather_actions(anchors.fit_returns_by_action, selected)
-    evaluation_selected = gather_actions(
-        anchors.evaluation_returns_by_action, selected
-    )
-    oracle = jnp.argmax(anchors.fit_returns_by_action, axis=-1)
-    evaluation_oracle = gather_actions(
-        anchors.evaluation_returns_by_action, oracle
-    )
-    return loss, anchor_teacher_latent, {
-        "counterfactual_loss": loss,
-        "counterfactual_online_loss": online_loss,
-        "counterfactual_teacher_loss": teacher_loss,
-        "counterfactual_selected_eval_return": jnp.mean(evaluation_selected),
-        "counterfactual_oracle_eval_return": jnp.mean(evaluation_oracle),
-        "counterfactual_selection_regret": jnp.mean(
-            evaluation_oracle - evaluation_selected
-        ),
-        "counterfactual_fit_eval_gap": jnp.mean(
-            fit_selected - evaluation_selected
-        ),
+    source = jax.nn.softmax(jnp.asarray(owner_logits, dtype=jnp.float32), axis=-1)
+    candidate_log = jax.nn.log_softmax(output.base_logits[:-1], axis=-1)
+    source_log = jax.nn.log_softmax(jnp.asarray(owner_logits, dtype=jnp.float32), axis=-1)
+    if source.shape != candidate_log.shape:
+        raise ValueError("Owner-SP logits do not align with the legal DELTA history.")
+    mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    pointwise = jnp.sum(source * (source_log - candidate_log), axis=-1)
+    loss = jnp.sum(mask * pointwise) / jnp.maximum(jnp.sum(mask), 1.0)
+    residual_rms = jnp.sqrt(jnp.mean(jnp.square(output.residual_logits[:-1])))
+    return loss, {
+        "base_distillation_kl": loss,
+        "base_distillation_residual_rms": residual_rms,
     }
-
-def teacher_student_losses(
-    *,
-    model: Any,
-    params: Mapping[str, Any],
-    task_features: Any,
-    student_logits: Any,
-    student_action_values: Any,
-    teacher_latents: Any,
-) -> tuple[Any, Any, Mapping[str, Any]]:
-    import jax
-    import jax.numpy as jnp
-
-    teacher_latent = jnp.asarray(teacher_latents, dtype=jnp.float32)
-    valid = jnp.all(jnp.isfinite(teacher_latent), axis=-1)
-    safe = jnp.where(valid[..., None], teacher_latent, 0.0)
-    teacher = model.apply(
-        {"params": params},
-        task_features,
-        safe,
-        1.0,
-        method=model.from_features_and_latent,
-    )
-    teacher_q = centered_action_values(teacher.action_values)
-    student_q = centered_action_values(student_action_values)
-    advantage_item = jnp.mean(jnp.square(student_q - jax.lax.stop_gradient(teacher_q)), axis=-1)
-    teacher_log = jax.lax.stop_gradient(
-        jax.nn.log_softmax(teacher.logits, axis=-1)
-    )
-    student_log = jax.nn.log_softmax(student_logits, axis=-1)
-    teacher_prob = jax.lax.stop_gradient(jnp.exp(teacher_log))
-    teacher_best = jnp.max(teacher.action_values, axis=-1)
-    sorted_q = jnp.sort(teacher.action_values, axis=-1)
-    margin = jax.lax.stop_gradient(jnp.maximum(teacher_best - sorted_q[..., -2], 0.0))
-    policy_item = margin * jnp.sum(teacher_prob * (teacher_log - student_log), axis=-1)
-    denominator = jnp.sum(valid.astype(jnp.float32)) + 1.0e-8
-    advantage = jnp.sum(advantage_item * valid) / denominator
-    policy = jnp.sum(policy_item * valid) / denominator
-    return advantage, policy, {
-        "advantage_distill_loss": advantage,
-        "policy_distill_loss": policy,
-        "teacher_valid_fraction": jnp.mean(valid.astype(jnp.float32)),
-        "teacher_action_margin": jnp.sum(margin * valid) / denominator,
-    }
-
-
-def posterior_consistency_loss(
-    *,
-    mixture_logits: Any,
-    means: Any,
-    log_variances: Any,
-    teacher_latents: Any,
-) -> Any:
-    """Negative mixture log-likelihood of a full-information teacher context."""
-
-    import jax
-    import jax.numpy as jnp
-
-    target = jax.lax.stop_gradient(
-        jnp.asarray(teacher_latents, dtype=jnp.float32)
-    )
-    valid = jnp.all(jnp.isfinite(target), axis=-1)
-    safe = jnp.where(valid[..., None], target, 0.0)
-    log_weights = jax.nn.log_softmax(mixture_logits, axis=-1)
-    log_var = jnp.asarray(log_variances, dtype=jnp.float32)
-    difference = safe[..., None, :] - jnp.asarray(means, dtype=jnp.float32)
-    component_log_prob = -0.5 * jnp.sum(
-        jnp.square(difference) * jnp.exp(-log_var)
-        + log_var
-        + jnp.log(2.0 * jnp.pi),
-        axis=-1,
-    )
-    log_prob = jax.scipy.special.logsumexp(log_weights + component_log_prob, axis=-1)
-    return -jnp.sum(log_prob * valid) / (jnp.sum(valid) + 1.0e-8)
 
 
 def compute_loss(
@@ -432,7 +280,18 @@ def compute_loss(
     anchors: CounterfactualAnchorBatch | None = None,
     quotient_pairs: QuotientPairBatch | None = None,
 ) -> LossBundle:
+    """PPO-only loss for r3.
+
+    Raw-Q/anchors, structured response and generator PPO have independent
+    optimizers and are invoked by the lifecycle in that fixed order.  Passing
+    anchor data into the PPO executable is therefore a hard error.
+    """
+
+    import jax
     import jax.numpy as jnp
+
+    if anchors is not None or quotient_pairs is not None:
+        raise ValueError("r3 anchor/replay updates must not run inside a PPO minibatch.")
 
     unused_final, output = model.apply(
         {"params": params},
@@ -452,15 +311,38 @@ def compute_loss(
         gamma=config.ppo.gamma,
         gae_lambda=config.ppo.gae_lambda,
     )
-    actor, actor_metrics = ppo_actor_loss(
-        logits=output.execution_logits[:-1],
+    gate = jnp.asarray(batch.gate_overrides[:-1] > 0.5, dtype=jnp.float32)
+    valid = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    base_mask = valid * (1.0 - gate)
+    conditional_mask = valid * gate
+    # Base-role PPO owns the base actor.  Conditional-role PPO owns only the
+    # residual; stop-gradient prevents conditional data from moving the base.
+    conditional_training_logits = (
+        jax.lax.stop_gradient(output.base_logits[:-1])
+        + output.residual_logits[:-1]
+    )
+    base_actor, base_actor_metrics = ppo_actor_loss(
+        logits=output.base_logits[:-1],
         actions=batch.actions,
         old_log_probabilities=batch.old_log_probabilities,
         advantages=advantages,
         clip_epsilon=config.ppo.clip_epsilon,
         normalize_advantages=config.ppo.normalize_advantages,
-        mask=batch.ppo_mask,
+        mask=base_mask,
     )
+    conditional_actor, conditional_actor_metrics = ppo_actor_loss(
+        logits=conditional_training_logits,
+        actions=batch.actions,
+        old_log_probabilities=batch.old_log_probabilities,
+        advantages=advantages,
+        clip_epsilon=config.ppo.clip_epsilon,
+        normalize_advantages=config.ppo.normalize_advantages,
+        mask=conditional_mask,
+    )
+    valid_count = jnp.maximum(jnp.sum(valid), 1.0)
+    base_fraction = jnp.sum(base_mask) / valid_count
+    conditional_fraction = jnp.sum(conditional_mask) / valid_count
+    actor = base_fraction * base_actor + conditional_fraction * conditional_actor
     value = clipped_value_loss(
         predictions=output.state_value[:-1],
         old_predictions=batch.old_values[:-1],
@@ -468,112 +350,90 @@ def compute_loss(
         clip_epsilon=config.ppo.value_clip_epsilon,
         mask=batch.ppo_mask,
     )
-    entropy_items = categorical_entropy(output.execution_logits[:-1])
-    entropy = jnp.sum(entropy_items * batch.ppo_mask) / jnp.maximum(
-        jnp.sum(batch.ppo_mask), 1.0e-8
-    )
-    response_prediction = model.apply(
-        {"params": params},
-        output.task_features[:-1],
-        output.belief_embedding[:-1],
-        batch.actions,
-        method=model.response_from_context_and_action,
-    )
-    response = response_prediction_loss(
-        prediction=response_prediction,
-        observations=batch.observations,
-        response_next_observations=batch.response_next_observations,
-        rewards=batch.rewards,
-        dones=batch.dones,
-    )
-    ib = gaussian_mixture_kl_upper_bound(
+    base_entropy_items = categorical_entropy(output.base_logits[:-1])
+    conditional_entropy_items = categorical_entropy(conditional_training_logits)
+    entropy = (
+        jnp.sum(base_entropy_items * base_mask)
+        + jnp.sum(conditional_entropy_items * conditional_mask)
+    ) / valid_count
+    # Information bottleneck is optimized by the decision/representation
+    # auxiliary path, never by PPO.
+    ib = jax.lax.stop_gradient(gaussian_mixture_kl_upper_bound(
         output.mixture_logits[:-1],
         output.mixture_means[:-1],
         output.mixture_log_variances[:-1],
         free_bits=config.loss.information_bottleneck_free_bits,
+    ))
+    base_log = jax.nn.log_softmax(output.base_logits[:-1], axis=-1)
+    conditional_log = jax.nn.log_softmax(conditional_training_logits, axis=-1)
+    base_prob = jnp.exp(base_log)
+    conditional_prob = jnp.exp(conditional_log)
+    base_entropy = -jnp.sum(base_prob * base_log, axis=-1)
+    conditional_entropy = -jnp.sum(conditional_prob * conditional_log, axis=-1)
+    conditional_denominator = jnp.maximum(jnp.sum(conditional_mask), 1.0)
+    entropy_noncollapse = conditional_entropy_noncollapse_penalty(
+        output.base_logits[:-1],
+        conditional_training_logits,
+        conditional_mask,
+        tolerance=0.1,
     )
-    teacher_latents = compute_teacher_latents(
-        model=model,
-        params=params,
-        batch=batch,
-        task_features=output.task_features[:-1],
-    )
-    advantage_distill, policy_distill, distill_metrics = teacher_student_losses(
-        model=model,
-        params=params,
-        task_features=output.task_features[:-1],
-        student_logits=output.execution_logits[:-1],
-        student_action_values=output.action_values[:-1],
-        teacher_latents=teacher_latents,
-    )
-    consistency = posterior_consistency_loss(
-        mixture_logits=output.mixture_logits[:-1],
-        means=output.mixture_means[:-1],
-        log_variances=output.mixture_log_variances[:-1],
-        teacher_latents=teacher_latents,
-    )
-
-    cf = jnp.asarray(0.0, dtype=jnp.float32)
-    cf_metrics: Mapping[str, Any] = {
-        "counterfactual_loss": jnp.asarray(0.0, dtype=jnp.float32),
-        "counterfactual_online_loss": jnp.asarray(0.0, dtype=jnp.float32),
-        "counterfactual_teacher_loss": jnp.asarray(0.0, dtype=jnp.float32),
-        "counterfactual_selected_eval_return": jnp.asarray(0.0, dtype=jnp.float32),
-        "counterfactual_oracle_eval_return": jnp.asarray(0.0, dtype=jnp.float32),
-        "counterfactual_selection_regret": jnp.asarray(0.0, dtype=jnp.float32),
-        "counterfactual_fit_eval_gap": jnp.asarray(0.0, dtype=jnp.float32),
-    }
-    if anchors is not None:
-        cf, anchor_teacher_latents, cf_metrics = counterfactual_anchor_loss(
-            model=model,
-            params=params,
-            teacher_latents=teacher_latents,
-            anchors=anchors,
+    conditional_to_base_kl = jnp.sum(
+        conditional_mask
+        * jnp.sum(conditional_prob * (conditional_log - base_log), axis=-1)
+    ) / conditional_denominator
+    residual_mean_square = (
+        jnp.sum(
+            conditional_mask[..., None] * jnp.square(output.residual_logits[:-1])
         )
-    else:
-        anchor_teacher_latents = None
-
-    quotient = jnp.asarray(0.0, dtype=jnp.float32)
-    if quotient_pairs is not None:
-        if anchor_teacher_latents is None:
-            raise ValueError("Quotient pairs require counterfactual anchors.")
-        quotient = quotient_geometry_loss(
-            anchor_teacher_latents[quotient_pairs.anchor_index_a],
-            anchor_teacher_latents[quotient_pairs.anchor_index_b],
-            quotient_pairs.decision_distance,
-            equivalence_epsilon=config.loss.quotient_equivalence_epsilon,
-            separation_epsilon=config.loss.quotient_separation_epsilon,
-            margin=config.loss.quotient_margin,
-            weights=quotient_pairs.weights,
+        / jnp.maximum(
+            conditional_denominator * output.residual_logits.shape[-1], 1.0
         )
+    )
+    # The residual output layer is exactly zero-initialized by contract.  A
+    # raw sqrt here gives an infinite derivative at update one, and the
+    # inactive RMS hinge then creates NaN gradients.  Use the stable RMS
+    # definition while retaining the same <= 1.0 constraint.
+    residual_rms = jnp.sqrt(
+        residual_mean_square + jnp.finfo(jnp.float32).tiny
+    )
+    kl_penalty = jnp.maximum(conditional_to_base_kl - 0.03, 0.0)
+    residual_penalty = jnp.maximum(residual_rms - 1.0, 0.0)
 
     total = (
         actor
         + float(config.ppo.value_weight) * value
         - float(config.ppo.entropy_weight) * entropy
-        + float(config.loss.response_weight) * response
-        + float(config.loss.counterfactual_weight) * cf
-        + float(config.loss.advantage_distill_weight) * advantage_distill
-        + float(config.loss.policy_distill_weight) * policy_distill
-        + float(config.loss.quotient_weight) * quotient
-        + float(config.loss.consistency_weight) * consistency
-        + float(config.loss.information_bottleneck_weight) * ib
+        + float(config.loss.conditional_entropy_weight)
+        * entropy_noncollapse
+        + float(config.loss.conditional_kl_weight) * kl_penalty
+        + float(config.loss.residual_norm_weight)
+        * residual_penalty
     )
     metrics = {
-        **actor_metrics,
-        **distill_metrics,
-        **cf_metrics,
+        "approx_kl": jnp.maximum(
+            base_actor_metrics["approx_kl"], conditional_actor_metrics["approx_kl"]
+        ),
+        "base_approx_kl": base_actor_metrics["approx_kl"],
+        "conditional_approx_kl": conditional_actor_metrics["approx_kl"],
+        "clip_fraction": (
+            base_fraction * base_actor_metrics["clip_fraction"]
+            + conditional_fraction * conditional_actor_metrics["clip_fraction"]
+        ),
+        "actor_loss": actor,
         "total_loss": total,
         "value_loss": value,
         "entropy": entropy,
-        "response_loss": response,
         "information_bottleneck": ib,
-        "posterior_consistency": consistency,
-        "quotient_loss": quotient,
         "mean_raw_reward": jnp.mean(batch.rewards),
         "mean_shaped_reward": jnp.mean(batch.shaped_rewards),
         "mean_support_score": jnp.mean(output.support_score[:-1]),
         "mean_gate": jnp.mean(output.gate[:-1]),
+        "base_entropy": jnp.mean(base_entropy),
+        "conditional_entropy": jnp.sum(conditional_entropy * conditional_mask)
+        / conditional_denominator,
+        "conditional_entropy_noncollapse": entropy_noncollapse,
+        "conditional_to_base_kl": conditional_to_base_kl,
+        "conditional_residual_rms": residual_rms,
     }
     return LossBundle(total=total, metrics=metrics)
 
@@ -686,7 +546,7 @@ def apply_training_update(
     next_state = state._replace(
         params=core.params,
         target_params=core.target_params,
-        optimizer_state=core.optimizer_state,
+        ppo_optimizer_state=core.ppo_optimizer_state,
     )
     return TrainingUpdate(state=next_state, metrics=metrics)
 
@@ -697,7 +557,7 @@ def training_core_state(state: TrainState) -> TrainingCoreState:
     return TrainingCoreState(
         params=state.params,
         target_params=state.target_params,
-        optimizer_state=state.optimizer_state,
+        ppo_optimizer_state=state.ppo_optimizer_state,
     )
 
 
@@ -710,7 +570,7 @@ def merge_training_core(
     return state._replace(
         params=core.params,
         target_params=core.target_params,
-        optimizer_state=core.optimizer_state,
+        ppo_optimizer_state=core.ppo_optimizer_state,
     )
 
 
@@ -723,6 +583,8 @@ def apply_training_core_update(
     config: Any,
     anchors: CounterfactualAnchorBatch | None = None,
     quotient_pairs: QuotientPairBatch | None = None,
+    task_trunk_scale: Any = 1.0,
+    base_actor_scale: Any = 1.0,
 ) -> tuple[TrainingCoreState, Mapping[str, Any]]:
     """Apply exactly one sequential Official PPO minibatch update.
 
@@ -731,6 +593,7 @@ def apply_training_core_update(
     """
 
     import jax
+    import jax.numpy as jnp
     import optax
 
     def objective(candidate: Any) -> tuple[Any, Mapping[str, Any]]:
@@ -748,17 +611,56 @@ def apply_training_core_update(
         core.params
     )
     del unused
+    from .gradient_routing import keep_gradients_for_losses
+
+    gradients = keep_gradients_for_losses(
+        gradients,
+        loss_names=("ppo", "base_ppo", "conditional_ppo", "ppo_value"),
+    )
+    from .gradient_routing import scale_base_policy_gradients
+
+    gradients = scale_base_policy_gradients(
+        gradients,
+        task_trunk_scale=task_trunk_scale,
+        base_actor_scale=base_actor_scale,
+    )
     updates, optimizer_state = optimizer.update(
-        gradients, core.optimizer_state, core.params
+        gradients, core.ppo_optimizer_state, core.params
     )
     params = optax.apply_updates(core.params, updates)
-    return TrainingCoreState(
+    candidate = TrainingCoreState(
         params=params,
-        target_params=polyak_update(
-            core.target_params, params, config.ppo.polyak_coefficient
-        ),
-        optimizer_state=optimizer_state,
-    ), metrics
+        # Target actor/belief/raw-Q are immutable inside a 16-update
+        # TargetPolicyEpoch and are synchronized only by the lifecycle.
+        target_params=core.target_params,
+        ppo_optimizer_state=optimizer_state,
+    )
+
+    def tree_all_finite(tree: Any) -> Any:
+        leaves = jax.tree_util.tree_leaves(tree)
+        if not leaves:
+            return jnp.asarray(True)
+        return jnp.all(
+            jnp.stack(
+                [jnp.all(jnp.isfinite(jnp.asarray(leaf))) for leaf in leaves]
+            )
+        )
+
+    finite = (
+        jnp.isfinite(jnp.asarray(metrics["total_loss"]))
+        & tree_all_finite(gradients)
+        & tree_all_finite(candidate.params)
+        & tree_all_finite(candidate.ppo_optimizer_state)
+    )
+    # Never commit a corrupt parameter/optimizer tree.  The scan records and
+    # stops on this flag; the host lifecycle then fails with an exact phase
+    # error before any auxiliary optimizer or checkpoint can consume it.
+    committed = jax.lax.cond(finite, lambda _: candidate, lambda _: core, operand=None)
+    return committed, {
+        **metrics,
+        "optimizer_applied": finite.astype(jnp.float32),
+        "nonfinite_update": (~finite).astype(jnp.float32),
+    }
 
 
 def scan_training_updates(
@@ -769,6 +671,8 @@ def scan_training_updates(
     batch: RolloutBatch,
     schedule: Any,
     config: Any,
+    task_trunk_scale: Any = 1.0,
+    base_actor_scale: Any = 1.0,
 ) -> tuple[TrainingCoreState, Mapping[str, Any]]:
     """Run minibatches sequentially on device without duplicating the rollout."""
 
@@ -780,181 +684,83 @@ def scan_training_updates(
         raise ValueError("The PPO schedule must contain minibatch and lane axes.")
     flat = indexes.reshape((-1, indexes.shape[-1]))
 
-    def one(
+    metric_names = (
+        "approx_kl",
+        "base_approx_kl",
+        "conditional_approx_kl",
+        "clip_fraction",
+        "actor_loss",
+        "total_loss",
+        "value_loss",
+        "entropy",
+        "information_bottleneck",
+        "mean_raw_reward",
+        "mean_shaped_reward",
+        "mean_support_score",
+        "mean_gate",
+        "base_entropy",
+        "conditional_entropy",
+        "conditional_entropy_noncollapse",
+        "conditional_to_base_kl",
+        "conditional_residual_rms",
+        "nonfinite_update",
+    )
+
+    def skipped(current: TrainingCoreState) -> tuple[TrainingCoreState, Mapping[str, Any]]:
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        return current, {
+            **{name: zero for name in metric_names},
+            "optimizer_applied": zero,
+            "nonfinite_update": zero,
+            "ppo_early_stop": jnp.asarray(1.0, dtype=jnp.float32),
+        }
+
+    def applied(
         current: TrainingCoreState,
         lane_indexes: Any,
     ) -> tuple[TrainingCoreState, Mapping[str, Any]]:
-        return apply_training_core_update(
+        updated, metrics = apply_training_core_update(
             model=model,
             core=current,
             optimizer=optimizer,
             batch=slice_rollout_lanes(batch, lane_indexes),
             config=config,
+            task_trunk_scale=task_trunk_scale,
+            base_actor_scale=base_actor_scale,
         )
-
-    return jax.lax.scan(one, core, flat)
-
-
-def apply_anchor_first_update(
-    *,
-    model: Any,
-    core: TrainingCoreState,
-    optimizer: Any,
-    batch: RolloutBatch,
-    lane_indexes: Any,
-    config: Any,
-    anchors: CounterfactualAnchorBatch,
-    quotient_pairs: QuotientPairBatch | None,
-) -> tuple[TrainingCoreState, Mapping[str, Any]]:
-    """Apply the registered anchor loss to only the first PPO minibatch."""
-
-    return apply_training_core_update(
-        model=model,
-        core=core,
-        optimizer=optimizer,
-        batch=slice_rollout_lanes(batch, lane_indexes),
-        config=config,
-        anchors=anchors,
-        quotient_pairs=quotient_pairs,
-    )
-
-
-def update_competence_multiplier(
-    multiplier: Any,
-    *,
-    competence: Any,
-    threshold: float,
-    learning_rate: float,
-) -> Any:
-    import jax.numpy as jnp
-
-    return jnp.maximum(
-        0.0,
-        jnp.asarray(multiplier)
-        + float(learning_rate) * (float(threshold) - jnp.asarray(competence)),
-    )
-
-
-
-def generator_score_function_loss(
-    *,
-    logits: Any,
-    values: Any,
-    actions: Any,
-    source_mask: Any,
-    rewards: Any,
-    dones: Any,
-    diversity_bonus: Any,
-    value_weight: float,
-    entropy_weight: float,
-    competence_multiplier: Any,
-    competence_threshold: float,
-    cvar_level: float,
-) -> LossBundle:
-    """Score-function generator objective with a real CVaR gradient path.
-
-    The generator maximizes empirical best-response diversity subject to a
-    lower-tail team-return constraint.  The environment is non-differentiable,
-    so both terms enter through the complete-trajectory log probability.  A
-    shared recurrent value head supplies a Monte-Carlo baseline; no target Q or
-    partner-class label is used.
-    """
-
-    import jax
-    import jax.numpy as jnp
-
-    log_probability = categorical_log_probability(logits, actions)
-    entropy = categorical_entropy(logits)
-    mask = jnp.asarray(source_mask, dtype=jnp.float32)
-    reward = jnp.asarray(rewards, dtype=jnp.float32)
-    done = jnp.asarray(dones, dtype=jnp.bool_)
-    predicted_value = jnp.asarray(values, dtype=jnp.float32)
-    if not (
-        log_probability.shape
-        == entropy.shape
-        == mask.shape
-        == reward.shape
-        == done.shape
-        == predicted_value.shape
-    ):
-        raise ValueError("Generator trajectory tensors must share [time,lane].")
-
-    active_lane = (jnp.sum(mask, axis=0) > 0).astype(jnp.float32)
-    active_count = jnp.maximum(jnp.sum(active_lane).astype(jnp.int32), 1)
-    episode_return = jnp.sum(reward * mask, axis=0)
-
-    # Empirical lower-tail CVaR and its score-function weights.  Ties are broken
-    # by the fixed lane order, which is independent of the candidate parameters.
-    tail_count = jnp.maximum(
-        jnp.ceil(float(cvar_level) * active_count).astype(jnp.int32), 1
-    )
-    order = jnp.argsort(jnp.where(active_lane > 0, episode_return, jnp.inf))
-    rank_weight = (
-        jnp.arange(episode_return.shape[0], dtype=jnp.int32) < tail_count
-    ).astype(jnp.float32)
-    tail_indicator = jnp.zeros_like(active_lane).at[order].set(rank_weight)
-    tail_indicator = tail_indicator * active_lane
-    competence = jnp.sum(episode_return * tail_indicator) / jnp.maximum(
-        jnp.sum(tail_indicator), 1.0e-8
-    )
-    constraint = float(competence_threshold) - competence
-
-    bonus = jax.lax.stop_gradient(
-        jnp.asarray(diversity_bonus, dtype=jnp.float32)
-    )
-    if bonus.shape != episode_return.shape:
-        raise ValueError("Generator diversity bonus must have one value per lane.")
-    # CVaR is an average over the selected tail.  Rescale lane contributions so
-    # the score-function estimate targets that average rather than its sum.
-    cvar_weight = tail_indicator * (
-        jnp.asarray(active_count, dtype=jnp.float32)
-        / jnp.maximum(jnp.sum(tail_indicator), 1.0e-8)
-    )
-    lane_objective = jax.lax.stop_gradient(
-        bonus
-        + jnp.asarray(competence_multiplier, dtype=jnp.float32)
-        * cvar_weight
-        * episode_return
-    )
-
-    # Every action in a code-conditioned trajectory affects the terminal
-    # diversity/competence objective.  A learned recurrent baseline is trained
-    # against the same lane objective and detached in the policy gradient.
-    advantage = lane_objective[None, :] - jax.lax.stop_gradient(predicted_value)
-    policy_loss = -jnp.sum(log_probability * advantage * mask) / jnp.maximum(
-        jnp.sum(mask), 1.0e-8
-    )
-    value_loss = jnp.sum(
-        huber(predicted_value - lane_objective[None, :]) * mask
-    ) / jnp.maximum(jnp.sum(mask), 1.0e-8)
-    entropy_mean = jnp.sum(entropy * mask) / jnp.maximum(
-        jnp.sum(mask), 1.0e-8
-    )
-    # The explicit Lagrangian constant has no parameter gradient but is retained
-    # so the reported scalar is the registered constrained objective.
-    total = (
-        policy_loss
-        + float(value_weight) * value_loss
-        - float(entropy_weight) * entropy_mean
-        + jax.lax.stop_gradient(
-            jnp.asarray(competence_multiplier, dtype=jnp.float32) * constraint
+        stop = (
+            (metrics["nonfinite_update"] > 0.5)
+            |
+            (metrics["base_approx_kl"] > float(config.ppo.max_approx_kl))
+            | (
+                metrics["conditional_approx_kl"]
+                > float(config.ppo.max_approx_kl)
+            )
         )
+        return updated, {
+            **metrics,
+            "ppo_early_stop": stop.astype(jnp.float32),
+        }
+
+    def one(
+        carry: tuple[TrainingCoreState, Any],
+        lane_indexes: Any,
+    ) -> tuple[tuple[TrainingCoreState, Any], Mapping[str, Any]]:
+        current, active = carry
+        updated, metrics = jax.lax.cond(
+            active,
+            lambda value: applied(value, lane_indexes),
+            skipped,
+            current,
+        )
+        still_active = active & (metrics["ppo_early_stop"] < 0.5)
+        return (updated, still_active), metrics
+
+    (final_core, unused_active), metrics = jax.lax.scan(
+        one, (core, jnp.asarray(True)), flat
     )
-    return LossBundle(
-        total=total,
-        metrics={
-            "generator_total_loss": total,
-            "generator_policy_loss": policy_loss,
-            "generator_value_loss": value_loss,
-            "generator_entropy": entropy_mean,
-            "generator_competence_cvar": competence,
-            "generator_competence_constraint": constraint,
-            "generator_diversity_bonus": jnp.sum(bonus * active_lane)
-            / jnp.maximum(jnp.sum(active_lane), 1.0e-8),
-            "generator_active_lanes": jnp.sum(active_lane),
-            "generator_tail_lanes": jnp.sum(tail_indicator),
-        },
-    )
+    del unused_active
+    return final_core, metrics
 
 
 def slice_rollout_lanes(batch: RolloutBatch, indexes: Any) -> RolloutBatch:
@@ -964,7 +770,7 @@ def slice_rollout_lanes(batch: RolloutBatch, indexes: Any) -> RolloutBatch:
 
     values = {}
     for name, value in batch._asdict().items():
-        if name == "initial_policy_state":
+        if name in {"initial_policy_state", "initial_target_policy_state"}:
             values[name] = jax.tree_util.tree_map(lambda leaf: leaf[indexes], value)
         else:
             values[name] = value[:, indexes]
@@ -996,32 +802,27 @@ def environment_minibatch_schedule(
 
 
 __all__ = [
-    "apply_anchor_first_update",
     "apply_training_update",
     "apply_training_core_update",
     "categorical_entropy",
+    "conditional_entropy_noncollapse_penalty",
+    "stable_root_mean_square",
     "categorical_log_probability",
     "clipped_value_loss",
     "compute_loss",
-    "compute_teacher_latents",
-    "counterfactual_anchor_loss",
     "environment_minibatch_schedule",
     "gather_actions",
     "gaussian_mixture_kl_upper_bound",
     "generalized_advantage_estimation",
-    "generator_score_function_loss",
     "huber",
     "make_optimizer",
     "merge_training_core",
     "official_learning_rate_schedule",
     "official_reward_shaping_factor",
     "polyak_update",
-    "posterior_consistency_loss",
     "ppo_actor_loss",
     "response_prediction_loss",
     "scan_training_updates",
     "slice_rollout_lanes",
-    "teacher_student_losses",
     "training_core_state",
-    "update_competence_multiplier",
 ]

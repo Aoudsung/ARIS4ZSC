@@ -7,6 +7,32 @@ from typing import Any
 _BELIEF_SET_ENCODER: Any | None = None
 
 
+def degenerate_gaussian_mixture(
+    latent: Any,
+    *,
+    mixture_components: int,
+    log_variance: float = -12.0,
+) -> tuple[Any, Any, Any]:
+    """Represent a fixed diagnostic context through the shared belief API."""
+
+    import jax.numpy as jnp
+
+    if mixture_components <= 0:
+        raise ValueError("mixture_components must be positive.")
+    value = jnp.asarray(latent, dtype=jnp.float32)
+    means = jnp.broadcast_to(
+        value[..., None, :],
+        value.shape[:-1] + (int(mixture_components), value.shape[-1]),
+    )
+    log_variances = jnp.full_like(means, float(log_variance))
+    logits = jnp.full(
+        value.shape[:-1] + (int(mixture_components),),
+        -1.0e9,
+        dtype=jnp.float32,
+    ).at[..., 0].set(0.0)
+    return logits, means, log_variances
+
+
 def normalized_mixture_weights(mixture_logits: Any) -> Any:
     import jax
     import jax.numpy as jnp
@@ -187,6 +213,7 @@ def belief_set_encoder_class() -> Any:
 
 
 __all__ = [
+    "degenerate_gaussian_mixture",
     "belief_set_encoder_class",
     "mixture_entropy",
     "mixture_moments",

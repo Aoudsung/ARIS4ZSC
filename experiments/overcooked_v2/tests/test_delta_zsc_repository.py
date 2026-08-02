@@ -13,7 +13,7 @@ import src.path_c.storage as storage
 
 
 ROOT = Path(__file__).resolve().parents[3]
-REGISTERED_DESIGN_SHA256 = "375586afdc18cc3d285d7562f66a2c4f0369e16e054ef23bc3793727af8433b5"
+REGISTERED_DESIGN_SHA256 = "e58dec253f3c0cc7d5cd2ca114a7e89d0b2f77f0355470ec21799e8a883a6cc3"
 
 
 def test_registered_design_document_is_byte_exact() -> None:

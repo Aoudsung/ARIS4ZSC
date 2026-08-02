@@ -1,8 +1,8 @@
 """Unified fixed-capacity DELTA-ZSC model.
 
 There is exactly one task encoder, one continuous belief encoder, one actor, one
-critic, and one response decoder.  Privileged teacher contexts pass through the
-same belief-set encoder, actor, and critic.
+critic, and one response decoder.  Privileged oracle contexts are supplied only
+to explicit diagnostic methods; the trainable model has no teacher encoder.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from .types import (
     ModelOutput,
     PolicyState,
     ResponsePrediction,
-    TeacherOutput,
 )
 
 _MODEL_CLASS: Any | None = None
@@ -31,21 +30,22 @@ def _model_class() -> Any:
     import jax.numpy as jnp
 
     from .belief_encoder import belief_encoder_classes
-    from .belief_set_encoder import belief_set_encoder_class
+    from .belief_set_encoder import (
+        belief_set_encoder_class,
+        degenerate_gaussian_mixture,
+    )
     from .response_decoder import response_decoder_class
     from .task_encoder import task_encoder_classes
-    from .teacher_context import code_teacher_class, degenerate_gaussian_mixture
     from .universal_actor import universal_actor_class
     from .universal_critic import universal_critic_class
 
     TaskCell, unused_task_scan = task_encoder_classes()
-    BeliefCell, unused_belief_scan, FullTeacher = belief_encoder_classes()
+    BeliefCell, unused_belief_scan = belief_encoder_classes()
     del unused_task_scan, unused_belief_scan
     BeliefSet = belief_set_encoder_class()
     Actor = universal_actor_class()
     Critic = universal_critic_class()
     Decoder = response_decoder_class()
-    CodeTeacher = code_teacher_class()
 
     class DELTAZSCModel(nn.Module):
         observation_shape: tuple[int, ...]
@@ -62,8 +62,6 @@ def _model_class() -> Any:
         action_embedding_dim: int
         log_variance_minimum: float
         log_variance_maximum: float
-        response_log_std_minimum: float
-        response_log_std_maximum: float
 
         def setup(self) -> None:
             self.task_cell = TaskCell(
@@ -100,25 +98,11 @@ def _model_class() -> Any:
                 name="universal_critic",
             )
             self.decoder = Decoder(
-                observation_size=int(__import__("math").prod(self.observation_shape)),
                 action_count=self.action_count,
                 hidden_dim=self.response_hidden_dim,
                 action_embedding_dim=self.action_embedding_dim,
-                log_std_minimum=self.response_log_std_minimum,
-                log_std_maximum=self.response_log_std_maximum,
+                inventory_factor_count=(self.observation_shape[-1] - 27) // 4 + 2,
                 name="response_decoder",
-            )
-            self.code_teacher = CodeTeacher(
-                latent_dim=self.latent_dim,
-                hidden_dim=self.belief_hidden_dim,
-                name="code_teacher",
-            )
-            self.full_teacher = FullTeacher(
-                hidden_dim=self.belief_hidden_dim,
-                latent_dim=self.latent_dim,
-                action_count=self.action_count,
-                action_embedding_dim=self.action_embedding_dim,
-                name="full_trajectory_teacher",
             )
 
         def _outputs_from_context(
@@ -138,9 +122,10 @@ def _model_class() -> Any:
             base_logits, residual_logits, execution_logits = self.actor(
                 context.task_features, actor_belief, gate
             )
-            state_value, action_values = self.critic(
+            state_value, raw_q1, raw_q2 = self.critic(
                 context.task_features, belief_embedding
             )
+            action_values = jnp.minimum(raw_q1, raw_q2)
             prefix = context.task_features.shape[:-1]
             return ModelOutput(
                 task_features=context.task_features,
@@ -154,6 +139,8 @@ def _model_class() -> Any:
                 gate=jnp.broadcast_to(jnp.asarray(gate), prefix),
                 execution_logits=execution_logits,
                 state_value=state_value,
+                raw_q1=raw_q1,
+                raw_q2=raw_q2,
                 action_values=action_values,
             )
 
@@ -167,7 +154,7 @@ def _model_class() -> Any:
                 (
                     observation,
                     state.previous_action,
-                    state.previous_reward,
+                    jnp.zeros_like(state.previous_reward),
                     state.episode_start,
                 ),
             )
@@ -177,7 +164,7 @@ def _model_class() -> Any:
                     state.previous_observation,
                     observation,
                     state.previous_action,
-                    state.previous_reward,
+                    jnp.zeros_like(state.previous_reward),
                     state.episode_start,
                 ),
             )
@@ -321,10 +308,12 @@ def _model_class() -> Any:
             if action.shape != prefix:
                 raise ValueError("Selected response actions do not match context axes.")
             (
-                delta_mean,
-                delta_log_std,
-                reward_mean,
-                reward_log_std,
+                visibility_logit,
+                relative_position_logits,
+                direction_logits,
+                inventory_logits,
+                interaction_change_logit,
+                diagnostic_reward_mean,
                 done_logit,
             ) = self.decoder(
                 jax.lax.stop_gradient(task_features),
@@ -332,16 +321,76 @@ def _model_class() -> Any:
                 action,
             )
             return ResponsePrediction(
-                observation_delta_mean=delta_mean.reshape(
-                    prefix + self.observation_shape
-                ),
-                observation_delta_log_std=delta_log_std.reshape(
-                    prefix + self.observation_shape
-                ),
-                reward_mean=reward_mean,
-                reward_log_std=reward_log_std,
+                visibility_logit=visibility_logit,
+                relative_position_logits=relative_position_logits,
+                direction_logits=direction_logits,
+                inventory_logits=inventory_logits,
+                interaction_change_logit=interaction_change_logit,
+                diagnostic_reward_mean=diagnostic_reward_mean,
                 done_logit=done_logit,
             )
+
+        def response_sequence(
+            self,
+            initial_state: PolicyState,
+            observations: Any,
+            previous_actions: Any,
+            previous_rewards: Any,
+            episode_starts: Any,
+            executed_actions: Any,
+        ) -> tuple[PolicyState, ResponsePrediction]:
+            """Replay legal history and evaluate only the structured decoder."""
+
+            final_state, context = self.context_sequence(
+                initial_state,
+                observations,
+                previous_actions,
+                previous_rewards,
+                episode_starts,
+            )
+            belief_embedding = self.belief_set(
+                context.mixture_logits,
+                context.mixture_means,
+                context.mixture_log_variances,
+                context.support_score,
+            )
+            prediction = self.response_from_context_and_action(
+                context.task_features[:-1],
+                belief_embedding[:-1],
+                executed_actions,
+            )
+            return final_state, prediction
+
+        def diagnostic_response_sequence(
+            self,
+            initial_state: PolicyState,
+            observations: Any,
+            previous_actions: Any,
+            previous_rewards: Any,
+            episode_starts: Any,
+            executed_actions: Any,
+        ) -> tuple[PolicyState, ResponsePrediction]:
+            """Diagnostic reward/done heads with no task/belief gradient."""
+
+            final_state, context = self.context_sequence(
+                initial_state,
+                observations,
+                previous_actions,
+                previous_rewards,
+                episode_starts,
+            )
+            belief_embedding = self.belief_set(
+                context.mixture_logits,
+                context.mixture_means,
+                context.mixture_log_variances,
+                context.support_score,
+            )
+            prediction = self.response_from_context_and_action(
+                jax.lax.stop_gradient(context.task_features[:-1]),
+                jax.lax.stop_gradient(belief_embedding[:-1]),
+                executed_actions,
+            )
+            return final_state, prediction
 
         def _belief_embedding_from_latent(
             self,
@@ -364,70 +413,41 @@ def _model_class() -> Any:
             belief_embedding = self._belief_embedding_from_latent(
                 task_features, latent
             )
-            unused_value, action_values = self.critic(
+            unused_value, raw_q1, raw_q2 = self.critic(
                 task_features, belief_embedding
             )
             del unused_value
-            return action_values
+            return jnp.minimum(raw_q1, raw_q2)
+
+        def twin_action_values_from_features_and_latent(
+            self,
+            task_features: Any,
+            latent: Any,
+        ) -> tuple[Any, Any]:
+            """Return both numerical raw-Q heads for calibrated training/audit."""
+
+            belief_embedding = self._belief_embedding_from_latent(task_features, latent)
+            unused_value, raw_q1, raw_q2 = self.critic(task_features, belief_embedding)
+            del unused_value
+            return raw_q1, raw_q2
 
         def from_features_and_latent(
             self,
             task_features: Any,
             latent: Any,
             gate: Any = 1.0,
-        ) -> TeacherOutput:
-            belief_embedding = self._belief_embedding_from_latent(
-                task_features, latent
+        ) -> ModelOutput:
+            mixture_logits, means, log_variances = degenerate_gaussian_mixture(
+                latent, mixture_components=self.mixture_components
             )
-            actor_belief = jax.lax.stop_gradient(belief_embedding)
-            unused_base, unused_residual, execution_logits = self.actor(
-                task_features, actor_belief, gate
+            context = ContextOutput(
+                task_features=task_features,
+                mixture_logits=mixture_logits,
+                mixture_means=means,
+                mixture_log_variances=log_variances,
+                support_score=jnp.ones(latent.shape[:-1], dtype=jnp.float32),
             )
-            del unused_base, unused_residual
-            unused_value, action_values = self.critic(
-                task_features, belief_embedding
-            )
-            del unused_value
-            return TeacherOutput(
-                latent=latent,
-                belief_embedding=belief_embedding,
-                logits=execution_logits,
-                action_values=action_values,
-            )
-
-        def latent_from_code(
-            self,
-            partner_code: Any,
-            task_features: Any,
-        ) -> Any:
-            """Return the training-only continuous teacher context only."""
-
-            return self.code_teacher(partner_code, task_features)
-
-        def teacher_from_code(
-            self,
-            partner_code: Any,
-            task_features: Any,
-            gate: Any = 1.0,
-        ) -> TeacherOutput:
-            latent = self.latent_from_code(partner_code, task_features)
-            return self.from_features_and_latent(task_features, latent, gate)
-
-        def full_trajectory_latents(
-            self,
-            observations: Any,
-            response_next_observations: Any,
-            actions: Any,
-            rewards: Any,
-            dones: Any,
-        ) -> Any:
-            return self.full_teacher(
-                observations,
-                response_next_observations,
-                actions,
-                rewards,
-                dones,
-            )
+            return self._outputs_from_context(context=context, gate=gate)
 
         def initialize_all(
             self,
@@ -443,23 +463,13 @@ def _model_class() -> Any:
                 observation,
                 jnp.ones(batch_shape, dtype=jnp.float32),
             )
-            teacher = self.teacher_from_code(
-                partner_code, output.task_features, 1.0
-            )
+            del partner_code
             response = self.response_from_context_and_action(
                 output.task_features,
                 output.belief_embedding,
                 jnp.zeros(batch_shape, dtype=jnp.int32),
             )
-            observations = jnp.stack((observation, observation), axis=0)
-            response_next = observation[None, ...]
-            actions = jnp.zeros((1,) + batch_shape, dtype=jnp.int32)
-            rewards = jnp.zeros((1,) + batch_shape, dtype=jnp.float32)
-            dones = jnp.zeros((1,) + batch_shape, dtype=jnp.bool_)
-            full_latent = self.full_trajectory_latents(
-                observations, response_next, actions, rewards, dones
-            )
-            return next_state, output, response, teacher, full_latent
+            return next_state, output, response
 
         def __call__(
             self,
@@ -499,8 +509,6 @@ def build_model(
     action_embedding_dim: int,
     log_variance_minimum: float,
     log_variance_maximum: float,
-    response_log_std_minimum: float,
-    response_log_std_maximum: float,
 ) -> Any:
     return _model_class()(
         observation_shape=tuple(int(value) for value in observation_shape),
@@ -517,8 +525,6 @@ def build_model(
         action_embedding_dim=int(action_embedding_dim),
         log_variance_minimum=float(log_variance_minimum),
         log_variance_maximum=float(log_variance_maximum),
-        response_log_std_minimum=float(response_log_std_minimum),
-        response_log_std_maximum=float(response_log_std_maximum),
     )
 
 

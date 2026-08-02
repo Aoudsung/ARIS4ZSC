@@ -60,26 +60,21 @@ class ModelOutput(NamedTuple):
     gate: Any
     execution_logits: Any
     state_value: Any
+    raw_q1: Any
+    raw_q2: Any
     action_values: Any
 
 
 class ResponsePrediction(NamedTuple):
-    """Response prediction for the single action executed in each lane."""
+    """Structured visible-partner prediction for the executed action only."""
 
-    observation_delta_mean: Any
-    observation_delta_log_std: Any
-    reward_mean: Any
-    reward_log_std: Any
+    visibility_logit: Any
+    relative_position_logits: Any
+    direction_logits: Any
+    inventory_logits: Any
+    interaction_change_logit: Any
+    diagnostic_reward_mean: Any
     done_logit: Any
-
-
-class TeacherOutput(NamedTuple):
-    """Training-only full-information output using a degenerate posterior."""
-
-    latent: Any
-    belief_embedding: Any
-    logits: Any
-    action_values: Any
 
 
 class PartnerGeneratorState(NamedTuple):
@@ -127,6 +122,7 @@ class RolloutBatch(NamedTuple):
     partner_sources: Any
     partner_run_ids: Any
     initial_policy_state: PolicyState
+    initial_target_policy_state: PolicyState
 
 
 class CounterfactualAnchorBatch(NamedTuple):
@@ -134,8 +130,8 @@ class CounterfactualAnchorBatch(NamedTuple):
 
     The anchor retains the legal online policy state and current observation so
     task/belief features are recomputed under the candidate parameters.  It also
-    stores the rollout index and partner source/code needed to recompute the
-    privileged teacher inside the loss.  No learned Q value is used as target.
+    stores the rollout index and partner source/code for lineage only.  No
+    hidden code or privileged diagnostic context is a supervised online target.
     """
 
     anchor_ids: Any
@@ -180,23 +176,55 @@ class CalibrationArtifact(NamedTuple):
 
 
 class TrainState(NamedTuple):
-    """Serializable active training state.
+    """Complete r3 signal-contract checkpoint state.
 
-    The target model is a Polyak copy of the same single model.  It is not a
-    partner-specific critic bank.
+    There is intentionally no compatibility tail for r2.  Orbax restoration
+    therefore fails before training when an archived r2 checkpoint is supplied.
+    Every optimizer counter, qualification decision, policy epoch, random
+    domain and replay fingerprint that can change the next update is explicit.
     """
-
     params: Any
     target_params: Any
-    optimizer_state: Any
+    ppo_optimizer_state: Any
+    raw_q_optimizer_state: Any
+    response_optimizer_state: Any
+    generator_optimizer_state: Any
+
     generator_params: Any
     generator_target_params: Any
-    generator_optimizer_state: Any
-    competence_multiplier: Any
+
+    target_policy_epoch: Any
+    qualified_base_params: Any
+    owner_source_artifact: Any
+    last_qualified_generator_params: Any
+    last_qualified_generator_optimizer_state: Any
+    last_qualified_generator_optimizer_step: Any
+    generator_signature_readout: Any
+    generator_snapshot_archive: Any
+    generator_admission_passes: Any
+    partner_source_probabilities: Any
+
+    qualification: Any
+    curriculum_phase: Any
+    anchor_training_replay: Any
+    anchor_audit_manifest: Any
+
+    kl_multiplier: Any
+    residual_multiplier: Any
+    raw_q_calibration_error: Any
+    raw_q_minimum_margin: Any
+
+    ppo_optimizer_step: Any
+    raw_q_optimizer_step: Any
+    response_optimizer_step: Any
+    generator_optimizer_step: Any
+
+    runner_state: Any
     random_key: Any
     update_count: Any
     effective_environment_steps: Any
-    runner_state: Any
+    random_domains: Any
+    resource_ledger: Any
     calibration: CalibrationArtifact
 
 
@@ -210,7 +238,7 @@ class TrainingCoreState(NamedTuple):
 
     params: Any
     target_params: Any
-    optimizer_state: Any
+    ppo_optimizer_state: Any
 
 
 class GeneratorCoreState(NamedTuple):
@@ -219,7 +247,16 @@ class GeneratorCoreState(NamedTuple):
     params: Any
     target_params: Any
     optimizer_state: Any
-    competence_multiplier: Any
+
+
+class AuxiliaryCoreState(NamedTuple):
+    """Shared parameters with independent raw-Q and response optimizer states."""
+
+    params: Any
+    raw_q_optimizer_state: Any
+    response_optimizer_state: Any
+    raw_q_optimizer_step: Any
+    response_optimizer_step: Any
 
 
 class LossBundle(NamedTuple):
@@ -261,7 +298,7 @@ __all__ = [
     "PolicyState",
     "QuotientPairBatch",
     "RolloutBatch",
-    "TeacherOutput",
+    "ResponsePrediction",
     "TrainingCoreState",
     "TrainState",
     "TrainingUpdate",

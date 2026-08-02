@@ -125,11 +125,21 @@ def bounded_mean_radius(
     return width * math.sqrt(math.log(2.0 / allocated) / (2.0 * replicas))
 
 
-def empty_calibration(*, latent_dim: int, alpha: float) -> CalibrationArtifact:
+def empty_calibration(
+    *, latent_dim: int, alpha: float, model_fingerprint: str | None = None
+) -> CalibrationArtifact:
     """An abstaining artifact used before independent calibration."""
 
     if latent_dim <= 0:
         raise ValueError("latent_dim must be positive.")
+    fingerprint = (
+        np.zeros((2,), dtype=np.uint32)
+        if model_fingerprint is None
+        else np.frombuffer(
+            hashlib.sha256(str(model_fingerprint).encode("utf-8")).digest()[:8],
+            dtype=">u4",
+        ).astype(np.uint32)
+    )
     return CalibrationArtifact(
         alpha=np.asarray(alpha, dtype=np.float32),
         residual_radius=np.asarray(np.inf, dtype=np.float32),
@@ -139,7 +149,7 @@ def empty_calibration(*, latent_dim: int, alpha: float) -> CalibrationArtifact:
         support_precision=np.eye(latent_dim, dtype=np.float32),
         support_distance_scale=np.asarray(1.0, dtype=np.float32),
         calibration_run_count=np.asarray(0, dtype=np.int32),
-        model_fingerprint=np.zeros((2,), dtype=np.uint32),
+        model_fingerprint=fingerprint,
     )
 
 

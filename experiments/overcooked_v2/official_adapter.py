@@ -10,6 +10,7 @@ public environment and evaluator.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import ast
 import copy
@@ -17,6 +18,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -42,6 +44,41 @@ from src.path_c.experiment import (
 
 
 ACTION_ORDER = ("right", "down", "left", "up", "stay", "interact")
+
+
+@contextmanager
+def _cuda_only_official_debug_callbacks_disabled() -> Any:
+    """Suppress Official logging callbacks when CUDA is the only JAX platform.
+
+    The fixed Official trainer contains ``jax.debug.print`` calls and a
+    ``jax.debug.callback(wandb.log, ...)``. JAX 0.4.38 places those host
+    callback operands on a local CPU device; a fail-closed DELTA worker with
+    ``JAX_PLATFORMS=cuda`` intentionally exposes no such device. The callbacks
+    are observational logging side effects and do not feed a value, random key,
+    gradient, parameter, or checkpoint back into the training graph.
+    """
+
+    import jax
+
+    if os.environ.get("JAX_PLATFORMS", "").strip().lower() != "cuda":
+        yield False
+        return
+    original_callback = jax.debug.callback
+    original_print = jax.debug.print
+
+    def no_callback(*unused_args: Any, **unused_kwargs: Any) -> None:
+        return None
+
+    def no_print(*unused_args: Any, **unused_kwargs: Any) -> None:
+        return None
+
+    jax.debug.callback = no_callback
+    jax.debug.print = no_print
+    try:
+        yield True
+    finally:
+        jax.debug.callback = original_callback
+        jax.debug.print = original_print
 
 
 def _distribution_source(distribution_name: str) -> Mapping[str, Any]:
@@ -726,8 +763,6 @@ def train_upstream(
     )
     import wandb
 
-    train = make_train(official_config)
-    mapped_train = mini_batch_pmap(jax.jit(train), 1)
     model_name = str(official_config["model"]["TYPE"])
     layout_name = str(official_config["env"]["ENV_KWARGS"]["layout"])
     agent_view_size = official_config["env"]["ENV_KWARGS"].get(
@@ -740,16 +775,19 @@ def train_upstream(
     # ``single_run`` with this context.  ``ippo.make_train`` contains an
     # unconditional ``jax.debug.callback(wandb.log, ...)``; calling it without
     # the Official context fails even when WANDB_MODE is disabled.
-    with wandb.init(
-        entity=official_config["wandb"]["ENTITY"],
-        project=official_config["wandb"]["PROJECT"],
-        tags=["IPPO", model_name, "OvercookedV2"],
-        config=dict(official_config),
-        mode=official_config["wandb"]["WANDB_MODE"],
-        name=run_name,
-    ):
-        output = mapped_train(jnp.asarray(run_key, dtype=jnp.uint32)[None, :])
-        jax.block_until_ready(output["metrics"]["env_step"])
+    with _cuda_only_official_debug_callbacks_disabled() as callbacks_disabled:
+        train = make_train(official_config)
+        mapped_train = mini_batch_pmap(jax.jit(train), 1)
+        with wandb.init(
+            entity=official_config["wandb"]["ENTITY"],
+            project=official_config["wandb"]["PROJECT"],
+            tags=["IPPO", model_name, "OvercookedV2"],
+            config=dict(official_config),
+            mode=official_config["wandb"]["WANDB_MODE"],
+            name=run_name,
+        ):
+            output = mapped_train(jnp.asarray(run_key, dtype=jnp.uint32)[None, :])
+            jax.block_until_ready(output["metrics"]["env_step"])
 
     metrics = jax.tree_util.tree_map(lambda value: value[0], output["metrics"])
     checkpoint_states = output["runner_state"][1]
@@ -792,6 +830,7 @@ def train_upstream(
         "effective_environment_steps": effective_environment_steps,
         "completed_episodes": completed_episodes,
         "update_count": total_updates,
+        "cuda_only_debug_callbacks_disabled": bool(callbacks_disabled),
     }
 
 
@@ -1117,6 +1156,42 @@ class FrozenPartnerPool:
 
         return jax.vmap(one)(
             member_indexes, observations, carry, episode_start, keys
+        )
+
+    def logits_and_value(
+        self,
+        member_indexes: Any,
+        observations: Any,
+        carry: Any,
+        episode_start: Any,
+    ) -> tuple[Any, Any, Any]:
+        """Return the exact Official recurrent logits for r3 distillation.
+
+        This is a training-only observation/carry surface.  It neither samples
+        an action nor exposes a partner identifier to the deployable policy.
+        """
+
+        import jax
+
+        def one(member: Any, observation: Any, member_carry: Any, start: Any) -> tuple[Any, Any, Any]:
+            params = jax.tree_util.tree_map(
+                lambda values: values[member], self.stacked_params
+            )
+            next_carry, unused_feature, logits, value = self.network.step(
+                params,
+                jax.tree_util.tree_map(lambda item: item[None, ...], member_carry),
+                observation[None, ...],
+                start[None, ...],
+            )
+            del unused_feature
+            return (
+                jax.tree_util.tree_map(lambda item: item[0], next_carry),
+                logits[0],
+                value[0],
+            )
+
+        return jax.vmap(one)(
+            member_indexes, observations, carry, episode_start
         )
 
 

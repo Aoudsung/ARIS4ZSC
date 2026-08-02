@@ -1,7 +1,7 @@
 """Export, load, and execute frozen DELTA-ZSC deployment artifacts.
 
-Training checkpoints contain training-only teacher encoders and the continuous
-partner generator in ``TrainState``.  Confirmatory evaluation never loads those
+Training checkpoints contain optimizer state and the continuous partner
+generator in ``TrainState``.  Confirmatory evaluation never loads those
 objects.  Calibration exports a pruned artifact containing only the legal-history
 model subtrees required by ``model.step`` plus the frozen conformal gate.
 """
@@ -22,6 +22,8 @@ from src.path_c.calibration import (
     predicted_policy_gain,
 )
 from src.path_c.experiment import METHOD_VERSION, RunConfig
+from src.path_c.fallback import DeploymentTier, deployment_tier
+from src.path_c.qualification import SignalQualification
 from src.path_c.model import build_model, initial_policy_state
 from src.path_c.runner import observe_policy_after_transition
 from src.path_c.storage import (
@@ -41,7 +43,7 @@ DEPLOYABLE_PARAM_NAMES = (
     "universal_critic",
     "response_decoder",
 )
-DEPLOYMENT_BUNDLE_VERSION = 1
+DEPLOYMENT_BUNDLE_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +53,10 @@ class Deployment:
     model: Any
     params: Any
     calibration: Any
+    deployment_tier: DeploymentTier = DeploymentTier.QUALIFIED_ROBUST_BASE
+    always_on_ablation: bool = False
+    qualification: Any = None
+    owner_source_checkpoint: str | None = None
 
 
 def _build_model(config: RunConfig, observation_shape: tuple[int, ...], action_count: int) -> Any:
@@ -72,8 +78,6 @@ def _build_model(config: RunConfig, observation_shape: tuple[int, ...], action_c
                 "action_embedding_dim",
                 "log_variance_minimum",
                 "log_variance_maximum",
-                "response_log_std_minimum",
-                "response_log_std_maximum",
             )
         },
     )
@@ -117,12 +121,25 @@ def load_training_model(run_directory: str | Path, config: RunConfig) -> Deploym
     params = values["params"]
     observation_shape = tuple(int(value) for value in identity["observation_shape"])
     action_count = int(identity.get("action_count", 6))
+    qualification = values.get("qualification", {})
+    if isinstance(qualification, Mapping):
+        qualification = SignalQualification.from_mapping(qualification)
+    owner_source = values.get("owner_source_artifact")
+    owner_checkpoint = None
+    if isinstance(owner_source, Mapping):
+        owner_checkpoint = owner_source.get("checkpoint")
     return Deployment(
         ego_run_id=str(identity.get("ego_run_id", root.name)),
         config=config,
         model=_build_model(config, observation_shape, action_count),
         params=params,
         calibration=values["calibration"],
+        deployment_tier=deployment_tier(qualification),
+        always_on_ablation=False,
+        qualification=qualification,
+        owner_source_checkpoint=(
+            None if owner_checkpoint is None else str(owner_checkpoint)
+        ),
     )
 
 
@@ -133,7 +150,7 @@ def export_deployment_bundle(
     deployment: Deployment,
     calibration: Any,
 ) -> Path:
-    """Write a self-contained deployment artifact without teacher/generator state."""
+    """Write a self-contained deployment artifact without generator/training state."""
 
     import orbax.checkpoint as ocp
 
@@ -145,6 +162,21 @@ def export_deployment_bundle(
     params_path = root / "params"
     ocp.PyTreeCheckpointer().save(str(params_path), pruned, force=True)
     identity = read_run_identity(source_training_run)
+    qualification = (
+        deployment.qualification
+        if isinstance(deployment.qualification, SignalQualification)
+        else SignalQualification.from_mapping(deployment.qualification or {})
+    )
+    tier = deployment_tier(qualification)
+    owner_checkpoint = deployment.owner_source_checkpoint
+    owner_sha = None
+    if tier == DeploymentTier.OWNER_SP_FALLBACK:
+        if owner_checkpoint is None:
+            raise ValueError("C0 failure requires the exact owner-SP source artifact.")
+        from src.path_c.storage import sha256_path
+
+        owner_sha = sha256_path(owner_checkpoint)
+    always_on = bool(deployment.config.calibration.always_on_ablation)
     payload = {
         "version": DEPLOYMENT_BUNDLE_VERSION,
         "method": METHOD_VERSION,
@@ -157,6 +189,14 @@ def export_deployment_bundle(
         "params_fingerprint": pytree_fingerprint(pruned),
         "source_training_run": str(Path(source_training_run).resolve()),
         "calibration": calibration_to_mapping(calibration),
+        "deployment_tier": tier.value,
+        "qualification": qualification.to_mapping(),
+        "owner_source_checkpoint": owner_checkpoint,
+        "owner_source_sha256": owner_sha,
+        "always_on_ablation": always_on,
+        "artifact_name": (
+            "DELTA-r3 always-on" if always_on else "DELTA-r3 calibrated gate"
+        ),
     }
     write_json(root / "deployment_bundle.json", payload)
     return root
@@ -187,6 +227,12 @@ def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployme
         "params_fingerprint",
         "source_training_run",
         "calibration",
+        "deployment_tier",
+        "qualification",
+        "owner_source_checkpoint",
+        "owner_source_sha256",
+        "always_on_ablation",
+        "artifact_name",
     }
     if set(payload) != required:
         raise ValueError(
@@ -208,6 +254,21 @@ def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployme
     if pytree_fingerprint(params) != payload["params_fingerprint"]:
         raise ValueError("Deployment parameter fingerprint differs from bundle metadata.")
     calibration = calibration_from_mapping(payload["calibration"])
+    tier = DeploymentTier(str(payload["deployment_tier"]))
+    qualification = SignalQualification.from_mapping(payload["qualification"])
+    if deployment_tier(qualification) != tier:
+        raise ValueError("Deployment tier disagrees with the frozen qualification.")
+    always_on = bool(payload["always_on_ablation"])
+    if always_on != bool(config.calibration.always_on_ablation):
+        raise ValueError("Always-on is an explicit ablation identity, not a runtime override.")
+    if always_on and payload["artifact_name"] != "DELTA-r3 always-on":
+        raise ValueError("Always-on deployment artifact is misnamed.")
+    owner_checkpoint = payload["owner_source_checkpoint"]
+    if tier == DeploymentTier.OWNER_SP_FALLBACK:
+        from src.path_c.storage import sha256_path
+
+        if owner_checkpoint is None or sha256_path(owner_checkpoint) != payload["owner_source_sha256"]:
+            raise ValueError("Owner-SP fallback artifact fingerprint differs.")
     expected = _fingerprint_words(payload["params_fingerprint"])
     observed = np.asarray(calibration.model_fingerprint, dtype=np.uint32)
     if observed.shape != (2,) or not np.array_equal(observed, expected):
@@ -220,6 +281,12 @@ def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployme
         model=_build_model(config, observation_shape, action_count),
         params=params,
         calibration=calibration,
+        deployment_tier=tier,
+        always_on_ablation=always_on,
+        qualification=qualification,
+        owner_source_checkpoint=(
+            None if owner_checkpoint is None else str(owner_checkpoint)
+        ),
     )
 
 
@@ -271,11 +338,18 @@ def deployment_action(
     )
     del unused_variance
     support = latent_support_score(posterior_mean, deployment.calibration)
-    gate = (
-        hard_adaptation_gate(gain, support, deployment.calibration)
-        if deployment.config.calibration.enable_hard_gate_at_evaluation
-        else jnp.ones_like(gain, dtype=jnp.float32)
-    )
+    conditional_allowed = deployment.deployment_tier in {
+        DeploymentTier.CALIBRATED_PASSIVE_CONDITIONAL,
+        DeploymentTier.CALIBRATED_FULL_ACTIVE,
+    }
+    if not conditional_allowed:
+        gate = jnp.zeros_like(gain, dtype=jnp.float32)
+    elif deployment.always_on_ablation:
+        gate = jnp.ones_like(gain, dtype=jnp.float32)
+    elif deployment.config.calibration.enable_hard_gate_at_evaluation:
+        gate = hard_adaptation_gate(gain, support, deployment.calibration)
+    else:
+        raise RuntimeError("Full r3 deployment requires the frozen calibrated gate.")
     if force_base:
         gate = jnp.zeros_like(gate)
     execution_logits = provisional.base_logits + gate[..., None] * provisional.residual_logits

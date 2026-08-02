@@ -3,8 +3,8 @@
   "layout": "test_time_simple",
   "runs": [
     {
-      "run_id": "train_external_000",
-      "role": "frozen_external_train",
+      "run_id": "owner_source_000",
+      "role": "owner_source",
       "checkpoint": "/ABSOLUTE/PATH/TO/TRAIN_EXTERNAL_000/ckpt_final",
       "parent_training_run_id": "train_external_parent_000",
       "generation_mechanism": "rnn-sp",
@@ -16,8 +16,8 @@
       "partner_type_id": null
     },
     {
-      "run_id": "train_external_001",
-      "role": "frozen_external_train",
+      "run_id": "generator_init_op_000",
+      "role": "generator_init_source",
       "checkpoint": "/ABSOLUTE/PATH/TO/TRAIN_EXTERNAL_001/ckpt_final",
       "parent_training_run_id": "train_external_parent_001",
       "generation_mechanism": "rnn-op",

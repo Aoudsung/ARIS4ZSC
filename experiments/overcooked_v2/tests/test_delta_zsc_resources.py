@@ -4,11 +4,21 @@ import pytest
 
 from src.path_c.resources import (
     ResourceLedger,
+    _cuda_major_from_ptxas_output,
     aggregate_resource_ledgers,
     gpu_hours_for_wall_seconds,
     measure_policy_inference_latency_ms,
     require_single_cuda_worker,
 )
+
+
+def test_cuda_ptxas_version_parser_requires_cuda_12_or_newer() -> None:
+    assert _cuda_major_from_ptxas_output(
+        "Cuda compilation tools, release 12.9, V12.9.86"
+    ) == 12
+    assert _cuda_major_from_ptxas_output("Build cuda_11.8.r11.8/compiler") == 11
+    with pytest.raises(RuntimeError, match="parse"):
+        _cuda_major_from_ptxas_output("unknown compiler")
 
 
 def test_resource_ledger_rejects_hidden_or_inconsistent_total() -> None:

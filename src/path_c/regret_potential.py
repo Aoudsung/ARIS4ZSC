@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from .belief_set_encoder import stratified_mixture_samples
-from .teacher_context import degenerate_gaussian_mixture
 
 
 def decision_regret_from_action_values(
@@ -67,8 +66,8 @@ def potential_shaping(
     next_regret: Any,
     dones: Any,
     *,
-    gamma: float,
-    weight: float,
+    gamma: Any,
+    weight: Any,
 ) -> Any:
     """Detached shaping F_t = lambda (R_t - gamma R_{t+1})."""
 
@@ -79,7 +78,9 @@ def potential_shaping(
     following = jax.lax.stop_gradient(jnp.asarray(next_regret, dtype=jnp.float32))
     terminal = jnp.asarray(dones, dtype=jnp.bool_)
     following = jnp.where(terminal, 0.0, following)
-    return float(weight) * (current - float(gamma) * following)
+    scale = jnp.asarray(weight, dtype=jnp.float32)
+    discount = jnp.asarray(gamma, dtype=jnp.float32)
+    return scale * (current - discount * following)
 
 
 def common_optimal_action_regret_zero(action_values_by_context: Any) -> Any:

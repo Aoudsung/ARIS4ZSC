@@ -22,7 +22,13 @@ from experiments.overcooked_v2.training_app import run_cuda_preflight, run_train
 from experiments.overcooked_v2.upstream_app import run_upstream
 from experiments.overcooked_v2.resource_report_app import run_resource_report
 from experiments.overcooked_v2.formal_claim_app import run_formal_claim_report
-from src.path_c.experiment import RUN_KINDS, load_config, load_partner_manifest
+from src.path_c.experiment import (
+    ENGINEERING_SEED_INDEX,
+    RUN_KINDS,
+    load_config,
+    load_partner_manifest,
+    validate_seed_signal_contract_manifest,
+)
 from src.path_c.storage import CompleteConsoleLog
 
 
@@ -83,6 +89,12 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--partner-manifest", required=True)
     validate.add_argument("--run-kind", choices=RUN_KINDS, required=True)
     validate.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX, *range(10)),
+        help="Required for formal r3 per-seed signal-contract manifests.",
+    )
+    validate.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
     )
 
@@ -93,6 +105,14 @@ def _parser() -> argparse.ArgumentParser:
             expected_layout=config.environment.layout,
             verify_files=not bool(args.skip_manifest_hash_check),
         )
+        if args.run_kind == "formal" and args.seed_index is None:
+            raise ValueError("Formal r3 manifest validation requires --seed-index.")
+        if args.seed_index is not None:
+            validate_seed_signal_contract_manifest(
+                manifest,
+                owner_seed_index=int(args.seed_index),
+                formal=(args.run_kind == "formal"),
+            )
         print(f"Valid DELTA-ZSC manifest: {len(manifest.runs)} runs")
 
     validate.set_defaults(function=validate_manifest, manages_output=False)
@@ -101,7 +121,12 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--config", required=True)
     train.add_argument("--partner-manifest", required=True)
     train.add_argument("--ego-run-id", required=True)
-    train.add_argument("--seed-index", type=int, choices=range(10), required=True)
+    train.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX, *range(10)),
+        required=True,
+    )
     train.add_argument("--run-kind", choices=RUN_KINDS, required=True)
     train.add_argument("--output", required=True)
     train.add_argument("--resume", action="store_true")
@@ -114,7 +139,10 @@ def _parser() -> argparse.ArgumentParser:
     cuda_preflight.add_argument("--config", required=True)
     cuda_preflight.add_argument("--partner-manifest", required=True)
     cuda_preflight.add_argument(
-        "--seed-index", type=int, choices=range(10), required=True
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX,),
+        default=ENGINEERING_SEED_INDEX,
     )
     cuda_preflight.add_argument(
         "--ego-run-id", default="delta-zsc-formal-cuda-preflight"
@@ -134,7 +162,12 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--config", required=True)
     calibrate.add_argument("--partner-manifest", required=True)
     calibrate.add_argument("--training-run", required=True)
-    calibrate.add_argument("--seed-index", type=int, choices=range(10), required=True)
+    calibrate.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX, *range(10)),
+        required=True,
+    )
     calibrate.add_argument("--run-kind", choices=RUN_KINDS, required=True)
     calibrate.add_argument("--output", required=True)
     calibrate.add_argument(

@@ -8,15 +8,10 @@ import pytest
 
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
-optax = pytest.importorskip("optax")
 
 from src.path_c.compiled_kernels import CompiledCallable  # noqa: E402
-from src.path_c.snapshot_archive import (  # noqa: E402
-    immutable_parameter_snapshot,
-    stack_parameter_trees,
-)
 import src.path_c.training as training  # noqa: E402
-from src.path_c.types import LossBundle, RolloutBatch, TrainingCoreState  # noqa: E402
+from src.path_c.types import RolloutBatch, TrainingCoreState  # noqa: E402
 
 
 def _batch(time_count: int = 2, lane_count: int = 4) -> RolloutBatch:
@@ -24,6 +19,7 @@ def _batch(time_count: int = 2, lane_count: int = 4) -> RolloutBatch:
         (time_count, lane_count)
     ) / 7.0
     states = jnp.zeros((time_count + 1, lane_count), dtype=jnp.float32)
+    initial = jnp.zeros((lane_count, 1), dtype=jnp.float32)
     return RolloutBatch(
         observations=states,
         response_next_observations=transition,
@@ -45,154 +41,106 @@ def _batch(time_count: int = 2, lane_count: int = 4) -> RolloutBatch:
         partner_codes=jnp.zeros((time_count, lane_count, 1), dtype=jnp.float32),
         partner_sources=jnp.zeros((time_count, lane_count), dtype=jnp.int32),
         partner_run_ids=jnp.zeros((time_count, lane_count), dtype=jnp.int32),
-        initial_policy_state=jnp.zeros((lane_count, 1), dtype=jnp.float32),
+        initial_policy_state=initial,
+        initial_target_policy_state=initial,
     )
 
 
-def _assert_tree_close(left, right) -> None:
-    for actual, expected in zip(
-        jax.tree_util.tree_leaves(left),
-        jax.tree_util.tree_leaves(right),
-        strict=True,
-    ):
-        np.testing.assert_allclose(
-            np.asarray(actual), np.asarray(expected), rtol=1.0e-6, atol=1.0e-6
-        )
+def _metrics(value):
+    names = (
+        "approx_kl", "base_approx_kl", "conditional_approx_kl",
+        "clip_fraction", "actor_loss", "total_loss", "value_loss",
+        "entropy", "information_bottleneck", "mean_raw_reward",
+        "mean_shaped_reward", "mean_support_score", "mean_gate",
+        "base_entropy", "conditional_entropy",
+        "conditional_entropy_noncollapse", "conditional_to_base_kl",
+        "conditional_residual_rms",
+        "nonfinite_update",
+    )
+    metrics = {name: value for name in names}
+    metrics["nonfinite_update"] = jnp.asarray(0.0, dtype=jnp.float32)
+    return metrics
 
 
-def test_cuda_scan_matches_sequential_minibatch_updates(
+def test_cuda_scan_preserves_sequential_minibatch_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fixture_loss(*, params, batch, anchors=None, **unused):
-        anchor_term = (
-            jnp.asarray(0.0, dtype=jnp.float32)
-            if anchors is None
-            else jnp.asarray(anchors, dtype=jnp.float32)
-        )
-        residual = (
-            params["weight"] * jnp.mean(batch.rewards)
-            + params["bias"]
-            + 0.125 * anchor_term
-        )
-        total = jnp.square(residual) + 0.01 * jnp.square(params["weight"])
-        return LossBundle(
-            total=total,
-            metrics={"total_loss": total, "weight": params["weight"]},
-        )
+    def toy_update(*, core, batch, **unused):
+        increment = jnp.mean(batch.rewards)
+        params = {"weight": core.params["weight"] + increment}
+        value = params["weight"]
+        return core._replace(params=params), {
+            **_metrics(value),
+            "optimizer_applied": jnp.asarray(1.0, dtype=jnp.float32),
+        }
 
-    monkeypatch.setattr(training, "compute_loss", fixture_loss)
-    params = {
-        "weight": jnp.asarray(0.75, dtype=jnp.float32),
-        "bias": jnp.asarray(-0.2, dtype=jnp.float32),
-    }
-    optimizer = optax.adam(2.5e-4, eps=1.0e-5)
+    monkeypatch.setattr(training, "apply_training_core_update", toy_update)
     initial = TrainingCoreState(
-        params=params,
-        target_params=params,
-        optimizer_state=optimizer.init(params),
+        params={"weight": jnp.asarray(0.0)},
+        target_params={"weight": jnp.asarray(9.0)},
+        ppo_optimizer_state=jnp.asarray(0),
     )
-    config = SimpleNamespace(ppo=SimpleNamespace(polyak_coefficient=0.03))
     batch = _batch()
-    schedule = jnp.asarray(
-        [[0, 3], [2, 1], [1, 0], [3, 2]], dtype=jnp.int32
-    )
-
-    reference = initial
-    reference_metrics = []
+    schedule = jnp.asarray([[0, 3], [2, 1], [1, 0], [3, 2]], dtype=jnp.int32)
+    config = SimpleNamespace(ppo=SimpleNamespace(max_approx_kl=1.0e9))
+    expected = initial
+    expected_values = []
     for indexes in np.asarray(schedule):
-        reference, metrics = training.apply_training_core_update(
-            model=None,
-            core=reference,
-            optimizer=optimizer,
-            batch=training.slice_rollout_lanes(batch, indexes),
-            config=config,
+        expected, metrics = toy_update(
+            core=expected, batch=training.slice_rollout_lanes(batch, indexes)
         )
-        reference_metrics.append(metrics)
-    expected_metrics = jax.tree_util.tree_map(
-        lambda *values: jnp.stack(values), *reference_metrics
-    )
-
-    scanned, observed_metrics = jax.jit(
+        expected_values.append(metrics["total_loss"])
+    observed, metrics = jax.jit(
         lambda core: training.scan_training_updates(
             model=None,
             core=core,
-            optimizer=optimizer,
+            optimizer=None,
             batch=batch,
             schedule=schedule,
             config=config,
         )
     )(initial)
-    _assert_tree_close(scanned, reference)
-    _assert_tree_close(observed_metrics, expected_metrics)
+    np.testing.assert_allclose(
+        np.asarray(observed.params["weight"]),
+        np.asarray(expected.params["weight"]),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(metrics["total_loss"]), np.asarray(expected_values), atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(observed.target_params["weight"]), 9.0, atol=0.0
+    )
 
 
-def test_anchor_first_plus_normal_scan_matches_registered_order(
+def test_kl_stop_makes_remaining_scan_steps_exact_noops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fixture_loss(*, params, batch, anchors=None, **unused):
-        anchor_term = 0.0 if anchors is None else anchors
-        residual = params["weight"] * jnp.mean(batch.rewards) + anchor_term
-        total = jnp.square(residual)
-        return LossBundle(total=total, metrics={"total_loss": total})
+    def toy_update(*, core, **unused):
+        value = core.params["weight"] + 1.0
+        return core._replace(params={"weight": value}), {
+            **_metrics(value),
+            "base_approx_kl": value,
+            "conditional_approx_kl": jnp.asarray(0.0),
+            "optimizer_applied": jnp.asarray(1.0),
+        }
 
-    monkeypatch.setattr(training, "compute_loss", fixture_loss)
-    params = {"weight": jnp.asarray(0.4, dtype=jnp.float32)}
-    optimizer = optax.adam(1.0e-3, eps=1.0e-5)
-    initial = TrainingCoreState(params, params, optimizer.init(params))
-    config = SimpleNamespace(ppo=SimpleNamespace(polyak_coefficient=0.1))
-    batch = _batch()
-    schedule = jnp.asarray([[0, 1], [2, 3], [1, 3]], dtype=jnp.int32)
-    anchor = jnp.asarray(0.75, dtype=jnp.float32)
-
-    reference, first_reference = training.apply_training_core_update(
+    monkeypatch.setattr(training, "apply_training_core_update", toy_update)
+    core = TrainingCoreState(
+        params={"weight": jnp.asarray(0.0)},
+        target_params={"weight": jnp.asarray(0.0)},
+        ppo_optimizer_state=jnp.asarray(0),
+    )
+    result, metrics = training.scan_training_updates(
         model=None,
-        core=initial,
-        optimizer=optimizer,
-        batch=training.slice_rollout_lanes(batch, schedule[0]),
-        config=config,
-        anchors=anchor,
+        core=core,
+        optimizer=None,
+        batch=_batch(),
+        schedule=jnp.asarray([[0, 1], [2, 3], [0, 2]], dtype=jnp.int32),
+        config=SimpleNamespace(ppo=SimpleNamespace(max_approx_kl=0.5)),
     )
-    remaining_reference = []
-    for indexes in np.asarray(schedule[1:]):
-        reference, metrics = training.apply_training_core_update(
-            model=None,
-            core=reference,
-            optimizer=optimizer,
-            batch=training.slice_rollout_lanes(batch, indexes),
-            config=config,
-        )
-        remaining_reference.append(metrics)
-
-    first_kernel = jax.jit(
-        lambda core: training.apply_anchor_first_update(
-            model=None,
-            core=core,
-            optimizer=optimizer,
-            batch=batch,
-            lane_indexes=schedule[0],
-            config=config,
-            anchors=anchor,
-            quotient_pairs=None,
-        )
-    )
-    scan_kernel = jax.jit(
-        lambda core: training.scan_training_updates(
-            model=None,
-            core=core,
-            optimizer=optimizer,
-            batch=batch,
-            schedule=schedule[1:],
-            config=config,
-        )
-    )
-    observed, first_observed = first_kernel(initial)
-    observed, remaining_observed = scan_kernel(observed)
-    _assert_tree_close(observed, reference)
-    _assert_tree_close(first_observed, first_reference)
-    expected_remaining = jax.tree_util.tree_map(
-        lambda *values: jnp.stack(values), *remaining_reference
-    )
-    _assert_tree_close(remaining_observed, expected_remaining)
+    assert float(result.params["weight"]) == 1.0
+    np.testing.assert_array_equal(np.asarray(metrics["optimizer_applied"]), [1, 0, 0])
 
 
 def test_compiled_callable_reuses_abstract_signature() -> None:
@@ -203,81 +151,18 @@ def test_compiled_callable_reuses_abstract_signature() -> None:
     assert kernel.last_call_compiled is False
     np.testing.assert_allclose(np.asarray(first), np.full((4,), 4.0))
     np.testing.assert_allclose(np.asarray(second), np.arange(4) * 3.0 + 1.0)
-    metadata = kernel.metadata()
-    assert len(metadata) == 1
-    assert metadata[0]["executable_fingerprint"]
 
 
-def test_donated_training_core_uses_distinct_online_and_target_buffers(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fixture_loss(*, params, batch, **unused):
-        total = jnp.square(params["weight"] * jnp.mean(batch.rewards))
-        return LossBundle(total=total, metrics={"total_loss": total})
+def test_zero_initialized_residual_hinge_has_finite_zero_gradient() -> None:
+    """Regression: r3 residuals start at zero and must not poison PPO."""
 
-    monkeypatch.setattr(training, "compute_loss", fixture_loss)
-    params = {"weight": jnp.asarray(0.75, dtype=jnp.float32)}
-    target = jax.tree_util.tree_map(jnp.copy, params)
-    assert (
-        params["weight"].unsafe_buffer_pointer()
-        != target["weight"].unsafe_buffer_pointer()
-    )
-    optimizer = optax.adam(2.5e-4, eps=1.0e-5)
-    core = TrainingCoreState(
-        params=params,
-        target_params=target,
-        optimizer_state=optimizer.init(params),
-    )
-    config = SimpleNamespace(ppo=SimpleNamespace(polyak_coefficient=0.03))
-    batch = _batch()
-    schedule = jnp.asarray([[0, 1], [2, 3]], dtype=jnp.int32)
-    kernel = CompiledCallable(
-        "donated_training_core_fixture",
-        lambda value, current_batch, current_schedule: (
-            training.scan_training_updates(
-                model=None,
-                core=value,
-                optimizer=optimizer,
-                batch=current_batch,
-                schedule=current_schedule,
-                config=config,
-            )
-        ),
-        donate_argnums=(0,),
-    )
-    completed, metrics = kernel(core, batch, schedule)
-    for leaf in jax.tree_util.tree_leaves(completed):
-        leaf.block_until_ready()
-    assert np.isfinite(np.asarray(metrics["total_loss"])).all()
+    residual = jnp.zeros((3, 4, 6), dtype=jnp.float32)
 
+    def penalty(value):
+        rms = training.stable_root_mean_square(value)
+        return jnp.maximum(rms - 1.0, 0.0)
 
-def test_generator_archive_copy_survives_later_live_buffer_donation() -> None:
-    live = {
-        "kernel": jnp.arange(12, dtype=jnp.float32).reshape((3, 4)),
-        "bias": jnp.asarray([0.25, -0.5], dtype=jnp.float32),
-    }
-    expected = jax.tree_util.tree_map(lambda value: np.asarray(value).copy(), live)
-    archived = immutable_parameter_snapshot(live)
-
-    for live_leaf, archived_leaf in zip(
-        jax.tree_util.tree_leaves(live),
-        jax.tree_util.tree_leaves(archived),
-        strict=True,
-    ):
-        assert live_leaf.unsafe_buffer_pointer() != archived_leaf.unsafe_buffer_pointer()
-
-    donated_update = jax.jit(
-        lambda params: jax.tree_util.tree_map(lambda value: value + 1.0, params),
-        donate_argnums=(0,),
-    )
-    updated = donated_update(live)
-    jax.block_until_ready(updated)
-
-    stacked = stack_parameter_trees((archived,))
-    jax.block_until_ready(stacked)
-    for actual, original in zip(
-        jax.tree_util.tree_leaves(stacked),
-        jax.tree_util.tree_leaves(expected),
-        strict=True,
-    ):
-        np.testing.assert_array_equal(np.asarray(actual[0]), original)
+    value, gradient = jax.value_and_grad(penalty)(residual)
+    assert float(value) == 0.0
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros(residual.shape))
+    assert np.all(np.isfinite(np.asarray(gradient)))

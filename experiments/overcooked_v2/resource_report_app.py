@@ -106,14 +106,15 @@ def run_resource_report(args: argparse.Namespace) -> None:
     lines = [
         "# Complete resource ledger",
         "",
-        "| Method | Ego PPO | Partner/pretrain | Anchors | State collection | Calibration | Total training simulator | GPU-h | Peak memory | Deploy params | Training-only params | Inference ms |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Ego PPO | Base distill | Partner sources | Generator | Training anchors | Audit anchors | Calibration | Total training simulator | GPU-h | Peak memory | Deploy params | Training-only params | Inference ms |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {ego_policy_steps} | {partner_training_steps} | "
-            "{counterfactual_steps} | {state_collection_steps} | "
-            "{calibration_steps} | {total_training_simulator_steps} | "
+            "| {method} | {ego_policy_steps} | {base_distillation_steps} | "
+            "{partner_source_training_steps} | {generator_training_steps} | "
+            "{training_anchor_steps} | {audit_anchor_steps} | {calibration_steps} | "
+            "{total_training_simulator_steps} | "
             "{gpu_hours:.4f} | {peak_memory_bytes} | {deployable_parameters} | "
             "{training_only_parameters} | {inference_latency_ms:.6f} |".format(
                 **row

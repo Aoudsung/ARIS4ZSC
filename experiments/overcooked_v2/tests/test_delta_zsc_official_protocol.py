@@ -12,6 +12,7 @@ jnp = pytest.importorskip("jax.numpy")
 optax = pytest.importorskip("optax")
 
 from experiments.overcooked_v2.official_adapter import (  # noqa: E402
+    _cuda_only_official_debug_callbacks_disabled,
     _official_symbol,
     _validate_official_baseline_config,
     compose_official_config,
@@ -25,6 +26,7 @@ from experiments.overcooked_v2.official_baseline_app import _official_command  #
 from experiments.overcooked_v2.mechanical_e2e_app import (  # noqa: E402
     generator_update_executed,
     mechanical_fixture_key,
+    mechanical_upstream_seed_slot,
 )
 from src.path_c.experiment import (  # noqa: E402
     OFFICIAL_CORRECT_DELIVERY_REWARD,
@@ -35,7 +37,10 @@ from src.path_c.experiment import (  # noqa: E402
     official_training_key,
 )
 from src.path_c.runner import official_ego_roles  # noqa: E402
-from src.path_c.resources import delta_anchor_attempted_steps  # noqa: E402
+from src.path_c.resources import (  # noqa: E402
+    r3_audit_anchor_attempted_steps,
+    r3_training_anchor_attempted_steps,
+)
 from src.path_c.training import (  # noqa: E402
     official_learning_rate_schedule,
     official_reward_shaping_factor,
@@ -100,22 +105,30 @@ def test_formal_budget_is_exact_whole_official_updates() -> None:
     assert config.training.environment_steps // steps_per_update == 457
     assert config.training.environment_steps == 29_949_952
     assert config.evaluation.one_sided_alpha == 0.05
-    trigger_count = 457 // config.anchors.interval_updates
-    matched_pairs = min(
-        config.anchors.states_per_interval,
-        config.partner_generator.codes_per_update,
-    )
-    # Each matched-code pair is two intervened worlds, not one.  The resource
-    # ledger records what the implementation actually executes.
-    assert delta_anchor_attempted_steps(
+    trigger_count = 1 + (457 - 1) // config.anchors.interval_updates
+    assert trigger_count == 29
+    assert r3_training_anchor_attempted_steps(
         trigger_count=trigger_count,
-        ordinary_worlds=config.anchors.states_per_interval,
-        matched_worlds=2 * matched_pairs,
+        ordinary_candidates=config.anchors.pilot_ordinary_candidates,
+        matched_code_candidates=config.anchors.pilot_matched_code_candidates,
+        selected_ordinary=config.anchors.selected_ordinary,
+        selected_matched_code=config.anchors.selected_matched_code,
         action_count=6,
+        pilot_replicas=config.anchors.pilot_replicas,
         fit_replicas=config.anchors.fit_replicas,
-        evaluation_replicas=config.anchors.evaluation_replicas,
         continuation_horizon=config.anchors.continuation_horizon,
-    ) == 1_680_998_400
+        probe_steps=config.anchors.probe_steps,
+    ) == 24_291_328
+    assert r3_audit_anchor_attempted_steps(
+        milestone_count=4,
+        ordinary_states=config.anchors.audit_ordinary_states,
+        matched_code_pairs=config.anchors.audit_matched_code_states,
+        action_count=6,
+        fit_replicas=config.anchors.audit_fit_replicas,
+        evaluation_replicas=config.anchors.audit_evaluation_replicas,
+        continuation_horizon=config.anchors.audit_continuation_horizon,
+        probe_steps=config.anchors.probe_steps,
+    ) == 88_477_696
 
 
 @pytest.mark.parametrize(
@@ -193,7 +206,7 @@ def test_mechanical_config_exercises_every_delta_auxiliary_stage() -> None:
     )
     assert updates == 16
     assert updates // config.anchors.interval_updates == 8
-    assert updates // config.partner_generator.update_interval == 8
+    assert updates // config.partner_generator.update_interval == 16
     assert updates // config.partner_generator.snapshot_interval == 4
     assert config.anchors.fit_replicas > 0
     assert config.anchors.evaluation_replicas > 0
@@ -218,6 +231,17 @@ def test_mechanical_fixture_keys_are_deterministic_fresh_and_disjoint() -> None:
     assert len(set(keys)) == len(keys)
     formal = {tuple(official_training_key(index)) for index in range(10)}
     assert not formal.intersection(keys)
+
+
+def test_mechanical_upstream_fixtures_stay_inside_official_seed_slots() -> None:
+    assert [mechanical_upstream_seed_slot(index) for index in range(7, 11)] == [
+        7,
+        8,
+        9,
+        0,
+    ]
+    with pytest.raises(ValueError, match="non-negative"):
+        mechanical_upstream_seed_slot(-1)
 
 
 def test_official_scalar_metrics_receive_a_lossless_row_axis() -> None:
@@ -350,7 +374,7 @@ def test_direct_upstream_trainer_preserves_official_wandb_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import experiments.overcooked_v2.official_adapter as adapter
-    import wandb
+    wandb = pytest.importorskip("wandb")
 
     active = {"value": False}
 
@@ -428,6 +452,23 @@ def test_direct_upstream_trainer_preserves_official_wandb_context(
     )
     assert result["effective_environment_steps"] == 65_536
     assert len(result["checkpoint_paths"]) == 3
+
+
+def test_cuda_only_official_debug_callbacks_are_side_effect_only_and_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callback = jax.debug.callback
+    debug_print = jax.debug.print
+    observed: list[int] = []
+    monkeypatch.setenv("JAX_PLATFORMS", "cuda")
+    with _cuda_only_official_debug_callbacks_disabled() as disabled:
+        assert disabled
+        jax.debug.callback(lambda value: observed.append(int(value)), 7)
+        jax.debug.print("value={value}", value=7)
+        assert float(jnp.asarray(3.0) + jnp.asarray(4.0)) == 7.0
+    assert observed == []
+    assert jax.debug.callback is callback
+    assert jax.debug.print is debug_print
 
 
 def test_official_checkpoint_store_uses_path_but_serializes_string_config(

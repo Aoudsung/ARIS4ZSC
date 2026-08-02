@@ -1,4 +1,4 @@
-version: 5
+version: 7
 
 environment:
   layout: test_time_simple
@@ -23,8 +23,6 @@ model:
   action_embedding_dim: 16
   log_variance_minimum: -5.0
   log_variance_maximum: 2.0
-  response_log_std_minimum: -5.0
-  response_log_std_maximum: 2.0
 
 ppo:
   update_epochs: 4
@@ -45,26 +43,36 @@ ppo:
 
 loss:
   response_weight: 1.0
-  counterfactual_weight: 1.0
-  advantage_distill_weight: 0.5
-  policy_distill_weight: 0.25
-  quotient_weight: 0.25
-  consistency_weight: 0.25
+  raw_q_weight: 1.0
+  q_policy_weight: 0.25
+  q_policy_temperature: 1.0
   information_bottleneck_weight: 0.001
   information_bottleneck_free_bits: 1.0
-  decision_regret_weight: 0.1
-  quotient_equivalence_epsilon: 0.05
-  quotient_separation_epsilon: 0.25
-  quotient_margin: 1.0
+  decision_regret_weight_maximum: 0.1
+  conditional_entropy_weight: 0.01
+  conditional_kl_weight: 1.0
+  residual_norm_weight: 1.0
+  response_updates_per_outer_update: 2
+  raw_q_updates_per_outer_update: 4
 
 anchors:
   interval_updates: 2
-  states_per_interval: 2
+  pilot_ordinary_candidates: 2
+  pilot_matched_code_candidates: 2
+  pilot_replicas: 1
+  selected_ordinary: 1
+  selected_matched_code: 1
   fit_replicas: 1
-  evaluation_replicas: 1
   continuation_horizon: 8
-  sampling_time_bins: 2
-  sampling_regret_bins: 2
+  probe_steps: 2
+  replay_capacity_per_epoch: 8
+  audit_milestones: [C0, 15M, 22.5M, final]
+  audit_ordinary_states: 4
+  audit_matched_code_states: 1
+  audit_fit_replicas: 1
+  audit_evaluation_replicas: 1
+  audit_continuation_horizon: 8
+  audit_uniform_fraction: 0.25
   return_lower_bound: -400.0
   return_upper_bound: 400.0
 
@@ -72,19 +80,25 @@ partner_generator:
   code_dim: 8
   hidden_dim: 128
   modulation_rank: 8
-  current_probability: 0.50
-  snapshot_probability: 0.25
-  frozen_external_probability: 0.25
-  update_interval: 2
+  initial_current_probability: 0.0
+  initial_snapshot_probability: 0.0
+  initial_frozen_external_probability: 1.0
+  episodes_per_update: 4
+  episode_steps: 400
+  update_epochs: 1
+  environment_minibatches: 1
   snapshot_interval: 4
-  competence_threshold: 50.0
   cvar_level: 0.20
+  source_distillation_kl_maximum: 0.05
+  trust_region_kl_maximum: 0.03
+  interpolation_uniform_kl_minimum: 0.01
+  delivery_noninferiority_margin: 20.0
   brdiv_weight: 1.0
   smoothness_weight: 0.05
   lagrangian_learning_rate: 0.01
   kernel_bandwidth: 20.0
   kernel_jitter: 0.0001
-  codes_per_update: 2
+  codes_per_update: 4
 
 calibration:
   alpha: 0.50
@@ -94,12 +108,18 @@ calibration:
   enable_hard_gate_at_evaluation: true
   episodes_per_run: 2
   anchors_per_run: 2
+  always_on_ablation: false
 
 training:
   rollout_length: 16
-  student_lane_probability: 0.75
-  teacher_lane_probability: 0.25
   base_policy_lane_probability: 0.25
+  conditional_policy_lane_probability: 0.75
+  target_policy_epoch_updates: 2
+  base_qualification_deadline_steps: 1024
+  owner_sources_per_seed: 1
+  generator_init_sources_per_mechanism: 1
+  development_runs_per_mechanism: 4
+  calibration_runs_per_mechanism: 5
 
 evaluation:
   episodes_per_pairing: 2

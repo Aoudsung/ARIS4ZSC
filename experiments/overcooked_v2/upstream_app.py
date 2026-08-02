@@ -125,6 +125,9 @@ def run_upstream(args: argparse.Namespace) -> None:
             "checkpoint_paths": [
                 str(path) for path in result["checkpoint_paths"]
             ],
+            "cuda_only_debug_callbacks_disabled": bool(
+                result["cuda_only_debug_callbacks_disabled"]
+            ),
             "metric_files": metric_paths,
         },
     )
@@ -144,6 +147,7 @@ def run_upstream(args: argparse.Namespace) -> None:
         output / "resource_ledger.json",
         ResourceLedger(
             partner_training_steps=int(result["effective_environment_steps"]),
+            partner_source_training_steps=int(result["effective_environment_steps"]),
             gpu_hours=gpu_hours_for_wall_seconds(wall_seconds),
             peak_memory_bytes=peak_device_memory_bytes(),
             deployable_parameters=parameter_count(final_params),

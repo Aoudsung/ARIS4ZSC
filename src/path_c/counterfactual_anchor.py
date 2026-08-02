@@ -31,6 +31,7 @@ class AnchorFunctions(NamedTuple):
     partner_policy_step: Callable[..., tuple[Any, Any, Any]]
     partner_observe: Callable[..., Any]
     environment_step: Callable[..., tuple[Any, Any, Any, Any, Any]]
+    ego_endpoint_value: Callable[..., Any]
 
 
 def tree_select(mask: Any, selected: Any, alternative: Any) -> Any:
@@ -114,6 +115,202 @@ def anchor_microbatch_candidates(
     return tuple(candidates)
 
 
+def select_anchor_microbatch_size(
+    *,
+    chunk_kernel: Any,
+    runtime: Any,
+    anchor_ids: Any,
+    root_keys: Any,
+    world: AnchorWorld,
+    rollout_flat_indexes: Any,
+    policy_states: Any,
+    observations: Any,
+    partner_codes: Any,
+    partner_sources: Any,
+    partner_run_ids: Any,
+    action_count: int,
+    replicas: int,
+) -> int:
+    """Compile-probe the largest complete-world anchor microbatch.
+
+    Scientific keys are generated before this operational choice.  Lowering
+    the returned branch count only changes the number of complete anchor
+    worlds dispatched per executable call.  When XLA memory analysis is not
+    exposed by the runtime, the selector conservatively accepts one world
+    rather than executing an unaccounted simulator preflight.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    count = int(jnp.asarray(anchor_ids).shape[0])
+    repeats = int(action_count) * int(replicas)
+    if count <= 0 or repeats <= 0:
+        raise ValueError("Anchor microbatch preflight dimensions must be positive.")
+
+    def take(tree: Any, size: int) -> Any:
+        return jax.tree_util.tree_map(lambda value: jnp.asarray(value)[:size], tree)
+
+    failures: list[str] = []
+    for branch_count in anchor_microbatch_candidates(
+        maximum_anchor_worlds=count,
+        action_count=action_count,
+        replicas=replicas,
+    ):
+        worlds = int(branch_count) // repeats
+        try:
+            chunk_kernel.executable(
+                runtime,
+                take(anchor_ids, worlds),
+                take(root_keys, worlds),
+                take(world, worlds),
+                take(rollout_flat_indexes, worlds),
+                take(policy_states, worlds),
+                take(observations, worlds),
+                take(partner_codes, worlds),
+                take(partner_sources, worlds),
+                take(partner_run_ids, worlds),
+            )
+        except Exception as error:
+            if error.__class__.__name__ != "CompiledMemoryLimitError":
+                raise
+            failures.append(f"{branch_count}:{error}")
+            continue
+        metadata = {
+            item.get("argument_signature"): item
+            for item in chunk_kernel.metadata()
+        }
+        last = metadata.get(chunk_kernel.last_signature, {})
+        memory = last.get("memory_analysis", {})
+        if memory.get("conservative_device_bytes") is not None or worlds == 1:
+            chunk_kernel.selected_microbatch_size = int(branch_count)
+            return int(branch_count)
+    raise RuntimeError(
+        "No registered anchor microbatch fits the device memory limit: "
+        + "; ".join(failures)
+    )
+
+
+def advance_anchor_world(
+    *,
+    world: AnchorWorld,
+    root_keys: Any,
+    functions: AnchorFunctions,
+    steps: int,
+    gate: float = 0.0,
+    runtime: Any | None = None,
+    domain: int = 70_001,
+) -> AnchorWorld:
+    """Generate legal post-evidence histories before a matched-code anchor.
+
+    Callers repeat the same root key for the two hidden-code branches.  Ego and
+    environment random primitives are therefore paired, while partner actions
+    may differ because the partner state contains a different code.  No hidden
+    code is passed to the ego policy.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    if steps <= 0:
+        raise ValueError("Post-evidence probe must contain at least one step.")
+    roots = jnp.asarray(root_keys)
+    lane_count = int(jnp.asarray(world.done).shape[0])
+    if roots.shape != (lane_count, 2):
+        raise ValueError("Post-evidence roots must provide one key per world.")
+
+    def one_step(current: AnchorWorld, time_index: int) -> AnchorWorld:
+        active = ~jnp.asarray(current.done, dtype=jnp.bool_)
+        ego_keys = jax.vmap(
+            lambda key: jax.random.fold_in(jax.random.fold_in(key, domain), 10 + time_index)
+        )(roots)
+        partner_keys = jax.vmap(
+            lambda key: jax.random.fold_in(jax.random.fold_in(key, domain), 20 + time_index)
+        )(roots)
+        environment_keys = jax.vmap(
+            lambda key: jax.random.fold_in(jax.random.fold_in(key, domain), 30 + time_index)
+        )(roots)
+        uniform_keys = jax.vmap(
+            lambda key: jax.random.fold_in(jax.random.fold_in(key, domain), 40 + time_index)
+        )(roots)
+        uniforms = jax.vmap(lambda key: jax.random.uniform(key))(uniform_keys)
+        lane = jnp.arange(lane_count, dtype=jnp.int32)
+        ego_observation = current.observations[lane, current.ego_roles]
+        partner_observation = current.observations[lane, 1 - current.ego_roles]
+        ego_args = (
+            current.ego_state,
+            ego_observation,
+            jnp.full((lane_count,), float(gate), dtype=jnp.float32),
+            ego_keys,
+        )
+        next_ego_pre, ego_probabilities = (
+            functions.ego_policy_step(*ego_args)
+            if runtime is None
+            else functions.ego_policy_step(runtime, *ego_args)
+        )
+        ego_actions = inverse_cdf_actions(ego_probabilities, uniforms)
+        partner_args = (
+            current.partner_state,
+            partner_observation,
+            current.partner_episode_start,
+            partner_keys,
+        )
+        partner_actions, next_partner_pre, partner_context = (
+            functions.partner_policy_step(*partner_args)
+            if runtime is None
+            else functions.partner_policy_step(runtime, *partner_args)
+        )
+        ego_first = jnp.stack((ego_actions, partner_actions), axis=-1)
+        partner_first = jnp.stack((partner_actions, ego_actions), axis=-1)
+        joint = jnp.where((current.ego_roles == 0)[:, None], ego_first, partner_first)
+        next_environment, next_observations, rewards, dones, info = functions.environment_step(
+            current.environment_state, joint, environment_keys
+        )
+        terminal = info["terminal_observations"]
+        obs_mask = jnp.asarray(dones).reshape(
+            jnp.asarray(dones).shape + (1,) * (next_observations[:, 0].ndim - 1)
+        )
+        ego_terminal = terminal[lane, current.ego_roles]
+        partner_terminal = terminal[lane, 1 - current.ego_roles]
+        ego_next = next_observations[lane, current.ego_roles]
+        partner_next = next_observations[lane, 1 - current.ego_roles]
+        ego_history = jnp.where(obs_mask, ego_terminal, ego_next)
+        partner_history = jnp.where(obs_mask, partner_terminal, partner_next)
+        next_ego = functions.ego_observe(
+            next_ego_pre, ego_observation, ego_actions, rewards, dones, ego_history
+        )
+        observe_args = (
+            next_partner_pre,
+            partner_context,
+            partner_observation,
+            partner_actions,
+            rewards,
+            dones,
+            partner_history,
+        )
+        next_partner = (
+            functions.partner_observe(*observe_args)
+            if runtime is None
+            else functions.partner_observe(runtime, *observe_args)
+        )
+        candidate = AnchorWorld(
+            environment_state=next_environment,
+            observations=next_observations,
+            ego_state=next_ego,
+            partner_state=next_partner,
+            partner_episode_start=dones,
+            ego_roles=current.ego_roles,
+            done=jnp.asarray(dones, dtype=jnp.bool_),
+            raw_return=current.raw_return + jnp.where(active, rewards, 0.0),
+        )
+        return tree_select(active, candidate, current)
+
+    def body(index: int, current: AnchorWorld) -> AnchorWorld:
+        return one_step(current, index)
+
+    return jax.lax.fori_loop(0, int(steps), body, world)
+
+
 def collect_counterfactual_anchors(
     *,
     anchor_ids: Any,
@@ -130,6 +327,7 @@ def collect_counterfactual_anchors(
     fit_replicas: int,
     evaluation_replicas: int,
     continuation_horizon: int,
+    discount: float = 1.0,
     gate: float = 1.0,
     microbatch_size: int | None = None,
     runtime: Any | None = None,
@@ -142,13 +340,29 @@ def collect_counterfactual_anchors(
 
     if action_count <= 1:
         raise ValueError("Counterfactual anchors need at least two actions.")
-    if fit_replicas <= 0 or evaluation_replicas <= 0:
-        raise ValueError("Both replica splits must be non-empty.")
+    if fit_replicas <= 0 or evaluation_replicas < 0:
+        raise ValueError("Fit replicas must be positive and evaluation replicas non-negative.")
     if continuation_horizon <= 0:
         raise ValueError("Continuation horizon must be positive.")
     anchor_count = int(jnp.asarray(world.done).shape[0])
     replicas = int(fit_replicas + evaluation_replicas)
     repeats = int(action_count * replicas)
+    if microbatch_size is None and chunk_kernel is not None:
+        microbatch_size = select_anchor_microbatch_size(
+            chunk_kernel=chunk_kernel,
+            runtime=runtime,
+            anchor_ids=anchor_ids,
+            root_keys=root_keys,
+            world=world,
+            rollout_flat_indexes=rollout_flat_indexes,
+            policy_states=policy_states,
+            observations=observations,
+            partner_codes=partner_codes,
+            partner_sources=partner_sources,
+            partner_run_ids=partner_run_ids,
+            action_count=action_count,
+            replicas=replicas,
+        )
     if microbatch_size is not None:
         limit = int(microbatch_size)
         if limit < repeats:
@@ -248,6 +462,7 @@ def collect_counterfactual_anchors(
                         fit_replicas=fit_replicas,
                         evaluation_replicas=evaluation_replicas,
                         continuation_horizon=continuation_horizon,
+                        discount=discount,
                         gate=gate,
                         runtime=runtime,
                     )
@@ -385,7 +600,12 @@ def collect_counterfactual_anchors(
             partner_episode_start=dones,
             ego_roles=current.ego_roles,
             done=jnp.asarray(dones, dtype=jnp.bool_),
-            raw_return=current.raw_return + jnp.where(active, rewards, 0.0),
+            raw_return=current.raw_return
+                + jnp.power(
+                    jnp.asarray(discount, dtype=jnp.float32),
+                    jnp.asarray(time_index, dtype=jnp.float32),
+                )
+                * jnp.where(active, rewards, 0.0),
         )
         return tree_select(active, candidate, current)
 
@@ -395,11 +615,30 @@ def collect_counterfactual_anchors(
         return step_world(current, forced_action=None, time_index=index)
 
     final = jax.lax.fori_loop(1, int(continuation_horizon), body, first)
-    returns = jnp.asarray(final.raw_return).reshape(
+    final_lane = jnp.arange(final.done.shape[0], dtype=jnp.int32)
+    final_ego_observation = final.observations[final_lane, final.ego_roles]
+    endpoint_args = (
+        final.ego_state,
+        final_ego_observation,
+        jnp.full(final.done.shape, float(gate), dtype=jnp.float32),
+    )
+    endpoint = (
+        functions.ego_endpoint_value(*endpoint_args)
+        if runtime is None
+        else functions.ego_endpoint_value(runtime, *endpoint_args)
+    )
+    bootstrapped_return = final.raw_return + (
+        float(discount) ** int(continuation_horizon)
+    ) * jnp.where(final.done, 0.0, endpoint)
+    returns = jnp.asarray(bootstrapped_return).reshape(
         (anchor_count, action_count, replicas)
     )
     fit = jnp.mean(returns[..., :fit_replicas], axis=-1)
-    evaluation = jnp.mean(returns[..., fit_replicas:], axis=-1)
+    evaluation = (
+        jnp.mean(returns[..., fit_replicas:], axis=-1)
+        if evaluation_replicas
+        else jnp.full(fit.shape, jnp.nan, dtype=fit.dtype)
+    )
     return CounterfactualAnchorBatch(
         anchor_ids=anchor_ids,
         rollout_flat_indexes=rollout_flat_indexes,
@@ -439,6 +678,8 @@ __all__ = [
     "AnchorFunctions",
     "AnchorWorld",
     "anchor_microbatch_candidates",
+    "select_anchor_microbatch_size",
+    "advance_anchor_world",
     "centered_fit_signature",
     "collect_counterfactual_anchors",
     "evaluate_selected_actions",

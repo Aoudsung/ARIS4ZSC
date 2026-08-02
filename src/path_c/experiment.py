@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CONFIG_VERSION = 5
-METHOD_VERSION = "delta_zsc_v5_decision_equivalent_bayes_r2_official"
+CONFIG_VERSION = 7
+METHOD_VERSION = "delta_zsc_v5_decision_equivalent_bayes_r3_signal_contract"
 MANIFEST_VERSION = 2
 OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
 OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
 OFFICIAL_TRAINING_ROOT_SEED = 42
 OFFICIAL_EVALUATION_ROOT_SEED = 0
 OFFICIAL_TRAINING_RUN_COUNT = 10
+ENGINEERING_SEED_INDEX = -1
 OFFICIAL_EPISODES_PER_PAIRING = 500
 OFFICIAL_ACTION_COUNT = 6
 OFFICIAL_EPISODE_STEPS = 400
@@ -29,11 +30,24 @@ OFFICIAL_SP_NUM_ENVS = 256
 OFFICIAL_OP_NUM_ENVS = 64
 OFFICIAL_NUM_MINIBATCHES = 64
 OFFICIAL_UPDATE_EPOCHS = 4
+OFFICIAL_TRAINING_KEYS = (
+    (1039196627, 2465224267),
+    (1885534764, 892988520),
+    (1592073730, 4208621316),
+    (4195573804, 1556624894),
+    (1378340893, 2340506400),
+    (1683848162, 2527321690),
+    (2857519579, 594117140),
+    (3206027959, 287420602),
+    (2042750619, 3456201790),
+    (1462505072, 2580034575),
+)
 RUN_KINDS = ("mechanical", "development", "formal")
 LAYOUTS = ("test_time_simple", "test_time_wide")
 PARTNER_ROLES = (
-    "generator_snapshot",
-    "frozen_external_train",
+    "owner_source",
+    "generator_init_source",
+    "development_support",
     "calibration",
     "confirmatory",
 )
@@ -81,8 +95,6 @@ class ModelConfig:
     action_embedding_dim: int
     log_variance_minimum: float
     log_variance_maximum: float
-    response_log_std_minimum: float
-    response_log_std_maximum: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,30 +119,64 @@ class PPOConfig:
 @dataclass(frozen=True, slots=True)
 class LossConfig:
     response_weight: float
-    counterfactual_weight: float
-    advantage_distill_weight: float
-    policy_distill_weight: float
-    quotient_weight: float
-    consistency_weight: float
+    raw_q_weight: float
+    q_policy_weight: float
+    q_policy_temperature: float
     information_bottleneck_weight: float
     information_bottleneck_free_bits: float
-    decision_regret_weight: float
-    quotient_equivalence_epsilon: float
-    quotient_separation_epsilon: float
-    quotient_margin: float
+    decision_regret_weight_maximum: float
+    conditional_entropy_weight: float
+    conditional_kl_weight: float
+    residual_norm_weight: float
+    response_updates_per_outer_update: int
+    raw_q_updates_per_outer_update: int
+
+    @property
+    def decision_regret_weight(self) -> float:
+        """Unqualified default; the r3 state machine supplies 0.1 only after C5."""
+
+        return 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class AnchorConfig:
     interval_updates: int
-    states_per_interval: int
+    pilot_ordinary_candidates: int
+    pilot_matched_code_candidates: int
+    pilot_replicas: int
+    selected_ordinary: int
+    selected_matched_code: int
     fit_replicas: int
-    evaluation_replicas: int
     continuation_horizon: int
-    sampling_time_bins: int
-    sampling_regret_bins: int
+    probe_steps: int
+    replay_capacity_per_epoch: int
+    audit_milestones: tuple[str, ...]
+    audit_ordinary_states: int
+    audit_matched_code_states: int
+    audit_fit_replicas: int
+    audit_evaluation_replicas: int
+    audit_continuation_horizon: int
+    audit_uniform_fraction: float
     return_lower_bound: float
     return_upper_bound: float
+
+    # Transitional read-only aliases used by audit/calibration utilities.  The
+    # r3 training lifecycle uses the explicit training/audit fields above.
+    @property
+    def states_per_interval(self) -> int:
+        return self.selected_ordinary + self.selected_matched_code
+
+    @property
+    def evaluation_replicas(self) -> int:
+        return self.audit_evaluation_replicas
+
+    @property
+    def sampling_time_bins(self) -> int:
+        return 1
+
+    @property
+    def sampling_regret_bins(self) -> int:
+        return 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,19 +184,45 @@ class PartnerGeneratorConfig:
     code_dim: int
     hidden_dim: int
     modulation_rank: int
-    current_probability: float
-    snapshot_probability: float
-    frozen_external_probability: float
-    update_interval: int
+    initial_current_probability: float
+    initial_snapshot_probability: float
+    initial_frozen_external_probability: float
+    episodes_per_update: int
+    episode_steps: int
+    update_epochs: int
+    environment_minibatches: int
     snapshot_interval: int
-    competence_threshold: float
     cvar_level: float
+    source_distillation_kl_maximum: float
+    trust_region_kl_maximum: float
+    interpolation_uniform_kl_minimum: float
+    delivery_noninferiority_margin: float
     brdiv_weight: float
     smoothness_weight: float
     lagrangian_learning_rate: float
     kernel_bandwidth: float
     kernel_jitter: float
     codes_per_update: int
+
+    @property
+    def current_probability(self) -> float:
+        return self.initial_current_probability
+
+    @property
+    def snapshot_probability(self) -> float:
+        return self.initial_snapshot_probability
+
+    @property
+    def frozen_external_probability(self) -> float:
+        return self.initial_frozen_external_probability
+
+    @property
+    def update_interval(self) -> int:
+        return 1
+
+    @property
+    def competence_threshold(self) -> float:
+        raise AttributeError("r3 uses paired noninferiority, not an absolute threshold")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +234,7 @@ class CalibrationConfig:
     enable_hard_gate_at_evaluation: bool
     episodes_per_run: int
     anchors_per_run: int
+    always_on_ablation: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,10 +243,14 @@ class TrainingConfig:
     minibatches_per_epoch: int
     checkpoint_interval_environment_steps: int
     rollout_length: int
-    student_lane_probability: float
-    teacher_lane_probability: float
     base_policy_lane_probability: float
-
+    conditional_policy_lane_probability: float
+    target_policy_epoch_updates: int
+    base_qualification_deadline_steps: int
+    owner_sources_per_seed: int
+    generator_init_sources_per_mechanism: int
+    development_runs_per_mechanism: int
+    calibration_runs_per_mechanism: int
 
 @dataclass(frozen=True, slots=True)
 class EvaluationConfig:
@@ -302,20 +379,22 @@ def _sha256(path: Path) -> str:
 def official_training_key(seed_index: int) -> tuple[int, int]:
     """Return the exact indexed key from split(PRNGKey(42), 10)."""
 
-    import jax
-    import numpy as np
-
     index = int(seed_index)
     if not 0 <= index < OFFICIAL_TRAINING_RUN_COUNT:
         raise ValueError("Official seed_index must lie in 0..9.")
-    key = np.asarray(
-        jax.random.split(
-            jax.random.PRNGKey(OFFICIAL_TRAINING_ROOT_SEED),
-            OFFICIAL_TRAINING_RUN_COUNT,
-        )[index],
-        dtype=np.uint32,
+    return OFFICIAL_TRAINING_KEYS[index]
+
+
+def engineering_training_key() -> tuple[int, int]:
+    """Named non-scientific key that cannot alias Official seed indices 0..9."""
+
+    digest = hashlib.sha256(
+        b"delta-zsc-v5-r3/signal-contract/engineering-seed"
+    ).digest()
+    return (
+        int.from_bytes(digest[:4], "big"),
+        int.from_bytes(digest[4:8], "big"),
     )
-    return int(key[0]), int(key[1])
 
 
 def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, int]]:
@@ -329,9 +408,22 @@ def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, in
     import jax
     import numpy as np
 
-    root = np.asarray(official_training_key(seed_index), dtype=np.uint32)
+    root_key = (
+        engineering_training_key()
+        if int(seed_index) == ENGINEERING_SEED_INDEX
+        else official_training_key(seed_index)
+    )
+    root = np.asarray(root_key, dtype=np.uint32)
     result: dict[str, tuple[int, int]] = {}
-    for name in ("ego", "generator", "snapshot", "anchor", "calibration"):
+    for name in (
+        "ego",
+        "generator",
+        "snapshot",
+        "training_anchor",
+        "audit_anchor",
+        "qualification",
+        "calibration",
+    ):
         tag = int.from_bytes(
             hashlib.sha256(f"delta-zsc-v5/{name}".encode("utf-8")).digest()[:4],
             "big",
@@ -343,7 +435,7 @@ def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, in
 
 
 def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
-    """Load config v5 and apply the registered run budget."""
+    """Load config v7 and apply the registered run budget."""
 
     import yaml
 
@@ -398,14 +490,11 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         payload["calibration"], set(CalibrationConfig.__dataclass_fields__), "calibration"
     )
     training_payload = _exact_fields(
-        payload["training"],
-        {
-            "rollout_length",
-            "student_lane_probability",
-            "teacher_lane_probability",
-            "base_policy_lane_probability",
-        },
-        "training",
+        payload["training"], set(TrainingConfig.__dataclass_fields__) - {
+            "environment_steps",
+            "minibatches_per_epoch",
+            "checkpoint_interval_environment_steps",
+        }, "training"
     )
     evaluation_payload = _exact_fields(
         payload["evaluation"], set(EvaluationConfig.__dataclass_fields__), "evaluation"
@@ -429,7 +518,12 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         model=ModelConfig(**model_payload),
         ppo=PPOConfig(**ppo_payload),
         loss=LossConfig(**loss_payload),
-        anchors=AnchorConfig(**anchor_payload),
+        anchors=AnchorConfig(
+            **{
+                **anchor_payload,
+                "audit_milestones": tuple(anchor_payload["audit_milestones"]),
+            }
+        ),
         partner_generator=PartnerGeneratorConfig(**generator_payload),
         calibration=CalibrationConfig(**calibration_payload),
         training=TrainingConfig(
@@ -475,8 +569,6 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Low-rank actor modulation needs positive rank.")
     if config.model.log_variance_minimum >= config.model.log_variance_maximum:
         raise ValueError("Posterior log-variance bounds are reversed.")
-    if config.model.response_log_std_minimum >= config.model.response_log_std_maximum:
-        raise ValueError("Response log-standard-deviation bounds are reversed.")
 
     if not 0.0 < config.ppo.gamma <= 1.0:
         raise ValueError("gamma must lie in (0, 1].")
@@ -492,9 +584,9 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Adam epsilon must be positive.")
 
     probabilities = (
-        config.partner_generator.current_probability,
-        config.partner_generator.snapshot_probability,
-        config.partner_generator.frozen_external_probability,
+        config.partner_generator.initial_current_probability,
+        config.partner_generator.initial_snapshot_probability,
+        config.partner_generator.initial_frozen_external_probability,
     )
     if any(value < 0.0 for value in probabilities) or abs(sum(probabilities) - 1.0) > 1e-8:
         raise ValueError("Partner-source probabilities must be non-negative and sum to one.")
@@ -502,11 +594,63 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Partner generator code dimension must be positive.")
     if not 0.0 < config.partner_generator.cvar_level <= 1.0:
         raise ValueError("Generator CVaR level must lie in (0, 1].")
+    registered_shape = config.run_kind != "mechanical"
+    if registered_shape and config.partner_generator.episodes_per_update != 32:
+        raise ValueError("r3 generator requires 32 complete episodes per outer update.")
+    if config.partner_generator.episode_steps != OFFICIAL_EPISODE_STEPS:
+        raise ValueError("Generator episodes must use all 400 Official steps.")
+    if registered_shape and config.partner_generator.update_epochs != 4:
+        raise ValueError("Generator PPO uses four Official update epochs.")
+    if registered_shape and config.partner_generator.environment_minibatches != 8:
+        raise ValueError("Generator PPO uses eight environment minibatches.")
+    if abs(config.partner_generator.trust_region_kl_maximum - 0.03) > 1e-12:
+        raise ValueError("Generator trust region must remain 0.03.")
+    if config.partner_generator.interpolation_uniform_kl_minimum <= 0.0:
+        raise ValueError(
+            "Generator interpolation must be registered as measurably non-uniform."
+        )
+    if abs(
+        config.partner_generator.delivery_noninferiority_margin
+        - OFFICIAL_CORRECT_DELIVERY_REWARD
+    ) > 1.0e-12:
+        raise ValueError(
+            "The competence noninferiority margin must equal one Official "
+            "correct-delivery reward."
+        )
 
-    if config.anchors.fit_replicas <= 0 or config.anchors.evaluation_replicas <= 0:
-        raise ValueError("Both anchor replica splits must be non-empty.")
+    if registered_shape and config.anchors.interval_updates != 16:
+        raise ValueError("Training anchors must align to 16-update target-policy epochs.")
+    if registered_shape and (
+        config.anchors.pilot_replicas != 2 or config.anchors.fit_replicas != 8
+    ):
+        raise ValueError("Training anchor pilot/fit replicas must remain 2/8.")
+    if registered_shape and (
+        config.anchors.selected_ordinary != 24
+        or config.anchors.selected_matched_code != 24
+    ):
+        raise ValueError("Training anchor selected strata must remain 24/24.")
+    if registered_shape and (
+        config.anchors.pilot_ordinary_candidates != 128
+        or config.anchors.pilot_matched_code_candidates != 64
+    ):
+        raise ValueError("Training anchor pilot candidate strata must remain 128/64.")
     if not 1 <= config.anchors.continuation_horizon <= config.environment.episode_steps:
         raise ValueError("Anchor continuation horizon is outside the episode.")
+    if registered_shape and (
+        config.anchors.continuation_horizon != 128 or config.anchors.probe_steps != 16
+    ):
+        raise ValueError("r3 training anchors require horizon 128 and 16 evidence steps.")
+    if tuple(config.anchors.audit_milestones) != ("C0", "15M", "22.5M", "final"):
+        raise ValueError("Audit anchor milestones differ from the preregistration.")
+    if registered_shape and (
+        config.anchors.audit_ordinary_states != 32
+        or config.anchors.audit_matched_code_states != 32
+        or config.anchors.audit_fit_replicas != 32
+        or config.anchors.audit_evaluation_replicas != 64
+        or config.anchors.audit_continuation_horizon != 400
+        or abs(config.anchors.audit_uniform_fraction - 0.25) > 1e-12
+    ):
+        raise ValueError("Audit anchor split/horizon/uniform fraction changed.")
     if config.anchors.return_lower_bound >= config.anchors.return_upper_bound:
         raise ValueError("Anchor return bounds are reversed.")
 
@@ -525,15 +669,26 @@ def validate_config(config: RunConfig) -> None:
         )
     if config.calibration.episodes_per_run <= 0 or config.calibration.anchors_per_run <= 0:
         raise ValueError("Calibration episodes and anchors per run must be positive.")
+    if config.run_kind == "formal" and config.calibration.always_on_ablation:
+        raise ValueError("Formal Full DELTA cannot enable the always-on ablation.")
 
     lane_sum = (
-        config.training.student_lane_probability
-        + config.training.teacher_lane_probability
+        config.training.base_policy_lane_probability
+        + config.training.conditional_policy_lane_probability
     )
     if abs(lane_sum - 1.0) > 1e-8:
-        raise ValueError("Student and teacher lane probabilities must sum to one.")
-    if not 0.0 <= config.training.base_policy_lane_probability <= 1.0:
-        raise ValueError("Base-policy lane probability must lie in [0, 1].")
+        raise ValueError("Exclusive base and conditional lane probabilities must sum to one.")
+    if registered_shape and config.training.target_policy_epoch_updates != 16:
+        raise ValueError("Target-policy epoch must remain 16 updates.")
+    if registered_shape and config.training.base_qualification_deadline_steps != 15_000_000:
+        raise ValueError("C0 deadline must remain 15M ego steps.")
+    if (
+        config.training.owner_sources_per_seed != 1
+        or config.training.generator_init_sources_per_mechanism != 1
+        or config.training.development_runs_per_mechanism != 4
+        or config.training.calibration_runs_per_mechanism != 5
+    ):
+        raise ValueError("Per-seed r3 partner resource counts changed.")
     if config.training.rollout_length <= 0:
         raise ValueError("Training rollout length must be positive.")
     if config.evaluation.episodes_per_pairing <= 0:
@@ -744,7 +899,11 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
                 f"Common confirmatory partner cannot belong to one ego run: {run.run_id}"
             )
         official_parent = (
-            run.role == "frozen_external_train"
+            run.role in {
+                "owner_source",
+                "generator_init_source",
+                "development_support",
+            }
             and run.generation_mechanism in {"rnn-sp", "rnn-op"}
         )
         if official_parent:
@@ -795,7 +954,12 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
             "Fresh calibration/confirmatory partners must use distinct JAX keys."
         )
 
-    for role in ("frozen_external_train", "generator_snapshot", "calibration"):
+    for role in (
+        "owner_source",
+        "generator_init_source",
+        "development_support",
+        "calibration",
+    ):
         owners_by_parent: dict[str, set[int | None]] = {}
         for run in manifest.by_role(role):
             owners_by_parent.setdefault(run.parent_training_run_id, set()).add(
@@ -812,7 +976,11 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
                 f"{shared_parents}"
             )
 
-    train_roles = {"generator_snapshot", "frozen_external_train"}
+    train_roles = {
+        "owner_source",
+        "generator_init_source",
+        "development_support",
+    }
     eval_roles = {"calibration", "confirmatory"}
     train_parents = {
         run.parent_training_run_id for run in manifest.runs if run.role in train_roles
@@ -857,10 +1025,10 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
             f"{sorted(calibration_confirmatory_overlap)}"
         )
 
-    external_train = manifest.by_role("frozen_external_train")
+    development_support = manifest.by_role("development_support")
     calibration = manifest.by_role("calibration")
     confirmatory = manifest.by_role("confirmatory")
-    if external_train and len({run.parent_training_run_id for run in external_train}) < 2:
+    if development_support and len({run.parent_training_run_id for run in development_support}) < 2:
         raise ValueError("Training support requires at least two independent frozen external runs.")
     if calibration and len({run.parent_training_run_id for run in calibration}) < 2:
         raise ValueError("Calibration requires at least two independent parent runs.")
@@ -868,9 +1036,96 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
         raise ValueError("Confirmatory evaluation requires at least two independent parent runs.")
 
 
+def validate_seed_signal_contract_manifest(
+    manifest: PartnerManifest,
+    *,
+    owner_seed_index: int,
+    formal: bool,
+) -> None:
+    """Enforce the per-seed, lineage-exclusive r3 resource contract."""
+
+    validate_partner_manifest(manifest)
+    owner = int(owner_seed_index)
+    if formal and not 0 <= owner < OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("Formal signal-contract owner seed must lie in 0..9.")
+    if not formal and owner not in {ENGINEERING_SEED_INDEX, *range(10)}:
+        raise ValueError("Mechanical/development owner seed is invalid.")
+    manifest_owner = None if owner == ENGINEERING_SEED_INDEX else owner
+    owned = tuple(run for run in manifest.runs if run.owner_seed_index == manifest_owner)
+    foreign = tuple(
+        run
+        for run in manifest.runs
+        if owner != ENGINEERING_SEED_INDEX
+        and run.owner_seed_index is not None
+        and run.owner_seed_index != owner
+    )
+    if foreign:
+        raise ValueError("A per-seed signal-contract manifest contains another seed's resource.")
+
+    owners = tuple(run for run in owned if run.role == "owner_source")
+    if len(owners) != 1 or owners[0].generation_mechanism not in {"rnn-sp", "sp"}:
+        raise ValueError("Each DELTA seed needs exactly one independent owner-SP source.")
+
+    mechanism_alias = {
+        "rnn-sp": "sp",
+        "sp": "sp",
+        "rnn-op": "op",
+        "op": "op",
+        "state-augmented": "sa",
+        "sa": "sa",
+        "fcp": "fcp",
+    }
+
+    def counts(role: str) -> Mapping[str, int]:
+        result = {name: 0 for name in ("sp", "op", "sa", "fcp")}
+        for run in owned:
+            if run.role != role:
+                continue
+            mechanism = mechanism_alias.get(run.generation_mechanism)
+            if mechanism is None:
+                raise ValueError(f"Unknown r3 partner mechanism: {run.generation_mechanism}")
+            result[mechanism] += 1
+        return result
+
+    expected = {
+        "generator_init_source": 1,
+        "development_support": 4,
+        "calibration": 5,
+    }
+    if formal:
+        for role, per_mechanism in expected.items():
+            observed = counts(role)
+            if any(value != per_mechanism for value in observed.values()):
+                raise ValueError(
+                    f"{role} must contain {per_mechanism} independent runs per mechanism; "
+                    f"observed={dict(observed)}."
+                )
+
+    role_groups = {
+        role: {
+            (run.checkpoint_sha256, run.parent_training_run_id, run.co_training_group_id)
+            for run in owned
+            if run.role == role
+        }
+        for role in ("generator_init_source", "development_support", "calibration")
+    }
+    roles = tuple(role_groups)
+    for index, first in enumerate(roles):
+        for second in roles[index + 1 :]:
+            first_parents = {row[1] for row in role_groups[first]}
+            second_parents = {row[1] for row in role_groups[second]}
+            if first_parents & second_parents:
+                raise ValueError(f"r3 resource groups {first}/{second} share a parent run.")
+            first_groups = {row[2] for row in role_groups[first] if row[2] is not None}
+            second_groups = {row[2] for row in role_groups[second] if row[2] is not None}
+            if first_groups & second_groups:
+                raise ValueError(f"r3 resource groups {first}/{second} share co-training lineage.")
+
+
 __all__ = [
     "AnchorConfig",
     "CONFIG_VERSION",
+    "ENGINEERING_SEED_INDEX",
     "CalibrationConfig",
     "EnvironmentConfig",
     "EvaluationConfig",
@@ -892,6 +1147,7 @@ __all__ = [
     "OFFICIAL_SP_NUM_ENVS",
     "OFFICIAL_SP_TOTAL_TIMESTEPS",
     "OFFICIAL_TRAINING_ROOT_SEED",
+    "OFFICIAL_TRAINING_KEYS",
     "OFFICIAL_TRAINING_RUN_COUNT",
     "OFFICIAL_UPDATE_EPOCHS",
     "OfficialProtocolConfig",
@@ -910,6 +1166,8 @@ __all__ = [
     "load_partner_manifest",
     "official_training_key",
     "official_training_domain_keys",
+    "engineering_training_key",
     "validate_config",
     "validate_partner_manifest",
+    "validate_seed_signal_contract_manifest",
 ]

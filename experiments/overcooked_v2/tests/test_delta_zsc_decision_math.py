@@ -76,3 +76,20 @@ def test_discounted_potential_shaping_telescopes() -> None:
     )
     discounted = sum((gamma**index) * float(value) for index, value in enumerate(shaping))
     assert discounted == pytest.approx(3.0, abs=1e-6)
+
+
+def test_potential_shaping_accepts_runtime_weight_in_jitted_kernel() -> None:
+    dynamic = jax.jit(
+        lambda value: potential_shaping(
+            jnp.asarray([2.0], dtype=jnp.float32),
+            jnp.asarray([1.0], dtype=jnp.float32),
+            jnp.asarray([False]),
+            gamma=0.99,
+            weight=value,
+        )
+    )
+    np.testing.assert_allclose(
+        np.asarray(dynamic(jnp.asarray(0.1, dtype=jnp.float32))),
+        np.asarray([0.101], dtype=np.float32),
+        atol=1.0e-6,
+    )

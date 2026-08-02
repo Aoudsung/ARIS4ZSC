@@ -18,6 +18,7 @@ import sys
 from typing import Any, Iterable, Mapping, Sequence, TextIO, cast
 
 from .experiment import (
+    ENGINEERING_SEED_INDEX,
     METHOD_VERSION,
     OFFICIAL_PROTOCOL_VERSION,
     OFFICIAL_SOURCE_COMMIT,
@@ -90,6 +91,7 @@ def training_identity(
         "config_fingerprint": config.fingerprint,
         "seed_index": int(seed_index),
         "jax_prng_key": [int(value) for value in jax_prng_key],
+        "engineering_seed": int(seed_index) == ENGINEERING_SEED_INDEX,
         "domain_keys": {
             name: [int(value) for value in key]
             for name, key in official_training_domain_keys(seed_index).items()

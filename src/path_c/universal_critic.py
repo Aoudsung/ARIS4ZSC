@@ -1,4 +1,4 @@
-"""One shared belief-conditioned dueling critic."""
+"""One shaped-return value and two independent raw-return Q heads."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ def universal_critic_class() -> Any:
         return _CRITIC
 
     import flax.linen as nn
+    import jax
     import jax.numpy as jnp
     from flax.linen.initializers import orthogonal, zeros
 
@@ -25,44 +26,86 @@ def universal_critic_class() -> Any:
             self,
             task_features: Any,
             belief_embedding: Any,
-        ) -> tuple[Any, Any]:
+        ) -> tuple[Any, Any, Any]:
             task = jnp.asarray(task_features, dtype=jnp.float32)
             belief = jnp.asarray(belief_embedding, dtype=jnp.float32)
             if task.shape[:-1] != belief.shape[:-1]:
                 raise ValueError("Critic task and belief batch axes differ.")
-            joined = jnp.concatenate((task, belief), axis=-1)
-            shared = nn.tanh(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="critic_hidden_0",
-                )(joined)
+            # The shaped PPO value must not turn the legal-history belief into
+            # a shaped-return shortcut.  Raw-Q retains the live belief path.
+            shaped_joined = jnp.concatenate(
+                (task, jax.lax.stop_gradient(belief)), axis=-1
             )
-            shared = nn.tanh(
+            raw_joined = jnp.concatenate((task, belief), axis=-1)
+            shaped_hidden = nn.tanh(
                 nn.Dense(
                     self.hidden_dim,
                     kernel_init=orthogonal(jnp.sqrt(2.0)),
                     bias_init=zeros,
-                    name="critic_hidden_1",
-                )(shared)
+                    name="shaped_hidden_0",
+                )(shaped_joined)
+            )
+            shaped_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="shaped_hidden_1",
+                )(shaped_hidden)
             )
             state_value = nn.Dense(
                 1,
                 kernel_init=orthogonal(1.0),
                 bias_init=zeros,
-                name="state_value",
-            )(shared)[..., 0]
-            raw_advantage = nn.Dense(
+                name="shaped_state_value",
+            )(shaped_hidden)[..., 0]
+
+            raw_q1_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="raw_q1_hidden_0",
+                )(raw_joined)
+            )
+            raw_q1_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="raw_q1_hidden_1",
+                )(raw_q1_hidden)
+            )
+            raw_q1 = nn.Dense(
                 self.action_count,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
-                name="action_advantage",
-            )(shared)
-            action_values = state_value[..., None] + raw_advantage - jnp.mean(
-                raw_advantage, axis=-1, keepdims=True
+                name="raw_q1_values",
+            )(raw_q1_hidden)
+
+            raw_q2_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="raw_q2_hidden_0",
+                )(raw_joined)
             )
-            return state_value, action_values
+            raw_q2_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="raw_q2_hidden_1",
+                )(raw_q2_hidden)
+            )
+            raw_q2 = nn.Dense(
+                self.action_count,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="raw_q2_values",
+            )(raw_q2_hidden)
+            return state_value, raw_q1, raw_q2
 
     _CRITIC = UniversalDuelingCritic
     return UniversalDuelingCritic

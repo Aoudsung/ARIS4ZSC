@@ -109,7 +109,11 @@ def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
             }
         )
         for raw in training_identity["partner_manifest"]["runs"]:
-            if raw["role"] not in {"frozen_external_train", "generator_snapshot"}:
+            if raw["role"] not in {
+                "owner_source",
+                "generator_init_source",
+                "development_support",
+            }:
                 continue
             lineage_rows.append(
                 {
@@ -258,9 +262,19 @@ def _load_policies(manifest: Mapping[str, Any], config: RunConfig) -> tuple[Any,
             official_config, params = restore_official_checkpoint(path)
             policy = official_policy(params, official_config)
         else:
-            deployment = load_deployment(path, config)
-            policy = OfficialDeltaPolicy(deployment)
-            assert_official_policy_surface(policy)
+            bundle = json.loads(
+                (path / "deployment_bundle.json").read_text(encoding="utf-8")
+            )
+            if bundle.get("deployment_tier") == "owner_sp_source_fallback":
+                source = bundle.get("owner_source_checkpoint")
+                if source is None:
+                    raise ValueError("Owner-SP fallback bundle lacks its source checkpoint.")
+                official_config, params = restore_official_checkpoint(source)
+                policy = official_policy(params, official_config)
+            else:
+                deployment = load_deployment(path, config)
+                policy = OfficialDeltaPolicy(deployment)
+                assert_official_policy_surface(policy)
         policies.append(policy)
     return tuple(policies)
 

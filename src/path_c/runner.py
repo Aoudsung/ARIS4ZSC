@@ -13,14 +13,13 @@ from .types import PolicyState, RolloutBatch
 
 
 DECISION_REGRET_STATE_CHUNK_SIZE = 4_096
+DECISION_REGRET_NUMERICAL_TILE_SIZE = 32
 
 
 class PartnerFunctions(NamedTuple):
     initial_state: Callable[[int], Any]
     step: Callable[..., tuple[Any, Any, Any, Any]]
     observe: Callable[..., Any]
-    pre_teacher_latent: Callable[..., Any]
-    teacher_latent: Callable[..., Any]
     run_id: Callable[..., Any]
     diagnostics: Callable[..., Mapping[str, Any]]
 
@@ -29,6 +28,7 @@ class RunnerState(NamedTuple):
     environment_state: Any
     observations: Any
     ego_policy: PolicyState
+    target_ego_policy: PolicyState
     partner_state: Any
     ego_roles: Any
     episode_return: Any
@@ -62,18 +62,20 @@ def initialize_runner(
     next_key, environment_key, partner_key = jax.random.split(random_key, 3)
     environment_state, observations = environment.reset(environment_key)
     count = int(environment.num_envs)
+    ego_policy = initial_policy_state(
+        batch_size=count,
+        observation_shape=environment.observation_shape,
+        action_count=6,
+        task_hidden_dim=model_config.task_hidden_dim,
+        belief_hidden_dim=model_config.belief_hidden_dim,
+        latent_dim=model_config.latent_dim,
+        mixture_components=model_config.mixture_components,
+    )
     return RunnerState(
         environment_state=environment_state,
         observations=observations,
-        ego_policy=initial_policy_state(
-            batch_size=count,
-            observation_shape=environment.observation_shape,
-            action_count=6,
-            task_hidden_dim=model_config.task_hidden_dim,
-            belief_hidden_dim=model_config.belief_hidden_dim,
-            latent_dim=model_config.latent_dim,
-            mixture_components=model_config.mixture_components,
-        ),
+        ego_policy=ego_policy,
+        target_ego_policy=ego_policy,
         partner_state=partner_functions.initial_state(count, partner_key),
         ego_roles=official_ego_roles(count),
         episode_return=jnp.zeros((count,), dtype=jnp.float32),
@@ -87,6 +89,7 @@ def policy_action(
     *,
     model: Any,
     params: Mapping[str, Any],
+    target_params: Mapping[str, Any],
     state: PolicyState,
     observation: Any,
     gate: Any,
@@ -133,9 +136,8 @@ def observe_policy_after_transition(
     candidate = stepped_state._replace(
         previous_action=jnp.asarray(action, dtype=jnp.int32),
         # Official AbstractPolicy does not receive reward.  The deployable
-        # student therefore never consumes this privileged transition field;
-        # raw reward remains available to PPO targets, the response objective,
-        # and the training-only full-trajectory teacher.
+        # policy therefore never consumes this privileged transition field;
+        # raw reward remains available only to training targets.
         previous_reward=jnp.zeros_like(jnp.asarray(reward, dtype=jnp.float32)),
         episode_start=jnp.asarray(done, dtype=jnp.bool_),
     )
@@ -149,11 +151,11 @@ def collect_rollout(
     environment: Any,
     model: Any,
     params: Mapping[str, Any],
+    target_params: Mapping[str, Any],
     model_config: Any,
     partner_functions: PartnerFunctions,
     partner_parameters: Any,
     gate_values: Any,
-    teacher_lane_mask: Any,
     official_shaping_factor: float,
     record_mode: str = "anchor_full",
 ) -> tuple[RunnerState, RolloutBatch, Mapping[str, Any]]:
@@ -166,6 +168,7 @@ def collect_rollout(
         raise ValueError(f"Unknown rollout record mode: {record_mode!r}.")
     count = int(environment.num_envs)
     initial_policy = state.ego_policy
+    initial_target_policy = state.target_ego_policy
 
     def one_step(current: RunnerState, unused: Any) -> tuple[Any, Mapping[str, Any]]:
         del unused
@@ -193,24 +196,15 @@ def collect_rollout(
             gate,
             method=model.step,
         )
-        teacher_latent_pre = partner_functions.pre_teacher_latent(
-            partner_parameters, current.partner_state, output.task_features
+        stepped_target_ego, unused_target_output = model.apply(
+            {"params": target_params},
+            current.target_ego_policy,
+            ego_observation,
+            gate,
+            method=model.step,
         )
-        valid_teacher = jnp.all(jnp.isfinite(teacher_latent_pre), axis=-1)
-        safe_teacher = jnp.where(valid_teacher[..., None], teacher_latent_pre, 0.0)
-        teacher_output = model.apply(
-            {"params": params},
-            output.task_features,
-            safe_teacher,
-            1.0,
-            method=model.from_features_and_latent,
-        )
-        teacher_mask = jnp.broadcast_to(
-            jnp.asarray(teacher_lane_mask, dtype=jnp.bool_), (count,)
-        ) & valid_teacher
-        behavior_logits = jnp.where(
-            teacher_mask[..., None], teacher_output.logits, output.execution_logits
-        )
+        del unused_target_output
+        behavior_logits = output.execution_logits
         ego_action = jax.vmap(
             lambda key, logits: jax.random.categorical(key, logits)
         )(ego_keys, behavior_logits)
@@ -273,6 +267,14 @@ def collect_rollout(
             next_observation=next_ego_observation,
             model_config=model_config,
         )
+        next_target_ego = observe_policy_after_transition(
+            stepped_state=stepped_target_ego,
+            action=ego_action,
+            reward=raw_rewards,
+            done=dones,
+            next_observation=next_ego_observation,
+            model_config=model_config,
+        )
         partner_diagnostics = partner_functions.diagnostics(
             partner_parameters, current.partner_state, partner_context
         )
@@ -291,6 +293,7 @@ def collect_rollout(
             environment_state=next_environment,
             observations=next_observations,
             ego_policy=next_ego,
+            target_ego_policy=next_target_ego,
             partner_state=next_partner,
             ego_roles=current.ego_roles,
             episode_return=jnp.where(dones, 0.0, completed_return),
@@ -318,7 +321,7 @@ def collect_rollout(
             "dones": dones,
             "old_log_probabilities": log_probability,
             "old_values": output.state_value,
-            "ppo_mask": (~teacher_mask).astype(jnp.float32),
+            "ppo_mask": jnp.ones_like(raw_rewards, dtype=jnp.float32),
             "partner_run_ids": partner_functions.run_id(
                 partner_parameters, current.partner_state, partner_context
             ),
@@ -357,6 +360,7 @@ def collect_rollout(
             "task_features": output.task_features,
             "environment_state": current.environment_state,
             "ego_policy_state": current.ego_policy,
+            "target_ego_policy_state": current.target_ego_policy,
             "partner_state": current.partner_state,
             "joint_observations": current.observations,
             "partner_observations": partner_observation,
@@ -431,6 +435,7 @@ def collect_rollout(
         partner_sources=recorded["partner_source"],
         partner_run_ids=recorded["partner_run_ids"],
         initial_policy_state=initial_policy,
+        initial_target_policy_state=initial_target_policy,
     )
     return final_state, batch, (recorded if record_mode == "anchor_full" else {})
 
@@ -546,32 +551,56 @@ def decision_regret_chunk(
     log_variances = jax.lax.stop_gradient(jnp.asarray(mixture_log_variances))
     keys = jnp.asarray(sample_keys)
     particle_count = int(posterior_particles)
-    chunk_size = int(features.shape[0])
-    samples, weights = jax.vmap(
-        lambda lane_key, lane_logits, lane_mu, lane_log_var: (
-            stratified_mixture_samples(
-                lane_key,
-                mixture_logits=lane_logits,
-                means=lane_mu,
-                log_variances=lane_log_var,
-                sample_count=particle_count,
-            )
+    real_count = int(features.shape[0])
+    tile_size = DECISION_REGRET_NUMERICAL_TILE_SIZE
+    padded_count = ((real_count + tile_size - 1) // tile_size) * tile_size
+    padding = padded_count - real_count
+
+    def tile(value: Any) -> Any:
+        array = jnp.asarray(value)
+        widths = ((0, padding),) + ((0, 0),) * (array.ndim - 1)
+        return jnp.pad(array, widths).reshape(
+            (padded_count // tile_size, tile_size) + array.shape[1:]
         )
-    )(keys, logits, means, log_variances)
-    particle_features = jnp.broadcast_to(
-        features[:, None, :],
-        (chunk_size, particle_count, features.shape[-1]),
+
+    tiled = (
+        tile(features),
+        tile(logits),
+        tile(means),
+        tile(log_variances),
+        tile(keys),
     )
-    action_values = model.apply(
-        {"params": target_params},
-        particle_features,
-        samples,
-        method=model.action_values_from_features_and_latent,
-    )
-    return decision_regret_from_action_values(
-        jax.lax.stop_gradient(action_values),
-        jax.lax.stop_gradient(weights),
-    )
+
+    def one_tile(values: tuple[Any, Any, Any, Any, Any]) -> Any:
+        tile_features, tile_logits, tile_means, tile_log_variances, tile_keys = values
+        samples, weights = jax.vmap(
+            lambda lane_key, lane_logits, lane_mu, lane_log_var: (
+                stratified_mixture_samples(
+                    lane_key,
+                    mixture_logits=lane_logits,
+                    means=lane_mu,
+                    log_variances=lane_log_var,
+                    sample_count=particle_count,
+                )
+            )
+        )(tile_keys, tile_logits, tile_means, tile_log_variances)
+        particle_features = jnp.broadcast_to(
+            tile_features[:, None, :],
+            (tile_size, particle_count, tile_features.shape[-1]),
+        )
+        action_values = model.apply(
+            {"params": target_params},
+            particle_features,
+            samples,
+            method=model.action_values_from_features_and_latent,
+        )
+        return decision_regret_from_action_values(
+            jax.lax.stop_gradient(action_values),
+            jax.lax.stop_gradient(weights),
+        )
+
+    regrets = jax.lax.map(one_tile, tiled).reshape((padded_count,))
+    return regrets[:real_count]
 
 
 def target_context_sequence(
@@ -584,7 +613,7 @@ def target_context_sequence(
 
     unused_final, context = model.apply(
         {"params": target_params},
-        batch.initial_policy_state,
+        batch.initial_target_policy_state,
         batch.observations,
         batch.previous_actions,
         batch.previous_rewards,
@@ -620,6 +649,7 @@ def finalize_decision_regret_shaping(
         shaped_rewards=shaped,
     ), {
         "decision_regret_values": values[:-1],
+        "decision_regret_values_with_next": values,
         "mean_decision_regret": jnp.mean(values[:-1]),
         "mean_decision_regret_shaping": jnp.mean(shaping),
         "mean_official_shaped_reward": jnp.mean(batch.official_shaped_rewards),
@@ -666,6 +696,7 @@ __all__ = [
     "PartnerFunctions",
     "RunnerState",
     "DECISION_REGRET_STATE_CHUNK_SIZE",
+    "DECISION_REGRET_NUMERICAL_TILE_SIZE",
     "attach_decision_regret_shaping",
     "chunked_decision_regret",
     "collect_rollout",

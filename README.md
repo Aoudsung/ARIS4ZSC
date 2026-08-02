@@ -5,7 +5,7 @@ This branch contains the implementation candidate for **DELTA-ZSC: Decision-Equi
 The active method version is:
 
 ```text
-delta_zsc_v5_decision_equivalent_bayes_r2_official
+delta_zsc_v5_decision_equivalent_bayes_r3_signal_contract
 ```
 
 ## Status
@@ -26,9 +26,9 @@ legal interaction history
     -> environment action and posterior update
 ```
 
-The V5 path does not use discrete critic slots, a response codebook, target-Q use/mask self-distillation, or a per-partner actor library. Counterfactual supervision comes from paired simulator continuations with fit and evaluation replicas kept separate.
+The r3 path uses C0--C5 signal contracts, target-policy-epoch-consistent twin raw-Q heads, complete-episode generator PPO, versioned anchor replay, structured partner-response targets, and a calibrated base fallback. It does not use discrete critic slots, privileged behavior lanes, future-trajectory targets, a response codebook, target-Q use/mask self-distillation, or a per-partner actor library.
 
-The complete mathematical design and proof obligations are documented in [`docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md`](docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md).
+The binding r3 method and proof obligations are documented in [`docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md`](docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md); the preserved full foundational derivations are in [`docs/theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md`](docs/theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md).
 
 ## Repository layout
 
@@ -89,11 +89,13 @@ formal shape before releasing seed 0:
 python -m experiments.overcooked_v2.path_c cuda-preflight \
   --config experiments/overcooked_v2/configs/delta_zsc_simple_formal.yaml \
   --partner-manifest manifests/simple-training-partners.json \
-  --seed-index 0 \
-  --output runs/preflight/simple-seed-0
+  --seed-index -1 \
+  --output runs/preflight/simple-engineering
 ```
 
-This command retains 256 environments, a 256-step rollout, 16 posterior
+The reserved index `-1` derives the non-scientific engineering key and is not
+one of the Official seed indices 0--9. This command retains 256 environments,
+a 256-step rollout, 16 posterior
 particles and the complete 4×64 minibatch sequence. It stops only after the
 full first update, records CUDA/kernel/timing/memory evidence, and is always
 marked non-scientific and non-resumable. It does not replace the eight-update
@@ -142,7 +144,7 @@ python -m experiments.overcooked_v2.path_c build-formal-claim-report ...
 
 Training, calibration, and confirmatory partners must be checkpoint-, parent-run-, and co-training-group-disjoint. Manifest validation treats any violation as an error.
 
-Formal baseline and DELTA runs use `split(PRNGKey(42), 10)`, final checkpoints only, and no result-dependent seed deletion or hyperparameter changes. Each DELTA run owns its SP/OP support, generator state, anchors and at least 19 calibration parent runs; none is shared across outer runs. The current formal anchor budget executes 57 triggers × 128 worlds × 6 actions × 96 replicas × 400 steps = **1,680,998,400 attempted branch transitions per DELTA run**. This cost is additional to the 29,949,952 main PPO steps and is never described as budget matched.
+Formal baseline and DELTA runs use `split(PRNGKey(42), 10)`, final checkpoints only, and no result-dependent seed deletion or hyperparameter changes. Each DELTA run owns its owner source, SP/OP/SA/FCP initialization sources, 16 development partners, 20 calibration partners, generator state, anchors and replay; none is shared across outer runs. The r3 training-anchor maximum is **24,291,328** attempted transitions (29 epoch-start opportunities), while the four independent audit milestones add at most **88,477,696**. The ledger records only collections actually executed after qualification. These costs are additional to the 29,949,952 main PPO steps and are never described as budget matched.
 
 ## Security
 

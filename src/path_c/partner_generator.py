@@ -126,12 +126,31 @@ def partner_generator_class() -> Any:
         ) -> tuple[Any, PartnerGeneratorOutput]:
             import jax
 
-            def one(carry: Any, values: tuple[Any, Any, Any]) -> tuple[Any, Any]:
-                observation, start, key = values
-                return self.step(carry, observation, code, start, key)
+            code_array = jnp.asarray(code, dtype=jnp.float32)
+            observation_array = jnp.asarray(observations)
+            if (
+                code_array.ndim == 3
+                and code_array.shape[:2] == observation_array.shape[:2]
+            ):
+                # Exact replay surface: one code is recorded at every step.
+                # Complete-episode validation requires it to be constant, but
+                # accepting the time axis prevents the old ``codes[0]`` bug
+                # from ever being reintroduced at this interface.
+                sequence_codes = code_array
+            else:
+                sequence_codes = jnp.broadcast_to(
+                    code_array,
+                    (observation_array.shape[0],) + code_array.shape,
+                )
+
+            def one(carry: Any, values: tuple[Any, Any, Any, Any]) -> tuple[Any, Any]:
+                observation, current_code, start, key = values
+                return self.step(carry, observation, current_code, start, key)
 
             return jax.lax.scan(
-                one, initial_carry, (observations, episode_starts, keys)
+                one,
+                initial_carry,
+                (observations, sequence_codes, episode_starts, keys),
             )
 
         def __call__(
@@ -217,7 +236,6 @@ def sample_partner_codes(
 __all__ = [
     "build_partner_generator",
     "initial_generator_carry",
-    "initialize_generator_parameters",
     "partner_generator_class",
     "sample_partner_codes",
 ]

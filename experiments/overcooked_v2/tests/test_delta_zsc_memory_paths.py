@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,6 @@ jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 pytest.importorskip("flax")
 
-from src.path_c.belief_set_encoder import stratified_mixture_samples  # noqa: E402
 from src.path_c.experiment import load_config  # noqa: E402
 from src.path_c.model import (  # noqa: E402
     build_model,
@@ -19,22 +19,29 @@ from src.path_c.model import (  # noqa: E402
     initialize_model_parameters,
 )
 from src.path_c.regret_potential import (  # noqa: E402
-    decision_regret_from_action_values,
     potential_shaping,
 )
 from src.path_c.resources import peak_device_memory_bytes  # noqa: E402
 from src.path_c.runner import (  # noqa: E402
     DECISION_REGRET_STATE_CHUNK_SIZE,
     chunked_decision_regret,
+    collect_rollout,
+    decision_regret_chunk,
 )
-from src.path_c.training import (  # noqa: E402
-    gather_actions,
-    response_prediction_loss,
+from src.path_c.response_targets import (  # noqa: E402
+    PartnerResponseTargets,
+    structured_partner_response_loss,
 )
 from src.path_c.types import ContextOutput, ResponsePrediction  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+def test_rollout_contract_accepts_frozen_target_policy_parameters() -> None:
+    parameters = inspect.signature(collect_rollout).parameters
+    assert "params" in parameters
+    assert "target_params" in parameters
 
 
 def _fixture() -> tuple[object, object, object, object, object]:
@@ -46,7 +53,7 @@ def _fixture() -> tuple[object, object, object, object, object]:
         / "delta_zsc_simple_development.yaml",
         run_kind="mechanical",
     )
-    observation_shape = (5, 5, 8)
+    observation_shape = (5, 5, 39)
     model = build_model(
         observation_shape=observation_shape,
         action_count=6,
@@ -65,8 +72,6 @@ def _fixture() -> tuple[object, object, object, object, object]:
                 "action_embedding_dim",
                 "log_variance_minimum",
                 "log_variance_maximum",
-                "response_log_std_minimum",
-                "response_log_std_maximum",
             )
         },
     )
@@ -79,7 +84,7 @@ def _fixture() -> tuple[object, object, object, object, object]:
         latent_dim=config.model.latent_dim,
         mixture_components=config.model.mixture_components,
     )
-    observation = jnp.arange(2 * 5 * 5 * 8, dtype=jnp.float32).reshape(
+    observation = jnp.arange(2 * 5 * 5 * 39, dtype=jnp.float32).reshape(
         (2,) + observation_shape
     ) / 255.0
     params = initialize_model_parameters(
@@ -117,23 +122,19 @@ def _all_action_prediction(module, task_features, belief_embedding):
     return module.decoder(jax.lax.stop_gradient(task), belief, actions)
 
 
-def _selected_from_all(all_prediction, actions, observation_shape):
-    mean, log_std, reward, reward_log_std, done = all_prediction
-    action_axis = mean.ndim - 2
-    return ResponsePrediction(
-        observation_delta_mean=gather_actions(
-            mean.reshape(mean.shape[:action_axis + 1] + observation_shape),
-            actions,
-            action_axis=action_axis,
-        ),
-        observation_delta_log_std=gather_actions(
-            log_std.reshape(log_std.shape[:action_axis + 1] + observation_shape),
-            actions,
-            action_axis=action_axis,
-        ),
-        reward_mean=gather_actions(reward, actions),
-        reward_log_std=gather_actions(reward_log_std, actions),
-        done_logit=gather_actions(done, actions),
+def _selected_from_all(all_prediction, actions):
+    lane = jnp.arange(actions.shape[0], dtype=jnp.int32)
+    return ResponsePrediction(*(value[lane, actions] for value in all_prediction))
+
+
+def _response_targets() -> PartnerResponseTargets:
+    return PartnerResponseTargets(
+        visibility=jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+        relative_position=jnp.asarray([3, 25], dtype=jnp.int32),
+        direction=jnp.asarray([1, 0], dtype=jnp.int32),
+        inventory=jnp.asarray([[0, 1, 2, 3, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32),
+        interaction_change=jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+        visible_mask=jnp.asarray([1.0, 0.0], dtype=jnp.float32),
     )
 
 
@@ -154,21 +155,11 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
         output.belief_embedding,
         method=_all_action_prediction,
     )
-    reference = _selected_from_all(all_prediction, actions, (5, 5, 8))
+    reference = _selected_from_all(all_prediction, actions)
     for actual, expected in zip(selected, reference):
         np.testing.assert_allclose(
             np.asarray(actual), np.asarray(expected), rtol=1.0e-6, atol=1.0e-6
         )
-
-    observations = jnp.stack(
-        (
-            jnp.zeros((2, 5, 5, 8), dtype=jnp.float32),
-            jnp.ones((2, 5, 5, 8), dtype=jnp.float32),
-        ),
-        axis=0,
-    )
-    rewards = jnp.asarray([0.25, -0.5], dtype=jnp.float32)
-    dones = jnp.asarray([False, True], dtype=jnp.bool_)
 
     def response_loss_from_selected(decoder_params):
         prediction = model.apply(
@@ -178,13 +169,7 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
             actions,
             method=model.response_from_context_and_action,
         )
-        return response_prediction_loss(
-            prediction=prediction,
-            observations=observations,
-            response_next_observations=observations[1:],
-            rewards=rewards,
-            dones=dones,
-        )
+        return structured_partner_response_loss(prediction, _response_targets()).total
 
     def response_loss_from_reference(decoder_params):
         prediction = model.apply(
@@ -193,16 +178,10 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
             output.belief_embedding,
             method=_all_action_prediction,
         )
-        selected_prediction = _selected_from_all(
-            prediction, actions, (5, 5, 8)
-        )
-        return response_prediction_loss(
-            prediction=selected_prediction,
-            observations=observations,
-            response_next_observations=observations[1:],
-            rewards=rewards,
-            dones=dones,
-        )
+        selected_prediction = _selected_from_all(prediction, actions)
+        return structured_partner_response_loss(
+            selected_prediction, _response_targets()
+        ).total
 
     def response_loss_from_selected_belief(belief):
         prediction = model.apply(
@@ -212,13 +191,7 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
             actions,
             method=model.response_from_context_and_action,
         )
-        return response_prediction_loss(
-            prediction=prediction,
-            observations=observations,
-            response_next_observations=observations[1:],
-            rewards=rewards,
-            dones=dones,
-        )
+        return structured_partner_response_loss(prediction, _response_targets()).total
 
     def response_loss_from_reference_belief(belief):
         prediction = model.apply(
@@ -227,16 +200,10 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
             belief,
             method=_all_action_prediction,
         )
-        selected_prediction = _selected_from_all(
-            prediction, actions, (5, 5, 8)
-        )
-        return response_prediction_loss(
-            prediction=selected_prediction,
-            observations=observations,
-            response_next_observations=observations[1:],
-            rewards=rewards,
-            dones=dones,
-        )
+        selected_prediction = _selected_from_all(prediction, actions)
+        return structured_partner_response_loss(
+            selected_prediction, _response_targets()
+        ).total
 
     np.testing.assert_allclose(
         np.asarray(response_loss_from_selected(params["response_decoder"])),
@@ -289,9 +256,7 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
             belief,
             method=_all_action_prediction,
         )
-        selected_prediction = _selected_from_all(
-            prediction, actions, (5, 5, 8)
-        )
+        selected_prediction = _selected_from_all(prediction, actions)
         return sum(jnp.sum(value) for value in selected_prediction)
 
     np.testing.assert_allclose(
@@ -318,9 +283,7 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
             output.belief_embedding,
             method=_all_action_prediction,
         )
-        selected_prediction = _selected_from_all(
-            prediction, actions, (5, 5, 8)
-        )
+        selected_prediction = _selected_from_all(prediction, actions)
         return sum(jnp.sum(value) for value in selected_prediction)
 
     selected_gradient = jax.grad(selected_parameter_sum)(
@@ -338,13 +301,13 @@ def test_selected_response_matches_all_action_reference_and_gradient() -> None:
         )
 
 
-def test_critic_only_teacher_matches_policy_teacher_without_decoder_params() -> None:
+def test_critic_only_action_values_match_full_policy_without_decoder_params() -> None:
     config, model, params, unused_state, output = _fixture()
     del unused_state
     latent = jnp.linspace(
         -0.5, 0.5, 2 * config.model.latent_dim, dtype=jnp.float32
     ).reshape((2, config.model.latent_dim))
-    teacher = model.apply(
+    full = model.apply(
         {"params": params},
         output.task_features,
         latent,
@@ -362,7 +325,7 @@ def test_critic_only_teacher_matches_policy_teacher_without_decoder_params() -> 
     )
     np.testing.assert_allclose(
         np.asarray(action_values),
-        np.asarray(teacher.action_values),
+        np.asarray(full.action_values),
         rtol=1.0e-6,
         atol=1.0e-6,
     )
@@ -371,8 +334,8 @@ def test_critic_only_teacher_matches_policy_teacher_without_decoder_params() -> 
 def test_chunking_preserves_keys_samples_and_regret() -> None:
     config, model, params, state, unused_output = _fixture()
     del unused_output
-    observations = jnp.arange(3 * 2 * 5 * 5 * 8, dtype=jnp.float32).reshape(
-        (3, 2, 5, 5, 8)
+    observations = jnp.arange(3 * 2 * 5 * 5 * 39, dtype=jnp.float32).reshape(
+        (3, 2, 5, 5, 39)
     ) / 511.0
     unused_final, context = model.apply(
         {"params": params},
@@ -413,32 +376,15 @@ def test_chunking_preserves_keys_samples_and_regret() -> None:
     )
     flat_log_variances = context.mixture_log_variances.reshape(flat_means.shape)
 
-    def one(feature, logits, means, log_variances, sample_key):
-        samples, weights = stratified_mixture_samples(
-            sample_key,
-            mixture_logits=logits,
-            means=means,
-            log_variances=log_variances,
-            sample_count=config.model.posterior_particles,
-        )
-        features = jnp.broadcast_to(
-            feature[None, :],
-            (config.model.posterior_particles, feature.shape[-1]),
-        )
-        action_values = model.apply(
-            {"params": params},
-            features,
-            samples,
-            method=model.action_values_from_features_and_latent,
-        )
-        return decision_regret_from_action_values(action_values, weights)
-
-    reference = jax.vmap(one)(
-        flat_task,
-        flat_logits,
-        flat_means,
-        flat_log_variances,
-        keys,
+    reference = decision_regret_chunk(
+        model=model,
+        target_params=params,
+        task_features=flat_task,
+        mixture_logits=flat_logits,
+        mixture_means=flat_means,
+        mixture_log_variances=flat_log_variances,
+        sample_keys=keys,
+        posterior_particles=config.model.posterior_particles,
     ).reshape((3, 2))
     np.testing.assert_allclose(
         np.asarray(chunked_two), np.asarray(reference), rtol=1.0e-6, atol=1.0e-6
@@ -527,8 +473,6 @@ def test_formal_regret_fixture_fits_registered_gpu() -> None:
                 "action_embedding_dim",
                 "log_variance_minimum",
                 "log_variance_maximum",
-                "response_log_std_minimum",
-                "response_log_std_maximum",
             )
         },
     )

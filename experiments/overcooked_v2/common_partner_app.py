@@ -216,8 +216,16 @@ def run_common_partner_evaluation(args: argparse.Namespace) -> None:
                     correct = np.asarray(correct, dtype=np.int64)
                     wrong = np.asarray(wrong, dtype=np.int64)
                     if method == "delta":
-                        assert isinstance(ego, OfficialDeltaPolicy)
-                        base_ego = OfficialDeltaPolicy(ego.deployment, force_base=True)
+                        # A formal DELTA seed that fails C0 is required to ship
+                        # the exact owner-SP policy, not an approximation inside
+                        # the DELTA parameter tree.  ``_load_policies`` therefore
+                        # returns the Official source policy for that deployment
+                        # mode.  Its paired base branch is the same exact policy.
+                        base_ego = (
+                            OfficialDeltaPolicy(ego.deployment, force_base=True)
+                            if isinstance(ego, OfficialDeltaPolicy)
+                            else ego
+                        )
                         base_left, base_right = (
                             (base_ego, partner)
                             if ego_role == 0

@@ -1,4 +1,4 @@
-"""Shared decoder for deployable partner-conditioned response evidence."""
+"""Structured decoder for deployable, visible-partner response evidence."""
 
 from __future__ import annotations
 
@@ -16,14 +16,17 @@ def response_decoder_class() -> Any:
     import jax
     import jax.numpy as jnp
     from flax.linen.initializers import orthogonal, zeros
+    from .response_targets import (
+        PARTNER_DIRECTION_CLASSES,
+        PARTNER_INVENTORY_FACTOR_CLASSES,
+        PARTNER_POSITION_CLASSES,
+    )
 
     class ResponseDecoder(nn.Module):
-        observation_size: int
         action_count: int
         hidden_dim: int
         action_embedding_dim: int
-        log_std_minimum: float
-        log_std_maximum: float
+        inventory_factor_count: int
 
         @nn.compact
         def __call__(
@@ -31,7 +34,7 @@ def response_decoder_class() -> Any:
             task_features: Any,
             belief_embedding: Any,
             actions: Any,
-        ) -> tuple[Any, Any, Any, Any, Any]:
+        ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
             task = jnp.asarray(task_features, dtype=jnp.float32)
             belief = jnp.asarray(belief_embedding, dtype=jnp.float32)
             action = jnp.asarray(actions, dtype=jnp.int32)
@@ -60,68 +63,63 @@ def response_decoder_class() -> Any:
                     name="response_hidden_1",
                 )(hidden)
             )
-            observation_delta_mean = nn.Dense(
-                self.observation_size,
-                kernel_init=orthogonal(0.01),
-                bias_init=zeros,
-                name="observation_delta_mean",
-            )(hidden)
-            observation_delta_log_std = jnp.clip(
-                nn.Dense(
-                    self.observation_size,
-                    kernel_init=zeros,
-                    bias_init=zeros,
-                    name="observation_delta_log_std",
-                )(hidden),
-                self.log_std_minimum,
-                self.log_std_maximum,
-            )
-            reward_mean = nn.Dense(
+            visibility_logit = nn.Dense(
                 1,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
-                name="reward_mean",
+                name="partner_visibility_logit",
             )(hidden)[..., 0]
-            reward_log_std = jnp.clip(
-                nn.Dense(
-                    1,
-                    kernel_init=zeros,
-                    bias_init=zeros,
-                    name="reward_log_std",
-                )(hidden)[..., 0],
-                self.log_std_minimum,
-                self.log_std_maximum,
+            relative_position_logits = nn.Dense(
+                PARTNER_POSITION_CLASSES,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="partner_relative_position_logits",
+            )(hidden)
+            direction_logits = nn.Dense(
+                PARTNER_DIRECTION_CLASSES,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="partner_direction_logits",
+            )(hidden)
+            inventory_logits = nn.Dense(
+                self.inventory_factor_count * PARTNER_INVENTORY_FACTOR_CLASSES,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="partner_inventory_logits",
+            )(hidden).reshape(
+                hidden.shape[:-1]
+                + (self.inventory_factor_count, PARTNER_INVENTORY_FACTOR_CLASSES)
             )
+            interaction_change_logit = nn.Dense(
+                1,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="partner_interaction_change_logit",
+            )(hidden)[..., 0]
+            diagnostic_reward_mean = nn.Dense(
+                1,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="diagnostic_reward_mean",
+            )(hidden)[..., 0]
             done_logit = nn.Dense(
                 1,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
-                name="done_logit",
+                name="diagnostic_done_logit",
             )(hidden)[..., 0]
             return (
-                observation_delta_mean,
-                observation_delta_log_std,
-                reward_mean,
-                reward_log_std,
+                visibility_logit,
+                relative_position_logits,
+                direction_logits,
+                inventory_logits,
+                interaction_change_logit,
+                diagnostic_reward_mean,
                 done_logit,
             )
 
     _DECODER = ResponseDecoder
     return ResponseDecoder
-
-
-def gaussian_negative_log_likelihood(
-    target: Any,
-    mean: Any,
-    log_standard_deviation: Any,
-) -> Any:
-    import jax.numpy as jnp
-
-    value = jnp.asarray(target, dtype=jnp.float32)
-    mu = jnp.asarray(mean, dtype=jnp.float32)
-    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
-    normalized = (value - mu) * jnp.exp(-log_std)
-    return 0.5 * jnp.square(normalized) + log_std
 
 
 def bernoulli_logit_loss(target: Any, logit: Any) -> Any:
@@ -136,6 +134,5 @@ def bernoulli_logit_loss(target: Any, logit: Any) -> Any:
 
 __all__ = [
     "bernoulli_logit_loss",
-    "gaussian_negative_log_likelihood",
     "response_decoder_class",
 ]

@@ -12,12 +12,14 @@ from src.path_c.experiment import (
     MANIFEST_VERSION,
     METHOD_VERSION,
     OFFICIAL_PROTOCOL_VERSION,
+    OFFICIAL_CORRECT_DELIVERY_REWARD,
     PartnerManifest,
     PartnerRun,
     RUN_BUDGETS,
     load_config,
     load_partner_manifest,
     validate_partner_manifest,
+    validate_config,
 )
 from src.path_c.storage import sha256_path
 
@@ -33,11 +35,11 @@ def _run(index: int, role: str, *, parent: str | None = None) -> PartnerRun:
         checkpoint=Path(f"/tmp/checkpoint-{index}"),
         checkpoint_sha256=f"{index:064x}",
         parent_training_run_id=parent or f"parent-{index}",
-        generation_mechanism=f"mechanism-{index % 2}",
+        generation_mechanism="fixture",
         seed=index,
         seed_index=None,
         jax_prng_key=(0, 10_000 + index),
-        owner_seed_index=None if role == "confirmatory" else index % 10,
+        owner_seed_index=None,
         co_training_group_id=f"group-{index}",
         partner_type_id=None,
     )
@@ -45,8 +47,11 @@ def _run(index: int, role: str, *, parent: str | None = None) -> PartnerRun:
 
 def _valid_manifest() -> PartnerManifest:
     roles = (
-        "frozen_external_train",
-        "frozen_external_train",
+        "owner_source",
+        "generator_init_source",
+        "generator_init_source",
+        "development_support",
+        "development_support",
         "calibration",
         "calibration",
         "confirmatory",
@@ -59,9 +64,9 @@ def _valid_manifest() -> PartnerManifest:
 
 
 def test_registered_versions_and_run_budgets() -> None:
-    assert CONFIG_VERSION == 5
+    assert CONFIG_VERSION == 7
     assert MANIFEST_VERSION == 2
-    assert METHOD_VERSION == "delta_zsc_v5_decision_equivalent_bayes_r2_official"
+    assert METHOD_VERSION == "delta_zsc_v5_decision_equivalent_bayes_r3_signal_contract"
     assert OFFICIAL_PROTOCOL_VERSION == "overcooked_v2_iclr2025_5ce1707_v1"
     assert RUN_BUDGETS["mechanical"].num_envs == 4
     assert RUN_BUDGETS["development"].environment_steps == 1_228_800
@@ -88,6 +93,25 @@ def test_v5_configs_load_with_registered_budget(
         16 if "mechanical_e2e" in filename else 256
     )
     assert len(config.fingerprint) == 64
+
+
+def test_competence_margin_is_bound_to_official_delivery_reward() -> None:
+    config = load_config(
+        CONFIGS / "delta_zsc_simple_formal.yaml", run_kind="formal"
+    )
+    assert (
+        config.partner_generator.delivery_noninferiority_margin
+        == OFFICIAL_CORRECT_DELIVERY_REWARD
+        == 20.0
+    )
+    invalid = replace(
+        config,
+        partner_generator=replace(
+            config.partner_generator, delivery_noninferiority_margin=19.0
+        ),
+    )
+    with pytest.raises(ValueError, match="one Official correct-delivery"):
+        validate_config(invalid)
 
 
 def test_config_rejects_unknown_fields(tmp_path: Path) -> None:
@@ -117,19 +141,19 @@ def test_manifest_rejects_checkpoint_parent_and_group_leakage() -> None:
         )
 
     shared_parent = replace(
-        manifest.runs[2], parent_training_run_id=manifest.runs[0].parent_training_run_id
+        manifest.runs[5], parent_training_run_id=manifest.runs[0].parent_training_run_id
     )
     with pytest.raises(ValueError, match="parent runs overlap"):
         validate_partner_manifest(
-            replace(manifest, runs=(manifest.runs[0], manifest.runs[1], shared_parent, *manifest.runs[3:]))
+            replace(manifest, runs=(*manifest.runs[:5], shared_parent, *manifest.runs[6:]))
         )
 
     shared_group = replace(
-        manifest.runs[2], co_training_group_id=manifest.runs[0].co_training_group_id
+        manifest.runs[5], co_training_group_id=manifest.runs[0].co_training_group_id
     )
     with pytest.raises(ValueError, match="co-training group"):
         validate_partner_manifest(
-            replace(manifest, runs=(manifest.runs[0], manifest.runs[1], shared_group, *manifest.runs[3:]))
+            replace(manifest, runs=(*manifest.runs[:5], shared_group, *manifest.runs[6:]))
         )
 
 
