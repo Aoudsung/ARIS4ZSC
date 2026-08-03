@@ -18,7 +18,10 @@ from src.path_c.regret_potential import (  # noqa: E402
     decision_regret_from_action_values,
     potential_shaping,
 )
-from src.path_c.runner import decision_regret_weight  # noqa: E402
+from src.path_c.runner import (  # noqa: E402
+    decision_regret_weight,
+    finalize_decision_regret_shaping,
+)
 from src.path_c.response_targets import (  # noqa: E402
     extract_partner_response_targets,
     official_partner_observation_planes,
@@ -154,3 +157,31 @@ def test_decision_regret_schedule_and_terminal_detached_potential() -> None:
     )(current, following)
     np.testing.assert_array_equal(gradients[0], 0.0)
     np.testing.assert_array_equal(gradients[1], 0.0)
+
+
+def test_decision_regret_runtime_metrics_are_scalar_summaries() -> None:
+    from typing import NamedTuple
+
+    class Batch(NamedTuple):
+        dones: object
+        shaped_rewards: object
+        decision_regret_shaping: object
+
+    batch = Batch(
+        dones=jnp.asarray([[False], [True]]),
+        shaped_rewards=jnp.zeros((2, 1), dtype=jnp.float32),
+        decision_regret_shaping=jnp.zeros((2, 1), dtype=jnp.float32),
+    )
+    _, metrics = finalize_decision_regret_shaping(
+        batch=batch,
+        regrets=jnp.asarray([[0.1], [0.2], [0.3]], dtype=jnp.float32),
+        action_ranges=jnp.ones((3, 1), dtype=jnp.float32),
+        action_range_ema=jnp.asarray(1.0, dtype=jnp.float32),
+        gamma=0.99,
+        weight=jnp.asarray(0.1, dtype=jnp.float32),
+    )
+
+    assert "decision_regret_values" not in metrics
+    assert "normalized_decision_regret" not in metrics
+    assert all(np.asarray(value).ndim == 0 for value in metrics.values())
+    assert float(metrics["rms_decision_regret_shaping"]) >= 0.0

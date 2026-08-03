@@ -549,11 +549,11 @@ def finalize_decision_regret_shaping(
     shaping = jnp.asarray(weight, dtype=jnp.float32) * unweighted
     shaped = batch.shaped_rewards + shaping
     return batch._replace(decision_regret_shaping=shaping, shaped_rewards=shaped), {
-        "decision_regret_values": values[:-1],
-        "normalized_decision_regret": normalized[:-1],
         "mean_decision_regret": jnp.mean(values[:-1]),
         "maximum_decision_regret": jnp.max(values[:-1]),
         "mean_decision_regret_shaping": jnp.mean(shaping),
+        "mean_absolute_decision_regret_shaping": jnp.mean(jnp.abs(shaping)),
+        "rms_decision_regret_shaping": jnp.sqrt(jnp.mean(jnp.square(shaping))),
         "decision_regret_weight": jnp.asarray(weight),
         "action_range_ema": next_scale,
         "mean_action_range": jnp.mean(ranges),

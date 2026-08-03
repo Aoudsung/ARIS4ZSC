@@ -1499,13 +1499,7 @@ def run_training(args: argparse.Namespace) -> None:
             ),
             "belief_objective_losses": _host(belief_values),
             "belief_gradient": _host(belief_gradient_metrics),
-            "regret": _host(
-                {
-                    key: value
-                    for key, value in regret_metrics.items()
-                    if key != "decision_regret_values"
-                }
-            ),
+            "regret": _host(regret_metrics),
             "generator": {
                 **_host(generator_metrics),
                 "raw_cvar": generator_cvar,
