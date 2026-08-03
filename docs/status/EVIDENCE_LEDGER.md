@@ -41,4 +41,6 @@
 
 - **2026-08-03** S1 面板盘点与 pilot：服务器现存上游只有 SP 与 OP 各 10 个完整 seed（ckpt_final），SA/FCP 在 V6 树上不可用；第一版面板限定 sp/op 两类型，入台账说明。Pilot（3 seed/类型，36 配对 × 5 回合）行数与标记完整，探索性读数 Γ_compat≈69.3，污染对照 identity 均值 146.7 vs run-disjoint 14.0，复现历史污染形态。回合数太少，不构成结论。证据：服务器 `runs/exploration/s1_panel/pilot/summary.json`。
 
-- **2026-08-03** S1 放量预算登记：全量面板取 sp/op 各 10 seed，20×20 配对共 400 格 × 500 回合 × 400 步 = 80,000,000 环境步，后台执行，产物入 `runs/exploration/s1_panel/full`。证据：本条目。
+- **2026-08-03** S1 放量预算登记：全量面板取 sp/op 各 10 seed，20×20 配对共 400 格 × 500 回合 × 400 步 = 80,000,000 环境步。证据：本条目。
+
+- **2026-08-03** S1 执行方式改多卡分片：单 GPU 串行方案实测 GPU 利用率近零且只用 1/8 卡，已停止（commit `032f93f` 给面板工具加了分片与合并支持），改为 GPU 2/4/5/6 四分片并行，产物入 `runs/exploration/s1_panel/full/shard_{0..3}`，完成后跑 `--merge-shards` 出最终汇总。证据：服务器 shard 日志与 nvidia-smi 读数。
