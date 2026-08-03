@@ -84,9 +84,14 @@ def estimate_pair(
         fa = window_histograms(actions_a, t)
         fb = window_histograms(actions_b, t)
         tv_curve[t] = max(0.0, 1.0 - 2.0 * loo_error(fa, fb))
-    fa1 = actions_a.mean(axis=0)
-    fb1 = actions_b.mean(axis=0)
-    kappa = 0.5 * float(np.abs(fa1 - fb1).sum())
+    # Kappa is the per-evidence-unit strength: the mean total variation of the
+    # single-step conditional action distributions, bounded in [0, 1].
+    hist_a = np.zeros(ACTION_RANGE, dtype=np.float64)
+    hist_b = np.zeros(ACTION_RANGE, dtype=np.float64)
+    for a in range(ACTION_RANGE):
+        hist_a[a] = float((actions_a == a).mean())
+        hist_b[a] = float((actions_b == a).mean())
+    kappa = 0.5 * float(np.abs(hist_a - hist_b).sum())
     return {"tv_curve": tv_curve, "kappa": kappa}
 
 
@@ -121,7 +126,8 @@ def synthetic_validation() -> dict:
                 ),
             }
         relative_biases = [entry["relative_bias"] for entry in tv_curve.values()]
-        kappa_hat = 0.5 * float(abs(group_a.mean() - group_b.mean()) * 2.0)
+        # Bernoulli evidence: the single-step marginal TV is |p1 - p0| = kappa.
+        kappa_hat = float(abs(group_a.mean() - group_b.mean()))
         results.append(
             {
                 "kappa_true": kappa_true,
