@@ -228,6 +228,16 @@ def run_panel(args: argparse.Namespace) -> None:
     if manifest["layout"] != config.environment.layout:
         raise RuntimeError("Panel manifest layout differs from the config layout.")
     pairings = build_pairings(manifest)
+    if args.merge_shards:
+        merge_shards(pairings, Path(args.output))
+        return
+    if args.shard_count > 1:
+        if not 0 <= args.shard_index < args.shard_count:
+            raise RuntimeError("shard-index out of range")
+        block = (len(pairings) + args.shard_count - 1) // args.shard_count
+        pairings = pairings[args.shard_index * block : (args.shard_index + 1) * block]
+        if not pairings:
+            raise RuntimeError("empty shard slice")
     episodes = int(args.pilot_episodes) if args.pilot_episodes else OFFICIAL_EPISODES
     root_key = jax.random.PRNGKey(OFFICIAL_EVALUATION_ROOT_SEED)
 
@@ -255,7 +265,15 @@ def run_panel(args: argparse.Namespace) -> None:
         for index, value in enumerate(values):
             rows.append({**pairing, "episode_index": index, "raw_return": float(value)})
     (output / "rows.json").write_text(json.dumps(rows), encoding="utf-8")
+    write_summary(pairings, cells, episodes, output)
 
+
+def write_summary(
+    pairings: list[dict],
+    cells: dict[tuple[str, str], np.ndarray],
+    episodes: int,
+    output: Path,
+) -> None:
     gamma = gamma_compat(pairings, cells)
     contrast = contamination_contrast(pairings, cells)
     all_values = np.concatenate(list(cells.values()))
@@ -271,6 +289,46 @@ def run_panel(args: argparse.Namespace) -> None:
     print(json.dumps(summary, indent=2))
 
 
+def merge_shards(pairings: list[dict], output: Path) -> None:
+    """Combine shard row files into the final rows.json and summary.json."""
+    shard_rows = []
+    for shard_file in sorted(output.glob("shard_*/rows.json")):
+        shard_rows.extend(json.loads(shard_file.read_text(encoding="utf-8")))
+    if not shard_rows:
+        raise RuntimeError("no shard rows found to merge")
+    episodes = max(int(row["episode_index"]) for row in shard_rows) + 1
+    seen = set()
+    for row in shard_rows:
+        key = (
+            row["mode_run_id"],
+            row["partner_run_id"],
+            int(row["episode_index"]),
+        )
+        if key in seen:
+            raise RuntimeError("duplicate row detected across shards")
+        seen.add(key)
+    expected_rows = len(pairings) * episodes
+    if len(shard_rows) != expected_rows:
+        raise RuntimeError(
+            f"merged row count {len(shard_rows)} differs from expected {expected_rows}"
+        )
+    (output / "rows.json").write_text(json.dumps(shard_rows), encoding="utf-8")
+    cells: dict[tuple[str, str], np.ndarray] = {}
+    for pairing in pairings:
+        key = (pairing["mode_run_id"], pairing["partner_run_id"])
+        cells[key] = np.array(
+            [
+                row["raw_return"]
+                for row in shard_rows
+                if row["mode_run_id"] == key[0] and row["partner_run_id"] == key[1]
+            ],
+            dtype=np.float64,
+        )
+        if cells[key].shape != (episodes,):
+            raise RuntimeError(f"cell {key} has an invalid episode count")
+    write_summary(pairings, cells, episodes, output)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="S1 run-disjoint opportunity panel (exploration track)."
@@ -283,6 +341,13 @@ def main() -> None:
         type=int,
         default=0,
         help="Override episodes per pairing for the pilot stage.",
+    )
+    parser.add_argument("--shard-index", type=int, default=0, help="Shard index.")
+    parser.add_argument("--shard-count", type=int, default=1, help="Total shards.")
+    parser.add_argument(
+        "--merge-shards",
+        action="store_true",
+        help="Merge shard_*/rows.json under --output into final outputs.",
     )
     args = parser.parse_args()
     if args.pilot_episodes and args.pilot_episodes <= 0:
