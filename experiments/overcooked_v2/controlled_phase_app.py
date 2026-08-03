@@ -107,7 +107,13 @@ def evaluate_point(
     t_prefix: int,
     epsilon: float,
 ) -> dict:
-    """Exact six-control values at the registered commit time n_e."""
+    """Exact six-control values at the registered commit time n_e.
+
+    All controls are evaluated committing at the same time n_e so every
+    object pays the identical waiting cost; the T2 identity then holds at
+    fixed commit time.  ``v_hz_free`` reports the label-informed value that
+    commits immediately (the J_HZ reference used in window accounting).
+    """
     if n_lock > n_e:
         raise ValueError("n_lock cannot exceed n_e")
     p0, p1 = evidence_probabilities(kappa)
@@ -118,7 +124,8 @@ def evaluate_point(
     v_fix = delta / 2.0 - wait
     v_state = delta * (1.0 + kappa) / 2.0 - wait
     v_hist = delta * (1.0 + float(tvs[n_e])) / 2.0 - wait
-    v_hz = delta - c * t_prefix
+    v_hz = delta - wait
+    v_hz_free = delta - c * t_prefix
     v_full = v_hz
 
     regrets = delta * (1.0 - tvs) / 2.0
@@ -136,6 +143,7 @@ def evaluate_point(
         "v_state": v_state,
         "v_hist": v_hist,
         "v_hz": v_hz,
+        "v_hz_free": v_hz_free,
         "v_full": v_full,
         "tv_at_n_e": float(tvs[n_e]),
         "n_emp": n_emp,
