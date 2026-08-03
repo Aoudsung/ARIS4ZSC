@@ -24,6 +24,11 @@ objects that are fixed during normal V6 learning are the Official protocol,
 run-disjoint data partitions, EMA target networks and the mechanically final
 checkpoint. No scientific statistic selects a checkpoint or seed.
 
+Formal CUDA execution remains float32 and fixes JAX matmul precision to
+`highest`; this avoids batch-shape-dependent TF32 differences in the bounded
+decision-regret chunks without introducing mixed precision or changing a model
+hyperparameter.
+
 Every partner-manifest entry records the real two-word JAX PRNG key together
 with its checkpoint hash, parent run and co-training lineage. Missing key
 provenance is invalid even for non-Official initialization or support partners.
@@ -208,7 +213,9 @@ L_{DE}=\left(\|\mu_i-\mu_j\|_2-
 \]
 
 where (s_A) has EMA decay 0.99 and initial value 1. There are no code-region
-labels, clustering gates or artificial parity groups.
+labels, clustering gates or artificial parity groups. Both Euclidean distances
+use `sqrt(sum(square(delta)) + 1e-12)` so an exactly collapsed or masked pair has
+a finite zero gradient rather than the undefined derivative of an unfloored norm.
 
 ## 6. Decision-regret shaping
 

@@ -76,6 +76,26 @@ def test_v6_continuous_decision_equivalence_matches_scaled_action_distance() -> 
     )(advantage_a).sum()) == 0.0
 
 
+def test_decision_equivalence_collapsed_pair_has_finite_zero_gradient() -> None:
+    mean = jnp.zeros((2, 8), dtype=jnp.float32)
+    advantage = jnp.zeros((2, 6), dtype=jnp.float32)
+
+    def objective(candidate):
+        return decision_equivalence_metric_loss(
+            mean_a=candidate,
+            mean_b=mean,
+            advantage_a=advantage,
+            advantage_b=advantage,
+            advantage_scale=jnp.asarray(1.0, dtype=jnp.float32),
+            weights=jnp.asarray([1.0, 0.0], dtype=jnp.float32),
+        )[0]
+
+    loss, gradient = jax.value_and_grad(objective)(mean)
+    assert bool(jnp.isfinite(loss))
+    assert bool(jnp.all(jnp.isfinite(gradient)))
+    np.testing.assert_array_equal(np.asarray(gradient), np.zeros((2, 8), dtype=np.float32))
+
+
 def test_brdiv_rewards_decision_distinct_signatures() -> None:
     duplicate = jnp.asarray([[1.0, 0.0], [1.0, 0.0]])
     distinct = jnp.asarray([[1.0, 0.0], [0.0, 1.0]])

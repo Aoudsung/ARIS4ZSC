@@ -222,11 +222,21 @@ def configure_bundled_cuda_toolchain() -> Mapping[str, Any]:
     binary_directory = str(candidate.parent)
     existing = os.environ.get("PATH", "")
     os.environ["PATH"] = binary_directory + (os.pathsep + existing if existing else "")
+    precision = os.environ.get("JAX_DEFAULT_MATMUL_PRECISION", "").strip().lower()
+    if not precision:
+        precision = "highest"
+        os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = precision
+    if precision != "highest":
+        raise RuntimeError(
+            "Formal V6 CUDA execution requires "
+            "JAX_DEFAULT_MATMUL_PRECISION=highest."
+        )
     return {
         "ptxas_path": str(candidate),
         "cuda_major": cuda_major,
         "version_output": version_text,
         "source": "nvidia-cuda-nvcc-cu12",
+        "jax_default_matmul_precision": precision,
     }
 
 
@@ -272,6 +282,11 @@ def require_single_cuda_worker() -> Mapping[str, Any]:
     platforms = os.environ.get("JAX_PLATFORMS", "").strip().lower()
     if platforms != "cuda":
         raise RuntimeError("Formal workers require JAX_PLATFORMS=cuda.")
+    precision = os.environ.get("JAX_DEFAULT_MATMUL_PRECISION", "").strip().lower()
+    if precision != "highest":
+        raise RuntimeError(
+            "Formal workers require JAX_DEFAULT_MATMUL_PRECISION=highest."
+        )
 
     try:
         total_memory_mib = int(registered["total_memory_mib"])
@@ -312,6 +327,7 @@ def require_single_cuda_worker() -> Mapping[str, Any]:
     return {
         "cuda_visible_devices": visible,
         "jax_platforms": platforms,
+        "jax_default_matmul_precision": precision,
         "jax_backend": backend,
         "jax_device_count": 1,
         "jax_device": {

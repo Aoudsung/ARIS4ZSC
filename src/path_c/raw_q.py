@@ -271,16 +271,28 @@ def decision_equivalence_metric_loss(
     import jax
     import jax.numpy as jnp
 
-    latent_distance = jnp.linalg.norm(
+    latent_delta = (
         jnp.asarray(mean_a, dtype=jnp.float32)
-        - jnp.asarray(mean_b, dtype=jnp.float32),
-        axis=-1,
+        - jnp.asarray(mean_b, dtype=jnp.float32)
+    )
+    # The Euclidean norm has an undefined derivative at an exactly collapsed
+    # pair.  Such pairs are expected at initialization and in masked replay
+    # rows, so use the same 1e-12 squared-distance floor as the registered
+    # decision-distance primitive.  This preserves the L2 geometry away from
+    # zero while making its zero-point gradient finite (and equal to zero).
+    latent_distance = jnp.sqrt(
+        jnp.sum(jnp.square(latent_delta), axis=-1) + 1.0e-12
     )
     decision_distance = jax.lax.stop_gradient(
-        jnp.linalg.norm(
-            jnp.asarray(advantage_a, dtype=jnp.float32)
-            - jnp.asarray(advantage_b, dtype=jnp.float32),
-            axis=-1,
+        jnp.sqrt(
+            jnp.sum(
+                jnp.square(
+                    jnp.asarray(advantage_a, dtype=jnp.float32)
+                    - jnp.asarray(advantage_b, dtype=jnp.float32)
+                ),
+                axis=-1,
+            )
+            + 1.0e-12
         )
         / (jnp.asarray(advantage_scale, dtype=jnp.float32) + 1.0e-8)
     )

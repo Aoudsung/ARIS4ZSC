@@ -90,6 +90,7 @@ def _registered_cuda_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     values = {
         "CUDA_VISIBLE_DEVICES": "5",
         "JAX_PLATFORMS": "cuda",
+        "JAX_DEFAULT_MATMUL_PRECISION": "highest",
         "DELTA_PHYSICAL_GPU_INDEX": "5",
         "DELTA_PHYSICAL_GPU_UUID": "GPU-test",
         "DELTA_GPU_NAME": "Test CUDA GPU",
@@ -118,6 +119,7 @@ def test_formal_cuda_worker_requires_actual_single_jax_gpu(
     observed = require_single_cuda_worker()
     assert observed["jax_backend"] == "gpu"
     assert observed["jax_device_count"] == 1
+    assert observed["jax_default_matmul_precision"] == "highest"
     assert observed["dispatcher_registration"]["physical_index"] == "5"
     assert observed["dispatcher_registration"]["volatile_uncorrectable_ecc"] == 0
 
@@ -140,4 +142,9 @@ def test_formal_cuda_worker_rejects_cpu_fallback_and_unhealthy_registration(
 
     monkeypatch.setenv("DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC", "1")
     with pytest.raises(RuntimeError, match="ECC"):
+        require_single_cuda_worker()
+
+    monkeypatch.setenv("DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC", "0")
+    monkeypatch.setenv("JAX_DEFAULT_MATMUL_PRECISION", "default")
+    with pytest.raises(RuntimeError, match="MATMUL_PRECISION"):
         require_single_cuda_worker()

@@ -15,6 +15,7 @@ from experiments.overcooked_v2.official_adapter import (
 from src.path_c.experiment import load_config, official_training_key
 from src.path_c.resources import (
     ResourceLedger,
+    configure_bundled_cuda_toolchain,
     gpu_hours_for_wall_seconds,
     parameter_count,
     peak_device_memory_bytes,
@@ -46,9 +47,11 @@ def run_upstream(args: argparse.Namespace) -> None:
     config = load_config(args.config, run_kind=args.run_kind)
     cuda_runtime = None
     if config.run_kind == "formal":
+        cuda_toolchain = configure_bundled_cuda_toolchain()
         validate_formal_repository_state()
         validate_registered_python_runtime()
         cuda_runtime = require_single_cuda_worker()
+        cuda_runtime = {**cuda_runtime, "cuda_toolchain": cuda_toolchain}
     runtime = validate_official_runtime()
     seed_index = int(args.seed_index)
     explicit_key = getattr(args, "jax_prng_key", None)
