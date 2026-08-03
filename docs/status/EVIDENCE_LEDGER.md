@@ -45,4 +45,8 @@
 
 - **2026-08-03** S1 执行方式改多卡分片：单 GPU 串行方案实测 GPU 利用率近零且只用 1/8 卡，已停止（commit `032f93f` 给面板工具加了分片与合并支持），改为 GPU 2/4/5/6 四分片并行，产物入 `runs/exploration/s1_panel/full/shard_{0..3}`，完成后跑 `--merge-shards` 出最终汇总。证据：服务器 shard 日志与 nvidia-smi 读数。
 
-- **2026-08-03** S1 全量面板完成：400 配对 × 500 回合 = 200,000 行，合并校验通过。探索性读数：逐伙伴最优上限 V_Z=136.35，最佳单一模式 V_fix=3.01，差值 133.34（含 identity 格，是上限不是机会证书）；identity 格均值 136.19 vs run-disjoint 格均值 −36.23，对照 172.4，历史污染形态在新面板上再次出现。Θ1 裁决还差迁移值分析（开发类型冻结映射在留出伙伴上的读数），未计算前不得据本条裁决。探索轨读数，`scientific_readout_allowed: false`。证据：服务器 `runs/exploration/s1_panel/full/summary.json`。
+- **2026-08-03** S1 迁移值分析完成：伙伴运行按 seed 0-4 开发、5-9 留出，全程剔除 identity 格。开发半冻结映射 sp→rnn-sp-seed-0、op→rnn-op-seed-7（开发分 78.2/88.3）；留出半上 V_transfer=−75.85，V_fix,test=+7.75（最佳单一模式 rnn-op-seed-9），迁移差 −83.60，伙伴运行级 bootstrap 区间 [−166.9,+27.9]（单元数 8）；去 identity 的留出 oracle 仍有 84.22。探索轨读数，`scientific_readout_allowed: false`。证据：服务器 `runs/exploration/s1_panel/full/transfer_summary.json`。
+
+- **2026-08-03** 论点裁决：Θ1 判死。迁移差点估计大幅为负且区间不给出正证书，命中 THESIS_CANDIDATES 注册的 falsifier（机会为正但冻结映射在留出伙伴上不迁移），也命中 EXPERIMENT_LADDER S1 停机判据；结论收缩：机会存在于个体/运行层面（去 identity oracle 84.22），类型级惯例映射不可跨运行复用。Θ3 失去前置（S1 停机则不投入方法训练），同步出局；Θ4 依赖 V6 训练与表征分析，本轮不具备裁决条件，挂起。主论点 Θ2（信息时序定理生态验证，S2 已 180/180 通过，生态推论 P1-P6 已注册），次论点 Θ5（分解链诊断工具，本面板就是它的首个完整实例）。落选与挂起理由以本条为准。
+
+- **2026-08-03** 论文形态收缩到 L1-L3：按 PAPER_STANDARD 主张层级，L4（方法 SOTA）随 Θ3 出局摘除；L1（分解链诊断，本次面板加 S2 相图）、L2（身份重合污染的第二次独立复现：污染对照 172.4，迁移失败）、L3（TV 匹配界与历史需求定理及生态预测）为投稿主体。标题候选与表图设计随 RESEARCH_THESIS 第二版收敛。
