@@ -12,8 +12,10 @@ two to four.  Two modes:
   Delta-hat uses the panel proxy defined in the spec.
 
 Window features are partner-action histograms (6 bins, window 20).  Group
-separability uses deterministic leave-one-out 1-nearest-neighbor on Euclidean
-distance; TV-hat = max(0, 1 - 2*err) by T2 (p_e^* = (1 - TV)/2).
+separability uses a deterministic leave-one-out plug-in Bayes classifier on
+the discrete feature keys; TV-hat = max(0, 1 - 2*err) by T2
+(p_e^* = (1 - TV)/2).  The plug-in Bayes rule is the sample-frequency
+majority class per feature key with leave-one-out frequency correction.
 """
 
 from __future__ import annotations
@@ -48,19 +50,30 @@ def window_histograms(actions: np.ndarray, t: int) -> np.ndarray:
 
 
 def loo_error(features_a: np.ndarray, features_b: np.ndarray) -> float:
-    """Leave-one-out 1-NN classification error between two feature sets."""
-    pooled = np.concatenate([features_a, features_b], axis=0)
-    labels = np.concatenate(
-        [np.zeros(len(features_a)), np.ones(len(features_b))]
-    )
-    n = len(pooled)
-    if n < 4:
+    """Leave-one-out plug-in Bayes error between two discrete feature sets."""
+    keys_a = [tuple(row) for row in features_a.astype(np.int64)]
+    keys_b = [tuple(row) for row in features_b.astype(np.int64)]
+    counts_a: dict[tuple, int] = {}
+    counts_b: dict[tuple, int] = {}
+    for key in keys_a:
+        counts_a[key] = counts_a.get(key, 0) + 1
+    for key in keys_b:
+        counts_b[key] = counts_b.get(key, 0) + 1
+    n_a, n_b = len(keys_a), len(keys_b)
+    if n_a < 2 or n_b < 2:
         raise RuntimeError("too few samples for leave-one-out classification")
-    squared = ((pooled[:, None, :] - pooled[None, :, :]) ** 2).sum(axis=-1)
-    np.fill_diagonal(squared, np.inf)
-    nearest = squared.argmin(axis=1)
-    predicted = labels[nearest]
-    return float((predicted != labels).mean())
+    errors = 0
+    for key in keys_a:
+        a_freq = counts_a[key] - 1
+        b_freq = counts_b.get(key, 0)
+        if b_freq > a_freq:
+            errors += 1
+    for key in keys_b:
+        a_freq = counts_a.get(key, 0)
+        b_freq = counts_b[key] - 1
+        if a_freq > b_freq:
+            errors += 1
+    return errors / (n_a + n_b)
 
 
 def estimate_pair(
@@ -92,32 +105,20 @@ def synthetic_validation() -> dict:
         for t in VALIDATE_T:
             prefix_a = group_a[:, :t].sum(axis=1)
             prefix_b = group_b[:, :t].sum(axis=1)
-            counts = np.zeros(t + 1, dtype=np.float64)
-            for k in range(t + 1):
-                counts[k] = 0.5 * (
-                    float((prefix_a == k).mean()) + float((prefix_b == k).mean())
-                )
             tv_true = 0.5 * float(
                 np.abs(
                     np.array([(prefix_a == k).mean() for k in range(t + 1)])
                     - np.array([(prefix_b == k).mean() for k in range(t + 1)])
                 ).sum()
             )
-            pooled = np.concatenate([prefix_a[:, None], prefix_b[:, None]], axis=0)
-            labels = np.concatenate(
-                [np.zeros(len(prefix_a)), np.ones(len(prefix_b))]
-            )
-            squared = (pooled[:, None, 0] - pooled[None, :, 0]) ** 2
-            np.fill_diagonal(squared, np.inf)
-            predicted = labels[squared.argmin(axis=1)]
-            tv_hat = max(0.0, 1.0 - 2.0 * float((predicted != labels).mean()))
+            err = loo_error(prefix_a[:, None], prefix_b[:, None])
+            tv_hat = max(0.0, 1.0 - 2.0 * err)
             tv_curve[t] = {
                 "tv_true": tv_true,
                 "tv_hat": tv_hat,
                 "relative_bias": (
                     abs(tv_hat - tv_true) / tv_true if tv_true > 1e-9 else 0.0
                 ),
-                "counts_check": float(counts.sum()),
             }
         relative_biases = [entry["relative_bias"] for entry in tv_curve.values()]
         kappa_hat = 0.5 * float(abs(group_a.mean() - group_b.mean()) * 2.0)

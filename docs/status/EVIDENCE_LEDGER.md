@@ -54,3 +54,7 @@
 - **2026-08-03** E0 类型内排序一致性分析：对每个伙伴 run 按 19 个非 identity 模式 run 的回报排序，同类型伙伴对（各 45 对）的 Kendall tau 均值 sp=0.040、op=0.084，合并 0.062（std 0.34，范围 −0.54 到 +0.80）；跨类型基线 100 对均值 0.065（std 0.29）。类型内一致性与跨类型基线持平，支持"无可迁移惯例结构"而非"结构存在但太弱"，补强 L2 第三层机制证据。探索轨读数，`scientific_readout_allowed: false`。证据：服务器 `runs/exploration/s1_panel/full/structure_summary.json`。
 
 - **2026-08-03** P4 预测重定义：按用户决策，生态预测测量工具改为插入式 Bayes 路由器（零 RL，模板匹配后验加面板均值表选模式）。P4 由"学习路由器学习曲线拐点步数"改为"插入式 Bayes 路由器实测回收率对理论值 Δ·TV/2"；完整注册见 `docs/research/TRAJECTORY_AND_ESTIMATION_SPEC.md`。本轮不训 Wide 上游，P6 布局级结论后置，边界入台账。
+
+- **2026-08-03** E2 轨迹采集完成：ego = rnn-sp-seed-0，20 伙伴 × 100 回合 × 400 步，伙伴动作序列全记录，episode key 流与面板隔离（根种子偏移 1000）。证据：服务器 `runs/exploration/s2_ecology/full/trajectories.json`。
+
+- **2026-08-03** E3 估计器首版合成验证失败：1 近邻留出分类器在已知 κ 的 Bernoulli 合成轨迹上 TV̂ 相对偏差最高 1.0（κ̂ 无偏），触发 fail-closed。按失配条款修估计器：换留出式经验 Bayes 分类器（离散特征键频数多数类），规格已同步，重验中。
