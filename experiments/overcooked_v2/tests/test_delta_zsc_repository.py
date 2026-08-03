@@ -13,7 +13,7 @@ import src.path_c.storage as storage
 
 
 ROOT = Path(__file__).resolve().parents[3]
-REGISTERED_DESIGN_SHA256 = "e58dec253f3c0cc7d5cd2ca114a7e89d0b2f77f0355470ec21799e8a883a6cc3"
+REGISTERED_DESIGN_SHA256 = "42a5544e571692b77476cff88fa97f66d358a5f9e26ff20728cc0d87c7572bf3"
 
 
 def test_registered_design_document_is_byte_exact() -> None:
@@ -52,8 +52,8 @@ def test_cli_help_imports_without_initializing_optional_runtime() -> None:
         "train-official-baseline",
         "train",
         "cuda-preflight",
-        "calibrate",
-        "evaluate",
+        "calibrate-safety",
+        "audit-signals",
         "build-delta-policy-manifest",
         "evaluate-official",
         "summarize-official",
@@ -82,7 +82,7 @@ def test_ci_targets_real_tests_and_active_branch() -> None:
     assert project.count("5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e") == 2
 
 
-def test_active_source_contains_no_retired_v44_semantics() -> None:
+def test_active_source_contains_no_retired_v4_or_v5_control_semantics() -> None:
     retired = (
         "slot_log_belief",
         "TwinDuelingQ",
@@ -92,6 +92,19 @@ def test_active_source_contains_no_retired_v44_semantics() -> None:
         "episode_responsibility_evidence",
         "bellman_control_values",
         "target_response_signatures",
+        "CurriculumPhase",
+        "qualified_base_params",
+        "deployment_tier",
+        "base_logits",
+        "residual_logits",
+        "conditional_enabled",
+        "regret_enabled",
+        "GeneratorAdmission",
+        "TargetPolicyEpoch",
+        "GaussianMixtureBelief",
+        "previous_reward",
+        "hard_adaptation_gate",
+        "owner_sp_source_fallback",
     )
     matches: list[str] = []
     for path in (ROOT / "src" / "path_c").glob("*.py"):
@@ -102,19 +115,26 @@ def test_active_source_contains_no_retired_v44_semantics() -> None:
     assert matches == []
 
 
-def test_counterfactual_ground_truth_has_no_critic_or_q_source() -> None:
+def test_counterfactual_ground_truth_uses_simulator_return_and_an_explicit_endpoint_hook() -> None:
     source = (ROOT / "src" / "path_c" / "counterfactual_anchor.py").read_text(
         encoding="utf-8"
     )
-    for forbidden in (
-        "action_values",
-        "target_params",
-        "critic",
-        "bellman",
-        "next_q",
-    ):
+    for forbidden in ("action_values", "target_params", "critic", "bellman", "next_q"):
         assert forbidden not in source
     assert "final.raw_return" in source
+    assert "functions.ego_endpoint_value" in source
+
+
+def test_retired_v5_control_modules_are_absent() -> None:
+    for name in (
+        "curriculum.py",
+        "fallback.py",
+        "policy_epoch.py",
+        "qualification.py",
+        "qualification_rollout.py",
+        "snapshot_archive.py",
+    ):
+        assert not (ROOT / "src" / "path_c" / name).exists()
 
 
 def test_sensitive_operational_files_are_untracked_and_ignored() -> None:

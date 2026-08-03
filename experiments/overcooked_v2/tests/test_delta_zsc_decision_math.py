@@ -11,44 +11,69 @@ from src.path_c.decision_geometry import (  # noqa: E402
     brdiv_logdet,
     centered_action_values,
     decision_distance,
-    quotient_geometry_loss,
 )
+from src.path_c.raw_q import decision_equivalence_metric_loss  # noqa: E402
 from src.path_c.regret_potential import (  # noqa: E402
     common_optimal_action_regret_zero,
     decision_regret_from_action_values,
     potential_shaping,
+)
+from src.path_c.runner import decision_regret_weight  # noqa: E402
+from src.path_c.response_targets import (  # noqa: E402
+    extract_partner_response_targets,
+    official_partner_observation_planes,
 )
 
 
 def test_decision_signatures_are_translation_invariant() -> None:
     values = jnp.asarray([[1.0, 2.0, 4.0], [11.0, 12.0, 14.0]])
     centered = centered_action_values(values)
-    np.testing.assert_allclose(
-        np.asarray(centered[0]), np.asarray(centered[1]), atol=1.0e-6
-    )
-    np.testing.assert_allclose(np.asarray(jnp.mean(centered, axis=-1)), 0.0, atol=1e-6)
+    np.testing.assert_allclose(centered[0], centered[1], atol=1.0e-6)
+    np.testing.assert_allclose(jnp.mean(centered, axis=-1), 0.0, atol=1e-6)
     assert float(decision_distance(centered[0], centered[1])) < 2e-6
 
 
-def test_quotient_loss_collapses_equivalent_and_separates_distinct_contexts() -> None:
-    equivalent = quotient_geometry_loss(
-        jnp.asarray([[0.0, 0.0]]),
-        jnp.asarray([[0.0, 0.0]]),
-        jnp.asarray([0.0]),
-        equivalence_epsilon=0.05,
-        separation_epsilon=0.25,
-        margin=1.0,
+def test_partner_movement_is_not_mislabeled_as_inventory_interaction() -> None:
+    planes = official_partner_observation_planes(39)
+    previous = jnp.zeros((5, 5, 39), dtype=jnp.float32)
+    current = jnp.zeros_like(previous)
+    previous = previous.at[1, 1, planes.visibility_channel].set(1.0)
+    current = current.at[1, 2, planes.visibility_channel].set(1.0)
+    previous = previous.at[1, 1, planes.inventory_channels[0]].set(1.0)
+    current = current.at[1, 2, planes.inventory_channels[0]].set(1.0)
+    targets = extract_partner_response_targets(previous, current, planes=planes)
+    assert float(targets.interaction_change) == 0.0
+    changed = current.at[1, 2, planes.inventory_channels[0]].set(2.0)
+    targets = extract_partner_response_targets(previous, changed, planes=planes)
+    assert float(targets.interaction_change) == 1.0
+
+
+def test_v6_continuous_decision_equivalence_matches_scaled_action_distance() -> None:
+    advantage_a = jnp.asarray([[1.0, 0.0, -1.0]])
+    advantage_b = jnp.asarray([[-1.0, 0.0, 1.0]])
+    target = float(jnp.linalg.norm(advantage_a - advantage_b) / 2.0)
+    latent_a = jnp.asarray([[0.0, 0.0]])
+    latent_b = jnp.asarray([[target, 0.0]])
+    loss, latent_distance, decision_target = decision_equivalence_metric_loss(
+        mean_a=latent_a,
+        mean_b=latent_b,
+        advantage_a=advantage_a,
+        advantage_b=advantage_b,
+        advantage_scale=jnp.asarray(2.0),
+        weights=jnp.asarray([1.0]),
     )
-    separated = quotient_geometry_loss(
-        jnp.asarray([[0.0, 0.0]]),
-        jnp.asarray([[1.0, 0.0]]),
-        jnp.asarray([1.0]),
-        equivalence_epsilon=0.05,
-        separation_epsilon=0.25,
-        margin=1.0,
-    )
-    assert float(equivalent) < 1e-8
-    assert float(separated) < 1e-8
+    assert float(loss) == pytest.approx(0.0, abs=1.0e-7)
+    np.testing.assert_allclose(latent_distance, decision_target, atol=1.0e-7)
+    assert float(jax.grad(
+        lambda values: decision_equivalence_metric_loss(
+            mean_a=latent_a,
+            mean_b=latent_b,
+            advantage_a=values,
+            advantage_b=advantage_b,
+            advantage_scale=jnp.asarray(2.0),
+            weights=jnp.asarray([1.0]),
+        )[0]
+    )(advantage_a).sum()) == 0.0
 
 
 def test_brdiv_rewards_decision_distinct_signatures() -> None:
@@ -66,30 +91,46 @@ def test_decision_regret_is_zero_only_when_an_optimal_action_is_shared() -> None
     assert float(decision_regret_from_action_values(opposed)) == pytest.approx(1.0)
 
 
-def test_discounted_potential_shaping_telescopes() -> None:
-    regret = jnp.asarray([3.0, 2.0, 1.0])
-    following = jnp.asarray([2.0, 1.0, 0.0])
-    dones = jnp.asarray([False, False, True])
-    gamma = 0.9
-    shaping = potential_shaping(
-        regret, following, dones, gamma=gamma, weight=1.0
+def test_decision_regret_schedule_and_terminal_detached_potential() -> None:
+    early = decision_regret_weight(
+        effective_steps=0,
+        total_steps=100,
+        maximum=0.1,
+        midpoint=0.2,
+        temperature=0.05,
     )
-    discounted = sum((gamma**index) * float(value) for index, value in enumerate(shaping))
-    assert discounted == pytest.approx(3.0, abs=1e-6)
+    midpoint = decision_regret_weight(
+        effective_steps=20,
+        total_steps=100,
+        maximum=0.1,
+        midpoint=0.2,
+        temperature=0.05,
+    )
+    late = decision_regret_weight(
+        effective_steps=100,
+        total_steps=100,
+        maximum=0.1,
+        midpoint=0.2,
+        temperature=0.05,
+    )
+    assert float(early) < 0.002
+    assert float(midpoint) == pytest.approx(0.05, abs=1.0e-7)
+    assert float(late) > 0.099
 
-
-def test_potential_shaping_accepts_runtime_weight_in_jitted_kernel() -> None:
-    dynamic = jax.jit(
-        lambda value: potential_shaping(
-            jnp.asarray([2.0], dtype=jnp.float32),
-            jnp.asarray([1.0], dtype=jnp.float32),
-            jnp.asarray([False]),
-            gamma=0.99,
-            weight=value,
-        )
+    current = jnp.asarray([2.0, 3.0])
+    following = jnp.asarray([100.0, 5.0])
+    terminal = jnp.asarray([True, False])
+    shaped = potential_shaping(
+        current, following, terminal, gamma=0.99, weight=0.1
     )
     np.testing.assert_allclose(
-        np.asarray(dynamic(jnp.asarray(0.1, dtype=jnp.float32))),
-        np.asarray([0.101], dtype=np.float32),
-        atol=1.0e-6,
+        shaped, [0.2, 0.1 * (3.0 - 0.99 * 5.0)], atol=1.0e-7
     )
+    gradients = jax.grad(
+        lambda left, right: jnp.sum(
+            potential_shaping(left, right, terminal, gamma=0.99, weight=0.1)
+        ),
+        argnums=(0, 1),
+    )(current, following)
+    np.testing.assert_array_equal(gradients[0], 0.0)
+    np.testing.assert_array_equal(gradients[1], 0.0)

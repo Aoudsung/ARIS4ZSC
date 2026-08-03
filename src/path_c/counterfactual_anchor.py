@@ -1,8 +1,11 @@
 """Common-random-number counterfactual action anchors.
 
 The collector is environment-agnostic.  All callbacks operate on a flattened
-batch of ``anchor × action × replica`` lanes.  Ground-truth targets are simulator
-returns; no model Q value is used to create labels.
+batch of ``anchor × action × replica`` lanes.  A label is the detached raw
+simulator-return prefix plus, only when the 128-step branch remains nonterminal,
+the registered EMA-policy conservative twin-Q endpoint bootstrap.  Live Q never
+creates or differentiates through a label, and every row records the target
+fingerprint that supplied its endpoint value.
 """
 
 from __future__ import annotations
@@ -197,7 +200,6 @@ def advance_anchor_world(
     root_keys: Any,
     functions: AnchorFunctions,
     steps: int,
-    gate: float = 0.0,
     runtime: Any | None = None,
     domain: int = 70_001,
 ) -> AnchorWorld:
@@ -237,12 +239,7 @@ def advance_anchor_world(
         lane = jnp.arange(lane_count, dtype=jnp.int32)
         ego_observation = current.observations[lane, current.ego_roles]
         partner_observation = current.observations[lane, 1 - current.ego_roles]
-        ego_args = (
-            current.ego_state,
-            ego_observation,
-            jnp.full((lane_count,), float(gate), dtype=jnp.float32),
-            ego_keys,
-        )
+        ego_args = (current.ego_state, ego_observation, ego_keys)
         next_ego_pre, ego_probabilities = (
             functions.ego_policy_step(*ego_args)
             if runtime is None
@@ -266,6 +263,12 @@ def advance_anchor_world(
         next_environment, next_observations, rewards, dones, info = functions.environment_step(
             current.environment_state, joint, environment_keys
         )
+        raw_by_agent = info.get("raw_rewards_by_agent")
+        ego_rewards = (
+            rewards
+            if raw_by_agent is None
+            else raw_by_agent[lane, current.ego_roles]
+        )
         terminal = info["terminal_observations"]
         obs_mask = jnp.asarray(dones).reshape(
             jnp.asarray(dones).shape + (1,) * (next_observations[:, 0].ndim - 1)
@@ -277,14 +280,19 @@ def advance_anchor_world(
         ego_history = jnp.where(obs_mask, ego_terminal, ego_next)
         partner_history = jnp.where(obs_mask, partner_terminal, partner_next)
         next_ego = functions.ego_observe(
-            next_ego_pre, ego_observation, ego_actions, rewards, dones, ego_history
+            next_ego_pre,
+            ego_observation,
+            ego_actions,
+            ego_rewards,
+            dones,
+            ego_history,
         )
         observe_args = (
             next_partner_pre,
             partner_context,
             partner_observation,
             partner_actions,
-            rewards,
+            ego_rewards,
             dones,
             partner_history,
         )
@@ -301,7 +309,7 @@ def advance_anchor_world(
             partner_episode_start=dones,
             ego_roles=current.ego_roles,
             done=jnp.asarray(dones, dtype=jnp.bool_),
-            raw_return=current.raw_return + jnp.where(active, rewards, 0.0),
+            raw_return=current.raw_return + jnp.where(active, ego_rewards, 0.0),
         )
         return tree_select(active, candidate, current)
 
@@ -328,10 +336,13 @@ def collect_counterfactual_anchors(
     evaluation_replicas: int,
     continuation_horizon: int,
     discount: float = 1.0,
-    gate: float = 1.0,
     microbatch_size: int | None = None,
     runtime: Any | None = None,
     chunk_kernel: Callable[..., Any] | None = None,
+    collection_policy_logits: Any | None = None,
+    collection_update: Any | None = None,
+    collection_target_fingerprint: Any | None = None,
+    matched_pair_ids: Any | None = None,
 ) -> CounterfactualAnchorBatch:
     """Estimate all-action continuation returns from identical anchor worlds."""
 
@@ -463,8 +474,19 @@ def collect_counterfactual_anchors(
                         evaluation_replicas=evaluation_replicas,
                         continuation_horizon=continuation_horizon,
                         discount=discount,
-                        gate=gate,
                         runtime=runtime,
+                        collection_policy_logits=(
+                            None
+                            if collection_policy_logits is None
+                            else jnp.asarray(collection_policy_logits)[start:stop]
+                        ),
+                        collection_update=collection_update,
+                        collection_target_fingerprint=collection_target_fingerprint,
+                        matched_pair_ids=(
+                            None
+                            if matched_pair_ids is None
+                            else jnp.asarray(matched_pair_ids)[start:stop]
+                        ),
                     )
                 )
         combined = jax.tree_util.tree_map(
@@ -517,12 +539,7 @@ def collect_counterfactual_anchors(
         partner_observation = current.observations[
             lane_indexes, 1 - current.ego_roles
         ]
-        ego_arguments = (
-            current.ego_state,
-            ego_observation,
-            jnp.full(active.shape, float(gate), dtype=jnp.float32),
-            ego_key,
-        )
+        ego_arguments = (current.ego_state, ego_observation, ego_key)
         next_ego_pre, ego_probabilities = (
             functions.ego_policy_step(*ego_arguments)
             if runtime is None
@@ -557,6 +574,12 @@ def collect_counterfactual_anchors(
             joint,
             environment_key,
         )
+        raw_by_agent = info.get("raw_rewards_by_agent")
+        ego_rewards = (
+            rewards
+            if raw_by_agent is None
+            else raw_by_agent[lane_indexes, current.ego_roles]
+        )
         terminal = info["terminal_observations"]
         obs_mask = jnp.asarray(dones).reshape(
             jnp.asarray(dones).shape
@@ -574,7 +597,7 @@ def collect_counterfactual_anchors(
             next_ego_pre,
             ego_observation,
             ego_action,
-            rewards,
+            ego_rewards,
             dones,
             ego_next_for_history,
         )
@@ -583,7 +606,7 @@ def collect_counterfactual_anchors(
             partner_context,
             partner_observation,
             partner_action,
-            rewards,
+            ego_rewards,
             dones,
             partner_next_for_history,
         )
@@ -605,7 +628,7 @@ def collect_counterfactual_anchors(
                     jnp.asarray(discount, dtype=jnp.float32),
                     jnp.asarray(time_index, dtype=jnp.float32),
                 )
-                * jnp.where(active, rewards, 0.0),
+                * jnp.where(active, ego_rewards, 0.0),
         )
         return tree_select(active, candidate, current)
 
@@ -617,11 +640,7 @@ def collect_counterfactual_anchors(
     final = jax.lax.fori_loop(1, int(continuation_horizon), body, first)
     final_lane = jnp.arange(final.done.shape[0], dtype=jnp.int32)
     final_ego_observation = final.observations[final_lane, final.ego_roles]
-    endpoint_args = (
-        final.ego_state,
-        final_ego_observation,
-        jnp.full(final.done.shape, float(gate), dtype=jnp.float32),
-    )
+    endpoint_args = (final.ego_state, final_ego_observation)
     endpoint = (
         functions.ego_endpoint_value(*endpoint_args)
         if runtime is None
@@ -634,10 +653,33 @@ def collect_counterfactual_anchors(
         (anchor_count, action_count, replicas)
     )
     fit = jnp.mean(returns[..., :fit_replicas], axis=-1)
-    evaluation = (
-        jnp.mean(returns[..., fit_replicas:], axis=-1)
-        if evaluation_replicas
-        else jnp.full(fit.shape, jnp.nan, dtype=fit.dtype)
+    fit_returns = returns[..., :fit_replicas]
+    fit_sum = jnp.sum(fit_returns, axis=-1)
+    fit_squared_sum = jnp.sum(jnp.square(fit_returns), axis=-1)
+    logits = (
+        jnp.zeros((anchor_count, action_count), dtype=jnp.float32)
+        if collection_policy_logits is None
+        else jnp.asarray(collection_policy_logits, dtype=jnp.float32)
+    )
+    update = (
+        jnp.zeros((anchor_count,), dtype=jnp.int32)
+        if collection_update is None
+        else jnp.broadcast_to(
+            jnp.asarray(collection_update, dtype=jnp.int32), (anchor_count,)
+        )
+    )
+    fingerprint = (
+        jnp.zeros((anchor_count, 2), dtype=jnp.uint32)
+        if collection_target_fingerprint is None
+        else jnp.broadcast_to(
+            jnp.asarray(collection_target_fingerprint, dtype=jnp.uint32),
+            (anchor_count, 2),
+        )
+    )
+    pair_ids = (
+        jnp.full((anchor_count,), -1, dtype=jnp.int32)
+        if matched_pair_ids is None
+        else jnp.asarray(matched_pair_ids, dtype=jnp.int32)
     )
     return CounterfactualAnchorBatch(
         anchor_ids=anchor_ids,
@@ -647,7 +689,15 @@ def collect_counterfactual_anchors(
         partner_codes=partner_codes,
         partner_sources=partner_sources,
         fit_returns_by_action=fit,
-        evaluation_returns_by_action=evaluation,
+        return_sum_by_action=fit_sum,
+        return_squared_sum_by_action=fit_squared_sum,
+        replica_count=jnp.full(
+            (anchor_count, action_count), int(fit_replicas), dtype=jnp.int32
+        ),
+        collection_policy_logits=logits,
+        collection_update=update,
+        collection_target_fingerprint=fingerprint,
+        matched_pair_ids=pair_ids,
         partner_run_ids=partner_run_ids,
         action_mask=jnp.ones((anchor_count, action_count), dtype=jnp.bool_),
     )
@@ -660,20 +710,6 @@ def centered_fit_signature(batch: CounterfactualAnchorBatch) -> Any:
     return values - jnp.mean(values, axis=-1, keepdims=True)
 
 
-def evaluate_selected_actions(
-    batch: CounterfactualAnchorBatch,
-    selected_actions: Any,
-) -> Any:
-    import jax.numpy as jnp
-
-    actions = jnp.asarray(selected_actions, dtype=jnp.int32)
-    return jnp.take_along_axis(
-        jnp.asarray(batch.evaluation_returns_by_action),
-        actions[..., None],
-        axis=-1,
-    )[..., 0]
-
-
 __all__ = [
     "AnchorFunctions",
     "AnchorWorld",
@@ -682,7 +718,6 @@ __all__ = [
     "advance_anchor_world",
     "centered_fit_signature",
     "collect_counterfactual_anchors",
-    "evaluate_selected_actions",
     "inverse_cdf_actions",
     "tree_repeat_interleave",
     "tree_select",

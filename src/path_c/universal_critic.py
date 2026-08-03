@@ -26,16 +26,20 @@ def universal_critic_class() -> Any:
             self,
             task_features: Any,
             belief_embedding: Any,
+            shaped_belief_embedding: Any | None = None,
         ) -> tuple[Any, Any, Any]:
             task = jnp.asarray(task_features, dtype=jnp.float32)
             belief = jnp.asarray(belief_embedding, dtype=jnp.float32)
+            shaped_belief = (
+                belief
+                if shaped_belief_embedding is None
+                else jnp.asarray(shaped_belief_embedding, dtype=jnp.float32)
+            )
             if task.shape[:-1] != belief.shape[:-1]:
                 raise ValueError("Critic task and belief batch axes differ.")
-            # The shaped PPO value must not turn the legal-history belief into
-            # a shaped-return shortcut.  Raw-Q retains the live belief path.
-            shaped_joined = jnp.concatenate(
-                (task, jax.lax.stop_gradient(belief)), axis=-1
-            )
+            if shaped_belief.shape[:-1] != task.shape[:-1]:
+                raise ValueError("Shaped-value belief batch axes differ.")
+            shaped_joined = jnp.concatenate((task, shaped_belief), axis=-1)
             raw_joined = jnp.concatenate((task, belief), axis=-1)
             shaped_hidden = nn.tanh(
                 nn.Dense(

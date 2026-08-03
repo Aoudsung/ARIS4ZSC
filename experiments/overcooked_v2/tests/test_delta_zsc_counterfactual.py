@@ -12,15 +12,13 @@ from src.path_c.counterfactual_anchor import (  # noqa: E402
     AnchorWorld,
     centered_fit_signature,
     collect_counterfactual_anchors,
-    evaluate_selected_actions,
 )
 
 
-def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
-    def ego_policy_step(state, observation, gate, keys):
-        del observation, gate, keys
-        probabilities = jnp.full((state.shape[0], 3), 1.0 / 3.0)
-        return state, probabilities
+def test_v6_anchor_common_randomness_padding_and_sufficient_statistics() -> None:
+    def ego_policy_step(state, observation, keys):
+        del observation, keys
+        return state, jnp.full((state.shape[0], 3), 1.0 / 3.0)
 
     def ego_observe(state, *unused):
         return state
@@ -33,12 +31,19 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
         return state
 
     def environment_step(state, joint_action, keys):
-        noise = jax.vmap(lambda key: jax.random.uniform(key, minval=-0.2, maxval=0.2))(keys)
-        reward = joint_action[:, 0].astype(jnp.float32) + noise
+        noise = jax.vmap(
+            lambda key: jax.random.uniform(key, minval=-0.2, maxval=0.2)
+        )(keys)
+        agent0_reward = joint_action[:, 0].astype(jnp.float32) + noise
+        agent1_reward = joint_action[:, 1].astype(jnp.float32) + 10.0 + noise
         observations = jnp.zeros((state.shape[0], 2, 1), dtype=jnp.float32)
         done = jnp.ones((state.shape[0],), dtype=jnp.bool_)
-        info = {"terminal_observations": observations}
-        return state, observations, reward, done, info
+        return state, observations, agent0_reward, done, {
+            "terminal_observations": observations,
+            "raw_rewards_by_agent": jnp.stack(
+                (agent0_reward, agent1_reward), axis=-1
+            ),
+        }
 
     world = AnchorWorld(
         environment_state=jnp.zeros((2, 1)),
@@ -46,7 +51,7 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
         ego_state=jnp.zeros((2, 1)),
         partner_state=jnp.zeros((2, 1)),
         partner_episode_start=jnp.ones((2,), dtype=jnp.bool_),
-        ego_roles=jnp.zeros((2,), dtype=jnp.int32),
+        ego_roles=jnp.asarray([0, 1], dtype=jnp.int32),
         done=jnp.zeros((2,), dtype=jnp.bool_),
         raw_return=jnp.zeros((2,), dtype=jnp.float32),
     )
@@ -66,21 +71,25 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
             partner_policy_step=partner_policy_step,
             partner_observe=partner_observe,
             environment_step=environment_step,
-            ego_endpoint_value=lambda state, observation, gate: jnp.zeros(
+            ego_endpoint_value=lambda state, observation: jnp.zeros(
                 (observation.shape[0],), dtype=jnp.float32
             ),
         ),
         action_count=3,
         fit_replicas=3,
-        evaluation_replicas=2,
+        evaluation_replicas=0,
         continuation_horizon=1,
+        collection_policy_logits=jnp.asarray([[1.0, 0.0, -1.0]] * 2),
+        collection_update=jnp.asarray(16),
+        collection_target_fingerprint=jnp.asarray([11, 12], dtype=jnp.uint32),
+        matched_pair_ids=jnp.asarray([-1, 4], dtype=jnp.int32),
     )
     batch = collect_counterfactual_anchors(**kwargs)
     microbatched = collect_counterfactual_anchors(
         **kwargs,
-        # Three-world fixed executable for two real worlds exercises inactive
-        # padding without introducing a scientific root key or output row.
-        microbatch_size=3 * 3 * (3 + 2),
+        # Three-world executable for two scientific worlds exercises zero-key
+        # inactive padding without adding an output row.
+        microbatch_size=3 * 3 * 3,
     )
     for full, chunked in zip(
         jax.tree_util.tree_leaves(batch),
@@ -88,16 +97,22 @@ def test_counterfactual_anchor_pairs_randomness_and_splits_replicas() -> None:
         strict=True,
     ):
         np.testing.assert_array_equal(np.asarray(full), np.asarray(chunked))
+
     fit = np.asarray(batch.fit_returns_by_action[0])
-    evaluation = np.asarray(batch.evaluation_returns_by_action[0])
-    np.testing.assert_allclose(np.diff(fit), [1.0, 1.0], atol=1e-6)
-    np.testing.assert_allclose(np.diff(evaluation), [1.0, 1.0], atol=1e-6)
-    assert not np.allclose(fit, evaluation)
+    np.testing.assert_allclose(np.diff(fit), [1.0, 1.0], atol=1.0e-6)
+    np.testing.assert_allclose(
+        np.diff(np.asarray(batch.fit_returns_by_action[1])),
+        [1.0, 1.0],
+        atol=1.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(batch.return_sum_by_action),
+        np.asarray(batch.fit_returns_by_action) * 3.0,
+        atol=1.0e-6,
+    )
+    np.testing.assert_array_equal(np.asarray(batch.replica_count), 3)
     np.testing.assert_allclose(
         np.asarray(centered_fit_signature(batch)).mean(axis=-1), 0.0, atol=1e-6
     )
-    selected = evaluate_selected_actions(batch, jnp.asarray([2, 2]))
-    np.testing.assert_allclose(
-        np.asarray(selected),
-        np.asarray(batch.evaluation_returns_by_action)[:, 2],
-    )
+    np.testing.assert_array_equal(np.asarray(batch.collection_update), [16, 16])
+    np.testing.assert_array_equal(np.asarray(batch.matched_pair_ids), [-1, 4])

@@ -1,222 +1,82 @@
-"""Permutation-invariant encoding and sampling for Gaussian-mixture beliefs."""
+"""Deterministic summaries and reparameterized particles for a single Gaussian."""
 
 from __future__ import annotations
 
 from typing import Any
 
-_BELIEF_SET_ENCODER: Any | None = None
 
-
-def degenerate_gaussian_mixture(
-    latent: Any,
-    *,
-    mixture_components: int,
-    log_variance: float = -12.0,
-) -> tuple[Any, Any, Any]:
-    """Represent a fixed diagnostic context through the shared belief API."""
-
+def gaussian_summary(mean: Any, log_standard_deviation: Any, uncertainty: Any) -> Any:
     import jax.numpy as jnp
 
-    if mixture_components <= 0:
-        raise ValueError("mixture_components must be positive.")
-    value = jnp.asarray(latent, dtype=jnp.float32)
-    means = jnp.broadcast_to(
-        value[..., None, :],
-        value.shape[:-1] + (int(mixture_components), value.shape[-1]),
-    )
-    log_variances = jnp.full_like(means, float(log_variance))
-    logits = jnp.full(
-        value.shape[:-1] + (int(mixture_components),),
-        -1.0e9,
-        dtype=jnp.float32,
-    ).at[..., 0].set(0.0)
-    return logits, means, log_variances
+    mu = jnp.asarray(mean, dtype=jnp.float32)
+    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
+    scalar = jnp.asarray(uncertainty, dtype=jnp.float32)
+    if mu.shape != log_std.shape or scalar.shape != mu.shape[:-1]:
+        raise ValueError("Gaussian belief summary shapes are incompatible.")
+    return jnp.concatenate((mu, log_std, scalar[..., None]), axis=-1)
 
 
-def normalized_mixture_weights(mixture_logits: Any) -> Any:
-    import jax
+def prior_gaussian_summary(reference: Any, latent_dim: int) -> Any:
     import jax.numpy as jnp
 
-    logits = jnp.asarray(mixture_logits, dtype=jnp.float32)
-    return jax.nn.softmax(logits, axis=-1)
+    prefix = jnp.asarray(reference).shape[:-1]
+    zeros = jnp.zeros(prefix + (2 * int(latent_dim),), dtype=jnp.float32)
+    # With the frozen [-5, 2] log-standard-deviation range, the N(0, I)
+    # prior has normalized uncertainty (0 - (-5)) / 7.
+    uncertainty = jnp.full(prefix + (1,), 5.0 / 7.0, dtype=jnp.float32)
+    return jnp.concatenate((zeros, uncertainty), axis=-1)
 
 
-def mixture_entropy(mixture_logits: Any, probability_floor: float = 1.0e-8) -> Any:
-    import jax.numpy as jnp
-
-    weights = normalized_mixture_weights(mixture_logits)
-    return -jnp.sum(
-        weights * jnp.log(jnp.maximum(weights, float(probability_floor))), axis=-1
-    )
-
-
-def mixture_moments(
-    mixture_logits: Any,
-    means: Any,
-    log_variances: Any,
-) -> tuple[Any, Any]:
-    """Return exact first and diagonal second central moments."""
-
-    import jax.numpy as jnp
-
-    weights = normalized_mixture_weights(mixture_logits)
-    mu = jnp.asarray(means, dtype=jnp.float32)
-    log_var = jnp.asarray(log_variances, dtype=jnp.float32)
-    if mu.shape != log_var.shape or mu.shape[-2] != weights.shape[-1]:
-        raise ValueError("Gaussian-mixture parameter shapes are incompatible.")
-    mean = jnp.sum(weights[..., :, None] * mu, axis=-2)
-    second = jnp.sum(
-        weights[..., :, None] * (jnp.exp(log_var) + jnp.square(mu)), axis=-2
-    )
-    variance = jnp.maximum(second - jnp.square(mean), 0.0)
-    return mean, variance
-
-
-def stratified_mixture_samples(
+def gaussian_samples(
     key: Any,
     *,
-    mixture_logits: Any,
-    means: Any,
-    log_variances: Any,
+    mean: Any,
+    log_standard_deviation: Any,
     sample_count: int,
 ) -> tuple[Any, Any]:
-    """Reparameterized samples plus importance weights.
-
-    Samples are drawn from the learned mixture.  The returned sample weights are
-    uniform because component selection already follows the mixture weights.
-    """
-
     import jax
     import jax.numpy as jnp
 
-    if sample_count <= 0:
+    if int(sample_count) <= 0:
         raise ValueError("sample_count must be positive.")
-    logits = jnp.asarray(mixture_logits, dtype=jnp.float32)
-    mu = jnp.asarray(means, dtype=jnp.float32)
-    log_var = jnp.asarray(log_variances, dtype=jnp.float32)
-    component_key, noise_key = jax.random.split(key)
-    components = jax.random.categorical(
-        component_key,
-        logits,
-        axis=-1,
-        shape=(int(sample_count),) + logits.shape[:-1],
+    mu = jnp.asarray(mean, dtype=jnp.float32)
+    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
+    if mu.shape != log_std.shape:
+        raise ValueError("Gaussian mean and log standard deviation shapes differ.")
+    noise = jax.random.normal(
+        key, mu.shape[:-1] + (int(sample_count), mu.shape[-1]), dtype=jnp.float32
     )
-    expanded_mu = jnp.broadcast_to(mu, (int(sample_count),) + mu.shape)
-    expanded_log_var = jnp.broadcast_to(
-        log_var, (int(sample_count),) + log_var.shape
-    )
-    indexes = components[..., None, None]
-    selected_mu = jnp.take_along_axis(expanded_mu, indexes, axis=-2)[..., 0, :]
-    selected_log_var = jnp.take_along_axis(
-        expanded_log_var, indexes, axis=-2
-    )[..., 0, :]
-    noise = jax.random.normal(noise_key, selected_mu.shape, dtype=jnp.float32)
-    samples = selected_mu + jnp.exp(0.5 * selected_log_var) * noise
-    samples = jnp.moveaxis(samples, 0, -2)
-    weights = jnp.full(
-        samples.shape[:-1], 1.0 / float(sample_count), dtype=jnp.float32
-    )
+    samples = mu[..., None, :] + jnp.exp(log_std[..., None, :]) * noise
+    weights = jnp.full(samples.shape[:-1], 1.0 / float(sample_count), dtype=jnp.float32)
     return samples, weights
 
 
-def belief_set_encoder_class() -> Any:
-    global _BELIEF_SET_ENCODER
-    if _BELIEF_SET_ENCODER is not None:
-        return _BELIEF_SET_ENCODER
-
-    import flax.linen as nn
-    import jax
+def gaussian_kl_standard_normal(
+    mean: Any,
+    log_standard_deviation: Any,
+    *,
+    free_bits_per_dimension: float,
+) -> Any:
     import jax.numpy as jnp
-    from flax.linen.initializers import orthogonal, zeros
 
-    class BeliefSetEncoder(nn.Module):
-        latent_dim: int
-        hidden_dim: int
-        output_dim: int
+    mu = jnp.asarray(mean, dtype=jnp.float32)
+    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
+    per_dimension = 0.5 * (
+        jnp.square(mu) + jnp.exp(2.0 * log_std) - 1.0 - 2.0 * log_std
+    )
+    allowance = float(free_bits_per_dimension)
+    return jnp.mean(jnp.sum(jnp.maximum(per_dimension - allowance, 0.0), axis=-1))
 
-        @nn.compact
-        def __call__(
-            self,
-            mixture_logits: Any,
-            means: Any,
-            log_variances: Any,
-            support_score: Any,
-        ) -> Any:
-            weights = jax.nn.softmax(
-                jnp.asarray(mixture_logits, dtype=jnp.float32), axis=-1
-            )
-            mu = jnp.asarray(means, dtype=jnp.float32)
-            log_var = jnp.asarray(log_variances, dtype=jnp.float32)
-            if mu.shape != log_var.shape:
-                raise ValueError("Belief means and log variances must share shape.")
-            if mu.shape[-1] != self.latent_dim:
-                raise ValueError("Belief latent width differs from the encoder.")
-            component_input = jnp.concatenate(
-                (
-                    mu,
-                    log_var,
-                    jnp.exp(log_var),
-                    weights[..., :, None],
-                ),
-                axis=-1,
-            )
-            component_feature = nn.tanh(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(1.0),
-                    bias_init=zeros,
-                    name="component_projection",
-                )(component_input)
-            )
-            weighted = weights[..., :, None] * component_feature
-            first = jnp.sum(weighted, axis=-2)
-            second = jnp.sum(
-                weights[..., :, None] * jnp.square(component_feature), axis=-2
-            )
-            entropy = -jnp.sum(
-                weights * jnp.log(jnp.maximum(weights, 1.0e-8)),
-                axis=-1,
-                keepdims=True,
-            )
-            support = jnp.asarray(support_score, dtype=jnp.float32)[..., None]
-            exact_mean, exact_variance = mixture_moments(
-                mixture_logits, means, log_variances
-            )
-            summary = jnp.concatenate(
-                (
-                    first,
-                    second,
-                    exact_mean,
-                    jnp.sqrt(jnp.maximum(exact_variance, 0.0) + 1.0e-8),
-                    entropy,
-                    support,
-                ),
-                axis=-1,
-            )
-            hidden = nn.tanh(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(1.0),
-                    bias_init=zeros,
-                    name="summary_hidden",
-                )(summary)
-            )
-            return nn.Dense(
-                self.output_dim,
-                kernel_init=orthogonal(1.0),
-                bias_init=zeros,
-                name="belief_embedding",
-            )(hidden)
 
-    _BELIEF_SET_ENCODER = BeliefSetEncoder
-    return BeliefSetEncoder
+# Compatibility aliases are deliberately mathematical only; active V6 code
+# does not expose mixture components.
+stratified_gaussian_samples = gaussian_samples
 
 
 __all__ = [
-    "degenerate_gaussian_mixture",
-    "belief_set_encoder_class",
-    "mixture_entropy",
-    "mixture_moments",
-    "normalized_mixture_weights",
-    "stratified_mixture_samples",
+    "gaussian_kl_standard_normal",
+    "gaussian_samples",
+    "gaussian_summary",
+    "prior_gaussian_summary",
+    "stratified_gaussian_samples",
 ]

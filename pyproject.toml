@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aris4zsc"
-version = "0.2.0"
-description = "DELTA-ZSC V5 decision-equivalent teammate adaptation experiments"
+version = "0.3.0"
+description = "DELTA-ZSC V6 end-to-end Bayes coordination experiments"
 requires-python = ">=3.10,<3.11"
 dependencies = [
-  "numpy>=1.24",
+  "numpy>=1.24,<2",
   "pyyaml>=6.0",
   "pyarrow>=14.0",
   "jax==0.4.38",

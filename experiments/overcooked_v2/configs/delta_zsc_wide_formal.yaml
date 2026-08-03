@@ -1,4 +1,4 @@
-version: 7
+version: 9
 
 environment:
   layout: test_time_wide
@@ -13,16 +13,14 @@ model:
   task_hidden_dim: 128
   belief_hidden_dim: 128
   latent_dim: 8
-  mixture_components: 4
   posterior_particles: 16
-  belief_embedding_dim: 128
   actor_hidden_dim: 128
   critic_hidden_dim: 128
   response_hidden_dim: 128
   modulation_rank: 8
   action_embedding_dim: 16
-  log_variance_minimum: -5.0
-  log_variance_maximum: 2.0
+  log_standard_deviation_minimum: -5.0
+  log_standard_deviation_maximum: 2.0
 
 ppo:
   update_epochs: 4
@@ -34,7 +32,6 @@ ppo:
   value_clip_epsilon: 0.2
   entropy_weight: 0.01
   value_weight: 0.5
-  max_approx_kl: 0.03
   normalize_advantages: true
   polyak_coefficient: 0.005
   lr_warmup_fraction: 0.05
@@ -44,35 +41,36 @@ ppo:
 loss:
   response_weight: 1.0
   raw_q_weight: 1.0
+  counterfactual_weight: 1.0
+  decision_equivalence_weight: 0.1
   q_policy_weight: 0.25
   q_policy_temperature: 1.0
+  q_policy_gap_midpoint: 1.0
+  q_policy_gap_temperature: 1.0
+  q_policy_disagreement_temperature: 5.0
   information_bottleneck_weight: 0.001
-  information_bottleneck_free_bits: 1.0
+  information_bottleneck_free_bits_per_dimension: 0.1
+  robust_generalist_weight: 0.1
+  policy_belief_gradient_scale: 0.1
+  belief_gradient_ema_decay: 0.99
   decision_regret_weight_maximum: 0.1
-  conditional_entropy_weight: 0.01
-  conditional_kl_weight: 1.0
-  residual_norm_weight: 1.0
+  decision_regret_schedule_midpoint: 0.2
+  decision_regret_schedule_temperature: 0.05
   response_updates_per_outer_update: 2
   raw_q_updates_per_outer_update: 4
 
 anchors:
   interval_updates: 16
-  pilot_ordinary_candidates: 128
-  pilot_matched_code_candidates: 64
-  pilot_replicas: 2
-  selected_ordinary: 24
-  selected_matched_code: 24
-  fit_replicas: 8
+  ordinary_states: 32
+  matched_code_pairs: 16
+  fit_replicas: 4
   continuation_horizon: 128
   probe_steps: 16
-  replay_capacity_per_epoch: 512
-  audit_milestones: [C0, 15M, 22.5M, final]
-  audit_ordinary_states: 32
-  audit_matched_code_states: 32
-  audit_fit_replicas: 32
-  audit_evaluation_replicas: 64
-  audit_continuation_horizon: 400
-  audit_uniform_fraction: 0.25
+  replay_capacity: 512
+  replay_minibatch_size: 64
+  policy_kl_decay: 0.05
+  age_decay_updates: 64.0
+  minimum_replay_weight: 0.001
   return_lower_bound: -400.0
   return_upper_bound: 400.0
 
@@ -80,42 +78,38 @@ partner_generator:
   code_dim: 8
   hidden_dim: 128
   modulation_rank: 8
-  initial_current_probability: 0.0
-  initial_snapshot_probability: 0.0
-  initial_frozen_external_probability: 1.0
   episodes_per_update: 32
   episode_steps: 400
   update_epochs: 4
   environment_minibatches: 8
-  snapshot_interval: 32
   cvar_level: 0.20
-  source_distillation_kl_maximum: 0.05
-  trust_region_kl_maximum: 0.03
-  interpolation_uniform_kl_minimum: 0.01
-  delivery_noninferiority_margin: 20.0
-  brdiv_weight: 1.0
+  target_polyak_coefficient: 0.005
+  maximum_generator_probability: 0.75
+  mixture_ramp_fraction: 0.30
+  competence_temperature: 20.0
+  cvar_ema_decay: 0.95
+  imitation_initial_weight: 1.0
+  brdiv_maximum_weight: 1.0
   smoothness_weight: 0.05
   lagrangian_learning_rate: 0.01
+  competence_multiplier_maximum: 10.0
   kernel_bandwidth: 20.0
   kernel_jitter: 0.0001
   codes_per_update: 32
 
 calibration:
+  enabled: false
   alpha: 0.05
   support_quantile: 0.05
   minimum_run_count: 19
   block_unit: partner_run
-  enable_hard_gate_at_evaluation: true
   episodes_per_run: 128
   anchors_per_run: 64
-  always_on_ablation: false
 
 training:
   rollout_length: 256
-  base_policy_lane_probability: 0.25
-  conditional_policy_lane_probability: 0.75
-  target_policy_epoch_updates: 16
-  base_qualification_deadline_steps: 15000000
+  context_dropout_initial: 0.30
+  context_dropout_final: 0.10
   owner_sources_per_seed: 1
   generator_init_sources_per_mechanism: 1
   development_runs_per_mechanism: 4
@@ -125,7 +119,6 @@ evaluation:
   episodes_per_pairing: 500
   bootstrap_replicates: 9999
   evaluation_seed: 0
-  enable_adaptation: true
   report_br_prox: true
   br_prox_anchors_per_pairing: 8
   br_prox_fit_replicas: 8

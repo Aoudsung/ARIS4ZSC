@@ -1,4 +1,4 @@
-numpy>=1.24
+numpy>=1.24,<2
 pytest>=8
 pyyaml>=6.0
 pyarrow>=14.0
@@ -6,6 +6,7 @@ jax==0.4.38
 jaxlib==0.4.38
 jaxmarl @ git+https://github.com/overcookedv2/experiments.git@5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e#subdirectory=JaxMARL
 overcooked_v2_experiments @ git+https://github.com/overcookedv2/experiments.git@5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e#subdirectory=experiments
+overcooked-ai==1.1.0
 chex>=0.1.86
 flax==0.10.3
 optax==0.2.5

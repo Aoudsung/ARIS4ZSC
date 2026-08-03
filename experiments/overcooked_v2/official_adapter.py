@@ -1165,7 +1165,7 @@ class FrozenPartnerPool:
         carry: Any,
         episode_start: Any,
     ) -> tuple[Any, Any, Any]:
-        """Return the exact Official recurrent logits for r3 distillation.
+        """Return the exact Official recurrent logits for V6 initialization.
 
         This is a training-only observation/carry surface.  It neither samples
         an action nor exposes a partner identifier to the deployable policy.

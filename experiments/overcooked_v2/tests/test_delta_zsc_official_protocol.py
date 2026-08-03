@@ -23,11 +23,6 @@ from experiments.overcooked_v2.official_adapter import (  # noqa: E402
     validate_official_runtime,
 )
 from experiments.overcooked_v2.official_baseline_app import _official_command  # noqa: E402
-from experiments.overcooked_v2.mechanical_e2e_app import (  # noqa: E402
-    generator_update_executed,
-    mechanical_fixture_key,
-    mechanical_upstream_seed_slot,
-)
 from src.path_c.experiment import (  # noqa: E402
     OFFICIAL_CORRECT_DELIVERY_REWARD,
     OFFICIAL_OP_TOTAL_TIMESTEPS,
@@ -37,11 +32,11 @@ from src.path_c.experiment import (  # noqa: E402
     official_training_key,
 )
 from src.path_c.runner import official_ego_roles  # noqa: E402
-from src.path_c.resources import (  # noqa: E402
-    r3_audit_anchor_attempted_steps,
-    r3_training_anchor_attempted_steps,
-)
+from src.path_c.anchor_sampling import anchor_budget_for_updates  # noqa: E402
+from src.path_c.resources import v6_anchor_attempted_steps  # noqa: E402
 from src.path_c.training import (  # noqa: E402
+    clipped_value_loss,
+    generalized_advantage_estimation,
     official_learning_rate_schedule,
     official_reward_shaping_factor,
 )
@@ -105,30 +100,21 @@ def test_formal_budget_is_exact_whole_official_updates() -> None:
     assert config.training.environment_steps // steps_per_update == 457
     assert config.training.environment_steps == 29_949_952
     assert config.evaluation.one_sided_alpha == 0.05
-    trigger_count = 1 + (457 - 1) // config.anchors.interval_updates
-    assert trigger_count == 29
-    assert r3_training_anchor_attempted_steps(
-        trigger_count=trigger_count,
-        ordinary_candidates=config.anchors.pilot_ordinary_candidates,
-        matched_code_candidates=config.anchors.pilot_matched_code_candidates,
-        selected_ordinary=config.anchors.selected_ordinary,
-        selected_matched_code=config.anchors.selected_matched_code,
+    budget = anchor_budget_for_updates(457, config.anchors.interval_updates)
+    assert budget == {
+        "triggers": 29,
+        "counterfactual_continuation_steps": 5_701_632,
+        "matched_code_probe_steps": 14_848,
+    }
+    assert v6_anchor_attempted_steps(
+        trigger_count=29,
+        ordinary_states=config.anchors.ordinary_states,
+        matched_code_pairs=config.anchors.matched_code_pairs,
         action_count=6,
-        pilot_replicas=config.anchors.pilot_replicas,
         fit_replicas=config.anchors.fit_replicas,
         continuation_horizon=config.anchors.continuation_horizon,
         probe_steps=config.anchors.probe_steps,
-    ) == 24_291_328
-    assert r3_audit_anchor_attempted_steps(
-        milestone_count=4,
-        ordinary_states=config.anchors.audit_ordinary_states,
-        matched_code_pairs=config.anchors.audit_matched_code_states,
-        action_count=6,
-        fit_replicas=config.anchors.audit_fit_replicas,
-        evaluation_replicas=config.anchors.audit_evaluation_replicas,
-        continuation_horizon=config.anchors.audit_continuation_horizon,
-        probe_steps=config.anchors.probe_steps,
-    ) == 88_477_696
+    ) == (5_701_632, 14_848)
 
 
 @pytest.mark.parametrize(
@@ -205,13 +191,16 @@ def test_mechanical_config_exercises_every_delta_auxiliary_stage() -> None:
         // config.training.rollout_length
     )
     assert updates == 16
-    assert updates // config.anchors.interval_updates == 8
-    assert updates // config.partner_generator.update_interval == 16
-    assert updates // config.partner_generator.snapshot_interval == 4
+    assert config.anchors.interval_updates == 2
+    assert anchor_budget_for_updates(updates, config.anchors.interval_updates)[
+        "triggers"
+    ] == 8
     assert config.anchors.fit_replicas > 0
-    assert config.anchors.evaluation_replicas > 0
+    assert config.anchors.replay_minibatch_size == 4
+    assert config.partner_generator.episodes_per_update == 4
+    assert config.partner_generator.update_epochs == 1
     assert config.calibration.minimum_run_count == 2
-    assert config.calibration.enable_hard_gate_at_evaluation
+    assert not config.calibration.enabled
     assert config.evaluation.report_br_prox
     assert config.evaluation.episodes_per_pairing == 2
 
@@ -222,28 +211,6 @@ def test_training_keys_are_exact_split_of_prngkey_42() -> None:
     np.testing.assert_array_equal(observed, expected)
 
 
-def test_mechanical_fixture_keys_are_deterministic_fresh_and_disjoint() -> None:
-    labels = ("calibration_a", "calibration_b", "confirmatory_a", "confirmatory_b")
-    first = [mechanical_fixture_key(label) for label in labels]
-    second = [mechanical_fixture_key(label) for label in labels]
-    assert first == second
-    keys = [key for unused_seed, key in first]
-    assert len(set(keys)) == len(keys)
-    formal = {tuple(official_training_key(index)) for index in range(10)}
-    assert not formal.intersection(keys)
-
-
-def test_mechanical_upstream_fixtures_stay_inside_official_seed_slots() -> None:
-    assert [mechanical_upstream_seed_slot(index) for index in range(7, 11)] == [
-        7,
-        8,
-        9,
-        0,
-    ]
-    with pytest.raises(ValueError, match="non-negative"):
-        mechanical_upstream_seed_slot(-1)
-
-
 def test_official_scalar_metrics_receive_a_lossless_row_axis() -> None:
     scalar = np.asarray(_metric_with_row_axis(np.asarray(3.5)))
     vector = np.asarray([1.0, 2.0])
@@ -251,6 +218,29 @@ def test_official_scalar_metrics_receive_a_lossless_row_axis() -> None:
     assert scalar.shape == (1,)
     assert scalar[0] == pytest.approx(3.5)
     assert observed_vector is vector
+
+
+def test_v6_ppo_targets_match_official_behavior_value_gae_and_value_clip() -> None:
+    rewards = jnp.asarray([[1.0], [2.0]], dtype=jnp.float32)
+    dones = jnp.asarray([[False], [True]])
+    behavior_values = jnp.asarray([[0.5], [1.0], [9.0]], dtype=jnp.float32)
+    advantages, targets = generalized_advantage_estimation(
+        rewards=rewards,
+        dones=dones,
+        values=behavior_values,
+        gamma=0.9,
+        gae_lambda=0.8,
+    )
+    np.testing.assert_allclose(np.asarray(advantages[:, 0]), [2.12, 1.0], atol=1e-6)
+    np.testing.assert_allclose(np.asarray(targets[:, 0]), [2.62, 2.0], atol=1e-6)
+    observed = clipped_value_loss(
+        predictions=jnp.asarray([[0.7], [0.5]], dtype=jnp.float32),
+        old_predictions=behavior_values[:-1],
+        targets=targets,
+        clip_epsilon=0.2,
+    )
+    expected = 0.5 * ((2.62 - 0.7) ** 2 + (2.0 - 0.5) ** 2) / 2.0
+    assert float(observed) == pytest.approx(expected, abs=1e-6)
 
 
 def test_official_learning_rate_schedule_matches_registered_optax_composition() -> None:
@@ -308,23 +298,6 @@ def test_official_shaping_schedule_and_role_mask() -> None:
     roles = np.asarray(official_ego_roles(256))
     np.testing.assert_array_equal(roles[:128], np.zeros(128, dtype=np.int32))
     np.testing.assert_array_equal(roles[128:], np.ones(128, dtype=np.int32))
-
-
-def test_generator_update_telemetry_distinguishes_update_from_skip() -> None:
-    assert not generator_update_executed({"generator_update_skipped": 1.0})
-    assert generator_update_executed({"generator_update_skipped": 0.0})
-    assert generator_update_executed(
-        {
-            "generator_total_loss": 1.0,
-            "generator_active_lanes": 2.0,
-        }
-    )
-    assert not generator_update_executed(
-        {
-            "generator_total_loss": 1.0,
-            "generator_active_lanes": 0.0,
-        }
-    )
 
 
 def test_ippo_large_changes_only_the_registered_capacity_fields() -> None:

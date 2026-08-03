@@ -7,6 +7,7 @@ import pytest
 
 from experiments.overcooked_v2.deployment import (
     DEPLOYABLE_PARAM_NAMES,
+    PRIMARY_ARTIFACT_NAME,
     deployable_parameters,
 )
 from src.path_c.storage import (
@@ -48,6 +49,7 @@ def test_run_identity_is_immutable(tmp_path: Path) -> None:
 
 
 def test_deployment_parameter_whitelist_excludes_training_only_subtrees() -> None:
+    assert PRIMARY_ARTIFACT_NAME == "DELTA-ZSC-E2E"
     params = {
         name: {"weight": np.asarray([index], dtype=np.float32)}
         for index, name in enumerate(DEPLOYABLE_PARAM_NAMES)

@@ -1,21 +1,10 @@
-"""Unified fixed-capacity DELTA-ZSC model.
-
-There is exactly one task encoder, one continuous belief encoder, one actor, one
-critic, and one response decoder.  Privileged oracle contexts are supplied only
-to explicit diagnostic methods; the trainable model has no teacher encoder.
-"""
+"""Single-path DELTA-ZSC V6 deployable model."""
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-from .types import (
-    ContextOutput,
-    GaussianMixtureBelief,
-    ModelOutput,
-    PolicyState,
-    ResponsePrediction,
-)
+from .types import ContextOutput, GaussianBelief, ModelOutput, PolicyState, ResponsePrediction
 
 _MODEL_CLASS: Any | None = None
 
@@ -30,19 +19,14 @@ def _model_class() -> Any:
     import jax.numpy as jnp
 
     from .belief_encoder import belief_encoder_classes
-    from .belief_set_encoder import (
-        belief_set_encoder_class,
-        degenerate_gaussian_mixture,
-    )
+    from .belief_set_encoder import gaussian_summary, prior_gaussian_summary
     from .response_decoder import response_decoder_class
     from .task_encoder import task_encoder_classes
     from .universal_actor import universal_actor_class
     from .universal_critic import universal_critic_class
 
-    TaskCell, unused_task_scan = task_encoder_classes()
-    BeliefCell, unused_belief_scan = belief_encoder_classes()
-    del unused_task_scan, unused_belief_scan
-    BeliefSet = belief_set_encoder_class()
+    TaskCell, _ = task_encoder_classes()
+    BeliefCell, _ = belief_encoder_classes()
     Actor = universal_actor_class()
     Critic = universal_critic_class()
     Decoder = response_decoder_class()
@@ -53,15 +37,13 @@ def _model_class() -> Any:
         task_hidden_dim: int
         belief_hidden_dim: int
         latent_dim: int
-        mixture_components: int
-        belief_embedding_dim: int
         actor_hidden_dim: int
         critic_hidden_dim: int
         response_hidden_dim: int
         modulation_rank: int
         action_embedding_dim: int
-        log_variance_minimum: float
-        log_variance_maximum: float
+        log_standard_deviation_minimum: float
+        log_standard_deviation_maximum: float
 
         def setup(self) -> None:
             self.task_cell = TaskCell(
@@ -73,18 +55,11 @@ def _model_class() -> Any:
             self.belief_cell = BeliefCell(
                 hidden_dim=self.belief_hidden_dim,
                 latent_dim=self.latent_dim,
-                mixture_components=self.mixture_components,
                 action_count=self.action_count,
                 action_embedding_dim=self.action_embedding_dim,
-                log_variance_minimum=self.log_variance_minimum,
-                log_variance_maximum=self.log_variance_maximum,
+                log_standard_deviation_minimum=self.log_standard_deviation_minimum,
+                log_standard_deviation_maximum=self.log_standard_deviation_maximum,
                 name="belief_encoder",
-            )
-            self.belief_set = BeliefSet(
-                latent_dim=self.latent_dim,
-                hidden_dim=self.belief_hidden_dim,
-                output_dim=self.belief_embedding_dim,
-                name="belief_set_encoder",
             )
             self.actor = Actor(
                 action_count=self.action_count,
@@ -105,58 +80,12 @@ def _model_class() -> Any:
                 name="response_decoder",
             )
 
-        def _outputs_from_context(
-            self,
-            *,
-            context: ContextOutput,
-            gate: Any,
-        ) -> ModelOutput:
-            belief_embedding = self.belief_set(
-                context.mixture_logits,
-                context.mixture_means,
-                context.mixture_log_variances,
-                context.support_score,
-            )
-            # Actor gradients are deliberately blocked at the belief interface.
-            actor_belief = jax.lax.stop_gradient(belief_embedding)
-            base_logits, residual_logits, execution_logits = self.actor(
-                context.task_features, actor_belief, gate
-            )
-            state_value, raw_q1, raw_q2 = self.critic(
-                context.task_features, belief_embedding
-            )
-            action_values = jnp.minimum(raw_q1, raw_q2)
-            prefix = context.task_features.shape[:-1]
-            return ModelOutput(
-                task_features=context.task_features,
-                belief_embedding=belief_embedding,
-                mixture_logits=context.mixture_logits,
-                mixture_means=context.mixture_means,
-                mixture_log_variances=context.mixture_log_variances,
-                support_score=context.support_score,
-                base_logits=base_logits,
-                residual_logits=residual_logits,
-                gate=jnp.broadcast_to(jnp.asarray(gate), prefix),
-                execution_logits=execution_logits,
-                state_value=state_value,
-                raw_q1=raw_q1,
-                raw_q2=raw_q2,
-                action_values=action_values,
-            )
-
         def _context_step(
-            self,
-            state: PolicyState,
-            observation: Any,
+            self, state: PolicyState, observation: Any
         ) -> tuple[PolicyState, ContextOutput]:
             next_task_carry, task_features = self.task_cell(
                 state.task_carry,
-                (
-                    observation,
-                    state.previous_action,
-                    jnp.zeros_like(state.previous_reward),
-                    state.episode_start,
-                ),
+                (observation, state.previous_action, state.episode_start),
             )
             next_belief_carry, belief_values = self.belief_cell(
                 state.belief.recurrent_carry,
@@ -164,310 +93,181 @@ def _model_class() -> Any:
                     state.previous_observation,
                     observation,
                     state.previous_action,
-                    jnp.zeros_like(state.previous_reward),
                     state.episode_start,
                 ),
             )
-            mixture_logits, means, log_variances, support_score = belief_values
-            context = ContextOutput(
-                task_features=task_features,
-                mixture_logits=mixture_logits,
-                mixture_means=means,
-                mixture_log_variances=log_variances,
-                support_score=support_score,
-            )
+            mean, log_std, uncertainty = belief_values
+            context = ContextOutput(task_features, mean, log_std, uncertainty)
             next_state = PolicyState(
                 task_carry=next_task_carry,
-                belief=GaussianMixtureBelief(
-                    recurrent_carry=next_belief_carry,
-                    mixture_logits=mixture_logits,
-                    means=means,
-                    log_variances=log_variances,
-                    support_score=support_score,
-                ),
-                # Official OvercookedV2 observations are integer tensors, while
-                # the recurrent history carry is initialized as float32.  Keep
-                # the carry dtype invariant across `lax.scan`; the belief and
-                # task encoders both consume observations in float32.
+                belief=GaussianBelief(next_belief_carry, mean, log_std, uncertainty),
                 previous_observation=jnp.asarray(
                     observation, dtype=state.previous_observation.dtype
                 ),
                 previous_action=state.previous_action,
-                previous_reward=state.previous_reward,
                 episode_start=state.episode_start,
             )
             return next_state, context
+
+        def _outputs_from_context(
+            self, *, context: ContextOutput, context_dropout_mask: Any
+        ) -> ModelOutput:
+            full_summary = gaussian_summary(
+                context.belief_mean,
+                context.belief_log_standard_deviation,
+                context.normalized_uncertainty,
+            )
+            prior_summary = prior_gaussian_summary(full_summary, self.latent_dim)
+            drop = jnp.asarray(context_dropout_mask, dtype=jnp.bool_)
+            if drop.shape != context.task_features.shape[:-1]:
+                drop = jnp.broadcast_to(drop, context.task_features.shape[:-1])
+            behavior_summary = jnp.where(drop[..., None], prior_summary, full_summary)
+            logits = self.actor(context.task_features, behavior_summary)
+            state_value, raw_q1, raw_q2 = self.critic(
+                context.task_features,
+                context.belief_mean,
+                behavior_summary,
+            )
+            return ModelOutput(
+                task_features=context.task_features,
+                belief_summary=full_summary,
+                belief_mean=context.belief_mean,
+                belief_log_standard_deviation=context.belief_log_standard_deviation,
+                normalized_uncertainty=context.normalized_uncertainty,
+                policy_logits=logits,
+                state_value=state_value,
+                raw_q1=raw_q1,
+                raw_q2=raw_q2,
+                action_values=jnp.minimum(raw_q1, raw_q2),
+            )
 
         def step(
             self,
             state: PolicyState,
             observation: Any,
-            gate_override: Any,
+            context_dropout_mask: Any = False,
         ) -> tuple[PolicyState, ModelOutput]:
             next_state, context = self._context_step(state, observation)
-            output = self._outputs_from_context(
-                context=context,
-                gate=jnp.asarray(gate_override, dtype=jnp.float32),
+            return next_state, self._outputs_from_context(
+                context=context, context_dropout_mask=context_dropout_mask
             )
-            return next_state, output
 
         def context_sequence(
             self,
             initial_state: PolicyState,
             observations: Any,
             previous_actions: Any,
-            previous_rewards: Any,
             episode_starts: Any,
         ) -> tuple[PolicyState, ContextOutput]:
-            """Replay legal history without evaluating actor, critic, or decoder."""
-
             obs = jnp.asarray(observations)
             actions = jnp.asarray(previous_actions, dtype=jnp.int32)
-            rewards = jnp.asarray(previous_rewards, dtype=jnp.float32)
             starts = jnp.asarray(episode_starts, dtype=jnp.bool_)
-            if not (
-                obs.shape[0]
-                == actions.shape[0]
-                == rewards.shape[0]
-                == starts.shape[0]
-            ):
+            if not (obs.shape[0] == actions.shape[0] == starts.shape[0]):
                 raise ValueError("Context sequence time axes differ.")
 
-            def one(
-                current: PolicyState,
-                values: tuple[Any, Any, Any, Any],
-            ) -> tuple[PolicyState, ContextOutput]:
-                observation, action, reward, start = values
-                current = current._replace(
-                    previous_action=action,
-                    previous_reward=reward,
-                    episode_start=start,
-                )
+            def one(current: PolicyState, values: tuple[Any, Any, Any]):
+                observation, action, start = values
+                current = current._replace(previous_action=action, episode_start=start)
                 return self._context_step(current, observation)
 
-            return jax.lax.scan(
-                one,
-                initial_state,
-                (obs, actions, rewards, starts),
-            )
+            return jax.lax.scan(one, initial_state, (obs, actions, starts))
 
         def sequence(
             self,
             initial_state: PolicyState,
             observations: Any,
             previous_actions: Any,
-            previous_rewards: Any,
             episode_starts: Any,
-            gate_overrides: Any,
+            context_dropout_masks: Any,
         ) -> tuple[PolicyState, ModelOutput]:
-            """Run a legal-history sequence with explicit recurrent inputs."""
-
             obs = jnp.asarray(observations)
             actions = jnp.asarray(previous_actions, dtype=jnp.int32)
-            rewards = jnp.asarray(previous_rewards, dtype=jnp.float32)
             starts = jnp.asarray(episode_starts, dtype=jnp.bool_)
-            gates = jnp.asarray(gate_overrides, dtype=jnp.float32)
+            drops = jnp.asarray(context_dropout_masks, dtype=jnp.bool_)
             if not (
-                obs.shape[0]
-                == actions.shape[0]
-                == rewards.shape[0]
-                == starts.shape[0]
-                == gates.shape[0]
+                obs.shape[0] == actions.shape[0] == starts.shape[0] == drops.shape[0]
             ):
                 raise ValueError("Sequence time axes differ.")
 
-            def one(
-                current: PolicyState,
-                values: tuple[Any, Any, Any, Any, Any],
-            ) -> tuple[PolicyState, ModelOutput]:
-                observation, action, reward, start, gate = values
-                current = current._replace(
-                    previous_action=action,
-                    previous_reward=reward,
-                    episode_start=start,
-                )
-                next_state, output = self.step(current, observation, gate)
-                return next_state, output
+            def one(current: PolicyState, values: tuple[Any, Any, Any, Any]):
+                observation, action, start, drop = values
+                current = current._replace(previous_action=action, episode_start=start)
+                return self.step(current, observation, drop)
 
-            return jax.lax.scan(
-                one,
-                initial_state,
-                (obs, actions, rewards, starts, gates),
-            )
+            return jax.lax.scan(one, initial_state, (obs, actions, starts, drops))
 
         def response_from_context_and_action(
-            self,
-            task_features: Any,
-            belief_embedding: Any,
-            actions: Any,
+            self, task_features: Any, belief_summary: Any, actions: Any
         ) -> ResponsePrediction:
-            """Predict only the observed action branch used by the response loss."""
-
             prefix = task_features.shape[:-1]
             action = jnp.asarray(actions, dtype=jnp.int32)
             if action.shape != prefix:
                 raise ValueError("Selected response actions do not match context axes.")
-            (
-                visibility_logit,
-                relative_position_logits,
-                direction_logits,
-                inventory_logits,
-                interaction_change_logit,
-                diagnostic_reward_mean,
-                done_logit,
-            ) = self.decoder(
-                jax.lax.stop_gradient(task_features),
-                belief_embedding,
-                action,
+            values = self.decoder(
+                jax.lax.stop_gradient(task_features), belief_summary, action
             )
-            return ResponsePrediction(
-                visibility_logit=visibility_logit,
-                relative_position_logits=relative_position_logits,
-                direction_logits=direction_logits,
-                inventory_logits=inventory_logits,
-                interaction_change_logit=interaction_change_logit,
-                diagnostic_reward_mean=diagnostic_reward_mean,
-                done_logit=done_logit,
-            )
+            return ResponsePrediction(*values)
 
         def response_sequence(
             self,
             initial_state: PolicyState,
             observations: Any,
             previous_actions: Any,
-            previous_rewards: Any,
             episode_starts: Any,
             executed_actions: Any,
         ) -> tuple[PolicyState, ResponsePrediction]:
-            """Replay legal history and evaluate only the structured decoder."""
-
             final_state, context = self.context_sequence(
-                initial_state,
-                observations,
-                previous_actions,
-                previous_rewards,
-                episode_starts,
+                initial_state, observations, previous_actions, episode_starts
             )
-            belief_embedding = self.belief_set(
-                context.mixture_logits,
-                context.mixture_means,
-                context.mixture_log_variances,
-                context.support_score,
+            summary = gaussian_summary(
+                context.belief_mean,
+                context.belief_log_standard_deviation,
+                context.normalized_uncertainty,
             )
             prediction = self.response_from_context_and_action(
-                context.task_features[:-1],
-                belief_embedding[:-1],
-                executed_actions,
+                context.task_features[:-1], summary[:-1], executed_actions
             )
             return final_state, prediction
 
-        def diagnostic_response_sequence(
-            self,
-            initial_state: PolicyState,
-            observations: Any,
-            previous_actions: Any,
-            previous_rewards: Any,
-            episode_starts: Any,
-            executed_actions: Any,
-        ) -> tuple[PolicyState, ResponsePrediction]:
-            """Diagnostic reward/done heads with no task/belief gradient."""
-
-            final_state, context = self.context_sequence(
-                initial_state,
-                observations,
-                previous_actions,
-                previous_rewards,
-                episode_starts,
-            )
-            belief_embedding = self.belief_set(
-                context.mixture_logits,
-                context.mixture_means,
-                context.mixture_log_variances,
-                context.support_score,
-            )
-            prediction = self.response_from_context_and_action(
-                jax.lax.stop_gradient(context.task_features[:-1]),
-                jax.lax.stop_gradient(belief_embedding[:-1]),
-                executed_actions,
-            )
-            return final_state, prediction
-
-        def _belief_embedding_from_latent(
-            self,
-            task_features: Any,
-            latent: Any,
+        def policy_logits_from_features_and_summary(
+            self, task_features: Any, belief_summary: Any
         ) -> Any:
-            logits, means, log_variances = degenerate_gaussian_mixture(
-                latent, mixture_components=self.mixture_components
-            )
-            support = jnp.ones(task_features.shape[:-1], dtype=jnp.float32)
-            return self.belief_set(logits, means, log_variances, support)
-
-        def action_values_from_features_and_latent(
-            self,
-            task_features: Any,
-            latent: Any,
-        ) -> Any:
-            """Evaluate the frozen full-information critic and nothing else."""
-
-            belief_embedding = self._belief_embedding_from_latent(
-                task_features, latent
-            )
-            unused_value, raw_q1, raw_q2 = self.critic(
-                task_features, belief_embedding
-            )
-            del unused_value
-            return jnp.minimum(raw_q1, raw_q2)
+            return self.actor(task_features, belief_summary)
 
         def twin_action_values_from_features_and_latent(
-            self,
-            task_features: Any,
-            latent: Any,
+            self, task_features: Any, latent: Any
         ) -> tuple[Any, Any]:
-            """Return both numerical raw-Q heads for calibrated training/audit."""
-
-            belief_embedding = self._belief_embedding_from_latent(task_features, latent)
-            unused_value, raw_q1, raw_q2 = self.critic(task_features, belief_embedding)
-            del unused_value
+            value = jnp.asarray(latent, dtype=jnp.float32)
+            # Shaped value is not consumed on the particle path.  A correctly
+            # shaped deterministic summary keeps parameter reuse explicit.
+            shaped_summary = jnp.concatenate(
+                (value, jnp.zeros_like(value), jnp.zeros(value.shape[:-1] + (1,))),
+                axis=-1,
+            )
+            _, raw_q1, raw_q2 = self.critic(task_features, value, shaped_summary)
             return raw_q1, raw_q2
 
-        def from_features_and_latent(
-            self,
-            task_features: Any,
-            latent: Any,
-            gate: Any = 1.0,
-        ) -> ModelOutput:
-            mixture_logits, means, log_variances = degenerate_gaussian_mixture(
-                latent, mixture_components=self.mixture_components
+        def action_values_from_features_and_latent(
+            self, task_features: Any, latent: Any
+        ) -> Any:
+            raw_q1, raw_q2 = self.twin_action_values_from_features_and_latent(
+                task_features, latent
             )
-            context = ContextOutput(
-                task_features=task_features,
-                mixture_logits=mixture_logits,
-                mixture_means=means,
-                mixture_log_variances=log_variances,
-                support_score=jnp.ones(latent.shape[:-1], dtype=jnp.float32),
-            )
-            return self._outputs_from_context(context=context, gate=gate)
+            return jnp.minimum(raw_q1, raw_q2)
 
         def initialize_all(
-            self,
-            state: PolicyState,
-            observation: Any,
-            partner_code: Any,
+            self, state: PolicyState, observation: Any, partner_code: Any
         ) -> tuple[Any, ...]:
-            """Initialize every trainable subtree in one consistent Flax call."""
-
-            batch_shape = state.previous_action.shape
+            del partner_code
             next_state, output = self.step(
                 state,
                 observation,
-                jnp.ones(batch_shape, dtype=jnp.float32),
+                jnp.zeros(state.previous_action.shape, dtype=jnp.bool_),
             )
-            del partner_code
             response = self.response_from_context_and_action(
                 output.task_features,
-                output.belief_embedding,
-                jnp.zeros(batch_shape, dtype=jnp.int32),
+                output.belief_summary,
+                jnp.zeros(state.previous_action.shape, dtype=jnp.int32),
             )
             return next_state, output, response
 
@@ -476,17 +276,15 @@ def _model_class() -> Any:
             initial_state: PolicyState,
             observations: Any,
             previous_actions: Any,
-            previous_rewards: Any,
             episode_starts: Any,
-            gate_overrides: Any,
+            context_dropout_masks: Any,
         ) -> tuple[PolicyState, ModelOutput]:
             return self.sequence(
                 initial_state,
                 observations,
                 previous_actions,
-                previous_rewards,
                 episode_starts,
-                gate_overrides,
+                context_dropout_masks,
             )
 
     _MODEL_CLASS = DELTAZSCModel
@@ -500,15 +298,13 @@ def build_model(
     task_hidden_dim: int,
     belief_hidden_dim: int,
     latent_dim: int,
-    mixture_components: int,
-    belief_embedding_dim: int,
     actor_hidden_dim: int,
     critic_hidden_dim: int,
     response_hidden_dim: int,
     modulation_rank: int,
     action_embedding_dim: int,
-    log_variance_minimum: float,
-    log_variance_maximum: float,
+    log_standard_deviation_minimum: float,
+    log_standard_deviation_maximum: float,
 ) -> Any:
     return _model_class()(
         observation_shape=tuple(int(value) for value in observation_shape),
@@ -516,15 +312,13 @@ def build_model(
         task_hidden_dim=int(task_hidden_dim),
         belief_hidden_dim=int(belief_hidden_dim),
         latent_dim=int(latent_dim),
-        mixture_components=int(mixture_components),
-        belief_embedding_dim=int(belief_embedding_dim),
         actor_hidden_dim=int(actor_hidden_dim),
         critic_hidden_dim=int(critic_hidden_dim),
         response_hidden_dim=int(response_hidden_dim),
         modulation_rank=int(modulation_rank),
         action_embedding_dim=int(action_embedding_dim),
-        log_variance_minimum=float(log_variance_minimum),
-        log_variance_maximum=float(log_variance_maximum),
+        log_standard_deviation_minimum=float(log_standard_deviation_minimum),
+        log_standard_deviation_maximum=float(log_standard_deviation_maximum),
     )
 
 
@@ -536,7 +330,6 @@ def initial_policy_state(
     task_hidden_dim: int,
     belief_hidden_dim: int,
     latent_dim: int,
-    mixture_components: int,
 ) -> PolicyState:
     import jax.numpy as jnp
 
@@ -544,23 +337,20 @@ def initial_policy_state(
     from .task_encoder import initial_task_carry
 
     count = int(batch_size)
-    mixture_logits = jnp.zeros((count, mixture_components), dtype=jnp.float32)
-    means = jnp.zeros((count, mixture_components, latent_dim), dtype=jnp.float32)
-    log_variances = jnp.zeros_like(means)
     return PolicyState(
         task_carry=initial_task_carry(count, task_hidden_dim),
-        belief=GaussianMixtureBelief(
+        belief=GaussianBelief(
             recurrent_carry=initial_belief_carry(count, belief_hidden_dim),
-            mixture_logits=mixture_logits,
-            means=means,
-            log_variances=log_variances,
-            support_score=jnp.zeros((count,), dtype=jnp.float32),
+            mean=jnp.zeros((count, latent_dim), dtype=jnp.float32),
+            log_standard_deviation=jnp.zeros((count, latent_dim), dtype=jnp.float32),
+            normalized_uncertainty=jnp.full(
+                (count,), 5.0 / 7.0, dtype=jnp.float32
+            ),
         ),
         previous_observation=jnp.zeros(
             (count,) + tuple(observation_shape), dtype=jnp.float32
         ),
         previous_action=jnp.full((count,), int(action_count), dtype=jnp.int32),
-        previous_reward=jnp.zeros((count,), dtype=jnp.float32),
         episode_start=jnp.ones((count,), dtype=jnp.bool_),
     )
 

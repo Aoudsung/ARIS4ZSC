@@ -1,4 +1,4 @@
-"""Owner-SP behavioral initialization for the r3 robust base.
+"""Owner-SP behavioral initialization for the V6 single actor.
 
 Only the Official policy surface (observation, done/carry and action logits) is
 recorded.  Environment state and partner identity never enter the DELTA model.
@@ -60,7 +60,7 @@ def collect_owner_behavior(
     owner_carry = owner_pool.initial_carry(count)
     partner_carry = partner_pool.initial_carry(count)
     starts = jnp.ones((count,), dtype=jnp.bool_)
-    previous_actions = jnp.zeros((count,), dtype=jnp.int32)
+    previous_actions = jnp.full((count,), 6, dtype=jnp.int32)
     # Alternate the ego role deterministically; this is a data-layout choice,
     # not a random scientific variable.
     owner_roles = (jnp.arange(count, dtype=jnp.int32) >= count // 2).astype(jnp.int32)
@@ -143,112 +143,100 @@ def owner_behavior_loss(
     initial_state: Any,
     batch: OwnerBehaviorBatch,
 ) -> tuple[Any, dict[str, Any]]:
-    """Forward-KL owner distillation; only base/task parameters may own it."""
+    """Forward KL from the owner-SP source into the one V6 actor."""
 
     import jax
     import jax.numpy as jnp
 
-    zeros = jnp.zeros(batch.previous_actions.shape, dtype=jnp.float32)
-    gates = jnp.zeros(batch.previous_actions.shape, dtype=jnp.float32)
+    dropout = jnp.zeros(batch.previous_actions.shape, dtype=jnp.bool_)
     unused_state, output = model.apply(
         {"params": params},
         initial_state,
         batch.observations,
         batch.previous_actions,
-        zeros,
         batch.episode_starts,
-        gates,
+        dropout,
         method=model.sequence,
     )
     del unused_state
     source_log = jax.nn.log_softmax(batch.owner_logits, axis=-1)
     source = jnp.exp(source_log)
-    candidate_log = jax.nn.log_softmax(output.base_logits[:-1], axis=-1)
+    candidate_log = jax.nn.log_softmax(output.policy_logits[:-1], axis=-1)
     pointwise = jnp.sum(source * (source_log - candidate_log), axis=-1)
     denominator = jnp.maximum(jnp.sum(batch.valid_mask), 1.0)
     loss = jnp.sum(batch.valid_mask * pointwise) / denominator
     return loss, {
-        "base_distillation_kl": loss,
-        "residual_rms_at_initialization": jnp.sqrt(
-            jnp.mean(jnp.square(output.residual_logits[:-1]))
-        ),
+        "owner_distillation_kl": loss,
     }
 
 
-def gate_zero_consistency(
+def distill_owner_actor(
     *,
     model: Any,
     params: Any,
-    initial_state: Any,
     batch: OwnerBehaviorBatch,
-    atol: float = 1.0e-7,
-) -> dict[str, Any]:
-    """Verify that ``gate=0`` is exactly the deterministic robust-base path.
-
-    Official and DELTA recurrent carries have different registered structures,
-    so source carries cannot be compared leaf-for-leaf.  The enforceable
-    deployment contract is instead checked directly: identical legal history
-    replay must produce identical DELTA carry/logits, and execution logits at
-    gate zero must equal the base logits without a residual contribution.
-    """
+    initial_state_factory: Any,
+    optimizer: Any,
+    optimizer_state: Any,
+    schedule: Any,
+) -> tuple[Any, Any, dict[str, Any]]:
+    """Execute the registered four-by-64 behavior initialization scan."""
 
     import jax
     import jax.numpy as jnp
+    import optax
 
-    zeros = jnp.zeros(batch.previous_actions.shape, dtype=jnp.float32)
+    from .gradient_routing import keep_owned_gradients
 
-    def replay() -> tuple[Any, Any]:
-        return model.apply(
-            {"params": params},
-            initial_state,
-            batch.observations,
-            batch.previous_actions,
-            zeros,
-            batch.episode_starts,
-            zeros,
-            method=model.sequence,
+    indexes = jnp.asarray(schedule, dtype=jnp.int32).reshape(
+        (-1, int(schedule.shape[-1]))
+    )
+
+    def one(carry: Any, lane_indexes: Any):
+        current, current_optimizer_state = carry
+        sliced = OwnerBehaviorBatch(
+            observations=batch.observations[:, lane_indexes],
+            previous_actions=batch.previous_actions[:, lane_indexes],
+            episode_starts=batch.episode_starts[:, lane_indexes],
+            owner_logits=batch.owner_logits[:, lane_indexes],
+            valid_mask=batch.valid_mask[:, lane_indexes],
+            source_members=batch.source_members[:, lane_indexes],
         )
+        initial_state = initial_state_factory(int(lane_indexes.shape[0]))
 
-    first_state, first = replay()
-    second_state, second = replay()
-    carry_errors = tuple(
-        _carry_leaf_max_error(left, right)
-        for left, right in zip(
-            jax.tree_util.tree_leaves(first_state),
-            jax.tree_util.tree_leaves(second_state),
-            strict=True,
+        def objective(candidate: Any):
+            return owner_behavior_loss(
+                model=model,
+                params=candidate,
+                initial_state=initial_state,
+                batch=sliced,
+            )
+
+        (loss, metrics), gradients = jax.value_and_grad(
+            objective, has_aux=True
+        )(current)
+        gradients = keep_owned_gradients(
+            gradients, loss_name="owner_distillation"
         )
+        updates, next_optimizer_state = optimizer.update(
+            gradients, current_optimizer_state, current
+        )
+        return (
+            optax.apply_updates(current, updates),
+            next_optimizer_state,
+        ), {**metrics, "owner_distillation_loss": loss}
+
+    (next_params, next_state), metrics = jax.lax.scan(
+        one, (params, optimizer_state), indexes
     )
-    carry_error = (
-        jnp.max(jnp.stack(carry_errors))
-        if carry_errors
-        else jnp.asarray(0.0, dtype=jnp.float32)
+    return next_params, next_state, jax.tree_util.tree_map(
+        lambda value: value[-1], metrics
     )
-    execution_error = jnp.max(
-        jnp.abs(first.execution_logits - first.base_logits)
-    )
-    replay_logit_error = jnp.max(
-        jnp.abs(first.execution_logits - second.execution_logits)
-    )
-    residual_rms = jnp.sqrt(jnp.mean(jnp.square(first.residual_logits)))
-    passed = (
-        (carry_error <= float(atol))
-        & (execution_error <= float(atol))
-        & (replay_logit_error <= float(atol))
-    )
-    return {
-        "passed": passed,
-        "carry_replay_max_error": carry_error,
-        "gate_zero_execution_max_error": execution_error,
-        "gate_zero_logit_replay_max_error": replay_logit_error,
-        "conditional_residual_rms": residual_rms,
-        "tolerance": jnp.asarray(float(atol), dtype=jnp.float32),
-    }
 
 
 __all__ = [
     "OwnerBehaviorBatch",
     "collect_owner_behavior",
-    "gate_zero_consistency",
+    "distill_owner_actor",
     "owner_behavior_loss",
 ]

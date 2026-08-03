@@ -208,7 +208,6 @@ def _record_forced_action(policy: Any, hstate: Any, action: Any) -> Any:
     )
     return hstate._replace(
         previous_action=jnp.broadcast_to(expanded, target.shape),
-        previous_reward=jnp.zeros_like(hstate.previous_reward),
     )
 
 

@@ -1,13 +1,12 @@
-"""Single command entry for the active DELTA-ZSC v5 implementation."""
+"""Single command entry for DELTA-ZSC V6 E2E."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from experiments.overcooked_v2.calibration_app import run_calibration
+from experiments.overcooked_v2.calibration_app import run_safety_calibration
 from experiments.overcooked_v2.common_partner_app import run_common_partner_evaluation
-from experiments.overcooked_v2.evaluation_app import run_evaluation
 from experiments.overcooked_v2.manifest_app import add_manifest_command
 from experiments.overcooked_v2.mechanical_e2e_app import run_mechanical_e2e
 from experiments.overcooked_v2.official_baseline_app import run_official_baseline
@@ -19,6 +18,7 @@ from experiments.overcooked_v2.official_evaluation_app import (
     run_official_summary,
 )
 from experiments.overcooked_v2.training_app import run_cuda_preflight, run_training
+from experiments.overcooked_v2.signal_audit_app import run_signal_audit
 from experiments.overcooked_v2.upstream_app import run_upstream
 from experiments.overcooked_v2.resource_report_app import run_resource_report
 from experiments.overcooked_v2.formal_claim_app import run_formal_claim_report
@@ -27,7 +27,7 @@ from src.path_c.experiment import (
     RUN_KINDS,
     load_config,
     load_partner_manifest,
-    validate_seed_signal_contract_manifest,
+    validate_seed_training_manifest,
 )
 from src.path_c.storage import CompleteConsoleLog
 
@@ -46,6 +46,13 @@ def _parser() -> argparse.ArgumentParser:
             "experiments/overcooked_v2/configs/"
             "delta_zsc_simple_mechanical_e2e.yaml"
         ),
+    )
+    mechanical.add_argument("--partner-manifest", required=True)
+    mechanical.add_argument("--ego-run-id", default="delta-zsc-v6-engineering")
+    mechanical.add_argument("--require-cuda", action="store_true", default=False)
+    mechanical.add_argument("--resume", action="store_true", default=False)
+    mechanical.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
     )
     mechanical.add_argument("--output", required=True)
     mechanical.set_defaults(function=run_mechanical_e2e, manages_output=True)
@@ -92,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
         "--seed-index",
         type=int,
         choices=(ENGINEERING_SEED_INDEX, *range(10)),
-        help="Required for formal r3 per-seed signal-contract manifests.",
+        help="Required for per-seed V6 initialization and training manifests.",
     )
     validate.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
@@ -106,9 +113,9 @@ def _parser() -> argparse.ArgumentParser:
             verify_files=not bool(args.skip_manifest_hash_check),
         )
         if args.run_kind == "formal" and args.seed_index is None:
-            raise ValueError("Formal r3 manifest validation requires --seed-index.")
+            raise ValueError("Formal V6 manifest validation requires --seed-index.")
         if args.seed_index is not None:
-            validate_seed_signal_contract_manifest(
+            validate_seed_training_manifest(
                 manifest,
                 owner_seed_index=int(args.seed_index),
                 formal=(args.run_kind == "formal"),
@@ -158,7 +165,7 @@ def _parser() -> argparse.ArgumentParser:
         resume=False,
     )
 
-    calibrate = commands.add_parser("calibrate")
+    calibrate = commands.add_parser("calibrate-safety")
     calibrate.add_argument("--config", required=True)
     calibrate.add_argument("--partner-manifest", required=True)
     calibrate.add_argument("--training-run", required=True)
@@ -173,20 +180,12 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
     )
-    calibrate.set_defaults(function=run_calibration, manages_output=True)
+    calibrate.set_defaults(function=run_safety_calibration, manages_output=True)
 
-    evaluate = commands.add_parser("evaluate")
-    evaluate.add_argument("--config", required=True)
-    evaluate.add_argument("--partner-manifest", required=True)
-    evaluate.add_argument("--deployments", nargs="+", required=True)
-    evaluate.add_argument("--seed", type=int, required=True)
-    evaluate.add_argument("--run-kind", choices=RUN_KINDS, required=True)
-    evaluate.add_argument("--output", required=True)
-    evaluate.add_argument("--allow-scientific-readout", action="store_true")
-    evaluate.add_argument(
-        "--skip-manifest-hash-check", action="store_true", default=False
-    )
-    evaluate.set_defaults(function=run_evaluation, manages_output=True)
+    audit = commands.add_parser("audit-signals")
+    audit.add_argument("--training-run", required=True)
+    audit.add_argument("--output", required=True)
+    audit.set_defaults(function=run_signal_audit, manages_output=True)
 
     delta_manifest = commands.add_parser("build-delta-policy-manifest")
     delta_manifest.add_argument("--deployments", nargs=10, required=True)

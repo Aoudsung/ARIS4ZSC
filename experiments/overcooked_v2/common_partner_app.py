@@ -23,7 +23,6 @@ from experiments.overcooked_v2.official_evaluation_app import (
     _load_policies,
     _load_policy_manifest,
 )
-from experiments.overcooked_v2.official_policy import OfficialDeltaPolicy
 from src.path_c.experiment import OFFICIAL_EVALUATION_ROOT_SEED, load_config, load_partner_manifest
 from src.path_c.official_statistics import (
     OFFICIAL_BOOTSTRAP_REPLICATES,
@@ -215,33 +214,6 @@ def run_common_partner_evaluation(args: argparse.Namespace) -> None:
                     )
                     correct = np.asarray(correct, dtype=np.int64)
                     wrong = np.asarray(wrong, dtype=np.int64)
-                    if method == "delta":
-                        # A formal DELTA seed that fails C0 is required to ship
-                        # the exact owner-SP policy, not an approximation inside
-                        # the DELTA parameter tree.  ``_load_policies`` therefore
-                        # returns the Official source policy for that deployment
-                        # mode.  Its paired base branch is the same exact policy.
-                        base_ego = (
-                            OfficialDeltaPolicy(ego.deployment, force_base=True)
-                            if isinstance(ego, OfficialDeltaPolicy)
-                            else ego
-                        )
-                        base_left, base_right = (
-                            (base_ego, partner)
-                            if ego_role == 0
-                            else (partner, base_ego)
-                        )
-                        base_rollouts, unused_keys = official_pairing_rollouts(
-                            left_policy=base_left,
-                            right_policy=base_right,
-                            environment=environment,
-                            root_key=root_key,
-                            episodes=500,
-                        )
-                        del unused_keys
-                        base_returns = np.asarray(
-                            base_rollouts.total_reward, dtype=np.float64
-                        )
                     for episode_index in range(500):
                         row = {
                             "layout": config.environment.layout,
@@ -257,10 +229,6 @@ def run_common_partner_evaluation(args: argparse.Namespace) -> None:
                             "correct_deliveries": int(correct[episode_index]),
                             "wrong_deliveries": int(wrong[episode_index]),
                         }
-                        if method == "delta":
-                            row["base_raw_return"] = float(
-                                base_returns[episode_index]
-                            )
                         method_rows.append(row)
                         all_rows.append(row)
         summaries[method] = {
@@ -362,18 +330,17 @@ def run_common_partner_evaluation(args: argparse.Namespace) -> None:
             "",
             f"DELTA−best-baseline one-sided LCB: "
             f"{bootstrap['one_sided_lcb']:.6f}.",
-            "Negative transfer is defined only for DELTA's paired calibrated "
-            "conditional policy versus its own robust base.",
+            "Negative transfer is not a primary V6 field because the method has "
+            "one actor and no deployment fallback branch.",
         )
     )
     (output / "common_partner_scoreboard.md").write_text(
         "\n".join(lines) + "\n", encoding="utf-8"
     )
-    # Five primary method panels plus one paired DELTA base-only panel.
     write_json(
         output / "budget_ledger.json",
         ResourceLedger(
-            evaluation_steps=(5 + 1) * 10 * 16 * 2 * 500 * 400
+            evaluation_steps=5 * 10 * 16 * 2 * 500 * 400
         ).to_mapping(),
     )
 

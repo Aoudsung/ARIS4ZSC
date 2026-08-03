@@ -12,20 +12,34 @@ from src.path_c.experiment import (
     MANIFEST_VERSION,
     METHOD_VERSION,
     OFFICIAL_PROTOCOL_VERSION,
-    OFFICIAL_CORRECT_DELIVERY_REWARD,
     PartnerManifest,
     PartnerRun,
     RUN_BUDGETS,
     load_config,
     load_partner_manifest,
+    official_training_key,
     validate_partner_manifest,
+    validate_seed_training_manifest,
     validate_config,
 )
 from src.path_c.storage import sha256_path
+from src.path_c.response_targets import official_partner_observation_planes
 
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIGS = ROOT / "experiments" / "overcooked_v2" / "configs"
+
+
+def test_response_planes_match_pinned_official_default_observation_order() -> None:
+    # With 39 channels the pinned shape equation gives three ingredients. Each
+    # agent block is position[1], direction[4], inventory[5], with ego first.
+    planes = official_partner_observation_planes(39)
+    assert planes.visibility_channel == 10
+    assert planes.direction_channels == (11, 12, 13, 14)
+    assert planes.inventory_channels == (15, 16, 17, 18, 19)
+    assert planes.interaction_channels == planes.inventory_channels
+    with pytest.raises(ValueError, match="Official DEFAULT"):
+        official_partner_observation_planes(41)
 
 
 def _run(index: int, role: str, *, parent: str | None = None) -> PartnerRun:
@@ -64,9 +78,9 @@ def _valid_manifest() -> PartnerManifest:
 
 
 def test_registered_versions_and_run_budgets() -> None:
-    assert CONFIG_VERSION == 7
+    assert CONFIG_VERSION == 9
     assert MANIFEST_VERSION == 2
-    assert METHOD_VERSION == "delta_zsc_v5_decision_equivalent_bayes_r3_signal_contract"
+    assert METHOD_VERSION == "delta_zsc_v6_end_to_end_bayes_coordination"
     assert OFFICIAL_PROTOCOL_VERSION == "overcooked_v2_iclr2025_5ce1707_v1"
     assert RUN_BUDGETS["mechanical"].num_envs == 4
     assert RUN_BUDGETS["development"].environment_steps == 1_228_800
@@ -84,7 +98,7 @@ def test_registered_versions_and_run_budgets() -> None:
         ("delta_zsc_wide_formal.yaml", "formal", 256),
     ),
 )
-def test_v5_configs_load_with_registered_budget(
+def test_v6_configs_load_with_registered_budget(
     filename: str, run_kind: str, expected_envs: int
 ) -> None:
     config = load_config(CONFIGS / filename, run_kind=run_kind)
@@ -95,22 +109,33 @@ def test_v5_configs_load_with_registered_budget(
     assert len(config.fingerprint) == 64
 
 
-def test_competence_margin_is_bound_to_official_delivery_reward() -> None:
+def test_v6_formal_signal_and_schedule_values_are_frozen() -> None:
     config = load_config(
         CONFIGS / "delta_zsc_simple_formal.yaml", run_kind="formal"
     )
-    assert (
-        config.partner_generator.delivery_noninferiority_margin
-        == OFFICIAL_CORRECT_DELIVERY_REWARD
-        == 20.0
-    )
+    assert config.model.latent_dim == 8
+    assert config.model.posterior_particles == 16
+    assert config.model.log_standard_deviation_minimum == -5.0
+    assert config.model.log_standard_deviation_maximum == 2.0
+    assert config.loss.raw_q_weight == 1.0
+    assert config.loss.counterfactual_weight == 1.0
+    assert config.loss.response_weight == 1.0
+    assert config.loss.decision_equivalence_weight == 0.1
+    assert config.loss.information_bottleneck_weight == 0.001
+    assert config.loss.q_policy_weight == 0.25
+    assert config.loss.robust_generalist_weight == 0.1
+    assert config.loss.policy_belief_gradient_scale == 0.1
+    assert config.training.context_dropout_initial == 0.30
+    assert config.training.context_dropout_final == 0.10
+    assert config.anchors.interval_updates == 16
+    assert config.anchors.replay_capacity == 512
+    assert config.partner_generator.target_polyak_coefficient == 0.005
+    assert config.partner_generator.maximum_generator_probability == 0.75
     invalid = replace(
         config,
-        partner_generator=replace(
-            config.partner_generator, delivery_noninferiority_margin=19.0
-        ),
+        loss=replace(config.loss, q_policy_weight=0.5),
     )
-    with pytest.raises(ValueError, match="one Official correct-delivery"):
+    with pytest.raises(ValueError, match="q_policy_weight"):
         validate_config(invalid)
 
 
@@ -128,6 +153,77 @@ def test_config_rejects_unknown_fields(tmp_path: Path) -> None:
 
 def test_manifest_accepts_run_disjoint_roles() -> None:
     validate_partner_manifest(_valid_manifest())
+
+
+def test_manifest_requires_real_prng_provenance_for_every_partner() -> None:
+    manifest = _valid_manifest()
+    missing = replace(manifest.runs[1], jax_prng_key=None)
+    with pytest.raises(ValueError, match="real two-word JAX key"):
+        validate_partner_manifest(
+            replace(manifest, runs=(manifest.runs[0], missing, *manifest.runs[2:]))
+        )
+
+
+def _formal_seed_manifest() -> PartnerManifest:
+    mechanisms = ("sp", "op", "sa", "fcp")
+    rows: list[PartnerRun] = [
+        PartnerRun(
+            run_id="owner-0",
+            role="owner_source",
+            checkpoint=Path("/tmp/formal-owner-0"),
+            checkpoint_sha256=f"{1:064x}",
+            parent_training_run_id="formal-parent-1",
+            generation_mechanism="rnn-sp",
+            seed=42,
+            seed_index=0,
+            jax_prng_key=official_training_key(0),
+            owner_seed_index=0,
+            co_training_group_id="formal-group-1",
+            partner_type_id=None,
+        )
+    ]
+    index = 2
+    for role, repetitions in (
+        ("generator_init_source", 1),
+        ("development_support", 4),
+    ):
+        for repetition in range(repetitions):
+            for mechanism_index, mechanism in enumerate(mechanisms):
+                rows.append(
+                    PartnerRun(
+                        run_id=f"{role}-{mechanism}-{repetition}",
+                        role=role,
+                        checkpoint=Path(f"/tmp/formal-source-{index}"),
+                        checkpoint_sha256=f"{index:064x}",
+                        parent_training_run_id=f"formal-parent-{index}",
+                        generation_mechanism=mechanism,
+                        seed=10_000 + index,
+                        seed_index=None,
+                        jax_prng_key=(mechanism_index + 1, 10_000 + index),
+                        owner_seed_index=0,
+                        co_training_group_id=f"formal-group-{index}",
+                        partner_type_id=None,
+                    )
+                )
+                index += 1
+    return PartnerManifest(layout="test_time_simple", runs=tuple(rows))
+
+
+def test_formal_seed_manifest_requires_exact_balanced_v6_support() -> None:
+    manifest = _formal_seed_manifest()
+    validate_seed_training_manifest(manifest, owner_seed_index=0, formal=True)
+
+    missing_fcp = next(
+        index
+        for index, run in enumerate(manifest.runs)
+        if run.role == "development_support" and run.generation_mechanism == "fcp"
+    )
+    reduced = replace(
+        manifest,
+        runs=manifest.runs[:missing_fcp] + manifest.runs[missing_fcp + 1 :],
+    )
+    with pytest.raises(ValueError, match="development_support"):
+        validate_seed_training_manifest(reduced, owner_seed_index=0, formal=True)
 
 
 def test_manifest_rejects_checkpoint_parent_and_group_leakage() -> None:

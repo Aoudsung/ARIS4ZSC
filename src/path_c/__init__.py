@@ -1,4 +1,4 @@
-"""Active DELTA-ZSC V5 implementation."""
+"""Active DELTA-ZSC V6 end-to-end Bayes coordination implementation."""
 
 from .experiment import (
     CONFIG_VERSION,

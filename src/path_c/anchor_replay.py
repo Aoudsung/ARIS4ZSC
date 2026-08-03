@@ -1,295 +1,192 @@
-"""Epoch-isolated counterfactual training replay.
-
-Audit anchors deliberately use a separate manifest type and have no sampling
-API, preventing confirmatory replicas from leaking into a loss.
-"""
+"""Policy-drift and age weighted V6 counterfactual replay."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
 import hashlib
-import json
-from typing import Any, Iterable, Mapping, NamedTuple, Sequence
-
-import numpy as np
-
-from .policy_epoch import TargetPolicyEpoch, validate_label_policy
-
-
-@dataclass(frozen=True, slots=True)
-class AnchorReplayItem:
-    target_policy_epoch_id: int
-    target_policy_fingerprint: str
-    partner_source: str
-    partner_run_id: str
-    uniform_or_opportunity: str
-    fit_return_mean: tuple[float, ...]
-    fit_return_standard_error: tuple[float, ...]
-    collection_step: int
-    payload: Any = None
-
-    def __post_init__(self) -> None:
-        if self.uniform_or_opportunity not in ("uniform", "opportunity"):
-            raise ValueError("Anchor stratum must be uniform or opportunity.")
-        if not self.partner_source or not self.partner_run_id:
-            raise ValueError("Every anchor must preserve partner lineage.")
-        if len(self.fit_return_mean) < 2:
-            raise ValueError("All-action anchor means are required.")
-        if len(self.fit_return_mean) != len(self.fit_return_standard_error):
-            raise ValueError("Anchor means and standard errors differ in length.")
-        if self.collection_step < 0:
-            raise ValueError("Anchor collection step cannot be negative.")
-
-
-@dataclass(frozen=True, slots=True)
-class AnchorTrainingReplay:
-    epoch_id: int
-    capacity: int = 512
-    items: tuple[AnchorReplayItem, ...] = field(default_factory=tuple)
-
-    def __post_init__(self) -> None:
-        if self.capacity <= 0:
-            raise ValueError("Replay capacity must be positive.")
-        if len(self.items) > self.capacity:
-            raise ValueError("Replay exceeds its per-epoch capacity.")
-        if any(int(item.target_policy_epoch_id) != int(self.epoch_id) for item in self.items):
-            raise ValueError("Replay cannot mix target-policy epochs.")
-
-    def add(self, additions: Iterable[AnchorReplayItem]) -> "AnchorTrainingReplay":
-        rows = self.items + tuple(additions)
-        for row in rows:
-            if int(row.target_policy_epoch_id) != int(self.epoch_id):
-                raise ValueError("Old target-policy epoch item rejected from replay.")
-        return AnchorTrainingReplay(
-            epoch_id=self.epoch_id,
-            capacity=self.capacity,
-            items=rows[-self.capacity :],
-        )
-
-    def sample_indexes(self, *, batch_size: int, key: int) -> np.ndarray:
-        if batch_size <= 0 or not self.items:
-            raise ValueError("Cannot sample an empty replay or non-positive batch.")
-        rng = np.random.default_rng(int(key))
-        return rng.integers(0, len(self.items), size=int(batch_size), dtype=np.int64)
-
-    def sample(
-        self,
-        *,
-        batch_size: int,
-        key: int,
-        current_epoch: TargetPolicyEpoch,
-    ) -> tuple[AnchorReplayItem, ...]:
-        indexes = self.sample_indexes(batch_size=batch_size, key=key)
-        rows = tuple(self.items[int(index)] for index in indexes)
-        for row in rows:
-            validate_label_policy(
-                label_epoch_id=row.target_policy_epoch_id,
-                label_policy_fingerprint=row.target_policy_fingerprint,
-                current_epoch=current_epoch,
-            )
-        return rows
-
-    @property
-    def fingerprint(self) -> str:
-        payload = [
-            {key: value for key, value in asdict(item).items() if key != "payload"}
-            for item in self.items
-        ]
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+from typing import Any, NamedTuple
 
 
 class AnchorReplayState(NamedTuple):
-    """Orbax-safe current-epoch replay payload used by the CUDA auxiliary scan."""
-
-    target_policy_epoch_id: Any
-    target_policy_fingerprint: str
     batch: Any
     item_count: Any
     capacity: int
+    use_counts: Any
 
 
 def append_replay_batch(
-    state: AnchorReplayState | None,
-    *,
-    batch: Any,
-    epoch: TargetPolicyEpoch,
-    capacity: int,
+    state: AnchorReplayState | None, *, batch: Any, capacity: int
 ) -> AnchorReplayState:
     import jax
     import jax.numpy as jnp
 
-    fingerprint = ":".join(
-        (epoch.actor_fingerprint, epoch.belief_fingerprint, epoch.raw_q_fingerprint)
-    )
+    incoming = int(jnp.asarray(batch.anchor_ids).shape[0])
+    if incoming <= 0 or int(capacity) <= 0:
+        raise ValueError("Replay batch and capacity must be positive.")
+    old_count = 0 if state is None else int(jnp.asarray(state.item_count))
     if state is None:
-        combined = batch
+        valid_old = None
+        valid_usage = jnp.zeros((0,), dtype=jnp.int32)
     else:
-        validate_label_policy(
-            label_epoch_id=int(state.target_policy_epoch_id),
-            label_policy_fingerprint=state.target_policy_fingerprint,
-            current_epoch=epoch,
+        valid_old = jax.tree_util.tree_map(
+            lambda value: jnp.asarray(value)[:old_count], state.batch
         )
-        combined = jax.tree_util.tree_map(
-            lambda first, second: jnp.concatenate((first, second), axis=0),
-            state.batch,
-            batch,
+        valid_usage = jnp.asarray(state.use_counts)[:old_count]
+    combined_valid = (
+        batch
+        if valid_old is None
+        else jax.tree_util.tree_map(
+            lambda old, new: jnp.concatenate((old, new), axis=0), valid_old, batch
         )
-    count = int(jnp.asarray(combined.anchor_ids).shape[0])
-    if count > int(capacity):
-        combined = jax.tree_util.tree_map(
-            lambda value: jnp.asarray(value)[-int(capacity) :], combined
+    )
+    usage_valid = jnp.concatenate(
+        (valid_usage, jnp.zeros((incoming,), dtype=jnp.int32)), axis=0
+    )
+    valid_count = old_count + incoming
+    if valid_count > int(capacity):
+        combined_valid = jax.tree_util.tree_map(
+            lambda value: jnp.asarray(value)[-int(capacity):], combined_valid
         )
-        count = int(capacity)
+        usage_valid = usage_valid[-int(capacity):]
+        valid_count = int(capacity)
+
+    padding = int(capacity) - valid_count
+
+    def fixed(value: Any) -> Any:
+        array = jnp.asarray(value)
+        if not padding:
+            return array
+        return jnp.concatenate(
+            (array, jnp.zeros((padding,) + array.shape[1:], dtype=array.dtype)),
+            axis=0,
+        )
+
+    combined = jax.tree_util.tree_map(fixed, combined_valid)
+    use_counts = jnp.concatenate(
+        (usage_valid, jnp.zeros((padding,), dtype=jnp.int32)), axis=0
+    )
     return AnchorReplayState(
-        target_policy_epoch_id=jnp.asarray(epoch.epoch_id, dtype=jnp.int32),
-        target_policy_fingerprint=fingerprint,
         batch=combined,
-        item_count=jnp.asarray(count, dtype=jnp.int32),
+        item_count=jnp.asarray(valid_count, dtype=jnp.int32),
         capacity=int(capacity),
+        use_counts=use_counts,
     )
 
 
-def current_epoch_replay_batch(
-    state: AnchorReplayState | None,
+def sample_replay_batch(
+    state: AnchorReplayState,
     *,
-    epoch: TargetPolicyEpoch,
-) -> Any | None:
+    key: Any,
+    batch_size: int,
+) -> tuple[AnchorReplayState, Any]:
+    """Sample 32 ordinary rows and 16 complete matched pairs by source/age strata."""
+
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    count = int(jnp.asarray(state.item_count))
+    size = int(batch_size)
+    if count < size or size <= 0 or size % 4:
+        raise ValueError("Replay minibatches require a positive 4-divisible size.")
+    pair_rows = size // 2
+    ordinary_rows = size - pair_rows
+    pair_count = pair_rows // 2
+    sources = np.asarray(state.batch.partner_sources[:count], dtype=np.int64)
+    updates = np.asarray(state.batch.collection_update[:count], dtype=np.int64)
+    pair_ids = np.asarray(state.batch.matched_pair_ids[:count], dtype=np.int64)
+    priorities = np.asarray(
+        jax.random.uniform(key, (count,), dtype=jnp.float32), dtype=np.float64
+    )
+
+    def stratified(candidates: list[int], requested: int) -> list[int]:
+        strata: dict[tuple[int, int], list[int]] = {}
+        for index in candidates:
+            strata.setdefault((int(sources[index]), int(updates[index])), []).append(index)
+        quota = max(1, int(np.ceil(requested / max(len(strata), 1))))
+        result: list[int] = []
+        used: set[int] = set()
+        for label in sorted(strata):
+            ranked = sorted(strata[label], key=lambda item: priorities[item], reverse=True)
+            for index in ranked[:quota]:
+                result.append(index)
+                used.add(index)
+        if len(result) < requested:
+            ranked = sorted(candidates, key=lambda item: priorities[item], reverse=True)
+            result.extend(index for index in ranked if index not in used)
+        return result[:requested]
+
+    ordinary_candidates = np.flatnonzero(pair_ids < 0).tolist()
+    pair_starts = [
+        index
+        for index in range(count - 1)
+        if pair_ids[index] >= 0
+        and pair_ids[index] == pair_ids[index + 1]
+        and updates[index] == updates[index + 1]
+        and (index == 0 or pair_ids[index - 1] != pair_ids[index] or updates[index - 1] != updates[index])
+    ]
+    if len(ordinary_candidates) < ordinary_rows or len(pair_starts) < pair_count:
+        raise ValueError("Replay lacks complete ordinary/matched strata for one minibatch.")
+    ordinary = stratified(ordinary_candidates, ordinary_rows)
+    starts = stratified(pair_starts, pair_count)
+    selected = ordinary + [row for start in starts for row in (start, start + 1)]
+    indexes = jnp.asarray(selected, dtype=jnp.int32)
+    sampled = jax.tree_util.tree_map(lambda value: value[indexes], state.batch)
+    usage = state.use_counts.at[indexes].add(1)
+    return state._replace(use_counts=usage), sampled
+
+
+def policy_drift_age_weights(
+    *,
+    current_policy_logits: Any,
+    collection_policy_logits: Any,
+    current_update: Any,
+    collection_update: Any,
+    kl_decay: float = 0.05,
+    age_decay_updates: float = 64.0,
+    minimum_weight: float = 1.0e-3,
+) -> Any:
+    import jax
+    import jax.numpy as jnp
+
+    current_log = jax.nn.log_softmax(current_policy_logits, axis=-1)
+    collection_log = jax.nn.log_softmax(collection_policy_logits, axis=-1)
+    current_probability = jnp.exp(current_log)
+    divergence = jnp.sum(
+        current_probability * (current_log - collection_log), axis=-1
+    )
+    age = jnp.maximum(
+        jnp.asarray(current_update, dtype=jnp.float32)
+        - jnp.asarray(collection_update, dtype=jnp.float32),
+        0.0,
+    )
+    weight = jnp.exp(-divergence / float(kl_decay)) * jnp.exp(
+        -age / float(age_decay_updates)
+    )
+    weight = jnp.clip(weight, float(minimum_weight), 1.0)
+    return weight / jnp.maximum(jnp.mean(weight), 1.0e-8)
+
+
+def replay_fingerprint(state: AnchorReplayState | None) -> str:
     if state is None:
-        return None
-    validate_label_policy(
-        label_epoch_id=int(state.target_policy_epoch_id),
-        label_policy_fingerprint=state.target_policy_fingerprint,
-        current_epoch=epoch,
-    )
-    return state.batch
+        return hashlib.sha256(b"delta-zsc-v6/empty-anchor-replay").hexdigest()
+    import jax
+    import numpy as np
 
-
-@dataclass(frozen=True, slots=True)
-class AnchorAuditRecord:
-    milestone: str
-    artifact_path: str
-    artifact_fingerprint: str
-    random_domain: str
-    fit_replicas: int
-    evaluation_replicas: int
-    continuation_horizon: int
-
-
-@dataclass(frozen=True, slots=True)
-class AnchorAuditManifest:
-    records: tuple[AnchorAuditRecord, ...] = field(default_factory=tuple)
-    expected_fit_replicas: int = 32
-    expected_evaluation_replicas: int = 64
-    expected_continuation_horizon: int = 400
-
-    def __post_init__(self) -> None:
-        if self.expected_fit_replicas <= 0 or self.expected_evaluation_replicas <= 0:
-            raise ValueError("Audit replica expectations must be positive.")
-        if self.expected_continuation_horizon <= 0:
-            raise ValueError("Audit continuation expectation must be positive.")
-
-    def add(self, record: AnchorAuditRecord) -> "AnchorAuditManifest":
-        if record.milestone not in ("C0", "15M", "22.5M", "final"):
-            raise ValueError("Audit anchor milestone is not preregistered.")
-        if (
-            record.fit_replicas != self.expected_fit_replicas
-            or record.evaluation_replicas != self.expected_evaluation_replicas
-        ):
-            raise ValueError(
-                "Audit replica split differs from the run's registered split "
-                f"{self.expected_fit_replicas}/{self.expected_evaluation_replicas}."
-            )
-        if record.continuation_horizon != self.expected_continuation_horizon:
-            raise ValueError(
-                "Audit continuation horizon differs from the run's registered "
-                f"horizon {self.expected_continuation_horizon}."
-            )
-        return AnchorAuditManifest(
-            records=self.records + (record,),
-            expected_fit_replicas=self.expected_fit_replicas,
-            expected_evaluation_replicas=self.expected_evaluation_replicas,
-            expected_continuation_horizon=self.expected_continuation_horizon,
-        )
-
-
-def audit_manifest_to_mapping(
-    manifest: AnchorAuditManifest | Mapping[str, Any],
-) -> dict[str, Any]:
-    """Convert validated host metadata to a fixed-structure checkpoint tree.
-
-    Orbax restoration requires the template and stored PyTrees to have the same
-    structure.  A run begins with no audit records but can finish with four, so
-    a variable-length tuple is not resumable.  The preregistered milestone set
-    provides a strict upper bound; padding preserves one stable tree definition
-    without inventing scientific records.
-    """
-
-    value = audit_manifest_from_mapping(manifest)
-    capacity = 4
-    if len(value.records) > capacity:
-        raise ValueError("Audit manifest exceeds the preregistered milestones.")
-    padding = AnchorAuditRecord(
-        milestone="",
-        artifact_path="",
-        artifact_fingerprint="",
-        random_domain="",
-        fit_replicas=0,
-        evaluation_replicas=0,
-        continuation_horizon=0,
-    )
-    records = value.records + (padding,) * (capacity - len(value.records))
-    return {
-        "record_count": int(len(value.records)),
-        "records": tuple(asdict(record) for record in records),
-        "expected_fit_replicas": int(value.expected_fit_replicas),
-        "expected_evaluation_replicas": int(value.expected_evaluation_replicas),
-        "expected_continuation_horizon": int(
-            value.expected_continuation_horizon
-        ),
-    }
-
-
-def audit_manifest_from_mapping(
-    value: AnchorAuditManifest | Mapping[str, Any],
-) -> AnchorAuditManifest:
-    """Restore and revalidate host audit metadata after checkpoint loading."""
-
-    if isinstance(value, AnchorAuditManifest):
-        return value
-    if not isinstance(value, Mapping):
-        raise TypeError("Anchor audit manifest must be a mapping or manifest.")
-    raw_records = tuple(
-        item
-        if isinstance(item, AnchorAuditRecord)
-        else AnchorAuditRecord(**dict(item))
-        for item in value.get("records", ())
-    )
-    record_count = int(value.get("record_count", len(raw_records)))
-    if not 0 <= record_count <= 4 or record_count > len(raw_records):
-        raise ValueError("Invalid audit checkpoint record count.")
-    records = raw_records[:record_count]
-    manifest = AnchorAuditManifest(
-        expected_fit_replicas=int(value["expected_fit_replicas"]),
-        expected_evaluation_replicas=int(value["expected_evaluation_replicas"]),
-        expected_continuation_horizon=int(
-            value["expected_continuation_horizon"]
-        ),
-    )
-    for record in records:
-        manifest = manifest.add(record)
-    return manifest
+    digest = hashlib.sha256()
+    count = int(np.asarray(jax.device_get(state.item_count)))
+    valid = jax.tree_util.tree_map(lambda value: value[:count], state.batch)
+    for leaf in jax.tree_util.tree_leaves((valid, state.use_counts[:count])):
+        array = np.asarray(jax.device_get(leaf))
+        digest.update(str(array.shape).encode("ascii"))
+        digest.update(str(array.dtype).encode("ascii"))
+        digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 __all__ = [
-    "AnchorAuditManifest",
-    "AnchorAuditRecord",
-    "AnchorReplayItem",
     "AnchorReplayState",
-    "AnchorTrainingReplay",
     "append_replay_batch",
-    "audit_manifest_from_mapping",
-    "audit_manifest_to_mapping",
-    "current_epoch_replay_batch",
+    "policy_drift_age_weights",
+    "replay_fingerprint",
+    "sample_replay_batch",
 ]

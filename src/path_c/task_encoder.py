@@ -26,14 +26,13 @@ def task_encoder_classes() -> tuple[Any, Any]:
         def __call__(
             self,
             carry: Any,
-            inputs: tuple[Any, Any, Any, Any],
+            inputs: tuple[Any, Any, Any],
         ) -> tuple[Any, Any]:
-            observation, previous_action, previous_reward, episode_start = inputs
+            observation, previous_action, episode_start = inputs
             obs = jnp.asarray(observation, dtype=jnp.float32)
             action = jnp.asarray(previous_action, dtype=jnp.int32)
-            reward = jnp.asarray(previous_reward, dtype=jnp.float32)
             start = jnp.asarray(episode_start, dtype=jnp.bool_)
-            if action.shape != reward.shape or action.shape != start.shape:
+            if action.shape != start.shape:
                 raise ValueError("Task encoder scalar inputs must share batch axes.")
             if obs.shape[:-3] != action.shape:
                 raise ValueError("Observation batch axes do not match task inputs.")
@@ -48,8 +47,8 @@ def task_encoder_classes() -> tuple[Any, Any]:
             # This is the exact visual trunk used by the locked Official RNN:
             # 128x1x1, 128x1x1, 8x1x1, 16x3x3, 32x3x3, 32x3x3,
             # flatten, Dense-128, ReLU, LayerNorm, GRU-128.  DELTA-specific
-            # belief and low-rank residual modules are attached after this
-            # shared public-protocol backbone.
+            # DELTA's belief and continuous low-rank actor modulation are
+            # attached after this shared public-protocol backbone.
             encoded = obs
             for index, (features, kernel) in enumerate(
                 ((128, (1, 1)), (128, (1, 1)), (8, (1, 1)),
@@ -79,12 +78,6 @@ def task_encoder_classes() -> tuple[Any, Any]:
                 bias_init=zeros,
                 name="action_projection",
             )(action_embedding)
-            encoded = encoded + nn.Dense(
-                self.hidden_dim,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="reward_projection",
-            )(reward[..., None])
             encoded = nn.LayerNorm(name="task_layer_norm")(encoded)
             carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
             next_carry, feature = nn.GRUCell(

@@ -123,25 +123,6 @@ def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
                     "role": f"delta_training_{raw['role']}",
                 }
             )
-        calibration_identity_path = artifact.parent / "run_identity.json"
-        if not calibration_identity_path.is_file():
-            raise FileNotFoundError(
-                f"DELTA calibration identity is missing: {calibration_identity_path}"
-            )
-        calibration_identity = json.loads(
-            calibration_identity_path.read_text(encoding="utf-8")
-        )
-        for raw in calibration_identity["partner_manifest"]["runs"]:
-            if raw["role"] != "calibration":
-                continue
-            lineage_rows.append(
-                {
-                    "checkpoint_sha256": str(raw["checkpoint_sha256"]),
-                    "parent_training_run_id": str(raw["parent_training_run_id"]),
-                    "co_training_group_id": raw["co_training_group_id"],
-                    "role": "delta_calibration",
-                }
-            )
     if seed_indexes != set(range(10)) or layout is None:
         raise ValueError("DELTA deployments must cover Official seed indexes 0..9.")
     if len(set(deployment_parameter_counts)) != 1:
@@ -262,19 +243,9 @@ def _load_policies(manifest: Mapping[str, Any], config: RunConfig) -> tuple[Any,
             official_config, params = restore_official_checkpoint(path)
             policy = official_policy(params, official_config)
         else:
-            bundle = json.loads(
-                (path / "deployment_bundle.json").read_text(encoding="utf-8")
-            )
-            if bundle.get("deployment_tier") == "owner_sp_source_fallback":
-                source = bundle.get("owner_source_checkpoint")
-                if source is None:
-                    raise ValueError("Owner-SP fallback bundle lacks its source checkpoint.")
-                official_config, params = restore_official_checkpoint(source)
-                policy = official_policy(params, official_config)
-            else:
-                deployment = load_deployment(path, config)
-                policy = OfficialDeltaPolicy(deployment)
-                assert_official_policy_surface(policy)
+            deployment = load_deployment(path, config)
+            policy = OfficialDeltaPolicy(deployment)
+            assert_official_policy_surface(policy)
         policies.append(policy)
     return tuple(policies)
 

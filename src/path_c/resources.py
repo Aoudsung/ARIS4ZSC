@@ -21,18 +21,14 @@ from typing import Any, Mapping, Sequence
 @dataclass(frozen=True, slots=True)
 class ResourceLedger:
     ego_policy_steps: int = 0
-    partner_training_steps: int = 0
-    counterfactual_steps: int = 0
-    state_collection_steps: int = 0
+    ego_initialization_steps: int = 0
+    generator_initialization_steps: int = 0
+    generator_training_steps: int = 0
+    counterfactual_continuation_steps: int = 0
+    matched_code_probe_steps: int = 0
+    upstream_partner_steps: int = 0
     calibration_steps: int = 0
     evaluation_steps: int = 0
-    # r3 attribution fields.  These partition the aggregate categories above
-    # and are therefore not added a second time to the total.
-    base_distillation_steps: int = 0
-    partner_source_training_steps: int = 0
-    generator_training_steps: int = 0
-    training_anchor_steps: int = 0
-    audit_anchor_steps: int = 0
     gpu_hours: float = 0.0
     peak_memory_bytes: int = 0
     deployable_parameters: int = 0
@@ -42,16 +38,14 @@ class ResourceLedger:
     def __post_init__(self) -> None:
         integer_fields = (
             "ego_policy_steps",
-            "partner_training_steps",
-            "counterfactual_steps",
-            "state_collection_steps",
+            "ego_initialization_steps",
+            "generator_initialization_steps",
+            "generator_training_steps",
+            "counterfactual_continuation_steps",
+            "matched_code_probe_steps",
+            "upstream_partner_steps",
             "calibration_steps",
             "evaluation_steps",
-            "base_distillation_steps",
-            "partner_source_training_steps",
-            "generator_training_steps",
-            "training_anchor_steps",
-            "audit_anchor_steps",
             "peak_memory_bytes",
             "deployable_parameters",
             "training_only_parameters",
@@ -63,20 +57,16 @@ class ResourceLedger:
         for name in ("gpu_hours", "inference_latency_ms"):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"Resource field {name} must be non-negative.")
-        if self.generator_training_steps + self.partner_source_training_steps > self.partner_training_steps:
-            raise ValueError("Partner-source and generator attributions exceed partner training.")
-        if self.training_anchor_steps + self.audit_anchor_steps > self.counterfactual_steps:
-            raise ValueError("Training/audit anchor attributions exceed counterfactual steps.")
-        if self.base_distillation_steps > self.state_collection_steps:
-            raise ValueError("Base-distillation attribution exceeds state collection.")
-
     @property
     def total_training_simulator_steps(self) -> int:
         return int(
             self.ego_policy_steps
-            + self.partner_training_steps
-            + self.counterfactual_steps
-            + self.state_collection_steps
+            + self.ego_initialization_steps
+            + self.generator_initialization_steps
+            + self.generator_training_steps
+            + self.counterfactual_continuation_steps
+            + self.matched_code_probe_steps
+            + self.upstream_partner_steps
             + self.calibration_steps
         )
 
@@ -123,16 +113,14 @@ def aggregate_resource_ledgers(ledgers: Sequence[ResourceLedger]) -> ResourceLed
         raise ValueError("A method's training-only parameter counts are inconsistent.")
     return ResourceLedger(
         ego_policy_steps=sum(item.ego_policy_steps for item in values),
-        partner_training_steps=sum(item.partner_training_steps for item in values),
-        counterfactual_steps=sum(item.counterfactual_steps for item in values),
-        state_collection_steps=sum(item.state_collection_steps for item in values),
+        ego_initialization_steps=sum(item.ego_initialization_steps for item in values),
+        generator_initialization_steps=sum(item.generator_initialization_steps for item in values),
+        generator_training_steps=sum(item.generator_training_steps for item in values),
+        counterfactual_continuation_steps=sum(item.counterfactual_continuation_steps for item in values),
+        matched_code_probe_steps=sum(item.matched_code_probe_steps for item in values),
+        upstream_partner_steps=sum(item.upstream_partner_steps for item in values),
         calibration_steps=sum(item.calibration_steps for item in values),
         evaluation_steps=sum(item.evaluation_steps for item in values),
-        base_distillation_steps=sum(item.base_distillation_steps for item in values),
-        partner_source_training_steps=sum(item.partner_source_training_steps for item in values),
-        generator_training_steps=sum(item.generator_training_steps for item in values),
-        training_anchor_steps=sum(item.training_anchor_steps for item in values),
-        audit_anchor_steps=sum(item.audit_anchor_steps for item in values),
         gpu_hours=sum(item.gpu_hours for item in values),
         peak_memory_bytes=max(item.peak_memory_bytes for item in values),
         deployable_parameters=(0 if not deployable else next(iter(deployable))),
@@ -433,96 +421,51 @@ def delta_anchor_attempted_steps(
     return result
 
 
-def r3_training_anchor_attempted_steps(
+def v6_anchor_attempted_steps(
     *,
     trigger_count: int,
-    ordinary_candidates: int,
-    matched_code_candidates: int,
-    selected_ordinary: int,
-    selected_matched_code: int,
-    action_count: int,
-    pilot_replicas: int,
-    fit_replicas: int,
-    continuation_horizon: int,
-    probe_steps: int,
-) -> int:
-    """Exact attempted transitions for r3's pilot/fit training anchors."""
+    ordinary_states: int = 32,
+    matched_code_pairs: int = 16,
+    action_count: int = 6,
+    fit_replicas: int = 4,
+    continuation_horizon: int = 128,
+    probe_steps: int = 16,
+) -> tuple[int, int]:
+    """Exact continuation and legal-probe attempted transitions for V6."""
 
-    values = (
+    factors = (
         trigger_count,
-        ordinary_candidates,
-        matched_code_candidates,
-        selected_ordinary,
-        selected_matched_code,
-        action_count,
-        pilot_replicas,
-        fit_replicas,
-        continuation_horizon,
-        probe_steps,
-    )
-    if any(int(value) < 0 for value in values):
-        raise ValueError("Training-anchor budget factors cannot be negative.")
-    per_trigger = (
-        int(ordinary_candidates)
-        * int(action_count)
-        * int(pilot_replicas)
-        * int(continuation_horizon)
-        + 2
-        * int(matched_code_candidates)
-        * int(action_count)
-        * int(pilot_replicas)
-        * int(continuation_horizon)
-        + (int(selected_ordinary) + 2 * int(selected_matched_code))
-        * int(action_count)
-        * int(fit_replicas)
-        * int(continuation_horizon)
-        + 2 * int(matched_code_candidates) * int(probe_steps)
-    )
-    return int(trigger_count) * per_trigger
-
-
-def r3_audit_anchor_attempted_steps(
-    *,
-    milestone_count: int,
-    ordinary_states: int,
-    matched_code_pairs: int,
-    action_count: int,
-    fit_replicas: int,
-    evaluation_replicas: int,
-    continuation_horizon: int,
-    probe_steps: int,
-) -> int:
-    """Exact attempted transitions for independent r3 audit anchors."""
-
-    values = (
-        milestone_count,
         ordinary_states,
         matched_code_pairs,
         action_count,
         fit_replicas,
-        evaluation_replicas,
         continuation_horizon,
         probe_steps,
     )
-    if any(int(value) < 0 for value in values):
-        raise ValueError("Audit-anchor budget factors cannot be negative.")
+    if any(int(value) < 0 for value in factors):
+        raise ValueError("V6 anchor budget factors cannot be negative.")
     worlds = int(ordinary_states) + 2 * int(matched_code_pairs)
     continuation = (
-        worlds
+        int(trigger_count)
+        * worlds
         * int(action_count)
-        * (int(fit_replicas) + int(evaluation_replicas))
+        * int(fit_replicas)
         * int(continuation_horizon)
     )
-    evidence = 2 * int(matched_code_pairs) * int(probe_steps)
-    return int(milestone_count) * (continuation + evidence)
+    probes = (
+        int(trigger_count)
+        * 2
+        * int(matched_code_pairs)
+        * int(probe_steps)
+    )
+    return continuation, probes
 
 
 __all__ = [
     "ResourceLedger",
     "aggregate_resource_ledgers",
     "delta_anchor_attempted_steps",
-    "r3_audit_anchor_attempted_steps",
-    "r3_training_anchor_attempted_steps",
+    "v6_anchor_attempted_steps",
     "gpu_device_count",
     "gpu_hours_for_wall_seconds",
     "configure_bundled_cuda_toolchain",

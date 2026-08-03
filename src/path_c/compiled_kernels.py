@@ -1,9 +1,4 @@
-"""Stable CUDA executable boundaries for DELTA-ZSC training.
-
-The helpers in this module change dispatch and materialization only.  Model
-parameters, random keys, minibatch order, optimizer state transitions, losses,
-and simulator budgets remain inputs to the same mathematical operations.
-"""
+"""Stable CUDA executable boundaries for the V6 end-to-end update."""
 
 from __future__ import annotations
 
@@ -12,9 +7,15 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import re
 from typing import Any, Callable, Mapping
 
+from .gradient_routing import keep_owned_gradients
+from .raw_q import (
+    anchor_all_action_loss,
+    decision_equivalence_loss,
+    rollout_retrace_loss,
+)
+from .response_targets import response_auxiliary_objective
 from .runner import (
     DECISION_REGRET_STATE_CHUNK_SIZE,
     collect_rollout,
@@ -22,22 +23,12 @@ from .runner import (
     finalize_decision_regret_shaping,
     target_context_sequence,
 )
-from .gradient_routing import (
-    keep_owned_gradients,
-    route_response_with_pcgrad,
-)
-from .raw_q import (
-    anchor_all_action_loss,
-    q_policy_coupling_loss,
-    rollout_retrace_loss,
-)
-from .response_targets import response_auxiliary_objective
-from .training import scan_training_updates
-from .types import AuxiliaryCoreState
+from .training import belief_objective_gradients, scan_training_updates
+from .types import TrainingCoreState
 
 
 class CompiledMemoryLimitError(RuntimeError):
-    """Raised before execution when XLA's conservative memory bound is too high."""
+    pass
 
 
 def _argument_signature(arguments: tuple[Any, ...]) -> str:
@@ -55,9 +46,7 @@ def _argument_signature(arguments: tuple[Any, ...]) -> str:
             for leaf in leaves
         ],
     }
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 def _memory_analysis_bytes(compiled: Any) -> Mapping[str, int]:
@@ -71,9 +60,6 @@ def _memory_analysis_bytes(compiled: Any) -> Mapping[str, int]:
         "output_size_in_bytes",
         "temp_size_in_bytes",
         "alias_size_in_bytes",
-        "host_argument_size_in_bytes",
-        "host_output_size_in_bytes",
-        "host_temp_size_in_bytes",
     ):
         value = getattr(analysis, name, None)
         if value is not None:
@@ -91,17 +77,13 @@ def _memory_analysis_bytes(compiled: Any) -> Mapping[str, int]:
 
 @dataclass
 class CompiledCallable:
-    """Compile once per abstract signature and expose auditable metadata."""
-
     name: str
     function: Callable[..., Any]
     donate_argnums: tuple[int, ...] = ()
     memory_limit_bytes: int | None = None
     _jitted: Any = field(init=False, repr=False)
     _compiled: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
-    _metadata: dict[str, Mapping[str, Any]] = field(
-        default_factory=dict, init=False, repr=False
-    )
+    _metadata: dict[str, Mapping[str, Any]] = field(default_factory=dict, init=False)
     last_call_compiled: bool = field(default=False, init=False)
     last_signature: str | None = field(default=None, init=False)
     selected_microbatch_size: int | None = field(default=None, init=False)
@@ -109,10 +91,7 @@ class CompiledCallable:
     def __post_init__(self) -> None:
         import jax
 
-        self._jitted = jax.jit(
-            self.function,
-            donate_argnums=self.donate_argnums,
-        )
+        self._jitted = jax.jit(self.function, donate_argnums=self.donate_argnums)
 
     def executable(self, *arguments: Any) -> Any:
         signature = _argument_signature(arguments)
@@ -120,30 +99,7 @@ class CompiledCallable:
         self.last_call_compiled = signature not in self._compiled
         if self.last_call_compiled:
             compiled = self._jitted.lower(*arguments).compile()
-            try:
-                runtime = compiled.runtime_executable()
-                fingerprint_value = getattr(runtime, "fingerprint")
-                if callable(fingerprint_value):
-                    fingerprint_value = fingerprint_value()
-                if isinstance(fingerprint_value, bytes):
-                    fingerprint_value = fingerprint_value.hex()
-                if not fingerprint_value:
-                    raise ValueError("empty runtime executable fingerprint")
-                fingerprint = str(fingerprint_value)
-            except Exception:
-                # The code commit and structural signature are recorded beside
-                # this fallback.  Avoid materializing multi-gigabyte HLO text
-                # merely to hash it on runtimes without executable fingerprints.
-                fingerprint = hashlib.sha256(
-                    f"{self.name}:{signature}".encode("utf-8")
-                ).hexdigest()
             memory = dict(_memory_analysis_bytes(compiled))
-            metadata = {
-                "name": self.name,
-                "argument_signature": signature,
-                "executable_fingerprint": fingerprint,
-                "memory_analysis": memory,
-            }
             conservative = memory.get("conservative_device_bytes")
             if (
                 self.memory_limit_bytes is not None
@@ -151,11 +107,25 @@ class CompiledCallable:
                 and conservative > int(self.memory_limit_bytes)
             ):
                 raise CompiledMemoryLimitError(
-                    f"{self.name} requires conservatively {conservative} bytes; "
-                    f"limit={int(self.memory_limit_bytes)}."
+                    f"{self.name} requires {conservative} device bytes; "
+                    f"limit={self.memory_limit_bytes}."
                 )
+            try:
+                executable = compiled.runtime_executable()
+                fingerprint = executable.fingerprint
+                fingerprint = fingerprint() if callable(fingerprint) else fingerprint
+                fingerprint = fingerprint.hex() if isinstance(fingerprint, bytes) else str(fingerprint)
+            except Exception:
+                fingerprint = hashlib.sha256(
+                    f"{self.name}:{signature}".encode()
+                ).hexdigest()
             self._compiled[signature] = compiled
-            self._metadata[signature] = metadata
+            self._metadata[signature] = {
+                "name": self.name,
+                "argument_signature": signature,
+                "executable_fingerprint": fingerprint,
+                "memory_analysis": memory,
+            }
         return self._compiled[signature]
 
     def __call__(self, *arguments: Any) -> Any:
@@ -173,24 +143,19 @@ class CompiledTrainingKernels:
     target_context_sequence: CompiledCallable
     regret_chunk: CompiledCallable
     regret_finalize: CompiledCallable
-    ppo_normal_scan: CompiledCallable
-    raw_q_auxiliary_scan: CompiledCallable
-    response_auxiliary_scan: CompiledCallable
+    ppo_scan: CompiledCallable
+    raw_q_retrace_update: CompiledCallable
+    anchor_head_update: CompiledCallable
+    response_head_update: CompiledCallable
+    belief_rollout_objectives: CompiledCallable
+    belief_anchor_objectives: CompiledCallable
+    belief_apply: CompiledCallable
 
     def metadata(self) -> Mapping[str, Any]:
         return {
-            item.name: list(item.metadata())
-            for item in (
-                self.rollout_minimal,
-                self.rollout_anchor_full,
-                self.rollout_support,
-                self.target_context_sequence,
-                self.regret_chunk,
-                self.regret_finalize,
-                self.ppo_normal_scan,
-                self.raw_q_auxiliary_scan,
-                self.response_auxiliary_scan,
-            )
+            value.name: list(value.metadata())
+            for value in self.__dict__.values()
+            if isinstance(value, CompiledCallable)
         }
 
 
@@ -202,24 +167,19 @@ def configure_persistent_compilation_cache(
     model_structure_fingerprint: str | None = None,
     cache_root: str | Path | None = None,
 ) -> Mapping[str, Any]:
-    """Enable a repository-external persistent cache before first compilation."""
-
     import jax
 
     device = jax.devices()[0]
-    device_kind = str(device.device_kind)
     identity = {
         "repository_commit": str(repository_commit),
         "official_commit": str(official_commit),
         "config_fingerprint": str(config_fingerprint),
         "model_structure_fingerprint": str(model_structure_fingerprint or ""),
         "jax_version": str(jax.__version__),
-        "device_kind": device_kind,
+        "device_kind": str(device.device_kind),
         "platform": str(device.platform),
     }
-    digest = hashlib.sha256(
-        json.dumps(identity, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
     root = (
         Path(cache_root).expanduser()
         if cache_root is not None
@@ -232,11 +192,18 @@ def configure_persistent_compilation_cache(
         jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
     except Exception:
         pass
-    return {
-        **identity,
-        "cache_directory": str(directory),
-        "cache_identity": digest,
-    }
+    return {**identity, "cache_directory": str(directory), "cache_identity": digest}
+
+
+def _apply_optimizer(
+    *, params: Any, optimizer_state: Any, gradients: Any, optimizer: Any
+) -> tuple[Any, Any]:
+    import optax
+
+    updates, next_optimizer_state = optimizer.update(
+        gradients, optimizer_state, params
+    )
+    return optax.apply_updates(params, updates), next_optimizer_state
 
 
 def build_training_kernels(
@@ -246,11 +213,12 @@ def build_training_kernels(
     model_config: Any,
     partner_functions: Any,
     config: Any,
-    optimizer: Any,
+    ppo_optimizer: Any,
     raw_q_optimizer: Any,
     response_optimizer: Any,
+    belief_optimizer: Any,
 ) -> CompiledTrainingKernels:
-    """Build one static executable family for one partner-archive structure."""
+    """Build a finite family of fixed-shape V6 CUDA programs."""
 
     def rollout(mode: str, length: int) -> Callable[..., Any]:
         def execute(
@@ -258,7 +226,8 @@ def build_training_kernels(
             params: Any,
             target_params: Any,
             partner_parameters: Any,
-            gate_values: Any,
+            context_dropout_probability_value: Any,
+            context_dropout_root: Any,
             official_shaping_factor: Any,
         ) -> Any:
             return collect_rollout(
@@ -271,7 +240,8 @@ def build_training_kernels(
                 model_config=model_config,
                 partner_functions=partner_functions,
                 partner_parameters=partner_parameters,
-                gate_values=gate_values,
+                context_dropout_probability_value=context_dropout_probability_value,
+                context_dropout_root=context_dropout_root,
                 official_shaping_factor=official_shaping_factor,
                 record_mode=mode,
             )
@@ -279,248 +249,237 @@ def build_training_kernels(
         return execute
 
     def context(target_params: Any, batch: Any) -> Any:
-        return target_context_sequence(
-            model=model,
-            target_params=target_params,
-            batch=batch,
-        )
+        return target_context_sequence(model=model, target_params=target_params, batch=batch)
 
     def regret(
         target_params: Any,
         task_features: Any,
-        mixture_logits: Any,
-        mixture_means: Any,
-        mixture_log_variances: Any,
+        belief_mean: Any,
+        belief_log_standard_deviation: Any,
         sample_keys: Any,
     ) -> Any:
         return decision_regret_chunk(
             model=model,
             target_params=target_params,
             task_features=task_features,
-            mixture_logits=mixture_logits,
-            mixture_means=mixture_means,
-            mixture_log_variances=mixture_log_variances,
+            belief_mean=belief_mean,
+            belief_log_standard_deviation=belief_log_standard_deviation,
             sample_keys=sample_keys,
             posterior_particles=config.model.posterior_particles,
         )
 
-    def finalize(batch: Any, regrets: Any, weight: Any) -> Any:
+    def finalize(
+        batch: Any, regrets: Any, ranges: Any, action_range_ema: Any, effective_steps: Any
+    ) -> Any:
+        import jax
+
+        progress = effective_steps / float(max(config.training.environment_steps, 1))
+        weight = float(config.loss.decision_regret_weight_maximum) * jax.nn.sigmoid(
+            (progress - float(config.loss.decision_regret_schedule_midpoint))
+            / float(config.loss.decision_regret_schedule_temperature)
+        )
         return finalize_decision_regret_shaping(
             batch=batch,
             regrets=regrets,
+            action_ranges=ranges,
+            action_range_ema=action_range_ema,
             gamma=config.ppo.gamma,
             weight=weight,
         )
 
-    def normal_scan(
-        core: Any,
-        batch: Any,
-        schedule: Any,
-        task_trunk_scale: Any,
-        base_actor_scale: Any,
-    ) -> Any:
+    def ppo_scan(core: Any, batch: Any, schedule: Any) -> Any:
         return scan_training_updates(
             model=model,
             core=core,
-            optimizer=optimizer,
+            optimizer=ppo_optimizer,
             batch=batch,
             schedule=schedule,
             config=config,
-            task_trunk_scale=task_trunk_scale,
-            base_actor_scale=base_actor_scale,
         )
 
-    def raw_q_scan(
-        core: AuxiliaryCoreState,
-        target_params: Any,
-        batch: Any,
+    def retrace_update(
+        params: Any, target_params: Any, optimizer_state: Any, batch: Any
+    ) -> tuple[Any, Any, Mapping[str, Any]]:
+        import jax
+
+        def objective(candidate: Any):
+            loss, metrics = rollout_retrace_loss(
+                model=model,
+                params=candidate,
+                target_params=target_params,
+                batch=batch,
+                gamma=config.ppo.gamma,
+            )
+            return float(config.loss.raw_q_weight) * loss, metrics
+
+        (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
+        gradients = keep_owned_gradients(gradients, loss_name="raw_q")
+        next_params, next_state = _apply_optimizer(
+            params=params,
+            optimizer_state=optimizer_state,
+            gradients=gradients,
+            optimizer=raw_q_optimizer,
+        )
+        return next_params, next_state, {**metrics, "raw_q_total": loss}
+
+    def anchor_update(
+        params: Any,
+        optimizer_state: Any,
         anchors: Any,
-        anchor_enabled: Any,
-        q_policy_enabled: Any,
-        calibration_error: Any,
-        minimum_margin: Any,
-    ) -> tuple[AuxiliaryCoreState, Mapping[str, Any], Any]:
+        replay_weights: Any,
+    ) -> tuple[Any, Any, Mapping[str, Any]]:
         import jax
-        import jax.numpy as jnp
-        import optax
 
-        def one(current: AuxiliaryCoreState, unused: Any) -> tuple[Any, Any]:
-            del unused
-
-            def decision_objective(candidate: Any) -> tuple[Any, Mapping[str, Any]]:
-                retrace, retrace_metrics = rollout_retrace_loss(
-                    model=model,
-                    params=candidate,
-                    target_params=target_params,
-                    batch=batch,
-                    gamma=config.ppo.gamma,
-                )
-                anchor, anchor_metrics = anchor_all_action_loss(
-                    model=model, params=candidate, anchors=anchors
-                )
-                total = (
-                    float(config.loss.raw_q_weight) * retrace
-                    + jnp.asarray(anchor_enabled, dtype=jnp.float32) * anchor
-                )
-                return total, {
-                    **retrace_metrics,
-                    **anchor_metrics,
-                    "raw_q_decision_total": total,
-                }
-
-            def policy_objective(candidate: Any) -> tuple[Any, Mapping[str, Any]]:
-                q_policy, q_policy_metrics = q_policy_coupling_loss(
-                    model=model,
-                    params=candidate,
-                    batch=batch,
-                    temperature=config.loss.q_policy_temperature,
-                    calibration_error=calibration_error,
-                    minimum_margin=minimum_margin,
-                )
-                total = (
-                    jnp.asarray(q_policy_enabled, dtype=jnp.float32)
-                    * float(config.loss.q_policy_weight)
-                    * q_policy
-                )
-                return total, {
-                    **q_policy_metrics,
-                    "q_policy_auxiliary_total": total,
-                }
-
-            (decision_loss, decision_metrics), decision_gradients = jax.value_and_grad(
-                decision_objective, has_aux=True
-            )(current.params)
-            (policy_loss, policy_metrics), policy_gradients = jax.value_and_grad(
-                policy_objective, has_aux=True
-            )(current.params)
-            decision_gradients = keep_owned_gradients(
-                decision_gradients, loss_name="raw_q"
+        def objective(candidate: Any):
+            loss, metrics = anchor_all_action_loss(
+                model=model,
+                params=candidate,
+                anchors=anchors,
+                replay_weights=replay_weights,
             )
-            policy_gradients = keep_owned_gradients(
-                policy_gradients, loss_name="q_policy"
-            )
-            from .gradient_routing import sum_gradient_trees
+            return float(config.loss.counterfactual_weight) * loss, metrics
 
-            gradients = sum_gradient_trees(decision_gradients, policy_gradients)
-            updates, optimizer_state = raw_q_optimizer.update(
-                gradients, current.raw_q_optimizer_state, current.params
-            )
-            params = optax.apply_updates(current.params, updates)
-            updated = current._replace(
-                params=params,
-                raw_q_optimizer_state=optimizer_state,
-                raw_q_optimizer_step=current.raw_q_optimizer_step + 1,
-            )
-            metrics = {
-                **decision_metrics,
-                **policy_metrics,
-                "raw_q_auxiliary_total": decision_loss + policy_loss,
-            }
-            return updated, (metrics, decision_gradients)
-
-        final, (metrics, decision_gradients) = jax.lax.scan(
-            one,
-            core,
-            xs=None,
-            length=int(config.loss.raw_q_updates_per_outer_update),
+        (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
+        gradients = keep_owned_gradients(gradients, loss_name="counterfactual")
+        next_params, next_state = _apply_optimizer(
+            params=params,
+            optimizer_state=optimizer_state,
+            gradients=gradients,
+            optimizer=raw_q_optimizer,
         )
-        latest_decision_gradients = jax.tree_util.tree_map(
-            lambda value: value[-1], decision_gradients
-        )
-        return final, metrics, latest_decision_gradients
+        return next_params, next_state, {**metrics, "counterfactual_total": loss}
 
-    def response_scan(
-        core: AuxiliaryCoreState,
-        batch: Any,
-        decision_gradients: Any,
-    ) -> tuple[AuxiliaryCoreState, Mapping[str, Any]]:
+    def response_update(
+        params: Any, optimizer_state: Any, batch: Any
+    ) -> tuple[Any, Any, Mapping[str, Any]]:
         import jax
-        import optax
 
-        def one(current: AuxiliaryCoreState, unused: Any) -> tuple[Any, Any]:
-            del unused
-
-            def objective(candidate: Any) -> tuple[Any, Mapping[str, Any]]:
-                return response_auxiliary_objective(
-                    model=model, params=candidate, batch=batch
-                )
-
-            (unused_loss, metrics), gradients = jax.value_and_grad(
-                objective, has_aux=True
-            )(current.params)
-            del unused_loss
-            gradients = keep_owned_gradients(gradients, loss_name="response")
-            gradients, routing = route_response_with_pcgrad(
-                gradients, decision_gradients
+        def objective(candidate: Any):
+            loss, metrics = response_auxiliary_objective(
+                model=model, params=candidate, batch=batch
             )
-            updates, optimizer_state = response_optimizer.update(
-                gradients, current.response_optimizer_state, current.params
-            )
-            params = optax.apply_updates(current.params, updates)
-            return current._replace(
-                params=params,
-                response_optimizer_state=optimizer_state,
-                response_optimizer_step=current.response_optimizer_step + 1,
-            ), {**metrics, **routing}
+            return float(config.loss.response_weight) * loss, metrics
 
-        return jax.lax.scan(
-            one,
-            core,
-            xs=None,
-            length=int(config.loss.response_updates_per_outer_update),
+        (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
+        gradients = keep_owned_gradients(gradients, loss_name="response")
+        next_params, next_state = _apply_optimizer(
+            params=params,
+            optimizer_state=optimizer_state,
+            gradients=gradients,
+            optimizer=response_optimizer,
+        )
+        return next_params, next_state, {**metrics, "response_total": loss}
+
+    def belief_rollout_gradients(
+        params: Any, target_params: Any, batch: Any
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        import jax
+
+        values, gradients = belief_objective_gradients(
+            model=model, params=params, batch=batch, config=config
+        )
+
+        def raw_objective(candidate: Any):
+            return rollout_retrace_loss(
+                model=model,
+                params=candidate,
+                target_params=target_params,
+                batch=batch,
+                gamma=config.ppo.gamma,
+            )[0]
+
+        def response_objective(candidate: Any):
+            return response_auxiliary_objective(
+                model=model, params=candidate, batch=batch
+            )[0]
+
+        for name, objective in (
+            ("raw_q", raw_objective),
+            ("response", response_objective),
+        ):
+            values[name], gradients[name] = jax.value_and_grad(objective)(params)
+        return values, gradients
+
+    def belief_anchor_gradients(
+        params: Any, anchors: Any, replay_weights: Any, advantage_scale: Any
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+        import jax
+
+        def cf_objective(candidate: Any):
+            return anchor_all_action_loss(
+                model=model,
+                params=candidate,
+                anchors=anchors,
+                replay_weights=replay_weights,
+            )[0]
+
+        def de_objective(candidate: Any):
+            return decision_equivalence_loss(
+                model=model,
+                params=candidate,
+                anchors=anchors,
+                advantage_scale=advantage_scale,
+                replay_weights=replay_weights,
+            )[0]
+
+        values: dict[str, Any] = {}
+        gradients: dict[str, Any] = {}
+        for name, objective in (
+            ("counterfactual", cf_objective),
+            ("decision_equivalence", de_objective),
+        ):
+            values[name], gradients[name] = jax.value_and_grad(objective)(params)
+        return values, gradients
+
+    def apply_belief(
+        params: Any, optimizer_state: Any, gradients: Any
+    ) -> tuple[Any, Any]:
+        from .gradient_routing import select_gradient_prefixes
+
+        return _apply_optimizer(
+            params=params,
+            optimizer_state=optimizer_state,
+            gradients=select_gradient_prefixes(gradients, ("belief_encoder",)),
+            optimizer=belief_optimizer,
         )
 
     return CompiledTrainingKernels(
         rollout_minimal=CompiledCallable(
-            "rollout_minimal",
-            rollout("minimal", int(config.training.rollout_length)),
+            "rollout_minimal", rollout("minimal", config.training.rollout_length)
         ),
         rollout_anchor_full=CompiledCallable(
-            "rollout_anchor_full",
-            rollout("anchor_full", int(config.training.rollout_length)),
+            "rollout_anchor_full", rollout("anchor_full", config.training.rollout_length)
         ),
         rollout_support=CompiledCallable(
-            "rollout_support",
-            rollout("support", int(config.environment.episode_steps)),
+            "rollout_support", rollout("support", config.environment.episode_steps)
         ),
         target_context_sequence=CompiledCallable("target_context_sequence", context),
         regret_chunk=CompiledCallable("regret_chunk", regret),
         regret_finalize=CompiledCallable("regret_finalize", finalize),
-        ppo_normal_scan=CompiledCallable(
-            "ppo_normal_scan", normal_scan, donate_argnums=(0,)
+        # The frozen EMA target is consumed again by dense raw-Q immediately
+        # after PPO.  Donating the containing core would invalidate those
+        # aliased buffers on CUDA, so this boundary deliberately does not
+        # donate its input tree.
+        ppo_scan=CompiledCallable("ppo_scan", ppo_scan),
+        raw_q_retrace_update=CompiledCallable(
+            "raw_q_retrace_update", retrace_update
         ),
-        raw_q_auxiliary_scan=CompiledCallable(
-            "raw_q_auxiliary_scan", raw_q_scan, donate_argnums=(0,)
+        anchor_head_update=CompiledCallable("anchor_head_update", anchor_update),
+        response_head_update=CompiledCallable("response_head_update", response_update),
+        belief_rollout_objectives=CompiledCallable(
+            "belief_rollout_objectives", belief_rollout_gradients
         ),
-        response_auxiliary_scan=CompiledCallable(
-            "response_auxiliary_scan", response_scan, donate_argnums=(0,)
+        belief_anchor_objectives=CompiledCallable(
+            "belief_anchor_objectives", belief_anchor_gradients
         ),
+        belief_apply=CompiledCallable("belief_apply", apply_belief),
     )
 
 
 def build_anchor_chunk_kernel(
-    *,
-    functions: Any,
-    config: Any,
-    memory_limit_bytes: int,
-    mode: str = "training",
+    *, functions: Any, config: Any, memory_limit_bytes: int
 ) -> CompiledCallable:
-    """Build the fixed-shape continuation executable with dynamic parameters."""
-
     from .counterfactual_anchor import collect_counterfactual_anchors
-
-    if mode == "training":
-        fit_replicas = int(config.anchors.fit_replicas)
-        evaluation_replicas = 0
-        continuation_horizon = int(config.anchors.continuation_horizon)
-        kernel_name = "training_anchor_continuation_chunk"
-    elif mode == "audit":
-        fit_replicas = int(config.anchors.audit_fit_replicas)
-        evaluation_replicas = int(config.anchors.audit_evaluation_replicas)
-        continuation_horizon = int(config.anchors.audit_continuation_horizon)
-        kernel_name = "audit_anchor_continuation_chunk"
-    else:
-        raise ValueError("Anchor kernel mode must be training or audit.")
 
     def execute(
         runtime: Any,
@@ -546,14 +505,15 @@ def build_anchor_chunk_kernel(
             partner_run_ids=partner_run_ids,
             functions=functions,
             action_count=6,
-            fit_replicas=fit_replicas,
-            evaluation_replicas=evaluation_replicas,
-            continuation_horizon=continuation_horizon,
+            fit_replicas=config.anchors.fit_replicas,
+            evaluation_replicas=0,
+            continuation_horizon=config.anchors.continuation_horizon,
+            discount=config.ppo.gamma,
             runtime=runtime,
         )
 
     return CompiledCallable(
-        kernel_name,
+        "anchor_continuation_chunk",
         execute,
         memory_limit_bytes=int(memory_limit_bytes),
     )
@@ -565,11 +525,10 @@ def attach_chunked_regret_with_kernels(
     batch: Any,
     target_params: Any,
     key: Any,
-    weight: float = 0.0,
+    action_range_ema: Any,
+    effective_steps: Any,
     state_chunk_size: int = DECISION_REGRET_STATE_CHUNK_SIZE,
 ) -> tuple[Any, Mapping[str, Any]]:
-    """Dispatch a fixed critic chunk 17 times for the formal 257x256 shape."""
-
     import jax
     import jax.numpy as jnp
 
@@ -580,51 +539,41 @@ def attach_chunked_regret_with_kernels(
     chunk_size = int(state_chunk_size)
     padded_count = ((state_count + chunk_size - 1) // chunk_size) * chunk_size
     padding = padded_count - state_count
-    real_keys = jax.random.split(key, state_count)
-    padded_keys = jnp.concatenate(
-        (real_keys, jnp.zeros((padding, 2), dtype=real_keys.dtype)), axis=0
+    keys = jnp.concatenate(
+        (
+            jax.random.split(key, state_count),
+            jnp.zeros((padding, 2), dtype=jnp.uint32),
+        ),
+        axis=0,
     )
 
     def flatten_pad(value: Any) -> Any:
         array = jnp.asarray(value)
-        flat = array.reshape((state_count,) + array.shape[len(prefix) :])
-        if padding:
-            flat = jnp.concatenate(
-                (
-                    flat,
-                    jnp.zeros((padding,) + flat.shape[1:], dtype=flat.dtype),
-                ),
-                axis=0,
-            )
-        return flat
+        flat = array.reshape((state_count,) + array.shape[len(prefix):])
+        return jnp.pad(flat, ((0, padding),) + ((0, 0),) * (flat.ndim - 1))
 
-    flat_values = (
+    flat = (
         flatten_pad(context.task_features),
-        flatten_pad(context.mixture_logits),
-        flatten_pad(context.mixture_means),
-        flatten_pad(context.mixture_log_variances),
+        flatten_pad(context.belief_mean),
+        flatten_pad(context.belief_log_standard_deviation),
     )
-    chunks = []
+    regret_chunks, range_chunks = [], []
     for start in range(0, padded_count, chunk_size):
         stop = start + chunk_size
-        chunks.append(
-            kernels.regret_chunk(
-                target_params,
-                flat_values[0][start:stop],
-                flat_values[1][start:stop],
-                flat_values[2][start:stop],
-                flat_values[3][start:stop],
-                padded_keys[start:stop],
-            )
+        regret, action_range = kernels.regret_chunk(
+            target_params,
+            flat[0][start:stop],
+            flat[1][start:stop],
+            flat[2][start:stop],
+            keys[start:stop],
         )
-    regrets = jnp.concatenate(chunks, axis=0)[:state_count].reshape(prefix)
+        regret_chunks.append(regret)
+        range_chunks.append(action_range)
+    regrets = jnp.concatenate(regret_chunks)[:state_count].reshape(prefix)
+    ranges = jnp.concatenate(range_chunks)[:state_count].reshape(prefix)
     return kernels.regret_finalize(
-        batch, regrets, jnp.asarray(weight, dtype=jnp.float32)
+        batch, regrets, ranges, action_range_ema, effective_steps
     )
-
-
-def safe_kernel_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
 
 
 __all__ = [

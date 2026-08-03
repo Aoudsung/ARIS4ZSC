@@ -1,8 +1,7 @@
-"""Complete-episode partner-generator records and admission safeguards."""
+"""Complete-episode records and continuously weighted V6 generator PPO."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, NamedTuple
 
 import numpy as np
@@ -10,7 +9,6 @@ import numpy as np
 
 GENERATOR_EPISODES_PER_UPDATE = 32
 GENERATOR_EPISODE_STEPS = 400
-GENERATOR_TRUST_REGION_KL = 0.03
 
 
 class PartnerEpisodeBatch(NamedTuple):
@@ -21,19 +19,32 @@ class PartnerEpisodeBatch(NamedTuple):
     dones: Any
     codes: Any
     behavior_log_probabilities: Any
+    behavior_values: Any
     initial_carries: Any
     parameter_version_ids: Any
     valid_mask: Any
+    ego_action_signatures: Any
+
+
+class ExternalEpisodeReturns(NamedTuple):
+    raw_returns: Any
+    members: Any
 
 
 def validate_complete_episode_batch(batch: PartnerEpisodeBatch) -> None:
-    arrays = tuple(np.asarray(value) for value in batch[:7])
-    time_batch = arrays[1].shape
+    time_batch = np.asarray(batch.actions).shape
     if len(time_batch) != 2:
         raise ValueError("Generator episode actions must be [time, episode].")
     if time_batch[0] != GENERATOR_EPISODE_STEPS:
-        raise ValueError("Generator qualification requires complete 400-step episodes.")
-    for value in arrays[2:5] + arrays[6:7]:
+        raise ValueError("Generator training requires complete 400-step episodes.")
+    for value in (
+        batch.raw_rewards,
+        batch.official_shaped_rewards,
+        batch.dones,
+        batch.behavior_log_probabilities,
+        batch.behavior_values,
+    ):
+        value = np.asarray(value)
         if value.shape != time_batch:
             raise ValueError("Generator episode transition axes differ.")
     codes = np.asarray(batch.codes)
@@ -45,6 +56,9 @@ def validate_complete_episode_batch(batch: PartnerEpisodeBatch) -> None:
     valid = np.asarray(batch.valid_mask, dtype=bool)
     if valid.shape != time_batch:
         raise ValueError("Generator valid mask axes differ.")
+    signatures = np.asarray(batch.ego_action_signatures)
+    if signatures.shape[:2] != time_batch or signatures.shape[-1] != 6:
+        raise ValueError("Generator ego decision signatures are misaligned.")
 
     for episode in range(time_batch[1]):
         active = np.flatnonzero(valid[:, episode])
@@ -76,36 +90,43 @@ def lower_tail_cvar(values: Iterable[float], *, level: float = 0.2) -> float:
     return float(np.mean(sample[:count]))
 
 
-@dataclass(frozen=True, slots=True)
-class GeneratorAdmission:
-    competence_passed: bool
-    signature_variance_passed: bool
-    oracle_code_lift_passed: bool
-    stable_action_regions: int
-    trust_region_kl: float
-    behavior_kl: float = 0.0
-    interpolation_uniform_kl: float = 0.0
-    interpolation_uniform_kl_minimum: float = 0.0
-    delivery_noninferiority_margin: float = 20.0
-    mean_noninferiority_lcb: float = float("-inf")
-    cvar_noninferiority_lcb: float = float("-inf")
+def lower_tail_cvar_jax(values: Any, *, level: float = 0.2) -> Any:
+    import jax.numpy as jnp
 
-    @property
-    def passed(self) -> bool:
-        return bool(
-            self.competence_passed
-            and self.signature_variance_passed
-            and self.oracle_code_lift_passed
-            and self.stable_action_regions >= 2
-            and self.trust_region_kl <= GENERATOR_TRUST_REGION_KL
-            and self.behavior_kl <= 0.05
-            and self.interpolation_uniform_kl
-            >= self.interpolation_uniform_kl_minimum
-            and self.mean_noninferiority_lcb
-            >= -self.delivery_noninferiority_margin
-            and self.cvar_noninferiority_lcb
-            >= -self.delivery_noninferiority_margin
-        )
+    sample = jnp.sort(jnp.asarray(values, dtype=jnp.float32))
+    count = max(int(np.ceil(float(level) * int(sample.shape[0]))), 1)
+    return jnp.mean(sample[:count])
+
+
+def generator_weight_schedule(
+    progress: Any, *, maximum_probability: float = 0.75, ramp_fraction: float = 0.30
+) -> tuple[Any, Any, Any]:
+    import jax.numpy as jnp
+
+    rho = float(maximum_probability) * jnp.clip(
+        jnp.asarray(progress, dtype=jnp.float32) / float(ramp_fraction), 0.0, 1.0
+    )
+    fraction = rho / float(maximum_probability)
+    return rho, 1.0 - fraction, fraction
+
+
+def update_competence_dual(
+    multiplier: Any,
+    *,
+    reference_cvar: Any,
+    generator_cvar: Any,
+    learning_rate: float = 0.01,
+    maximum: float = 10.0,
+) -> Any:
+    import jax.numpy as jnp
+
+    return jnp.clip(
+        jnp.asarray(multiplier, dtype=jnp.float32)
+        + float(learning_rate)
+        * (jnp.asarray(reference_cvar) - jnp.asarray(generator_cvar)),
+        0.0,
+        float(maximum),
+    )
 
 
 def generator_ppo_objective(
@@ -114,21 +135,28 @@ def generator_ppo_objective(
     new_values: Any,
     actions: Any,
     behavior_log_probabilities: Any,
+    behavior_values: Any,
     official_shaped_rewards: Any,
     dones: Any,
     valid_mask: Any,
     gamma: float,
     gae_lambda: float,
     clip_epsilon: float,
+    value_clip_epsilon: float,
     value_weight: float,
     entropy_weight: float,
+    normalize_advantages: bool,
     diversity_episode_bonus: Any | None = None,
+    imitation_loss: Any = 0.0,
+    imitation_weight: Any = 0.0,
+    smoothness_loss: Any = 0.0,
+    smoothness_weight: Any = 0.0,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Official-shaped recurrent PPO on complete generator episodes.
 
-    Raw return is deliberately absent.  It is reserved for competence and
-    admission.  A diversity bonus may be broadcast to the final valid step of
-    each episode only after C1/C2 qualify decision signatures.
+    Raw return is deliberately absent from the policy-gradient reward.  It is
+    used continuously by the competence dual.  A decision-diversity bonus is
+    broadcast to the final valid step with a smooth training-time schedule.
     """
 
     import jax
@@ -138,12 +166,16 @@ def generator_ppo_objective(
     values = jnp.asarray(new_values, dtype=jnp.float32)
     selected = jnp.asarray(actions, dtype=jnp.int32)
     old_logp = jnp.asarray(behavior_log_probabilities, dtype=jnp.float32)
+    old_values = jnp.asarray(behavior_values, dtype=jnp.float32)
     reward = jnp.asarray(official_shaped_rewards, dtype=jnp.float32)
     terminal = jnp.asarray(dones, dtype=jnp.bool_)
     mask = jnp.asarray(valid_mask, dtype=jnp.float32)
     if logits.shape[:-1] != selected.shape or values.shape != selected.shape:
         raise ValueError("Generator PPO axes differ.")
-    if any(jnp.asarray(value).shape != selected.shape for value in (old_logp, reward, terminal, mask)):
+    if any(
+        jnp.asarray(value).shape != selected.shape
+        for value in (old_logp, old_values, reward, terminal, mask)
+    ):
         raise ValueError("Generator PPO transition records are misaligned.")
 
     if diversity_episode_bonus is not None:
@@ -167,27 +199,50 @@ def generator_ppo_objective(
     _, reverse_advantage = jax.lax.scan(
         backward,
         (zero, zero),
-        (reward[::-1], values[::-1], terminal[::-1], mask[::-1]),
+        (reward[::-1], old_values[::-1], terminal[::-1], mask[::-1]),
     )
     advantages = jax.lax.stop_gradient(reverse_advantage[::-1])
-    returns = jax.lax.stop_gradient(advantages + values)
+    returns = jax.lax.stop_gradient(advantages + old_values)
     log_probabilities = jax.nn.log_softmax(logits, axis=-1)
     new_logp = jnp.take_along_axis(
         log_probabilities, selected[..., None], axis=-1
     )[..., 0]
     ratio = jnp.exp(new_logp - old_logp)
+    denominator = jnp.maximum(jnp.sum(mask), 1.0)
+    if normalize_advantages:
+        advantage_mean = jnp.sum(mask * advantages) / denominator
+        advantage_variance = (
+            jnp.sum(mask * jnp.square(advantages - advantage_mean)) / denominator
+        )
+        advantages = (advantages - advantage_mean) / (
+            jnp.sqrt(advantage_variance) + 1.0e-8
+        )
     unclipped = ratio * advantages
     clipped = jnp.clip(
         ratio, 1.0 - float(clip_epsilon), 1.0 + float(clip_epsilon)
     ) * advantages
-    denominator = jnp.maximum(jnp.sum(mask), 1.0)
     actor_loss = -jnp.sum(mask * jnp.minimum(unclipped, clipped)) / denominator
-    value_loss = 0.5 * jnp.sum(mask * jnp.square(values - returns)) / denominator
+    clipped_values = old_values + jnp.clip(
+        values - old_values,
+        -float(value_clip_epsilon),
+        float(value_clip_epsilon),
+    )
+    value_error = jnp.maximum(
+        jnp.square(values - returns),
+        jnp.square(clipped_values - returns),
+    )
+    value_loss = 0.5 * jnp.sum(mask * value_error) / denominator
     probabilities = jnp.exp(log_probabilities)
     entropy = -jnp.sum(probabilities * log_probabilities, axis=-1)
     mean_entropy = jnp.sum(mask * entropy) / denominator
     approx_kl = jnp.sum(mask * (old_logp - new_logp)) / denominator
-    total = actor_loss + float(value_weight) * value_loss - float(entropy_weight) * mean_entropy
+    total = (
+        actor_loss
+        + float(value_weight) * value_loss
+        - float(entropy_weight) * mean_entropy
+        + jnp.asarray(imitation_weight) * jnp.asarray(imitation_loss)
+        + jnp.asarray(smoothness_weight) * jnp.asarray(smoothness_loss)
+    )
     return total, {
         "generator_ppo_total": total,
         "generator_actor_loss": actor_loss,
@@ -195,6 +250,9 @@ def generator_ppo_objective(
         "generator_entropy": mean_entropy,
         "generator_approx_kl": approx_kl,
         "generator_valid_transitions": jnp.sum(mask),
+        "generator_imitation_loss": jnp.asarray(imitation_loss),
+        "generator_imitation_weight": jnp.asarray(imitation_weight),
+        "generator_smoothness_loss": jnp.asarray(smoothness_loss),
     }
 
 
@@ -258,7 +316,6 @@ def collect_complete_generator_episodes(
         task_hidden_dim=model_config.task_hidden_dim,
         belief_hidden_dim=model_config.belief_hidden_dim,
         latent_dim=model_config.latent_dim,
-        mixture_components=model_config.mixture_components,
     )
     generator_carry = initial_generator_carry(
         episode_count, int(generator.hidden_dim)
@@ -281,11 +338,11 @@ def collect_complete_generator_episodes(
             {"params": ego_params},
             policy_state,
             ego_observation,
-            jnp.zeros((episode_count,), dtype=jnp.float32),
+            jnp.zeros((episode_count,), dtype=jnp.bool_),
             method=model.step,
         )
         ego_action = jax.vmap(jax.random.categorical)(
-            ego_keys, ego_output.base_logits
+            ego_keys, ego_output.policy_logits
         )
         next_partner_carry, generator_output = generator.apply(
             {"params": generator_params},
@@ -348,8 +405,14 @@ def collect_complete_generator_episodes(
             dones,
             jnp.broadcast_to(codes, (episode_count, codes.shape[-1])),
             generator_output.log_probability,
-            jnp.full((episode_count,), int(parameter_version_id), dtype=jnp.int32),
+            generator_output.value,
+            jnp.broadcast_to(
+                jnp.asarray(parameter_version_id, dtype=jnp.int32),
+                (episode_count,),
+            ),
             is_active,
+            ego_output.action_values
+            - jnp.mean(ego_output.action_values, axis=-1, keepdims=True),
         )
         return next_carry, row
 
@@ -374,8 +437,10 @@ def collect_complete_generator_episodes(
         dones,
         recorded_codes,
         behavior_log_probabilities,
+        behavior_values,
         versions,
         valid_mask,
+        ego_action_signatures,
     ) = rows
     return PartnerEpisodeBatch(
         observations=observations,
@@ -385,46 +450,132 @@ def collect_complete_generator_episodes(
         dones=dones,
         codes=recorded_codes,
         behavior_log_probabilities=behavior_log_probabilities,
+        behavior_values=behavior_values,
         initial_carries=initial_carry,
         parameter_version_ids=versions,
         valid_mask=valid_mask,
+        ego_action_signatures=ego_action_signatures,
     )
 
 
-def admitted_source_probabilities(consecutive_passes: int) -> tuple[float, float, float]:
-    count = int(consecutive_passes)
-    if count <= 0:
-        return 0.0, 0.0, 1.0
-    if count == 1:
-        return 0.125, 0.125, 0.75
-    if count < 4:
-        return 0.25, 0.25, 0.50
-    return 0.50, 0.25, 0.25
+def collect_complete_external_episodes(
+    *,
+    environment: Any,
+    model: Any,
+    ego_params: Any,
+    model_config: Any,
+    external_pool: Any,
+    key: Any,
+) -> ExternalEpisodeReturns:
+    """Collect one complete frozen-external episode per vector lane."""
 
+    import jax
+    import jax.numpy as jnp
 
-def rollback_unqualified_generator(
-    candidate_params: Any,
-    last_qualified_params: Any,
-    admission: GeneratorAdmission,
-) -> Any:
-    del candidate_params
-    if admission.passed:
-        raise ValueError("Passed candidates must be committed, not rolled back.")
-    return last_qualified_params
+    from .counterfactual_anchor import tree_select
+    from .model import initial_policy_state
+    from .runner import observe_policy_after_transition
+
+    count = int(environment.num_envs)
+    if int(environment.episode_steps) != GENERATOR_EPISODE_STEPS:
+        raise ValueError("External reference episodes must use 400 Official steps.")
+    reset_key, member_key, scan_key = jax.random.split(key, 3)
+    environment_state, observations = environment.reset(reset_key)
+    members = external_pool.sample_members(member_key, count)
+    external_carry = external_pool.initial_carry(count)
+    ego_state = initial_policy_state(
+        batch_size=count,
+        observation_shape=tuple(environment.observation_shape),
+        action_count=6,
+        task_hidden_dim=model_config.task_hidden_dim,
+        belief_hidden_dim=model_config.belief_hidden_dim,
+        latent_dim=model_config.latent_dim,
+    )
+    roles = (jnp.arange(count) >= count // 2).astype(jnp.int32)
+    active = jnp.ones((count,), dtype=jnp.bool_)
+    starts = jnp.ones((count,), dtype=jnp.bool_)
+    returns = jnp.zeros((count,), dtype=jnp.float32)
+
+    def one(carry: Any, time_index: Any):
+        env_state, joint_obs, policy_state, partner_carry, episode_start, live, total = carry
+        lane = jnp.arange(count, dtype=jnp.int32)
+        ego_obs = joint_obs[lane, roles]
+        partner_obs = joint_obs[lane, 1 - roles]
+        root = jax.random.fold_in(scan_key, time_index)
+        ego_root, partner_root, environment_root = jax.random.split(root, 3)
+        ego_keys = jax.random.split(ego_root, count)
+        partner_keys = jax.random.split(partner_root, count)
+        stepped, output = model.apply(
+            {"params": ego_params},
+            policy_state,
+            ego_obs,
+            jnp.zeros((count,), dtype=jnp.bool_),
+            method=model.step,
+        )
+        ego_action = jax.vmap(jax.random.categorical)(ego_keys, output.policy_logits)
+        partner_action, next_partner_carry = external_pool.step_with_keys(
+            members, partner_obs, partner_carry, episode_start, partner_keys
+        )
+        ego_first = jnp.stack((ego_action, partner_action), axis=-1)
+        partner_first = jnp.stack((partner_action, ego_action), axis=-1)
+        actions = jnp.where(roles[:, None] == 0, ego_first, partner_first)
+        next_env, next_obs, unused, dones, info = environment.step(
+            env_state, actions, environment_root
+        )
+        del unused
+        raw = info["raw_rewards_by_agent"][lane, 1 - roles]
+        terminal = info["terminal_observations"]
+        mask = dones.reshape(dones.shape + (1,) * (ego_obs.ndim - 1))
+        ego_next = jnp.where(mask, terminal[lane, roles], next_obs[lane, roles])
+        next_ego = observe_policy_after_transition(
+            stepped_state=stepped,
+            action=ego_action,
+            reward=raw,
+            done=dones,
+            next_observation=ego_next,
+            model_config=model_config,
+        )
+        next_live = live & ~dones
+        candidate = (
+            next_env,
+            next_obs,
+            next_ego,
+            next_partner_carry,
+            dones,
+            next_live,
+            total + jnp.where(live, raw, 0.0),
+        )
+        return tree_select(live, candidate, carry), None
+
+    final, _ = jax.lax.scan(
+        one,
+        (
+            environment_state,
+            observations,
+            ego_state,
+            external_carry,
+            starts,
+            active,
+            returns,
+        ),
+        jnp.arange(GENERATOR_EPISODE_STEPS, dtype=jnp.int32),
+    )
+    return ExternalEpisodeReturns(final[-1], members)
 
 
 __all__ = [
     "GENERATOR_EPISODES_PER_UPDATE",
     "GENERATOR_EPISODE_STEPS",
-    "GENERATOR_TRUST_REGION_KL",
-    "GeneratorAdmission",
     "PartnerEpisodeBatch",
-    "admitted_source_probabilities",
+    "ExternalEpisodeReturns",
     "complete_episode_raw_returns",
     "collect_complete_generator_episodes",
+    "collect_complete_external_episodes",
     "generator_ppo_objective",
+    "generator_weight_schedule",
     "lower_tail_cvar",
-    "rollback_unqualified_generator",
+    "lower_tail_cvar_jax",
     "source_logit_distillation_loss",
+    "update_competence_dual",
     "validate_complete_episode_batch",
 ]

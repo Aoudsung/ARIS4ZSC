@@ -112,11 +112,16 @@ def extract_partner_response_targets(
         raise ValueError("Partner response observations have incompatible shapes.")
     height, width, channels = current.shape[-3:]
     if (height, width) != (5, 5):
-        raise ValueError("r3 response contract is registered for a 5x5 Official view.")
+        raise ValueError("V6 response contract is registered for a 5x5 Official view.")
     planes.validate(channels)
 
+    previous_visible_plane = previous[..., planes.visibility_channel] > 0
     visible_plane = current[..., planes.visibility_channel] > 0
+    previous_flat_visible = previous_visible_plane.reshape(
+        previous_visible_plane.shape[:-2] + (height * width,)
+    )
     flat_visible = visible_plane.reshape(visible_plane.shape[:-2] + (height * width,))
+    previous_visible = jnp.any(previous_flat_visible, axis=-1)
     visible = jnp.any(flat_visible, axis=-1)
     position = jnp.argmax(flat_visible.astype(jnp.int32), axis=-1)
     position = jnp.where(visible, position, height * width)
@@ -133,10 +138,20 @@ def extract_partner_response_targets(
         jnp.rint(inventory_scores), 0, PARTNER_INVENTORY_FACTOR_CLASSES - 1
     )
 
-    before_interaction = previous[..., list(planes.interaction_channels)]
-    after_interaction = current[..., list(planes.interaction_channels)]
-    interaction_change = jnp.any(before_interaction != after_interaction, axis=(-3, -2, -1))
-    interaction_change = jnp.logical_and(interaction_change, visible)
+    before_interaction = jnp.sum(
+        previous[..., list(planes.interaction_channels)]
+        * previous_visible_plane[..., None],
+        axis=(-3, -2),
+    )
+    after_interaction = jnp.sum(
+        current[..., list(planes.interaction_channels)]
+        * visible_plane[..., None],
+        axis=(-3, -2),
+    )
+    interaction_change = jnp.any(
+        jnp.rint(before_interaction) != jnp.rint(after_interaction), axis=-1
+    )
+    interaction_change = previous_visible & visible & interaction_change
     return PartnerResponseTargets(
         visibility=visible.astype(jnp.float32),
         relative_position=position.astype(jnp.int32),
@@ -217,7 +232,6 @@ def response_auxiliary_objective(
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
-        batch.previous_rewards,
         batch.episode_starts,
         batch.actions,
         method=model.response_sequence,
@@ -227,39 +241,13 @@ def response_auxiliary_objective(
         batch.observations[:-1], batch.response_next_observations, planes=planes
     )
     losses = structured_partner_response_loss(prediction, targets)
-    _, diagnostic_prediction = model.apply(
-        {"params": params},
-        batch.initial_policy_state,
-        batch.observations,
-        batch.previous_actions,
-        batch.previous_rewards,
-        batch.episode_starts,
-        batch.actions,
-        method=model.diagnostic_response_sequence,
-    )
-    diagnostic_error = (
-        diagnostic_prediction.diagnostic_reward_mean - batch.rewards
-    )
-    diagnostic_absolute = jnp.abs(diagnostic_error)
-    diagnostic_reward = jnp.mean(jnp.where(
-        diagnostic_absolute <= 1.0,
-        0.5 * jnp.square(diagnostic_error),
-        diagnostic_absolute - 0.5,
-    ))
-    diagnostic_done = jnp.mean(_binary_cross_entropy(
-        diagnostic_prediction.done_logit, batch.dones.astype(jnp.float32)
-    ))
-    diagnostic_total = diagnostic_reward + diagnostic_done
-    return losses.total + diagnostic_total, {
+    return losses.total, {
         "response_total_loss": losses.total,
         "response_visibility_loss": losses.visibility,
         "response_position_loss": losses.relative_position,
         "response_direction_loss": losses.direction,
         "response_inventory_loss": losses.inventory,
         "response_interaction_loss": losses.interaction_change,
-        "diagnostic_reward_mae": diagnostic_reward,
-        "diagnostic_done_bce": diagnostic_done,
-        "diagnostic_total_loss": diagnostic_total,
     }
 
 

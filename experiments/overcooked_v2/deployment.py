@@ -1,9 +1,8 @@
-"""Export, load, and execute frozen DELTA-ZSC deployment artifacts.
+"""Export and execute the primary DELTA-ZSC V6 E2E policy.
 
-Training checkpoints contain optimizer state and the continuous partner
-generator in ``TrainState``.  Confirmatory evaluation never loads those
-objects.  Calibration exports a pruned artifact containing only the legal-history
-model subtrees required by ``model.step`` plus the frozen conformal gate.
+The primary artifact always contains the final end-to-end parameter tree.  It
+has no deployment tier, owner-policy fallback, residual branch, or hard gate.
+The optional safety wrapper is a separate artifact and command.
 """
 
 from __future__ import annotations
@@ -13,17 +12,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.path_c.belief_set_encoder import mixture_moments
-from src.path_c.calibration import (
-    calibration_from_mapping,
-    calibration_to_mapping,
-    hard_adaptation_gate,
-    latent_support_score,
-    predicted_policy_gain,
-)
-from src.path_c.experiment import METHOD_VERSION, RunConfig
-from src.path_c.fallback import DeploymentTier, deployment_tier
-from src.path_c.qualification import SignalQualification
+from src.path_c.experiment import CONFIG_VERSION, METHOD_VERSION, RunConfig
 from src.path_c.model import build_model, initial_policy_state
 from src.path_c.runner import observe_policy_after_transition
 from src.path_c.storage import (
@@ -35,15 +24,16 @@ from src.path_c.storage import (
 )
 from src.path_c.training import categorical_log_probability
 
+
 DEPLOYABLE_PARAM_NAMES = (
     "task_encoder",
     "belief_encoder",
-    "belief_set_encoder",
     "universal_actor",
     "universal_critic",
     "response_decoder",
 )
-DEPLOYMENT_BUNDLE_VERSION = 2
+DEPLOYMENT_BUNDLE_VERSION = 3
+PRIMARY_ARTIFACT_NAME = "DELTA-ZSC-E2E"
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,39 +42,35 @@ class Deployment:
     config: RunConfig
     model: Any
     params: Any
-    calibration: Any
-    deployment_tier: DeploymentTier = DeploymentTier.QUALIFIED_ROBUST_BASE
-    always_on_ablation: bool = False
-    qualification: Any = None
-    owner_source_checkpoint: str | None = None
+    artifact_name: str = PRIMARY_ARTIFACT_NAME
+    safety: Any | None = None
 
 
-def _build_model(config: RunConfig, observation_shape: tuple[int, ...], action_count: int) -> Any:
+def _build_model(
+    config: RunConfig, observation_shape: tuple[int, ...], action_count: int
+) -> Any:
     return build_model(
         observation_shape=observation_shape,
         action_count=action_count,
-        **{
-            name: getattr(config.model, name)
-            for name in (
-                "task_hidden_dim",
-                "belief_hidden_dim",
-                "latent_dim",
-                "mixture_components",
-                "belief_embedding_dim",
-                "actor_hidden_dim",
-                "critic_hidden_dim",
-                "response_hidden_dim",
-                "modulation_rank",
-                "action_embedding_dim",
-                "log_variance_minimum",
-                "log_variance_maximum",
-            )
-        },
+        task_hidden_dim=config.model.task_hidden_dim,
+        belief_hidden_dim=config.model.belief_hidden_dim,
+        latent_dim=config.model.latent_dim,
+        actor_hidden_dim=config.model.actor_hidden_dim,
+        critic_hidden_dim=config.model.critic_hidden_dim,
+        response_hidden_dim=config.model.response_hidden_dim,
+        modulation_rank=config.model.modulation_rank,
+        action_embedding_dim=config.model.action_embedding_dim,
+        log_standard_deviation_minimum=(
+            config.model.log_standard_deviation_minimum
+        ),
+        log_standard_deviation_maximum=(
+            config.model.log_standard_deviation_maximum
+        ),
     )
 
 
 def deployable_parameters(params: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return an exact whitelist; training-only subtrees cannot leak by accident."""
+    """Apply the exact V6 deployment whitelist."""
 
     missing = [name for name in DEPLOYABLE_PARAM_NAMES if name not in params]
     if missing:
@@ -92,54 +78,53 @@ def deployable_parameters(params: Mapping[str, Any]) -> Mapping[str, Any]:
     return {name: params[name] for name in DEPLOYABLE_PARAM_NAMES}
 
 
-def _fingerprint_words(fingerprint: str) -> Any:
-    import hashlib
-    import numpy as np
+def _checkpoint_values(state: Any) -> Mapping[str, Any]:
+    if isinstance(state, Mapping):
+        return state
+    if hasattr(state, "_asdict"):
+        return state._asdict()
+    raise TypeError("Training checkpoint is not a named or mapping V6 state.")
 
-    return np.frombuffer(
-        hashlib.sha256(str(fingerprint).encode("utf-8")).digest()[:8],
-        dtype=">u4",
-    ).astype(np.uint32)
+
+def _validate_training_identity(identity: Mapping[str, Any], config: RunConfig) -> None:
+    if identity.get("method") != METHOD_VERSION or identity.get("stage") != "train":
+        raise ValueError("Run directory is not a DELTA-ZSC V6 training run.")
+    if int(identity.get("config", {}).get("version", -1)) != CONFIG_VERSION:
+        raise ValueError("V5 checkpoints and identities cannot be loaded by V6.")
+    if identity.get("config") != config.to_mapping():
+        raise ValueError("Training model config differs from the requested config.")
 
 
 def load_training_model(run_directory: str | Path, config: RunConfig) -> Deployment:
-    """Load the full training model for calibration/anchor collection only."""
+    """Load the current final V6 model for export or optional offline audit."""
 
     root = Path(run_directory).resolve()
     identity = read_run_identity(root)
-    if identity.get("method") != METHOD_VERSION or identity.get("stage") != "train":
-        raise ValueError("Run directory is not a DELTA-ZSC v5 training run.")
-    if identity.get("config") != config.to_mapping():
-        raise ValueError("Training model config differs from calibration config.")
+    _validate_training_identity(identity, config)
     manager = orbax_manager(root / "checkpoints", create=False)
     restored = restore_latest_checkpoint(manager)
     if restored is None:
         raise FileNotFoundError(f"No checkpoint in {root / 'checkpoints'}")
     unused_step, state = restored
     del unused_step
-    values = state if isinstance(state, Mapping) else state._asdict()
-    params = values["params"]
+    values = _checkpoint_values(state)
+    required = {
+        "params",
+        "target_params",
+        "belief_optimizer_state",
+        "generator_params",
+        "anchor_replay",
+        "update_count",
+    }
+    if not required.issubset(values):
+        raise ValueError("Checkpoint lacks V6 E2E state fields; V5 restore is forbidden.")
     observation_shape = tuple(int(value) for value in identity["observation_shape"])
     action_count = int(identity.get("action_count", 6))
-    qualification = values.get("qualification", {})
-    if isinstance(qualification, Mapping):
-        qualification = SignalQualification.from_mapping(qualification)
-    owner_source = values.get("owner_source_artifact")
-    owner_checkpoint = None
-    if isinstance(owner_source, Mapping):
-        owner_checkpoint = owner_source.get("checkpoint")
     return Deployment(
         ego_run_id=str(identity.get("ego_run_id", root.name)),
         config=config,
         model=_build_model(config, observation_shape, action_count),
-        params=params,
-        calibration=values["calibration"],
-        deployment_tier=deployment_tier(qualification),
-        always_on_ablation=False,
-        qualification=qualification,
-        owner_source_checkpoint=(
-            None if owner_checkpoint is None else str(owner_checkpoint)
-        ),
+        params=values["params"],
     )
 
 
@@ -148,9 +133,8 @@ def export_deployment_bundle(
     *,
     source_training_run: str | Path,
     deployment: Deployment,
-    calibration: Any,
 ) -> Path:
-    """Write a self-contained deployment artifact without generator/training state."""
+    """Write the final V6 actor artifact; no fallback selection is permitted."""
 
     import orbax.checkpoint as ocp
 
@@ -158,28 +142,15 @@ def export_deployment_bundle(
     if root.exists() and any(root.iterdir()):
         raise RuntimeError(f"Deployment bundle directory is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    identity = read_run_identity(source_training_run)
+    _validate_training_identity(identity, deployment.config)
     pruned = deployable_parameters(deployment.params)
     params_path = root / "params"
     ocp.PyTreeCheckpointer().save(str(params_path), pruned, force=True)
-    identity = read_run_identity(source_training_run)
-    qualification = (
-        deployment.qualification
-        if isinstance(deployment.qualification, SignalQualification)
-        else SignalQualification.from_mapping(deployment.qualification or {})
-    )
-    tier = deployment_tier(qualification)
-    owner_checkpoint = deployment.owner_source_checkpoint
-    owner_sha = None
-    if tier == DeploymentTier.OWNER_SP_FALLBACK:
-        if owner_checkpoint is None:
-            raise ValueError("C0 failure requires the exact owner-SP source artifact.")
-        from src.path_c.storage import sha256_path
-
-        owner_sha = sha256_path(owner_checkpoint)
-    always_on = bool(deployment.config.calibration.always_on_ablation)
     payload = {
         "version": DEPLOYMENT_BUNDLE_VERSION,
         "method": METHOD_VERSION,
+        "artifact_name": PRIMARY_ARTIFACT_NAME,
         "ego_run_id": deployment.ego_run_id,
         "config": deployment.config.to_mapping(),
         "config_fingerprint": deployment.config.fingerprint,
@@ -188,36 +159,26 @@ def export_deployment_bundle(
         "deployable_param_names": list(DEPLOYABLE_PARAM_NAMES),
         "params_fingerprint": pytree_fingerprint(pruned),
         "source_training_run": str(Path(source_training_run).resolve()),
-        "calibration": calibration_to_mapping(calibration),
-        "deployment_tier": tier.value,
-        "qualification": qualification.to_mapping(),
-        "owner_source_checkpoint": owner_checkpoint,
-        "owner_source_sha256": owner_sha,
-        "always_on_ablation": always_on,
-        "artifact_name": (
-            "DELTA-r3 always-on" if always_on else "DELTA-r3 calibrated gate"
-        ),
+        "safety_wrapper": False,
     }
     write_json(root / "deployment_bundle.json", payload)
     return root
 
 
 def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployment:
-    """Load only the pruned confirmatory deployment artifact."""
+    """Load only an exact primary V6 deployment bundle."""
 
     import orbax.checkpoint as ocp
-    import numpy as np
 
     root = Path(bundle_directory).resolve()
     payload_path = root / "deployment_bundle.json"
     if not payload_path.is_file():
-        raise FileNotFoundError(
-            f"Pruned deployment bundle is missing: {payload_path}. Run calibration first."
-        )
+        raise FileNotFoundError(f"V6 deployment bundle is missing: {payload_path}")
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
     required = {
         "version",
         "method",
+        "artifact_name",
         "ego_run_id",
         "config",
         "config_fingerprint",
@@ -226,67 +187,36 @@ def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployme
         "deployable_param_names",
         "params_fingerprint",
         "source_training_run",
-        "calibration",
-        "deployment_tier",
-        "qualification",
-        "owner_source_checkpoint",
-        "owner_source_sha256",
-        "always_on_ablation",
-        "artifact_name",
+        "safety_wrapper",
     }
     if set(payload) != required:
-        raise ValueError(
-            "Deployment bundle fields differ: "
-            f"missing={sorted(required-set(payload))}, "
-            f"unknown={sorted(set(payload)-required)}."
-        )
-    if int(payload["version"]) != DEPLOYMENT_BUNDLE_VERSION:
-        raise ValueError("Unknown deployment bundle version.")
-    if payload["method"] != METHOD_VERSION:
-        raise ValueError("Deployment bundle belongs to another method.")
-    if payload["config"] != config.to_mapping() or payload["config_fingerprint"] != config.fingerprint:
-        raise ValueError("Deployment bundle config differs from evaluation config.")
+        raise ValueError("Deployment bundle is not the exact V6 primary schema.")
+    if (
+        int(payload["version"]) != DEPLOYMENT_BUNDLE_VERSION
+        or payload["method"] != METHOD_VERSION
+        or payload["artifact_name"] != PRIMARY_ARTIFACT_NAME
+        or bool(payload["safety_wrapper"])
+    ):
+        raise ValueError("V5, tier, fallback, and safety artifacts are not primary V6.")
+    if (
+        payload["config"] != config.to_mapping()
+        or payload["config_fingerprint"] != config.fingerprint
+    ):
+        raise ValueError("Deployment config differs from evaluation config.")
     if tuple(payload["deployable_param_names"]) != DEPLOYABLE_PARAM_NAMES:
-        raise ValueError("Deployment parameter whitelist differs from the active method.")
+        raise ValueError("Deployment parameter whitelist differs from V6.")
     params = ocp.PyTreeCheckpointer().restore(str(root / "params"))
     if set(params) != set(DEPLOYABLE_PARAM_NAMES):
-        raise ValueError("Deployment artifact contains missing or training-only parameter subtrees.")
+        raise ValueError("Deployment contains training-only or missing parameter subtrees.")
     if pytree_fingerprint(params) != payload["params_fingerprint"]:
-        raise ValueError("Deployment parameter fingerprint differs from bundle metadata.")
-    calibration = calibration_from_mapping(payload["calibration"])
-    tier = DeploymentTier(str(payload["deployment_tier"]))
-    qualification = SignalQualification.from_mapping(payload["qualification"])
-    if deployment_tier(qualification) != tier:
-        raise ValueError("Deployment tier disagrees with the frozen qualification.")
-    always_on = bool(payload["always_on_ablation"])
-    if always_on != bool(config.calibration.always_on_ablation):
-        raise ValueError("Always-on is an explicit ablation identity, not a runtime override.")
-    if always_on and payload["artifact_name"] != "DELTA-r3 always-on":
-        raise ValueError("Always-on deployment artifact is misnamed.")
-    owner_checkpoint = payload["owner_source_checkpoint"]
-    if tier == DeploymentTier.OWNER_SP_FALLBACK:
-        from src.path_c.storage import sha256_path
-
-        if owner_checkpoint is None or sha256_path(owner_checkpoint) != payload["owner_source_sha256"]:
-            raise ValueError("Owner-SP fallback artifact fingerprint differs.")
-    expected = _fingerprint_words(payload["params_fingerprint"])
-    observed = np.asarray(calibration.model_fingerprint, dtype=np.uint32)
-    if observed.shape != (2,) or not np.array_equal(observed, expected):
-        raise ValueError("Calibration artifact belongs to a different deployment parameter tree.")
-    observation_shape = tuple(int(value) for value in payload["observation_shape"])
+        raise ValueError("Deployment parameter fingerprint differs from metadata.")
+    shape = tuple(int(value) for value in payload["observation_shape"])
     action_count = int(payload["action_count"])
     return Deployment(
         ego_run_id=str(payload["ego_run_id"]),
         config=config,
-        model=_build_model(config, observation_shape, action_count),
+        model=_build_model(config, shape, action_count),
         params=params,
-        calibration=calibration,
-        deployment_tier=tier,
-        always_on_ablation=always_on,
-        qualification=qualification,
-        owner_source_checkpoint=(
-            None if owner_checkpoint is None else str(owner_checkpoint)
-        ),
     )
 
 
@@ -303,7 +233,6 @@ def reset_deployment_state(
         task_hidden_dim=deployment.config.model.task_hidden_dim,
         belief_hidden_dim=deployment.config.model.belief_hidden_dim,
         latent_dim=deployment.config.model.latent_dim,
-        mixture_components=deployment.config.model.mixture_components,
     )
 
 
@@ -313,60 +242,27 @@ def deployment_action(
     state: Any,
     observation: Any,
     keys: Any,
-    force_base: bool = False,
 ) -> tuple[Any, Any, Any, Any]:
     import jax
     import jax.numpy as jnp
 
-    stepped, provisional = deployment.model.apply(
+    batch_size = int(jnp.asarray(observation).shape[0])
+    stepped, output = deployment.model.apply(
         {"params": deployment.params},
         state,
         observation,
-        jnp.ones(state.previous_action.shape, dtype=jnp.float32),
+        jnp.zeros((batch_size,), dtype=jnp.bool_),
         method=deployment.model.step,
     )
-    conditional_logits = provisional.base_logits + provisional.residual_logits
-    gain = predicted_policy_gain(
-        provisional.action_values,
-        provisional.base_logits,
-        conditional_logits,
-    )
-    posterior_mean, unused_variance = mixture_moments(
-        provisional.mixture_logits,
-        provisional.mixture_means,
-        provisional.mixture_log_variances,
-    )
-    del unused_variance
-    support = latent_support_score(posterior_mean, deployment.calibration)
-    conditional_allowed = deployment.deployment_tier in {
-        DeploymentTier.CALIBRATED_PASSIVE_CONDITIONAL,
-        DeploymentTier.CALIBRATED_FULL_ACTIVE,
-    }
-    if not conditional_allowed:
-        gate = jnp.zeros_like(gain, dtype=jnp.float32)
-    elif deployment.always_on_ablation:
-        gate = jnp.ones_like(gain, dtype=jnp.float32)
-    elif deployment.config.calibration.enable_hard_gate_at_evaluation:
-        gate = hard_adaptation_gate(gain, support, deployment.calibration)
-    else:
-        raise RuntimeError("Full r3 deployment requires the frozen calibrated gate.")
-    if force_base:
-        gate = jnp.zeros_like(gate)
-    execution_logits = provisional.base_logits + gate[..., None] * provisional.residual_logits
     key_array = jnp.asarray(keys)
     action = (
         jax.vmap(lambda key, logits: jax.random.categorical(key, logits))(
-            key_array, execution_logits
+            key_array, output.policy_logits
         )
         if key_array.ndim == 2
-        else jax.random.categorical(key_array, execution_logits)
+        else jax.random.categorical(key_array, output.policy_logits)
     )
-    log_probability = categorical_log_probability(execution_logits, action)
-    output = provisional._replace(
-        gate=gate,
-        support_score=support,
-        execution_logits=execution_logits,
-    )
+    log_probability = categorical_log_probability(output.policy_logits, action)
     return stepped, action, output, log_probability
 
 
@@ -392,6 +288,7 @@ def update_after_transition(
 __all__ = [
     "DEPLOYABLE_PARAM_NAMES",
     "DEPLOYMENT_BUNDLE_VERSION",
+    "PRIMARY_ARTIFACT_NAME",
     "Deployment",
     "deployable_parameters",
     "deployment_action",

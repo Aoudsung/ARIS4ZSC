@@ -34,7 +34,7 @@ def response_decoder_class() -> Any:
             task_features: Any,
             belief_embedding: Any,
             actions: Any,
-        ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+        ) -> tuple[Any, Any, Any, Any, Any]:
             task = jnp.asarray(task_features, dtype=jnp.float32)
             belief = jnp.asarray(belief_embedding, dtype=jnp.float32)
             action = jnp.asarray(actions, dtype=jnp.int32)
@@ -96,26 +96,12 @@ def response_decoder_class() -> Any:
                 bias_init=zeros,
                 name="partner_interaction_change_logit",
             )(hidden)[..., 0]
-            diagnostic_reward_mean = nn.Dense(
-                1,
-                kernel_init=orthogonal(0.01),
-                bias_init=zeros,
-                name="diagnostic_reward_mean",
-            )(hidden)[..., 0]
-            done_logit = nn.Dense(
-                1,
-                kernel_init=orthogonal(0.01),
-                bias_init=zeros,
-                name="diagnostic_done_logit",
-            )(hidden)[..., 0]
             return (
                 visibility_logit,
                 relative_position_logits,
                 direction_logits,
                 inventory_logits,
                 interaction_change_logit,
-                diagnostic_reward_mean,
-                done_logit,
             )
 
     _DECODER = ResponseDecoder

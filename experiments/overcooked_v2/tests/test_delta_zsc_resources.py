@@ -22,7 +22,11 @@ def test_cuda_ptxas_version_parser_requires_cuda_12_or_newer() -> None:
 
 
 def test_resource_ledger_rejects_hidden_or_inconsistent_total() -> None:
-    ledger = ResourceLedger(ego_policy_steps=10, counterfactual_steps=20)
+    ledger = ResourceLedger(
+        ego_policy_steps=10,
+        counterfactual_continuation_steps=20,
+        matched_code_probe_steps=2,
+    )
     payload = dict(ledger.to_mapping())
     assert ResourceLedger.from_mapping(payload) == ledger
     payload["total_training_simulator_steps"] += 1
@@ -64,6 +68,7 @@ def test_gpu_hours_are_device_hours_not_wall_hours() -> None:
 
 
 def test_latency_measurement_is_positive_for_compiled_recurrent_policy() -> None:
+    pytest.importorskip("jax")
     import jax.numpy as jnp
 
     class Policy:
@@ -100,7 +105,7 @@ def _registered_cuda_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_formal_cuda_worker_requires_actual_single_jax_gpu(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import jax
+    jax = pytest.importorskip("jax")
 
     class Device:
         id = 0
@@ -120,7 +125,7 @@ def test_formal_cuda_worker_requires_actual_single_jax_gpu(
 def test_formal_cuda_worker_rejects_cpu_fallback_and_unhealthy_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import jax
+    jax = pytest.importorskip("jax")
 
     class Device:
         id = 0

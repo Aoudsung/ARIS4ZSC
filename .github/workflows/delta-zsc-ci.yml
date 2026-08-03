@@ -1,4 +1,4 @@
-name: delta-zsc-ci
+name: delta-zsc-v6-ci
 
 on:
   push:
@@ -36,11 +36,16 @@ jobs:
         run: |
           python -m experiments.overcooked_v2.path_c --help
           python -m experiments.overcooked_v2.path_c train --help
+          python -m experiments.overcooked_v2.path_c calibrate-safety --help
+          python -m experiments.overcooked_v2.path_c audit-signals --help
           python -m experiments.overcooked_v2.path_c evaluate-official --help
           python -m experiments.overcooked_v2.path_c evaluate-common --help
       - name: Reject legacy semantics in active source
         run: |
           ! grep -R -n -E 'slot_log_belief|TwinDuelingQ|CodebookState|next_q_use_targets|next_q_mask_targets|episode_responsibility_evidence|bellman_control_values|target_response_signatures' src/path_c experiments/overcooked_v2 --exclude-dir=tests
+      - name: Reject V5 control paths in active source
+        run: |
+          ! grep -R -n -E 'CurriculumPhase|qualified_base_params|deployment_tier|base_logits|residual_logits|conditional_enabled|regret_enabled|GeneratorAdmission|TargetPolicyEpoch|GaussianMixtureBelief|previous_reward|hard_adaptation_gate|owner_sp_source_fallback' src/path_c experiments/overcooked_v2 --exclude-dir=tests
       - name: Reject committed credentials
         run: |
           ! git ls-files | grep -E '(^|/)SSH_Document\.md$'

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .belief_set_encoder import stratified_mixture_samples
+from .belief_set_encoder import gaussian_samples
 
 
 def decision_regret_from_action_values(
@@ -38,17 +38,15 @@ def decision_regret_from_action_values(
 def posterior_decision_regret(
     key: Any,
     *,
-    mixture_logits: Any,
-    means: Any,
-    log_variances: Any,
+    mean: Any,
+    log_standard_deviation: Any,
     sample_count: int,
     action_value_function: Callable[[Any], Any],
 ) -> Any:
-    samples, weights = stratified_mixture_samples(
+    samples, weights = gaussian_samples(
         key,
-        mixture_logits=mixture_logits,
-        means=means,
-        log_variances=log_variances,
+        mean=mean,
+        log_standard_deviation=log_standard_deviation,
         sample_count=sample_count,
     )
     q = action_value_function(samples)

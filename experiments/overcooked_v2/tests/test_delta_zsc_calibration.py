@@ -4,63 +4,78 @@ import numpy as np
 import pytest
 
 from src.path_c.calibration import (
-    calibrate_adaptation_gate,
+    calibrate_safety_wrapper,
     calibration_from_mapping,
     calibration_to_mapping,
-    empty_calibration,
-    finite_sample_conformal_quantile,
-    hard_adaptation_gate,
-    partner_run_block_scores,
+    empirical_policy_gain,
+    predicted_policy_gain,
+    safety_select_full_context,
 )
 
 
-def test_finite_sample_quantile_abstains_when_sample_is_too_small() -> None:
-    assert np.isinf(finite_sample_conformal_quantile(np.arange(18), 0.05))
-    assert finite_sample_conformal_quantile(np.arange(19), 0.05) == 18.0
+def test_direct_policy_gain_uses_full_minus_prior_probabilities() -> None:
+    values = np.asarray([[0.0, 20.0]], dtype=np.float32)
+    full = np.asarray([[-10.0, 10.0]], dtype=np.float32)
+    prior = np.asarray([[0.0, 0.0]], dtype=np.float32)
+    predicted = np.asarray(predicted_policy_gain(values, full, prior))
+    empirical = np.asarray(empirical_policy_gain(values, full, prior))
+    assert predicted[0] == pytest.approx(10.0, abs=1.0e-3)
+    np.testing.assert_allclose(predicted, empirical)
 
 
-def test_partner_run_scores_use_maximum_error_per_independent_run() -> None:
-    predicted = np.zeros((3, 2), dtype=np.float32)
-    empirical = np.asarray([[1.0, -2.0], [3.0, 0.0], [0.5, 0.25]])
-    scores = partner_run_block_scores(predicted, empirical, ("a", "a", "b"))
-    assert scores == {"a": 3.0, "b": 0.5}
-
-
-def test_calibration_round_trip_and_hard_abstention() -> None:
-    jnp = pytest.importorskip("jax.numpy")
-
-    empty = empty_calibration(latent_dim=2, alpha=0.05)
-    gate = hard_adaptation_gate(
-        jnp.asarray([1.0e9]), jnp.asarray([1.0]), empty
-    )
-    assert np.asarray(gate).tolist() == [0.0]
-    restored = calibration_from_mapping(calibration_to_mapping(empty))
-    assert np.isinf(np.asarray(restored.residual_radius))
-
-
-def test_partner_block_calibration_is_finite_with_registered_minimum() -> None:
-    count = 19
-    predicted = np.zeros((count, 3), dtype=np.float32)
-    empirical = np.linspace(0.0, 0.18, count, dtype=np.float32)[:, None]
-    empirical = np.repeat(empirical, 3, axis=1)
-    training_latents = np.stack(
+def test_optional_safety_calibrates_run_block_gain_residual() -> None:
+    run_count = 19
+    predicted = np.linspace(10.0, 28.0, run_count, dtype=np.float32)
+    empirical = predicted - np.linspace(0.0, 1.8, run_count, dtype=np.float32)
+    support = np.stack(
         (np.linspace(-1.0, 1.0, 40), np.linspace(1.0, -1.0, 40)), axis=-1
     )
-    calibration_latents = training_latents[:count]
-    artifact = calibrate_adaptation_gate(
-        predicted_values=predicted,
-        empirical_values=empirical,
-        partner_run_ids=tuple(f"run-{index}" for index in range(count)),
-        training_support_latents=training_latents,
-        calibration_latents=calibration_latents,
+    artifact = calibrate_safety_wrapper(
+        predicted_gains=predicted,
+        empirical_gains=empirical,
+        partner_run_ids=tuple(f"run-{index}" for index in range(run_count)),
+        training_support_latents=support,
+        calibration_latents=support[:run_count],
         alpha=0.05,
         support_quantile=0.05,
-        return_lower_bound=-1.0,
-        return_upper_bound=1.0,
-        evaluation_replicas=128,
-        action_count=3,
-        model_fingerprint="model-a",
+        model_fingerprint=np.asarray([1, 2], dtype=np.uint32),
     )
-    assert int(np.asarray(artifact.calibration_run_count)) == count
-    assert np.isfinite(np.asarray(artifact.residual_radius))
-    assert np.asarray(artifact.model_fingerprint).shape == (2,)
+    assert int(np.asarray(artifact.calibration_run_count)) == 19
+    assert float(np.asarray(artifact.gain_residual_radius)) == pytest.approx(1.8)
+    restored = calibration_from_mapping(calibration_to_mapping(artifact))
+    assert calibration_to_mapping(restored) == calibration_to_mapping(artifact)
+
+
+def test_safety_wrapper_is_not_an_always_on_gate() -> None:
+    artifact = calibrate_safety_wrapper(
+        predicted_gains=np.full(19, 30.0),
+        empirical_gains=np.full(19, 20.0),
+        partner_run_ids=tuple(f"run-{index}" for index in range(19)),
+        training_support_latents=np.stack((np.arange(30), np.arange(30)), axis=-1),
+        calibration_latents=np.stack((np.arange(19), np.arange(19)), axis=-1),
+        alpha=0.05,
+        support_quantile=0.0,
+        model_fingerprint=np.asarray([3, 4], dtype=np.uint32),
+    )
+    selected = np.asarray(
+        safety_select_full_context(
+            np.asarray([11.0, 9.0]),
+            np.asarray([1.0, 1.0]),
+            artifact,
+        )
+    )
+    assert selected.tolist() == [True, False]
+
+
+def test_too_few_run_blocks_fail_instead_of_replacing_primary_method() -> None:
+    with pytest.raises(ValueError, match="Too few"):
+        calibrate_safety_wrapper(
+            predicted_gains=np.zeros(18),
+            empirical_gains=np.zeros(18),
+            partner_run_ids=tuple(f"run-{index}" for index in range(18)),
+            training_support_latents=np.zeros((20, 2)),
+            calibration_latents=np.zeros((18, 2)),
+            alpha=0.05,
+            support_quantile=0.05,
+            model_fingerprint=np.asarray([1, 2], dtype=np.uint32),
+        )

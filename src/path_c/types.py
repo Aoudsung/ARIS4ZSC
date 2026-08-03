@@ -1,9 +1,9 @@
-"""Core immutable PyTree-compatible records for DELTA-ZSC.
+"""Immutable PyTree records for DELTA-ZSC V6.
 
-The active implementation deliberately contains no partner-specific actor/critic
-branches or finite partner-type heads.  Every field
-below is either a deployable legal-history quantity or an explicitly marked
-training-only quantity.
+The deployable policy contains one legal-history task encoder, one diagonal
+Gaussian partner belief and one belief-conditioned actor.  Training-only
+objects are explicit so that deployment pruning and checkpoint identity can be
+checked mechanically.
 """
 
 from __future__ import annotations
@@ -11,54 +11,37 @@ from __future__ import annotations
 from typing import Any, Mapping, NamedTuple
 
 
-class GaussianMixtureBelief(NamedTuple):
-    """Online posterior over the continuous decision context.
-
-    Shapes use an arbitrary batch prefix ``...`` followed by
-    ``[mixture_components]`` or ``[mixture_components, latent_dim]``.
-    """
-
+class GaussianBelief(NamedTuple):
     recurrent_carry: Any
-    mixture_logits: Any
-    means: Any
-    log_variances: Any
-    support_score: Any
+    mean: Any
+    log_standard_deviation: Any
+    normalized_uncertainty: Any
 
 
 class PolicyState(NamedTuple):
-    """Complete deployable recurrent state of one ego policy."""
+    """Complete legal recurrent state exposed by the Official policy wrapper."""
 
     task_carry: Any
-    belief: GaussianMixtureBelief
+    belief: GaussianBelief
     previous_observation: Any
     previous_action: Any
-    previous_reward: Any
     episode_start: Any
 
 
 class ContextOutput(NamedTuple):
-    """Task and continuous-belief state without policy/decoder evaluation."""
-
     task_features: Any
-    mixture_logits: Any
-    mixture_means: Any
-    mixture_log_variances: Any
-    support_score: Any
+    belief_mean: Any
+    belief_log_standard_deviation: Any
+    normalized_uncertainty: Any
 
 
 class ModelOutput(NamedTuple):
-    """Compact policy/value output of the shared DELTA-ZSC model."""
-
     task_features: Any
-    belief_embedding: Any
-    mixture_logits: Any
-    mixture_means: Any
-    mixture_log_variances: Any
-    support_score: Any
-    base_logits: Any
-    residual_logits: Any
-    gate: Any
-    execution_logits: Any
+    belief_summary: Any
+    belief_mean: Any
+    belief_log_standard_deviation: Any
+    normalized_uncertainty: Any
+    policy_logits: Any
     state_value: Any
     raw_q1: Any
     raw_q2: Any
@@ -66,20 +49,14 @@ class ModelOutput(NamedTuple):
 
 
 class ResponsePrediction(NamedTuple):
-    """Structured visible-partner prediction for the executed action only."""
-
     visibility_logit: Any
     relative_position_logits: Any
     direction_logits: Any
     inventory_logits: Any
     interaction_change_logit: Any
-    diagnostic_reward_mean: Any
-    done_logit: Any
 
 
 class PartnerGeneratorState(NamedTuple):
-    """Recurrent state of the single continuous partner generator."""
-
     carry: Any
     code: Any
     episode_start: Any
@@ -94,20 +71,14 @@ class PartnerGeneratorOutput(NamedTuple):
 
 
 class RolloutBatch(NamedTuple):
-    """A complete recurrent PPO batch.
-
-    ``observations`` and recurrent inputs have T+1 states.  Transition fields
-    have T rows.  ``response_next_observations`` stores terminal observations
-    on done transitions, while ``observations`` continues with the reset state.
-    """
+    """Recurrent PPO batch with T+1 legal-history states and T transitions."""
 
     observations: Any
     response_next_observations: Any
     previous_actions: Any
-    previous_rewards: Any
     episode_starts: Any
     action_keys: Any
-    gate_overrides: Any
+    context_dropout_masks: Any
     actions: Any
     rewards: Any
     official_shaped_rewards: Any
@@ -117,6 +88,7 @@ class RolloutBatch(NamedTuple):
     dones: Any
     old_log_probabilities: Any
     old_values: Any
+    behavior_probabilities: Any
     ppo_mask: Any
     partner_codes: Any
     partner_sources: Any
@@ -126,13 +98,7 @@ class RolloutBatch(NamedTuple):
 
 
 class CounterfactualAnchorBatch(NamedTuple):
-    """Simulator-return supervision for all ego actions at anchor states.
-
-    The anchor retains the legal online policy state and current observation so
-    task/belief features are recomputed under the candidate parameters.  It also
-    stores the rollout index and partner source/code for lineage only.  No
-    hidden code or privileged diagnostic context is a supervised online target.
-    """
+    """Soft-policy-drift replay rows for real-return all-action supervision."""
 
     anchor_ids: Any
     rollout_flat_indexes: Any
@@ -140,15 +106,19 @@ class CounterfactualAnchorBatch(NamedTuple):
     observations: Any
     partner_codes: Any
     partner_sources: Any
-    fit_returns_by_action: Any
-    evaluation_returns_by_action: Any
     partner_run_ids: Any
+    fit_returns_by_action: Any
+    return_sum_by_action: Any
+    return_squared_sum_by_action: Any
+    replica_count: Any
+    collection_policy_logits: Any
+    collection_update: Any
+    collection_target_fingerprint: Any
+    matched_pair_ids: Any
     action_mask: Any
 
 
 class QuotientPairBatch(NamedTuple):
-    """Matched anchor pairs with empirical decision distances."""
-
     anchor_index_a: Any
     anchor_index_b: Any
     decision_distance: Any
@@ -156,17 +126,10 @@ class QuotientPairBatch(NamedTuple):
 
 
 class CalibrationArtifact(NamedTuple):
-    """Frozen partner-run-block conformal gate artifact.
-
-    The support model is fit only from training-support posterior summaries and
-    then thresholded on run-disjoint calibration partners.  Keeping the complete
-    Mahalanobis model in the artifact makes deployment deterministic and avoids
-    an untrained neural ``support_score`` head.
-    """
+    """Optional E2E+Safety wrapper; never part of the primary method."""
 
     alpha: Any
-    residual_radius: Any
-    monte_carlo_radius: Any
+    gain_residual_radius: Any
     support_threshold: Any
     support_mean: Any
     support_precision: Any
@@ -176,82 +139,56 @@ class CalibrationArtifact(NamedTuple):
 
 
 class TrainState(NamedTuple):
-    """Complete r3 signal-contract checkpoint state.
+    """Complete V6 checkpoint state; deliberately incompatible with V5."""
 
-    There is intentionally no compatibility tail for r2.  Orbax restoration
-    therefore fails before training when an archived r2 checkpoint is supplied.
-    Every optimizer counter, qualification decision, policy epoch, random
-    domain and replay fingerprint that can change the next update is explicit.
-    """
     params: Any
     target_params: Any
+
     ppo_optimizer_state: Any
     raw_q_optimizer_state: Any
     response_optimizer_state: Any
+    belief_optimizer_state: Any
     generator_optimizer_state: Any
 
     generator_params: Any
     generator_target_params: Any
+    generator_competence_multiplier: Any
+    generator_cvar_ema: Any
+    external_reference_cvar_ema: Any
 
-    target_policy_epoch: Any
-    qualified_base_params: Any
-    owner_source_artifact: Any
-    last_qualified_generator_params: Any
-    last_qualified_generator_optimizer_state: Any
-    last_qualified_generator_optimizer_step: Any
-    generator_signature_readout: Any
-    generator_snapshot_archive: Any
-    generator_admission_passes: Any
-    partner_source_probabilities: Any
+    anchor_replay: Any
+    anchor_sampling_counter: Any
 
-    qualification: Any
-    curriculum_phase: Any
-    anchor_training_replay: Any
-    anchor_audit_manifest: Any
-
-    kl_multiplier: Any
-    residual_multiplier: Any
-    raw_q_calibration_error: Any
-    raw_q_minimum_margin: Any
+    belief_gradient_norm_ema: Any
+    action_range_ema: Any
+    anchor_advantage_scale_ema: Any
 
     ppo_optimizer_step: Any
     raw_q_optimizer_step: Any
     response_optimizer_step: Any
+    belief_optimizer_step: Any
     generator_optimizer_step: Any
 
     runner_state: Any
-    random_key: Any
+    random_domains: Any
     update_count: Any
     effective_environment_steps: Any
-    random_domains: Any
     resource_ledger: Any
-    calibration: CalibrationArtifact
 
 
 class TrainingCoreState(NamedTuple):
-    """The only state carried through the compiled PPO minibatch scan.
-
-    Generator, runner, RNG, calibration, and accounting state deliberately stay
-    outside the gradient executable.  This keeps the compiled signature stable
-    without changing the sequential optimizer or Polyak-update semantics.
-    """
-
     params: Any
     target_params: Any
     ppo_optimizer_state: Any
 
 
 class GeneratorCoreState(NamedTuple):
-    """Training-only generator state carried by its compiled update."""
-
     params: Any
     target_params: Any
     optimizer_state: Any
 
 
 class AuxiliaryCoreState(NamedTuple):
-    """Shared parameters with independent raw-Q and response optimizer states."""
-
     params: Any
     raw_q_optimizer_state: Any
     response_optimizer_state: Any
@@ -278,18 +215,18 @@ class EvaluationRow(NamedTuple):
     raw_return: float
     correct_deliveries: int
     wrong_deliveries: int
-    adaptation_enabled_steps: int
-    base_policy_steps: int
-    mean_support_score: float
+    mean_belief_uncertainty: float
     mean_predicted_gain: float
     negative_transfer: bool
 
 
 __all__ = [
+    "AuxiliaryCoreState",
     "CalibrationArtifact",
+    "ContextOutput",
     "CounterfactualAnchorBatch",
     "EvaluationRow",
-    "GaussianMixtureBelief",
+    "GaussianBelief",
     "GeneratorCoreState",
     "LossBundle",
     "ModelOutput",
@@ -297,8 +234,8 @@ __all__ = [
     "PartnerGeneratorState",
     "PolicyState",
     "QuotientPairBatch",
-    "RolloutBatch",
     "ResponsePrediction",
+    "RolloutBatch",
     "TrainingCoreState",
     "TrainState",
     "TrainingUpdate",

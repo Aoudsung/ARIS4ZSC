@@ -1,10 +1,8 @@
-"""Twin raw-return Q targets with target-policy-epoch semantics."""
+"""Dense twin raw-return Q learning and smooth V6 policy improvement."""
 
 from __future__ import annotations
 
 from typing import Any, NamedTuple
-
-from .gradient_routing import keep_owned_gradients
 
 
 RETRACE_LAMBDA = 0.95
@@ -44,8 +42,9 @@ def target_expected_q(action_values: Any, target_probabilities: Any) -> Any:
     probabilities = jnp.asarray(target_probabilities, dtype=jnp.float32)
     if values.shape != probabilities.shape:
         raise ValueError("Target probabilities must cover every raw-Q action.")
-    normalizer = jnp.sum(probabilities, axis=-1, keepdims=True)
-    probabilities = probabilities / jnp.maximum(normalizer, 1e-8)
+    probabilities = probabilities / jnp.maximum(
+        jnp.sum(probabilities, axis=-1, keepdims=True), 1.0e-8
+    )
     return jnp.sum(probabilities * values, axis=-1)
 
 
@@ -64,13 +63,6 @@ def recurrent_retrace_targets(
     gamma: float,
     trace_lambda: float = RETRACE_LAMBDA,
 ) -> RawQTargets:
-    """Build stop-gradient recurrent Retrace targets from raw reward only.
-
-    Time-major inputs have T rows.  Endpoint inputs describe state T.  The
-    correction at t uses c_(t+1), matching the standard backward Retrace
-    recursion; terminal transitions strictly remove both bootstrap terms.
-    """
-
     import jax
     import jax.numpy as jnp
 
@@ -79,60 +71,35 @@ def recurrent_retrace_targets(
     action = jnp.asarray(actions, dtype=jnp.int32)
     behavior = jnp.asarray(behavior_action_probabilities, dtype=jnp.float32)
     target_probs = jnp.asarray(target_action_probabilities, dtype=jnp.float32)
-    if reward.shape != terminal.shape or reward.shape != action.shape:
-        raise ValueError("Retrace transition time/batch axes differ.")
-    if target_probs.shape[:-1] != reward.shape:
-        raise ValueError("Retrace target policy axes differ from transitions.")
-    if behavior.shape != reward.shape:
-        raise ValueError("Behavior action probabilities must be recorded per transition.")
-    if not 0.0 <= trace_lambda <= 1.0 or not 0.0 <= gamma <= 1.0:
-        raise ValueError("Invalid Retrace discount or lambda.")
-
     conservative = conservative_raw_q(target_raw_q1, target_raw_q2)
     taken_q = gather_actions(conservative, action)
     target_taken_probability = gather_actions(target_probs, action)
     coefficients = float(trace_lambda) * jnp.minimum(
-        1.0, target_taken_probability / jnp.maximum(behavior, 1e-8)
+        1.0, target_taken_probability / jnp.maximum(behavior, 1.0e-8)
     )
     state_values = target_expected_q(conservative, target_probs)
-    endpoint_values = target_expected_q(
+    endpoint = target_expected_q(
         conservative_raw_q(endpoint_target_raw_q1, endpoint_target_raw_q2),
         endpoint_target_probabilities,
     )
+    next_taken = jnp.concatenate((taken_q[1:], endpoint[None]), axis=0)
+    next_coeff = jnp.concatenate((coefficients[1:], jnp.zeros_like(coefficients[:1])), axis=0)
+    next_values = jnp.concatenate((state_values[1:], endpoint[None]), axis=0)
 
-    next_taken_q = jnp.concatenate((taken_q[1:], endpoint_values[None, ...]), axis=0)
-    next_coefficients = jnp.concatenate(
-        (coefficients[1:], jnp.zeros_like(coefficients[:1])), axis=0
-    )
-    next_state_values = jnp.concatenate(
-        (state_values[1:], endpoint_values[None, ...]), axis=0
-    )
-
-    def backward(carry: Any, values: tuple[Any, ...]) -> tuple[Any, Any]:
-        r_t, done_t, v_next, q_next, c_next = values
-        not_done = 1.0 - done_t.astype(jnp.float32)
-        target = r_t + float(gamma) * not_done * (
-            v_next + c_next * (carry - q_next)
+    def backward(carry: Any, values: tuple[Any, ...]):
+        reward_t, done_t, value_next, q_next, coefficient_next = values
+        target = reward_t + float(gamma) * (1.0 - done_t.astype(jnp.float32)) * (
+            value_next + coefficient_next * (carry - q_next)
         )
         return target, target
 
-    _, reversed_targets = jax.lax.scan(
+    _, reverse = jax.lax.scan(
         backward,
-        endpoint_values,
-        (
-            reward[::-1],
-            terminal[::-1],
-            next_state_values[::-1],
-            next_taken_q[::-1],
-            next_coefficients[::-1],
-        ),
+        endpoint,
+        (reward[::-1], terminal[::-1], next_values[::-1], next_taken[::-1], next_coeff[::-1]),
     )
-    targets = jax.lax.stop_gradient(reversed_targets[::-1])
     return RawQTargets(
-        targets=targets,
-        conservative_taken_q=taken_q,
-        target_expected_values=state_values,
-        trace_coefficients=coefficients,
+        jax.lax.stop_gradient(reverse[::-1]), taken_q, state_values, coefficients
     )
 
 
@@ -144,32 +111,21 @@ def twin_raw_q_loss(raw_q1: Any, raw_q2: Any, actions: Any, targets: Any, mask: 
     target = jnp.asarray(targets, dtype=jnp.float32)
     weight = jnp.asarray(mask, dtype=jnp.float32)
     denominator = jnp.maximum(jnp.sum(weight), 1.0)
-    return jnp.sum(weight * (jnp.square(first - target) + jnp.square(second - target))) / (
-        2.0 * denominator
-    )
+    return jnp.sum(weight * (jnp.square(first - target) + jnp.square(second - target))) / (2.0 * denominator)
 
 
-def rollout_retrace_loss(
-    *,
-    model: Any,
-    params: Any,
-    target_params: Any,
-    batch: Any,
-    gamma: float,
-) -> tuple[Any, dict[str, Any]]:
-    """Dense selected-action raw-Q supervision for every legal rollout step."""
-
+def rollout_retrace_loss(*, model: Any, params: Any, target_params: Any, batch: Any, gamma: float):
     import jax
     import jax.numpy as jnp
 
+    zero_dropout = jnp.zeros_like(batch.context_dropout_masks)
     _, target = model.apply(
         {"params": target_params},
         batch.initial_target_policy_state,
         batch.observations,
         batch.previous_actions,
-        batch.previous_rewards,
         batch.episode_starts,
-        batch.gate_overrides,
+        zero_dropout,
         method=model.sequence,
     )
     _, live = model.apply(
@@ -177,17 +133,16 @@ def rollout_retrace_loss(
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
-        batch.previous_rewards,
         batch.episode_starts,
-        batch.gate_overrides,
+        batch.context_dropout_masks,
         method=model.sequence,
     )
-    target_probabilities = jax.nn.softmax(target.execution_logits, axis=-1)
+    target_probabilities = jax.nn.softmax(target.policy_logits, axis=-1)
     target_bundle = recurrent_retrace_targets(
         rewards=batch.rewards,
         dones=batch.dones,
         actions=batch.actions,
-        behavior_action_probabilities=jnp.exp(batch.old_log_probabilities),
+        behavior_action_probabilities=batch.behavior_probabilities,
         target_action_probabilities=target_probabilities[:-1],
         target_raw_q1=target.raw_q1[:-1],
         target_raw_q2=target.raw_q2[:-1],
@@ -195,73 +150,66 @@ def rollout_retrace_loss(
         endpoint_target_raw_q1=target.raw_q1[-1],
         endpoint_target_raw_q2=target.raw_q2[-1],
         gamma=float(gamma),
-        trace_lambda=RETRACE_LAMBDA,
     )
     loss = twin_raw_q_loss(
-        live.raw_q1[:-1],
-        live.raw_q2[:-1],
-        batch.actions,
-        target_bundle.targets,
-        batch.ppo_mask,
+        live.raw_q1[:-1], live.raw_q2[:-1], batch.actions, target_bundle.targets, batch.ppo_mask
     )
     conservative = conservative_raw_q(live.raw_q1[:-1], live.raw_q2[:-1])
     action_range = jnp.max(conservative, axis=-1) - jnp.min(conservative, axis=-1)
-    head_disagreement = jnp.mean(jnp.abs(live.raw_q1[:-1] - live.raw_q2[:-1]))
     return loss, {
         "raw_q_retrace_loss": loss,
         "raw_q_action_range_mean": jnp.mean(action_range),
         "raw_q_action_range_p90": jnp.quantile(action_range, 0.9),
-        "raw_q_head_disagreement": head_disagreement,
+        "raw_q_head_disagreement": jnp.mean(jnp.abs(live.raw_q1[:-1] - live.raw_q2[:-1])),
         "retrace_coefficient_mean": jnp.mean(target_bundle.trace_coefficients),
         "raw_q_target_mean": jnp.mean(target_bundle.targets),
     }
 
 
-def anchor_all_action_loss(
-    *,
-    model: Any,
-    params: Any,
-    anchors: Any,
-) -> tuple[Any, dict[str, Any]]:
-    """All-action simulator-return supervision from current-epoch replay."""
+def centered(values: Any) -> Any:
+    import jax.numpy as jnp
 
+    array = jnp.asarray(values, dtype=jnp.float32)
+    return array - jnp.mean(array, axis=-1, keepdims=True)
+
+
+def _huber(error: Any, delta: float = 1.0) -> Any:
+    import jax.numpy as jnp
+
+    absolute = jnp.abs(error)
+    quadratic = jnp.minimum(absolute, float(delta))
+    return 0.5 * jnp.square(quadratic) + float(delta) * (absolute - quadratic)
+
+
+def anchor_all_action_loss(
+    *, model: Any, params: Any, anchors: Any, replay_weights: Any | None = None
+):
     import jax.numpy as jnp
 
     _, output = model.apply(
         {"params": params},
         anchors.policy_states,
         anchors.observations,
-        jnp.ones(anchors.anchor_ids.shape, dtype=jnp.float32),
+        jnp.zeros(anchors.anchor_ids.shape, dtype=jnp.bool_),
         method=model.step,
     )
-    target = jnp.asarray(anchors.fit_returns_by_action, dtype=jnp.float32)
-    mask = jnp.asarray(anchors.action_mask, dtype=jnp.float32)
+    target = centered(anchors.fit_returns_by_action)
+    first = centered(output.raw_q1)
+    second = centered(output.raw_q2)
+    row_weights = (
+        jnp.ones(anchors.anchor_ids.shape, dtype=jnp.float32)
+        if replay_weights is None
+        else jnp.asarray(replay_weights, dtype=jnp.float32)
+    )
+    mask = jnp.asarray(anchors.action_mask, dtype=jnp.float32) * row_weights[:, None]
     denominator = jnp.maximum(jnp.sum(mask), 1.0)
-    first = jnp.sum(mask * jnp.square(output.raw_q1 - target)) / denominator
-    second = jnp.sum(mask * jnp.square(output.raw_q2 - target)) / denominator
-    loss = 0.5 * (first + second)
-    conservative = conservative_raw_q(output.raw_q1, output.raw_q2)
-    selected = jnp.argmax(conservative, axis=-1)
-    selected_return = gather_actions(target, selected)
+    loss = 0.5 * jnp.sum(mask * (_huber(first - target) + _huber(second - target))) / denominator
+    selected = jnp.argmax(conservative_raw_q(output.raw_q1, output.raw_q2), axis=-1)
     return loss, {
         "anchor_raw_q_loss": loss,
-        "anchor_selected_fit_return": jnp.mean(selected_return),
-        "anchor_empirical_action_range": jnp.mean(
-            jnp.max(target, axis=-1) - jnp.min(target, axis=-1)
-        ),
+        "anchor_selected_fit_return": jnp.mean(gather_actions(anchors.fit_returns_by_action, selected)),
+        "anchor_empirical_action_range": jnp.mean(jnp.max(target, axis=-1) - jnp.min(target, axis=-1)),
     }
-
-
-def raw_q_gradients(
-    objective: Any,
-    params: Any,
-) -> tuple[Any, Any, Any]:
-    """Differentiate one raw-Q objective and enforce its parameter ownership."""
-
-    import jax
-
-    (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
-    return loss, metrics, keep_owned_gradients(gradients, loss_name="raw_q")
 
 
 def q_policy_coupling_loss(
@@ -270,11 +218,10 @@ def q_policy_coupling_loss(
     params: Any,
     batch: Any,
     temperature: float,
-    calibration_error: float,
-    minimum_margin: float,
-) -> tuple[Any, dict[str, Any]]:
-    """Couple calibrated raw-Q to only the conditional residual actor."""
-
+    gap_midpoint: float,
+    gap_temperature: float,
+    disagreement_temperature: float,
+):
     import jax
     import jax.numpy as jnp
 
@@ -283,51 +230,136 @@ def q_policy_coupling_loss(
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
-        batch.previous_rewards,
         batch.episode_starts,
-        batch.gate_overrides,
+        batch.context_dropout_masks,
         method=model.sequence,
     )
-    first = output.raw_q1[:-1]
-    second = output.raw_q2[:-1]
-    conservative = jax.lax.stop_gradient(conservative_raw_q(first, second))
-    ordered = jnp.sort(conservative, axis=-1)
-    margin = ordered[..., -1] - ordered[..., -2]
-    agreement = jnp.max(jnp.abs(first - second), axis=-1)
-    qualified = (
-        (margin >= jnp.asarray(minimum_margin, dtype=jnp.float32))
-        & (agreement <= jnp.asarray(calibration_error, dtype=jnp.float32))
-        & (batch.gate_overrides[:-1] > 0.5)
-    ).astype(jnp.float32)
-    target = jax.nn.softmax(conservative / float(temperature), axis=-1)
-    # Stop base actor gradients: C4 couples only the residual.
-    conditional_logits = (
-        jax.lax.stop_gradient(output.base_logits[:-1])
-        + output.residual_logits[:-1]
-    )
-    log_conditional = jax.nn.log_softmax(conditional_logits, axis=-1)
-    log_target = jnp.log(jnp.maximum(target, 1e-8))
-    items = jnp.sum(target * (log_target - log_conditional), axis=-1)
-    denominator = jnp.maximum(jnp.sum(qualified), 1.0)
-    loss = jnp.sum(qualified * items) / denominator
+    first, second = output.raw_q1[:-1], output.raw_q2[:-1]
+    q = jax.lax.stop_gradient(conservative_raw_q(first, second))
+    ordered = jnp.sort(q, axis=-1)
+    gap = ordered[..., -1] - ordered[..., -2]
+    disagreement = jnp.mean(jnp.abs(first - second), axis=-1)
+    weight = jax.nn.sigmoid(
+        (gap - float(gap_midpoint)) / float(gap_temperature)
+    ) * jnp.exp(-disagreement / float(disagreement_temperature))
+    target = jax.nn.softmax(q / float(temperature), axis=-1)
+    log_target = jnp.log(jnp.maximum(target, 1.0e-8))
+    log_policy = jax.nn.log_softmax(output.policy_logits[:-1], axis=-1)
+    items = jnp.sum(target * (log_target - log_policy), axis=-1)
+    valid = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    denominator = jnp.maximum(jnp.sum(valid), 1.0)
+    loss = jnp.sum(valid * weight * items) / denominator
     return loss, {
         "q_policy_coupling_loss": loss,
-        "q_policy_qualified_fraction": jnp.mean(qualified),
-        "q_policy_margin_mean": jnp.mean(margin),
-        "q_policy_head_disagreement_mean": jnp.mean(agreement),
+        "q_policy_weight_mean": jnp.sum(valid * weight) / denominator,
+        "q_policy_gap_mean": jnp.sum(valid * gap) / denominator,
+        "q_policy_head_disagreement_mean": jnp.sum(valid * disagreement) / denominator,
+    }
+
+
+def decision_equivalence_metric_loss(
+    *,
+    mean_a: Any,
+    mean_b: Any,
+    advantage_a: Any,
+    advantage_b: Any,
+    advantage_scale: Any,
+    weights: Any,
+) -> tuple[Any, Any, Any]:
+    """Continuous post-evidence latent/action-signature metric objective."""
+
+    import jax
+    import jax.numpy as jnp
+
+    latent_distance = jnp.linalg.norm(
+        jnp.asarray(mean_a, dtype=jnp.float32)
+        - jnp.asarray(mean_b, dtype=jnp.float32),
+        axis=-1,
+    )
+    decision_distance = jax.lax.stop_gradient(
+        jnp.linalg.norm(
+            jnp.asarray(advantage_a, dtype=jnp.float32)
+            - jnp.asarray(advantage_b, dtype=jnp.float32),
+            axis=-1,
+        )
+        / (jnp.asarray(advantage_scale, dtype=jnp.float32) + 1.0e-8)
+    )
+    pair_weights = jnp.asarray(weights, dtype=jnp.float32)
+    loss = jnp.sum(
+        pair_weights * jnp.square(latent_distance - decision_distance)
+    ) / jnp.maximum(jnp.sum(pair_weights), 1.0)
+    return loss, latent_distance, decision_distance
+
+
+def decision_equivalence_loss(
+    *,
+    model: Any,
+    params: Any,
+    anchors: Any,
+    advantage_scale: Any,
+    replay_weights: Any | None = None,
+):
+    import jax
+    import jax.numpy as jnp
+
+    pair_ids = jnp.asarray(anchors.matched_pair_ids, dtype=jnp.int32)
+    # Rows of every matched pair are stored adjacently by replay construction;
+    # ordinary adjacent rows carry -1 and are masked below.
+    first_indexes = jnp.arange(0, pair_ids.shape[0] - 1, 2, dtype=jnp.int32)
+    paired = jnp.stack((first_indexes, first_indexes + 1), axis=-1)
+    _, output = model.apply(
+        {"params": params},
+        anchors.policy_states,
+        anchors.observations,
+        jnp.zeros(anchors.anchor_ids.shape, dtype=jnp.bool_),
+        method=model.step,
+    )
+    mean_a, mean_b = output.belief_mean[paired[:, 0]], output.belief_mean[paired[:, 1]]
+    advantage = centered(anchors.fit_returns_by_action)
+    advantage_a, advantage_b = advantage[paired[:, 0]], advantage[paired[:, 1]]
+    action_valid = jnp.any(anchors.action_mask, axis=-1)
+    pair_valid = (
+        (pair_ids[paired[:, 0]] == pair_ids[paired[:, 1]])
+        & (pair_ids[paired[:, 0]] >= 0)
+        & action_valid[paired[:, 0]]
+        & action_valid[paired[:, 1]]
+    )
+    row_weights = (
+        jnp.ones(pair_ids.shape, dtype=jnp.float32)
+        if replay_weights is None
+        else jnp.asarray(replay_weights, dtype=jnp.float32)
+    )
+    weights = pair_valid.astype(jnp.float32) * 0.5 * (
+        row_weights[paired[:, 0]] + row_weights[paired[:, 1]]
+    )
+    loss, latent_distance, decision_distance = decision_equivalence_metric_loss(
+        mean_a=mean_a,
+        mean_b=mean_b,
+        advantage_a=advantage_a,
+        advantage_b=advantage_b,
+        advantage_scale=advantage_scale,
+        weights=weights,
+    )
+    return loss, {
+        "decision_equivalence_loss": loss,
+        "decision_equivalence_pair_count": jnp.sum(weights),
+        "decision_equivalence_latent_distance": jnp.sum(weights * latent_distance) / jnp.maximum(jnp.sum(weights), 1.0),
+        "decision_equivalence_target_distance": jnp.sum(weights * decision_distance) / jnp.maximum(jnp.sum(weights), 1.0),
     }
 
 
 __all__ = [
     "RETRACE_LAMBDA",
     "RawQTargets",
+    "anchor_all_action_loss",
+    "centered",
     "conservative_raw_q",
+    "decision_equivalence_loss",
+    "decision_equivalence_metric_loss",
     "gather_actions",
+    "q_policy_coupling_loss",
     "recurrent_retrace_targets",
     "rollout_retrace_loss",
-    "anchor_all_action_loss",
-    "raw_q_gradients",
-    "q_policy_coupling_loss",
     "target_expected_q",
     "twin_raw_q_loss",
 ]
