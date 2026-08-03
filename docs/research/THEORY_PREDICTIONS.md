@@ -1,5 +1,7 @@
 # 理论的定量预测（探索轨）
 
+注：本文失配条款仅约束理论轨，不阻塞方法轨（方法轨关键路径见 [EXPERIMENT_LADDER](EXPERIMENT_LADDER.md) 核心原则）。
+
 状态：探索轨产物，`scientific_readout_allowed: false`。
 职责：把三大理论资产从附录里的验证材料升格为对 OvercookedV2 的定量预测。预测先写死，实测后对照。对不上就按失配条款处理，不许事后调参数圆场。
 素材来源：[PATH_C_PROPOSAL §2](../legacy/v44/design/PATH_C_PROPOSAL.md) 的信息价值分解与匹配界，[PATH_C_THEORY](../legacy/v44/design/PATH_C_THEORY.md) 的 belief-kernel 有限样本定理（T1），[FOUNDATIONAL_THEORY_AND_PROOFS](../theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md) §2 的不可识别性下界。

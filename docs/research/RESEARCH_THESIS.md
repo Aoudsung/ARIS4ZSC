@@ -20,7 +20,7 @@
 
 次论点（Θ5）：**信息价值分解链六控制设计是可操作的通用 ZSC 诊断工具，能在同一面板上分开测量机会、信息、控制三类瓶颈。** 本次 S1 面板与 S2 相图是它的首个完整实例。
 
-论文形态按 [PAPER_STANDARD](PAPER_STANDARD.md) 收缩到 L1-L3：L4（方法 SOTA）已随 Θ3 出局摘除。
+论文形态按 [PAPER_STANDARD](PAPER_STANDARD.md)：L4（方法 SOTA）随 Θ3 复活而恢复（2026-08-03 人类复议，见 [THESIS_CANDIDATES](THESIS_CANDIDATES.md) 末节），DELTA-ZSC-E2E 重新作为 SOTA 竞争者出场，SOTA 注册基线见 [SOTA_BASELINE](SOTA_BASELINE.md)。
 
 ## 顺序假设
 

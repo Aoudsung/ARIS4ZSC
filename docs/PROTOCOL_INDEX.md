@@ -2,7 +2,7 @@
 
 职责：一页索引，编目全部契约类文档。这些文档管的是"怎么做才有效"，不管"研究什么问题"。研究问题见 [RESEARCH_PROGRAM](RESEARCH_PROGRAM.md)。
 纪律：契约文档的修订必须与代码、配置在同一提交内保持一致，修订理由入台账。字节级哈希锁已于 2026-08-03 废除，见[证据台账](status/EVIDENCE_LEDGER.md)。
-阶梯级编号对应 [EXPERIMENT_LADDER](research/EXPERIMENT_LADDER.md)：S1 只读面板，S2 受控相图，S3 单 seed 机制读数，S4 探索性矩阵，S5 正式冻结矩阵。
+阶梯级编号对应 [EXPERIMENT_LADDER](research/EXPERIMENT_LADDER.md)：S1 只读面板，S2 受控相图，S3 单 seed preflight（已整级降级），S4 探索性矩阵，S5 正式冻结矩阵。
 
 ## 收录文档
 

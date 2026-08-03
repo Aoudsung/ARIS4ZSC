@@ -1,5 +1,7 @@
 # S2 受控相图任务族规格（注册版）
 
+注：本规格属并行旁路（理论轨），对方法轨无阻塞权。
+
 状态：探索轨产物，`scientific_readout_allowed: false`。
 职责：注册"Bernoulli 证据路由任务"的完整规格。实现（`experiments/overcooked_v2/controlled_phase_app.py`）必须与本规格一致；规格变更先入[证据台账](../status/EVIDENCE_LEDGER.md)再改代码。
 定理引用：T1-T4 见 [FOUNDATIONAL §10](../theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md)。

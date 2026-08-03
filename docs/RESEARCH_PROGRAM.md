@@ -8,11 +8,11 @@
 
 过去的文档体系把工程契约放在顶层：注册身份、门控、冻结协议写满了三份主文档，真正的科学问题压在 legacy 归档里。重构把顺序翻了过来。现在顶层是候选论点、判决性实验和理论预测，契约退到附卷，只管"S5 正式实验怎么做才有效"。
 
-中心论点目前**没有定**。按"先探索再定"的决策，五个候选论点已登记，等文献复核与 S1 机会面板读数之后裁决。任何提前宣称的中心论点都不算数。
+中心论点状态（2026-08-03 裁决与人类复议）：主论点 Θ2（信息时序定理生态验证），次论点 Θ5（分解链诊断）；**Θ3 复活为方法载体论点**（V6 端到端 Bayes 协调为载体，复议依据见 [THESIS_CANDIDATES](research/THESIS_CANDIDATES.md) 末节）。核心原则：在 OvercookedV2 benchmark 中超越 SOTA 的 performance 是唯一核心目标，方法轨是唯一关键路径，理论/诊断轨为并行旁路、无阻塞权。
 
 ## 当前阶段与唯一下一步
 
-探索轨，论点裁决前。唯一下一步：执行 S1 只读机会面板，测 `Γ_compat = V_Z − V_fix`。详见[仪表盘](status/DASHBOARD.md)。
+探索轨，论点已裁决。唯一下一步：方法轨关键路径——执行 M1 preflight（V6 单 seed，价值排序 preflight 门槛值跑前入台账；失败则换载体，不停止目标）。并行旁路（不阻塞方法轨）：E5 插入式 Bayes 路由器对撞（H3/P4，见 [TRAJECTORY_AND_ESTIMATION_SPEC](research/TRAJECTORY_AND_ESTIMATION_SPEC.md) §5）、旁路诊断写表（Θ5 面板读数回填）。详见[仪表盘](status/DASHBOARD.md)。
 
 ## 研究层文档地图
 
@@ -24,6 +24,7 @@
 | [research/EXPERIMENT_LADDER](research/EXPERIMENT_LADDER.md) | S1 到 S5 判决性实验阶梯 |
 | [research/THEORY_PREDICTIONS](research/THEORY_PREDICTIONS.md) | 理论的定量预测表与失配条款 |
 | [research/PAPER_STANDARD](research/PAPER_STANDARD.md) | 顶会标准：主张层级、定理清单、基线注册、表图设计与审稿防御 |
+| [research/SOTA_BASELINE](research/SOTA_BASELINE.md) | SOTA 基线注册专页：布局映射、已发表数值、判决式与口径偏移披露 |
 | [research/TRACKS_AND_GOVERNANCE](research/TRACKS_AND_GOVERNANCE.md) | 探索轨与确认轨规则、晋升门 |
 | [status/DASHBOARD](status/DASHBOARD.md) | 活仪表盘，当前阶段与唯一下一步 |
 | [status/EVIDENCE_LEDGER](status/EVIDENCE_LEDGER.md) | 只追加证据台账 |

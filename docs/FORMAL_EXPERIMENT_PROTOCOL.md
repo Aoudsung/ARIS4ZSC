@@ -119,3 +119,12 @@ Unit tests, CUDA mechanical runs, formal-shape preflight and mechanism audits pr
 only mechanical execution, identity integrity and the stated measurements. ZSC
 claims require the frozen Simple and Wide Official matrices, the common-partner
 scoreboards, raw-return data and complete resource disclosure.
+
+Registered SOTA baseline for the verdict: the published Table 2 values of
+arXiv:2503.17821 (Gessler et al., "OvercookedV2: Rethinking Overcooked for
+Zero-Shot Coordination"), Test Time Simple FCP 6±29 and Test Time Wide FCP
+23±40 (10 seeds, 500 episodes per cell). These are the benchmark paper's
+author-trained checkpoint values; the resulting calibration-drift risk is
+disclosed in `docs/research/SOTA_BASELINE.md` and, per the 2026-08-03 human
+adjudication, is not a gating prerequisite, while the verdict still requires
+`J_XP` to be significantly above the registered baseline.

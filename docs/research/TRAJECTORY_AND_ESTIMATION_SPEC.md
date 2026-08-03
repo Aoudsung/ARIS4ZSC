@@ -1,5 +1,7 @@
 # 轨迹采集与信号估计规格（注册版，E1-E5）
 
+注：本规格属并行旁路（理论轨），对方法轨无阻塞权。
+
 状态：探索轨，`scientific_readout_allowed: false`。
 职责：注册 Θ2 生态验证（H2/H3）的全部测量协议。本规格变更必须先入[证据台账](../status/EVIDENCE_LEDGER.md)。上游：[THEORY_PREDICTIONS](THEORY_PREDICTIONS.md) 预测表，[S1 面板](S1_EXECUTION_SPEC.md) 数据。
 
