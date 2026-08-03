@@ -1,0 +1,50 @@
+# 研究总纲
+
+本仓库文档体系的入口。2026-08-03 文档重构后，体系顶层是研究方案，契约内容降级为确认轨协议附卷。
+
+## 这个研究想干什么
+
+一句话：搞清楚零样本协调的差距到底在哪一环，然后按证据决定往哪押注。
+
+过去的文档体系把工程契约放在顶层：注册身份、门控、冻结协议写满了三份主文档，真正的科学问题压在 legacy 归档里。重构把顺序翻了过来。现在顶层是候选论点、判决性实验和理论预测，契约退到附卷，只管"S5 正式实验怎么做才有效"。
+
+中心论点目前**没有定**。按"先探索再定"的决策，五个候选论点已登记，等文献复核与 S1 机会面板读数之后裁决。任何提前宣称的中心论点都不算数。
+
+## 当前阶段与唯一下一步
+
+探索轨，论点裁决前。唯一下一步：执行 S1 只读机会面板，测 `Γ_compat = V_Z − V_fix`。详见[仪表盘](status/DASHBOARD.md)。
+
+## 研究层文档地图
+
+| 文档 | 一句话定位 |
+|---|---|
+| [research/THESIS_CANDIDATES](research/THESIS_CANDIDATES.md) | 五个候选论点、falsifier、四维评估、裁决留空 |
+| [research/RESEARCH_THESIS](research/RESEARCH_THESIS.md) | 中心论点，初版只含已排除假说，裁决后展开 |
+| [research/LITERATURE_MATRIX](research/LITERATURE_MATRIX.md) | 文献卡片与生态位图谱 |
+| [research/EXPERIMENT_LADDER](research/EXPERIMENT_LADDER.md) | S1 到 S5 判决性实验阶梯 |
+| [research/THEORY_PREDICTIONS](research/THEORY_PREDICTIONS.md) | 理论的定量预测表与失配条款 |
+| [research/PAPER_STANDARD](research/PAPER_STANDARD.md) | 顶会标准：主张层级、定理清单、基线注册、表图设计与审稿防御 |
+| [research/TRACKS_AND_GOVERNANCE](research/TRACKS_AND_GOVERNANCE.md) | 探索轨与确认轨规则、晋升门 |
+| [status/DASHBOARD](status/DASHBOARD.md) | 活仪表盘，当前阶段与唯一下一步 |
+| [status/EVIDENCE_LEDGER](status/EVIDENCE_LEDGER.md) | 只追加证据台账 |
+
+## 确认轨冻结协议（语义降级声明）
+
+以下三份文档的定位从"体系顶层设计"改写为**确认轨冻结协议**：它们定义 S5 正式实验的方法、矩阵与统计纪律，不再承担研究方案的职能。确认轨 commit 冻结前可正常修订，冻结后不得再改。
+
+- [theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md](theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md)，确认轨绑定设计。
+- [FORMAL_EXPERIMENT_PROTOCOL.md](FORMAL_EXPERIMENT_PROTOCOL.md)，S5 矩阵、记分板与 claim boundary。
+- [theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md)，方法内部引理。
+
+完整编目与解冻流程见 [PROTOCOL_INDEX](PROTOCOL_INDEX.md)。
+
+## 归档层
+
+- [legacy/v44](legacy/v44/README.md)，V4.4 研究线全量归档，只读，断链不修。本方案的理论资产（信息价值分解链、TV 匹配界、历史需求定理）与三条负面证据都出自这里，引用时带证据指针。
+- [legacy/v5_r3](legacy/v5_r3/README.md)，根级旧副本归档，非权威。
+
+## 阅读顺序建议
+
+第一次读：本文档，然后 THESIS_CANDIDATES，然后 EXPERIMENT_LADDER。
+要动手做实验：EXPERIMENT_LADDER 找到所在级，对照 TRACKS_AND_GOVERNANCE 的轨道规则。
+要改方法：先读 PROTOCOL_INDEX 确认哪些文件碰不得。

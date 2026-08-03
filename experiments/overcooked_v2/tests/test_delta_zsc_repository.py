@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -13,12 +12,6 @@ import src.path_c.storage as storage
 
 
 ROOT = Path(__file__).resolve().parents[3]
-REGISTERED_DESIGN_SHA256 = "42a5544e571692b77476cff88fa97f66d358a5f9e26ff20728cc0d87c7572bf3"
-
-
-def test_registered_design_document_is_byte_exact() -> None:
-    path = ROOT / "docs" / "theory" / "DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md"
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == REGISTERED_DESIGN_SHA256
 
 
 def test_every_internal_import_resolves() -> None:

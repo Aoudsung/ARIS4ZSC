@@ -47,10 +47,14 @@ admission state. C0–C5 labels survive only in the post-training `audit-signals
 report and cannot affect training, checkpoint selection, deployment or formal
 samples.
 
-The binding design is
+The confirm-track binding design is
 [`docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md`](docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md).
 The fixed benchmark and claim protocol is
 [`docs/FORMAL_EXPERIMENT_PROTOCOL.md`](docs/FORMAL_EXPERIMENT_PROTOCOL.md).
+The research program entry point is
+[`docs/RESEARCH_PROGRAM.md`](docs/RESEARCH_PROGRAM.md).
+The confirm-track protocol index is
+[`docs/PROTOCOL_INDEX.md`](docs/PROTOCOL_INDEX.md).
 
 ## Runtime
 
