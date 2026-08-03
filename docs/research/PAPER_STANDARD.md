@@ -122,3 +122,15 @@ SOTA 注册基线数值（判决 Θ3 的对比锚点，注册详情与判决式�
 | §主结果与统计 | S5 |
 
 推进顺序即 [EXPERIMENT_LADDER](EXPERIMENT_LADDER.md) 的 S1 到 S5。每级完成时按本文档第九节回填对应表图，避免最后赶工。
+
+## 修订段（2026-08-04，统一重构 I 节，文档重构任务 #16；只追加，不改写上文）
+
+**一、S5 基线集合与路径 1 判决程序对齐。** 第六节基线注册表按下述口径执行，冲突处以本段为准：
+
+1. **同 commit 重训基线 run 节点**：基线节点与己方评估一律在固定 Official commit（`5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`）上执行，同 episode keys 做配对/双样本层级推断，判决程序以 [STATISTICAL_PREREGISTRATION](STATISTICAL_PREREGISTRATION.md) 第五节（路径 1 已裁定生效）为唯一权威。
+2. **必训项**：SP、OP、FCP（及路径 1 口径的 SA）为必训/必取 run 节点项；SP/OP 现成 10 seed 可按引用口径记账，FCP 种群重训（约 24 亿步/布局）为判决批前置成本项。
+3. **视可得性降级为外部参考**：MEP、PLASTIC、PECAN（及 GOAT）不参与判决式，复现成本与协议可比性逐一核对后另行注册；已发表 Table 2 数值（Simple 6±29、Wide 23±40）仅作外部 sanity check。
+4. 资源披露由本文第八节五项升级为 [DEVELOPMENT_MATRIX](DEVELOPMENT_MATRIX.md) 第四节全口径六项（另见 [EVALUATION_SPEC](../EVALUATION_SPEC.md) 第五节）。
+
+**二、论文中心统一为 DEPI 主张（双中心表述废止）。** 本文第二节"测量驱动的方法论文"形态与以 Θ2/L3 为中心的双中心表述废止；论文中心统一为 [SCIENTIFIC_SPEC](../SCIENTIFIC_SPEC.md) §3 的 DEPI 中心主张（legal-history protocol inference improves XP），Θ2 降为支持性理论（消除评审 §11 双中心冲突）；主张层级与表图设计后续按 SCIENTIFIC_SPEC 与 [EVALUATION_SPEC](../EVALUATION_SPEC.md) 重排，重排结果另追加新修订段。
+

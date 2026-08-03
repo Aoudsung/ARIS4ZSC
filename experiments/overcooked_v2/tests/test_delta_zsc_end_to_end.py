@@ -1,6 +1,18 @@
-from __future__ import annotations
+"""End-to-end mechanism tests for the DEPI core.
 
-from types import SimpleNamespace
+Specification entries covered (docs/METHOD_SPEC.md):
+- §2 replay bookkeeping stays valid under the new three-object architecture
+  (anchor rows now carry capability/protocol contexts via PolicyState).
+- Partner generator mechanics (mixture admission, episode validation,
+  fixed-behavior PPO) stay importable; the learned generator is rejected by
+  the §7.3 boundary (static wide partner pool is the default), so these
+  modules are exercised here but disconnected from the default path.
+
+Deprecated mechanics removed from this file per §3.3 (belief gradient
+routing / PCGrad / normalized gradient caps are abolished).
+"""
+
+from __future__ import annotations
 
 import numpy as np
 import pytest
@@ -15,17 +27,6 @@ from src.path_c.anchor_replay import (  # noqa: E402
     policy_drift_age_weights,
     sample_replay_batch,
 )
-from src.path_c.gradient_routing import (  # noqa: E402
-    BELIEF_OBJECTIVE_ORDER,
-    combine_belief_gradients,
-    tree_inner_product,
-    tree_l2_norm,
-)
-from src.path_c.model import (  # noqa: E402
-    build_model,
-    initial_policy_state,
-    initialize_model_parameters,
-)
 from src.path_c.partner_episode import (  # noqa: E402
     PartnerEpisodeBatch,
     generator_ppo_objective,
@@ -33,8 +34,8 @@ from src.path_c.partner_episode import (  # noqa: E402
     validate_complete_episode_batch,
 )
 from src.path_c.partner_sources import soft_generator_mixture  # noqa: E402
-from src.path_c.training import belief_objective_gradients  # noqa: E402
-from src.path_c.types import CounterfactualAnchorBatch, RolloutBatch  # noqa: E402
+from src.path_c.model import initial_policy_state  # noqa: E402
+from src.path_c.types import CounterfactualAnchorBatch  # noqa: E402
 
 
 def _policy_state(rows: int):
@@ -43,8 +44,11 @@ def _policy_state(rows: int):
         observation_shape=(5, 5, 39),
         action_count=6,
         task_hidden_dim=8,
-        belief_hidden_dim=8,
-        latent_dim=4,
+        capability_hidden_dim=8,
+        protocol_hidden_dim=8,
+        capability_dim=4,
+        component_embedding_dim=4,
+        protocol_components=4,
     )
 
 
@@ -192,121 +196,3 @@ def test_generator_ppo_uses_fixed_behavior_gae_and_official_value_clipping() -> 
     assert float(loss) == pytest.approx(
         0.5 * expected_value_loss - 0.01 * np.log(2.0), abs=1e-6
     )
-
-
-def test_normalized_pcgrad_prevents_response_scale_domination_or_cancellation() -> None:
-    def gradient(value):
-        return {"belief_encoder": {"w": jnp.asarray(value, dtype=jnp.float32)}}
-
-    zero = gradient([0.0, 0.0])
-    objective = {name: zero for name in BELIEF_OBJECTIVE_ORDER}
-    objective["ppo"] = gradient([1.0, 0.0])
-    objective["response"] = gradient([-1.0e6, 1.0e6])
-    weights = {name: 1.0 for name in BELIEF_OBJECTIVE_ORDER}
-    combined, _, metrics = combine_belief_gradients(
-        objective,
-        # The production state starts at one.  This fixture therefore covers
-        # the dangerous first-update EMA lag instead of starting with a
-        # perfectly adapted zero EMA.
-        {name: jnp.asarray(1.0) for name in BELIEF_OBJECTIVE_ORDER},
-        weights=weights,
-        decay=0.99,
-    )
-    assert float(tree_inner_product(combined, objective["ppo"])) > 0.0
-    response_normalized = metrics["belief_gradient_normalized_norm/response"]
-    ppo_normalized = metrics["belief_gradient_normalized_norm/ppo"]
-    assert float(response_normalized / ppo_normalized) == pytest.approx(1.0, rel=1e-5)
-    assert float(metrics["belief_gradient_ema_normalized_norm/response"]) > 1.0
-    assert float(response_normalized) <= 1.0 + 1.0e-6
-    assert float(tree_l2_norm(combined)) > 0.0
-
-
-def test_belief_gradient_cap_respects_each_registered_objective_weight() -> None:
-    def gradient(value):
-        return {"belief_encoder": {"w": jnp.asarray(value, dtype=jnp.float32)}}
-
-    objective = {
-        name: gradient([1.0e5, -1.0e5]) for name in BELIEF_OBJECTIVE_ORDER
-    }
-    weights = {name: 1.0 for name in BELIEF_OBJECTIVE_ORDER}
-    weights["ppo"] = 0.10
-    weights["information_bottleneck"] = 0.001
-    _, _, metrics = combine_belief_gradients(
-        objective,
-        {name: jnp.asarray(1.0) for name in BELIEF_OBJECTIVE_ORDER},
-        weights=weights,
-        decay=0.99,
-    )
-    for name, registered_weight in weights.items():
-        assert float(metrics[f"belief_gradient_normalized_norm/{name}"]) <= (
-            registered_weight + 1.0e-6
-        )
-
-
-def test_ppo_has_nonzero_legal_history_belief_gradient() -> None:
-    shape = (5, 5, 39)
-    model = build_model(
-        observation_shape=shape,
-        action_count=6,
-        task_hidden_dim=8,
-        belief_hidden_dim=8,
-        latent_dim=4,
-        actor_hidden_dim=8,
-        critic_hidden_dim=8,
-        response_hidden_dim=8,
-        modulation_rank=2,
-        action_embedding_dim=4,
-        log_standard_deviation_minimum=-5.0,
-        log_standard_deviation_maximum=2.0,
-    )
-    state = _policy_state(2)
-    observation = jax.random.normal(jax.random.PRNGKey(1), (4, 2) + shape)
-    params = initialize_model_parameters(
-        model, key=jax.random.PRNGKey(2), example_state=state,
-        example_observation=observation[0], partner_code_dim=4,
-    )
-    transition = (3, 2)
-    batch = RolloutBatch(
-        observations=observation,
-        response_next_observations=observation[1:],
-        previous_actions=jnp.zeros((4, 2), dtype=jnp.int32),
-        episode_starts=jnp.zeros((4, 2), dtype=jnp.bool_),
-        action_keys=jnp.zeros((4, 2, 2), dtype=jnp.uint32),
-        context_dropout_masks=jnp.zeros((4, 2), dtype=jnp.bool_),
-        actions=jnp.asarray([[0, 1], [2, 3], [4, 5]], dtype=jnp.int32),
-        rewards=jnp.asarray([[0.0, 1.0], [2.0, -1.0], [3.0, 0.5]]),
-        official_shaped_rewards=jnp.zeros(transition),
-        official_shaping_factors=jnp.ones(transition),
-        decision_regret_shaping=jnp.zeros(transition),
-        shaped_rewards=jnp.asarray([[0.0, 1.0], [2.0, -1.0], [3.0, 0.5]]),
-        dones=jnp.zeros(transition, dtype=jnp.bool_),
-        old_log_probabilities=jnp.zeros(transition),
-        old_values=jnp.zeros((4, 2)),
-        behavior_probabilities=jnp.full(transition, 1.0 / 6.0),
-        ppo_mask=jnp.ones(transition),
-        partner_codes=jnp.zeros((3, 2, 4)),
-        partner_sources=jnp.zeros(transition, dtype=jnp.int32),
-        partner_run_ids=jnp.zeros(transition, dtype=jnp.int32),
-        initial_policy_state=state,
-        initial_target_policy_state=state,
-    )
-    config = SimpleNamespace(
-        ppo=SimpleNamespace(
-            gamma=0.99, gae_lambda=0.95, clip_epsilon=0.2,
-            value_clip_epsilon=0.2, value_weight=0.5, entropy_weight=0.01,
-            normalize_advantages=True,
-        ),
-        loss=SimpleNamespace(
-            q_policy_temperature=1.0,
-            q_policy_gap_midpoint=1.0,
-            q_policy_gap_temperature=1.0,
-            q_policy_disagreement_temperature=5.0,
-            information_bottleneck_free_bits_per_dimension=0.1,
-        ),
-    )
-    values, gradients = belief_objective_gradients(
-        model=model, params=params, batch=batch, config=config
-    )
-    assert set(values) == {"ppo", "q_policy", "robust", "information_bottleneck"}
-    ppo_belief = gradients["ppo"]["belief_encoder"]
-    assert float(tree_l2_norm(ppo_belief)) > 0.0

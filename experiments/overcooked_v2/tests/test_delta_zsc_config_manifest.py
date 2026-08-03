@@ -1,3 +1,18 @@
+"""Configuration manifest tests.
+
+Specification entries covered (docs/METHOD_SPEC.md):
+- §1.1 frozen DEPI model dimensions (capability/protocol/component).
+- §3.1/§3.2/§3.4 frozen loss_v2 weights and the combined_policy_kl gate.
+- §5 anchor legalization: anchors are enabled in every registered config and
+  feed the supervised loss path; the §5.3 frozen comparator thresholds
+  (0.55 / 0.70 / 1.0) and the §6 extended M1 gate (0.8 / 0.9) are pinned.
+- §7.1 generator code space fixed to the 3-dimensional tetrahedral simplex.
+- §7.2 frozen diversity bank, code archive, and backbone-freeze values.
+- §7.3 boundary: the static wide partner pool stays enabled with frozen
+  checkpoint stages and a test-only heuristic family, while the learned
+  partner generator stays disabled and enabling it is rejected.
+"""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -78,9 +93,9 @@ def _valid_manifest() -> PartnerManifest:
 
 
 def test_registered_versions_and_run_budgets() -> None:
-    assert CONFIG_VERSION == 9
+    assert CONFIG_VERSION == 11
     assert MANIFEST_VERSION == 2
-    assert METHOD_VERSION == "delta_zsc_v6_end_to_end_bayes_coordination"
+    assert METHOD_VERSION == "delta_zsc_depi_three_object_bayes_coordination"
     assert OFFICIAL_PROTOCOL_VERSION == "overcooked_v2_iclr2025_5ce1707_v1"
     assert RUN_BUDGETS["mechanical"].num_envs == 4
     assert RUN_BUDGETS["development"].environment_steps == 1_228_800
@@ -113,18 +128,44 @@ def test_v6_formal_signal_and_schedule_values_are_frozen() -> None:
     config = load_config(
         CONFIGS / "delta_zsc_simple_formal.yaml", run_kind="formal"
     )
-    assert config.model.latent_dim == 8
-    assert config.model.posterior_particles == 16
-    assert config.model.log_standard_deviation_minimum == -5.0
-    assert config.model.log_standard_deviation_maximum == 2.0
-    assert config.loss.raw_q_weight == 1.0
-    assert config.loss.counterfactual_weight == 1.0
-    assert config.loss.response_weight == 1.0
-    assert config.loss.decision_equivalence_weight == 0.1
-    assert config.loss.information_bottleneck_weight == 0.001
-    assert config.loss.q_policy_weight == 0.25
-    assert config.loss.robust_generalist_weight == 0.1
-    assert config.loss.policy_belief_gradient_scale == 0.1
+    # §1.1 frozen DEPI three-object dimensions.
+    assert config.model.capability_hidden_dim == 64
+    assert config.model.protocol_hidden_dim == 128
+    assert config.model.capability_dim == 16
+    assert config.model.protocol_components == 4
+    assert config.model.component_embedding_dim == 16
+    # §3.1/§3.2 frozen active objective weights.
+    assert config.loss_v2.signature_weight == 1.0
+    assert config.loss_v2.response_weight == 1.0
+    assert config.loss_v2.separation_weight == 0.1
+    assert config.loss_v2.rank_hinge_margin == 0.1
+    assert config.loss_v2.rank_hinge_advantage_gap == 2.0
+    assert config.loss_v2.separation_margin_scale == 0.25
+    # §3.4 frozen KL early-stop gate.
+    assert config.loss_v2.combined_policy_kl_threshold == 0.04
+    # §5 anchor legalization: anchors are enabled by default so the
+    # signature/separation supervision path is active in every registered run.
+    assert config.anchors.enabled is True
+    assert config.partner_generator.enabled is False
+    # §5.3 frozen comparator thresholds for the matched-pair classifier.
+    assert config.anchors.observable_equivalent_accuracy_max == 0.55
+    assert config.anchors.decision_distinct_accuracy_min == 0.70
+    assert config.anchors.signature_distance_threshold == 1.0
+    # §6 extended M1 gate thresholds (Spearman over >=90% of anchors).
+    assert config.anchors.m1_spearman_threshold == 0.8
+    assert config.anchors.m1_minimum_anchor_fraction == 0.9
+    # §7.1 tetrahedral simplex code space.
+    assert config.partner_generator.code_dim == 3
+    # §7.2 shared-state diversity bank, code archive, and backbone freeze.
+    assert config.partner_generator.diversity_bank_size == 64
+    assert config.partner_generator.diversity_codes_per_update == 8
+    assert config.partner_generator.code_archive_capacity == 256
+    assert config.partner_generator.freeze_after_imitation is True
+    # §7.3 static wide partner pool: default B0–B2 partner distribution.
+    assert config.partner_pool.enabled is True
+    assert config.partner_pool.checkpoint_stages == (0.0, 0.5, 1.0)
+    assert config.partner_pool.heuristic_family_test_only is True
+    assert config.partner_pool.family_uniform_sampling is True
     assert config.training.context_dropout_initial == 0.30
     assert config.training.context_dropout_final == 0.10
     assert config.anchors.interval_updates == 16
@@ -133,10 +174,43 @@ def test_v6_formal_signal_and_schedule_values_are_frozen() -> None:
     assert config.partner_generator.maximum_generator_probability == 0.75
     invalid = replace(
         config,
-        loss=replace(config.loss, q_policy_weight=0.5),
+        loss_v2=replace(config.loss_v2, signature_weight=0.5),
     )
-    with pytest.raises(ValueError, match="q_policy_weight"):
+    with pytest.raises(ValueError, match="signature_weight"):
         validate_config(invalid)
+    enabled_generator = replace(
+        config,
+        partner_generator=replace(config.partner_generator, enabled=True),
+    )
+    with pytest.raises(ValueError, match="stays disabled"):
+        validate_config(enabled_generator)
+    # §5.3 comparator thresholds are frozen; perturbations are rejected.
+    drifted_comparator = replace(
+        config,
+        anchors=replace(config.anchors, observable_equivalent_accuracy_max=0.60),
+    )
+    with pytest.raises(ValueError, match="observable_equivalent_accuracy_max"):
+        validate_config(drifted_comparator)
+    drifted_m1 = replace(
+        config,
+        anchors=replace(config.anchors, m1_spearman_threshold=0.7),
+    )
+    with pytest.raises(ValueError, match="m1_spearman_threshold"):
+        validate_config(drifted_m1)
+    # §7.1 code space dimension is fixed at 3.
+    drifted_code_dim = replace(
+        config,
+        partner_generator=replace(config.partner_generator, code_dim=8),
+    )
+    with pytest.raises(ValueError, match="code_dim must be 3"):
+        validate_config(drifted_code_dim)
+    # §7.3 the static wide partner pool cannot be disabled.
+    disabled_pool = replace(
+        config,
+        partner_pool=replace(config.partner_pool, enabled=False),
+    )
+    with pytest.raises(ValueError, match="stays enabled"):
+        validate_config(disabled_pool)
 
 
 def test_config_rejects_unknown_fields(tmp_path: Path) -> None:

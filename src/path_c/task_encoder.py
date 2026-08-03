@@ -1,4 +1,10 @@
-"""Deployable task-state encoder for DELTA-ZSC."""
+"""Deployable task-state encoder for DEPI.
+
+METHOD_SPEC §1.4: the task pathway input shrinks to ``o_t`` only.  The
+previous_action_embedding and action_projection wiring is deleted so that the
+task GRU structurally never touches any partner-history carrier (METHOD_SPEC
+§1.2 input-layer isolation).  The Official CNN trunk weights are untouched.
+"""
 
 from __future__ import annotations
 
@@ -19,36 +25,25 @@ def task_encoder_classes() -> tuple[Any, Any]:
 
     class TaskEncoderCell(nn.Module):
         hidden_dim: int
-        action_count: int
-        action_embedding_dim: int
 
         @nn.compact
         def __call__(
             self,
             carry: Any,
-            inputs: tuple[Any, Any, Any],
+            inputs: tuple[Any, Any],
         ) -> tuple[Any, Any]:
-            observation, previous_action, episode_start = inputs
+            observation, episode_start = inputs
             obs = jnp.asarray(observation, dtype=jnp.float32)
-            action = jnp.asarray(previous_action, dtype=jnp.int32)
             start = jnp.asarray(episode_start, dtype=jnp.bool_)
-            if action.shape != start.shape:
+            batch_axes = obs.shape[:-3]
+            if start.shape != batch_axes:
                 raise ValueError("Task encoder scalar inputs must share batch axes.")
-            if obs.shape[:-3] != action.shape:
-                raise ValueError("Observation batch axes do not match task inputs.")
 
-            sentinel = jnp.where(start, self.action_count, action)
-            action_embedding = nn.Embed(
-                num_embeddings=self.action_count + 1,
-                features=self.action_embedding_dim,
-                embedding_init=nn.initializers.normal(0.02),
-                name="previous_action_embedding",
-            )(sentinel)
             # This is the exact visual trunk used by the locked Official RNN:
             # 128x1x1, 128x1x1, 8x1x1, 16x3x3, 32x3x3, 32x3x3,
-            # flatten, Dense-128, ReLU, LayerNorm, GRU-128.  DELTA-specific
-            # DELTA's belief and continuous low-rank actor modulation are
-            # attached after this shared public-protocol backbone.
+            # flatten, Dense-128, ReLU, LayerNorm, GRU-128.  DEPI attaches the
+            # capability/protocol pathways after this shared public backbone;
+            # the task pathway itself reads only the current observation.
             encoded = obs
             for index, (features, kernel) in enumerate(
                 ((128, (1, 1)), (128, (1, 1)), (8, (1, 1)),
@@ -63,7 +58,7 @@ def task_encoder_classes() -> tuple[Any, Any]:
                         name=f"official_conv_{index}",
                     )(encoded)
                 )
-            encoded = encoded.reshape(action.shape + (-1,))
+            encoded = encoded.reshape(batch_axes + (-1,))
             encoded = nn.relu(
                 nn.Dense(
                     self.hidden_dim,
@@ -72,12 +67,6 @@ def task_encoder_classes() -> tuple[Any, Any]:
                     name="official_dense",
                 )(encoded)
             )
-            encoded = encoded + nn.Dense(
-                self.hidden_dim,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="action_projection",
-            )(action_embedding)
             encoded = nn.LayerNorm(name="task_layer_norm")(encoded)
             carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
             next_carry, feature = nn.GRUCell(

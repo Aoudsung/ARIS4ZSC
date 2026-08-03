@@ -43,3 +43,11 @@
 - 晋升门要求"SOTA 基线数值已注册"即指本页（[TRACKS_AND_GOVERNANCE](TRACKS_AND_GOVERNANCE.md)）。
 - S5 进入条件与判决见 [EXPERIMENT_LADDER](EXPERIMENT_LADDER.md) S5。
 - 基线注册表的简表见 [PAPER_STANDARD](PAPER_STANDARD.md) 第六节。
+
+## 六、判决式统计问题与预注册指针（追加段，待裁定生效）
+
+统一重构评审（F 节）判定第三节现行判决式在统计上不可执行：注册数值 6±29 / 23±40 是已发表均值±标准差、无原始 run node，不能做配对 run-node bootstrap，也不能把己方 bootstrap 区间减基线点估计称为“差值置信区间”。两套合规判决程序已并行预注册于 [STATISTICAL_PREREGISTRATION](STATISTICAL_PREREGISTRATION.md)：路径 1（固定 Official commit 重训/获取 FCP/OP/SA run-level 节点，同 episode keys 配对/双样本层级推断，Table 2 降为外部 sanity check）与路径 2（维持发表标量对标，判决措辞降级为“超过已发表点估计（基线训练不确定性未计入，口径如实披露）”，补 Welch 口径保守边际报告）。δ_min = 20.0（`src/path_c/experiment.py` 常量 `OFFICIAL_CORRECT_DELIVERY_REWARD = 20.0`）同步预注册。状态：pending 用户裁定，裁定后由预注册文件登记生效路径，本段与第三节判决式按生效路径执行；在此之前本段只追加，上文不覆盖。
+
+## 七、裁定生效说明（2026-08-03 追加）
+
+用户裁定（登记于 [DECISION_LOG](../status/DECISION_LOG.md) D2）：SOTA 判决采用**路径 1**——在固定 Official commit 上重训/获取 FCP/OP/SA 的 run-level 节点，同 episode keys 配对/双样本层级推断；已发表 Table 2（Simple 6±29、Wide 23±40）降为外部 sanity check；“显著超过 SOTA”措辞仅在配对推断支持下使用。路径 2 降为备用（仅在路径 1 资源不可行并经新裁定后启用）。生效口径与执行要点见 [STATISTICAL_PREREGISTRATION](STATISTICAL_PREREGISTRATION.md) 第五节。本判决文件待基线 run 节点就绪后按预注册程序执行；在此之前本段只追加，上文不覆盖。

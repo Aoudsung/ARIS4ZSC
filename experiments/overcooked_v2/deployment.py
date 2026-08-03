@@ -27,10 +27,10 @@ from src.path_c.training import categorical_log_probability
 
 DEPLOYABLE_PARAM_NAMES = (
     "task_encoder",
-    "belief_encoder",
+    "capability_encoder",
+    "protocol_encoder",
+    "protocol_component_embeddings",
     "universal_actor",
-    "universal_critic",
-    "response_decoder",
 )
 DEPLOYMENT_BUNDLE_VERSION = 3
 PRIMARY_ARTIFACT_NAME = "DELTA-ZSC-E2E"
@@ -53,19 +53,16 @@ def _build_model(
         observation_shape=observation_shape,
         action_count=action_count,
         task_hidden_dim=config.model.task_hidden_dim,
-        belief_hidden_dim=config.model.belief_hidden_dim,
-        latent_dim=config.model.latent_dim,
+        capability_hidden_dim=config.model.capability_hidden_dim,
+        protocol_hidden_dim=config.model.protocol_hidden_dim,
+        capability_dim=config.model.capability_dim,
+        protocol_components=config.model.protocol_components,
+        component_embedding_dim=config.model.component_embedding_dim,
         actor_hidden_dim=config.model.actor_hidden_dim,
         critic_hidden_dim=config.model.critic_hidden_dim,
         response_hidden_dim=config.model.response_hidden_dim,
         modulation_rank=config.model.modulation_rank,
         action_embedding_dim=config.model.action_embedding_dim,
-        log_standard_deviation_minimum=(
-            config.model.log_standard_deviation_minimum
-        ),
-        log_standard_deviation_maximum=(
-            config.model.log_standard_deviation_maximum
-        ),
     )
 
 
@@ -231,8 +228,11 @@ def reset_deployment_state(
         observation_shape=observation_shape,
         action_count=6,
         task_hidden_dim=deployment.config.model.task_hidden_dim,
-        belief_hidden_dim=deployment.config.model.belief_hidden_dim,
-        latent_dim=deployment.config.model.latent_dim,
+        capability_hidden_dim=deployment.config.model.capability_hidden_dim,
+        protocol_hidden_dim=deployment.config.model.protocol_hidden_dim,
+        capability_dim=deployment.config.model.capability_dim,
+        component_embedding_dim=deployment.config.model.component_embedding_dim,
+        protocol_components=deployment.config.model.protocol_components,
     )
 
 

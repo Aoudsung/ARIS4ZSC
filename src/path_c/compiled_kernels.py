@@ -1,4 +1,12 @@
-"""Stable CUDA executable boundaries for the V6 end-to-end update."""
+"""Stable CUDA executable boundaries for the DEPI foundation update.
+
+The active default path compiles only rollout, target-context and the
+combined four-loss PPO scan (METHOD_SPEC §3.3).  The legacy V6 kernels
+(detached raw-Q retrace, counterfactual anchor heads, separate response
+head updates, belief-objective gradient collection and decision-regret
+shaping) are disconnected from the default path by task #10's §5–§7
+boundary: their slots are ``None`` unless a future task re-enables them.
+"""
 
 from __future__ import annotations
 
@@ -9,22 +17,12 @@ import math
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .gradient_routing import keep_owned_gradients
-from .raw_q import (
-    anchor_all_action_loss,
-    decision_equivalence_loss,
-    rollout_retrace_loss,
-)
-from .response_targets import response_auxiliary_objective
 from .runner import (
     DECISION_REGRET_STATE_CHUNK_SIZE,
     collect_rollout,
-    decision_regret_chunk,
-    finalize_decision_regret_shaping,
     target_context_sequence,
 )
-from .training import belief_objective_gradients, scan_training_updates
-from .types import TrainingCoreState
+from .training import scan_training_updates
 
 
 class CompiledMemoryLimitError(RuntimeError):
@@ -141,15 +139,16 @@ class CompiledTrainingKernels:
     rollout_anchor_full: CompiledCallable
     rollout_support: CompiledCallable
     target_context_sequence: CompiledCallable
-    regret_chunk: CompiledCallable
-    regret_finalize: CompiledCallable
     ppo_scan: CompiledCallable
-    raw_q_retrace_update: CompiledCallable
-    anchor_head_update: CompiledCallable
-    response_head_update: CompiledCallable
-    belief_rollout_objectives: CompiledCallable
-    belief_anchor_objectives: CompiledCallable
-    belief_apply: CompiledCallable
+    # Legacy V6 kernels; disconnected until §5–§7 lands (task #13 boundary).
+    regret_chunk: CompiledCallable | None = None
+    regret_finalize: CompiledCallable | None = None
+    raw_q_retrace_update: CompiledCallable | None = None
+    anchor_head_update: CompiledCallable | None = None
+    response_head_update: CompiledCallable | None = None
+    belief_rollout_objectives: CompiledCallable | None = None
+    belief_anchor_objectives: CompiledCallable | None = None
+    belief_apply: CompiledCallable | None = None
 
     def metadata(self) -> Mapping[str, Any]:
         return {
@@ -195,17 +194,6 @@ def configure_persistent_compilation_cache(
     return {**identity, "cache_directory": str(directory), "cache_identity": digest}
 
 
-def _apply_optimizer(
-    *, params: Any, optimizer_state: Any, gradients: Any, optimizer: Any
-) -> tuple[Any, Any]:
-    import optax
-
-    updates, next_optimizer_state = optimizer.update(
-        gradients, optimizer_state, params
-    )
-    return optax.apply_updates(params, updates), next_optimizer_state
-
-
 def build_training_kernels(
     *,
     environment: Any,
@@ -214,11 +202,13 @@ def build_training_kernels(
     partner_functions: Any,
     config: Any,
     ppo_optimizer: Any,
-    raw_q_optimizer: Any,
-    response_optimizer: Any,
-    belief_optimizer: Any,
 ) -> CompiledTrainingKernels:
-    """Build a finite family of fixed-shape V6 CUDA programs."""
+    """Build the finite family of fixed-shape DEPI CUDA programs.
+
+    Only the active §1–§4 kernels are compiled.  All legacy V6 auxiliary
+    kernels are returned as ``None`` so that importing this module never
+    touches the deprecated belief/raw-Q/response-head objectives.
+    """
 
     def rollout(mode: str, length: int) -> Callable[..., Any]:
         def execute(
@@ -251,43 +241,15 @@ def build_training_kernels(
     def context(target_params: Any, batch: Any) -> Any:
         return target_context_sequence(model=model, target_params=target_params, batch=batch)
 
-    def regret(
-        target_params: Any,
-        task_features: Any,
-        belief_mean: Any,
-        belief_log_standard_deviation: Any,
-        sample_keys: Any,
+    def ppo_scan(
+        core: Any,
+        batch: Any,
+        schedule: Any,
+        anchors: Any = None,
+        separation_terms: Any = None,
     ) -> Any:
-        return decision_regret_chunk(
-            model=model,
-            target_params=target_params,
-            task_features=task_features,
-            belief_mean=belief_mean,
-            belief_log_standard_deviation=belief_log_standard_deviation,
-            sample_keys=sample_keys,
-            posterior_particles=config.model.posterior_particles,
-        )
-
-    def finalize(
-        batch: Any, regrets: Any, ranges: Any, action_range_ema: Any, effective_steps: Any
-    ) -> Any:
-        import jax
-
-        progress = effective_steps / float(max(config.training.environment_steps, 1))
-        weight = float(config.loss.decision_regret_weight_maximum) * jax.nn.sigmoid(
-            (progress - float(config.loss.decision_regret_schedule_midpoint))
-            / float(config.loss.decision_regret_schedule_temperature)
-        )
-        return finalize_decision_regret_shaping(
-            batch=batch,
-            regrets=regrets,
-            action_ranges=ranges,
-            action_range_ema=action_range_ema,
-            gamma=config.ppo.gamma,
-            weight=weight,
-        )
-
-    def ppo_scan(core: Any, batch: Any, schedule: Any) -> Any:
+        # ``anchors`` / ``separation_terms``: §5 anchor supervision payload;
+        # anchor-batch-global, shared by every scan step.
         return scan_training_updates(
             model=model,
             core=core,
@@ -295,152 +257,8 @@ def build_training_kernels(
             batch=batch,
             schedule=schedule,
             config=config,
-        )
-
-    def retrace_update(
-        params: Any, target_params: Any, optimizer_state: Any, batch: Any
-    ) -> tuple[Any, Any, Mapping[str, Any]]:
-        import jax
-
-        def objective(candidate: Any):
-            loss, metrics = rollout_retrace_loss(
-                model=model,
-                params=candidate,
-                target_params=target_params,
-                batch=batch,
-                gamma=config.ppo.gamma,
-            )
-            return float(config.loss.raw_q_weight) * loss, metrics
-
-        (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
-        gradients = keep_owned_gradients(gradients, loss_name="raw_q")
-        next_params, next_state = _apply_optimizer(
-            params=params,
-            optimizer_state=optimizer_state,
-            gradients=gradients,
-            optimizer=raw_q_optimizer,
-        )
-        return next_params, next_state, {**metrics, "raw_q_total": loss}
-
-    def anchor_update(
-        params: Any,
-        optimizer_state: Any,
-        anchors: Any,
-        replay_weights: Any,
-    ) -> tuple[Any, Any, Mapping[str, Any]]:
-        import jax
-
-        def objective(candidate: Any):
-            loss, metrics = anchor_all_action_loss(
-                model=model,
-                params=candidate,
-                anchors=anchors,
-                replay_weights=replay_weights,
-            )
-            return float(config.loss.counterfactual_weight) * loss, metrics
-
-        (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
-        gradients = keep_owned_gradients(gradients, loss_name="counterfactual")
-        next_params, next_state = _apply_optimizer(
-            params=params,
-            optimizer_state=optimizer_state,
-            gradients=gradients,
-            optimizer=raw_q_optimizer,
-        )
-        return next_params, next_state, {**metrics, "counterfactual_total": loss}
-
-    def response_update(
-        params: Any, optimizer_state: Any, batch: Any
-    ) -> tuple[Any, Any, Mapping[str, Any]]:
-        import jax
-
-        def objective(candidate: Any):
-            loss, metrics = response_auxiliary_objective(
-                model=model, params=candidate, batch=batch
-            )
-            return float(config.loss.response_weight) * loss, metrics
-
-        (loss, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(params)
-        gradients = keep_owned_gradients(gradients, loss_name="response")
-        next_params, next_state = _apply_optimizer(
-            params=params,
-            optimizer_state=optimizer_state,
-            gradients=gradients,
-            optimizer=response_optimizer,
-        )
-        return next_params, next_state, {**metrics, "response_total": loss}
-
-    def belief_rollout_gradients(
-        params: Any, target_params: Any, batch: Any
-    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-        import jax
-
-        values, gradients = belief_objective_gradients(
-            model=model, params=params, batch=batch, config=config
-        )
-
-        def raw_objective(candidate: Any):
-            return rollout_retrace_loss(
-                model=model,
-                params=candidate,
-                target_params=target_params,
-                batch=batch,
-                gamma=config.ppo.gamma,
-            )[0]
-
-        def response_objective(candidate: Any):
-            return response_auxiliary_objective(
-                model=model, params=candidate, batch=batch
-            )[0]
-
-        for name, objective in (
-            ("raw_q", raw_objective),
-            ("response", response_objective),
-        ):
-            values[name], gradients[name] = jax.value_and_grad(objective)(params)
-        return values, gradients
-
-    def belief_anchor_gradients(
-        params: Any, anchors: Any, replay_weights: Any, advantage_scale: Any
-    ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
-        import jax
-
-        def cf_objective(candidate: Any):
-            return anchor_all_action_loss(
-                model=model,
-                params=candidate,
-                anchors=anchors,
-                replay_weights=replay_weights,
-            )[0]
-
-        def de_objective(candidate: Any):
-            return decision_equivalence_loss(
-                model=model,
-                params=candidate,
-                anchors=anchors,
-                advantage_scale=advantage_scale,
-                replay_weights=replay_weights,
-            )[0]
-
-        values: dict[str, Any] = {}
-        gradients: dict[str, Any] = {}
-        for name, objective in (
-            ("counterfactual", cf_objective),
-            ("decision_equivalence", de_objective),
-        ):
-            values[name], gradients[name] = jax.value_and_grad(objective)(params)
-        return values, gradients
-
-    def apply_belief(
-        params: Any, optimizer_state: Any, gradients: Any
-    ) -> tuple[Any, Any]:
-        from .gradient_routing import select_gradient_prefixes
-
-        return _apply_optimizer(
-            params=params,
-            optimizer_state=optimizer_state,
-            gradients=select_gradient_prefixes(gradients, ("belief_encoder",)),
-            optimizer=belief_optimizer,
+            anchors=anchors,
+            separation_terms=separation_terms,
         )
 
     return CompiledTrainingKernels(
@@ -454,25 +272,11 @@ def build_training_kernels(
             "rollout_support", rollout("support", config.environment.episode_steps)
         ),
         target_context_sequence=CompiledCallable("target_context_sequence", context),
-        regret_chunk=CompiledCallable("regret_chunk", regret),
-        regret_finalize=CompiledCallable("regret_finalize", finalize),
         # The frozen EMA target is consumed again by dense raw-Q immediately
         # after PPO.  Donating the containing core would invalidate those
         # aliased buffers on CUDA, so this boundary deliberately does not
         # donate its input tree.
         ppo_scan=CompiledCallable("ppo_scan", ppo_scan),
-        raw_q_retrace_update=CompiledCallable(
-            "raw_q_retrace_update", retrace_update
-        ),
-        anchor_head_update=CompiledCallable("anchor_head_update", anchor_update),
-        response_head_update=CompiledCallable("response_head_update", response_update),
-        belief_rollout_objectives=CompiledCallable(
-            "belief_rollout_objectives", belief_rollout_gradients
-        ),
-        belief_anchor_objectives=CompiledCallable(
-            "belief_anchor_objectives", belief_anchor_gradients
-        ),
-        belief_apply=CompiledCallable("belief_apply", apply_belief),
     )
 
 
@@ -529,6 +333,13 @@ def attach_chunked_regret_with_kernels(
     effective_steps: Any,
     state_chunk_size: int = DECISION_REGRET_STATE_CHUNK_SIZE,
 ) -> tuple[Any, Mapping[str, Any]]:
+    """Legacy V6 decision-regret shaping; disconnected from the DEPI path."""
+
+    if kernels.regret_chunk is None or kernels.regret_finalize is None:
+        raise RuntimeError(
+            "Decision-regret shaping stays disabled until the §5–§7 geometry "
+            "fixes land (METHOD_SPEC §7.3; boundary of task #10)."
+        )
     import jax
     import jax.numpy as jnp
 

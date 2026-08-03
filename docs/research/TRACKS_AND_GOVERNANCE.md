@@ -35,3 +35,9 @@
 - 只追加台账：[EVIDENCE_LEDGER](../status/EVIDENCE_LEDGER.md)，结论被推翻时追加新条目，不改旧条目。
 - 单次运行报告一页上限，归档进 `docs/status/` 或按主题进 `docs/research/`。
 - 退休即归档：不再维护的文档移入 `docs/legacy/`，原样冻结，断链不修。
+
+## 修订段（2026-08-04，统一重构 I 节，文档重构任务 #16；只追加，不改写上文）
+
+**晋升条件治理（冲突冻结）。** 开发矩阵的组件取舍与晋升规则自此以 [DEVELOPMENT_MATRIX](DEVELOPMENT_MATRIX.md) 为唯一权威口径：取舍由配对增量决定，不设制度性停机门槛，任何一级读数为负不触发计划停机。本文件上文"晋升门"一节中与该口径冲突的旧晋升/停机条款（包括门条件隐含的停机语义）予以**冻结**；仍生效的最低条件仅为：commit 冻结且仓库测试全绿、与本轨 claim 相关的预测/基线已登记（理论轨 [THEORY_PREDICTIONS](THEORY_PREDICTIONS.md)、方法轨 SOTA 基线 [SOTA_BASELINE](SOTA_BASELINE.md)）。冻结条款如需恢复，须追加新修订段并先入[证据台账](../status/EVIDENCE_LEDGER.md)，不得静默复活。
+
+**探索轨读数与论文依赖的调和规则。** S1–S4 探索轨产物一律标注 `scientific_readout_allowed: false`，不得直接用作论文有效性主张；与论文表图/论证的依赖冲突按以下规则调和：探索轨读数须经**正式重跑**（确认轨口径，跑前注册）或按**预注册程序复核**后方可入论文；调和规则的完整登记处在 [EVALUATION_SPEC](../EVALUATION_SPEC.md) 第七节，两途皆未通过的读数只保留为台账条目，不入论文。

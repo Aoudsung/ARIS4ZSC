@@ -222,20 +222,41 @@ def sample_partner_codes(
     *,
     batch_size: int,
     code_dim: int,
+    alpha: Any | None = None,
+    anchors: Any | None = None,
 ) -> Any:
-    import jax
+    """Sample codes inside the fitted Dirichlet simplex support (§7.1).
 
-    return jax.random.uniform(
-        key,
-        (int(batch_size), int(code_dim)),
-        minval=-1.0,
-        maxval=1.0,
+    Barycentric weights are drawn from Dirichlet(alpha) over the four
+    tetrahedral anchors and mapped to codes via ``code = V^T w``; every
+    sample is therefore a convex combination of the anchors and lies within
+    the support region (alpha is fitted by method of moments from real
+    collected codes upstream, defaulting to the uniform distribution).
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from .generator_training import codes_from_barycentric
+
+    if int(code_dim) != 3:
+        raise ValueError(
+            "METHOD_SPEC §7.1 fixes the generator code space to the "
+            "3-dimensional tetrahedral simplex; code_dim must be 3."
+        )
+    concentration = (
+        jnp.asarray(alpha, dtype=jnp.float32)
+        if alpha is not None
+        else jnp.ones((4,), dtype=jnp.float32)
     )
+    weights = jax.random.dirichlet(key, concentration, shape=(int(batch_size),))
+    return codes_from_barycentric(weights, anchors)
 
 
 __all__ = [
     "build_partner_generator",
     "initial_generator_carry",
+    "initialize_generator_parameters",
     "partner_generator_class",
     "sample_partner_codes",
 ]

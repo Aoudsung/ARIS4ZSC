@@ -1,3 +1,11 @@
+"""Compiled training-kernel tests.
+
+Specification entries covered (docs/METHOD_SPEC.md):
+- §3.3 single combined gradient step (toy ``apply_training_core_update``).
+- §3.4 combined_policy_kl early stop aborts the remaining minibatches.
+- Nonfinite updates abort the scan (official safeguard retained).
+"""
+
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -45,29 +53,41 @@ def _batch(time_count: int = 2, lane_count: int = 4) -> RolloutBatch:
 
 
 def _metrics(
-    value: object, *, kl: object = 0.0, nonfinite: object = 0.0
+    value: object, *, kl_stop: object = 0.0, nonfinite: object = 0.0
 ) -> dict[str, object]:
+    """Exact metric key set emitted by ``apply_training_core_update`` (§3.3).
+
+    The scan's skip branch must return the identical pytree structure, so the
+    toy update has to emit exactly these keys.
+    """
+
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     return {
         "actor_loss": value,
-        "approx_kl": jnp.asarray(kl, dtype=jnp.float32),
+        "approx_kl": zero,
         "clip_fraction": zero,
+        "response_total_loss": zero,
+        "response_visibility_loss": zero,
+        "response_position_loss": zero,
+        "response_direction_loss": zero,
+        "response_inventory_loss": zero,
+        "response_event_loss": zero,
+        "signature_loss": zero,
+        "signature_huber_loss": zero,
+        "signature_hinge_loss": zero,
+        "separation_loss": zero,
+        "ppo_total_loss": zero,
         "total_loss": value,
         "value_loss": zero,
         "entropy": zero,
-        "q_policy_coupling_loss": zero,
-        "q_policy_weight_mean": zero,
-        "q_policy_gap_mean": zero,
-        "q_policy_head_disagreement_mean": zero,
-        "robust_generalist_kl": zero,
-        "full_context_entropy": zero,
-        "prior_context_entropy": zero,
         "mean_raw_reward": zero,
         "mean_shaped_reward": zero,
-        "mean_belief_uncertainty": zero,
+        "mean_posterior_entropy": zero,
         "context_dropout_fraction": zero,
+        "combined_policy_kl": zero,
         "optimizer_applied": 1.0 - jnp.asarray(nonfinite, dtype=jnp.float32),
         "nonfinite_update": jnp.asarray(nonfinite, dtype=jnp.float32),
+        "kl_early_stop": jnp.asarray(kl_stop, dtype=jnp.float32),
     }
 
 
@@ -102,14 +122,19 @@ def test_cuda_scan_preserves_all_minibatch_updates_in_order(
     )
     assert float(result.params["weight"]) == pytest.approx(expected)
     assert int(np.asarray(jnp.sum(metrics["optimizer_applied"]))) == 4
+    assert np.asarray(metrics["training_aborted"]).tolist() == [0.0, 0.0, 0.0, 0.0]
 
 
-def test_large_kl_is_diagnostic_and_does_not_skip_official_minibatches(
+def test_combined_policy_kl_early_stop_aborts_remaining_minibatches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # METHOD_SPEC §3.4: once combined_policy_kl exceeds the frozen 0.04 gate
+    # (emitted here as kl_early_stop=1), no further minibatch is applied.
     def toy_update(*, core, **unused):
         value = core.params["weight"] + 1.0
-        return core._replace(params={"weight": value}), _metrics(value, kl=value)
+        kl_stop = value >= 2.0
+        next_core = core._replace(params={"weight": value})
+        return next_core, _metrics(value, kl_stop=kl_stop)
 
     monkeypatch.setattr(training, "apply_training_core_update", toy_update)
     core = TrainingCoreState(
@@ -125,9 +150,10 @@ def test_large_kl_is_diagnostic_and_does_not_skip_official_minibatches(
         schedule=jnp.asarray([[0, 1], [2, 3], [0, 2]], dtype=jnp.int32),
         config=SimpleNamespace(ppo=SimpleNamespace()),
     )
-    assert float(result.params["weight"]) == 3.0
-    assert np.asarray(metrics["optimizer_applied"]).tolist() == [1.0, 1.0, 1.0]
-    assert np.asarray(metrics["training_aborted_nonfinite"]).tolist() == [0.0, 0.0, 0.0]
+    assert float(result.params["weight"]) == 2.0
+    assert np.asarray(metrics["optimizer_applied"]).tolist() == [1.0, 1.0, 0.0]
+    assert np.asarray(metrics["kl_early_stop"]).tolist() == [0.0, 1.0, 0.0]
+    assert np.asarray(metrics["training_aborted"]).tolist() == [0.0, 1.0, 1.0]
 
 
 def test_nonfinite_minibatch_aborts_the_remaining_scan(
@@ -160,7 +186,7 @@ def test_nonfinite_minibatch_aborts_the_remaining_scan(
     )
     assert float(result.params["weight"]) == 1.0
     assert np.asarray(metrics["optimizer_applied"]).tolist() == [1.0, 0.0, 0.0]
-    assert np.asarray(metrics["training_aborted_nonfinite"]).tolist() == [0.0, 1.0, 1.0]
+    assert np.asarray(metrics["training_aborted"]).tolist() == [0.0, 1.0, 1.0]
 
 
 def test_compiled_callable_reuses_one_shape_signature() -> None:

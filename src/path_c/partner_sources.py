@@ -32,6 +32,80 @@ class MixedPartnerContext(NamedTuple):
     reset_keys: Any
 
 
+class StaticPoolPartnerState(NamedTuple):
+    carry: Any
+    member: Any
+
+
+class StaticPoolPartnerContext(NamedTuple):
+    member: Any
+    reset_keys: Any
+
+
+def make_static_pool_partner_functions(*, external_pool: Any) -> PartnerFunctions:
+    """Default static wide partner pool (METHOD_SPEC §7.3).
+
+    Every episode reset resamples a pool member uniformly; between resets the
+    member is fixed.  Pool composition (SP/OP x10 seeds x3 checkpoint stages,
+    OP width variants, heuristic family held out for testing) is decided where
+    the pool itself is built; the learned partner generator stays disabled on
+    this path.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    def initial_state(batch_size: int, key: Any) -> StaticPoolPartnerState:
+        member = external_pool.sample_members(key, int(batch_size))
+        return StaticPoolPartnerState(
+            carry=external_pool.initial_carry(int(batch_size)), member=member
+        )
+
+    def step(parameters: Any, state: StaticPoolPartnerState, observations: Any, episode_start: Any, keys: Any):
+        del parameters
+        action_keys = jax.vmap(lambda key: jax.random.fold_in(key, 0))(keys)
+        reset_keys = jax.vmap(lambda key: jax.random.fold_in(key, 911))(keys)
+        action, next_carry = external_pool.step_with_keys(
+            state.member, observations, state.carry, episode_start, action_keys
+        )
+        next_state = state._replace(carry=next_carry)
+        context = StaticPoolPartnerContext(state.member, reset_keys)
+        return action, next_state, context, jnp.zeros_like(action, dtype=jnp.float32)
+
+    def observe(parameters: Any, state: StaticPoolPartnerState, context: StaticPoolPartnerContext, observations: Any, actions: Any, rewards: Any, dones: Any, next_observations: Any):
+        del parameters, observations, actions, rewards, next_observations
+        done = jnp.asarray(dones, dtype=jnp.bool_)
+        count = int(done.shape[0])
+        fresh_members = external_pool.sample_members_from_keys(
+            context.reset_keys
+        ) if hasattr(external_pool, "sample_members_from_keys") else jax.vmap(
+            lambda key: external_pool.sample_members(key, 1)[0]
+        )(context.reset_keys)
+        fresh = StaticPoolPartnerState(
+            carry=external_pool.initial_carry(count), member=fresh_members
+        )
+        return tree_select(done, fresh, state)
+
+    def run_id(parameters: Any, state: StaticPoolPartnerState, context: StaticPoolPartnerContext):
+        del parameters, context
+        return (10_000 + state.member).astype(jnp.int32)
+
+    def diagnostics(parameters: Any, state: StaticPoolPartnerState, context: StaticPoolPartnerContext):
+        del parameters, state
+        count = context.member.shape[0]
+        return {
+            "source": jnp.full((count,), 2, dtype=jnp.int32),
+            "member": context.member,
+            # Static pools have no continuous generator code; the member index
+            # fills the rollout partner_code slot (run_id carries identity).
+            "code": jnp.asarray(context.member, dtype=jnp.float32)[:, None],
+            "generator_logits": jnp.zeros((count, 6), dtype=jnp.float32),
+            "generator_value": jnp.zeros((count,), dtype=jnp.float32),
+        }
+
+    return PartnerFunctions(initial_state, step, observe, run_id, diagnostics)
+
+
 def soft_generator_mixture(
     *,
     progress: Any,
@@ -175,6 +249,9 @@ __all__ = [
     "MixedPartnerContext",
     "MixedPartnerParameters",
     "MixedPartnerState",
+    "StaticPoolPartnerContext",
+    "StaticPoolPartnerState",
     "make_mixed_partner_functions",
+    "make_static_pool_partner_functions",
     "soft_generator_mixture",
 ]

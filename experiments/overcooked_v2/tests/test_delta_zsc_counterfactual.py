@@ -1,3 +1,11 @@
+"""Counterfactual anchor collection tests.
+
+Specification note (docs/METHOD_SPEC.md): §5 anchor legalization enables
+the anchor pipeline (``anchors.enabled: true``) and wires its matched-pair
+supervision into the loss path; these tests pin its common-randomness and
+sufficient-statistics invariants.
+"""
+
 from __future__ import annotations
 
 import numpy as np

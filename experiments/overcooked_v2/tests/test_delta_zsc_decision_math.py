@@ -1,3 +1,12 @@
+"""Decision-geometry and regret-potential math tests.
+
+Specification note (docs/METHOD_SPEC.md): decision regret shaping and the
+raw-Q decision-equivalence geometry are detached legacy mechanics (§3.3
+abolishes regret shaping; §7 geometry fixes belong to task #13).  The modules
+stay importable per the §5 boundary, and these tests pin their pure-math
+invariants in case the exploration track re-enables them.
+"""
+
 from __future__ import annotations
 
 import numpy as np

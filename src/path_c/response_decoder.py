@@ -1,4 +1,23 @@
-"""Structured decoder for deployable, visible-partner response evidence."""
+"""Action-conditioned protocol response decoder (METHOD_SPEC §2.2).
+
+The decoder implements the per-component likelihood
+``p(y_{t+1} | z_t=k, a_t^ego, sg[frame_t])`` of the mixture model
+
+    p(y | z, H, a) = sum_k pi_{t,k} p(y | z=k, a, sg[frame_t]).
+
+Interface (METHOD_SPEC §1.4): the ``task_features`` parameter is deleted.
+
+* Kinematic components 1-4 (visibility, relative position, direction,
+  inventory) read the stop-gradient frame feature ``sg[frame_t]`` -- predicting
+  kinematics requires a coordinate frame -- plus ``(m_k, u, a^ego)``.
+* Component 5 (protocol event ``interaction_change``) reads **only**
+  ``(m_k, u, a^ego)``; it never sees task or frame features (review §10.2
+  bypass closed).
+
+All five heads emit a trailing ``K`` component axis so that
+``response_targets.mixture_response_loss`` can form the proper mixture NLL
+(METHOD_SPEC §2.3).
+"""
 
 from __future__ import annotations
 
@@ -13,7 +32,6 @@ def response_decoder_class() -> Any:
         return _DECODER
 
     import flax.linen as nn
-    import jax
     import jax.numpy as jnp
     from flax.linen.initializers import orthogonal, zeros
     from .response_targets import (
@@ -31,71 +49,132 @@ def response_decoder_class() -> Any:
         @nn.compact
         def __call__(
             self,
-            task_features: Any,
-            belief_embedding: Any,
+            frame_features: Any,
+            component_embeddings: Any,
+            capability: Any,
             actions: Any,
         ) -> tuple[Any, Any, Any, Any, Any]:
-            task = jnp.asarray(task_features, dtype=jnp.float32)
-            belief = jnp.asarray(belief_embedding, dtype=jnp.float32)
+            """Predict per-component response logits.
+
+            Args:
+                frame_features: ``sg[frame_t]``; the caller applies
+                    stop-gradient.  Any spatial axes are flattened.
+                component_embeddings: matrix ``(K, D)`` of protocol component
+                    embeddings ``m_k``.
+                capability: partner capability embedding ``u``.
+                actions: ego actions ``a_t^ego`` (integer codes).
+
+            Returns:
+                Five logit tensors each carrying a trailing component axis K.
+            """
+
+            frame = jnp.asarray(frame_features, dtype=jnp.float32)
+            components = jnp.asarray(component_embeddings, dtype=jnp.float32)
+            u = jnp.asarray(capability, dtype=jnp.float32)
             action = jnp.asarray(actions, dtype=jnp.int32)
-            if task.shape[:-1] != action.shape or belief.shape[:-1] != action.shape:
+            if components.ndim != 2:
+                raise ValueError("Component embeddings must be a (K, D) matrix.")
+            component_count, component_dim = components.shape
+            lead = action.shape
+            frame = frame.reshape(lead + (-1,))
+            if u.shape[:-1] != lead:
                 raise ValueError("Response decoder batch axes differ.")
+
             action_embedding = nn.Embed(
                 num_embeddings=self.action_count,
                 features=self.action_embedding_dim,
                 embedding_init=nn.initializers.normal(0.02),
                 name="action_embedding",
             )(action)
-            joined = jnp.concatenate((task, belief, action_embedding), axis=-1)
-            hidden = nn.tanh(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="response_hidden_0",
-                )(joined)
+            # Broadcast the component embedding to (..., K, D).
+            broadcast_components = jnp.broadcast_to(
+                components, lead + (component_count, component_dim)
             )
-            hidden = nn.tanh(
+            broadcast_u = jnp.broadcast_to(
+                u, lead + (component_count, u.shape[-1])
+            )
+            broadcast_action = jnp.broadcast_to(
+                action_embedding, lead + (component_count, action_embedding.shape[-1])
+            )
+            broadcast_frame = jnp.broadcast_to(
+                frame, lead + (component_count, frame.shape[-1])
+            )
+
+            # Kinematic trunk: [sg(frame), m_k, u, a] (components 1-4).
+            kinematic_input = jnp.concatenate(
+                (broadcast_frame, broadcast_components, broadcast_u, broadcast_action),
+                axis=-1,
+            )
+            kinematic_hidden = nn.tanh(
                 nn.Dense(
                     self.hidden_dim,
                     kernel_init=orthogonal(jnp.sqrt(2.0)),
                     bias_init=zeros,
-                    name="response_hidden_1",
-                )(hidden)
+                    name="kinematic_hidden_0",
+                )(kinematic_input)
+            )
+            kinematic_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="kinematic_hidden_1",
+                )(kinematic_hidden)
             )
             visibility_logit = nn.Dense(
                 1,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="partner_visibility_logit",
-            )(hidden)[..., 0]
+            )(kinematic_hidden)[..., 0]
             relative_position_logits = nn.Dense(
                 PARTNER_POSITION_CLASSES,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="partner_relative_position_logits",
-            )(hidden)
+            )(kinematic_hidden)
             direction_logits = nn.Dense(
                 PARTNER_DIRECTION_CLASSES,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="partner_direction_logits",
-            )(hidden)
+            )(kinematic_hidden)
             inventory_logits = nn.Dense(
                 self.inventory_factor_count * PARTNER_INVENTORY_FACTOR_CLASSES,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="partner_inventory_logits",
-            )(hidden).reshape(
-                hidden.shape[:-1]
-                + (self.inventory_factor_count, PARTNER_INVENTORY_FACTOR_CLASSES)
+            )(kinematic_hidden).reshape(
+                lead + (component_count, self.inventory_factor_count,
+                        PARTNER_INVENTORY_FACTOR_CLASSES)
+            )
+
+            # Event head: only (m_k, u, a) -- no frame/task features (§2.2).
+            event_input = jnp.concatenate(
+                (broadcast_components, broadcast_u, broadcast_action), axis=-1
+            )
+            event_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="event_hidden_0",
+                )(event_input)
+            )
+            event_hidden = nn.tanh(
+                nn.Dense(
+                    self.hidden_dim,
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="event_hidden_1",
+                )(event_hidden)
             )
             interaction_change_logit = nn.Dense(
                 1,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="partner_interaction_change_logit",
-            )(hidden)[..., 0]
+            )(event_hidden)[..., 0]
             return (
                 visibility_logit,
                 relative_position_logits,
@@ -109,7 +188,6 @@ def response_decoder_class() -> Any:
 
 
 def bernoulli_logit_loss(target: Any, logit: Any) -> Any:
-    import jax
     import jax.numpy as jnp
 
     label = jnp.asarray(target, dtype=jnp.float32)

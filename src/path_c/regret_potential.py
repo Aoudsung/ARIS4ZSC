@@ -1,10 +1,16 @@
-"""Decision-relevant uncertainty and policy-invariant potential shaping."""
+"""Report-only decision regret over the §6 closed hypothesis set.
+
+METHOD_SPEC §6 abolishes Q/regret computation on arbitrary Gaussian
+particles.  The hypothesis set is closed: the posterior-mean context plus the
+B bootstrap history-encoder members, all conditioned on the *same real legal
+history* and therefore sharing one consistent CRN all-action continuation
+label.  Regret ``R_t = E_h max_a Q(h,a) - max_a E_h Q(h,a)`` is computed on
+that set only and reported; it never shapes rewards or gradients.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Callable
-
-from .belief_set_encoder import gaussian_samples
+from typing import Any
 
 
 def decision_regret_from_action_values(
@@ -35,22 +41,17 @@ def decision_regret_from_action_values(
     return jnp.maximum(full_information - bayes, 0.0)
 
 
-def posterior_decision_regret(
-    key: Any,
-    *,
-    mean: Any,
-    log_standard_deviation: Any,
-    sample_count: int,
-    action_value_function: Callable[[Any], Any],
-) -> Any:
-    samples, weights = gaussian_samples(
-        key,
-        mean=mean,
-        log_standard_deviation=log_standard_deviation,
-        sample_count=sample_count,
-    )
-    q = action_value_function(samples)
-    return decision_regret_from_action_values(q, weights)
+def hypothesis_set_decision_regret(action_values_by_hypothesis: Any) -> Any:
+    """Report-only regret over the closed hypothesis set (§6).
+
+    ``action_values_by_hypothesis`` has a leading hypothesis axis holding the
+    all-action Q values of each hypothesis (posterior-mean context plus
+    bootstrap encoder members) evaluated on one shared real history; uniform
+    hypothesis weights are used.  The result must only be logged, never
+    differentiated into the training objective.
+    """
+
+    return decision_regret_from_action_values(action_values_by_hypothesis)
 
 
 def potential_from_regret(regret: Any) -> Any:
@@ -97,7 +98,7 @@ def common_optimal_action_regret_zero(action_values_by_context: Any) -> Any:
 __all__ = [
     "common_optimal_action_regret_zero",
     "decision_regret_from_action_values",
-    "posterior_decision_regret",
+    "hypothesis_set_decision_regret",
     "potential_from_regret",
     "potential_shaping",
 ]

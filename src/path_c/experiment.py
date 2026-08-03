@@ -1,4 +1,4 @@
-"""Single configuration and manifest authority for DELTA-ZSC V6."""
+"""Single configuration and manifest authority for DEPI (DELTA-ZSC foundation)."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CONFIG_VERSION = 9
-METHOD_VERSION = "delta_zsc_v6_end_to_end_bayes_coordination"
+CONFIG_VERSION = 11
+METHOD_VERSION = "delta_zsc_depi_three_object_bayes_coordination"
 MANIFEST_VERSION = 2
 OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
 OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
@@ -83,16 +83,16 @@ class EnvironmentConfig:
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     task_hidden_dim: int
-    belief_hidden_dim: int
-    latent_dim: int
-    posterior_particles: int
+    capability_hidden_dim: int
+    protocol_hidden_dim: int
+    capability_dim: int
+    protocol_components: int
+    component_embedding_dim: int
     actor_hidden_dim: int
     critic_hidden_dim: int
     response_hidden_dim: int
     modulation_rank: int
     action_embedding_dim: int
-    log_standard_deviation_minimum: float
-    log_standard_deviation_maximum: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +115,8 @@ class PPOConfig:
 
 @dataclass(frozen=True, slots=True)
 class LossConfig:
+    """Deprecated V6 loss section; retained for exactly one release cycle."""
+
     response_weight: float
     raw_q_weight: float
     counterfactual_weight: float
@@ -137,7 +139,21 @@ class LossConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class LossV2Config:
+    """Active DEPI objective weights and gates (METHOD_SPEC §3.1/§3.2/§3.4)."""
+
+    signature_weight: float
+    response_weight: float
+    separation_weight: float
+    combined_policy_kl_threshold: float
+    rank_hinge_margin: float
+    rank_hinge_advantage_gap: float
+    separation_margin_scale: float
+
+
+@dataclass(frozen=True, slots=True)
 class AnchorConfig:
+    enabled: bool
     interval_updates: int
     ordinary_states: int
     matched_code_pairs: int
@@ -151,6 +167,12 @@ class AnchorConfig:
     minimum_replay_weight: float
     return_lower_bound: float
     return_upper_bound: float
+    # §5.3 frozen comparator thresholds and the §6 extended M1 gate.
+    observable_equivalent_accuracy_max: float
+    decision_distinct_accuracy_min: float
+    signature_distance_threshold: float
+    m1_spearman_threshold: float
+    m1_minimum_anchor_fraction: float
 
     # Read-only aliases used by optional audit utilities.
     @property
@@ -168,6 +190,7 @@ class AnchorConfig:
 
 @dataclass(frozen=True, slots=True)
 class PartnerGeneratorConfig:
+    enabled: bool
     code_dim: int
     hidden_dim: int
     modulation_rank: int
@@ -189,6 +212,23 @@ class PartnerGeneratorConfig:
     kernel_bandwidth: float
     kernel_jitter: float
     codes_per_update: int
+    # §7.2 shared-state diversity bank, code archive and backbone freeze.
+    diversity_bank_size: int
+    diversity_codes_per_update: int
+    code_archive_capacity: int
+    freeze_after_imitation: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PartnerPoolConfig:
+    """Static wide partner pool, the default B0–B2 partner distribution
+    (METHOD_SPEC §7.3): SP/OP multi-seed runs x checkpoint stages, OP width
+    variants, and a heuristic family held out exclusively for testing."""
+
+    enabled: bool
+    checkpoint_stages: tuple[float, ...]
+    heuristic_family_test_only: bool
+    family_uniform_sampling: bool
 
 @dataclass(frozen=True, slots=True)
 class CalibrationConfig:
@@ -255,8 +295,10 @@ class RunConfig:
     model: ModelConfig
     ppo: PPOConfig
     loss: LossConfig
+    loss_v2: LossV2Config
     anchors: AnchorConfig
     partner_generator: PartnerGeneratorConfig
+    partner_pool: PartnerPoolConfig
     calibration: CalibrationConfig
     training: TrainingConfig
     evaluation: EvaluationConfig
@@ -397,7 +439,7 @@ def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, in
 
 
 def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
-    """Load config v9 and apply the registered run budget."""
+    """Load config v11 and apply the registered run budget."""
 
     import yaml
 
@@ -413,8 +455,10 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
             "model",
             "ppo",
             "loss",
+            "loss_v2",
             "anchors",
             "partner_generator",
+            "partner_pool",
             "calibration",
             "training",
             "evaluation",
@@ -442,11 +486,17 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
     model_payload = _exact_fields(payload["model"], set(ModelConfig.__dataclass_fields__), "model")
     ppo_payload = _exact_fields(payload["ppo"], set(PPOConfig.__dataclass_fields__), "ppo")
     loss_payload = _exact_fields(payload["loss"], set(LossConfig.__dataclass_fields__), "loss")
+    loss_v2_payload = _exact_fields(
+        payload["loss_v2"], set(LossV2Config.__dataclass_fields__), "loss_v2"
+    )
     anchor_payload = _exact_fields(payload["anchors"], set(AnchorConfig.__dataclass_fields__), "anchors")
     generator_payload = _exact_fields(
         payload["partner_generator"],
         set(PartnerGeneratorConfig.__dataclass_fields__),
         "partner_generator",
+    )
+    pool_payload = _exact_fields(
+        payload["partner_pool"], set(PartnerPoolConfig.__dataclass_fields__), "partner_pool"
     )
     calibration_payload = _exact_fields(
         payload["calibration"], set(CalibrationConfig.__dataclass_fields__), "calibration"
@@ -480,8 +530,15 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         model=ModelConfig(**model_payload),
         ppo=PPOConfig(**ppo_payload),
         loss=LossConfig(**loss_payload),
+        loss_v2=LossV2Config(**loss_v2_payload),
         anchors=AnchorConfig(**anchor_payload),
         partner_generator=PartnerGeneratorConfig(**generator_payload),
+        partner_pool=PartnerPoolConfig(
+            enabled=bool(pool_payload["enabled"]),
+            checkpoint_stages=tuple(float(value) for value in pool_payload["checkpoint_stages"]),
+            heuristic_family_test_only=bool(pool_payload["heuristic_family_test_only"]),
+            family_uniform_sampling=bool(pool_payload["family_uniform_sampling"]),
+        ),
         calibration=CalibrationConfig(**calibration_payload),
         training=TrainingConfig(
             **training_payload,
@@ -518,15 +575,18 @@ def validate_config(config: RunConfig) -> None:
         and config.environment.indicate_successful_delivery
     ):
         raise ValueError("Formal OvercookedV2 environment flags must match Official.")
-    if config.model.latent_dim != 8 or config.model.posterior_particles != 16:
-        raise ValueError("V6 fixes latent_dim=8 and posterior_particles=16.")
+    if config.model.protocol_components != 4:
+        raise ValueError("DEPI fixes protocol_components=4 (METHOD_SPEC §1.1).")
+    if config.model.component_embedding_dim != 16:
+        raise ValueError("DEPI fixes component_embedding_dim=16 (METHOD_SPEC §1.1).")
+    if config.model.capability_dim != 16:
+        raise ValueError("DEPI fixes capability_dim=16 (METHOD_SPEC §1.1).")
+    if config.model.capability_hidden_dim != 64:
+        raise ValueError("DEPI fixes capability_hidden_dim=64 (METHOD_SPEC §1.1).")
+    if config.model.protocol_hidden_dim != 128:
+        raise ValueError("DEPI fixes protocol_hidden_dim=128 (METHOD_SPEC §1.1).")
     if config.model.modulation_rank <= 0:
         raise ValueError("Low-rank actor modulation needs positive rank.")
-    if (
-        config.model.log_standard_deviation_minimum != -5.0
-        or config.model.log_standard_deviation_maximum != 2.0
-    ):
-        raise ValueError("V6 fixes posterior log-standard-deviation bounds to [-5,2].")
 
     if not 0.0 < config.ppo.gamma <= 1.0:
         raise ValueError("gamma must lie in (0, 1].")
@@ -567,8 +627,31 @@ def validate_config(config: RunConfig) -> None:
         if getattr(config.loss, name) != expected:
             raise ValueError(f"V6 loss field {name} must equal {expected!r}.")
 
-    if config.partner_generator.code_dim != 8:
-        raise ValueError("V6 fixes the continuous generator code dimension at 8.")
+    frozen_loss_v2 = {
+        "signature_weight": 1.0,
+        "response_weight": 1.0,
+        "separation_weight": 0.1,
+        "combined_policy_kl_threshold": 0.04,
+        "rank_hinge_margin": 0.1,
+        "rank_hinge_advantage_gap": 2.0,
+        "separation_margin_scale": 0.25,
+    }
+    for name, expected in frozen_loss_v2.items():
+        if getattr(config.loss_v2, name) != expected:
+            raise ValueError(f"DEPI loss_v2 field {name} must equal {expected!r}.")
+
+    if config.partner_generator.enabled:
+        raise ValueError(
+            "The learned partner generator stays disabled: the current tree "
+            "registers only SP/OP seeds, SA/FCP upstream sources are missing, "
+            "and the §7.3 static wide partner pool is the default "
+            "(METHOD_SPEC §7.3)."
+        )
+    if config.partner_generator.code_dim != 3:
+        raise ValueError(
+            "§7.1 fixes the generator code space to the 3-dimensional "
+            "tetrahedral simplex; code_dim must be 3."
+        )
     if config.partner_generator.cvar_level != 0.20:
         raise ValueError("V6 fixes generator competence to CVaR20.")
     registered_shape = config.run_kind != "mechanical"
@@ -597,6 +680,10 @@ def validate_config(config: RunConfig) -> None:
         "smoothness_weight": 0.05,
         "lagrangian_learning_rate": 0.01,
         "competence_multiplier_maximum": 10.0,
+        "diversity_bank_size": 64,
+        "diversity_codes_per_update": 8,
+        "code_archive_capacity": 256,
+        "freeze_after_imitation": True,
     }
     for name, expected in frozen_generator.items():
         if getattr(config.partner_generator, name) != expected:
@@ -630,6 +717,42 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("V6 replay capacity and continuous decay constants are frozen.")
     if config.anchors.return_lower_bound >= config.anchors.return_upper_bound:
         raise ValueError("Anchor return bounds are reversed.")
+    frozen_anchor_comparator = {
+        "observable_equivalent_accuracy_max": 0.55,
+        "decision_distinct_accuracy_min": 0.70,
+        "signature_distance_threshold": 1.0,
+    }
+    for name, expected in frozen_anchor_comparator.items():
+        if getattr(config.anchors, name) != expected:
+            raise ValueError(
+                f"§5.3 frozen comparator field {name} must equal {expected!r}."
+            )
+    frozen_m1_gate = {
+        "m1_spearman_threshold": 0.8,
+        "m1_minimum_anchor_fraction": 0.9,
+    }
+    for name, expected in frozen_m1_gate.items():
+        if getattr(config.anchors, name) != expected:
+            raise ValueError(
+                f"§6 extended M1 gate field {name} must equal {expected!r}."
+            )
+
+    if not config.partner_pool.enabled:
+        raise ValueError(
+            "The §7.3 static wide partner pool is the default B0–B2 partner "
+            "distribution and stays enabled."
+        )
+    if tuple(config.partner_pool.checkpoint_stages) != (0.0, 0.5, 1.0):
+        raise ValueError(
+            "Partner-pool checkpoint stages are frozen at (0.0, 0.5, 1.0)."
+        )
+    if not config.partner_pool.heuristic_family_test_only:
+        raise ValueError(
+            "The heuristic partner family stays held out as the test-only "
+            "algorithm family (family-disjoint declaration)."
+        )
+    if not config.partner_pool.family_uniform_sampling:
+        raise ValueError("Partner-pool sampling is uniform across families.")
 
     if not 0.0 < config.calibration.alpha < 1.0:
         raise ValueError("Conformal alpha must lie in (0, 1).")
@@ -1105,6 +1228,7 @@ __all__ = [
     "EvaluationConfig",
     "LAYOUTS",
     "LossConfig",
+    "LossV2Config",
     "MANIFEST_VERSION",
     "METHOD_VERSION",
     "OFFICIAL_ACTION_COUNT",
@@ -1130,6 +1254,7 @@ __all__ = [
     "PPOConfig",
     "PartnerGeneratorConfig",
     "PartnerManifest",
+    "PartnerPoolConfig",
     "PartnerRun",
     "RUN_BUDGETS",
     "RUN_KINDS",

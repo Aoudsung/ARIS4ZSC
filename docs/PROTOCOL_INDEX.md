@@ -20,3 +20,18 @@
 ## 修订流程（留档备查）
 
 将来如需修订契约文档：先在台账登记动因，在同一提交内同步更新文档、引用链接和受影响的代码与配置，最后重跑仓库测试确认全绿。确认轨 commit 冻结之后的任何方法修订都属于违规。
+
+## 修订段（2026-08-04，统一重构 I 节，文档重构任务 #16；只追加，不改写上文）
+
+**权威文件层级登记。** 文档收敛为四份权威文件，构成权威层；其余 `docs/research/` 与 `docs/theory/` 文件降为支撑附录与台账，与权威层冲突时以权威层为准：
+
+| 层级 | 文件 | 职责 |
+|---|---|---|
+| 权威层 1 | [SCIENTIFIC_SPEC](SCIENTIFIC_SPEC.md) | 问题、合法信息、中心主张、estimand、可证伪条件 |
+| 权威层 2 | [METHOD_SPEC](METHOD_SPEC.md) | 模型、数据流、损失、partner curriculum |
+| 权威层 3 | [EVALUATION_SPEC](EVALUATION_SPEC.md) | 伙伴划分、baseline、统计、资源 |
+| 权威层 4 | [THEORY](THEORY.md) | 一般结果、特例与适用边界 |
+| 支撑附录 | `docs/research/` 其余文件（DEVELOPMENT_MATRIX、STATISTICAL_PREREGISTRATION、SOTA_BASELINE、THEORY_PREDICTIONS、TRAJECTORY_AND_ESTIMATION_SPEC 等）与 `docs/theory/` 两文件 | 被权威层交叉引用的细则、预测台账与证明全文；其中 DEVELOPMENT_MATRIX 与 STATISTICAL_PREREGISTRATION 分别为矩阵与判决统计的细则权威，由 EVALUATION_SPEC 指向 |
+
+**命名统一决定。** 分支名统一为 `delta-zsc-v5`（`agent/delta-zsc-v5`）；方法名统一为 **DEPI**（Decision-Equivalent Protocol Inference）——原"V6"称谓废止用于当前方法，仅历史台账条目内的 V6 字样按只追加纪律保留；文档、代码提交信息与论文措辞一律用 DEPI。
+

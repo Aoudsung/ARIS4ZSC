@@ -52,6 +52,15 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
     if missing:
         raise RuntimeError(f"Mechanical V6 flow omitted artifacts: {missing}")
     identity = read_run_identity(training_output)
+    # §6 extended M1 gate readout: the training loop writes one gate record
+    # per anchor trigger; the mechanical harness reports it without judging
+    # it (gate failure blocks formal runs inside run_training itself).
+    m1_gate_path = training_output / "m1_gate.json"
+    m1_gate_payload = (
+        json.loads(m1_gate_path.read_text(encoding="utf-8"))
+        if m1_gate_path.is_file()
+        else None
+    )
     deployment = json.loads(
         (training_output / "final_deployment" / "deployment_bundle.json").read_text(
             encoding="utf-8"
@@ -67,6 +76,21 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
         "training_run": str(training_output),
         "signal_audit": str(audit_output),
         "cuda_required": bool(getattr(args, "require_cuda", False)),
+        "m1_gate": (
+            {
+                "evaluated": True,
+                "passed": bool(m1_gate_payload["latest"]["m1_gate_passed"]),
+                "path_passing_fractions": m1_gate_payload["latest"][
+                    "m1_path_passing_fractions"
+                ],
+                "path_mean_spearman": m1_gate_payload["latest"][
+                    "m1_path_mean_spearman"
+                ],
+                "evaluations": len(m1_gate_payload["history"]),
+            }
+            if m1_gate_payload is not None
+            else {"evaluated": False, "reason": "anchors disabled"}
+        ),
         "scientific_readout": False,
         "note": "Mechanical completion proves execution, not ZSC effectiveness.",
     }

@@ -314,8 +314,11 @@ def collect_complete_generator_episodes(
         observation_shape=tuple(environment.observation_shape),
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
-        belief_hidden_dim=model_config.belief_hidden_dim,
-        latent_dim=model_config.latent_dim,
+        capability_hidden_dim=model_config.capability_hidden_dim,
+        protocol_hidden_dim=model_config.protocol_hidden_dim,
+        capability_dim=model_config.capability_dim,
+        component_embedding_dim=model_config.component_embedding_dim,
+        protocol_components=model_config.protocol_components,
     )
     generator_carry = initial_generator_carry(
         episode_count, int(generator.hidden_dim)
@@ -488,8 +491,11 @@ def collect_complete_external_episodes(
         observation_shape=tuple(environment.observation_shape),
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
-        belief_hidden_dim=model_config.belief_hidden_dim,
-        latent_dim=model_config.latent_dim,
+        capability_hidden_dim=model_config.capability_hidden_dim,
+        protocol_hidden_dim=model_config.protocol_hidden_dim,
+        capability_dim=model_config.capability_dim,
+        component_embedding_dim=model_config.component_embedding_dim,
+        protocol_components=model_config.protocol_components,
     )
     roles = (jnp.arange(count) >= count // 2).astype(jnp.int32)
     active = jnp.ones((count,), dtype=jnp.bool_)

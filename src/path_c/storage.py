@@ -500,6 +500,115 @@ def read_array_chunks(paths: Sequence[str | Path]) -> Any:
     return np.concatenate(arrays, axis=0)
 
 
+ANCHOR_SNAPSHOT_REQUIRED_FIELDS: tuple[str, ...] = (
+    # METHOD_SPEC §5.1 five-item checklist for every anchor snapshot.
+    "environment_state",   # 1. environment snapshot
+    "ego_state",           # 2. ego recurrent state
+    "partner_state",       # 3. partner recurrent state
+    "rollout_flat_indexes",  # 4. legal ego history (record pointer)
+    "partner_lineage",     # 5. partner_source / run_id / checkpoint / seed
+)
+
+
+def anchor_snapshot_checklist(
+    world: Any,
+    *,
+    rollout_flat_indexes: Any,
+    partner_sources: Any,
+    partner_run_ids: Any,
+) -> Mapping[str, bool]:
+    """Verify the §5.1 five-item snapshot checklist for one anchor batch.
+
+    Every snapshot must originate from a real, complete episode record; any
+    missing item invalidates the batch as anchor supervision.
+    """
+
+    import numpy as np
+
+    def nonempty(value: Any) -> bool:
+        array = np.asarray(value)
+        return bool(array.size > 0)
+
+    return {
+        "environment_state": nonempty(
+            getattr(world, "environment_state", np.zeros((0,)))
+        ),
+        "ego_state": bool(getattr(world, "ego_state", None) is not None),
+        "partner_state": bool(getattr(world, "partner_state", None) is not None),
+        "rollout_flat_indexes": nonempty(rollout_flat_indexes),
+        "partner_lineage": nonempty(partner_sources) and nonempty(partner_run_ids),
+    }
+
+
+def anchor_comparator_registration(
+    *,
+    equivalent_accuracy_max: float,
+    distinct_accuracy_min: float,
+    signature_distance_threshold: float,
+    probe_steps: int,
+) -> Mapping[str, Any]:
+    """Frozen §5.3 comparator registration; threshold changes after a run
+    starts require a new ledger entry rather than silent edits."""
+
+    return {
+        "observable_equivalent_accuracy_max": float(equivalent_accuracy_max),
+        "decision_distinct_accuracy_min": float(distinct_accuracy_min),
+        "signature_distance_threshold": float(signature_distance_threshold),
+        "probe_steps": int(probe_steps),
+    }
+
+
+def anchor_ledger_entry(
+    *,
+    update: int,
+    kind: str,
+    checklist: Mapping[str, bool],
+    pair_class_fractions: Any | None = None,
+    irreducible_ambiguity_fraction: float | None = None,
+    comparator_holdout_accuracy: float | None = None,
+) -> Mapping[str, Any]:
+    """One replay-ledger row for an anchor collection (§5.3 readings).
+
+    Irreducible-ambiguity pairs are recorded here and never enter any
+    separation or consistency loss.
+    """
+
+    import numpy as np
+
+    entry: dict[str, Any] = {
+        "update": int(update),
+        "kind": str(kind),
+        "snapshot_checklist": {key: bool(value) for key, value in checklist.items()},
+        "snapshot_complete": bool(all(checklist.values())),
+    }
+    if pair_class_fractions is not None:
+        fractions = np.asarray(pair_class_fractions, dtype=np.float64)
+        entry["pair_class_fractions"] = {
+            name: float(value)
+            for name, value in zip(
+                ("observable_equivalent", "decision_distinct", "irreducible_ambiguity"),
+                fractions,
+                strict=True,
+            )
+        }
+        entry["irreducible_ambiguity"] = float(
+            fractions[2]
+            if irreducible_ambiguity_fraction is None
+            else irreducible_ambiguity_fraction
+        )
+    if comparator_holdout_accuracy is not None:
+        entry["comparator_holdout_accuracy"] = float(comparator_holdout_accuracy)
+    return entry
+
+
+def write_anchor_ledger(
+    directory: str | Path, entries: Iterable[Mapping[str, Any]]
+) -> Path:
+    """Append anchor snapshot/comparator ledger rows as JSONL."""
+
+    return write_jsonl(Path(directory).resolve() / "anchor_ledger.jsonl", entries)
+
+
 class Tee(TextIO):
     def __init__(self, terminal: TextIO, log: TextIO) -> None:
         self._terminal = terminal
@@ -553,7 +662,11 @@ class CompleteConsoleLog:
 
 
 __all__ = [
+    "ANCHOR_SNAPSHOT_REQUIRED_FIELDS",
     "CompleteConsoleLog",
+    "anchor_comparator_registration",
+    "anchor_ledger_entry",
+    "anchor_snapshot_checklist",
     "calibration_identity",
     "ensure_run_identity",
     "evaluation_identity",
@@ -571,6 +684,7 @@ __all__ = [
     "validate_formal_repository_state",
     "validate_registered_python_runtime",
     "upstream_identity",
+    "write_anchor_ledger",
     "write_array_chunks",
     "write_json",
     "write_json_atomic",

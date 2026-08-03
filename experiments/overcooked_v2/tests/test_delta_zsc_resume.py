@@ -1,3 +1,12 @@
+"""Checkpoint resume tests.
+
+Specification entries covered (docs/METHOD_SPEC.md):
+- §1.4 PolicyState (task/capability/protocol carries) serializes through the
+  anchor replay rows stored inside the V6 checkpoint.
+- §3.3 TrainState keeps the frozen legacy optimizer slots for checkpoint
+  structure compatibility; only the PPO core is actively updated.
+"""
+
 from __future__ import annotations
 
 import json
@@ -37,8 +46,11 @@ def _replay() -> AnchorReplayState:
         observation_shape=(1,),
         action_count=6,
         task_hidden_dim=2,
-        belief_hidden_dim=2,
-        latent_dim=2,
+        capability_hidden_dim=2,
+        protocol_hidden_dim=2,
+        capability_dim=2,
+        component_embedding_dim=2,
+        protocol_components=4,
     )
     values = jnp.arange(count * 6, dtype=jnp.float32).reshape((count, 6))
     batch = CounterfactualAnchorBatch(

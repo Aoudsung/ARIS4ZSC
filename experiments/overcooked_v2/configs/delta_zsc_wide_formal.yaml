@@ -1,4 +1,4 @@
-version: 9
+version: 11
 
 environment:
   layout: test_time_wide
@@ -11,16 +11,16 @@ environment:
 
 model:
   task_hidden_dim: 128
-  belief_hidden_dim: 128
-  latent_dim: 8
-  posterior_particles: 16
+  capability_hidden_dim: 64
+  protocol_hidden_dim: 128
+  capability_dim: 16
+  protocol_components: 4
+  component_embedding_dim: 16
   actor_hidden_dim: 128
   critic_hidden_dim: 128
   response_hidden_dim: 128
   modulation_rank: 8
   action_embedding_dim: 16
-  log_standard_deviation_minimum: -5.0
-  log_standard_deviation_maximum: 2.0
 
 ppo:
   update_epochs: 4
@@ -38,6 +38,7 @@ ppo:
   anneal_learning_rate: true
   adam_epsilon: 0.00001
 
+# deprecated: retained for exactly one release cycle (METHOD_SPEC §3).
 loss:
   response_weight: 1.0
   raw_q_weight: 1.0
@@ -59,7 +60,17 @@ loss:
   response_updates_per_outer_update: 2
   raw_q_updates_per_outer_update: 4
 
+loss_v2:
+  signature_weight: 1.0
+  response_weight: 1.0
+  separation_weight: 0.1
+  combined_policy_kl_threshold: 0.04
+  rank_hinge_margin: 0.1
+  rank_hinge_advantage_gap: 2.0
+  separation_margin_scale: 0.25
+
 anchors:
+  enabled: true
   interval_updates: 16
   ordinary_states: 32
   matched_code_pairs: 16
@@ -73,9 +84,16 @@ anchors:
   minimum_replay_weight: 0.001
   return_lower_bound: -400.0
   return_upper_bound: 400.0
+  # §5.3 frozen comparator thresholds and the §6 extended M1 gate.
+  observable_equivalent_accuracy_max: 0.55
+  decision_distinct_accuracy_min: 0.70
+  signature_distance_threshold: 1.0
+  m1_spearman_threshold: 0.8
+  m1_minimum_anchor_fraction: 0.9
 
 partner_generator:
-  code_dim: 8
+  enabled: false
+  code_dim: 3
   hidden_dim: 128
   modulation_rank: 8
   episodes_per_update: 32
@@ -96,6 +114,18 @@ partner_generator:
   kernel_bandwidth: 20.0
   kernel_jitter: 0.0001
   codes_per_update: 32
+  # §7.2 shared-state diversity bank, code archive and backbone freeze.
+  diversity_bank_size: 64
+  diversity_codes_per_update: 8
+  code_archive_capacity: 256
+  freeze_after_imitation: true
+
+# §7.3 static wide partner pool: default B0–B2 partner distribution.
+partner_pool:
+  enabled: true
+  checkpoint_stages: [0.0, 0.5, 1.0]
+  heuristic_family_test_only: true
+  family_uniform_sampling: true
 
 calibration:
   enabled: false

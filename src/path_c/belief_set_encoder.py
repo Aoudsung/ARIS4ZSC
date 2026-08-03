@@ -1,82 +1,63 @@
-"""Deterministic summaries and reparameterized particles for a single Gaussian."""
+"""Deterministic summaries for the K=4 categorical protocol posterior.
+
+METHOD_SPEC §1.4: ``gaussian_summary``/``prior_gaussian_summary`` are replaced
+by ``mixture_summary``/``prior_mixture_summary``.  The protocol state is
+``c_t = sum_k pi_{t,k} m_k`` with component embeddings ``m_k ∈ R^16``
+(METHOD_SPEC §1.1); the prior context uses the uniform posterior.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
+from .protocol_encoder import PROTOCOL_COMPONENTS
 
-def gaussian_summary(mean: Any, log_standard_deviation: Any, uncertainty: Any) -> Any:
+
+def mixture_summary(protocol_probabilities: Any, component_embeddings: Any) -> Any:
+    """c = Σ_k π_k m_k.
+
+    ``protocol_probabilities`` has shape (..., K) and ``component_embeddings``
+    has shape (K, component_dim).
+    """
+
     import jax.numpy as jnp
 
-    mu = jnp.asarray(mean, dtype=jnp.float32)
-    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
-    scalar = jnp.asarray(uncertainty, dtype=jnp.float32)
-    if mu.shape != log_std.shape or scalar.shape != mu.shape[:-1]:
-        raise ValueError("Gaussian belief summary shapes are incompatible.")
-    return jnp.concatenate((mu, log_std, scalar[..., None]), axis=-1)
+    probs = jnp.asarray(protocol_probabilities, dtype=jnp.float32)
+    embeddings = jnp.asarray(component_embeddings, dtype=jnp.float32)
+    if probs.shape[-1] != embeddings.shape[0]:
+        raise ValueError("Protocol posterior and component count differ.")
+    return jnp.einsum("...k,kd->...d", probs, embeddings)
 
 
-def prior_gaussian_summary(reference: Any, latent_dim: int) -> Any:
-    import jax.numpy as jnp
-
-    prefix = jnp.asarray(reference).shape[:-1]
-    zeros = jnp.zeros(prefix + (2 * int(latent_dim),), dtype=jnp.float32)
-    # With the frozen [-5, 2] log-standard-deviation range, the N(0, I)
-    # prior has normalized uncertainty (0 - (-5)) / 7.
-    uncertainty = jnp.full(prefix + (1,), 5.0 / 7.0, dtype=jnp.float32)
-    return jnp.concatenate((zeros, uncertainty), axis=-1)
-
-
-def gaussian_samples(
-    key: Any,
-    *,
-    mean: Any,
-    log_standard_deviation: Any,
-    sample_count: int,
-) -> tuple[Any, Any]:
-    import jax
-    import jax.numpy as jnp
-
-    if int(sample_count) <= 0:
-        raise ValueError("sample_count must be positive.")
-    mu = jnp.asarray(mean, dtype=jnp.float32)
-    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
-    if mu.shape != log_std.shape:
-        raise ValueError("Gaussian mean and log standard deviation shapes differ.")
-    noise = jax.random.normal(
-        key, mu.shape[:-1] + (int(sample_count), mu.shape[-1]), dtype=jnp.float32
-    )
-    samples = mu[..., None, :] + jnp.exp(log_std[..., None, :]) * noise
-    weights = jnp.full(samples.shape[:-1], 1.0 / float(sample_count), dtype=jnp.float32)
-    return samples, weights
-
-
-def gaussian_kl_standard_normal(
-    mean: Any,
-    log_standard_deviation: Any,
-    *,
-    free_bits_per_dimension: float,
+def prior_mixture_summary(
+    reference: Any,
+    component_embeddings: Any,
+    component_count: int = PROTOCOL_COMPONENTS,
 ) -> Any:
+    """Prior context: uniform posterior over the K regimes (METHOD_SPEC §2.1)."""
+
     import jax.numpy as jnp
 
-    mu = jnp.asarray(mean, dtype=jnp.float32)
-    log_std = jnp.asarray(log_standard_deviation, dtype=jnp.float32)
-    per_dimension = 0.5 * (
-        jnp.square(mu) + jnp.exp(2.0 * log_std) - 1.0 - 2.0 * log_std
+    embeddings = jnp.asarray(component_embeddings, dtype=jnp.float32)
+    prefix = jnp.asarray(reference).shape[:-1]
+    uniform = jnp.full(
+        prefix + (int(component_count),),
+        1.0 / float(component_count),
+        dtype=jnp.float32,
     )
-    allowance = float(free_bits_per_dimension)
-    return jnp.mean(jnp.sum(jnp.maximum(per_dimension - allowance, 0.0), axis=-1))
+    return mixture_summary(uniform, embeddings)
 
 
-# Compatibility aliases are deliberately mathematical only; active V6 code
-# does not expose mixture components.
-stratified_gaussian_samples = gaussian_samples
+def prior_capability(prefix_shape: tuple[int, ...]) -> Any:
+    """Prior capability context is the zero vector (METHOD_SPEC §1.2)."""
+
+    import jax.numpy as jnp
+
+    return jnp.zeros(tuple(prefix_shape), dtype=jnp.float32)
 
 
 __all__ = [
-    "gaussian_kl_standard_normal",
-    "gaussian_samples",
-    "gaussian_summary",
-    "prior_gaussian_summary",
-    "stratified_gaussian_samples",
+    "mixture_summary",
+    "prior_capability",
+    "prior_mixture_summary",
 ]

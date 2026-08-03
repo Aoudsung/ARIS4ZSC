@@ -54,3 +54,7 @@
 - 读数：`J_SP`、`J_XP`、Gap，共同伙伴记分板，完整资源披露。
 - 判决：Θ3 成立当且仅当 XP 优于全部注册基线（含 [SOTA_BASELINE](SOTA_BASELINE.md) 注册的已发表 SOTA 数值）且共同伙伴记分板排除内部惯例互利的解释。
 - 意外发现捕获口：Wide 与 Simple 的方向不一致；对角 SP 格的异常退化。
+
+## 修订段（统一重构，只追加）
+
+统一重构计划 E 节以统一开发矩阵取代门槛堆叠：B0–B3 的方法定义、统一条件、报告读数、全口径算力报告与组件取舍规则以 [DEVELOPMENT_MATRIX](DEVELOPMENT_MATRIX.md) 为唯一权威规格。本文 S1–S5 中与 DEVELOPMENT_MATRIX 冲突的旧晋升/停机条件（含 S4 消融设计与各级停机判据）以矩阵规格为准；本段只追加，旧内容保留为历史条目。SOTA 判决式统计问题见 [SOTA_BASELINE](SOTA_BASELINE.md) 追加段与 [STATISTICAL_PREREGISTRATION](STATISTICAL_PREREGISTRATION.md)（状态：pending 用户裁定）。

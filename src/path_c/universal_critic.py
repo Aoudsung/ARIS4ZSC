@@ -1,4 +1,12 @@
-"""One shaped-return value and two independent raw-return Q heads."""
+"""Dueling critic for DEPI (METHOD_SPEC §1.3/§1.4).
+
+``UniversalDuelingCritic(task_features, context)`` outputs (V, Q1, Q2) with
+``context = concat(u, c_t)`` (32 dimensions).  The ``shaped_belief_embedding``
+special case is removed: every head conditions on the same
+``[x_t; u; c_t]`` context.  Head names are retained because the parameter
+ownership table (METHOD_SPEC §3.4) routes ``shaped_*`` gradients to the PPO
+loss and ``raw_q*`` gradients to the signature loss.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +21,6 @@ def universal_critic_class() -> Any:
         return _CRITIC
 
     import flax.linen as nn
-    import jax
     import jax.numpy as jnp
     from flax.linen.initializers import orthogonal, zeros
 
@@ -25,29 +32,20 @@ def universal_critic_class() -> Any:
         def __call__(
             self,
             task_features: Any,
-            belief_embedding: Any,
-            shaped_belief_embedding: Any | None = None,
+            context: Any,
         ) -> tuple[Any, Any, Any]:
             task = jnp.asarray(task_features, dtype=jnp.float32)
-            belief = jnp.asarray(belief_embedding, dtype=jnp.float32)
-            shaped_belief = (
-                belief
-                if shaped_belief_embedding is None
-                else jnp.asarray(shaped_belief_embedding, dtype=jnp.float32)
-            )
-            if task.shape[:-1] != belief.shape[:-1]:
-                raise ValueError("Critic task and belief batch axes differ.")
-            if shaped_belief.shape[:-1] != task.shape[:-1]:
-                raise ValueError("Shaped-value belief batch axes differ.")
-            shaped_joined = jnp.concatenate((task, shaped_belief), axis=-1)
-            raw_joined = jnp.concatenate((task, belief), axis=-1)
+            ctx = jnp.asarray(context, dtype=jnp.float32)
+            if task.shape[:-1] != ctx.shape[:-1]:
+                raise ValueError("Critic task and context batch axes differ.")
+            joined = jnp.concatenate((task, ctx), axis=-1)
             shaped_hidden = nn.tanh(
                 nn.Dense(
                     self.hidden_dim,
                     kernel_init=orthogonal(jnp.sqrt(2.0)),
                     bias_init=zeros,
                     name="shaped_hidden_0",
-                )(shaped_joined)
+                )(joined)
             )
             shaped_hidden = nn.tanh(
                 nn.Dense(
@@ -70,7 +68,7 @@ def universal_critic_class() -> Any:
                     kernel_init=orthogonal(jnp.sqrt(2.0)),
                     bias_init=zeros,
                     name="raw_q1_hidden_0",
-                )(raw_joined)
+                )(joined)
             )
             raw_q1_hidden = nn.tanh(
                 nn.Dense(
@@ -93,7 +91,7 @@ def universal_critic_class() -> Any:
                     kernel_init=orthogonal(jnp.sqrt(2.0)),
                     bias_init=zeros,
                     name="raw_q2_hidden_0",
-                )(raw_joined)
+                )(joined)
             )
             raw_q2_hidden = nn.tanh(
                 nn.Dense(

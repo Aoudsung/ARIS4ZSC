@@ -1,4 +1,10 @@
-"""One low-rank continuously belief-conditioned coordination actor."""
+"""One low-rank continuously context-conditioned coordination actor.
+
+METHOD_SPEC §1.3: the actor interface is ``(task_features, context)`` with
+``context = concat(u, c_t)`` (32 dimensions).  Low-rank modulation is kept:
+``task_basis(x) ⊙ context_gain(concat(u, c))``.  Still a single actor for all
+partner types/sources.
+"""
 
 from __future__ import annotations
 
@@ -22,11 +28,11 @@ def universal_actor_class() -> Any:
         modulation_rank: int
 
         @nn.compact
-        def __call__(self, task_features: Any, belief_summary: Any) -> Any:
+        def __call__(self, task_features: Any, context: Any) -> Any:
             task = jnp.asarray(task_features, dtype=jnp.float32)
-            belief = jnp.asarray(belief_summary, dtype=jnp.float32)
-            if task.shape[:-1] != belief.shape[:-1]:
-                raise ValueError("Actor task and belief batch axes differ.")
+            joined_context = jnp.asarray(context, dtype=jnp.float32)
+            if task.shape[:-1] != joined_context.shape[:-1]:
+                raise ValueError("Actor task and context batch axes differ.")
             trunk = nn.tanh(nn.Dense(
                 self.hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
@@ -44,7 +50,7 @@ def universal_actor_class() -> Any:
                 kernel_init=orthogonal(0.5),
                 bias_init=zeros,
                 name="context_low_rank_gain",
-            )(belief))
+            )(joined_context))
             interaction = nn.tanh(nn.Dense(
                 self.hidden_dim,
                 kernel_init=orthogonal(1.0),

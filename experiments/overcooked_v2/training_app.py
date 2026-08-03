@@ -36,14 +36,16 @@ from src.path_c.anchor_replay import (
     sample_replay_batch,
 )
 from src.path_c.anchor_sampling import (
+    AnchorRuntime,
     collect_anchor_batch,
+    collect_diversity_bank_signatures,
     make_anchor_functions,
     preflight_anchor_microbatch_from_records,
+    separation_terms_from_matched_pairs,
 )
 from src.path_c.base_distillation import collect_owner_behavior, distill_owner_actor
 from src.path_c.compiled_kernels import (
     CompiledCallable,
-    attach_chunked_regret_with_kernels,
     build_anchor_chunk_kernel,
     build_training_kernels,
     configure_persistent_compilation_cache,
@@ -65,10 +67,7 @@ from src.path_c.generator_training import (
     source_code_anchors,
     update_generator,
 )
-from src.path_c.gradient_routing import (
-    BELIEF_OBJECTIVE_ORDER,
-    combine_belief_gradients,
-)
+from src.path_c.m1_gate import evaluate_m1_gate_on_anchor_batch, m1_gate_report
 from src.path_c.model import (
     build_model,
     initial_policy_state,
@@ -90,9 +89,15 @@ from src.path_c.partner_generator import (
 from src.path_c.partner_sources import (
     MixedPartnerParameters,
     make_mixed_partner_functions,
+    make_static_pool_partner_functions,
     soft_generator_mixture,
 )
 from src.path_c.raw_q import centered
+from src.path_c.protocol_encoder import (
+    bootstrap_protocol_ensemble_class,
+    initial_protocol_carry,
+    initial_protocol_probabilities,
+)
 from src.path_c.resources import (
     ResourceLedger,
     configure_bundled_cuda_toolchain,
@@ -293,8 +298,11 @@ def _empty_replay(
         observation_shape=observation_shape,
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
-        belief_hidden_dim=model_config.belief_hidden_dim,
-        latent_dim=model_config.latent_dim,
+        capability_hidden_dim=model_config.capability_hidden_dim,
+        protocol_hidden_dim=model_config.protocol_hidden_dim,
+        capability_dim=model_config.capability_dim,
+        component_embedding_dim=model_config.component_embedding_dim,
+        protocol_components=model_config.protocol_components,
     )
     zeros_action = jnp.zeros((count, 6), dtype=jnp.float32)
     batch = CounterfactualAnchorBatch(
@@ -590,7 +598,17 @@ def _write_training_support_latents(
 
     count = int(np.asarray(replay.item_count))
     if count < 2:
-        raise RuntimeError("V6 final support requires at least two replay states.")
+        write_json(
+            output / "records" / "training_support_latents.json",
+            {
+                "method": METHOD_VERSION,
+                "config_fingerprint": config.fingerprint,
+                "model_fingerprint": pytree_fingerprint(deployable_parameters(params)),
+                "row_count": count,
+                "status": "skipped_empty_replay",
+            },
+        )
+        return
     batch = jax.tree_util.tree_map(lambda value: value[:count], replay.batch)
     unused_state, output_values = model.apply(
         {"params": params},
@@ -607,7 +625,8 @@ def _write_training_support_latents(
             "config_fingerprint": config.fingerprint,
             "model_fingerprint": pytree_fingerprint(deployable_parameters(params)),
             "row_count": count,
-            "posterior_mean": _host(output_values.belief_mean),
+            "capability": _host(output_values.capability),
+            "protocol_probabilities": _host(output_values.protocol_probabilities),
         },
     )
 
@@ -616,6 +635,8 @@ def run_training(args: argparse.Namespace) -> None:
     scope = str(getattr(args, "_execution_scope", "training"))
     preflight = scope == CUDA_PREFLIGHT_SCOPE
     config = load_config(args.config, run_kind=args.run_kind)
+    generator_enabled = bool(config.partner_generator.enabled)
+    anchor_enabled = bool(config.anchors.enabled)
     cuda_toolchain = None
     if config.run_kind == "formal" or os.environ.get("DELTA_REQUIRE_CUDA") == "1":
         cuda_toolchain = configure_bundled_cuda_toolchain()
@@ -703,28 +724,32 @@ def run_training(args: argparse.Namespace) -> None:
         observation_shape=observation_shape,
         action_count=6,
         task_hidden_dim=config.model.task_hidden_dim,
-        belief_hidden_dim=config.model.belief_hidden_dim,
-        latent_dim=config.model.latent_dim,
+        capability_hidden_dim=config.model.capability_hidden_dim,
+        protocol_hidden_dim=config.model.protocol_hidden_dim,
+        capability_dim=config.model.capability_dim,
+        protocol_components=config.model.protocol_components,
+        component_embedding_dim=config.model.component_embedding_dim,
         actor_hidden_dim=config.model.actor_hidden_dim,
         critic_hidden_dim=config.model.critic_hidden_dim,
         response_hidden_dim=config.model.response_hidden_dim,
         modulation_rank=config.model.modulation_rank,
         action_embedding_dim=config.model.action_embedding_dim,
-        log_standard_deviation_minimum=config.model.log_standard_deviation_minimum,
-        log_standard_deviation_maximum=config.model.log_standard_deviation_maximum,
     )
-    generator = build_partner_generator(
-        observation_shape=observation_shape,
-        action_count=6,
-        code_dim=config.partner_generator.code_dim,
-        hidden_dim=config.partner_generator.hidden_dim,
-        modulation_rank=config.partner_generator.modulation_rank,
-    )
-    generator_environment = VectorEnvironment(
-        environment.environment,
-        int(config.partner_generator.episodes_per_update),
-        int(config.partner_generator.episode_steps),
-    )
+    generator = None
+    generator_environment = None
+    if generator_enabled:
+        generator = build_partner_generator(
+            observation_shape=observation_shape,
+            action_count=6,
+            code_dim=config.partner_generator.code_dim,
+            hidden_dim=config.partner_generator.hidden_dim,
+            modulation_rank=config.partner_generator.modulation_rank,
+        )
+        generator_environment = VectorEnvironment(
+            environment.environment,
+            int(config.partner_generator.episodes_per_update),
+            int(config.partner_generator.episode_steps),
+        )
 
     ego_root = jnp.asarray(domains["ego"], dtype=jnp.uint32)
     generator_root = jnp.asarray(domains["generator"], dtype=jnp.uint32)
@@ -736,23 +761,61 @@ def run_training(args: argparse.Namespace) -> None:
         observation_shape=observation_shape,
         action_count=6,
         task_hidden_dim=config.model.task_hidden_dim,
-        belief_hidden_dim=config.model.belief_hidden_dim,
-        latent_dim=config.model.latent_dim,
+        capability_hidden_dim=config.model.capability_hidden_dim,
+        protocol_hidden_dim=config.model.protocol_hidden_dim,
+        capability_dim=config.model.capability_dim,
+        component_embedding_dim=config.model.component_embedding_dim,
+        protocol_components=config.model.protocol_components,
     )
     initial_params = initialize_model_parameters(
         model,
         key=model_key,
         example_state=example_policy,
         example_observation=initial_observations[:, 0],
-        partner_code_dim=config.partner_generator.code_dim,
     )
-    initial_generator_params = initialize_generator_parameters(
-        generator,
-        key=jax.random.fold_in(generator_root, 0),
-        observation_shape=observation_shape,
-        code_dim=config.partner_generator.code_dim,
-        batch_size=config.partner_generator.episodes_per_update,
-        hidden_dim=config.partner_generator.hidden_dim,
+    bootstrap_ensemble = None
+    bootstrap_params = None
+    if anchor_enabled:
+        # §6 hypothesis path (ii): B=3 independently initialized protocol
+        # encoders re-filter the same real anchor history.  The ensemble is
+        # report-only; the training loop never applies gradients to it.
+        bootstrap_ensemble = bootstrap_protocol_ensemble_class()(
+            hidden_dim=config.model.protocol_hidden_dim,
+            component_count=config.model.protocol_components,
+            action_count=6,
+            action_embedding_dim=config.model.action_embedding_dim,
+        )
+        member_count = int(getattr(bootstrap_ensemble, "member_count", 3))
+        bootstrap_carries = tuple(
+            initial_protocol_carry(environment.num_envs, config.model.protocol_hidden_dim)
+            for _ in range(member_count)
+        )
+        bootstrap_inputs = (
+            initial_observations[:, 0],
+            initial_observations[:, 0],
+            jnp.zeros((environment.num_envs,), dtype=jnp.int32),
+            jnp.ones((environment.num_envs,), dtype=jnp.bool_),
+            initial_protocol_probabilities(
+                (environment.num_envs,), config.model.protocol_components
+            ),
+        )
+        bootstrap_params = bootstrap_ensemble.init(
+            jax.random.fold_in(model_key, 60),
+            bootstrap_carries,
+            bootstrap_inputs,
+            False,
+        )["params"]
+    initial_generator_params = (
+        initialize_generator_parameters(
+            generator,
+            key=jax.random.fold_in(generator_root, 0),
+            observation_shape=observation_shape,
+            code_dim=config.partner_generator.code_dim,
+            batch_size=config.partner_generator.episodes_per_update,
+            hidden_dim=config.partner_generator.hidden_dim,
+        )
+        if generator_enabled
+        else None
     )
     total_updates = config.training.environment_steps // (
         config.environment.num_envs * config.training.rollout_length
@@ -801,8 +864,11 @@ def run_training(args: argparse.Namespace) -> None:
                     observation_shape=observation_shape,
                     action_count=6,
                     task_hidden_dim=config.model.task_hidden_dim,
-                    belief_hidden_dim=config.model.belief_hidden_dim,
-                    latent_dim=config.model.latent_dim,
+                    capability_hidden_dim=config.model.capability_hidden_dim,
+                    protocol_hidden_dim=config.model.protocol_hidden_dim,
+                    capability_dim=config.model.capability_dim,
+                    component_embedding_dim=config.model.component_embedding_dim,
+                    protocol_components=config.model.protocol_components,
                 ),
                 optimizer=owner_optimizer,
                 optimizer_state=owner_optimizer_state,
@@ -811,80 +877,91 @@ def run_training(args: argparse.Namespace) -> None:
         )
         del unused_owner_state, unused
 
-        episode_count = config.partner_generator.episodes_per_update
-        if episode_count % 4:
-            raise ValueError("Generator source initialization needs balanced SP/OP/SA/FCP lanes.")
-        members = jnp.tile(jnp.arange(4, dtype=jnp.int32), episode_count // 4)
-        source_batch, unused = _phase(
-            output,
-            name="generator_initialization_collection",
-            update=0,
-            function=lambda: collect_owner_behavior(
-                environment=generator_environment,
-                owner_pool=init_pool,
-                partner_pool=owner_pool,
-                length=config.partner_generator.episode_steps,
-                key=jax.random.fold_in(generator_root, 1),
-                owner_members=members,
-            ),
-        )
-        del unused
-        _save_source_batch(source_cache, source_batch, run_identity=identity)
-        init_generator_optimizer, init_generator_state = make_optimizer(
-            initial_generator_params,
-            learning_rate=config.ppo.learning_rate,
-            gradient_clip_norm=config.ppo.gradient_clip_norm,
-            adam_epsilon=config.ppo.adam_epsilon,
-        )
-        generator_init_schedule = environment_minibatch_schedule(
-            jax.random.fold_in(generator_root, 2),
-            environment_count=episode_count,
-            minibatches_per_epoch=config.partner_generator.environment_minibatches,
-            update_epochs=config.partner_generator.update_epochs,
-        )
         code_anchors = source_code_anchors(4, config.partner_generator.code_dim)
-        (
-            generator_params,
-            unused_generator_init_state,
-            generator_initialization_metrics,
-        ), unused = _phase(
-            output,
-            name="generator_source_distillation",
-            update=0,
-            function=lambda: distill_generator_sources(
-                generator=generator,
-                params=initial_generator_params,
-                batch=source_batch,
-                code_anchors=code_anchors,
-                optimizer=init_generator_optimizer,
-                optimizer_state=init_generator_state,
-                schedule=generator_init_schedule,
-                hidden_dim=config.partner_generator.hidden_dim,
-            ),
-        )
-        del unused_generator_init_state, unused
-        external_returns, unused = _phase(
-            output,
-            name="external_reference_initialization",
-            update=0,
-            function=lambda: collect_complete_external_episodes(
-                environment=generator_environment,
-                model=model,
-                ego_params=params,
-                model_config=config.model,
-                external_pool=external_pool,
-                key=jax.random.fold_in(generator_root, 3),
-            ),
-        )
-        del unused
-        reference_cvar = lower_tail_cvar(
-            np.asarray(external_returns.raw_returns).tolist(),
-            level=config.partner_generator.cvar_level,
-        )
+        if generator_enabled:
+            episode_count = config.partner_generator.episodes_per_update
+            if episode_count % 4:
+                raise ValueError("Generator source initialization needs balanced SP/OP/SA/FCP lanes.")
+            members = jnp.tile(jnp.arange(4, dtype=jnp.int32), episode_count // 4)
+            source_batch, unused = _phase(
+                output,
+                name="generator_initialization_collection",
+                update=0,
+                function=lambda: collect_owner_behavior(
+                    environment=generator_environment,
+                    owner_pool=init_pool,
+                    partner_pool=owner_pool,
+                    length=config.partner_generator.episode_steps,
+                    key=jax.random.fold_in(generator_root, 1),
+                    owner_members=members,
+                ),
+            )
+            del unused
+            _save_source_batch(source_cache, source_batch, run_identity=identity)
+            init_generator_optimizer, init_generator_state = make_optimizer(
+                initial_generator_params,
+                learning_rate=config.ppo.learning_rate,
+                gradient_clip_norm=config.ppo.gradient_clip_norm,
+                adam_epsilon=config.ppo.adam_epsilon,
+            )
+            generator_init_schedule = environment_minibatch_schedule(
+                jax.random.fold_in(generator_root, 2),
+                environment_count=episode_count,
+                minibatches_per_epoch=config.partner_generator.environment_minibatches,
+                update_epochs=config.partner_generator.update_epochs,
+            )
+            (
+                generator_params,
+                unused_generator_init_state,
+                generator_initialization_metrics,
+            ), unused = _phase(
+                output,
+                name="generator_source_distillation",
+                update=0,
+                function=lambda: distill_generator_sources(
+                    generator=generator,
+                    params=initial_generator_params,
+                    batch=source_batch,
+                    code_anchors=code_anchors,
+                    optimizer=init_generator_optimizer,
+                    optimizer_state=init_generator_state,
+                    schedule=generator_init_schedule,
+                    hidden_dim=config.partner_generator.hidden_dim,
+                ),
+            )
+            del unused_generator_init_state, unused
+            external_returns, unused = _phase(
+                output,
+                name="external_reference_initialization",
+                update=0,
+                function=lambda: collect_complete_external_episodes(
+                    environment=generator_environment,
+                    model=model,
+                    ego_params=params,
+                    model_config=config.model,
+                    external_pool=external_pool,
+                    key=jax.random.fold_in(generator_root, 3),
+                ),
+            )
+            del unused
+            reference_cvar = lower_tail_cvar(
+                np.asarray(external_returns.raw_returns).tolist(),
+                level=config.partner_generator.cvar_level,
+            )
+        else:
+            generator_params = initial_generator_params
+            generator_initialization_metrics = {
+                "generator_source_distillation_kl": jnp.asarray(np.nan)
+            }
+            reference_cvar = 0.0
     else:
         params = initial_params
         generator_params = initial_generator_params
-        source_batch = _load_source_batch(source_cache, run_identity=identity)
+        source_batch = (
+            _load_source_batch(source_cache, run_identity=identity)
+            if generator_enabled
+            else None
+        )
         owner_metrics = {"owner_distillation_kl": jnp.asarray(np.nan)}
         generator_initialization_metrics = {
             "generator_source_distillation_kl": jnp.asarray(np.nan)
@@ -921,24 +998,32 @@ def run_training(args: argparse.Namespace) -> None:
         gradient_clip_norm=config.ppo.gradient_clip_norm,
         adam_epsilon=config.ppo.adam_epsilon,
     )
-    generator_optimizer, generator_state = make_optimizer(
-        generator_params,
-        learning_rate=config.ppo.learning_rate,
-        gradient_clip_norm=config.ppo.gradient_clip_norm,
-        adam_epsilon=config.ppo.adam_epsilon,
-        anneal_learning_rate=config.ppo.anneal_learning_rate,
-        warmup_fraction=config.ppo.lr_warmup_fraction,
-        update_count=total_updates,
-        minibatches_per_epoch=(
-            config.partner_generator.environment_minibatches
-        ),
-        update_epochs=config.partner_generator.update_epochs,
+    generator_optimizer, generator_state = (
+        make_optimizer(
+            generator_params,
+            learning_rate=config.ppo.learning_rate,
+            gradient_clip_norm=config.ppo.gradient_clip_norm,
+            adam_epsilon=config.ppo.adam_epsilon,
+            anneal_learning_rate=config.ppo.anneal_learning_rate,
+            warmup_fraction=config.ppo.lr_warmup_fraction,
+            update_count=total_updates,
+            minibatches_per_epoch=(
+                config.partner_generator.environment_minibatches
+            ),
+            update_epochs=config.partner_generator.update_epochs,
+        )
+        if generator_enabled
+        else (None, None)
     )
-    partner_functions = make_mixed_partner_functions(
-        generator=generator,
-        generator_hidden_dim=config.partner_generator.hidden_dim,
-        generator_code_dim=config.partner_generator.code_dim,
-        external_pool=external_pool,
+    partner_functions = (
+        make_mixed_partner_functions(
+            generator=generator,
+            generator_hidden_dim=config.partner_generator.hidden_dim,
+            generator_code_dim=config.partner_generator.code_dim,
+            external_pool=external_pool,
+        )
+        if generator_enabled
+        else make_static_pool_partner_functions(external_pool=external_pool)
     )
     runner = initialize_runner(
         environment=environment,
@@ -958,16 +1043,27 @@ def run_training(args: argparse.Namespace) -> None:
         ),
         generator_initialization_steps=(
             0
-            if not new_run
+            if (not new_run or not generator_enabled)
             else 2
             * config.partner_generator.episodes_per_update
             * config.partner_generator.episode_steps
         ),
         upstream_partner_steps=upstream_steps,
     )
+    # Frozen V6 belief-objective keys kept only for checkpoint identity
+    # stability; the belief-gradient mechanism itself is abolished (§3.3).
     norm_ema = {
         name: jnp.asarray(1.0, dtype=jnp.float32)
-        for name in BELIEF_OBJECTIVE_ORDER
+        for name in (
+            "ppo",
+            "raw_q",
+            "counterfactual",
+            "response",
+            "decision_equivalence",
+            "information_bottleneck",
+            "q_policy",
+            "robust",
+        )
     }
     template = TrainState(
         params=params,
@@ -1014,90 +1110,100 @@ def run_training(args: argparse.Namespace) -> None:
         partner_functions=partner_functions,
         config=config,
         ppo_optimizer=ppo_optimizer,
-        raw_q_optimizer=raw_q_optimizer,
-        response_optimizer=response_optimizer,
-        belief_optimizer=belief_optimizer,
     )
-    anchor_functions = make_anchor_functions(
-        model=model,
-        model_config=config.model,
-        partner_functions=partner_functions,
-        environment=environment,
-    )
-    anchor_kernel = build_anchor_chunk_kernel(
-        functions=anchor_functions,
-        config=config,
-        memory_limit_bytes=FORMAL_PEAK_MEMORY_LIMIT_BYTES,
-    )
-    anchor_logits_kernel = CompiledCallable(
-        "anchor_policy_logits",
-        lambda candidate, batch: _anchor_policy_logits(model, candidate, batch),
-    )
-    generator_collect_kernel = CompiledCallable(
-        "generator_episode_collection",
-        lambda ego, gen, codes, key, version, factor: collect_complete_generator_episodes(
-            environment=generator_environment,
+    anchor_functions = None
+    anchor_kernel = None
+    anchor_logits_kernel = None
+    if anchor_enabled:
+        anchor_functions = make_anchor_functions(
             model=model,
-            ego_params=ego,
             model_config=config.model,
-            generator=generator,
-            generator_params=gen,
-            codes=codes,
-            key=key,
-            parameter_version_id=version,
-            official_shaping_factor=factor,
-        ),
-    )
-    generator_update_kernel = CompiledCallable(
-        "generator_ppo_scan",
-        lambda gen, opt_state, episodes, source, schedule, progress, multiplier, reference: update_generator(
-            generator=generator,
-            params=gen,
-            optimizer_state=opt_state,
-            optimizer=generator_optimizer,
-            batch=episodes,
-            source_batch=source,
-            code_anchors=code_anchors,
-            schedule=schedule,
+            partner_functions=partner_functions,
+            environment=environment,
+        )
+        anchor_kernel = build_anchor_chunk_kernel(
+            functions=anchor_functions,
             config=config,
-            progress=progress,
-            competence_multiplier=multiplier,
-            reference_cvar=reference,
-        ),
-    )
+            memory_limit_bytes=FORMAL_PEAK_MEMORY_LIMIT_BYTES,
+        )
+        anchor_logits_kernel = CompiledCallable(
+            "anchor_policy_logits",
+            lambda candidate, batch: _anchor_policy_logits(model, candidate, batch),
+        )
+    generator_collect_kernel = None
+    generator_update_kernel = None
+    if generator_enabled:
+        generator_collect_kernel = CompiledCallable(
+            "generator_episode_collection",
+            lambda ego, gen, codes, key, version, factor: collect_complete_generator_episodes(
+                environment=generator_environment,
+                model=model,
+                ego_params=ego,
+                model_config=config.model,
+                generator=generator,
+                generator_params=gen,
+                codes=codes,
+                key=key,
+                parameter_version_id=version,
+                official_shaping_factor=factor,
+            ),
+        )
+        generator_update_kernel = CompiledCallable(
+            "generator_ppo_scan",
+            lambda gen, opt_state, episodes, source, schedule, progress, multiplier, reference, bank: update_generator(
+                generator=generator,
+                params=gen,
+                optimizer_state=opt_state,
+                optimizer=generator_optimizer,
+                batch=episodes,
+                source_batch=source,
+                code_anchors=code_anchors,
+                schedule=schedule,
+                config=config,
+                progress=progress,
+                competence_multiplier=multiplier,
+                reference_cvar=reference,
+                bank_signatures=bank,
+            ),
+        )
 
+    # §3.3/§5: the most recent anchor batch and its matched-pair separation
+    # terms supervise every combined-loss update until the next anchor trigger
+    # refreshes them; both stay None while anchors are disabled.
+    supervision_anchors = None
+    supervision_separation = None
+    supervision_readings: dict[str, Any] = {}
+    diversity_bank_signatures = None
+    m1_history: list[dict[str, Any]] = []
     anchor_microbatch = None
     start_update = int(np.asarray(state.update_count))
     last_update = min(total_updates, start_update + 1) if preflight else total_updates
     wall_started = time.perf_counter()
     wall_accounted_at = wall_started
-    belief_weights = {
-        "ppo": config.loss.policy_belief_gradient_scale,
-        "raw_q": config.loss.raw_q_weight,
-        "counterfactual": config.loss.counterfactual_weight,
-        "response": config.loss.response_weight,
-        "decision_equivalence": config.loss.decision_equivalence_weight,
-        "information_bottleneck": config.loss.information_bottleneck_weight,
-        "q_policy": config.loss.q_policy_weight,
-        "robust": config.loss.robust_generalist_weight,
-    }
+    # §3.4: when the combined-policy-KL gate fires inside the scan, shrink the
+    # next update's epoch count (floor 2) and recover one epoch per clean update.
+    effective_update_epochs = int(config.ppo.update_epochs)
 
     for update in range(start_update, last_update):
         phase_times: dict[str, float] = {}
         snapshot_params = state.params
         snapshot_target = state.target_params
         progress = jnp.asarray(update / float(max(total_updates, 1)), dtype=jnp.float32)
-        probabilities = soft_generator_mixture(
-            progress=progress,
-            generator_cvar_ema=state.generator_cvar_ema,
-            reference_cvar_ema=state.external_reference_cvar_ema,
-            maximum_probability=config.partner_generator.maximum_generator_probability,
-            ramp_fraction=config.partner_generator.mixture_ramp_fraction,
-            competence_temperature=config.partner_generator.competence_temperature,
-        )
-        partner_parameters = MixedPartnerParameters(
-            state.generator_params, state.generator_target_params, probabilities
-        )
+        if generator_enabled:
+            probabilities = soft_generator_mixture(
+                progress=progress,
+                generator_cvar_ema=state.generator_cvar_ema,
+                reference_cvar_ema=state.external_reference_cvar_ema,
+                maximum_probability=config.partner_generator.maximum_generator_probability,
+                ramp_fraction=config.partner_generator.mixture_ramp_fraction,
+                competence_temperature=config.partner_generator.competence_temperature,
+            )
+            partner_parameters = MixedPartnerParameters(
+                state.generator_params, state.generator_target_params, probabilities
+            )
+        else:
+            probabilities = {}
+            partner_parameters = None
         dropout = context_dropout_probability(
             state.effective_environment_steps,
             total_steps=config.training.environment_steps,
@@ -1108,7 +1214,7 @@ def run_training(args: argparse.Namespace) -> None:
             state.effective_environment_steps,
             horizon=config.upstream.reward_shaping_horizon,
         )
-        anchor_trigger = update % config.anchors.interval_updates == 0
+        anchor_trigger = anchor_enabled and update % config.anchors.interval_updates == 0
         rollout_kernel = kernels.rollout_anchor_full if anchor_trigger else kernels.rollout_minimal
         (rollout_result, elapsed) = _phase(
             output,
@@ -1132,28 +1238,15 @@ def run_training(args: argparse.Namespace) -> None:
         if batch is None:
             raise RuntimeError("Training rollout did not return the V6 PPO batch.")
 
-        (regret_result, elapsed) = _phase(
-            output,
-            name="decision_regret",
-            update=update,
-            function=lambda: attach_chunked_regret_with_kernels(
-                kernels=kernels,
-                batch=batch,
-                target_params=snapshot_target,
-                key=jax.random.fold_in(
-                    jnp.asarray(domains["ego"], dtype=jnp.uint32), 200_000 + update
-                ),
-                action_range_ema=state.action_range_ema,
-                effective_steps=state.effective_environment_steps,
-            ),
-        )
-        phase_times["decision_regret"] = elapsed
-        batch, regret_metrics = regret_result
+        # Decision-regret shaping is disconnected from the DEPI foundation
+        # path (METHOD_SPEC §3.3 abolishes the regret potential; §7 boundary).
+        regret_metrics = {"action_range_ema": state.action_range_ema}
         next_replay = state.anchor_replay
         anchor_budget = {
             "counterfactual_continuation_steps": 0,
             "matched_code_probe_steps": 0,
         }
+        bank_continuation_steps = 0
         if anchor_trigger:
             if anchor_microbatch is None:
                 anchor_microbatch = preflight_anchor_microbatch_from_records(
@@ -1193,8 +1286,108 @@ def run_training(args: argparse.Namespace) -> None:
                 ),
             )
             phase_times["counterfactual_anchor"] = elapsed
-            anchors, unused_pairs, anchor_budget = anchor_result
-            del unused_pairs
+            anchors, quotient_pairs, anchor_budget = anchor_result
+            supervision_anchors = anchors
+            supervision_separation = None
+            supervision_readings = {}
+            if quotient_pairs.comparator_accuracy is not None:
+                # §5.3 -> §3.2: matched-pair classification feeds L_separation.
+                # Only the classification (masks/weights/margin) is built here;
+                # the loss forward passes run inside the jit-compiled scan on
+                # the current params so the gradient is live (§3.2/§3.4).
+                (
+                    supervision_separation,
+                    supervision_readings,
+                ) = separation_terms_from_matched_pairs(
+                    quotient=quotient_pairs,
+                    equivalent_accuracy_max=float(
+                        config.anchors.observable_equivalent_accuracy_max
+                    ),
+                    distinct_accuracy_min=float(
+                        config.anchors.decision_distinct_accuracy_min
+                    ),
+                    signature_threshold=float(
+                        config.anchors.signature_distance_threshold
+                    ),
+                    margin_scale=float(config.loss_v2.separation_margin_scale),
+                )
+            # §6 extended M1 gate: posterior-mean path plus every bootstrap
+            # member path against the shared CRN all-action signatures.
+            (gate_result, elapsed) = _phase(
+                output,
+                name="m1_gate",
+                update=update,
+                function=lambda: evaluate_m1_gate_on_anchor_batch(
+                    model=model,
+                    params=snapshot_params,
+                    bootstrap_ensemble=bootstrap_ensemble,
+                    bootstrap_params=bootstrap_params,
+                    anchors=anchors,
+                    spearman_threshold=float(config.anchors.m1_spearman_threshold),
+                    minimum_anchor_fraction=float(
+                        config.anchors.m1_minimum_anchor_fraction
+                    ),
+                ),
+            )
+            phase_times["m1_gate"] = elapsed
+            gate_payload = {
+                "update": update + 1,
+                **m1_gate_report(gate_result),
+                "separation_readings": _host(supervision_readings),
+            }
+            m1_history.append(gate_payload)
+            write_json(
+                output / "m1_gate.json",
+                {
+                    "specification": "METHOD_SPEC §6 extended M1 gate",
+                    "history": m1_history,
+                    "latest": gate_payload,
+                },
+            )
+            if (
+                not bool(np.asarray(gate_result.passed))
+                and config.run_kind == "formal"
+                and not preflight
+            ):
+                raise RuntimeError(
+                    "§6 extended M1 gate failed: both the posterior-mean path "
+                    "and every bootstrap member path must reach Spearman >= "
+                    "0.8 on >= 90% of anchor states before a formal run may "
+                    "proceed."
+                )
+            if generator_enabled:
+                # §7.2 shared-state diversity bank: real all-action
+                # continuations of the diversity codes on identical legal
+                # anchor snapshots.
+                diversity_codes = sample_partner_codes(
+                    jax.random.fold_in(
+                        jnp.asarray(domains["training_anchor"], dtype=jnp.uint32),
+                        50_000 + update,
+                    ),
+                    batch_size=config.partner_generator.diversity_codes_per_update,
+                    code_dim=config.partner_generator.code_dim,
+                )
+                diversity_bank_signatures = collect_diversity_bank_signatures(
+                    anchor_domain=update + 1,
+                    key=jax.random.fold_in(
+                        jnp.asarray(domains["training_anchor"], dtype=jnp.uint32),
+                        51_000 + update,
+                    ),
+                    records=records,
+                    codes=diversity_codes,
+                    functions=anchor_functions,
+                    runtime=AnchorRuntime(snapshot_target, partner_parameters),
+                    config=config,
+                    microbatch_size=anchor_microbatch,
+                    chunk_kernel=anchor_kernel,
+                )
+                bank_continuation_steps = (
+                    int(config.partner_generator.diversity_bank_size)
+                    * int(config.partner_generator.diversity_codes_per_update)
+                    * 6
+                    * int(config.anchors.fit_replicas)
+                    * int(config.anchors.continuation_horizon)
+                )
             next_replay = append_replay_batch(
                 next_replay,
                 batch=anchors,
@@ -1204,69 +1397,28 @@ def run_training(args: argparse.Namespace) -> None:
         replay_samples: list[Any] = []
         replay_weights: list[Any] = []
         sampled_replay = next_replay
-        for replay_index in range(config.loss.raw_q_updates_per_outer_update):
-            sampled_replay, sample = sample_replay_batch(
-                sampled_replay,
-                key=jax.random.fold_in(
-                    jnp.asarray(domains["anchor_replay"], dtype=jnp.uint32),
-                    update * config.loss.raw_q_updates_per_outer_update + replay_index,
-                ),
-                batch_size=config.anchors.replay_minibatch_size,
-            )
-            current_logits = anchor_logits_kernel(snapshot_params, sample)
-            weights = policy_drift_age_weights(
-                current_policy_logits=current_logits,
-                collection_policy_logits=sample.collection_policy_logits,
-                current_update=update,
-                collection_update=sample.collection_update,
-                kl_decay=config.anchors.policy_kl_decay,
-                age_decay_updates=config.anchors.age_decay_updates,
-                minimum_weight=config.anchors.minimum_replay_weight,
-            )
-            replay_samples.append(sample)
-            replay_weights.append(weights)
-
-        (rollout_belief, elapsed) = _phase(
-            output,
-            name="belief_gradient_rollout",
-            update=update,
-            function=lambda: kernels.belief_rollout_objectives(
-                snapshot_params, snapshot_target, batch
-            ),
-        )
-        phase_times["belief_gradient_rollout"] = elapsed
-        belief_values, belief_gradients = rollout_belief
-        anchor_values: list[Mapping[str, Any]] = []
-        anchor_gradients: list[Mapping[str, Any]] = []
-        for sample, weights in zip(replay_samples, replay_weights):
-            values, gradients = kernels.belief_anchor_objectives(
-                snapshot_params,
-                sample,
-                weights,
-                state.anchor_advantage_scale_ema,
-            )
-            anchor_values.append(values)
-            anchor_gradients.append(gradients)
-        belief_values["counterfactual"] = sum(
-            value["counterfactual"] for value in anchor_values
-        ) / float(len(anchor_values))
-        belief_values["decision_equivalence"] = sum(
-            value["decision_equivalence"] for value in anchor_values
-        ) / float(len(anchor_values))
-        belief_gradients["counterfactual"] = _tree_average(
-            [value["counterfactual"] for value in anchor_gradients]
-        )
-        belief_gradients["decision_equivalence"] = _tree_average(
-            [value["decision_equivalence"] for value in anchor_gradients]
-        )
-        combined_belief, next_norm_ema, belief_gradient_metrics = (
-            combine_belief_gradients(
-                belief_gradients,
-                state.belief_gradient_norm_ema,
-                weights=belief_weights,
-                decay=config.loss.belief_gradient_ema_decay,
-            )
-        )
+        if anchor_enabled:
+            for replay_index in range(config.loss.raw_q_updates_per_outer_update):
+                sampled_replay, sample = sample_replay_batch(
+                    sampled_replay,
+                    key=jax.random.fold_in(
+                        jnp.asarray(domains["anchor_replay"], dtype=jnp.uint32),
+                        update * config.loss.raw_q_updates_per_outer_update + replay_index,
+                    ),
+                    batch_size=config.anchors.replay_minibatch_size,
+                )
+                current_logits = anchor_logits_kernel(snapshot_params, sample)
+                weights = policy_drift_age_weights(
+                    current_policy_logits=current_logits,
+                    collection_policy_logits=sample.collection_policy_logits,
+                    current_update=update,
+                    collection_update=sample.collection_update,
+                    kl_decay=config.anchors.policy_kl_decay,
+                    age_decay_updates=config.anchors.age_decay_updates,
+                    minimum_weight=config.anchors.minimum_replay_weight,
+                )
+                replay_samples.append(sample)
+                replay_weights.append(weights)
 
         schedule = environment_minibatch_schedule(
             jax.random.fold_in(
@@ -1274,7 +1426,7 @@ def run_training(args: argparse.Namespace) -> None:
             ),
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
-            update_epochs=config.ppo.update_epochs,
+            update_epochs=effective_update_epochs,
         )
         from src.path_c.types import TrainingCoreState
 
@@ -1288,142 +1440,143 @@ def run_training(args: argparse.Namespace) -> None:
                 ),
                 batch,
                 schedule,
+                supervision_anchors,
+                supervision_separation,
             ),
         )
         phase_times["ppo"] = elapsed
         ppo_core, ppo_metrics = ppo_result
         if bool(
-            np.any(np.asarray(ppo_metrics["training_aborted_nonfinite"]) > 0.5)
+            np.any(np.asarray(ppo_metrics["training_aborted"]) > 0.5)
         ):
             raise FloatingPointError(
-                "NaN or Inf occurred during the V6 PPO minibatch scan."
+                "NaN or Inf occurred during the DEPI combined-loss minibatch scan."
             )
-        params_after_heads = ppo_core.params
-        (
-            params_after_heads,
-            next_raw_q_state,
-            raw_q_metrics,
-        ) = kernels.raw_q_retrace_update(
-            params_after_heads, snapshot_target, state.raw_q_optimizer_state, batch
-        )
-        anchor_head_metrics = []
-        for sample, weights in zip(replay_samples, replay_weights):
-            params_after_heads, next_raw_q_state, metrics = kernels.anchor_head_update(
-                params_after_heads, next_raw_q_state, sample, weights
-            )
-            anchor_head_metrics.append(metrics)
+        # §3.4 combined-policy-KL gate: adapt the next update's epoch count
+        # (shrink towards the floor of two, recover one epoch per clean update).
+        kl_stop_fraction = float(np.mean(np.asarray(ppo_metrics["kl_early_stop"])))
+        if kl_stop_fraction > 0.5:
+            effective_update_epochs = max(2, effective_update_epochs - 1)
+        elif effective_update_epochs < int(config.ppo.update_epochs):
+            effective_update_epochs += 1
+        # The single combined four-loss gradient step (METHOD_SPEC §3.3)
+        # replaces every detached head update; the legacy raw-Q/anchor/
+        # response/belief optimizers stay frozen for checkpoint identity.
+        next_params = ppo_core.params
+        next_raw_q_state = state.raw_q_optimizer_state
         next_response_state = state.response_optimizer_state
-        response_metrics = []
-        for unused_index in range(config.loss.response_updates_per_outer_update):
-            del unused_index
-            params_after_heads, next_response_state, metrics = kernels.response_head_update(
-                params_after_heads, next_response_state, batch
-            )
-            response_metrics.append(metrics)
-        (belief_result, elapsed) = _phase(
-            output,
-            name="belief_apply",
-            update=update,
-            function=lambda: kernels.belief_apply(
-                params_after_heads, state.belief_optimizer_state, combined_belief
-            ),
-        )
-        phase_times["belief_apply"] = elapsed
-        next_params, next_belief_state = belief_result
+        next_belief_state = state.belief_optimizer_state
 
-        generator_codes = sample_partner_codes(
-            jax.random.fold_in(generator_root, 500_000 + update),
-            batch_size=config.partner_generator.episodes_per_update,
-            code_dim=config.partner_generator.code_dim,
-        )
-        (generator_episodes, elapsed) = _phase(
-            output,
-            name="generator_collection",
-            update=update,
-            function=lambda: generator_collect_kernel(
-                next_params,
-                state.generator_params,
-                generator_codes,
-                jax.random.fold_in(generator_root, 600_000 + update),
-                jnp.asarray(update, dtype=jnp.int32),
-                shaping_factor,
-            ),
-        )
-        phase_times["generator_collection"] = elapsed
-        validate_complete_episode_batch(generator_episodes)
-        generator_schedule = environment_minibatch_schedule(
-            jax.random.fold_in(generator_root, 700_000 + update),
-            environment_count=config.partner_generator.episodes_per_update,
-            minibatches_per_epoch=config.partner_generator.environment_minibatches,
-            update_epochs=config.partner_generator.update_epochs,
-        )
-        (generator_result, elapsed) = _phase(
-            output,
-            name="generator_ppo",
-            update=update,
-            function=lambda: generator_update_kernel(
-                state.generator_params,
-                state.generator_optimizer_state,
-                generator_episodes,
-                source_batch,
-                generator_schedule,
-                progress,
-                state.generator_competence_multiplier,
-                state.external_reference_cvar_ema,
-            ),
-        )
-        phase_times["generator_ppo"] = elapsed
-        next_generator_params, next_generator_optimizer_state, generator_metrics = generator_result
-        generator_returns = complete_episode_raw_returns(generator_episodes)
-        generator_cvar = lower_tail_cvar(
-            generator_returns.tolist(), level=config.partner_generator.cvar_level
-        )
-        generator_cvar_ema = (
-            config.partner_generator.cvar_ema_decay * state.generator_cvar_ema
-            + (1.0 - config.partner_generator.cvar_ema_decay) * generator_cvar
-        )
-        external_cvar = _external_cvar_from_rollout(
-            records, config.partner_generator.cvar_level
-        )
-        external_reference_cvar_ema = state.external_reference_cvar_ema
-        if external_cvar is not None:
-            external_reference_cvar_ema = (
-                config.partner_generator.cvar_ema_decay
-                * state.external_reference_cvar_ema
-                + (1.0 - config.partner_generator.cvar_ema_decay) * external_cvar
+        if generator_enabled:
+            generator_codes = sample_partner_codes(
+                jax.random.fold_in(generator_root, 500_000 + update),
+                batch_size=config.partner_generator.episodes_per_update,
+                code_dim=config.partner_generator.code_dim,
             )
-        next_dual = update_competence_dual(
-            state.generator_competence_multiplier,
-            reference_cvar=external_reference_cvar_ema,
-            generator_cvar=generator_cvar_ema,
-            learning_rate=config.partner_generator.lagrangian_learning_rate,
-            maximum=config.partner_generator.competence_multiplier_maximum,
-        )
+            (generator_episodes, elapsed) = _phase(
+                output,
+                name="generator_collection",
+                update=update,
+                function=lambda: generator_collect_kernel(
+                    next_params,
+                    state.generator_params,
+                    generator_codes,
+                    jax.random.fold_in(generator_root, 600_000 + update),
+                    jnp.asarray(update, dtype=jnp.int32),
+                    shaping_factor,
+                ),
+            )
+            phase_times["generator_collection"] = elapsed
+            validate_complete_episode_batch(generator_episodes)
+            generator_schedule = environment_minibatch_schedule(
+                jax.random.fold_in(generator_root, 700_000 + update),
+                environment_count=config.partner_generator.episodes_per_update,
+                minibatches_per_epoch=config.partner_generator.environment_minibatches,
+                update_epochs=config.partner_generator.update_epochs,
+            )
+            (generator_result, elapsed) = _phase(
+                output,
+                name="generator_ppo",
+                update=update,
+                function=lambda: generator_update_kernel(
+                    state.generator_params,
+                    state.generator_optimizer_state,
+                    generator_episodes,
+                    source_batch,
+                    generator_schedule,
+                    progress,
+                    state.generator_competence_multiplier,
+                    state.external_reference_cvar_ema,
+                    diversity_bank_signatures,
+                ),
+            )
+            phase_times["generator_ppo"] = elapsed
+            next_generator_params, next_generator_optimizer_state, generator_metrics = generator_result
+            generator_returns = complete_episode_raw_returns(generator_episodes)
+            generator_cvar = lower_tail_cvar(
+                generator_returns.tolist(), level=config.partner_generator.cvar_level
+            )
+            generator_cvar_ema = (
+                config.partner_generator.cvar_ema_decay * state.generator_cvar_ema
+                + (1.0 - config.partner_generator.cvar_ema_decay) * generator_cvar
+            )
+            external_cvar = _external_cvar_from_rollout(
+                records, config.partner_generator.cvar_level
+            )
+            external_reference_cvar_ema = state.external_reference_cvar_ema
+            if external_cvar is not None:
+                external_reference_cvar_ema = (
+                    config.partner_generator.cvar_ema_decay
+                    * state.external_reference_cvar_ema
+                    + (1.0 - config.partner_generator.cvar_ema_decay) * external_cvar
+                )
+            next_dual = update_competence_dual(
+                state.generator_competence_multiplier,
+                reference_cvar=external_reference_cvar_ema,
+                generator_cvar=generator_cvar_ema,
+                learning_rate=config.partner_generator.lagrangian_learning_rate,
+                maximum=config.partner_generator.competence_multiplier_maximum,
+            )
+            next_generator_target = polyak_update(
+                state.generator_target_params,
+                next_generator_params,
+                config.partner_generator.target_polyak_coefficient,
+            )
+        else:
+            generator_metrics = {}
+            generator_cvar = float("nan")
+            generator_cvar_ema = state.generator_cvar_ema
+            external_reference_cvar_ema = state.external_reference_cvar_ema
+            next_dual = state.generator_competence_multiplier
+            next_generator_params = state.generator_params
+            next_generator_optimizer_state = state.generator_optimizer_state
+            next_generator_target = state.generator_target_params
         next_target_params = polyak_update(
             state.target_params, next_params, config.ppo.polyak_coefficient
         )
-        next_generator_target = polyak_update(
-            state.generator_target_params,
-            next_generator_params,
-            config.partner_generator.target_polyak_coefficient,
-        )
 
-        empirical_scale = np.asarray(
-            jnp.mean(jnp.linalg.norm(centered(replay_samples[0].fit_returns_by_action), axis=-1))
-        )
-        next_advantage_scale = (
-            0.99 * state.anchor_advantage_scale_ema + 0.01 * float(empirical_scale)
-        )
+        if replay_samples:
+            empirical_scale = np.asarray(
+                jnp.mean(jnp.linalg.norm(centered(replay_samples[0].fit_returns_by_action), axis=-1))
+            )
+            next_advantage_scale = (
+                0.99 * state.anchor_advantage_scale_ema + 0.01 * float(empirical_scale)
+            )
+        else:
+            next_advantage_scale = float(np.asarray(state.anchor_advantage_scale_ema))
         completed_steps = int(np.asarray(runner.effective_environment_steps))
         ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
             ego_policy_steps=config.environment.num_envs * config.training.rollout_length,
             generator_training_steps=(
                 config.partner_generator.episodes_per_update
                 * config.partner_generator.episode_steps
+                if generator_enabled
+                else 0
             ),
             counterfactual_continuation_steps=int(
                 anchor_budget["counterfactual_continuation_steps"]
-            ),
+            )
+            + bank_continuation_steps,
             matched_code_probe_steps=int(anchor_budget["matched_code_probe_steps"]),
         )
         ppo_applied = int(
@@ -1446,24 +1599,21 @@ def run_training(args: argparse.Namespace) -> None:
             anchor_sampling_counter=(
                 state.anchor_sampling_counter + int(anchor_trigger)
             ),
-            belief_gradient_norm_ema=next_norm_ema,
+            belief_gradient_norm_ema=state.belief_gradient_norm_ema,
             action_range_ema=regret_metrics["action_range_ema"],
             anchor_advantage_scale_ema=jnp.asarray(next_advantage_scale),
             ppo_optimizer_step=state.ppo_optimizer_step + ppo_applied,
-            raw_q_optimizer_step=(
-                state.raw_q_optimizer_step
-                + 1
-                + config.loss.raw_q_updates_per_outer_update
-            ),
-            response_optimizer_step=(
-                state.response_optimizer_step
-                + config.loss.response_updates_per_outer_update
-            ),
-            belief_optimizer_step=state.belief_optimizer_step + 1,
+            raw_q_optimizer_step=state.raw_q_optimizer_step,
+            response_optimizer_step=state.response_optimizer_step,
+            belief_optimizer_step=state.belief_optimizer_step,
             generator_optimizer_step=(
                 state.generator_optimizer_step
-                + config.partner_generator.update_epochs
-                * config.partner_generator.environment_minibatches
+                + (
+                    config.partner_generator.update_epochs
+                    * config.partner_generator.environment_minibatches
+                    if generator_enabled
+                    else 0
+                )
             ),
             runner_state=runner,
             update_count=jnp.asarray(update + 1, dtype=jnp.int32),
@@ -1489,26 +1639,46 @@ def run_training(args: argparse.Namespace) -> None:
             "partner_source_probabilities": _host(probabilities),
             "context_dropout_probability": float(np.asarray(dropout)),
             "official_shaping_factor": float(np.asarray(shaping_factor)),
+            # Four-loss combined objective metrics (§3): PPO, signature,
+            # response, separation plus combined_policy_kl and posterior
+            # entropy, all recorded per minibatch inside the scan.
             "ppo": _host(_mean_metrics(ppo_metrics)),
-            "raw_q": _host(raw_q_metrics),
-            "counterfactual": _host(
-                _mean_metrics(jax.tree_util.tree_map(lambda *values: jnp.stack(values), *anchor_head_metrics))
-            ),
-            "response": _host(
-                _mean_metrics(jax.tree_util.tree_map(lambda *values: jnp.stack(values), *response_metrics))
-            ),
-            "belief_objective_losses": _host(belief_values),
-            "belief_gradient": _host(belief_gradient_metrics),
-            "regret": _host(regret_metrics),
-            "generator": {
-                **_host(generator_metrics),
-                "raw_cvar": generator_cvar,
-                "raw_cvar_ema": float(np.asarray(generator_cvar_ema)),
-                "external_reference_cvar_ema": float(
-                    np.asarray(external_reference_cvar_ema)
+            "combined_policy_kl_stop_fraction": kl_stop_fraction,
+            "effective_update_epochs": int(effective_update_epochs),
+            # §5 anchor supervision readouts (per-anchor-trigger refresh; the
+            # carried supervision payload trains every combined-loss update).
+            "anchor_supervision": {
+                "active": supervision_anchors is not None,
+                "anchor_trigger": anchor_trigger,
+                "separation_terms": (
+                    {
+                        "margin": float(np.asarray(supervision_separation.margin)),
+                        "pair_count": int(
+                            np.asarray(supervision_separation.equivalent_mask).shape[0]
+                        ),
+                        "equivalent_pair_count": int(
+                            np.sum(np.asarray(supervision_separation.equivalent_mask))
+                        ),
+                    }
+                    if supervision_separation is not None
+                    else None
                 ),
-                "competence_multiplier": float(np.asarray(next_dual)),
+                "readings": _host(supervision_readings),
             },
+            "m1_gate": m1_history[-1] if m1_history else {"evaluated": False},
+            "generator": (
+                {
+                    **_host(generator_metrics),
+                    "raw_cvar": generator_cvar,
+                    "raw_cvar_ema": float(np.asarray(generator_cvar_ema)),
+                    "external_reference_cvar_ema": float(
+                        np.asarray(external_reference_cvar_ema)
+                    ),
+                    "competence_multiplier": float(np.asarray(next_dual)),
+                }
+                if generator_enabled
+                else {"enabled": False}
+            ),
             "replay": {
                 "item_count": int(np.asarray(state.anchor_replay.item_count)),
                 "fingerprint": replay_fingerprint(state.anchor_replay),
@@ -1585,9 +1755,19 @@ def run_training(args: argparse.Namespace) -> None:
         "decision_regret_state_chunk_size": DECISION_REGRET_STATE_CHUNK_SIZE,
         "anchor_microbatch": anchor_microbatch,
         "compiled_kernels": kernels.metadata(),
-        "anchor_kernel": list(anchor_kernel.metadata()),
-        "generator_collection_kernel": list(generator_collect_kernel.metadata()),
-        "generator_update_kernel": list(generator_update_kernel.metadata()),
+        "anchor_kernel": (
+            list(anchor_kernel.metadata()) if anchor_kernel is not None else []
+        ),
+        "generator_collection_kernel": (
+            list(generator_collect_kernel.metadata())
+            if generator_collect_kernel is not None
+            else []
+        ),
+        "generator_update_kernel": (
+            list(generator_update_kernel.metadata())
+            if generator_update_kernel is not None
+            else []
+        ),
         "owner_initialization": _host(owner_metrics),
         "generator_initialization": _host(generator_initialization_metrics),
         "gpu": _gpu_snapshot(),

@@ -98,6 +98,21 @@ class PartnerResponseLosses(NamedTuple):
     interaction_change: Any
 
 
+class ResponsePrediction(NamedTuple):
+    """Per-step mixture-likelihood prediction bundle (METHOD_SPEC §2.2/§2.3).
+
+    Every logit tensor carries a trailing ``K`` protocol-component axis; the
+    mixture is formed with ``posterior_log_probabilities`` = log pi_t.
+    """
+
+    posterior_log_probabilities: Any
+    visibility_logit: Any
+    relative_position_logits: Any
+    direction_logits: Any
+    inventory_logits: Any
+    interaction_change_logit: Any
+
+
 def extract_partner_response_targets(
     previous_observation: Any,
     next_observation: Any,
@@ -181,74 +196,103 @@ def _binary_cross_entropy(logits: Any, labels: Any) -> Any:
     )
 
 
-def structured_partner_response_loss(
-    prediction: Any,
+def _categorical_log_probability(logits: Any, labels: Any) -> Any:
+    import jax.nn as jnn
+    import jax.numpy as jnp
+
+    prediction = jnp.asarray(logits, dtype=jnp.float32)
+    label = jnp.asarray(labels, dtype=jnp.int32)
+    return jnp.take_along_axis(jnn.log_softmax(prediction, axis=-1), label[..., None], axis=-1)[..., 0]
+
+
+def _bernoulli_log_probability(logits: Any, labels: Any) -> Any:
+    import jax.numpy as jnp
+
+    prediction = jnp.asarray(logits, dtype=jnp.float32)
+    target = jnp.asarray(labels, dtype=jnp.float32)
+    return -(
+        jnp.maximum(prediction, 0.0)
+        - prediction * target
+        + jnp.log1p(jnp.exp(-jnp.abs(prediction)))
+    )
+
+
+def _mixture_log_probability(
+    posterior_log_probabilities: Any, component_log_probability: Any
+) -> Any:
+    """log sum_k pi_{t,k} p_k(y) via logsumexp (proper mixture NLL term)."""
+
+    from jax.scipy.special import logsumexp
+    import jax.numpy as jnp
+
+    log_pi = jnp.asarray(posterior_log_probabilities, dtype=jnp.float32)
+    component = jnp.asarray(component_log_probability, dtype=jnp.float32)
+    return logsumexp(log_pi + component, axis=-1)
+
+
+def _masked_mean(values: Any, mask: Any | None) -> Any:
+    import jax.numpy as jnp
+
+    array = jnp.asarray(values, dtype=jnp.float32)
+    if mask is None:
+        return jnp.mean(array)
+    weight = jnp.asarray(mask, dtype=jnp.float32)
+    return jnp.sum(weight * array) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
+def mixture_response_loss(
+    prediction: ResponsePrediction,
     targets: PartnerResponseTargets,
     *,
-    interaction_positive_weight: float = 4.0,
+    mask: Any | None = None,
 ) -> PartnerResponseLosses:
+    """Proper mixture negative log-likelihood L_response (METHOD_SPEC §2.3).
+
+    Per step the loss is
+    ``-[log p(vis) + log p(pos) + visible * (log p(dir) + log p(inv) + log p(event))]``
+    with every term marginalized over the K protocol components via
+    ``logsumexp(log pi_t + log p_k)``.  Direction/inventory/event terms are
+    only scored while the partner is visible (their labels are defined by the
+    visible partner planes).
+    """
+
     import jax.numpy as jnp
 
-    visibility = jnp.mean(_binary_cross_entropy(prediction.visibility_logit, targets.visibility))
-    position = jnp.mean(
-        _categorical_cross_entropy(prediction.relative_position_logits, targets.relative_position)
-    )
+    log_pi = prediction.posterior_log_probabilities
     visible = jnp.asarray(targets.visible_mask, dtype=jnp.float32)
-    denominator = jnp.maximum(jnp.sum(visible), 1.0)
-    direction = jnp.sum(
-        visible * _categorical_cross_entropy(prediction.direction_logits, targets.direction)
-    ) / denominator
-    inventory_items = _categorical_cross_entropy(
-        prediction.inventory_logits, targets.inventory
+    visibility_lp = _mixture_log_probability(
+        log_pi, _bernoulli_log_probability(prediction.visibility_logit, targets.visibility)
     )
-    inventory = jnp.sum(visible[..., None] * inventory_items) / jnp.maximum(
-        denominator * inventory_items.shape[-1], 1.0
+    position_lp = _mixture_log_probability(
+        log_pi,
+        _categorical_log_probability(prediction.relative_position_logits, targets.relative_position),
     )
-    interaction_weight = 1.0 + (
-        float(interaction_positive_weight) - 1.0
-    ) * jnp.asarray(targets.interaction_change, dtype=jnp.float32)
-    interaction = jnp.sum(
-        visible
-        * interaction_weight
-        * _binary_cross_entropy(prediction.interaction_change_logit, targets.interaction_change)
-    ) / denominator
-    total = visibility + position + direction + inventory + interaction
-    return PartnerResponseLosses(total, visibility, position, direction, inventory, interaction)
-
-
-def response_auxiliary_objective(
-    *,
-    model: Any,
-    params: Any,
-    batch: Any,
-) -> tuple[Any, dict[str, Any]]:
-    """Selected-action response loss with no task/actor/value/raw-Q gradient."""
-
-    import jax
-    import jax.numpy as jnp
-
-    _, prediction = model.apply(
-        {"params": params},
-        batch.initial_policy_state,
-        batch.observations,
-        batch.previous_actions,
-        batch.episode_starts,
-        batch.actions,
-        method=model.response_sequence,
+    direction_lp = _mixture_log_probability(
+        log_pi, _categorical_log_probability(prediction.direction_logits, targets.direction)
     )
-    planes = official_partner_observation_planes(batch.observations.shape[-1])
-    targets = extract_partner_response_targets(
-        batch.observations[:-1], batch.response_next_observations, planes=planes
+    inventory_component_lp = jnp.sum(
+        _categorical_log_probability(prediction.inventory_logits, targets.inventory),
+        axis=-1,
     )
-    losses = structured_partner_response_loss(prediction, targets)
-    return losses.total, {
-        "response_total_loss": losses.total,
-        "response_visibility_loss": losses.visibility,
-        "response_position_loss": losses.relative_position,
-        "response_direction_loss": losses.direction,
-        "response_inventory_loss": losses.inventory,
-        "response_interaction_loss": losses.interaction_change,
-    }
+    inventory_lp = _mixture_log_probability(log_pi, inventory_component_lp)
+    event_lp = _mixture_log_probability(
+        log_pi,
+        _bernoulli_log_probability(
+            prediction.interaction_change_logit, targets.interaction_change
+        ),
+    )
+    per_step_nll = -(
+        visibility_lp + position_lp + visible * (direction_lp + inventory_lp + event_lp)
+    )
+    total = _masked_mean(per_step_nll, mask)
+    return PartnerResponseLosses(
+        total,
+        _masked_mean(-visibility_lp, mask),
+        _masked_mean(-position_lp, mask),
+        _masked_mean(-visible * direction_lp, mask),
+        _masked_mean(-visible * inventory_lp, mask),
+        _masked_mean(-visible * event_lp, mask),
+    )
 
 
 __all__ = [
@@ -258,8 +302,8 @@ __all__ = [
     "PartnerObservationPlanes",
     "PartnerResponseLosses",
     "PartnerResponseTargets",
+    "ResponsePrediction",
     "extract_partner_response_targets",
+    "mixture_response_loss",
     "official_partner_observation_planes",
-    "response_auxiliary_objective",
-    "structured_partner_response_loss",
 ]

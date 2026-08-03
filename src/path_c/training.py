@@ -1,4 +1,15 @@
-"""Official PPO plus V6 end-to-end actor/belief objectives."""
+"""DEPI combined-loss training (METHOD_SPEC §3).
+
+L = L_PPO + lambda_A * L_signature + lambda_R * L_response + lambda_S * L_separation
+
+All four terms are evaluated at the current parameters inside one
+``jax.value_and_grad`` and a single gradient step updates every trainable
+parameter (§3.3).  The eight-objective PCGrad / snapshot-gradient machinery is
+abolished.  After each combined update the rollout batch reports
+``combined_policy_kl`` (k1 estimator of the behaviour-vs-updated policy KL,
+including every context-pathway effect); exceeding the registered threshold
+terminates the remaining minibatches of the current PPO epoch (§3.4).
+"""
 
 from __future__ import annotations
 
@@ -100,83 +111,159 @@ def clipped_value_loss(*, predictions: Any, old_predictions: Any, targets: Any, 
     return jnp.sum(items * weight) / jnp.maximum(jnp.sum(weight), 1.0e-8)
 
 
-def gaussian_kl_loss(mean: Any, log_standard_deviation: Any, *, free_bits_per_dimension: float) -> Any:
-    from .belief_set_encoder import gaussian_kl_standard_normal
-
-    return gaussian_kl_standard_normal(
-        mean,
-        log_standard_deviation,
-        free_bits_per_dimension=free_bits_per_dimension,
-    )
-
-
-def robust_generalist_loss(*, model: Any, params: Any, output: Any, mask: Any):
-    import jax
+def centered(values: Any) -> Any:
     import jax.numpy as jnp
 
-    from .belief_set_encoder import prior_gaussian_summary
+    array = jnp.asarray(values, dtype=jnp.float32)
+    return array - jnp.mean(array, axis=-1, keepdims=True)
 
-    task = jax.lax.stop_gradient(output.task_features[:-1])
-    full_logits = model.apply(
-        {"params": params}, task, output.belief_summary[:-1], method=model.policy_logits_from_features_and_summary
+
+def signature_loss(
+    *,
+    raw_q1: Any,
+    raw_q2: Any,
+    advantage_targets: Any,
+    action_mask: Any,
+    hinge_margin: float,
+    hinge_advantage_gap: float,
+) -> tuple[Any, Any, Any]:
+    """L_signature: centered-Q Huber fit plus rank-preserving hinge (§3.2).
+
+    Q_c = min(Q1, Q2) - mean_a min(Q1, Q2); targets are the centered CRN
+    continuation returns A(a).  The hinge enforces the action ranking implied
+    by advantages whose gap exceeds ``hinge_advantage_gap``.
+    """
+
+    import jax.numpy as jnp
+
+    conservative = jnp.minimum(
+        jnp.asarray(raw_q1, dtype=jnp.float32), jnp.asarray(raw_q2, dtype=jnp.float32)
     )
-    prior_summary = prior_gaussian_summary(
-        output.belief_summary[:-1], output.belief_mean.shape[-1]
+    q_centered = conservative - jnp.mean(conservative, axis=-1, keepdims=True)
+    target = centered(advantage_targets)
+    mask = jnp.asarray(action_mask, dtype=jnp.float32)
+    denominator = jnp.maximum(jnp.sum(mask), 1.0)
+    fit = jnp.sum(mask * huber(q_centered - target)) / denominator
+
+    gap = jnp.abs(target[..., :, None] - target[..., None, :])
+    order = jnp.sign(target[..., :, None] - target[..., None, :])
+    q_gap = q_centered[..., :, None] - q_centered[..., None, :]
+    pair_mask = (gap > float(hinge_advantage_gap)) & (order > 0.0)
+    pair_mask = pair_mask & (mask[..., :, None] > 0.0) & (mask[..., None, :] > 0.0)
+    hinge = jnp.maximum(
+        0.0, float(hinge_margin) - q_gap * order
     )
-    prior_logits = model.apply(
-        {"params": params}, task, prior_summary, method=model.policy_logits_from_features_and_summary
+    pair_denominator = jnp.maximum(jnp.sum(pair_mask.astype(jnp.float32)), 1.0)
+    hinge_loss = jnp.sum(pair_mask.astype(jnp.float32) * hinge) / pair_denominator
+    total = fit + hinge_loss
+    return total, fit, hinge_loss
+
+
+def signature_anchor_objective(*, model: Any, params: Any, anchors: Any, loss_v2: Any):
+    """Anchor-batch signature loss; contributes 0 while anchors are disabled."""
+
+    import jax.numpy as jnp
+
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+    if anchors is None:
+        return zero, {"signature_loss": zero, "signature_huber_loss": zero, "signature_hinge_loss": zero}
+    _, output = model.apply(
+        {"params": params},
+        anchors.policy_states,
+        anchors.observations,
+        method=model.step,
     )
-    full_log = jax.nn.log_softmax(full_logits, axis=-1)
-    prior_log = jax.nn.log_softmax(prior_logits, axis=-1)
-    probability = jnp.exp(full_log)
-    items = jnp.asarray(output.normalized_uncertainty[:-1]) * jnp.sum(
-        probability * (full_log - prior_log), axis=-1
+    total, fit, hinge_loss = signature_loss(
+        raw_q1=output.raw_q1,
+        raw_q2=output.raw_q2,
+        advantage_targets=anchors.fit_returns_by_action,
+        action_mask=anchors.action_mask,
+        hinge_margin=float(loss_v2.rank_hinge_margin),
+        hinge_advantage_gap=float(loss_v2.rank_hinge_advantage_gap),
     )
-    valid = jnp.asarray(mask, dtype=jnp.float32)
-    loss = jnp.sum(valid * items) / jnp.maximum(jnp.sum(valid), 1.0)
-    return loss, {
-        "robust_generalist_kl": loss,
-        "full_context_entropy": jnp.mean(categorical_entropy(full_logits)),
-        "prior_context_entropy": jnp.mean(categorical_entropy(prior_logits)),
+    return total, {
+        "signature_loss": total,
+        "signature_huber_loss": fit,
+        "signature_hinge_loss": hinge_loss,
     }
 
 
-def _q_policy_from_output(*, output: Any, model: Any, params: Any, batch: Any, config: Any):
-    import jax
+def separation_loss(
+    *,
+    context_a: Any,
+    context_b: Any,
+    equivalent_mask: Any,
+    margin: Any,
+    weights: Any,
+) -> Any:
+    """L_separation on matched pairs (§3.2).
+
+    Observable-equivalent pairs (``equivalent_mask``) contribute
+    ``||c_i - c_j||^2``; decision-distinct pairs contribute
+    ``max(0, m - ||c_i - c_j||)`` with ``m`` the registered margin.
+    """
+
     import jax.numpy as jnp
 
-    q1, q2 = output.raw_q1[:-1], output.raw_q2[:-1]
-    q = jax.lax.stop_gradient(jnp.minimum(q1, q2))
-    ordered = jnp.sort(q, axis=-1)
-    gap = ordered[..., -1] - ordered[..., -2]
-    disagreement = jnp.mean(jnp.abs(q1 - q2), axis=-1)
-    weight = jax.nn.sigmoid(
-        (gap - float(config.loss.q_policy_gap_midpoint))
-        / float(config.loss.q_policy_gap_temperature)
-    ) * jnp.exp(-disagreement / float(config.loss.q_policy_disagreement_temperature))
-    full_logits = model.apply(
-        {"params": params}, jax.lax.stop_gradient(output.task_features[:-1]), output.belief_summary[:-1], method=model.policy_logits_from_features_and_summary
+    delta = jnp.asarray(context_a, dtype=jnp.float32) - jnp.asarray(context_b, dtype=jnp.float32)
+    distance = jnp.sqrt(jnp.sum(jnp.square(delta), axis=-1) + 1.0e-12)
+    equivalent = jnp.asarray(equivalent_mask, dtype=jnp.bool_)
+    margin_value = jnp.asarray(margin, dtype=jnp.float32)
+    items = jnp.where(
+        equivalent,
+        jnp.square(distance),
+        jnp.maximum(0.0, margin_value - distance),
     )
-    target = jax.nn.softmax(q / float(config.loss.q_policy_temperature), axis=-1)
-    items = jnp.sum(
-        target * (jnp.log(jnp.maximum(target, 1.0e-8)) - jax.nn.log_softmax(full_logits, axis=-1)),
-        axis=-1,
+    pair_weights = jnp.asarray(weights, dtype=jnp.float32)
+    return jnp.sum(pair_weights * items) / jnp.maximum(jnp.sum(pair_weights), 1.0)
+
+
+def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
+    """Proper mixture NLL L_response over rollout transitions (§2.3)."""
+
+    import jax.numpy as jnp
+
+    from .response_targets import (
+        extract_partner_response_targets,
+        mixture_response_loss,
+        official_partner_observation_planes,
     )
-    valid = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
-    loss = jnp.sum(valid * weight * items) / jnp.maximum(jnp.sum(valid), 1.0)
-    return loss, {
-        "q_policy_coupling_loss": loss,
-        "q_policy_weight_mean": jnp.sum(valid * weight) / jnp.maximum(jnp.sum(valid), 1.0),
-        "q_policy_gap_mean": jnp.mean(gap),
-        "q_policy_head_disagreement_mean": jnp.mean(disagreement),
+
+    _, prediction = model.apply(
+        {"params": params},
+        batch.initial_policy_state,
+        batch.observations,
+        batch.previous_actions,
+        batch.episode_starts,
+        batch.actions,
+        method=model.response_sequence,
+    )
+    planes = official_partner_observation_planes(batch.observations.shape[-1])
+    targets = extract_partner_response_targets(
+        batch.observations[:-1], batch.response_next_observations, planes=planes
+    )
+    losses = mixture_response_loss(prediction, targets, mask=batch.ppo_mask)
+    return losses.total, {
+        "response_total_loss": losses.total,
+        "response_visibility_loss": losses.visibility,
+        "response_position_loss": losses.relative_position,
+        "response_direction_loss": losses.direction,
+        "response_inventory_loss": losses.inventory,
+        "response_event_loss": losses.interaction_change,
     }
 
 
-def compute_loss(*, model: Any, params: Mapping[str, Any], batch: RolloutBatch, config: Any, anchors: Any = None, quotient_pairs: Any = None) -> LossBundle:
+def compute_loss(*, model: Any, params: Mapping[str, Any], batch: RolloutBatch, config: Any, anchors: Any = None, separation_terms: Any = None) -> LossBundle:
+    """Combined four-loss objective at the current parameters (§3.1/§3.3).
+
+    ``separation_terms`` is the §3.2 ``SeparationTerms`` payload: its
+    classification fields are precomputed constants, but the two ego
+    forward passes run here on ``params`` so L_separation contributes a
+    live gradient (§3.4 ownership: capability/protocol encoders).
+    """
+
     import jax.numpy as jnp
 
-    if anchors is not None or quotient_pairs is not None:
-        raise ValueError("V6 replay updates are independent of PPO minibatches.")
     _, output = model.apply(
         {"params": params},
         batch.initial_policy_state,
@@ -210,118 +297,71 @@ def compute_loss(*, model: Any, params: Mapping[str, Any], batch: RolloutBatch, 
         mask=batch.ppo_mask,
     )
     entropy = jnp.sum(categorical_entropy(output.policy_logits[:-1]) * batch.ppo_mask) / jnp.maximum(jnp.sum(batch.ppo_mask), 1.0)
-    q_policy, q_metrics = _q_policy_from_output(
-        output=output, model=model, params=params, batch=batch, config=config
-    )
-    robust, robust_metrics = robust_generalist_loss(
-        model=model, params=params, output=output, mask=batch.ppo_mask
-    )
-    total = (
+    ppo_total = (
         actor
         + float(config.ppo.value_weight) * value
         - float(config.ppo.entropy_weight) * entropy
-        + float(config.loss.q_policy_weight) * q_policy
-        + float(config.loss.robust_generalist_weight) * robust
+    )
+
+    response_total, response_metrics = response_objective(
+        model=model, params=params, batch=batch
+    )
+    signature_total, signature_metrics = signature_anchor_objective(
+        model=model, params=params, anchors=anchors, loss_v2=config.loss_v2
+    )
+    # §3.2/§3.4: L_separation is re-evaluated here on the *current* params so
+    # it joins this same value_and_grad; only the §5.3 classification
+    # (masks/weights/margin) is a precomputed constant carried in the payload.
+    if separation_terms is None:
+        separation_total = jnp.asarray(0.0, dtype=jnp.float32)
+    else:
+        pair_count = jnp.asarray(separation_terms.equivalent_mask).shape[0]
+        dropped = jnp.zeros((pair_count,), dtype=jnp.bool_)
+        _, output_a = model.apply(
+            {"params": params},
+            separation_terms.ego_state_a,
+            separation_terms.probe_observations[0],
+            dropped,
+            method=model.step,
+        )
+        _, output_b = model.apply(
+            {"params": params},
+            separation_terms.ego_state_b,
+            separation_terms.probe_observations[1],
+            dropped,
+            method=model.step,
+        )
+        separation_total = separation_loss(
+            context_a=output_a.protocol_embedding,
+            context_b=output_b.protocol_embedding,
+            equivalent_mask=separation_terms.equivalent_mask,
+            margin=separation_terms.margin,
+            weights=separation_terms.weights,
+        )
+
+    total = (
+        ppo_total
+        + float(config.loss_v2.signature_weight) * signature_total
+        + float(config.loss_v2.response_weight) * response_total
+        + float(config.loss_v2.separation_weight) * separation_total
     )
     return LossBundle(total, {
         **actor_metrics,
-        **q_metrics,
-        **robust_metrics,
+        **response_metrics,
+        **signature_metrics,
+        "separation_loss": separation_total,
+        "ppo_total_loss": ppo_total,
         "total_loss": total,
         "value_loss": value,
         "entropy": entropy,
         "mean_raw_reward": jnp.mean(batch.rewards),
         "mean_shaped_reward": jnp.mean(batch.shaped_rewards),
-        "mean_belief_uncertainty": jnp.mean(output.normalized_uncertainty[:-1]),
+        "mean_posterior_entropy": jnp.mean(output.posterior_entropy[:-1]),
         "context_dropout_fraction": jnp.mean(batch.context_dropout_masks[:-1].astype(jnp.float32)),
+        # The policy logits already condition on (x, u, c); the k1 estimate
+        # therefore includes every context-pathway parameter effect (§3.4).
+        "combined_policy_kl": actor_metrics["approx_kl"],
     })
-
-
-def owner_behavior_distillation_loss(*, model: Any, params: Any, batch: RolloutBatch, owner_logits: Any):
-    import jax
-    import jax.numpy as jnp
-
-    _, output = model.apply(
-        {"params": params}, batch.initial_policy_state, batch.observations,
-        batch.previous_actions, batch.episode_starts,
-        jnp.zeros_like(batch.context_dropout_masks), method=model.sequence,
-    )
-    source = jax.nn.softmax(jnp.asarray(owner_logits, dtype=jnp.float32), axis=-1)
-    source_log = jax.nn.log_softmax(jnp.asarray(owner_logits, dtype=jnp.float32), axis=-1)
-    candidate_log = jax.nn.log_softmax(output.policy_logits[:-1], axis=-1)
-    items = jnp.sum(source * (source_log - candidate_log), axis=-1)
-    mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
-    loss = jnp.sum(mask * items) / jnp.maximum(jnp.sum(mask), 1.0)
-    return loss, {"owner_distillation_kl": loss}
-
-
-def belief_objective_gradients(*, model: Any, params: Any, batch: Any, config: Any):
-    """Compute PPO/Q-policy/robust/IB belief gradients from one frozen snapshot."""
-
-    import jax
-    import jax.numpy as jnp
-
-    def objective(name: str):
-        def loss(candidate: Any):
-            _, output = model.apply(
-                {"params": candidate}, batch.initial_policy_state, batch.observations,
-                batch.previous_actions, batch.episode_starts,
-                batch.context_dropout_masks, method=model.sequence,
-            )
-            if name == "ppo":
-                advantages, returns = generalized_advantage_estimation(
-                    rewards=batch.shaped_rewards, dones=batch.dones,
-                    values=batch.old_values,
-                    gamma=config.ppo.gamma, gae_lambda=config.ppo.gae_lambda,
-                )
-                actor, _ = ppo_actor_loss(
-                    logits=output.policy_logits[:-1], actions=batch.actions,
-                    old_log_probabilities=batch.old_log_probabilities,
-                    advantages=advantages, clip_epsilon=config.ppo.clip_epsilon,
-                    normalize_advantages=config.ppo.normalize_advantages, mask=batch.ppo_mask,
-                )
-                value = clipped_value_loss(
-                    predictions=output.state_value[:-1],
-                    old_predictions=batch.old_values[:-1],
-                    targets=returns,
-                    clip_epsilon=config.ppo.value_clip_epsilon,
-                    mask=batch.ppo_mask,
-                )
-                entropy = (
-                    jnp.sum(
-                        categorical_entropy(output.policy_logits[:-1])
-                        * batch.ppo_mask
-                    )
-                    / jnp.maximum(jnp.sum(batch.ppo_mask), 1.0)
-                )
-                return (
-                    actor
-                    + float(config.ppo.value_weight) * value
-                    - float(config.ppo.entropy_weight) * entropy
-                )
-            if name == "q_policy":
-                value, _ = _q_policy_from_output(
-                    output=output, model=model, params=candidate, batch=batch, config=config
-                )
-                return value
-            if name == "robust":
-                value, _ = robust_generalist_loss(
-                    model=model, params=candidate, output=output, mask=batch.ppo_mask
-                )
-                return value
-            if name == "information_bottleneck":
-                return gaussian_kl_loss(
-                    output.belief_mean[:-1], output.belief_log_standard_deviation[:-1],
-                    free_bits_per_dimension=config.loss.information_bottleneck_free_bits_per_dimension,
-                )
-            raise AssertionError(name)
-        return loss
-
-    values: dict[str, Any] = {}
-    gradients: dict[str, Any] = {}
-    for name in ("ppo", "q_policy", "robust", "information_bottleneck"):
-        values[name], gradients[name] = jax.value_and_grad(objective(name))(params)
-    return values, gradients
 
 
 def official_learning_rate_schedule(*, learning_rate: float, warmup_fraction: float, update_count: int, minibatches_per_epoch: int, update_epochs: int) -> Any:
@@ -367,34 +407,51 @@ def merge_training_core(state: TrainState, core: TrainingCoreState) -> TrainStat
     return state._replace(params=core.params, target_params=core.target_params, ppo_optimizer_state=core.ppo_optimizer_state)
 
 
-def apply_training_core_update(*, model: Any, core: TrainingCoreState, optimizer: Any, batch: RolloutBatch, config: Any, anchors: Any = None, quotient_pairs: Any = None, task_trunk_scale: Any = 1.0, base_actor_scale: Any = 1.0):
+def apply_training_core_update(*, model: Any, core: TrainingCoreState, optimizer: Any, batch: RolloutBatch, config: Any, anchors: Any = None, separation_terms: Any = None):
+    """One combined gradient step over all four losses (§3.3)."""
+
     import jax
     import jax.numpy as jnp
     import optax
-    from .gradient_routing import keep_owned_gradients, scale_gradient_prefixes
-
-    del task_trunk_scale, base_actor_scale
 
     def objective(candidate: Any):
-        loss = compute_loss(model=model, params=candidate, batch=batch, config=config, anchors=anchors, quotient_pairs=quotient_pairs)
+        loss = compute_loss(
+            model=model, params=candidate, batch=batch, config=config,
+            anchors=anchors, separation_terms=separation_terms,
+        )
         return loss.total, loss.metrics
 
     (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(core.params)
-    gradients = keep_owned_gradients(gradients, loss_name="ppo")
     updates, optimizer_state = optimizer.update(gradients, core.ppo_optimizer_state, core.params)
     params = optax.apply_updates(core.params, updates)
     candidate = TrainingCoreState(params, core.target_params, optimizer_state)
     leaves = jax.tree_util.tree_leaves((candidate.params, candidate.ppo_optimizer_state))
     finite = jnp.isfinite(metrics["total_loss"]) & jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in leaves]))
     committed = jax.lax.cond(finite, lambda _: candidate, lambda _: core, operand=None)
-    return committed, {**metrics, "optimizer_applied": finite.astype(jnp.float32), "nonfinite_update": (~finite).astype(jnp.float32)}
+    kl_stop = metrics["combined_policy_kl"] > float(
+        config.loss_v2.combined_policy_kl_threshold
+    )
+    return committed, {
+        **metrics,
+        "optimizer_applied": finite.astype(jnp.float32),
+        "nonfinite_update": (~finite).astype(jnp.float32),
+        "kl_early_stop": kl_stop.astype(jnp.float32),
+    }
 
 
-def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any, batch: RolloutBatch, schedule: Any, config: Any, task_trunk_scale: Any = 1.0, base_actor_scale: Any = 1.0):
+def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any, batch: RolloutBatch, schedule: Any, config: Any, anchors: Any = None, separation_terms: Any = None):
+    """Scan minibatches with the §3.4 early-stop on combined_policy_kl.
+
+    ``anchors`` and ``separation_terms`` are anchor-batch-global payloads
+    (§5 matched-pair separation data path); they are shared by every
+    minibatch step of the scan, never lane-sliced.  The separation payload
+    carries states/observations/masks; the loss forward passes execute on
+    the scan's current params inside ``compute_loss`` (§3.2).
+    """
+
     import jax
     import jax.numpy as jnp
 
-    del task_trunk_scale, base_actor_scale
     indexes = jnp.asarray(schedule, dtype=jnp.int32)
     flat = indexes.reshape((-1, indexes.shape[-1]))
 
@@ -405,32 +462,35 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
             updated, metrics = apply_training_core_update(
                 model=model, core=value, optimizer=optimizer,
                 batch=slice_rollout_lanes(batch, lane_indexes), config=config,
+                anchors=anchors, separation_terms=separation_terms,
             )
-            stop = metrics["nonfinite_update"] > 0.5
+            stop = (metrics["nonfinite_update"] > 0.5) | (metrics["kl_early_stop"] > 0.5)
             return updated, {
                 **metrics,
-                "training_aborted_nonfinite": stop.astype(jnp.float32),
+                "training_aborted": stop.astype(jnp.float32),
             }
 
         def skip(value: Any):
             zero = jnp.asarray(0.0, dtype=jnp.float32)
             return value, {
                 "actor_loss": zero, "approx_kl": zero, "clip_fraction": zero,
-                "total_loss": zero, "value_loss": zero, "entropy": zero,
-                "q_policy_coupling_loss": zero, "q_policy_weight_mean": zero,
-                "q_policy_gap_mean": zero, "q_policy_head_disagreement_mean": zero,
-                "robust_generalist_kl": zero, "full_context_entropy": zero,
-                "prior_context_entropy": zero, "mean_raw_reward": zero,
-                "mean_shaped_reward": zero, "mean_belief_uncertainty": zero,
-                "context_dropout_fraction": zero, "optimizer_applied": zero,
-                "nonfinite_update": zero,
-                "training_aborted_nonfinite": jnp.asarray(1.0),
+                "response_total_loss": zero, "response_visibility_loss": zero,
+                "response_position_loss": zero, "response_direction_loss": zero,
+                "response_inventory_loss": zero, "response_event_loss": zero,
+                "signature_loss": zero, "signature_huber_loss": zero,
+                "signature_hinge_loss": zero, "separation_loss": zero,
+                "ppo_total_loss": zero, "total_loss": zero, "value_loss": zero,
+                "entropy": zero, "mean_raw_reward": zero, "mean_shaped_reward": zero,
+                "mean_posterior_entropy": zero, "context_dropout_fraction": zero,
+                "combined_policy_kl": zero, "optimizer_applied": zero,
+                "nonfinite_update": zero, "kl_early_stop": zero,
+                "training_aborted": jnp.asarray(1.0),
             }
 
         updated, metrics = jax.lax.cond(active, apply, skip, current)
         return (
             updated,
-            active & (metrics["training_aborted_nonfinite"] < 0.5),
+            active & (metrics["training_aborted"] < 0.5),
         ), metrics
 
     (final, _), metrics = jax.lax.scan(one, (core, jnp.asarray(True)), flat)
@@ -461,21 +521,22 @@ def environment_minibatch_schedule(key: Any, *, environment_count: int, minibatc
     return jnp.stack([jax.random.permutation(k, environment_count).reshape((minibatches_per_epoch, lane_count)) for k in keys])
 
 
-def apply_training_update(*, model: Any, state: TrainState, optimizer: Any, batch: RolloutBatch, config: Any, anchors: Any = None, quotient_pairs: Any = None) -> TrainingUpdate:
+def apply_training_update(*, model: Any, state: TrainState, optimizer: Any, batch: RolloutBatch, config: Any, anchors: Any = None, separation_terms: Any = None) -> TrainingUpdate:
     core, metrics = apply_training_core_update(
         model=model, core=training_core_state(state), optimizer=optimizer,
-        batch=batch, config=config, anchors=anchors, quotient_pairs=quotient_pairs,
+        batch=batch, config=config, anchors=anchors, separation_terms=separation_terms,
     )
     return TrainingUpdate(merge_training_core(state, core), metrics)
 
 
 __all__ = [
     "apply_training_core_update", "apply_training_update",
-    "belief_objective_gradients", "categorical_entropy", "categorical_log_probability",
+    "categorical_entropy", "categorical_log_probability", "centered",
     "clipped_value_loss", "compute_loss", "environment_minibatch_schedule",
-    "gather_actions", "gaussian_kl_loss", "generalized_advantage_estimation", "huber",
+    "gather_actions", "generalized_advantage_estimation", "huber",
     "make_optimizer", "merge_training_core", "official_learning_rate_schedule",
-    "official_reward_shaping_factor", "owner_behavior_distillation_loss", "polyak_update",
-    "ppo_actor_loss", "robust_generalist_loss", "scan_training_updates",
-    "slice_rollout_lanes", "training_core_state",
+    "official_reward_shaping_factor", "polyak_update", "ppo_actor_loss",
+    "response_objective", "scan_training_updates", "separation_loss",
+    "signature_anchor_objective", "signature_loss", "slice_rollout_lanes",
+    "training_core_state",
 ]

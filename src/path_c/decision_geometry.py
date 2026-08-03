@@ -90,6 +90,51 @@ def brdiv_logdet(signatures: Any, bandwidth: float, jitter: float = 1.0e-5) -> A
     return jnp.where(sign > 0.0, log_abs, -jnp.inf)
 
 
+def mean_pairwise_signature_distance(signatures: Any) -> Any:
+    """METHOD_SPEC §7.2 diversity: mean pairwise signature distance.
+
+    Replaces BR-divergence.  Callers supply signatures computed from real
+    all-action continuations over a shared environment-state bank (M states);
+    this primitive only averages the off-diagonal pairwise distances.
+    """
+
+    import jax.numpy as jnp
+
+    values = jnp.asarray(signatures, dtype=jnp.float32)
+    if values.ndim < 2:
+        raise ValueError("Signatures require item and feature axes.")
+    flat = values.reshape((values.shape[0], -1))
+    count = flat.shape[0]
+    pairwise = jnp.sqrt(
+        jnp.sum(jnp.square(flat[:, None, :] - flat[None, :, :]), axis=-1)
+        + 1.0e-12
+    )
+    mask = 1.0 - jnp.eye(count, dtype=jnp.float32)
+    return jnp.sum(pairwise * mask) / jnp.maximum(
+        jnp.asarray(count * (count - 1), dtype=jnp.float32), 1.0
+    )
+
+
+def mean_pairwise_signature_contributions(signatures: Any) -> Any:
+    """Per-item mean distance to every other signature on the shared bank."""
+
+    import jax.numpy as jnp
+
+    values = jnp.asarray(signatures, dtype=jnp.float32)
+    if values.ndim < 2:
+        raise ValueError("Signatures require item and feature axes.")
+    flat = values.reshape((values.shape[0], -1))
+    count = flat.shape[0]
+    pairwise = jnp.sqrt(
+        jnp.sum(jnp.square(flat[:, None, :] - flat[None, :, :]), axis=-1)
+        + 1.0e-12
+    )
+    mask = 1.0 - jnp.eye(count, dtype=jnp.float32)
+    return jnp.sum(pairwise * mask, axis=-1) / jnp.maximum(
+        jnp.asarray(count - 1, dtype=jnp.float32), 1.0
+    )
+
+
 def smoothness_loss(codes: Any, signatures: Any) -> Any:
     """Penalize discontinuous generator responses in neighboring code regions."""
 
@@ -177,6 +222,8 @@ __all__ = [
     "decision_distance",
     "empirical_effective_rank",
     "lower_tail_cvar",
+    "mean_pairwise_signature_contributions",
+    "mean_pairwise_signature_distance",
     "quotient_geometry_loss",
     "rbf_kernel",
     "smoothness_loss",

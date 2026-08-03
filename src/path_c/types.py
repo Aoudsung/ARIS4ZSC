@@ -1,7 +1,8 @@
-"""Immutable PyTree records for DELTA-ZSC V6.
+"""Immutable PyTree records for DEPI (DELTA-ZSC foundation batch).
 
-The deployable policy contains one legal-history task encoder, one diagonal
-Gaussian partner belief and one belief-conditioned actor.  Training-only
+METHOD_SPEC §1 defines the three scientific objects x_t / u / c_t with
+structural input-layer isolation.  The deployable policy carries one task
+encoder, one capability encoder and one protocol encoder; training-only
 objects are explicit so that deployment pruning and checkpoint identity can be
 checked mechanically.
 """
@@ -11,49 +12,58 @@ from __future__ import annotations
 from typing import Any, Mapping, NamedTuple
 
 
-class GaussianBelief(NamedTuple):
-    recurrent_carry: Any
-    mean: Any
-    log_standard_deviation: Any
-    normalized_uncertainty: Any
+class ProtocolContext(NamedTuple):
+    """Recurrent state of the capability and protocol pathways.
+
+    METHOD_SPEC §1.1: u is the stable partner-capability embedding (16) and
+    pi is the categorical protocol posterior over K=4 regimes.
+    """
+
+    capability_carry: Any
+    protocol_carry: Any
+    capability: Any
+    protocol_logits: Any
 
 
 class PolicyState(NamedTuple):
-    """Complete legal recurrent state exposed by the Official policy wrapper."""
+    """Complete legal recurrent state exposed by the Official policy wrapper.
+
+    METHOD_SPEC §1.4 field list: (task_carry, capability_carry,
+    protocol_carry, context_summary, previous_observation, previous_action,
+    episode_start).  ``context_summary`` stores concat(u, c) from the last
+    step (32 dimensions) for deployment continuity.
+    """
 
     task_carry: Any
-    belief: GaussianBelief
+    capability_carry: Any
+    protocol_carry: Any
+    context_summary: Any
     previous_observation: Any
     previous_action: Any
     episode_start: Any
 
 
 class ContextOutput(NamedTuple):
+    """METHOD_SPEC §1.4: ContextOutput carries (task_features, u, pi, c)."""
+
     task_features: Any
-    belief_mean: Any
-    belief_log_standard_deviation: Any
-    normalized_uncertainty: Any
+    capability: Any
+    protocol_probabilities: Any
+    protocol_embedding: Any
 
 
 class ModelOutput(NamedTuple):
     task_features: Any
-    belief_summary: Any
-    belief_mean: Any
-    belief_log_standard_deviation: Any
-    normalized_uncertainty: Any
+    capability: Any
+    protocol_probabilities: Any
+    protocol_embedding: Any
+    context_summary: Any
+    posterior_entropy: Any
     policy_logits: Any
     state_value: Any
     raw_q1: Any
     raw_q2: Any
     action_values: Any
-
-
-class ResponsePrediction(NamedTuple):
-    visibility_logit: Any
-    relative_position_logits: Any
-    direction_logits: Any
-    inventory_logits: Any
-    interaction_change_logit: Any
 
 
 class PartnerGeneratorState(NamedTuple):
@@ -119,10 +129,43 @@ class CounterfactualAnchorBatch(NamedTuple):
 
 
 class QuotientPairBatch(NamedTuple):
+    """Matched-pair payload for the §5.3 frozen comparator data path.
+
+    ``comparator_accuracy``/``ego_state_*``/``probe_observations`` stay
+    ``None`` for legacy constructions; the §5 anchor pipeline fills them so
+    ``separation_terms_from_matched_pairs`` can build the ``SeparationTerms``
+    payload consumed inside the jit-compiled combined-loss scan.
+    """
+
     anchor_index_a: Any
     anchor_index_b: Any
     decision_distance: Any
     weights: Any
+    comparator_accuracy: Any = None
+    ego_state_a: Any = None
+    ego_state_b: Any = None
+    probe_observations: Any = None
+
+
+class SeparationTerms(NamedTuple):
+    """§3.2 L_separation payload carried into the jit-compiled scan.
+
+    The classification output of the §5.3 frozen comparator (equivalent /
+    distinct masks, per-pair weights, margin) is precomputed at anchor
+    trigger time and stays constant between triggers.  The two forward
+    passes over ``ego_state_*`` / ``probe_observations`` run inside
+    ``compute_loss`` against the *current* params, so L_separation joins
+    the same ``value_and_grad`` as the other three losses and its gradient
+    reaches the capability/protocol encoders (METHOD_SPEC §3.2/§3.4).
+    Shapes are fixed per anchor trigger, keeping the compiled scan stable.
+    """
+
+    ego_state_a: Any
+    ego_state_b: Any
+    probe_observations: Any
+    equivalent_mask: Any
+    weights: Any
+    margin: Any
 
 
 class CalibrationArtifact(NamedTuple):
@@ -226,15 +269,14 @@ __all__ = [
     "ContextOutput",
     "CounterfactualAnchorBatch",
     "EvaluationRow",
-    "GaussianBelief",
     "GeneratorCoreState",
     "LossBundle",
     "ModelOutput",
     "PartnerGeneratorOutput",
     "PartnerGeneratorState",
     "PolicyState",
+    "ProtocolContext",
     "QuotientPairBatch",
-    "ResponsePrediction",
     "RolloutBatch",
     "TrainingCoreState",
     "TrainState",

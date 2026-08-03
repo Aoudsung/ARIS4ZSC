@@ -326,7 +326,12 @@ def decision_equivalence_loss(
         jnp.zeros(anchors.anchor_ids.shape, dtype=jnp.bool_),
         method=model.step,
     )
-    mean_a, mean_b = output.belief_mean[paired[:, 0]], output.belief_mean[paired[:, 1]]
+    # §6: belief_mean no longer exists; paired contexts are compared through
+    # the protocol embedding of the three-object architecture.
+    mean_a, mean_b = (
+        output.protocol_embedding[paired[:, 0]],
+        output.protocol_embedding[paired[:, 1]],
+    )
     advantage = centered(anchors.fit_returns_by_action)
     advantage_a, advantage_b = advantage[paired[:, 0]], advantage[paired[:, 1]]
     action_valid = jnp.any(anchors.action_mask, axis=-1)

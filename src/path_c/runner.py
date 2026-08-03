@@ -1,13 +1,18 @@
-"""CUDA-friendly rollout and detached V6 decision-regret shaping."""
+"""CUDA-friendly rollout; legacy particle regret paths raise explicitly.
+
+METHOD_SPEC §6 abolishes Q/regret computation on arbitrary Gaussian
+particles.  The legacy entry points below keep their importable names and
+signatures (checkpoint-era call sites and tests reference them) but raise an
+explicit not-enabled error; regret now exists only as a report-only readout
+over the closed hypothesis set (see ``regret_potential``).
+"""
 
 from __future__ import annotations
 
 from typing import Any, Callable, Mapping, NamedTuple
 
-from .belief_set_encoder import gaussian_samples
 from .counterfactual_anchor import tree_select
 from .model import initial_policy_state
-from .regret_potential import decision_regret_from_action_values
 from .training import categorical_log_probability
 from .types import PolicyState, RolloutBatch
 
@@ -60,8 +65,11 @@ def initialize_runner(
         observation_shape=environment.observation_shape,
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
-        belief_hidden_dim=model_config.belief_hidden_dim,
-        latent_dim=model_config.latent_dim,
+        capability_hidden_dim=model_config.capability_hidden_dim,
+        protocol_hidden_dim=model_config.protocol_hidden_dim,
+        capability_dim=model_config.capability_dim,
+        component_embedding_dim=model_config.component_embedding_dim,
+        protocol_components=model_config.protocol_components,
     )
     return RunnerState(
         environment_state,
@@ -128,8 +136,11 @@ def observe_policy_after_transition(
         observation_shape=tuple(next_observation.shape[1:]),
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
-        belief_hidden_dim=model_config.belief_hidden_dim,
-        latent_dim=model_config.latent_dim,
+        capability_hidden_dim=model_config.capability_hidden_dim,
+        protocol_hidden_dim=model_config.protocol_hidden_dim,
+        capability_dim=model_config.capability_dim,
+        component_embedding_dim=model_config.component_embedding_dim,
+        protocol_components=model_config.protocol_components,
     )
     candidate = stepped_state._replace(
         previous_action=jnp.asarray(action, dtype=jnp.int32),
@@ -322,9 +333,9 @@ def collect_rollout(
             return next_state, {
                 "partner_run_ids": common["partner_run_ids"],
                 "partner_source": common["partner_source"],
-                "belief_mean": output.belief_mean,
-                "belief_log_standard_deviation": output.belief_log_standard_deviation,
-                "normalized_uncertainty": output.normalized_uncertainty,
+                "capability": output.capability,
+                "protocol_probabilities": output.protocol_probabilities,
+                "posterior_entropy": output.posterior_entropy,
             }
         return next_state, {
             **common,
@@ -338,9 +349,10 @@ def collect_rollout(
             "action_values": output.action_values,
             "raw_q1": output.raw_q1,
             "raw_q2": output.raw_q2,
-            "belief_mean": output.belief_mean,
-            "belief_log_standard_deviation": output.belief_log_standard_deviation,
-            "normalized_uncertainty": output.normalized_uncertainty,
+            "capability": output.capability,
+            "protocol_probabilities": output.protocol_probabilities,
+            "protocol_embedding": output.protocol_embedding,
+            "posterior_entropy": output.posterior_entropy,
             "task_features": output.task_features,
             "environment_state": current.environment_state,
             "ego_policy_state": current.ego_policy,
@@ -425,35 +437,19 @@ def decision_regret_chunk(
     sample_keys: Any,
     posterior_particles: int,
 ) -> tuple[Any, Any]:
-    import jax
-    import jax.numpy as jnp
+    """Abolished (METHOD_SPEC §6): Q/regret on Gaussian particles is banned.
 
-    features = jax.lax.stop_gradient(jnp.asarray(task_features))
-    means = jax.lax.stop_gradient(jnp.asarray(belief_mean))
-    log_std = jax.lax.stop_gradient(jnp.asarray(belief_log_standard_deviation))
-    keys = jnp.asarray(sample_keys)
-    samples, weights = jax.vmap(
-        lambda key, mean, std: gaussian_samples(
-            key,
-            mean=mean,
-            log_standard_deviation=std,
-            sample_count=int(posterior_particles),
-        )
-    )(keys, means, log_std)
-    particle_features = jnp.broadcast_to(
-        features[:, None, :],
-        (features.shape[0], int(posterior_particles), features.shape[-1]),
+    The signature survives for import compatibility; any call is an error.
+    """
+
+    del model, target_params, task_features, belief_mean
+    del belief_log_standard_deviation, sample_keys, posterior_particles
+    raise RuntimeError(
+        "METHOD_SPEC §6 abolishes Q/regret computation on arbitrary Gaussian "
+        "particles (no belief_mean/belief_log_standard_deviation path, no "
+        "posterior_particles). Regret is report-only over the closed "
+        "hypothesis set; see regret_potential.hypothesis_set_decision_regret."
     )
-    action_values = model.apply(
-        {"params": target_params},
-        particle_features,
-        samples,
-        method=model.action_values_from_features_and_latent,
-    )
-    values = jax.lax.stop_gradient(action_values)
-    regret = decision_regret_from_action_values(values, jax.lax.stop_gradient(weights))
-    action_range = jnp.mean(jnp.max(values, axis=-1) - jnp.min(values, axis=-1), axis=-1)
-    return regret, action_range
 
 
 def chunked_decision_regret(
@@ -465,45 +461,13 @@ def chunked_decision_regret(
     posterior_particles: int,
     state_chunk_size: int = DECISION_REGRET_STATE_CHUNK_SIZE,
 ) -> tuple[Any, Any]:
-    import math
-    import jax
-    import jax.numpy as jnp
+    """Abolished (METHOD_SPEC §6); kept importable, always raises."""
 
-    features = jnp.asarray(context.task_features)
-    means = jnp.asarray(context.belief_mean)
-    log_std = jnp.asarray(context.belief_log_standard_deviation)
-    prefix = features.shape[:-1]
-    state_count = int(math.prod(prefix))
-    chunk_size = int(state_chunk_size)
-    padded_count = ((state_count + chunk_size - 1) // chunk_size) * chunk_size
-    padding = padded_count - state_count
-    keys = jnp.pad(jax.random.split(key, state_count), ((0, padding), (0, 0)))
-
-    def chunks(value: Any):
-        flat = value.reshape((state_count,) + value.shape[len(prefix):])
-        widths = ((0, padding),) + ((0, 0),) * (flat.ndim - 1)
-        return jnp.pad(flat, widths).reshape(
-            (padded_count // chunk_size, chunk_size) + flat.shape[1:]
-        )
-
-    values = (chunks(features), chunks(means), chunks(log_std), keys.reshape((-1, chunk_size, 2)))
-
-    def one(items: tuple[Any, Any, Any, Any]):
-        f, m, s, k = items
-        return decision_regret_chunk(
-            model=model,
-            target_params=target_params,
-            task_features=f,
-            belief_mean=m,
-            belief_log_standard_deviation=s,
-            sample_keys=k,
-            posterior_particles=posterior_particles,
-        )
-
-    regrets, ranges = jax.lax.map(one, values)
-    return (
-        regrets.reshape((padded_count,))[:state_count].reshape(prefix),
-        ranges.reshape((padded_count,))[:state_count].reshape(prefix),
+    del model, target_params, context, key, posterior_particles, state_chunk_size
+    raise RuntimeError(
+        "METHOD_SPEC §6 abolishes the particle decision-regret path; the "
+        "chunked variant cannot be re-enabled without a specification "
+        "amendment."
     )
 
 
@@ -571,28 +535,16 @@ def attach_decision_regret_shaping(
     action_range_ema: Any = 1.0,
     effective_steps: Any = 0,
 ) -> tuple[RolloutBatch, Mapping[str, Any]]:
-    context = target_context_sequence(model=model, target_params=target_params, batch=batch)
-    regrets, ranges = chunked_decision_regret(
-        model=model,
-        target_params=target_params,
-        context=context,
-        key=key,
-        posterior_particles=config.model.posterior_particles,
-    )
-    weight = decision_regret_weight(
-        effective_steps=effective_steps,
-        total_steps=config.training.environment_steps,
-        maximum=config.loss.decision_regret_weight_maximum,
-        midpoint=config.loss.decision_regret_schedule_midpoint,
-        temperature=config.loss.decision_regret_schedule_temperature,
-    )
-    return finalize_decision_regret_shaping(
-        batch=batch,
-        regrets=regrets,
-        action_ranges=ranges,
-        action_range_ema=action_range_ema,
-        gamma=config.ppo.gamma,
-        weight=weight,
+    """Abolished (METHOD_SPEC §6): the particle regret-shaping attachment is
+    disconnected from the DEPI foundation path and cannot be re-enabled.
+    ``config.model.posterior_particles`` no longer exists."""
+
+    del batch, model, target_params, config, key, action_range_ema, effective_steps
+    raise RuntimeError(
+        "METHOD_SPEC §6 abolishes decision-regret shaping on Gaussian "
+        "particles; the DEPI path carries no posterior_particles config and "
+        "no particle Q evaluation. Report-only regret belongs to the anchor "
+        "hypothesis-set readout instead."
     )
 
 
