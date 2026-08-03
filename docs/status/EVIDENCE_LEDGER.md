@@ -34,3 +34,11 @@
 - **2026-08-03** 文档重构完成：研究层文档（RESEARCH_PROGRAM、research/ 六份、status/ 两份、PROTOCOL_INDEX）全部新建；README 导航追加。论点裁决留空，待 S1 与文献复核。证据：本次提交 diff。
 
 - **2026-08-03** 字节级哈希锁废除：按用户决策，SHA 逐字节校验属不必要措施。已移除 `test_delta_zsc_repository.py` 中的 `test_registered_design_document_is_byte_exact` 与注册哈希常量，理论文档恢复为可正常修订（确认轨 commit 冻结后仍不得改方法）。仓库其余 8 项测试全绿。证据：本次提交 diff。
+
+- **2026-08-03** T2/T3/T4 定理形式化完成：TV 精确式、历史样本复杂度、路由紧上界等式写入 FOUNDATIONAL §10，必要性下界修正为标准 Le Cam 二点形式，常数复核与 legacy 草案一致。证据：`docs/theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md` §10，commit `eeca646`。
+
+- **2026-08-03** S2 受控相图验证全过：180 个参数点（服务器执行，commit `4e146bb`）上 T1 链 180/180、T2 精确式 180/180（最大残差 8.9e-16）、T3 边界 180/180，窗口外无净收益成立。理论工具验证通过，生态估计协议解锁。探索轨读数，`scientific_readout_allowed: false`。证据：服务器 `runs/exploration/s2_phase/summary.json`。
+
+- **2026-08-03** S1 面板盘点与 pilot：服务器现存上游只有 SP 与 OP 各 10 个完整 seed（ckpt_final），SA/FCP 在 V6 树上不可用；第一版面板限定 sp/op 两类型，入台账说明。Pilot（3 seed/类型，36 配对 × 5 回合）行数与标记完整，探索性读数 Γ_compat≈69.3，污染对照 identity 均值 146.7 vs run-disjoint 14.0，复现历史污染形态。回合数太少，不构成结论。证据：服务器 `runs/exploration/s1_panel/pilot/summary.json`。
+
+- **2026-08-03** S1 放量预算登记：全量面板取 sp/op 各 10 seed，20×20 配对共 400 格 × 500 回合 × 400 步 = 80,000,000 环境步，后台执行，产物入 `runs/exploration/s1_panel/full`。证据：本条目。
