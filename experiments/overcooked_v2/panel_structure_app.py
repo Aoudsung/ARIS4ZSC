@@ -84,8 +84,8 @@ def main() -> None:
                 for lv, rv in zip(rankings[left], rankings[right])
                 if not (np.isnan(lv) or np.isnan(rv))
             ]
-            if len(pairs) < len(mode_runs):
-                raise RuntimeError("incomplete cell coverage in ranking comparison")
+            if len(pairs) < 2:
+                raise RuntimeError("ranking comparison has fewer than two modes")
             taus.append(
                 kendall_tau([p[0] for p in pairs], [p[1] for p in pairs])
             )
@@ -96,27 +96,22 @@ def main() -> None:
         z: pairwise_tau([p for p in partner_runs if partner_type[p] == z])
         for z in types
     }
-    cross_type = pairwise_tau(partner_runs)
-    within_flat = [tau for values in within_type.values() for tau in values]
-    cross_only = [
-        tau
-        for left, right in itertools.combinations(partner_runs, 2)
-        if partner_type[left] != partner_type[right]
-        for tau in [
-            kendall_tau(
-                [
-                    lv
-                    for lv, rv in zip(rankings[left], rankings[right])
-                    if not (np.isnan(lv) or np.isnan(rv))
-                ],
-                [
-                    rv
-                    for lv, rv in zip(rankings[left], rankings[right])
-                    if not (np.isnan(lv) or np.isnan(rv))
-                ],
-            )
+    cross_only = []
+    common_modes_used = []
+    for left, right in itertools.combinations(partner_runs, 2):
+        if partner_type[left] == partner_type[right]:
+            continue
+        pairs = [
+            (lv, rv)
+            for lv, rv in zip(rankings[left], rankings[right])
+            if not (np.isnan(lv) or np.isnan(rv))
         ]
-    ]
+        common_modes_used.append(len(pairs))
+        cross_only.append(
+            kendall_tau([p[0] for p in pairs], [p[1] for p in pairs])
+        )
+
+    within_flat = [tau for values in within_type.values() for tau in values]
 
     summary = {
         "mode_runs": mode_runs,
@@ -140,6 +135,13 @@ def main() -> None:
             "mean": float(np.mean(cross_only)),
             "std": float(np.std(cross_only)),
             "n_pairs": len(cross_only),
+        },
+        "identity_missing_cells": {
+            "note": (
+                "same-type partner pairs share exactly one missing mode cell "
+                "(the identity cell); cross-type pairs compare all 20 modes"
+            ),
+            "cross_type_common_modes_min": int(np.min(common_modes_used)),
         },
         "reading_rule": (
             "within-type tau near zero supports no transferable convention "
