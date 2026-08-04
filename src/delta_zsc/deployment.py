@@ -23,7 +23,6 @@ from .config import (
     validate_config,
 )
 from .model import (
-    FULL_VARIANT,
     METHOD_VARIANTS,
     UnifiedAgent,
     build_models,
@@ -62,7 +61,7 @@ def config_from_mapping(value: Mapping[str, Any]) -> UnifiedConfig:
     return config
 
 
-def _fingerprint(tree: Any) -> str:
+def parameter_fingerprint(tree: Any) -> str:
     import hashlib
     import jax
     import numpy as np
@@ -100,9 +99,7 @@ def export_deployment(
         "base_params": base_params,
         "latent_params": latent_params,
     }
-    ocp.PyTreeCheckpointer().save(
-        str(root / "params"), parameter_tree, force=True
-    )
+    ocp.PyTreeCheckpointer().save(str(root / "params"), parameter_tree, force=True)
     payload = {
         "version": DEPLOYMENT_SCHEMA_VERSION,
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -113,7 +110,9 @@ def export_deployment(
         "config_fingerprint": config.fingerprint,
         "observation_shape": [int(value) for value in observation_shape],
         "action_count": int(action_count),
-        "parameter_fingerprint": _fingerprint(parameter_tree),
+        "base_parameter_fingerprint": parameter_fingerprint(base_params),
+        "latent_parameter_fingerprint": parameter_fingerprint(latent_params),
+        "parameter_fingerprint": parameter_fingerprint(parameter_tree),
         "source_training_run": str(Path(source_training_run).resolve()),
     }
     (root / "deployment_bundle.json").write_text(
@@ -146,6 +145,8 @@ def load_deployment(
         "config_fingerprint",
         "observation_shape",
         "action_count",
+        "base_parameter_fingerprint",
+        "latent_parameter_fingerprint",
         "parameter_fingerprint",
         "source_training_run",
     }
@@ -171,8 +172,15 @@ def load_deployment(
     params = ocp.PyTreeCheckpointer().restore(str(root / "params"))
     if set(params) != {"base_params", "latent_params"}:
         raise ValueError("Deployment parameter tree differs.")
-    if _fingerprint(params) != payload["parameter_fingerprint"]:
+    if parameter_fingerprint(params) != payload["parameter_fingerprint"]:
         raise ValueError("Deployment parameters changed after export.")
+    if (
+        parameter_fingerprint(params["base_params"])
+        != payload["base_parameter_fingerprint"]
+        or parameter_fingerprint(params["latent_params"])
+        != payload["latent_parameter_fingerprint"]
+    ):
+        raise ValueError("Deployment base/latent parameter identity differs.")
     observation_shape = tuple(int(value) for value in payload["observation_shape"])
     action_count = int(payload["action_count"])
     base_model, latent_model = build_models(
@@ -258,5 +266,6 @@ __all__ = [
     "export_deployment",
     "load_deployment",
     "observe_transition",
+    "parameter_fingerprint",
     "reset_state",
 ]
