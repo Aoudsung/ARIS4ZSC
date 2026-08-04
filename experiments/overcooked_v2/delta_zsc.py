@@ -9,10 +9,32 @@ from experiments.overcooked_v2.unified_causal_app import run_causal_evaluation
 from experiments.overcooked_v2.unified_evaluation_app import run_evaluation
 from experiments.overcooked_v2.unified_summary_app import run_summary
 from experiments.overcooked_v2.unified_training_app import (
-    TRAINING_VARIANTS,
-    run_training,
+    run_training as _run_training,
+)
+from src.delta_zsc.model import (
+    BASE_VARIANT,
+    JOINT_VARIANT,
+    RESPONSE_ONLY_VARIANT,
 )
 from src.path_c.experiment import ENGINEERING_SEED_INDEX
+
+
+# Full DELTA is the joint parameter bundle plus an analytic VOI operator.  It
+# has no separate training run, parameter tree, optimizer, or data budget.
+TRAINING_VARIANTS = (
+    BASE_VARIANT,
+    RESPONSE_ONLY_VARIANT,
+    JOINT_VARIANT,
+)
+
+
+def run_training(args: argparse.Namespace) -> None:
+    if str(args.variant).lower() not in TRAINING_VARIANTS:
+        raise ValueError(
+            "Only base, response_only, and joint are trainable. Full reuses the "
+            "joint deployment and is selected by --variant-override full."
+        )
+    _run_training(args)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -52,7 +74,9 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--deployment", required=True)
     evaluate.add_argument("--partner-manifest", required=True)
     evaluate.add_argument(
-        "--partner-role", default="confirmatory", choices=("confirmatory", "calibration")
+        "--partner-role",
+        default="confirmatory",
+        choices=("confirmatory", "calibration"),
     )
     evaluate.add_argument("--variant-override", choices=("joint", "full"))
     evaluate.add_argument("--episodes", type=int)
@@ -78,7 +102,9 @@ def _parser() -> argparse.ArgumentParser:
     causal.add_argument("--deployment", required=True)
     causal.add_argument("--partner-manifest", required=True)
     causal.add_argument(
-        "--partner-role", default="confirmatory", choices=("confirmatory", "calibration")
+        "--partner-role",
+        default="confirmatory",
+        choices=("confirmatory", "calibration"),
     )
     causal.add_argument("--num-envs", type=int, default=64)
     causal.add_argument("--anchor-count", type=int, default=64)
