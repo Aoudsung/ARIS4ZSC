@@ -58,6 +58,8 @@ def filter_step(
     Missing response factors are represented by zero log likelihood inside the
     emission model.  The state transition is never disabled merely because the
     partner is occluded; negative visibility remains legitimate evidence.
+    Episode starts use the registered uniform prior directly and do not apply a
+    fictitious pre-episode transition.
     """
 
     from jax.scipy.special import logsumexp
@@ -71,12 +73,9 @@ def filter_step(
     if likelihood.shape != previous.shape:
         raise ValueError("Response likelihood must have one value per component.")
     start = jnp.asarray(episode_start, dtype=jnp.bool_)
-    prior = jnp.where(
-        start[..., None],
-        jnp.full_like(previous, 1.0 / float(previous.shape[-1])),
-        previous,
-    )
-    predictive = prior @ matrix
+    uniform = jnp.full_like(previous, 1.0 / float(previous.shape[-1]))
+    transitioned = previous @ matrix
+    predictive = jnp.where(start[..., None], uniform, transitioned)
     log_joint = jnp.log(jnp.maximum(predictive, 1.0e-30)) + likelihood
     log_evidence = logsumexp(log_joint, axis=-1)
     posterior = jnp.exp(log_joint - log_evidence[..., None])
@@ -169,17 +168,17 @@ def sequence_log_likelihood(
 
     def one(log_previous: Any, items: tuple[Any, Any, Any, Any, Any]):
         response_t, decision_t, decision_valid_t, start_t, valid_t = items
-        prior = jnp.where(start_t[..., None], log_uniform, log_previous)
-        log_predictive = logsumexp(
-            prior[..., :, None] + log_transition,
+        transitioned = logsumexp(
+            log_previous[..., :, None] + log_transition,
             axis=-2,
         )
+        log_predictive = jnp.where(start_t[..., None], log_uniform, transitioned)
         response_joint = log_predictive + response_t
         response_evidence = logsumexp(response_joint, axis=-1)
         joint = response_joint + decision_valid_t[..., None] * decision_t
         joint_evidence = logsumexp(joint, axis=-1)
         posterior = joint - joint_evidence[..., None]
-        posterior = jnp.where(valid_t[..., None] > 0.0, posterior, prior)
+        posterior = jnp.where(valid_t[..., None] > 0.0, posterior, log_predictive)
         response_term = -valid_t * response_evidence
         decision_term = -valid_t * decision_valid_t * (
             joint_evidence - response_evidence
