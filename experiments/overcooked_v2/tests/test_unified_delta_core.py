@@ -42,9 +42,7 @@ def test_beta_behavior_statistics_are_analytic_and_reset() -> None:
     assert updated.alpha.shape == (2, 4)
     assert updated.beta.shape == (2, 4)
     assert behavior_features(updated).shape == (2, 8)
-    # Current-frame visibility is a valid negative Bernoulli observation.
     assert float(updated.beta[0, 0]) == pytest.approx(2.0)
-    # Episode reset starts from the same proper prior before current evidence.
     assert float(updated.beta[1, 0]) == pytest.approx(2.0)
 
 
@@ -121,5 +119,5 @@ def test_joint_likelihood_uses_decision_evidence_without_loss_weight() -> None:
         episode_starts=jnp.asarray([[True], [False]]),
         valid_mask=jnp.ones((2, 1), dtype=jnp.float32),
     )
-    assert float(result.decision_observation_count) == 1.0
+    assert float(result.decision_count) == 1.0
     assert float(result.final_posterior[0, 0]) > 0.99
