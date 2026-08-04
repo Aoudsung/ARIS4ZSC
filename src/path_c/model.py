@@ -73,6 +73,7 @@ def _model_class() -> Any:
         response_hidden_dim: int
         modulation_rank: int
         action_embedding_dim: int
+        protocol_stay_probability: float
 
         def setup(self) -> None:
             self.task_cell = TaskCell(
@@ -120,9 +121,17 @@ def _model_class() -> Any:
             )
 
         def _component_matrix(self) -> Any:
-            return self.component_embeddings(
+            components = self.component_embeddings(
                 jnp.arange(self.protocol_components, dtype=jnp.int32)
             )
+            return components / jnp.maximum(
+                jnp.linalg.norm(components, axis=-1, keepdims=True), 1.0e-6
+            )
+
+        def component_embedding_matrix(self) -> Any:
+            """Return the normalized exchangeable component geometry."""
+
+            return self._component_matrix()
 
         def _context_step(
             self, state: PolicyState, observation: Any
@@ -189,7 +198,10 @@ def _model_class() -> Any:
                 emission_prediction, observed_response
             )
             filtered = exact_bayes_filter_step(
-                previous_probs, emission_log_likelihood
+                previous_probs,
+                emission_log_likelihood,
+                stay=float(self.protocol_stay_probability),
+                evidence_valid=observed_response.visibility > 0.5,
             )
             protocol_probabilities = jnp.where(
                 start[..., None],
@@ -205,6 +217,9 @@ def _model_class() -> Any:
                 )
             protocol_embedding = mixture_summary(
                 protocol_probabilities, component_matrix
+            )
+            protocol_embedding = protocol_embedding / jnp.maximum(
+                jnp.linalg.norm(protocol_embedding, axis=-1, keepdims=True), 1.0e-6
             )
             context = ContextOutput(
                 task_features,
@@ -410,6 +425,8 @@ def _model_class() -> Any:
             context: ContextOutput,
             frame_features: Any,
             actions: Any,
+            *,
+            use_components: bool = True,
         ) -> ResponsePrediction:
             """Per-component response logits for the mixture likelihood (§2.2).
 
@@ -423,6 +440,8 @@ def _model_class() -> Any:
             if action.shape != prefix:
                 raise ValueError("Selected response actions do not match context axes.")
             component_matrix = self._component_matrix()
+            if not use_components:
+                component_matrix = jnp.zeros_like(component_matrix)
             values = self.decoder(
                 jax.lax.stop_gradient(frame_features),
                 component_matrix,
@@ -465,10 +484,63 @@ def _model_class() -> Any:
             )
             return final_state, prediction
 
+        def response_sequence_without_component(
+            self,
+            initial_state: PolicyState,
+            observations: Any,
+            previous_actions: Any,
+            episode_starts: Any,
+            executed_actions: Any,
+        ) -> tuple[PolicyState, ResponsePrediction]:
+            """Registered shortcut control with the component input ablated."""
+
+            final_state, context = self.context_sequence(
+                initial_state, observations, previous_actions, episode_starts
+            )
+            sliced = ContextOutput(
+                context.task_features[:-1],
+                context.instant_partner[:-1],
+                context.capability[:-1],
+                context.protocol_probabilities[:-1],
+                context.protocol_embedding[:-1],
+            )
+            prediction = self.response_from_context_and_action(
+                sliced,
+                jnp.asarray(observations)[:-1],
+                executed_actions,
+                use_components=False,
+            )
+            return final_state, prediction
+
         def policy_logits_from_features_and_context(
             self, task_features: Any, context: Any
         ) -> Any:
             return self.actor(task_features, context)
+
+        def decision_from_frozen_context(
+            self,
+            *,
+            task_features: Any,
+            instant_partner: Any,
+            capability: Any,
+            protocol_embedding: Any,
+        ) -> tuple[Any, Any, Any, Any]:
+            """Pure decision-head intervention with no recurrent-state update."""
+
+            instant = jnp.asarray(instant_partner, dtype=jnp.float32)
+            u = jnp.asarray(capability, dtype=jnp.float32)
+            c = jnp.asarray(protocol_embedding, dtype=jnp.float32)
+            if self.method_variant == "no_capability":
+                u = jnp.zeros_like(u)
+            adaptive = jnp.concatenate((u, c), axis=-1)
+            if self.method_variant in {"r0", "b0", "decision_only"}:
+                adaptive = jnp.zeros_like(adaptive)
+            if self.method_variant in {"r0", "decision_only"}:
+                instant = jnp.zeros_like(instant)
+            summary = jnp.concatenate((instant, adaptive), axis=-1)
+            logits = self.actor(task_features, summary)
+            value, raw_q1, raw_q2 = self.critic(task_features, summary)
+            return logits, value, raw_q1, raw_q2
 
         def twin_action_values_from_features_and_context(
             self, task_features: Any, context: Any
@@ -536,6 +608,7 @@ def build_model(
     modulation_rank: int,
     action_embedding_dim: int,
     instant_partner_dim: int = 32,
+    protocol_stay_probability: float = 0.97,
     method_variant: str = "b2",
 ) -> Any:
     kwargs = {
@@ -552,6 +625,7 @@ def build_model(
         "response_hidden_dim": response_hidden_dim,
         "modulation_rank": modulation_rank,
         "action_embedding_dim": action_embedding_dim,
+        "protocol_stay_probability": protocol_stay_probability,
     }
     variant = str(method_variant).lower()
     if variant == "r0":
@@ -569,6 +643,7 @@ def build_model(
         "actor_only",
         "no_separation",
         "no_capability",
+        "response_only_posterior",
     }:
         return _build_variant(method_variant=variant, **kwargs)
     if variant == "b3":
@@ -595,6 +670,7 @@ def _build_variant(*, method_variant: str, **kwargs: Any) -> Any:
         response_hidden_dim=int(kwargs["response_hidden_dim"]),
         modulation_rank=int(kwargs["modulation_rank"]),
         action_embedding_dim=int(kwargs["action_embedding_dim"]),
+        protocol_stay_probability=float(kwargs["protocol_stay_probability"]),
     )
 
 

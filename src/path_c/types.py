@@ -144,6 +144,8 @@ class CounterfactualAnchorBatch(NamedTuple):
     evaluation_returns_by_action: Any = None
     evaluation_replica_count: Any = None
     fit_replica_returns_by_action: Any = None
+    collection_policy_fingerprint: Any = None
+    collection_context_fingerprint: Any = None
 
 
 class QuotientPairBatch(NamedTuple):
@@ -189,7 +191,7 @@ class SeparationTerms(NamedTuple):
 
 
 class TrainState(NamedTuple):
-    """Complete DEPI scientific state (checkpoint schema 7).
+    """Complete DEPI scientific state (checkpoint schema 8).
 
     Every value capable of changing the next outer update is explicit.  Dead
     per-head optimizers, reward-shaping EMAs, synthetic-partner state, and

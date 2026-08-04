@@ -5,8 +5,9 @@ encoder.  The protocol state has no recognition GRU or hidden dimension: its
 complete carry is the categorical posterior itself, updated by the registered
 transition matrix and the shared response likelihood.
 
-The sticky transition prior P(z_{t+1}|z_t) with P(stay)=0.9 and equal mass on
-the other components is a registered constant; it is never learned
+The visible-evidence transition prior uses a registered stay probability and
+equal mass on the other components.  When no partner evidence is visible the
+transition is exactly the identity, so occlusion cannot erase the posterior.
 (METHOD_SPEC §2.1).  The predictive step and the log-sticky correction applied
 to the posterior logits are parameter-free constant mappings.  Posterior
 entropy is a report-only uncertainty reading and never enters a loss weight.
@@ -17,13 +18,15 @@ from __future__ import annotations
 from typing import Any
 
 PROTOCOL_COMPONENTS = 4
-STICKY_SELF_PROBABILITY = 0.9
+STICKY_SELF_PROBABILITY = 0.97
 CAPABILITY_UPDATE_PERIOD = 16
 
 _CAPABILITY_CELL: Any | None = None
 
 
-def sticky_predictive(previous_probabilities: Any) -> Any:
+def sticky_predictive(
+    previous_probabilities: Any, *, stay: float = STICKY_SELF_PROBABILITY
+) -> Any:
     """Exact one-step predictive distribution of the sticky HMM prior.
 
     This is an explicit multiplication by the registered row-stochastic
@@ -35,7 +38,7 @@ def sticky_predictive(previous_probabilities: Any) -> Any:
 
     previous = jnp.asarray(previous_probabilities, dtype=jnp.float32)
     transition = sticky_transition_matrix(
-        previous.shape[-1], stay=STICKY_SELF_PROBABILITY
+        previous.shape[-1], stay=float(stay)
     )
     return previous @ transition
 
@@ -60,10 +63,14 @@ def sticky_transition_matrix(
     return matrix.at[jnp.diag_indices(count)].set(stay_probability)
 
 
-def sticky_predictive_log_probabilities(previous_probabilities: Any) -> Any:
+def sticky_predictive_log_probabilities(
+    previous_probabilities: Any, *, stay: float = STICKY_SELF_PROBABILITY
+) -> Any:
     import jax.numpy as jnp
 
-    return jnp.log(jnp.maximum(sticky_predictive(previous_probabilities), 1.0e-12))
+    return jnp.log(
+        jnp.maximum(sticky_predictive(previous_probabilities, stay=stay), 1.0e-12)
+    )
 
 
 def uniform_prior(component_count: int = PROTOCOL_COMPONENTS) -> Any:
@@ -73,7 +80,11 @@ def uniform_prior(component_count: int = PROTOCOL_COMPONENTS) -> Any:
 
 
 def exact_bayes_filter_step(
-    previous_probabilities: Any, log_likelihood: Any
+    previous_probabilities: Any,
+    log_likelihood: Any,
+    *,
+    stay: float = STICKY_SELF_PROBABILITY,
+    evidence_valid: Any = True,
 ) -> Any:
     """Reference exact filtering recursion for the synthetic-HMM unit test.
 
@@ -84,10 +95,16 @@ def exact_bayes_filter_step(
     import jax.nn as jnn
     import jax.numpy as jnp
 
-    predictive = sticky_predictive(previous_probabilities)
+    previous = jnp.asarray(previous_probabilities, dtype=jnp.float32)
+    sticky = sticky_predictive(previous, stay=float(stay))
+    valid = jnp.asarray(evidence_valid, dtype=jnp.bool_)
+    predictive = jnp.where(valid[..., None], sticky, previous)
+    evidence = jnp.where(
+        valid[..., None], jnp.asarray(log_likelihood, dtype=jnp.float32), 0.0
+    )
     return jnn.softmax(
         jnp.log(jnp.maximum(predictive, 1.0e-30))
-        + jnp.asarray(log_likelihood, dtype=jnp.float32),
+        + evidence,
         axis=-1,
     )
 
@@ -112,17 +129,23 @@ def _evidence_vector(
     action_embedding_dim: int,
     embedding_name: str,
 ) -> Any:
-    """Build e_t = (Δo, a^ego_{t-1} embedding, episode_start) (METHOD_SPEC §1.1)."""
+    """Build evidence from partner-plane deltas, own action, and episode start."""
 
     import flax.linen as nn
     import jax.numpy as jnp
 
     action = jnp.asarray(previous_action, dtype=jnp.int32)
     start = jnp.asarray(episode_start, dtype=jnp.bool_)
-    previous = jnp.asarray(previous_observation, dtype=jnp.float32).reshape(
+    from .task_encoder import instantaneous_partner_observation
+
+    previous = jnp.asarray(
+        instantaneous_partner_observation(previous_observation), dtype=jnp.float32
+    ).reshape(
         action.shape + (-1,)
     )
-    current = jnp.asarray(observation, dtype=jnp.float32).reshape(
+    current = jnp.asarray(
+        instantaneous_partner_observation(observation), dtype=jnp.float32
+    ).reshape(
         action.shape + (-1,)
     )
     if previous.shape != current.shape:
@@ -154,7 +177,7 @@ def capability_encoder_classes() -> Any:
     from flax.linen.initializers import orthogonal, zeros
 
     class CapabilityEncoderCell(nn.Module):
-        """GRU-64 stable partner-capability encoder; output u ∈ R^16."""
+        """GRU-64 stable semantic partner-capability encoder; output u ∈ R^4."""
 
         hidden_dim: int
         output_dim: int
@@ -224,7 +247,7 @@ def capability_encoder_classes() -> Any:
 
 
 def initial_capability_carry(
-    batch_size: int, hidden_dim: int, output_dim: int = 16
+    batch_size: int, hidden_dim: int, output_dim: int = 4
 ) -> Any:
     import jax.numpy as jnp
 

@@ -96,6 +96,7 @@ def test_anchor_common_randomness_padding_and_sufficient_statistics() -> None:
         fit_replicas=3,
         evaluation_replicas=2,
         continuation_horizon=1,
+        discount=0.99,
         collection_policy_logits=jnp.asarray([[1.0, 0.0, -1.0]] * 2),
         collection_update=jnp.asarray(16),
         collection_target_fingerprint=jnp.asarray([11, 12], dtype=jnp.uint32),

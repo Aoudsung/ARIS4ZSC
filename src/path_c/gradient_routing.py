@@ -1,9 +1,9 @@
-"""Explicit DEPI parameter ownership for the single combined transaction.
+"""Explicit DEPI parameter ownership for PPO and auxiliary transactions.
 
-Every objective is still evaluated inside one ``value_and_grad`` call.  Each
-objective receives the same numerical parameter tree with disallowed leaves
-wrapped in ``stop_gradient``; gradients therefore add once without allowing a
-control loss to distort the probabilistic response decoder.
+Within each transaction, every enabled objective is evaluated inside one
+``value_and_grad`` call. Each objective receives the same numerical parameter
+tree with disallowed leaves wrapped in ``stop_gradient``; gradients therefore
+add once without allowing a control loss to distort an unowned subtree.
 """
 
 from __future__ import annotations
@@ -17,7 +17,8 @@ LOSS_OWNERSHIP: dict[str, tuple[str, ...]] = {
         "ppo", "signature", "decision", "owner_distillation"
     ),
     "capability_encoder": (
-        "ppo", "response", "capability", "signature", "decision", "separation"
+        "ppo", "response", "capability", "signature", "decision", "separation",
+        "posterior_decision",
     ),
     "protocol_component_embeddings": (
         "ppo",
@@ -25,10 +26,11 @@ LOSS_OWNERSHIP: dict[str, tuple[str, ...]] = {
         "signature",
         "decision",
         "separation",
+        "posterior_decision",
     ),
     "universal_actor": ("ppo", "decision", "owner_distillation"),
     "universal_critic": ("ppo", "signature"),
-    "response_decoder": ("response",),
+    "response_decoder": ("response", "posterior_decision"),
 }
 
 

@@ -362,7 +362,7 @@ def test_capability_auxiliary_makes_the_zero_representation_nonoptimal() -> None
 
     zero_loss, gradient = jax.value_and_grad(prediction)(values)
     improved = values.at[-1, :, 0].set(-1.0)
-    _, variance_loss, metrics = capability_auxiliary_objective(
+    _, variance_loss, covariance_loss, metrics = capability_auxiliary_objective(
         capability_sequence=values,
         observations=observations,
         initial_previous_observation=jnp.zeros(
@@ -373,15 +373,21 @@ def test_capability_auxiliary_makes_the_zero_representation_nonoptimal() -> None
         transition_mask=mask,
         variance_floor=0.05,
     )
+    assert float(covariance_loss) == pytest.approx(0.0)
     assert float(zero_loss) == pytest.approx(1.0)
     assert float(prediction(improved)) == pytest.approx(0.0)
     assert float(jnp.linalg.norm(gradient)) > 0.0
     assert float(variance_loss) > 0.0
     assert float(metrics["capability_publication_count"]) == 2.0
-    assert float(metrics["capability_published_partner_count"]) == 2.0
+    assert float(metrics["capability_published_sample_count"]) == 2.0
 
 
-def test_capability_variance_floor_is_computed_between_partner_runs() -> None:
+def test_capability_vicreg_has_no_partner_run_identity_input() -> None:
+    import inspect
+
+    assert "partner_run_ids" not in inspect.signature(
+        capability_auxiliary_objective
+    ).parameters
     time_count, lane_count = 16, 2
     observations = jnp.zeros(
         (time_count, lane_count) + OBSERVATION_SHAPE, dtype=jnp.float32
@@ -390,30 +396,20 @@ def test_capability_variance_floor_is_computed_between_partner_runs() -> None:
     values = jnp.zeros((time_count, lane_count, 4), dtype=jnp.float32)
     values = values.at[-1, 0].set(-0.1).at[-1, 1].set(0.1)
 
-    def floor(ids):
-        return capability_auxiliary_objective(
-            capability_sequence=values,
-            observations=observations,
-            initial_previous_observation=jnp.zeros(
-                (lane_count,) + OBSERVATION_SHAPE, dtype=jnp.float32
-            ),
-            initial_steps=jnp.zeros((lane_count,), dtype=jnp.int32),
-            episode_starts=starts,
-            transition_mask=jnp.ones((time_count, lane_count)),
-            partner_run_ids=jnp.broadcast_to(
-                jnp.asarray(ids, dtype=jnp.int32), (time_count, lane_count)
-            ),
-            variance_floor=0.05,
-        )
-
-    # Production static-pool IDs use the 10_000 + member convention.  The
-    # variance grouping must be invariant to that source-specific offset.
-    _, same_partner_floor, same_metrics = floor([10_007, 10_007])
-    _, distinct_partner_floor, distinct_metrics = floor([10_007, 10_008])
-    assert float(same_partner_floor) > 0.0
-    assert float(distinct_partner_floor) == pytest.approx(0.0, abs=1.0e-7)
-    assert float(same_metrics["capability_published_partner_count"]) == 1.0
-    assert float(distinct_metrics["capability_published_partner_count"]) == 2.0
+    result = capability_auxiliary_objective(
+        capability_sequence=values,
+        observations=observations,
+        initial_previous_observation=jnp.zeros(
+            (lane_count,) + OBSERVATION_SHAPE, dtype=jnp.float32
+        ),
+        initial_steps=jnp.zeros((lane_count,), dtype=jnp.int32),
+        episode_starts=starts,
+        transition_mask=jnp.ones((time_count, lane_count)),
+        variance_floor=0.05,
+    )
+    assert float(result[1]) == pytest.approx(0.0, abs=1.0e-7)
+    assert float(result[2]) > 0.0
+    assert float(result[3]["capability_published_sample_count"]) == 2.0
 
 
 def test_registered_mechanism_ablations_change_only_the_intended_live_wires() -> None:

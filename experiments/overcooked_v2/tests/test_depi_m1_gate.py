@@ -232,18 +232,20 @@ def test_m1_anchor_gate_uses_evaluation_not_fit_replicas() -> None:
 
     class FakeModel:
         step = object()
-        action_values_from_features_and_context = object()
+        decision_from_frozen_context = object()
 
-        def apply(self, variables, *args, method):
+        def apply(self, variables, *args, method, **kwargs):
             del variables
             if method is self.step:
                 count = int(np.asarray(args[1]).shape[0])
                 output = type("Output", (), {})()
+                output.instant_partner = jnp.zeros((count, 1))
                 output.capability = jnp.zeros((count, 1))
                 output.protocol_embedding = jnp.zeros((count, 1))
                 output.task_features = jnp.zeros((count, 1))
                 return args[0], output
-            return predicted
+            del args, kwargs
+            return None, None, predicted, predicted
 
     class FakeMember:
         def apply(self, variables, features):

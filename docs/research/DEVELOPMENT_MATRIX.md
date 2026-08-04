@@ -12,16 +12,17 @@ fail-closed 代码为准。
 - `B2-B1`：真实 continuation 的 decision supervision 是否有额外正增量？
 - `B2-R0/B0/B1-extra`：相同总 simulator cost 下，监督是否优于更多普通 PPO 数据？
 - K sensitivity：以上结论是否只依赖一个 latent component count？
-- 六项机制消融：deterministic context、decision-only、Q-only、actor-only、no-separation、
-  no-capability 是否排除了更简单解释？
+- 七项机制消融：deterministic context、decision-only、Q-only、actor-only、no-separation、
+  no-capability、response-only-posterior 是否排除了更简单解释？
 
 B3 未实现，不进入任何格。
 
 ## 2. 格与共同控制
 
-每个 K/seed 执行 R0、B0、B1、B2、R0-extra、B0-extra、B1-extra，以及 deterministic-context、
-decision-only、Q-only、actor-only、no-separation、no-capability。所有格共享 partner sampler、
-deployable capacity、named key domains、Official 环境和 evaluator。
+K=4/seed 执行 R0、B0、B1、B2、R0-extra、B0-extra、B1-extra，以及 deterministic-context、
+decision-only、Q-only、actor-only、no-separation、no-capability、response-only-posterior。
+K=2/8 只执行 B1/B2 sensitivity。所有格共享 partner sampler、deployable capacity、named key
+domains、Official 环境和 evaluator。
 
 core 四格的主 PPO transitions 相同；B2 continuation/probe 额外列账。R0/B0/B1 不采集后
 丢弃 anchors。extra 两格用普通 PPO 精确替换 B2 的 auxiliary transition cost，并与 B2 的
@@ -33,7 +34,7 @@ kernel，不能向上取整成本。
 先用独立 comparator-fit/validation parents 和固定 Official reference ego checkpoint 运行
 `collect-pair-comparator-source`，再以生成的严格 source 运行 `fit-pair-comparator`。随后
 `run-development-matrix` 接收 development config、partner manifest、冻结 comparator、固定
-seed indexes 0--9 和输出目录。命令对所有注册 K/variants 生成 config 并调用同一训练
+seed indexes 0--9 和输出目录。命令按注册分层矩阵生成 config 并调用同一训练
 入口。
 
 `development_matrix.json` 每格绑定 run identity、config path/hash/fingerprint、partner pool
@@ -58,8 +59,9 @@ hash、resource ledger、PPO/auxiliary/total steps、deployable capacity 和 epi
 `summarize-development-matrix` 只接受完整 evaluation directories。它重新验证 deployment/raw
 hash、episode 数、双方角色与 schedule，并从 episode rows 内部重算每 seed XP。对每个 K
 生成 `B0-R0`、`B1-B0`、`B2-B1`、`B2-B0`、`B2-R0-extra`、`B2-B0-extra`、`B2-B1-extra` 和
-B2 对六项机制消融的 paired 99% interval。B2 的 final component diagnostics 另外对每个 K
-执行 permutation-aligned cross-seed stability 重算。
+B2 对七项机制消融的 paired 99% interval。B2 的 final component diagnostics 在同一只读
+comparator validation history panel 上生成 `[anchor,K,action]` 张量，对每个 K 执行
+permutation-aligned cross-seed stability 重算。
 
 formal claim builder 再次回溯这些 raw rows 并重算 summary；手写均值、boolean 或区间不能
 解锁任何主张。负结果、跨零、缺格和失败 seed 必须保留。

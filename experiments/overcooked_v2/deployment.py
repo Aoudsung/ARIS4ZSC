@@ -42,7 +42,7 @@ DEPLOYABLE_PARAM_NAMES = (
     # training-only auxiliary head.
     "response_decoder",
 )
-DEPLOYMENT_BUNDLE_VERSION = 8
+DEPLOYMENT_BUNDLE_VERSION = 9
 PRIMARY_ARTIFACT_NAME = "DEPI"
 
 
@@ -72,6 +72,7 @@ def _build_model(
         response_hidden_dim=config.model.response_hidden_dim,
         modulation_rank=config.model.modulation_rank,
         action_embedding_dim=config.model.action_embedding_dim,
+        protocol_stay_probability=config.model.protocol_stay_probability,
         method_variant=config.method_variant,
     )
 
@@ -236,6 +237,18 @@ def load_deployment(bundle_directory: str | Path, config: RunConfig) -> Deployme
     )
 
 
+def load_self_contained_deployment(bundle_directory: str | Path) -> Deployment:
+    """Load a deployment against its own immutable resolved training config."""
+
+    root = Path(bundle_directory).resolve()
+    payload = json.loads(
+        (root / "deployment_bundle.json").read_text(encoding="utf-8")
+    )
+    from src.path_c.experiment import run_config_from_mapping
+
+    return load_deployment(root, run_config_from_mapping(payload.get("config")))
+
+
 def reset_deployment_state(
     deployment: Deployment,
     *,
@@ -312,6 +325,7 @@ __all__ = [
     "deployment_action",
     "export_deployment_bundle",
     "load_deployment",
+    "load_self_contained_deployment",
     "load_training_model",
     "reset_deployment_state",
     "update_after_transition",

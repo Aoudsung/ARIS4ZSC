@@ -45,23 +45,7 @@ def _read_population_ledger(path: str | Path | None) -> ResourceLedger:
             "population formation cost cannot be omitted."
         )
     payload = json.loads(Path(path).resolve().read_text(encoding="utf-8"))
-    required = {
-        "ego_policy_steps",
-        "partner_training_steps",
-        "counterfactual_steps",
-        "state_collection_steps",
-        "calibration_steps",
-        "evaluation_steps",
-        "gpu_hours",
-        "peak_memory_bytes",
-        "deployable_parameters",
-        "training_only_parameters",
-        "inference_latency_ms",
-    }
-    missing = required - set(payload)
-    if missing:
-        raise ValueError(f"FCP population ledger is incomplete: {sorted(missing)}")
-    return ResourceLedger(**{name: payload[name] for name in required})
+    return ResourceLedger.from_mapping(payload)
 
 
 def _read_training_lineage(path: str | Path | None) -> list[Mapping[str, Any]]:
@@ -271,18 +255,20 @@ def _baseline_ledger(
     per_run = 49_987_584 if method == "op" else 29_949_952
     base = ResourceLedger(
         ego_policy_steps=10 * per_run,
-        state_collection_steps=(4_000_000 if method == "state-augmented" else 0),
+        shared_pretraining_cost=(4_000_000 if method == "state-augmented" else 0),
         gpu_hours=gpu_hours_for_wall_seconds(
             wall_seconds, device_count=gpu_device_count()
         ),
+        wall_clock_hours=float(wall_seconds) / 3_600.0,
         peak_memory_bytes=_peak_device_memory(),
         inference_latency_ms=float(inference_latency_ms),
     )
     if population is None:
         return base
     return base.plus(
-        partner_training_steps=population.total_training_simulator_steps,
+        shared_pretraining_cost=population.total_training_simulator_steps,
         gpu_hours=population.gpu_hours,
+        wall_clock_hours=population.wall_clock_hours,
         peak_memory_bytes=max(0, population.peak_memory_bytes - base.peak_memory_bytes),
         training_only_parameters=population.deployable_parameters
         + population.training_only_parameters,

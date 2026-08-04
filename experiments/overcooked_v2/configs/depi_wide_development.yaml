@@ -1,4 +1,4 @@
-version: 17
+version: 18
 method_variant: b2
 
 environment:
@@ -14,7 +14,7 @@ model:
   task_hidden_dim: 128
   instant_partner_dim: 32
   capability_hidden_dim: 64
-  capability_dim: 16
+  capability_dim: 4
   protocol_components: 4
   component_embedding_dim: 16
   actor_hidden_dim: 128
@@ -22,6 +22,9 @@ model:
   response_hidden_dim: 128
   modulation_rank: 8
   action_embedding_dim: 16
+  protocol_stay_probability: 0.97
+  evidence_gated_transition: true
+  capability_evidence_mode: partner_planes_only
 
 ppo:
   update_epochs: 4
@@ -46,18 +49,21 @@ loss_v2:
   combined_policy_kl_threshold: 0.04
   rank_hinge_margin: 0.1
   rank_hinge_advantage_gap: 2.0
-  separation_margin_scale: 0.25
   decision_policy_weight: 0.25
   decision_policy_temperature: 1.0
   capability_consistency_weight: 0.01
   capability_prediction_weight: 0.1
   capability_variance_weight: 0.01
+  capability_covariance_weight: 0.01
   capability_variance_floor: 0.05
   component_signature_weight: 0.25
+  posterior_decision_weight: 0.25
+  posterior_decision_temperature: 1.0
+  separation_margin: 0.5
 
 anchors:
   enabled: true
-  interval_updates: 16
+  interval_updates: 4
   ordinary_states: 4
   matched_history_pairs: 2
   fit_replicas: 4
@@ -72,6 +78,10 @@ anchors:
   signature_distance_threshold: 1.0
   m1_spearman_threshold: 0.8
   m1_minimum_anchor_fraction: 0.9
+  task_match_epsilon: 4.0
+  endpoint_task_match_epsilon: 4.0
+  episode_time_tolerance: 0
+  maximum_age_updates: 4
 
 # Registered hierarchical static partner pool: default R0/B0–B2 distribution.
 partner_pool:
@@ -93,6 +103,8 @@ posterior_calibration:
   brier_ratio: 0.90
   primary_unit: partner_run
   secondary_unit: episode
+  minimum_positive_event_count: 100
+  minimum_positive_event_count_per_family: 20
 
 training:
   extra_ppo_environment_steps: 0

@@ -10,6 +10,7 @@ deployed continuation policy; it is not an unrestricted best response.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Any, Mapping, NamedTuple
 
@@ -406,19 +407,25 @@ def empirical_all_action_continuations_from_snapshots(
     fit_replicas: int,
     evaluation_replicas: int,
     continuation_horizon: int,
-    ego_hstate: Any | None = None,
+    gamma: float,
+    continuation_policy_fingerprint: str = "runtime-bound",
 ) -> Mapping[str, Any]:
-    """Evaluate all six forced ego actions with paired real continuations.
+    """Evaluate the registered discounted six-action continuation estimand.
 
     Fit replicas select the empirical oracle; a disjoint replica block reports
-    every action value.  ``ego_hstate`` may replace only the ego recurrent
-    state, which is the intervention surface used by history-shuffle,
-    state-only, swap-u, and swap-c controls.  The environment, partner state,
-    role, current observation, action keys, and continuation keys remain fixed.
+    every action value.  The recurrent states must be the legal states stored
+    in ``selected``.  Context interventions choose only a forced first action
+    and then index these source-world continuations; transplanting recurrent
+    state into this simulator path is deliberately unsupported.
     """
 
     import jax
     import jax.numpy as jnp
+
+    from src.path_c.continuation import (
+        ContinuationContract,
+        discounted_reward_increment,
+    )
 
     role = int(ego_role)
     if role not in {0, 1}:
@@ -426,6 +433,11 @@ def empirical_all_action_continuations_from_snapshots(
     fit_count = int(fit_replicas)
     evaluation_count = int(evaluation_replicas)
     horizon = int(continuation_horizon)
+    continuation_contract = ContinuationContract(
+        gamma=float(gamma),
+        horizon=horizon,
+        continuation_policy_fingerprint=str(continuation_policy_fingerprint),
+    )
     if min(fit_count, evaluation_count, horizon) <= 0:
         raise ValueError("Continuation replica counts and horizon must be positive.")
     roots_array = jnp.asarray(anchor_roots, dtype=jnp.uint32)
@@ -434,11 +446,6 @@ def empirical_all_action_continuations_from_snapshots(
         raise ValueError("Every continuation anchor needs one two-word root key.")
     left_hstate = selected["left_hstate"]
     right_hstate = selected["right_hstate"]
-    if ego_hstate is not None:
-        if role == 0:
-            left_hstate = ego_hstate
-        else:
-            right_hstate = ego_hstate
 
     ego_name = "agent_0" if role == 0 else "agent_1"
     ego_policy = left if role == 0 else right
@@ -525,7 +532,9 @@ def empirical_all_action_continuations_from_snapshots(
             left_hstate=next_left,
             right_hstate=next_right,
             raw_return=current.raw_return
-            + jnp.where(active, rewards["agent_0"], 0.0),
+            + discounted_reward_increment(
+                rewards["agent_0"], active=active, step=step, gamma=float(gamma)
+            ),
         )
         return _select_tree(active, candidate, current)
 
@@ -549,6 +558,8 @@ def empirical_all_action_continuations_from_snapshots(
         "selected_evaluation_return": evaluation[rows, selected_host],
         "fit_oracle_action": oracle,
         "oracle_evaluation_return": evaluation[rows, oracle],
+        "continuation_contract": continuation_contract.to_mapping(),
+        "continuation_contract_fingerprint": continuation_contract.fingerprint,
     }
 
 
@@ -563,6 +574,8 @@ def empirical_official_br_prox_pairing(
     fit_replicas: int,
     evaluation_replicas: int,
     continuation_horizon: int,
+    gamma: float,
+    continuation_policy_fingerprint: str,
     episodes: int = 500,
 ) -> list[Mapping[str, Any]]:
     import jax
@@ -607,7 +620,6 @@ def empirical_official_br_prox_pairing(
         time_indexes,
         jnp.arange(int(anchors), dtype=jnp.int32),
     )
-    actual = selected["left_action"] if int(ego_role) == 0 else selected["right_action"]
     anchor_episode_keys = episode_keys[episode_indexes]
     anchor_roots = jax.vmap(
         lambda key, time: jax.random.fold_in(
@@ -615,91 +627,32 @@ def empirical_official_br_prox_pairing(
         )
     )(anchor_episode_keys, time_indexes.astype(jnp.uint32))
 
-    replica_count = int(fit_replicas + evaluation_replicas)
-    action_count = 6
-    repeats = action_count * replica_count
-    forced_actions = jnp.tile(
-        jnp.repeat(jnp.arange(action_count, dtype=jnp.int32), replica_count),
-        int(anchors),
+    continuations = empirical_all_action_continuations_from_snapshots(
+        left=left,
+        right=right,
+        ego_role=int(ego_role),
+        environment=environment,
+        selected=selected,
+        anchor_roots=anchor_roots,
+        fit_replicas=int(fit_replicas),
+        evaluation_replicas=int(evaluation_replicas),
+        continuation_horizon=int(continuation_horizon),
+        gamma=float(gamma),
+        continuation_policy_fingerprint=str(continuation_policy_fingerprint),
     )
-    roots = _shared_branch_roots(anchor_roots, action_count, replica_count)
-    expanded_done = _repeat_tree(selected["done"], repeats)
-    branch = _BranchCarry(
-        observations=_repeat_tree(selected["observations"], repeats),
-        environment_state=_repeat_tree(selected["environment_state"], repeats),
-        done=expanded_done,
-        left_hstate=_repeat_tree(selected["left_hstate"], repeats),
-        right_hstate=_repeat_tree(selected["right_hstate"], repeats),
-        raw_return=jnp.zeros((int(anchors) * repeats,), dtype=jnp.float32),
+    actual_host = np.asarray(continuations["selected_action"], dtype=np.int64)
+    oracle = np.asarray(continuations["fit_oracle_action"], dtype=np.int64)
+    selected_returns = np.asarray(
+        continuations["selected_evaluation_return"], dtype=np.float64
     )
-
-    def advance(step: int, current: _BranchCarry) -> _BranchCarry:
-        active = ~jnp.asarray(current.done["__all__"], dtype=jnp.bool_)
-        lane_step_keys = jax.vmap(
-            lambda key: jax.random.fold_in(key, step)
-        )(roots)
-        split = jax.vmap(lambda key: jax.random.split(key, 2))(lane_step_keys)
-        sample_roots, environment_keys = split[:, 0], split[:, 1]
-        action_keys = jax.vmap(lambda key: jax.random.split(key, 2))(sample_roots)
-        left_action, next_left = _vmap_policy(
-            left,
-            current.observations["agent_0"],
-            current.done["agent_0"],
-            current.left_hstate,
-            action_keys[:, 0],
-        )
-        right_action, next_right = _vmap_policy(
-            right,
-            current.observations["agent_1"],
-            current.done["agent_1"],
-            current.right_hstate,
-            action_keys[:, 1],
-        )
-        first = step == 0
-        if int(ego_role) == 0:
-            left_action = jnp.where(first, forced_actions, left_action)
-            forced_left = _record_forced_action(left, next_left, forced_actions)
-            next_left = jax.tree_util.tree_map(
-                lambda forced, normal: jnp.where(first, forced, normal),
-                forced_left,
-                next_left,
-            )
-        else:
-            right_action = jnp.where(first, forced_actions, right_action)
-            forced_right = _record_forced_action(right, next_right, forced_actions)
-            next_right = jax.tree_util.tree_map(
-                lambda forced, normal: jnp.where(first, forced, normal),
-                forced_right,
-                next_right,
-            )
-        actions = {"agent_0": left_action, "agent_1": right_action}
-        next_observations, next_state, rewards, next_done, unused_info = jax.vmap(
-            environment.step
-        )(environment_keys, current.environment_state, actions)
-        del unused_info
-        candidate = _BranchCarry(
-            observations=next_observations,
-            environment_state=next_state,
-            done=next_done,
-            left_hstate=next_left,
-            right_hstate=next_right,
-            raw_return=current.raw_return
-            + jnp.where(active, rewards["agent_0"], 0.0),
-        )
-        return _select_tree(active, candidate, current)
-
-    final = jax.lax.fori_loop(0, int(continuation_horizon), advance, branch)
-    values = np.asarray(final.raw_return, dtype=np.float64).reshape(
-        (int(anchors), action_count, replica_count)
+    oracle_returns = np.asarray(
+        continuations["oracle_evaluation_return"], dtype=np.float64
     )
-    fit = np.mean(values[..., : int(fit_replicas)], axis=-1)
-    evaluation = np.mean(values[..., int(fit_replicas) :], axis=-1)
-    actual_host = np.asarray(actual, dtype=np.int64)
-    oracle = np.argmax(fit, axis=-1)
+    contract = dict(continuations["continuation_contract"])
     rows = []
     for index in range(int(anchors)):
-        actual_return = float(evaluation[index, actual_host[index]])
-        oracle_return = float(evaluation[index, oracle[index]])
+        actual_return = float(selected_returns[index])
+        oracle_return = float(oracle_returns[index])
         rows.append(
             {
                 "anchor_index": index,
@@ -714,6 +667,14 @@ def empirical_official_br_prox_pairing(
                 "br_prox": br_prox(actual_return, oracle_return),
                 "oracle_action_agreement": bool(actual_host[index] == oracle[index]),
                 "scope": "one_action_deviation_with_frozen_deployed_continuation",
+                "continuation_gamma": float(contract["gamma"]),
+                "continuation_horizon": int(contract["horizon"]),
+                "continuation_policy_fingerprint": str(
+                    contract["continuation_policy_fingerprint"]
+                ),
+                "continuation_contract_fingerprint": str(
+                    continuations["continuation_contract_fingerprint"]
+                ),
             }
         )
     return rows
@@ -772,6 +733,18 @@ def run_common_br_prox(args: argparse.Namespace) -> None:
                         fit_replicas=config.evaluation.br_prox_fit_replicas,
                         evaluation_replicas=config.evaluation.br_prox_evaluation_replicas,
                         continuation_horizon=config.evaluation.br_prox_continuation_horizon,
+                        gamma=float(config.ppo.gamma),
+                        continuation_policy_fingerprint=hashlib.sha256(
+                            (
+                                str(
+                                    manifests[method]["runs"][ego_index][
+                                        "checkpoint_sha256"
+                                    ]
+                                )
+                                + ":"
+                                + str(partner_run.checkpoint_sha256)
+                            ).encode("utf-8")
+                        ).hexdigest(),
                     )
                     for row in rows:
                         all_rows.append(

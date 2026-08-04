@@ -40,6 +40,7 @@ def test_resource_aggregation_sums_cost_but_not_model_parameters() -> None:
             ResourceLedger(
                 ego_policy_steps=10,
                 gpu_hours=1.0,
+                wall_clock_hours=0.5,
                 peak_memory_bytes=3,
                 deployable_parameters=100,
                 training_only_parameters=50,
@@ -47,6 +48,7 @@ def test_resource_aggregation_sums_cost_but_not_model_parameters() -> None:
             ResourceLedger(
                 ego_policy_steps=10,
                 gpu_hours=2.0,
+                wall_clock_hours=0.75,
                 peak_memory_bytes=7,
                 deployable_parameters=100,
                 training_only_parameters=50,
@@ -55,6 +57,7 @@ def test_resource_aggregation_sums_cost_but_not_model_parameters() -> None:
     )
     assert combined.ego_policy_steps == 20
     assert combined.gpu_hours == pytest.approx(3.0)
+    assert combined.wall_clock_hours == pytest.approx(1.25)
     assert combined.peak_memory_bytes == 7
     assert combined.deployable_parameters == 100
     assert combined.training_only_parameters == 50

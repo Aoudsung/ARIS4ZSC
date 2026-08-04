@@ -62,6 +62,8 @@ def test_empirical_br_prox_uses_independent_fit_and_evaluation_returns() -> None
         fit_replicas=2,
         evaluation_replicas=3,
         continuation_horizon=3,
+        gamma=1.0,
+        continuation_policy_fingerprint="tiny-policy",
         episodes=4,
     )
     assert len(rows) == 2

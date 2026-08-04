@@ -18,7 +18,7 @@
 
 - [`THEORY.md`](THEORY.md)：可由当前结构证明的有限保证及不作出的保证。
 - [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md)：嵌套 core、总预算对照、
-  六项机制消融、K sensitivity 与 raw-evaluator/component-diagnostic artifact 合同。
+  七项机制消融、分层 K sensitivity 与 raw-evaluator/shared-panel component-diagnostic artifact 合同。
 - [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md)：正式
   inference 与 claim gate 的预注册摘要。
 - [`RESEARCH_PROGRAM.md`](RESEARCH_PROGRAM.md)：当前阶段、下一决策点和停止规则；只链接注册

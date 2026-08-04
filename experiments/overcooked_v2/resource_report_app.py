@@ -64,7 +64,31 @@ def run_resource_report(args: argparse.Namespace) -> None:
     for method in RESOURCE_METHODS:
         paths = grouped[method]
         aggregate = aggregate_resource_ledgers([_read_ledger(path) for path in paths])
-        rows.append({"method": method, **aggregate.to_mapping()})
+        run_count = len(paths)
+        marginal_per_run = aggregate.marginal_training_simulator_steps / run_count
+        # Every ego ledger deliberately repeats the complete shared-cost
+        # disclosure.  Divide once to recover the unique shared source, then
+        # amortize that source over the actual number of ego runs.
+        unique_shared = aggregate.shared_training_simulator_steps / run_count
+        amortized_per_run = marginal_per_run + unique_shared / run_count
+        fully_loaded_reproduction = int(
+            aggregate.marginal_training_simulator_steps
+            + unique_shared
+            + aggregate.final_m1_steps
+            + aggregate.component_diagnostic_steps
+            + aggregate.mechanism_evaluation_steps
+            + aggregate.evaluation_steps
+        )
+        rows.append(
+            {
+                "method": method,
+                **aggregate.to_mapping(),
+                "run_count": run_count,
+                "marginal_training_steps_per_run": marginal_per_run,
+                "amortized_training_steps_per_run": amortized_per_run,
+                "fully_loaded_reproduction_steps": fully_loaded_reproduction,
+            }
+        )
         sources[method] = [
             {"path": str(path), "sha256": sha256_path(path)} for path in paths
         ]
@@ -85,10 +109,15 @@ def run_resource_report(args: argparse.Namespace) -> None:
             "methods": rows,
             "sources": sources,
             "accounting_rule": {
-                "step_counts_and_gpu_hours": "sum",
+                "step_counts_gpu_hours_and_wall_clock_hours": "sum",
                 "peak_memory_and_latency": "maximum",
                 "parameter_counts": "one deployable instance; nonzero inputs must agree",
                 "evaluation_excluded_from_total_training_simulator_steps": True,
+                "shared_cost_disclosure": (
+                    "shared fields repeat in every ego ledger; report divides by "
+                    "run_count once for unique fully-loaded cost and twice for "
+                    "per-run amortization"
+                ),
                 "gpu_hours": "wall time multiplied by GPU devices actually used",
                 "inference_latency_ms": (
                     "median of 100 synchronized compiled stochastic batch-one "
@@ -106,16 +135,15 @@ def run_resource_report(args: argparse.Namespace) -> None:
     lines = [
         "# Complete resource ledger",
         "",
-        "| Method | Ego PPO | Owner distill | Upstream partners | Counterfactual continuations | Matched probes | Calibration | Total training simulator | GPU-h | Peak memory | Deploy params | Training-only params | Inference ms |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Method | Runs | Marginal/run | Amortized/run | Fully loaded reproduction | Wall-h | GPU-h | Comparator GPU-h | Peak memory | Deploy params | Training-only params | Inference ms |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {ego_policy_steps} | {ego_initialization_steps} | "
-            "{upstream_partner_steps} | {counterfactual_continuation_steps} | "
-            "{matched_pair_probe_steps} | {calibration_steps} | "
-            "{total_training_simulator_steps} | "
-            "{gpu_hours:.4f} | {peak_memory_bytes} | {deployable_parameters} | "
+            "| {method} | {run_count} | {marginal_training_steps_per_run:.1f} | "
+            "{amortized_training_steps_per_run:.1f} | "
+            "{fully_loaded_reproduction_steps} | {wall_clock_hours:.4f} | {gpu_hours:.4f} | "
+            "{comparator_gpu_hours:.4f} | {peak_memory_bytes} | {deployable_parameters} | "
             "{training_only_parameters} | {inference_latency_ms:.6f} |".format(
                 **row
             )

@@ -204,13 +204,14 @@ def collect_counterfactual_anchors(
     fit_replicas: int,
     evaluation_replicas: int,
     continuation_horizon: int,
-    discount: float = 1.0,
+    discount: float,
     microbatch_size: int | None = None,
     runtime: Any | None = None,
     chunk_kernel: Callable[..., Any] | None = None,
     collection_policy_logits: Any | None = None,
     collection_update: Any | None = None,
     collection_target_fingerprint: Any | None = None,
+    collection_policy_fingerprint: Any | None = None,
     matched_pair_ids: Any | None = None,
 ) -> CounterfactualAnchorBatch:
     """Estimate all-action continuation returns from identical anchor worlds."""
@@ -218,12 +219,15 @@ def collect_counterfactual_anchors(
     import jax
     import jax.numpy as jnp
 
+    from .continuation import ContinuationContract, discounted_reward_increment
+
     if action_count <= 1:
         raise ValueError("Counterfactual anchors need at least two actions.")
     if fit_replicas <= 0 or evaluation_replicas < 0:
         raise ValueError("Fit replicas must be positive and evaluation replicas non-negative.")
     if continuation_horizon <= 0:
         raise ValueError("Continuation horizon must be positive.")
+    ContinuationContract(gamma=float(discount), horizon=int(continuation_horizon))
     anchor_count = int(jnp.asarray(world.done).shape[0])
     replicas = int(fit_replicas + evaluation_replicas)
     repeats = int(action_count * replicas)
@@ -503,11 +507,12 @@ def collect_counterfactual_anchors(
             ego_roles=current.ego_roles,
             done=jnp.asarray(dones, dtype=jnp.bool_),
             raw_return=current.raw_return
-                + jnp.power(
-                    jnp.asarray(discount, dtype=jnp.float32),
-                    jnp.asarray(time_index, dtype=jnp.float32),
-                )
-                * jnp.where(active, ego_rewards, 0.0),
+            + discounted_reward_increment(
+                ego_rewards,
+                active=active,
+                step=time_index,
+                gamma=float(discount),
+            ),
         )
         return tree_select(active, candidate, current)
 
@@ -549,6 +554,14 @@ def collect_counterfactual_anchors(
             (anchor_count, 2),
         )
     )
+    policy_fingerprint = (
+        fingerprint
+        if collection_policy_fingerprint is None
+        else jnp.broadcast_to(
+            jnp.asarray(collection_policy_fingerprint, dtype=jnp.uint32),
+            (anchor_count, 2),
+        )
+    )
     pair_ids = (
         jnp.full((anchor_count,), -1, dtype=jnp.int32)
         if matched_pair_ids is None
@@ -582,6 +595,7 @@ def collect_counterfactual_anchors(
             dtype=jnp.int32,
         ),
         fit_replica_returns_by_action=fit_returns,
+        collection_policy_fingerprint=policy_fingerprint,
     )
 
 

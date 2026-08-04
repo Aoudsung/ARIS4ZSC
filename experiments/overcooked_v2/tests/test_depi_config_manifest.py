@@ -9,7 +9,10 @@ from pathlib import Path
 import pytest
 
 from experiments.overcooked_v2.deployment import DEPLOYMENT_BUNDLE_VERSION
-from experiments.overcooked_v2.development_matrix_app import _variant_config
+from experiments.overcooked_v2.development_matrix_app import (
+    _b2_auxiliary_transition_budget,
+    _variant_config,
+)
 
 from src.path_c.experiment import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -36,10 +39,10 @@ CONFIGS = ROOT / "experiments" / "overcooked_v2" / "configs"
 
 
 def test_registered_identity_and_budgets_are_current() -> None:
-    assert CONFIG_VERSION == 17
-    assert CHECKPOINT_SCHEMA_VERSION == 7
+    assert CONFIG_VERSION == 18
+    assert CHECKPOINT_SCHEMA_VERSION == 8
     assert MANIFEST_VERSION == 4
-    assert METHOD_VERSION == "depi_instant_partner_exact_filter_decision_supervision_v7"
+    assert METHOD_VERSION == "depi_decision_consistent_evidence_gated_filter_v8"
     assert OFFICIAL_PROTOCOL_VERSION == "overcooked_v2_iclr2025_5ce1707_v1"
     assert RUN_BUDGETS["mechanical"].environment_steps == 1_024
     assert RUN_BUDGETS["development"].environment_steps == 1_228_800
@@ -111,18 +114,24 @@ def test_total_budget_controls_replace_b2_auxiliary_cost_with_exact_ppo_steps(
     assert r0.method_variant == "r0"
     assert b0.method_variant == "b0"
     assert b1.method_variant == "b1"
-    assert r0.training.extra_ppo_environment_steps == 737_920
-    assert b0.training.extra_ppo_environment_steps == 737_920
-    assert b1.training.extra_ppo_environment_steps == 737_920
+    import yaml
+
+    expected_extra = _b2_auxiliary_transition_budget(
+        yaml.safe_load(source.read_text(encoding="utf-8"))
+    )
+    assert expected_extra == 2_804_096
+    assert r0.training.extra_ppo_environment_steps == expected_extra
+    assert b0.training.extra_ppo_environment_steps == expected_extra
+    assert b1.training.extra_ppo_environment_steps == expected_extra
     assert (
         r0.training.environment_steps
         == b0.training.environment_steps
         == b1.training.environment_steps
-        == 1_966_720
+        == 4_032_896
     )
     assert r0.training.environment_steps % (
         r0.environment.num_envs * r0.training.rollout_length
-    ) == 640
+    ) == 2_432
 
 
 def test_b3_and_nonregistered_formal_component_count_fail_closed() -> None:

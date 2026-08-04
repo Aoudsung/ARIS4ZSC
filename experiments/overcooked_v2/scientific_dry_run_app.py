@@ -132,6 +132,9 @@ def run_scientific_dry_run(args: argparse.Namespace) -> None:
                 run_kind="mechanical",
                 output=str(training_run),
                 pair_comparator=str(comparator_path),
+                comparator_reference_ego_checkpoint=str(
+                    Path(args.comparator_reference_ego_checkpoint).resolve()
+                ),
                 resume=bool(args.resume),
                 skip_manifest_hash_check=bool(args.skip_manifest_hash_check),
                 _execution_scope="scientific-dry-run",

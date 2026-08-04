@@ -10,6 +10,9 @@ import numpy as np
 
 def _matrix(value: Any) -> np.ndarray:
     matrix = np.asarray(value, dtype=np.float64)
+    if matrix.ndim == 3:
+        # Shared panel tensor [anchor, component, action] -> component rows.
+        matrix = np.moveaxis(matrix, 1, 0).reshape((matrix.shape[1], -1))
     if matrix.ndim != 2 or matrix.shape[0] < 2 or matrix.shape[1] < 2:
         raise ValueError("Component signatures must be a K x feature matrix.")
     if matrix.shape[0] > 8 or not np.all(np.isfinite(matrix)):
@@ -98,6 +101,9 @@ def component_intervention_summary(
     action_signatures: Any,
     policy_logits: Any,
     protocol_probabilities: Any,
+    diagnostic_panel_ids: Any | None = None,
+    diagnostic_panel_state_hashes: Any | None = None,
+    component_embeddings: Any | None = None,
 ) -> Mapping[str, Any]:
     """Aggregate fresh-anchor one-hot intervention results for one run."""
 
@@ -129,17 +135,54 @@ def component_intervention_summary(
     entropy = -np.sum(
         posterior * np.log(np.maximum(posterior, 1.0e-12)), axis=-1
     )
+    utilization = np.mean(posterior, axis=0)
+    usage_entropy = float(
+        -np.sum(utilization * np.log(np.maximum(utilization, 1.0e-12)))
+    )
+    panel_ids = (
+        [f"panel-{index}" for index in range(signatures.shape[0])]
+        if diagnostic_panel_ids is None
+        else [str(value) for value in np.asarray(diagnostic_panel_ids).reshape((-1,))]
+    )
+    state_hashes = (
+        panel_ids
+        if diagnostic_panel_state_hashes is None
+        else [
+            str(value)
+            for value in np.asarray(diagnostic_panel_state_hashes).reshape((-1,))
+        ]
+    )
+    if len(panel_ids) != signatures.shape[0] or len(state_hashes) != signatures.shape[0]:
+        raise ValueError("Shared component diagnostic panel identities differ.")
+    embedding = (
+        np.ones((count, 1), dtype=np.float64)
+        if component_embeddings is None
+        else np.asarray(component_embeddings, dtype=np.float64)
+    )
+    if embedding.ndim != 2 or embedding.shape[0] != count or not np.all(
+        np.isfinite(embedding)
+    ):
+        raise ValueError("Component embedding diagnostic shape differs.")
+    embedding_norm = np.linalg.norm(embedding, axis=-1)
     return {
         "component_action_signatures": np.mean(signatures, axis=0).tolist(),
+        "component_action_signatures_by_anchor": signatures.tolist(),
+        "diagnostic_panel_ids": panel_ids,
+        "diagnostic_panel_state_hashes": state_hashes,
         "component_one_hot_actor_probabilities": np.mean(probability, axis=0).tolist(),
-        "component_utilization": np.mean(posterior, axis=0).tolist(),
+        "component_utilization": utilization.tolist(),
         "mean_effective_component_count": float(np.mean(np.exp(entropy))),
         "minimum_component_utilization": float(
             np.min(np.mean(posterior, axis=0))
         ),
-        "component_collapse_fraction": float(
+        "posterior_high_confidence_fraction": float(
             np.mean(np.max(posterior, axis=-1) > 0.98)
         ),
+        "dominant_component_fraction": float(np.max(utilization)),
+        "component_usage_entropy": usage_entropy,
+        "component_embedding_norms": embedding_norm.tolist(),
+        "component_embedding_minimum_norm": float(np.min(embedding_norm)),
+        "component_embedding_maximum_norm": float(np.max(embedding_norm)),
         "mean_pairwise_action_signature_divergence": float(
             np.mean(signature_distance[:, pair_mask])
         ),
@@ -161,11 +204,38 @@ def validate_component_diagnostic_values(
         payload.get("component_one_hot_actor_probabilities"), dtype=np.float64
     )
     utilization = np.asarray(payload.get("component_utilization"), dtype=np.float64)
+    panel_signatures = np.asarray(
+        payload.get("component_action_signatures_by_anchor"), dtype=np.float64
+    )
+    panel_ids = payload.get("diagnostic_panel_ids")
+    panel_hashes = payload.get("diagnostic_panel_state_hashes")
+    embedding_norms = np.asarray(
+        payload.get("component_embedding_norms"), dtype=np.float64
+    )
     if signatures.shape != (count, int(action_count)) or actor.shape != signatures.shape:
         raise ValueError("Component action diagnostic shapes differ.")
     if utilization.shape != (count,):
         raise ValueError("Component utilization shape differs.")
-    if not all(np.all(np.isfinite(value)) for value in (signatures, actor, utilization)):
+    if (
+        panel_signatures.ndim != 3
+        or panel_signatures.shape[1:] != (count, int(action_count))
+        or not isinstance(panel_ids, list)
+        or not isinstance(panel_hashes, list)
+        or len(panel_ids) != panel_signatures.shape[0]
+        or len(panel_hashes) != panel_signatures.shape[0]
+        or embedding_norms.shape != (count,)
+    ):
+        raise ValueError("Shared component diagnostic panel differs.")
+    if not all(
+        np.all(np.isfinite(value))
+        for value in (
+            signatures,
+            actor,
+            utilization,
+            panel_signatures,
+            embedding_norms,
+        )
+    ):
         raise ValueError("Component diagnostic arrays contain non-finite values.")
     if (
         np.any(actor < 0.0)
@@ -185,17 +255,29 @@ def validate_component_diagnostic_values(
             raise ValueError(f"Component diagnostic {name} is invalid.")
     effective = float(payload.get("mean_effective_component_count", float("nan")))
     minimum = float(payload.get("minimum_component_utilization", float("nan")))
-    collapse = float(payload.get("component_collapse_fraction", float("nan")))
+    high_confidence = float(
+        payload.get("posterior_high_confidence_fraction", float("nan"))
+    )
+    dominant = float(payload.get("dominant_component_fraction", float("nan")))
+    usage_entropy = float(payload.get("component_usage_entropy", float("nan")))
     disagreement = float(
         payload.get("one_hot_top_action_disagreement_fraction", float("nan"))
     )
     actor_tv = float(payload["mean_pairwise_one_hot_actor_tv"])
+    minimum_norm = float(payload.get("component_embedding_minimum_norm", float("nan")))
+    maximum_norm = float(payload.get("component_embedding_maximum_norm", float("nan")))
     if not (
         1.0 <= effective <= count + 1.0e-5
         and 0.0 <= minimum <= 1.0
-        and 0.0 <= collapse <= 1.0
+        and 0.0 <= high_confidence <= 1.0
+        and 0.0 <= dominant <= 1.0
+        and 0.0 <= usage_entropy <= np.log(count) + 1.0e-5
         and 0.0 <= disagreement <= 1.0
         and 0.0 <= actor_tv <= 1.0 + 1.0e-5
+        and minimum_norm > 0.0
+        and maximum_norm >= minimum_norm
+        and np.isclose(minimum_norm, np.min(embedding_norms), atol=1.0e-6)
+        and np.isclose(maximum_norm, np.max(embedding_norms), atol=1.0e-6)
     ):
         raise ValueError("Component diagnostic scalar ranges differ.")
 

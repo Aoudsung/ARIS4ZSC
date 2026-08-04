@@ -405,15 +405,15 @@ def evaluate_m1_gate_on_anchor_batch(
         dropped,
         method=model.step,
     )
-    posterior_summary = jnp.concatenate(
-        (posterior.capability, posterior.protocol_embedding), axis=-1
-    )
-    posterior_values = model.apply(
+    _, _, posterior_q1, posterior_q2 = model.apply(
         {"params": params},
-        posterior.task_features,
-        posterior_summary,
-        method=model.action_values_from_features_and_context,
+        task_features=posterior.task_features,
+        instant_partner=posterior.instant_partner,
+        capability=posterior.capability,
+        protocol_embedding=posterior.protocol_embedding,
+        method=model.decision_from_frozen_context,
     )
+    posterior_values = jnp.minimum(posterior_q1, posterior_q2)
     if anchors.evaluation_returns_by_action is None:
         raise ValueError("M1 requires independent evaluation replicas.")
     evaluation_count = jnp.asarray(anchors.evaluation_replica_count)

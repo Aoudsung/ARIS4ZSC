@@ -45,10 +45,11 @@ agent 的 carry、未来轨迹，以及由这些量产生的部署路由信号�
   direction 和 inventory planes 的当前观测。
 - `r_t=f_instant(o_t^partner)`：无记忆即时伙伴通路，只读取当前 other-agent planes，不保存
   carry，负责可见位置、朝向、inventory、挡路和碰撞几何。
-- `u_t`：低频发布的 capability/tendency context。hidden 每步读合法 evidence，actor 可见值
-  每 16 步发布；前四坐标预测窗口级可复算行为率并配合跨 partner-run group mean variance
-  floor，其余坐标仍是 latent。必须报告 prediction/variance/norm/坍缩诊断、`swap-u` 和
-  `no-capability` 增量。
+- `u_t`：4 维低频发布的 capability/tendency context。hidden 每步只读相邻帧中即时伙伴
+  semantic planes 的变化、ego 前一动作和 episode start，actor 可见值每 16 步发布；四个坐标
+  全部预测窗口级可复算行为率。anti-collapse 使用不读取 run ID 的 batch variance floor 与
+  off-diagonal covariance penalty。必须报告 prediction/variance/covariance/norm/坍缩诊断、
+  `swap-u` 和 `no-capability` 增量。
 - `pi_t,c_t`：注册离散 response model 下的精确类别滤波结果；
   `c_t=sum_k pi_t,k m_k`。
 
@@ -58,8 +59,10 @@ task isolation 的精确保证只有：task GRU 不直接读取显式 other-agen
 
 K 个 component 的名称固定为 **exchangeable response regimes**。index 不对应伙伴身份、
 算法族或人类可命名协议，也不具有唯一 decision-signature 语义。训练直接约束
-`sum_k pi_k S_k(x,u,a)` 拟合 empirical centered continuation signature，并用 one-hot `z=k`
-干预构造 `S_k`；这只建立 mixture-level decision coupling。component 本身仍只能用
+`sum_k pi_k S_k(x,u,a)` 拟合 empirical centered continuation signature，并由 fit-replica
+signature 构造 permutation-equivariant `q^A_k`，加入 `KL(sg(q^A)||pi_t)`；one-hot `z=k`
+干预构造 `S_k`。这建立 decision-consistent posterior coupling，但不赋予 index 真值语义。
+component 本身仍只能用
 utilization、response/action divergence、one-hot actor effect 和跨 seed 置换对齐诊断描述。
 
 ## 4. 决策等价 estimand
@@ -74,6 +77,11 @@ A(H_t,a) = G(H_t,a) - mean_b G(H_t,b)
 continuation 从真实环境、ego carry 和伙伴 carry 快照开始，首动作强制为 `a`，之后双方按
 冻结 continuation policy 运行。fit 与 evaluation replicas 使用可审计且不重叠的 key
 index domains。标签不得包含 critic、学习端点值或手写协议类别。
+
+训练 anchor、冻结 comparator、final M1、BR-Prox、identifiability 和 recoverable-value 必须
+共用同一个 continuation contract：`gamma`、horizon、raw reward definition、terminal
+handling、continuation-policy fingerprint 及互斥 fit/evaluation key domains。任一字段不同即
+fail closed，不能共用 `A(H,a)` 名称或阈值。
 
 两段历史的 centered signatures 相同，只表示它们在注册 horizon/continuation policy 下
 decision-equivalent；不表示伙伴类型相同。
@@ -110,8 +118,11 @@ event_mask = previous_visible & current_visible
 ```
 
 进入/离开视野只进入 visibility head，不能在 event 中重复计数。运动学 head 可读 stopped
-physical frame；event head 只能读 `(m_k,u_t,a_t^ego)`，不能读 task features。让位、争抢、
-等待或角色意图均不得作为标签。
+physical frame；event head 只能读 `(m_k,u_t,a_t^ego,sg[压缩物理协变量])`，不能读 task
+features；物理协变量是固定的 stop-gradient channel-wise spatial mean/max 摘要，可涵盖可见
+agent/object/workstation feasibility，但不经过 task encoder，也不复制逐格 frame。让位、争抢、
+等待或角色意图均不得作为标签。必须同时报告去除 component 的 held-out NLL、event
+prevalence、正/负例 Brier 和 reliability curve。
 
 ## 7. 方法层级与公平比较
 
@@ -122,8 +133,14 @@ physical frame；event head 只能读 `(m_k,u_t,a_t^ego)`，不能读 task featu
 - B3：主动 action-conditioned transition/VOI，未实现并 fail closed。
 
 同容量开发消融固定为 deterministic-context、decision-only、Q-only、actor-only、
-no-separation 与 no-capability；它们与 R0、filter-only(B1)、extra-rollout controls 和 K
+no-separation、no-capability 与 response-only-posterior；它们与 R0、filter-only(B1)、
+extra-rollout controls 和 K
 sensitivity 一起用于排除更简单的机制解释，不改变正式 B2 身份。
+
+同期适应方法只以三个诚实的仓内 proxy 呈现：full-history recurrent、recurrent Bayes-filter
+和 deterministic latent-context。它们必须绑定同一训练伙伴池、ego interaction budget、
+deployable capacity、Common-Partner panel 和 episode keys；不得写成 CooT、RecBayes 或其他
+论文方法的忠实复现。未完成同协议同期复现前，不得声称达到 2026 领域 SOTA。
 
 `B1-B0` 和 `B2-B1` 是严格嵌套增量；`R0` 只回答显式结构是否优于普通 recurrence。开发期
 同时报告：相同主 PPO transitions 的 core matrix，以及把 B2 anchor/probe 成本全部换成普通

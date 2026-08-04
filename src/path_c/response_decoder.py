@@ -5,12 +5,9 @@ The decoder implements the per-component likelihood
 
     p(y | z, H, a) = sum_k pi_{t,k} p(y | z=k, a, sg[frame_t]).
 
-* Kinematic components 1-4 (visibility, relative position, direction,
-  inventory) read the stop-gradient frame feature ``sg[frame_t]`` -- predicting
-  kinematics requires a coordinate frame -- plus ``(m_k, u, a^ego)``.
-* Component 5 (observable interaction event) reads only ``(m_k, u, a^ego)``.
-  It cannot bypass the isolated task trunk or let task-state consequences
-  dominate the response-regime likelihood.
+* Both trunks read only stop-gradient physical channel summaries (spatial mean
+  and maximum), never task-encoder features.  This supplies event feasibility
+  while preventing pixel-level next-frame copying.
 
 All five heads emit a trailing ``K`` component axis so that
 ``response_targets.mixture_response_loss`` can form the proper mixture NLL
@@ -94,7 +91,15 @@ def response_decoder_class() -> Any:
                 raise ValueError("Component embeddings must be a (K, D) matrix.")
             component_count, component_dim = components.shape
             lead = action.shape
-            frame = frame.reshape(lead + (-1,))
+            if frame.shape[:-3] != lead:
+                raise ValueError("Response frame and action batch axes differ.")
+            frame = jnp.concatenate(
+                (
+                    jnp.mean(frame, axis=(-3, -2)),
+                    jnp.max(frame, axis=(-3, -2)),
+                ),
+                axis=-1,
+            )
             if u.shape[:-1] != lead:
                 raise ValueError("Response decoder batch axes differ.")
 
@@ -162,9 +167,11 @@ def response_decoder_class() -> Any:
                         PARTNER_INVENTORY_FACTOR_CLASSES)
             )
 
-            # Event head: response-regime, capability, and ego action only.
+            # Event head receives the same stopped physical covariates so an
+            # inventory change is conditioned on local interaction feasibility.
             event_input = jnp.concatenate(
                 (
+                    broadcast_frame,
                     broadcast_components,
                     broadcast_u,
                     broadcast_action,

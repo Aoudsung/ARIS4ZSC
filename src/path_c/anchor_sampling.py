@@ -267,18 +267,39 @@ def _attach_metadata(
     logits: Any,
     update: int,
     target_fingerprint: Any,
+    policy_fingerprint: Any,
     matched_pair_ids: Any,
+    context_summary: Any | None = None,
 ) -> Any:
     import jax.numpy as jnp
 
     count = int(jnp.asarray(batch.anchor_ids).shape[0])
+    context = jnp.asarray(
+        jnp.zeros((count, 1), dtype=jnp.float32)
+        if context_summary is None
+        else context_summary,
+        dtype=jnp.float32,
+    ).reshape((count, -1))
+    quantized = jnp.rint(context * 10_000.0).astype(jnp.int32)
+    positions = jnp.arange(1, quantized.shape[-1] + 1, dtype=jnp.int32)
+    context_fingerprint = jnp.stack(
+        (
+            jnp.sum(quantized, axis=-1).astype(jnp.uint32),
+            jnp.sum(quantized * positions[None], axis=-1).astype(jnp.uint32),
+        ),
+        axis=-1,
+    )
     return batch._replace(
         collection_policy_logits=jnp.asarray(logits, dtype=jnp.float32),
         collection_update=jnp.full((count,), int(update), dtype=jnp.int32),
         collection_target_fingerprint=jnp.broadcast_to(
             jnp.asarray(target_fingerprint, dtype=jnp.uint32), (count, 2)
         ),
+        collection_policy_fingerprint=jnp.broadcast_to(
+            jnp.asarray(policy_fingerprint, dtype=jnp.uint32), (count, 2)
+        ),
         matched_pair_ids=jnp.asarray(matched_pair_ids, dtype=jnp.int32),
+        collection_context_fingerprint=context_fingerprint,
     )
 
 
@@ -767,6 +788,128 @@ def decision_distinction_pair_dataset(
     return matrix, target, np.asarray(pair_blocks, dtype=object)
 
 
+def task_matched_decision_distinction_pair_dataset(
+    history_features: Any,
+    decision_signatures: Any,
+    task_features: Any,
+    partner_run_ids: Any,
+    *,
+    signature_distance_threshold: float,
+    task_match_epsilon: float,
+    episode_times: Any | None = None,
+    episode_time_tolerance: int = 0,
+    recipe_order_states: Any | None = None,
+    ego_roles: Any | None = None,
+    maximum_pairs: int = 32_768,
+    require_both_classes: bool = True,
+) -> tuple[Any, Any, Any, Mapping[str, Any]]:
+    """Build run-disjoint reciprocal-nearest-neighbour task-matched pairs."""
+
+    import numpy as np
+
+    histories = np.asarray(history_features, dtype=np.float64)
+    signatures = np.asarray(decision_signatures, dtype=np.float64)
+    tasks = np.asarray(task_features, dtype=np.float64)
+    runs = np.asarray(partner_run_ids).astype(str).reshape((-1,))
+    count = histories.shape[0]
+    if (
+        histories.ndim != 2
+        or signatures.ndim != 2
+        or tasks.ndim != 2
+        or signatures.shape[0] != count
+        or tasks.shape[0] != count
+        or runs.shape[0] != count
+    ):
+        raise ValueError("Comparator task/history/signature rows must align.")
+    if float(task_match_epsilon) <= 0.0:
+        raise ValueError("Task-match epsilon must be positive.")
+    times = (
+        np.zeros((count,), dtype=np.int64)
+        if episode_times is None
+        else np.asarray(episode_times, dtype=np.int64).reshape((-1,))
+    )
+    regimes = (
+        np.asarray(["registered"] * count)
+        if recipe_order_states is None
+        else np.asarray(recipe_order_states).astype(str).reshape((-1,))
+    )
+    roles = (
+        np.zeros((count,), dtype=np.int64)
+        if ego_roles is None
+        else np.asarray(ego_roles, dtype=np.int64).reshape((-1,))
+    )
+    if times.shape[0] != count or regimes.shape[0] != count or roles.shape[0] != count:
+        raise ValueError("Comparator time/regime rows must align.")
+
+    distances = np.sqrt(
+        np.sum(np.square(tasks[:, None, :] - tasks[None, :, :]), axis=-1)
+    )
+    eligible = (
+        (runs[:, None] != runs[None, :])
+        & (np.abs(times[:, None] - times[None, :]) <= int(episode_time_tolerance))
+        & (regimes[:, None] == regimes[None, :])
+        & (roles[:, None] == roles[None, :])
+    )
+    np.fill_diagonal(eligible, False)
+    candidate_count = int(np.sum(np.triu(eligible, k=1)))
+    masked = np.where(eligible, distances, np.inf)
+    nearest = np.argmin(masked, axis=1)
+    nearest_distance = masked[np.arange(count), nearest]
+    pairs: list[tuple[int, int, float]] = []
+    for left in range(count):
+        right = int(nearest[left])
+        if (
+            left < right
+            and np.isfinite(nearest_distance[left])
+            and int(nearest[right]) == left
+            and float(nearest_distance[left]) <= float(task_match_epsilon)
+        ):
+            pairs.append((left, right, float(nearest_distance[left])))
+    pairs = sorted(pairs, key=lambda item: (item[2], item[0], item[1]))[
+        : int(maximum_pairs)
+    ]
+    if not pairs:
+        raise ValueError("Task matching produced no reciprocal cross-run pairs.")
+    rows = np.stack(
+        [pair_feature_rows(histories[left], histories[right]) for left, right, _ in pairs]
+    )
+    labels = np.asarray(
+        [
+            float(
+                np.linalg.norm(signatures[left] - signatures[right])
+                > float(signature_distance_threshold)
+            )
+            for left, right, _ in pairs
+        ],
+        dtype=np.float32,
+    )
+    if require_both_classes and np.unique(labels).size != 2:
+        raise ValueError("Task-matched comparator fit needs both decision classes.")
+    blocks = np.asarray(
+        [f"{runs[left]}|{runs[right]}" for left, right, _ in pairs], dtype=object
+    )
+    matched_indexes = {index for left, right, _ in pairs for index in (left, right)}
+    per_run = {
+        run: int(sum(run in str(block).split("|") for block in blocks.astype(str)))
+        for run in sorted(set(runs.tolist()))
+    }
+    match_distances = np.asarray([distance for _, _, distance in pairs])
+    report = {
+        "candidate_pair_count": candidate_count,
+        "matched_pair_count": int(len(pairs)),
+        "match_coverage": float(len(matched_indexes) / max(count, 1)),
+        "unmatched_fraction": float(1.0 - len(matched_indexes) / max(count, 1)),
+        "task_distance_min": float(np.min(match_distances)),
+        "task_distance_median": float(np.median(match_distances)),
+        "task_distance_p90": float(np.quantile(match_distances, 0.90)),
+        "task_distance_max": float(np.max(match_distances)),
+        "pairs_per_partner_run": per_run,
+        "task_match_epsilon": float(task_match_epsilon),
+        "episode_time_tolerance": int(episode_time_tolerance),
+    }
+    return rows, labels, blocks, report
+
+
 def _fit_logistic_pair_rows(
     pair_features: Any,
     pair_labels: Any,
@@ -999,13 +1142,13 @@ def separation_terms_from_matched_pairs(
     equivalent_probability_max: float,
     distinct_probability_min: float,
     signature_threshold: float,
-    margin_scale: float,
+    margin: float,
 ) -> tuple[SeparationTerms, Mapping[str, Any]]:
     """Build the L_separation payload from the §5.3 classification (§3.2).
 
     Only the classification is precomputed here: equivalent/distinct masks,
-    per-pair weights and ``margin = margin_scale x mean distinct signature
-    distance`` stay constant between anchor triggers.  The two ego forward
+    per-pair weights and the registered cosine-space ``margin`` stay constant
+    between anchor triggers.  The two ego forward
     passes and the loss itself run inside ``compute_loss`` against the
     current params so the separation gradient enters the same
     ``value_and_grad`` as the other three losses (METHOD_SPEC §3.2/§3.4);
@@ -1028,12 +1171,9 @@ def separation_terms_from_matched_pairs(
         signature_threshold=float(signature_threshold),
         pair_valid=quotient.pair_valid,
     )
-    distinct_distance = jnp.where(
-        distinct_mask, quotient.decision_distance, 0.0
-    )
-    margin = margin_scale * jnp.sum(distinct_distance) / jnp.maximum(
-        jnp.sum(distinct_mask.astype(jnp.float32)), 1.0
-    )
+    margin_value = jnp.asarray(float(margin), dtype=jnp.float32)
+    if not 0.0 < float(margin) < 2.0:
+        raise ValueError("Normalized protocol cosine margin must lie in (0, 2).")
     weights = jnp.where(
         distinct_mask,
         quotient.decision_distance,
@@ -1045,7 +1185,7 @@ def separation_terms_from_matched_pairs(
         probe_observations=quotient.probe_observations,
         equivalent_mask=equivalent_mask,
         weights=weights,
-        margin=margin,
+        margin=margin_value,
         pair_valid=(
             jnp.ones_like(equivalent_mask, dtype=jnp.bool_)
             if quotient.pair_valid is None
@@ -1055,7 +1195,7 @@ def separation_terms_from_matched_pairs(
     readings = {
         "pair_class_fractions": fractions,
         "irreducible_ambiguity_fraction": fractions[2],
-        "separation_margin": margin,
+        "separation_margin": margin_value,
         "valid_pair_fraction": jnp.mean(
             (
                 jnp.ones_like(equivalent_mask, dtype=jnp.float32)
@@ -1163,11 +1303,16 @@ def collect_anchor_batch(
         logits=ordinary_target_output.policy_logits,
         update=collection_update,
         target_fingerprint=target_fingerprint,
+        policy_fingerprint=target_fingerprint,
         matched_pair_ids=jnp.full((ordinary_count,), -1, dtype=jnp.int32),
+        context_summary=ordinary_target_output.context_summary,
     )
 
     # §5.2: matched pairs are nearest-neighbour couplings of genuine
-    # snapshots from *different* partner runs.  No generator code, no
+    # snapshots from *different* partner runs. Candidate selection is
+    # stratified by time and the immutable partner-run identity so the
+    # fixed run-disjoint budget is controllable rather than left to a lucky
+    # draw of the coarser partner-source label. No generator code, no
     # mid-episode intervention, no forced episode-start splicing.
     candidate_count = 4 * pair_count
     if manifest_partitioned:
@@ -1192,7 +1337,7 @@ def collect_anchor_batch(
                     time_count=time_count,
                     environment_count=environment_count,
                     requested=requested,
-                    source_values=records["partner_source"],
+                    source_values=records["partner_run_ids"],
                     eligible_mask=np.asarray(partition_values) == partition,
                 )
             )
@@ -1203,7 +1348,7 @@ def collect_anchor_batch(
             time_count=time_count,
             environment_count=environment_count,
             requested=candidate_count,
-            source_values=records["partner_source"],
+            source_values=records["partner_run_ids"],
         )
     candidate_world = world_from_records(records, candidate_indexes)
     candidate_observations = gather_time_lanes(
@@ -1284,6 +1429,34 @@ def collect_anchor_batch(
     )
     lanes = jnp.arange(2 * pair_count, dtype=jnp.int32)
     paired_observations = paired_world.observations[lanes, paired_world.ego_roles]
+    endpoint_task_observation = task_only_observation(paired_observations)
+    endpoint_task_features = np.asarray(endpoint_task_observation).reshape(
+        (2 * pair_count, -1)
+    )
+    endpoint_task_distance = np.linalg.norm(
+        endpoint_task_features[0::2] - endpoint_task_features[1::2], axis=-1
+    )
+    endpoint_steps = np.asarray(
+        paired_world.ego_state.capability_carry.steps, dtype=np.int64
+    ).reshape((pair_count, 2))
+    endpoint_time_match = (
+        np.abs(endpoint_steps[:, 0] - endpoint_steps[:, 1])
+        <= int(config.anchors.episode_time_tolerance)
+    )
+    endpoint_channel_counts = np.sum(
+        np.asarray(endpoint_task_observation), axis=(1, 2)
+    ).reshape((pair_count, 2, -1))
+    endpoint_recipe_match = np.all(
+        np.isclose(
+            endpoint_channel_counts[:, 0],
+            endpoint_channel_counts[:, 1],
+            atol=1.0e-5,
+        ),
+        axis=-1,
+    )
+    endpoint_match = (
+        endpoint_task_distance <= float(config.anchors.endpoint_task_match_epsilon)
+    ) & endpoint_time_match & endpoint_recipe_match
     probe_features = pair_legal_history_features(probe_history)
     matched = collect_counterfactual_anchors(
         anchor_ids=(
@@ -1332,7 +1505,9 @@ def collect_anchor_batch(
         logits=matched_output.policy_logits,
         update=collection_update,
         target_fingerprint=target_fingerprint,
+        policy_fingerprint=target_fingerprint,
         matched_pair_ids=pair_ids,
+        context_summary=matched_output.context_summary,
     )
     combined = _concatenate(ordinary, matched)
     offset = ordinary_count
@@ -1539,6 +1714,7 @@ def collect_anchor_batch(
         np.asarray(probe_valid[0::2])
         & np.asarray(probe_valid[1::2])
         & training_pair_mask
+        & endpoint_match
     )
     quotient = QuotientPairBatch(
         anchor_index_a=left,
@@ -1546,8 +1722,12 @@ def collect_anchor_batch(
         decision_distance=decision_distance(signatures[left], signatures[right]),
         weights=jnp.ones((pair_count,), dtype=jnp.float32),
         comparator_distinct_probability=jnp.asarray(pair_probabilities),
-        ego_state_a=paired_world.ego_state[0::2],
-        ego_state_b=paired_world.ego_state[1::2],
+        ego_state_a=jax.tree_util.tree_map(
+            lambda value: value[0::2], paired_world.ego_state
+        ),
+        ego_state_b=jax.tree_util.tree_map(
+            lambda value: value[1::2], paired_world.ego_state
+        ),
         probe_observations=jnp.stack(
             (paired_observations[0::2], paired_observations[1::2])
         ),
@@ -1577,6 +1757,12 @@ def collect_anchor_batch(
         "invalid_matched_probe_states": int(
             np.sum(~np.asarray(probe_valid, dtype=bool))
         ),
+        "endpoint_task_matched_pair_count": int(np.sum(endpoint_match)),
+        "endpoint_task_match_fraction": float(np.mean(endpoint_match)),
+        "endpoint_task_distance_median": float(np.median(endpoint_task_distance)),
+        "endpoint_task_distance_max": float(np.max(endpoint_task_distance)),
+        "endpoint_time_match_fraction": float(np.mean(endpoint_time_match)),
+        "endpoint_recipe_match_fraction": float(np.mean(endpoint_recipe_match)),
         "pair_class_fractions": class_readings["pair_class_fractions"],
         "irreducible_ambiguity_fraction": class_readings[
             "irreducible_ambiguity_fraction"

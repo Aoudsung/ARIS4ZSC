@@ -47,13 +47,13 @@ scoreboard 使用注册次数的 node bootstrap 和单侧 LCB。superiority 同�
 
 ## 5. 开发矩阵与双重预算
 
-每个 K∈{2,4,8}、固定 paired seed indexes 0--9，执行：
+固定 paired seed indexes 0--9，按分层资源设计执行：
 
 ```text
-core: R0, B0, B1, B2
-total-budget controls: R0-extra, B0-extra, B1-extra
-mechanism ablations: deterministic-context, decision-only, Q-only, actor-only,
-                     no-separation, no-capability
+K=4 main: R0, B0, B1, B2, R0-extra, B0-extra, B1-extra
+K=4 mechanism: deterministic-context, decision-only, Q-only, actor-only,
+               no-separation, no-capability, response-only-posterior
+K=2/8 sensitivity: B1, B2
 ```
 
 所有格共享 partner sampler、deployable capacity、训练/评估 key domains、Official 环境和
@@ -62,17 +62,19 @@ mechanism ablations: deterministic-context, decision-only, Q-only, actor-only,
 training simulator steps 必须与 B2 精确相等。
 
 主嵌套 contrasts 为 `B1-B0` 和 `B2-B1`；`B0-R0` 只比较结构基座与 full-history reference。
-必须同时报告 `B2-R0-extra`、`B2-B0-extra`、`B2-B1-extra` 以及 B2 对六项机制消融的 paired
+必须同时报告 `B2-R0-extra`、`B2-B0-extra`、`B2-B1-extra` 以及 B2 对七项机制消融的 paired
 contrast，避免把额外数据成本或较简单机制误写为算法增益。
 
-每个 K/variant 必须由 `evaluate-development-matrix` 生成 raw episode parquet、run identity、
+每个注册 K/variant 格必须由 `evaluate-development-matrix` 生成 raw episode parquet、run identity、
 deployment hashes、config fingerprint、key schedule 和 resource ledger。summary 只接受这些
 evaluation directories，并从 raw rows 重算 per-seed 双角色 XP 与 99% paired intervals。
 自由格式 `depi_development_scores.json`、训练曲线或手写 `xp_mean` 一律无效。
 
-每个 K 的 B2 必须覆盖十个 final-policy component diagnostic artifacts；summary 从 one-hot
-signature 重新执行 permutation alignment，报告跨 seed stability，并验证 utilization、pairwise
-response/action divergence 和 actor intervention 均来自 fresh final anchors。
+每个 K 的 B2 必须覆盖十个 final-policy component diagnostic artifacts；所有 seed 在同一个由
+comparator validation histories 冻结的只读 panel 上重放。summary 在 `[anchor,K,action]` 张量
+上重新执行 permutation alignment，报告跨 seed stability，并验证 minimum utilization、
+effective count、dominant fraction、usage entropy、pairwise response/action divergence 和 actor
+intervention 均来自该共享 panel。
 
 K=4 是主设置。`B1-B0` 下界是否为正只决定 filter architecture claim；`B2-B1` 下界与 final
 M1 只决定 decision-supervision claim。B3 不进入矩阵。
@@ -86,8 +88,11 @@ gate 使用 run-level interval，而非聚合点估计：
 
 - model-minus-uniform NLL 的 UCB 不高于 `-0.02`；
 - model-minus-no-history NLL 的 UCB 不高于 `-0.02`；
-- position/direction 的 90% HPS coverage interval 与注册 coverage band 相交；
+- position/direction 的 90% HPS coverage 95% interval 完整包含于注册 coverage band；
 - event Brier 相对注册 prior baseline 的 contrast UCB 不高于零。
+
+event gate 要求总正事件至少 100、每个 partner family 至少 20；不足必须为 `not_estimable`。
+另报 event prevalence interval、positive/negative Brier 与 reliability curve。
 
 评分复用 deployment filter/joint likelihood。component index accuracy 与 pooled episode p-value
 禁止进入 gate。
@@ -108,14 +113,24 @@ gate 使用 run-level interval，而非聚合点估计：
 - **final M1**：必须使用 final-policy fresh anchors、重新初始化的 bootstrap members 和不重叠
   replica index domains；所有 policy fingerprints 与 deployment 一致。
 
+transplant 只调用 `decision_from_frozen_context(x_s,r_s,u,c)`，不得把 donor recurrent hidden 与
+source previous observation/action 拼成 hybrid state。区间同时给出 fixed-panel ego bootstrap 与
+ego/partner/donor crossed bootstrap。
+
 G4 偶尔低于 G1 不构成 schema 失败，也不作 pass gate。task representation 在 carry
 transplant 下的恒等不变只作描述性/结构测试，不重复算一项经验门。
 
 ## 8. 容量、资源与来源闭合
 
-资源报告至少分列：ego PPO、owner initialization、upstream partner、counterfactual
-continuation、matched probe、calibration、evaluation、GPU hours、peak memory、deployable 与
-training-only parameters。失败/恢复历史也必须保留。
+资源报告至少分列：ego PPO、owner initialization、upstream partner、comparator history 与
+continuation、reference ego、counterfactual continuation、matched probe、final M1、component
+diagnostic、mechanism evaluation、calibration、evaluation、GPU hours、peak memory、inference
+latency、deployable 与 training-only parameters。每个方法同时报告 marginal、shared、按实际
+reuse count amortized 与 fully-loaded reproduction cost。失败/恢复历史也必须保留。
+
+三个同期适应 proxy 必须在 manifest 级验证与 DEPI 相同的训练 pool、ego interaction budget 和
+deployable capacity，并使用同一 Common-Partner panel、角色、episode keys 与 raw return。结果
+只能称仓内 proxy 对照，不能外推为对已发表方法的复现或领域 SOTA 比较。
 
 所有 summary 必须验证输入路径与 SHA、method、布局、deployment、config、partner panel、
 episode count/roles/keys 和资源账本。formal claim builder 应再次从 raw sources 重算可重算

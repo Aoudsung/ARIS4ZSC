@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Any, Mapping
 
 import numpy as np
@@ -22,10 +24,16 @@ from experiments.overcooked_v2.official_br_prox_app import (
 from src.path_c.anchor_sampling import (
     COMPARATOR_RUN_ID_CAPACITY,
     FrozenPairComparator,
-    decision_distinction_pair_dataset,
     fit_pair_comparator,
     pair_legal_history_features,
+    task_matched_decision_distinction_pair_dataset,
 )
+from src.path_c.comparator_contract import (
+    ComparatorContract,
+    comparator_contract_for_run,
+    comparator_reference_policy_set_hash,
+)
+from src.path_c.continuation import ContinuationContract, validate_continuation_contract
 from src.path_c.decision_geometry import centered_action_values
 from src.path_c.experiment import (
     OFFICIAL_SOURCE_COMMIT,
@@ -33,7 +41,11 @@ from src.path_c.experiment import (
     load_partner_manifest,
     validate_partner_manifest,
 )
-from src.path_c.resources import ResourceLedger
+from src.path_c.resources import ResourceLedger, gpu_hours_for_wall_seconds
+from src.path_c.task_encoder import (
+    instantaneous_partner_observation,
+    task_only_observation,
+)
 from src.path_c.storage import (
     ensure_run_identity,
     runtime_provenance,
@@ -44,18 +56,52 @@ from src.path_c.storage import (
 )
 
 
-COMPARATOR_ARTIFACT_VERSION = 1
-COMPARATOR_SOURCE_VERSION = 2
+COMPARATOR_ARTIFACT_VERSION = 3
+COMPARATOR_SOURCE_VERSION = 4
 MINIMUM_HISTORIES_PER_SPLIT = 256
 MINIMUM_RUNS_PER_SPLIT = 8
 COMPARATOR_HISTORIES_PER_ROLE_RUN = 16
 COMPARATOR_REFERENCE_ROOT_SEED = 42
+COMPARATOR_TASK_MATCH_EPSILON = 4.0
+COMPARATOR_EPISODE_TIME_TOLERANCE = 0
+
+
+def _training_cost_source(checkpoint: Path, *, label: str) -> Mapping[str, Any]:
+    """Resolve an explicit upstream ledger for a shared frozen policy."""
+
+    candidates: list[Path] = []
+    for directory in (checkpoint, *checkpoint.parents[:6]):
+        candidates.extend(
+            (directory / "resource_ledger.json", directory / "upstream_summary.json")
+        )
+    ledger_path = next((path for path in candidates if path.is_file()), None)
+    if ledger_path is None:
+        raise RuntimeError(f"{label} has no explicit upstream resource ledger.")
+    payload = json.loads(ledger_path.read_text(encoding="utf-8"))
+    try:
+        ledger = ResourceLedger.from_mapping(payload)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"{label} upstream resource ledger is not the registered schema."
+        ) from error
+    steps = ledger.total_training_simulator_steps
+    if int(steps) <= 0:
+        raise RuntimeError(f"{label} upstream resource ledger has no positive step total.")
+    return {
+        "path": str(ledger_path.resolve()),
+        "sha256": sha256_path(ledger_path),
+        "training_simulator_steps": int(steps),
+        "gpu_hours": float(ledger.gpu_hours),
+        "wall_clock_hours": float(ledger.wall_clock_hours),
+    }
 
 
 def collect_pair_comparator_source(args: argparse.Namespace) -> None:
     """Collect a lineage-bound comparator source in the pinned simulator."""
 
     import jax
+
+    started = time.perf_counter()
 
     validate_formal_repository_state()
     validate_registered_python_runtime()
@@ -87,6 +133,18 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
             raise ValueError("Comparator source partners must be shared and owner-free.")
     if parents_by_split["fit_histories"] & parents_by_split["validation_histories"]:
         raise ValueError("Comparator source fit/validation parents overlap.")
+    reference_resource = _training_cost_source(
+        reference_checkpoint, label="Comparator reference ego"
+    )
+    comparator_parent_resources: dict[str, Mapping[str, Any]] = {}
+    for runs in split_runs.values():
+        for run in runs:
+            parent = str(run.parent_training_run_id)
+            if parent not in comparator_parent_resources:
+                comparator_parent_resources[parent] = _training_cost_source(
+                    Path(run.checkpoint).resolve(),
+                    label=f"Comparator partner parent {parent}",
+                )
     reference_checkpoint_sha = sha256_path(reference_checkpoint)
     comparator_checkpoint_hashes = {
         str(run.checkpoint_sha256)
@@ -95,6 +153,17 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
     }
     if reference_checkpoint_sha in comparator_checkpoint_hashes:
         raise ValueError("Comparator reference ego is also a comparator partner.")
+    reference_policy_set_hash = comparator_reference_policy_set_hash(
+        reference_checkpoint_sha256=reference_checkpoint_sha,
+        manifest=manifest,
+    )
+    comparator_contract = comparator_contract_for_run(
+        config=config,
+        manifest=manifest,
+        reference_policy_set_hash=reference_policy_set_hash,
+    )
+    if comparator_contract.task_match_epsilon != COMPARATOR_TASK_MATCH_EPSILON:
+        raise ValueError("Config comparator task-match epsilon differs from registration.")
 
     reference_config, reference_params = restore_official_checkpoint(
         reference_checkpoint
@@ -149,6 +218,8 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
                     fit_replicas=fit_replicas,
                     evaluation_replicas=evaluation_replicas,
                     continuation_horizon=horizon,
+                    gamma=float(config.ppo.gamma),
+                    continuation_policy_fingerprint=reference_policy_set_hash,
                 )
                 features = np.asarray(
                     pair_legal_history_features(recorded["history"]),
@@ -160,6 +231,29 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
                 evaluation_returns = np.asarray(
                     continuations["evaluation_returns_by_action"], dtype=np.float64
                 )
+                ego_name = "agent_0" if ego_role == 0 else "agent_1"
+                current_observation = np.asarray(
+                    recorded["selected"]["observations"][ego_name],
+                    dtype=np.float32,
+                )
+                task_observation = np.asarray(
+                    task_only_observation(current_observation), dtype=np.float32
+                )
+                task_features = task_observation.reshape(
+                    (anchors_per_role_run, -1)
+                )
+                instant_features = np.asarray(
+                    instantaneous_partner_observation(current_observation),
+                    dtype=np.float32,
+                ).reshape((anchors_per_role_run, -1))
+                task_channel_counts = np.sum(task_observation, axis=(1, 2))
+                history_observations = np.asarray(
+                    recorded["history"].ego_observations, dtype=np.float32
+                )
+                history_actions = np.asarray(
+                    recorded["history"].ego_actions, dtype=np.int32
+                )
+                episode_times = np.asarray(recorded["time_indexes"], dtype=np.int64)
                 if (
                     features.shape[0] != anchors_per_role_run
                     or returns.shape != (anchors_per_role_run, 6)
@@ -174,6 +268,20 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
                             index
                         ].tolist(),
                         "partner_run_id": str(run.run_id),
+                        "partner_mechanism": str(run.generation_mechanism),
+                        "task_features": task_features[index].tolist(),
+                        "episode_time": int(episode_times[index]),
+                        "recipe_order_state": hashlib.sha256(
+                            np.round(task_channel_counts[index], 4).tobytes()
+                        ).hexdigest(),
+                        "ego_role": int(ego_role),
+                        "instant_partner_features": instant_features[index].tolist(),
+                        "task_state_hash": hashlib.sha256(
+                            np.round(task_features[index], 4).tobytes()
+                        ).hexdigest(),
+                        "history_observations": history_observations[index].tolist(),
+                        "history_actions": history_actions[index].tolist(),
+                        "current_observation": current_observation[index].tolist(),
                     }
                     for index in range(anchors_per_role_run)
                 )
@@ -196,9 +304,35 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
         "path": str(manifest_path),
         "sha256": sha256_path(manifest_path),
     }
+    elapsed_wall_seconds = time.perf_counter() - started
+    comparator_gpu_hours = gpu_hours_for_wall_seconds(elapsed_wall_seconds)
     resource_ledger = ResourceLedger(
-        counterfactual_continuation_steps=continuation_steps,
-        evaluation_steps=trajectory_steps,
+        comparator_continuation_steps=continuation_steps,
+        comparator_history_collection_steps=trajectory_steps,
+        reference_ego_upstream_steps=int(
+            reference_resource["training_simulator_steps"]
+        ),
+        shared_pretraining_cost=sum(
+            int(value["training_simulator_steps"])
+            for value in comparator_parent_resources.values()
+        ),
+        gpu_hours=(
+            float(reference_resource["gpu_hours"])
+            + sum(
+                float(value["gpu_hours"])
+                for value in comparator_parent_resources.values()
+            )
+            + comparator_gpu_hours
+        ),
+        comparator_gpu_hours=comparator_gpu_hours,
+        wall_clock_hours=(
+            elapsed_wall_seconds / 3_600.0
+            + float(reference_resource["wall_clock_hours"])
+            + sum(
+                float(value["wall_clock_hours"])
+                for value in comparator_parent_resources.values()
+            )
+        ),
     ).to_mapping()
     payload = {
         "version": COMPARATOR_SOURCE_VERSION,
@@ -207,9 +341,18 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
         "official_source_commit": OFFICIAL_SOURCE_COMMIT,
         "config_fingerprint": config.fingerprint,
         "reference_ego_checkpoint": reference,
+        "reference_ego_resource": reference_resource,
+        "comparator_partner_resources": comparator_parent_resources,
         "partner_manifest": partner_source,
         "probe_steps": probe_steps,
         "signature_distance_threshold": 1.0,
+        "comparator_contract": comparator_contract.to_mapping(),
+        "comparator_contract_fingerprint": comparator_contract.fingerprint,
+        "continuation_contract": ContinuationContract(
+            gamma=float(config.ppo.gamma),
+            horizon=horizon,
+            continuation_policy_fingerprint=reference_policy_set_hash,
+        ).to_mapping(),
         "collection": {
             "reference_policy": "fixed_official_checkpoint",
             "root_key": [0, COMPARATOR_REFERENCE_ROOT_SEED],
@@ -230,8 +373,14 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
             "repository_runtime": runtime_provenance(),
             "config": {"path": str(config_path), "fingerprint": config.fingerprint},
             "reference_ego_checkpoint": reference,
+            "reference_ego_resource": reference_resource,
+            "comparator_partner_resources": comparator_parent_resources,
             "partner_manifest": partner_source,
             "collection": payload["collection"],
+            "comparator_contract": payload["comparator_contract"],
+            "comparator_contract_fingerprint": payload[
+                "comparator_contract_fingerprint"
+            ],
         },
     )
     write_json(output / "pair_comparator_source.json", payload)
@@ -240,7 +389,7 @@ def collect_pair_comparator_source(args: argparse.Namespace) -> None:
 
 def _rows(
     payload: Any, *, label: str
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Mapping[str, np.ndarray]:
     if not isinstance(payload, list) or len(payload) < MINIMUM_HISTORIES_PER_SPLIT:
         raise ValueError(
             f"Comparator {label} needs at least {MINIMUM_HISTORIES_PER_SPLIT} histories."
@@ -250,6 +399,16 @@ def _rows(
         "fit_returns_by_action",
         "evaluation_returns_by_action",
         "partner_run_id",
+        "partner_mechanism",
+        "task_features",
+        "episode_time",
+        "recipe_order_state",
+        "ego_role",
+        "instant_partner_features",
+        "task_state_hash",
+        "history_observations",
+        "history_actions",
+        "current_observation",
     }
     if any(not isinstance(row, Mapping) or set(row) != expected for row in payload):
         raise ValueError(f"Comparator {label} history row schema differs.")
@@ -259,28 +418,78 @@ def _rows(
         [row["evaluation_returns_by_action"] for row in payload], dtype=np.float64
     )
     runs = np.asarray([str(row["partner_run_id"]) for row in payload])
+    mechanisms = np.asarray([str(row["partner_mechanism"]) for row in payload])
+    tasks = np.asarray([row["task_features"] for row in payload], dtype=np.float64)
+    times = np.asarray([row["episode_time"] for row in payload], dtype=np.int64)
+    regimes = np.asarray([str(row["recipe_order_state"]) for row in payload])
+    roles = np.asarray([row["ego_role"] for row in payload], dtype=np.int64)
+    instant = np.asarray(
+        [row["instant_partner_features"] for row in payload], dtype=np.float64
+    )
+    hashes = np.asarray([str(row["task_state_hash"]) for row in payload])
+    history_observations = np.asarray(
+        [row["history_observations"] for row in payload], dtype=np.float32
+    )
+    history_actions = np.asarray(
+        [row["history_actions"] for row in payload], dtype=np.int32
+    )
+    current_observations = np.asarray(
+        [row["current_observation"] for row in payload], dtype=np.float32
+    )
     if (
         features.ndim != 2
         or returns.shape != (features.shape[0], 6)
         or evaluation_returns.shape != returns.shape
+        or tasks.ndim != 2
+        or tasks.shape[0] != features.shape[0]
+        or instant.ndim != 2
+        or instant.shape[0] != features.shape[0]
+        or history_observations.shape[0] != features.shape[0]
+        or history_actions.shape[:2] != history_observations.shape[:2]
+        or current_observations.shape[0] != features.shape[0]
+        or times.shape != runs.shape
+        or roles.shape != runs.shape
+        or hashes.shape != runs.shape
+        or mechanisms.shape != runs.shape
     ):
         raise ValueError(f"Comparator {label} feature/return shapes differ.")
     if (
         not np.all(np.isfinite(features))
         or not np.all(np.isfinite(returns))
         or not np.all(np.isfinite(evaluation_returns))
+        or not np.all(np.isfinite(tasks))
+        or not np.all(np.isfinite(instant))
+        or not np.all(np.isfinite(history_observations))
+        or not np.all(np.isfinite(current_observations))
     ):
         raise ValueError(f"Comparator {label} contains non-finite values.")
     if np.unique(runs).size < MINIMUM_RUNS_PER_SPLIT:
         raise ValueError(
             f"Comparator {label} needs at least {MINIMUM_RUNS_PER_SPLIT} partner runs."
         )
-    return (
-        features,
-        centered_action_values(returns),
-        centered_action_values(evaluation_returns),
-        runs,
-    )
+    if (
+        np.any((roles != 0) & (roles != 1))
+        or any(len(value) != 64 for value in hashes)
+        or any(len(value) != 64 for value in regimes)
+        or any(not value for value in mechanisms)
+    ):
+        raise ValueError(f"Comparator {label} role/hash values differ.")
+    return {
+        "history_features": features,
+        "fit_signatures": centered_action_values(returns),
+        "evaluation_signatures": centered_action_values(evaluation_returns),
+        "partner_run_ids": runs,
+        "partner_mechanisms": mechanisms,
+        "task_features": tasks,
+        "episode_times": times,
+        "recipe_order_states": regimes,
+        "ego_roles": roles,
+        "instant_partner_features": instant,
+        "task_state_hashes": hashes,
+        "history_observations": history_observations,
+        "history_actions": history_actions,
+        "current_observations": current_observations,
+    }
 
 
 def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
@@ -293,9 +502,14 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
         "official_source_commit",
         "config_fingerprint",
         "reference_ego_checkpoint",
+        "reference_ego_resource",
+        "comparator_partner_resources",
         "partner_manifest",
         "probe_steps",
         "signature_distance_threshold",
+        "comparator_contract",
+        "comparator_contract_fingerprint",
+        "continuation_contract",
         "collection",
         "resource_ledger",
         "fit_histories",
@@ -314,12 +528,52 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
         or float(payload["signature_distance_threshold"]) != 1.0
     ):
         raise ValueError("Comparator source registration differs.")
+    comparator_contract = ComparatorContract.from_mapping(
+        payload["comparator_contract"]
+    )
+    if comparator_contract.fingerprint != payload["comparator_contract_fingerprint"]:
+        raise ValueError("Comparator contract fingerprint differs.")
+    validate_continuation_contract(
+        payload["continuation_contract"],
+        expected=ContinuationContract(
+            gamma=float(comparator_contract.gamma),
+            horizon=int(comparator_contract.continuation_horizon),
+            continuation_policy_fingerprint=(
+                comparator_contract.reference_policy_set_hash
+            ),
+        ),
+    )
     for field in ("reference_ego_checkpoint", "partner_manifest"):
         descriptor = payload[field]
         if not isinstance(descriptor, Mapping) or set(descriptor) != {"path", "sha256"}:
             raise ValueError(f"Comparator source {field} identity differs.")
         if sha256_path(Path(str(descriptor["path"])).resolve()) != descriptor["sha256"]:
             raise ValueError(f"Comparator source {field} hash differs.")
+    reference_resource = payload["reference_ego_resource"]
+    if (
+        not isinstance(reference_resource, Mapping)
+        or set(reference_resource) != {
+            "path", "sha256", "training_simulator_steps", "gpu_hours", "wall_clock_hours"
+        }
+        or sha256_path(Path(str(reference_resource["path"])).resolve())
+        != reference_resource["sha256"]
+        or int(reference_resource["training_simulator_steps"]) <= 0
+    ):
+        raise ValueError("Comparator reference-ego resource provenance differs.")
+    parent_resources = payload["comparator_partner_resources"]
+    if not isinstance(parent_resources, Mapping) or not parent_resources:
+        raise ValueError("Comparator partner resource provenance differs.")
+    for descriptor in parent_resources.values():
+        if (
+            not isinstance(descriptor, Mapping)
+            or set(descriptor) != {
+                "path", "sha256", "training_simulator_steps", "gpu_hours", "wall_clock_hours"
+            }
+            or sha256_path(Path(str(descriptor["path"])).resolve())
+            != descriptor["sha256"]
+            or int(descriptor["training_simulator_steps"]) <= 0
+        ):
+            raise ValueError("Comparator partner resource provenance differs.")
     collection = payload["collection"]
     if (
         not isinstance(collection, Mapping)
@@ -341,10 +595,27 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
     except (TypeError, ValueError) as error:
         raise ValueError("Comparator source resource ledger differs.") from error
     if (
-        ledger.counterfactual_continuation_steps <= 0
-        or ledger.evaluation_steps <= 0
-        or ledger.total_training_simulator_steps
-        != ledger.counterfactual_continuation_steps
+        ledger.comparator_continuation_steps <= 0
+        or ledger.comparator_history_collection_steps <= 0
+        or ledger.reference_ego_upstream_steps
+        != int(reference_resource["training_simulator_steps"])
+        or ledger.shared_pretraining_cost
+        != sum(
+            int(value["training_simulator_steps"])
+            for value in parent_resources.values()
+        )
+        or not np.isclose(
+            ledger.gpu_hours,
+            float(reference_resource["gpu_hours"])
+            + sum(float(value["gpu_hours"]) for value in parent_resources.values())
+            + float(ledger.comparator_gpu_hours),
+        )
+        or ledger.wall_clock_hours
+        < float(reference_resource["wall_clock_hours"])
+        + sum(
+            float(value["wall_clock_hours"])
+            for value in parent_resources.values()
+        )
     ):
         raise ValueError("Comparator source resource ledger differs.")
     collector_identity_path = source.parent / "run_identity.json"
@@ -360,40 +631,57 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
         != payload["config_fingerprint"]
         or collector_identity.get("reference_ego_checkpoint")
         != payload["reference_ego_checkpoint"]
+        or collector_identity.get("reference_ego_resource")
+        != payload["reference_ego_resource"]
+        or collector_identity.get("comparator_partner_resources")
+        != payload["comparator_partner_resources"]
         or collector_identity.get("partner_manifest") != payload["partner_manifest"]
         or collector_identity.get("collection") != payload["collection"]
+        or collector_identity.get("comparator_contract")
+        != payload["comparator_contract"]
+        or collector_identity.get("comparator_contract_fingerprint")
+        != payload["comparator_contract_fingerprint"]
         or collector_budget != ledger_payload
     ):
         raise ValueError("Comparator source collector provenance differs.")
-    (
-        fit_features,
-        fit_signatures,
-        unused_fit_evaluation_signatures,
-        fit_runs,
-    ) = _rows(payload["fit_histories"], label="fit")
-    (
-        validation_features,
-        unused_validation_fit_signatures,
-        validation_signatures,
-        validation_runs,
-    ) = _rows(payload["validation_histories"], label="validation")
-    del unused_fit_evaluation_signatures, unused_validation_fit_signatures
+    fit_source = _rows(payload["fit_histories"], label="fit")
+    validation_source = _rows(payload["validation_histories"], label="validation")
+    fit_features = fit_source["history_features"]
+    fit_signatures = fit_source["fit_signatures"]
+    fit_runs = fit_source["partner_run_ids"]
+    validation_features = validation_source["history_features"]
+    validation_signatures = validation_source["evaluation_signatures"]
+    validation_runs = validation_source["partner_run_ids"]
     if fit_features.shape[1] != validation_features.shape[1]:
         raise ValueError("Comparator fit/validation feature dimensions differ.")
     if set(fit_runs.tolist()) & set(validation_runs.tolist()):
         raise ValueError("Comparator fit and validation partner runs overlap.")
-    fit_rows, fit_labels, fit_blocks = decision_distinction_pair_dataset(
-        fit_features,
-        fit_signatures,
-        signature_distance_threshold=1.0,
-        block_ids=fit_runs,
+    fit_rows, fit_labels, fit_blocks, fit_match_report = (
+        task_matched_decision_distinction_pair_dataset(
+            fit_features,
+            fit_signatures,
+            fit_source["task_features"],
+            fit_runs,
+            signature_distance_threshold=1.0,
+            task_match_epsilon=float(comparator_contract.task_match_epsilon),
+            episode_times=fit_source["episode_times"],
+            episode_time_tolerance=COMPARATOR_EPISODE_TIME_TOLERANCE,
+            recipe_order_states=fit_source["recipe_order_states"],
+            ego_roles=fit_source["ego_roles"],
+        )
     )
-    validation_rows, validation_labels, validation_blocks = (
-        decision_distinction_pair_dataset(
+    validation_rows, validation_labels, validation_blocks, validation_match_report = (
+        task_matched_decision_distinction_pair_dataset(
             validation_features,
             validation_signatures,
+            validation_source["task_features"],
+            validation_runs,
             signature_distance_threshold=1.0,
-            block_ids=validation_runs,
+            task_match_epsilon=float(comparator_contract.task_match_epsilon),
+            episode_times=validation_source["episode_times"],
+            episode_time_tolerance=COMPARATOR_EPISODE_TIME_TOLERANCE,
+            recipe_order_states=validation_source["recipe_order_states"],
+            ego_roles=validation_source["ego_roles"],
             require_both_classes=True,
         )
     )
@@ -412,10 +700,21 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
     result = {
         "version": COMPARATOR_ARTIFACT_VERSION,
         "artifact_type": "depi_frozen_pair_comparator",
-        "estimand": "P(decision-signature distance > 1.0 | legal history pair)",
+        "estimand": (
+            "P(discounted decision-signature distance > 1.0 | reciprocal "
+            "task-state-matched legal history pair)"
+        ),
         "method_independent": True,
         "protocol_component_count_independent": True,
         "state_matching_space": "fixed_simulator_task_planes",
+        "state_matching_algorithm": "run_disjoint_mutual_nearest_neighbour",
+        "fit_match_report": fit_match_report,
+        "validation_match_report": validation_match_report,
+        "comparator_contract": payload["comparator_contract"],
+        "comparator_contract_fingerprint": payload[
+            "comparator_contract_fingerprint"
+        ],
+        "continuation_contract": payload["continuation_contract"],
         "history_feature_dim": int(comparator.history_feature_dim),
         "pair_feature_dim": int(comparator.pair_feature_dim),
         "weights": np.asarray(comparator.weights).tolist(),
@@ -434,9 +733,18 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
             "official_source_commit": str(payload["official_source_commit"]),
             "config_fingerprint": str(payload["config_fingerprint"]),
             "reference_ego_checkpoint": payload["reference_ego_checkpoint"],
+            "reference_ego_resource": payload["reference_ego_resource"],
+            "comparator_partner_resources": payload[
+                "comparator_partner_resources"
+            ],
             "partner_manifest": payload["partner_manifest"],
             "collection": payload["collection"],
             "resource_ledger": payload["resource_ledger"],
+            "comparator_contract": payload["comparator_contract"],
+            "comparator_contract_fingerprint": payload[
+                "comparator_contract_fingerprint"
+            ],
+            "continuation_contract": payload["continuation_contract"],
         },
         "source_provenance": {
             "run_identity": {
@@ -467,13 +775,19 @@ def fit_frozen_pair_comparator(args: argparse.Namespace) -> None:
 
 
 def load_frozen_pair_comparator(
-    path: str | Path, *, expected_history_feature_dim: int
+    path: str | Path,
+    *,
+    expected_contract: ComparatorContract,
+    expected_history_feature_dim: int,
 ) -> FrozenPairComparator:
     source = Path(path).resolve()
     payload = json.loads(source.read_text(encoding="utf-8"))
     required = {
         "version", "artifact_type", "estimand", "method_independent",
         "protocol_component_count_independent", "state_matching_space",
+        "state_matching_algorithm", "fit_match_report", "validation_match_report",
+        "comparator_contract", "comparator_contract_fingerprint",
+        "continuation_contract",
         "history_feature_dim", "pair_feature_dim", "weights", "bias",
         "train_accuracy", "validation_accuracy", "validation_accuracy_interval",
         "fit_pair_count", "validation_pair_count", "fit_history_count",
@@ -490,6 +804,11 @@ def load_frozen_pair_comparator(
         or payload["method_independent"] is not True
         or payload["protocol_component_count_independent"] is not True
         or payload["state_matching_space"] != "fixed_simulator_task_planes"
+        or payload["state_matching_algorithm"]
+        != "run_disjoint_mutual_nearest_neighbour"
+        or payload["comparator_contract"] != expected_contract.to_mapping()
+        or payload["comparator_contract_fingerprint"]
+        != expected_contract.fingerprint
         or int(payload["history_feature_dim"]) != int(expected_history_feature_dim)
         or int(payload["pair_feature_dim"]) != 2 * int(expected_history_feature_dim)
         or int(payload["fit_history_count"]) < MINIMUM_HISTORIES_PER_SPLIT
@@ -498,6 +817,26 @@ def load_frozen_pair_comparator(
         or int(payload["validation_partner_run_count"]) < MINIMUM_RUNS_PER_SPLIT
     ):
         raise ValueError("Frozen comparator registration differs.")
+    validate_continuation_contract(
+        payload["continuation_contract"],
+        expected=ContinuationContract(
+            gamma=float(expected_contract.gamma),
+            horizon=int(expected_contract.continuation_horizon),
+            continuation_policy_fingerprint=(
+                expected_contract.reference_policy_set_hash
+            ),
+        ),
+    )
+    for name in ("fit_match_report", "validation_match_report"):
+        report = payload[name]
+        if (
+            not isinstance(report, Mapping)
+            or int(report.get("matched_pair_count", 0)) <= 0
+            or not 0.0 < float(report.get("match_coverage", 0.0)) <= 1.0
+            or float(report.get("task_distance_max", float("inf")))
+            > float(expected_contract.task_match_epsilon)
+        ):
+            raise ValueError("Frozen comparator task-matching report differs.")
     if not isinstance(payload["source"], Mapping) or set(payload["source"]) != {
         "path",
         "sha256",
@@ -524,14 +863,23 @@ def load_frozen_pair_comparator(
         "official_source_commit",
         "config_fingerprint",
         "reference_ego_checkpoint",
+        "reference_ego_resource",
+        "comparator_partner_resources",
         "partner_manifest",
         "collection",
         "resource_ledger",
+        "comparator_contract",
+        "comparator_contract_fingerprint",
+        "continuation_contract",
     }
     if (
         not isinstance(source_registration, Mapping)
         or set(source_registration) != registration_fields
         or source_registration["official_source_commit"] != OFFICIAL_SOURCE_COMMIT
+        or source_registration["comparator_contract"]
+        != expected_contract.to_mapping()
+        or source_registration["comparator_contract_fingerprint"]
+        != expected_contract.fingerprint
         or not isinstance(source_registration["layout"], str)
         or not source_registration["layout"]
         or not isinstance(source_registration["config_fingerprint"], str)
@@ -540,8 +888,38 @@ def load_frozen_pair_comparator(
         raise ValueError("Frozen comparator source registration differs.")
     for field in ("reference_ego_checkpoint", "partner_manifest"):
         descriptor = source_registration[field]
-        if not isinstance(descriptor, Mapping) or set(descriptor) != {"path", "sha256"}:
+        if (
+            not isinstance(descriptor, Mapping)
+            or set(descriptor) != {"path", "sha256"}
+            or sha256_path(Path(str(descriptor["path"])).resolve())
+            != descriptor["sha256"]
+        ):
             raise ValueError("Frozen comparator source lineage differs.")
+    reference_resource = source_registration["reference_ego_resource"]
+    parent_resources = source_registration["comparator_partner_resources"]
+    if (
+        not isinstance(reference_resource, Mapping)
+        or set(reference_resource) != {
+            "path", "sha256", "training_simulator_steps", "gpu_hours", "wall_clock_hours"
+        }
+        or sha256_path(Path(str(reference_resource["path"])).resolve())
+        != reference_resource["sha256"]
+        or int(reference_resource["training_simulator_steps"]) <= 0
+        or not isinstance(parent_resources, Mapping)
+        or not parent_resources
+    ):
+        raise ValueError("Frozen comparator shared-resource lineage differs.")
+    for descriptor in parent_resources.values():
+        if (
+            not isinstance(descriptor, Mapping)
+            or set(descriptor) != {
+                "path", "sha256", "training_simulator_steps", "gpu_hours", "wall_clock_hours"
+            }
+            or sha256_path(Path(str(descriptor["path"])).resolve())
+            != descriptor["sha256"]
+            or int(descriptor["training_simulator_steps"]) <= 0
+        ):
+            raise ValueError("Frozen comparator shared-resource lineage differs.")
     collection = source_registration["collection"]
     if (
         not isinstance(collection, Mapping)
@@ -564,8 +942,27 @@ def load_frozen_pair_comparator(
     except (TypeError, ValueError) as error:
         raise ValueError("Frozen comparator source resource ledger differs.") from error
     if (
-        source_ledger.counterfactual_continuation_steps <= 0
-        or source_ledger.evaluation_steps <= 0
+        source_ledger.comparator_continuation_steps <= 0
+        or source_ledger.comparator_history_collection_steps <= 0
+        or source_ledger.reference_ego_upstream_steps
+        != int(reference_resource["training_simulator_steps"])
+        or source_ledger.shared_pretraining_cost
+        != sum(
+            int(value["training_simulator_steps"])
+            for value in parent_resources.values()
+        )
+        or not np.isclose(
+            source_ledger.gpu_hours,
+            float(reference_resource["gpu_hours"])
+            + sum(float(value["gpu_hours"]) for value in parent_resources.values())
+            + float(source_ledger.comparator_gpu_hours),
+        )
+        or source_ledger.wall_clock_hours
+        < float(reference_resource["wall_clock_hours"])
+        + sum(
+            float(value["wall_clock_hours"])
+            for value in parent_resources.values()
+        )
     ):
         raise ValueError("Frozen comparator source resource ledger differs.")
     raw_source = Path(str(payload["source"]["path"])).resolve()
@@ -579,9 +976,14 @@ def load_frozen_pair_comparator(
         "official_source_commit",
         "config_fingerprint",
         "reference_ego_checkpoint",
+        "reference_ego_resource",
+        "comparator_partner_resources",
         "partner_manifest",
         "probe_steps",
         "signature_distance_threshold",
+        "comparator_contract",
+        "comparator_contract_fingerprint",
+        "continuation_contract",
         "collection",
         "resource_ledger",
         "fit_histories",
@@ -614,19 +1016,26 @@ def load_frozen_pair_comparator(
         != source_registration["config_fingerprint"]
         or collector_identity.get("reference_ego_checkpoint")
         != source_registration["reference_ego_checkpoint"]
+        or collector_identity.get("reference_ego_resource")
+        != source_registration["reference_ego_resource"]
+        or collector_identity.get("comparator_partner_resources")
+        != source_registration["comparator_partner_resources"]
         or collector_identity.get("partner_manifest")
         != source_registration["partner_manifest"]
         or collector_identity.get("collection") != source_registration["collection"]
+        or collector_identity.get("comparator_contract")
+        != source_registration["comparator_contract"]
+        or collector_identity.get("comparator_contract_fingerprint")
+        != source_registration["comparator_contract_fingerprint"]
         or collector_budget != source_registration["resource_ledger"]
     ):
         raise ValueError("Frozen comparator collector provenance differs.")
-    raw_fit_features, unused_a, unused_b, raw_fit_runs = _rows(
-        raw_payload["fit_histories"], label="fit"
-    )
-    raw_validation_features, unused_c, unused_d, raw_validation_runs = _rows(
-        raw_payload["validation_histories"], label="validation"
-    )
-    del unused_a, unused_b, unused_c, unused_d
+    raw_fit = _rows(raw_payload["fit_histories"], label="fit")
+    raw_validation = _rows(raw_payload["validation_histories"], label="validation")
+    raw_fit_features = raw_fit["history_features"]
+    raw_validation_features = raw_validation["history_features"]
+    raw_fit_runs = raw_fit["partner_run_ids"]
+    raw_validation_runs = raw_validation["partner_run_ids"]
     if (
         raw_fit_features.shape[1] != int(expected_history_feature_dim)
         or raw_validation_features.shape[1] != int(expected_history_feature_dim)
@@ -660,8 +1069,58 @@ def load_frozen_pair_comparator(
     )
 
 
+def load_component_diagnostic_panel(
+    path: str | Path, *, maximum_histories: int = 32
+) -> Mapping[str, Any]:
+    """Load the immutable validation-history panel shared by every ego seed."""
+
+    artifact_path = Path(path).resolve()
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if (
+        artifact.get("version") != COMPARATOR_ARTIFACT_VERSION
+        or artifact.get("artifact_type") != "depi_frozen_pair_comparator"
+        or not isinstance(artifact.get("source"), Mapping)
+    ):
+        raise ValueError("Component panel requires the active comparator artifact.")
+    source_path = Path(str(artifact["source"]["path"])).resolve()
+    if sha256_path(source_path) != artifact["source"]["sha256"]:
+        raise ValueError("Component panel comparator source hash differs.")
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    if source.get("version") != COMPARATOR_SOURCE_VERSION:
+        raise ValueError("Component panel source schema is stale.")
+    rows = source.get("validation_histories")
+    parsed = _rows(rows, label="validation")
+    count = min(int(maximum_histories), int(parsed["history_features"].shape[0]))
+    if count < 2:
+        raise ValueError("Component diagnostic panel needs at least two histories.")
+    selected = np.arange(count, dtype=np.int64)
+    panel_ids = [
+        hashlib.sha256(
+            (
+                str(rows[index]["partner_run_id"])
+                + ":"
+                + str(rows[index]["ego_role"])
+                + ":"
+                + str(rows[index]["episode_time"])
+                + ":"
+                + str(rows[index]["task_state_hash"])
+            ).encode("utf-8")
+        ).hexdigest()
+        for index in selected
+    ]
+    return {
+        "panel_ids": panel_ids,
+        "state_hashes": [str(rows[index]["task_state_hash"]) for index in selected],
+        "history_observations": parsed["history_observations"][selected],
+        "history_actions": parsed["history_actions"][selected],
+        "current_observations": parsed["current_observations"][selected],
+        "source": {"path": str(source_path), "sha256": sha256_path(source_path)},
+    }
+
+
 __all__ = [
     "fit_frozen_pair_comparator",
     "collect_pair_comparator_source",
     "load_frozen_pair_comparator",
+    "load_component_diagnostic_panel",
 ]

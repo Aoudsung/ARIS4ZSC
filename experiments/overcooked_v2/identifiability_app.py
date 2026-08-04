@@ -30,7 +30,6 @@ from experiments.overcooked_v2.official_adapter import (
     validate_official_runtime,
 )
 from experiments.overcooked_v2.official_br_prox_app import (
-    _stack_initial_hstate,
     empirical_all_action_continuations_from_snapshots,
     record_official_anchor_snapshots,
 )
@@ -46,6 +45,7 @@ from src.path_c.experiment import (
     load_partner_manifest,
     official_training_domain_keys,
 )
+from src.path_c.continuation import ContinuationContract
 from src.path_c.identifiability_controls import (
     LEAKAGE_PROBE_EXCESS_THRESHOLD,
     SHUFFLE_EPSILON_QUANTILE,
@@ -65,9 +65,9 @@ from src.path_c.storage import (
 )
 
 
-IDENTIFIABILITY_SCHEMA_VERSION = 3
-RECOVERABLE_VALUE_SCHEMA_VERSION = 3
-MECHANISM_RAW_SCHEMA_VERSION = 3
+IDENTIFIABILITY_SCHEMA_VERSION = 4
+RECOVERABLE_VALUE_SCHEMA_VERSION = 4
+MECHANISM_RAW_SCHEMA_VERSION = 4
 
 
 _RAW_BASE_FIELDS = {
@@ -83,6 +83,7 @@ _RAW_BASE_FIELDS = {
     "partner_manifest_sha256",
     "registration",
     "resource_ledger",
+    "continuation_contract",
     "rows",
 }
 
@@ -128,6 +129,10 @@ def _load_raw(path: str | Path, artifact_type: str) -> tuple[Path, Mapping[str, 
         raise ValueError("Mechanism raw artifact is not from the pinned simulator.")
     if payload["collector"] != "real_environment_crn_continuations":
         raise ValueError("Mechanism controls require real simulator continuations.")
+    try:
+        ContinuationContract(**dict(payload["continuation_contract"]))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Mechanism continuation contract differs.") from error
     if not isinstance(payload["rows"], Sequence) or not payload["rows"]:
         raise ValueError("Mechanism raw artifact contains no matched rows.")
     return source, payload
@@ -176,25 +181,6 @@ def _tree_take(tree: Any, indexes: Any) -> Any:
     )
 
 
-def _tree_concat(trees: Sequence[Any]) -> Any:
-    import jax
-    import jax.numpy as jnp
-
-    if not trees:
-        raise ValueError("Cannot concatenate an empty state collection.")
-    return jax.tree_util.tree_map(
-        lambda *values: (
-            None
-            if values[0] is None
-            else jnp.concatenate(
-                tuple(jnp.asarray(value) for value in values), axis=0
-            )
-        ),
-        *trees,
-        is_leaf=lambda value: value is None,
-    )
-
-
 def _squeeze_official_hstate(state: Any) -> Any:
     """Remove the adapter's per-policy singleton batch axis."""
 
@@ -210,7 +196,9 @@ def _squeeze_official_hstate(state: Any) -> Any:
     return jax.tree_util.tree_map(squeeze, state)
 
 
-def _task_features(policy: Any, hstate: Any, observation: Any) -> np.ndarray:
+def _frozen_context(policy: Any, hstate: Any, observation: Any) -> Mapping[str, np.ndarray]:
+    """Compute one internally consistent legal context before any intervention."""
+
     import jax.numpy as jnp
 
     if not isinstance(policy, OfficialDEPIPolicy):
@@ -224,64 +212,37 @@ def _task_features(policy: Any, hstate: Any, observation: Any) -> np.ndarray:
         jnp.zeros((count,), dtype=jnp.bool_),
         method=policy.deployment.model.step,
     )
-    return np.asarray(output.task_features, dtype=np.float64)
+    return {
+        "task_features": np.asarray(output.task_features, dtype=np.float32),
+        "instant_partner": np.asarray(output.instant_partner, dtype=np.float32),
+        "capability": np.asarray(output.capability, dtype=np.float32),
+        "protocol_embedding": np.asarray(output.protocol_embedding, dtype=np.float32),
+    }
 
 
-def _policy_probabilities(policy: Any, hstate: Any, observation: Any) -> np.ndarray:
-    """Read the deployed action distribution without sampling an action."""
+def _frozen_decision_probabilities(
+    policy: Any,
+    *,
+    task_features: Any,
+    instant_partner: Any,
+    capability: Any,
+    protocol_embedding: Any,
+) -> np.ndarray:
+    """Evaluate only the actor/critic heads; recurrent encoders are not called."""
 
     import jax
     import jax.numpy as jnp
 
-    if not isinstance(policy, OfficialDEPIPolicy):
-        raise TypeError("Mechanism controls require a DEPI deployment policy.")
-    state = _squeeze_official_hstate(hstate)
-    count = int(np.asarray(observation).shape[0])
-    _, output = policy.deployment.model.apply(
+    logits, unused_value, unused_q1, unused_q2 = policy.deployment.model.apply(
         {"params": policy.deployment.params},
-        state,
-        jnp.asarray(observation),
-        jnp.zeros((count,), dtype=jnp.bool_),
-        method=policy.deployment.model.step,
+        task_features=jnp.asarray(task_features),
+        instant_partner=jnp.asarray(instant_partner),
+        capability=jnp.asarray(capability),
+        protocol_embedding=jnp.asarray(protocol_embedding),
+        method=policy.deployment.model.decision_from_frozen_context,
     )
-    return np.asarray(jax.nn.softmax(output.policy_logits, axis=-1), dtype=np.float64)
-
-
-def _history_intervention(
-    source: Any,
-    donor: Any,
-    *,
-    mode: str,
-    capability_dim: int,
-) -> Any:
-    """Replace only registered capability/protocol state fields."""
-
-    import jax.numpy as jnp
-
-    if mode == "history":
-        return source._replace(
-            capability_carry=donor.capability_carry,
-            protocol_carry=donor.protocol_carry,
-            context_summary=donor.context_summary,
-        )
-    source_summary = jnp.asarray(source.context_summary)
-    donor_summary = jnp.asarray(donor.context_summary)
-    cut = int(capability_dim)
-    if mode == "swap_u":
-        return source._replace(
-            capability_carry=donor.capability_carry,
-            context_summary=jnp.concatenate(
-                (donor_summary[..., :cut], source_summary[..., cut:]), axis=-1
-            ),
-        )
-    if mode == "swap_c":
-        return source._replace(
-            protocol_carry=donor.protocol_carry,
-            context_summary=jnp.concatenate(
-                (source_summary[..., :cut], donor_summary[..., cut:]), axis=-1
-            ),
-        )
-    raise ValueError(f"Unknown recurrent-state intervention: {mode}")
+    del unused_value, unused_q1, unused_q2
+    return np.asarray(jax.nn.softmax(logits, axis=-1), dtype=np.float64)
 
 
 def _pytree_sha256(tree: Any) -> str:
@@ -316,18 +277,16 @@ def _collector_registration(config: Any) -> Mapping[str, Any]:
             config.evaluation.recoverable_signal_threshold
         ),
         "fit_and_evaluation_replicas_disjoint": True,
-        "history_shuffle_fields": [
-            "capability_carry",
-            "protocol_carry",
-            "context_summary",
-        ],
+        "intervention_surface": "decision_from_frozen_context",
+        "transplanted_fields": ["capability", "protocol_embedding"],
         "fixed_fields": [
             "ego_checkpoint",
             "environment_state",
             "partner_policy_and_carry",
             "ego_role",
             "current_observation",
-            "task_carry",
+            "task_features",
+            "instant_partner",
             "episode_time",
             "continuation_keys",
         ],
@@ -482,7 +441,10 @@ def collect_mechanism_raw_artifacts(
                 observation = selected["observations"][
                     "agent_0" if ego_role == 0 else "agent_1"
                 ]
-                features = _task_features(ego_policy, ego_hstate, observation)
+                frozen_context = _frozen_context(
+                    ego_policy, ego_hstate, observation
+                )
+                features = frozen_context["task_features"]
                 legal = empirical_all_action_continuations_from_snapshots(
                     left=left,
                     right=right,
@@ -493,7 +455,8 @@ def collect_mechanism_raw_artifacts(
                     fit_replicas=fit_replicas,
                     evaluation_replicas=evaluation_replicas,
                     continuation_horizon=horizon,
-                    ego_hstate=ego_hstate,
+                    gamma=float(config.ppo.gamma),
+                    continuation_policy_fingerprint=sha256_path(policy_path),
                 )
                 continuation_steps += (
                     anchors * 6 * (fit_replicas + evaluation_replicas) * horizon
@@ -504,6 +467,7 @@ def collect_mechanism_raw_artifacts(
                         **recorded,
                         "ego_hstate": ego_hstate,
                         "task_features": features,
+                        "frozen_context": frozen_context,
                         "legal": legal,
                         "partner_index": partner_index,
                         "partner_run_id": str(partner_descriptor.run_id),
@@ -524,9 +488,18 @@ def collect_mechanism_raw_artifacts(
                     for snapshot in snapshots
                 ]
             )
-            all_states = _tree_concat(
-                [snapshot["ego_hstate"] for snapshot in snapshots]
-            )
+            all_contexts = {
+                name: np.concatenate(
+                    [snapshot["frozen_context"][name] for snapshot in snapshots],
+                    axis=0,
+                )
+                for name in (
+                    "task_features",
+                    "instant_partner",
+                    "capability",
+                    "protocol_embedding",
+                )
+            }
             all_legal_fit = np.concatenate(
                 [snapshot["legal"]["fit_returns_by_action"] for snapshot in snapshots],
                 axis=0,
@@ -559,21 +532,10 @@ def collect_mechanism_raw_artifacts(
                 stop = start + anchors
                 source_global = np.arange(start, stop, dtype=np.int64)
                 source_state = snapshot["ego_hstate"]
-                all_donor_state = _tree_take(
-                    all_states, donor_by_source[source_global]
-                )
-                all_history_state = _history_intervention(
-                    source_state,
-                    all_donor_state,
-                    mode="history",
-                    capability_dim=config.model.capability_dim,
-                )
-                all_shuffled_features = _task_features(
-                    ego_policy,
-                    all_history_state,
-                    snapshot["selected"]["observations"][
-                        "agent_0" if ego_role == 0 else "agent_1"
-                    ],
+                # Decision-head context transplant holds source task features
+                # exactly fixed; no hybrid recurrent state is ever created.
+                all_shuffled_features = np.asarray(
+                    snapshot["frozen_context"]["task_features"]
                 )
                 from src.path_c.task_encoder import task_only_observation
 
@@ -638,69 +600,56 @@ def collect_mechanism_raw_artifacts(
                 selected = _tree_take(snapshot["selected"], matched_local)
                 roots = np.asarray(snapshot["anchor_roots"])[matched_local]
                 source_state = _tree_take(snapshot["ego_hstate"], matched_local)
-                donor_state = _tree_take(all_states, donor_global)
-                history_state = _history_intervention(
-                    source_state,
-                    donor_state,
-                    mode="history",
-                    capability_dim=config.model.capability_dim,
-                )
-                swap_u_state = _history_intervention(
-                    source_state,
-                    donor_state,
-                    mode="swap_u",
-                    capability_dim=config.model.capability_dim,
-                )
-                swap_c_state = _history_intervention(
-                    source_state,
-                    donor_state,
-                    mode="swap_c",
-                    capability_dim=config.model.capability_dim,
-                )
-                state_only = _stack_initial_hstate(ego_policy, matched_local.size)
-                left, right = (
-                    (ego_policy, partner_policies[snapshot["partner_index"]])
-                    if ego_role == 0
-                    else (partner_policies[snapshot["partner_index"]], ego_policy)
-                )
-
-                def evaluate(candidate_state: Any) -> Mapping[str, Any]:
-                    nonlocal continuation_steps
-                    continuation_steps += (
-                        matched_local.size
-                        * 6
-                        * (fit_replicas + evaluation_replicas)
-                        * horizon
-                    )
-                    return empirical_all_action_continuations_from_snapshots(
-                        left=left,
-                        right=right,
-                        ego_role=ego_role,
-                        environment=environment,
-                        selected=selected,
-                        anchor_roots=roots,
-                        fit_replicas=fit_replicas,
-                        evaluation_replicas=evaluation_replicas,
-                        continuation_horizon=horizon,
-                        ego_hstate=candidate_state,
-                    )
-
-                shuffled = evaluate(history_state)
-                state_only_values = evaluate(state_only)
-                swapped_u = evaluate(swap_u_state)
-                swapped_c = evaluate(swap_c_state)
                 source_observations = selected["observations"][
                     "agent_0" if ego_role == 0 else "agent_1"
                 ]
-                original_policy_probabilities = _policy_probabilities(
-                    ego_policy, source_state, source_observations
+                source_context = {
+                    name: np.asarray(snapshot["frozen_context"][name])[matched_local]
+                    for name in (
+                        "task_features",
+                        "instant_partner",
+                        "capability",
+                        "protocol_embedding",
+                    )
+                }
+                donor_context = {
+                    name: np.asarray(all_contexts[name])[donor_global]
+                    for name in source_context
+                }
+                original_policy_probabilities = _frozen_decision_probabilities(
+                    ego_policy, **source_context
                 )
-                swapped_c_policy_probabilities = _policy_probabilities(
-                    ego_policy, swap_c_state, source_observations
+                history_policy_probabilities = _frozen_decision_probabilities(
+                    ego_policy,
+                    task_features=source_context["task_features"],
+                    instant_partner=source_context["instant_partner"],
+                    capability=donor_context["capability"],
+                    protocol_embedding=donor_context["protocol_embedding"],
                 )
-                shuffled_features = _task_features(
-                    ego_policy, history_state, source_observations
+                swapped_u_policy_probabilities = _frozen_decision_probabilities(
+                    ego_policy,
+                    task_features=source_context["task_features"],
+                    instant_partner=source_context["instant_partner"],
+                    capability=donor_context["capability"],
+                    protocol_embedding=source_context["protocol_embedding"],
                 )
+                swapped_c_policy_probabilities = _frozen_decision_probabilities(
+                    ego_policy,
+                    task_features=source_context["task_features"],
+                    instant_partner=source_context["instant_partner"],
+                    capability=source_context["capability"],
+                    protocol_embedding=donor_context["protocol_embedding"],
+                )
+                state_only_policy_probabilities = _frozen_decision_probabilities(
+                    ego_policy,
+                    task_features=source_context["task_features"],
+                    instant_partner=np.zeros_like(source_context["instant_partner"]),
+                    capability=np.zeros_like(source_context["capability"]),
+                    protocol_embedding=np.zeros_like(
+                        source_context["protocol_embedding"]
+                    ),
+                )
+                shuffled_features = source_context["task_features"]
                 legal = snapshot["legal"]
                 source_signature = _center_signature(
                     legal["fit_returns_by_action"][matched_local]
@@ -754,6 +703,15 @@ def collect_mechanism_raw_artifacts(
                         legal["evaluation_returns_by_action"][int(local_index)],
                         dtype=np.float64,
                     )
+                    original_action = int(
+                        np.argmax(original_policy_probabilities[index])
+                    )
+                    history_action = int(
+                        np.argmax(history_policy_probabilities[index])
+                    )
+                    state_only_action = int(
+                        np.argmax(state_only_policy_probabilities[index])
+                    )
                     identifiability_rows.append(
                         {
                             **common,
@@ -763,22 +721,22 @@ def collect_mechanism_raw_artifacts(
                             ].tolist(),
                             "partner_run_label": partner_run_id,
                             "legal_history_return": float(
-                                legal["selected_evaluation_return"][int(local_index)]
+                                original_returns[original_action]
                             ),
                             "history_shuffled_return": float(
-                                shuffled["selected_evaluation_return"][index]
+                                original_returns[history_action]
                             ),
                             "task_match_distance": float(distances[index]),
                             "task_match_epsilon": float(epsilon),
                             "swap_u_original_returns_by_action": original_returns.tolist(),
                             "swap_u_returns_by_action": np.asarray(
-                                swapped_u["evaluation_returns_by_action"][index]
+                                original_returns
                             ).tolist(),
                             "swap_u_source_signature": source_signature[index].tolist(),
                             "swap_u_target_signature": target_signature[index].tolist(),
                             "swap_c_original_returns_by_action": original_returns.tolist(),
                             "swap_c_returns_by_action": np.asarray(
-                                swapped_c["evaluation_returns_by_action"][index]
+                                original_returns
                             ).tolist(),
                             "swap_c_source_signature": source_signature[index].tolist(),
                             "swap_c_target_signature": target_signature[index].tolist(),
@@ -788,21 +746,30 @@ def collect_mechanism_raw_artifacts(
                             "swap_c_policy_probabilities": (
                                 swapped_c_policy_probabilities[index].tolist()
                             ),
+                            "history_transplant_policy_probabilities": (
+                                history_policy_probabilities[index].tolist()
+                            ),
+                            "swap_u_policy_probabilities": (
+                                swapped_u_policy_probabilities[index].tolist()
+                            ),
+                            "decision_intervention_surface": "frozen_decision_head",
                         }
                     )
                     recoverable_rows.append(
                         {
                             **common,
                             "g1": float(
-                                legal["selected_evaluation_return"][int(local_index)]
+                                original_returns[original_action]
                             ),
-                            "g2": float(shuffled["selected_evaluation_return"][index]),
-                            "g3": float(
-                                state_only_values["selected_evaluation_return"][index]
-                            ),
+                            "g2": float(original_returns[history_action]),
+                            "g3": float(original_returns[state_only_action]),
                             "g4": float(
                                 legal["oracle_evaluation_return"][int(local_index)]
                             ),
+                            "g1_action": original_action,
+                            "g2_action": history_action,
+                            "g3_action": state_only_action,
+                            "decision_intervention_surface": "frozen_decision_head",
                             "g4_selection_stability": float(
                                 np.mean(
                                     np.argmax(
@@ -847,6 +814,11 @@ def collect_mechanism_raw_artifacts(
         "partner_manifest_sha256": sha256_path(partner_path),
         "registration": registration,
         "resource_ledger": resource_ledger,
+        "continuation_contract": ContinuationContract(
+            gamma=float(config.ppo.gamma),
+            horizon=horizon,
+            continuation_policy_fingerprint=sha256_path(policy_path),
+        ).to_mapping(),
     }
     ident_path = root / "depi_identifiability_raw.json"
     recoverable_path = root / "depi_recoverable_value_raw.json"
@@ -932,6 +904,9 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
         "swap_c_target_signature",
         "original_policy_probabilities",
         "swap_c_policy_probabilities",
+        "history_transplant_policy_probabilities",
+        "swap_u_policy_probabilities",
+        "decision_intervention_surface",
     }
     rows = list(payload["rows"])
     for row in rows:
@@ -953,10 +928,14 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
             "swap_c_target_signature",
             "original_policy_probabilities",
             "swap_c_policy_probabilities",
+            "history_transplant_policy_probabilities",
+            "swap_u_policy_probabilities",
         ):
             values = np.asarray(row[name], dtype=np.float64)
             if values.shape != (6,) or not np.all(np.isfinite(values)):
                 raise ValueError(f"{name} must contain six finite action continuations.")
+        if row["decision_intervention_surface"] != "frozen_decision_head":
+            raise ValueError("Mechanism intervention did not stay at the decision head.")
 
     leakage_rows = list(payload["leakage_rows"])
     leakage_required = {
@@ -1154,7 +1133,35 @@ def _paired_run_bootstrap(
     point, low, high = paired_bootstrap_drop(
         left_values, right_values, replications=9_999, seed=seed
     )
-    return {"point_difference": point, "bootstrap_99_percent_ci": [low, high]}
+    differences = np.asarray(
+        [float(row[left]) - float(row[right]) for row in rows], dtype=np.float64
+    )
+    cluster_names = ("ego_run_id", "partner_run_id", "donor_partner_run_id")
+    rng = np.random.default_rng(int(seed) + 10_000)
+    boot = np.empty((9_999,), dtype=np.float64)
+    for draw in range(boot.shape[0]):
+        weights = np.ones((len(rows),), dtype=np.float64)
+        for name in cluster_names:
+            labels = np.asarray([str(row[name]) for row in rows])
+            unique = np.unique(labels)
+            sampled = rng.choice(unique, size=unique.size, replace=True)
+            counts = {value: int(np.sum(sampled == value)) for value in unique}
+            weights *= np.asarray([counts[label] for label in labels], dtype=np.float64)
+        boot[draw] = np.sum(weights * differences) / np.maximum(
+            np.sum(weights), 1.0
+        )
+    return {
+        "point_difference": float(np.mean(differences)),
+        "fixed_panel_ego_run_bootstrap_99_percent_ci": [low, high],
+        "crossed_random_partner_bootstrap_99_percent_ci": [
+            float(np.quantile(boot, 0.005)),
+            float(np.quantile(boot, 0.995)),
+        ],
+        "bootstrap_99_percent_ci": [
+            float(np.quantile(boot, 0.005)),
+            float(np.quantile(boot, 0.995)),
+        ],
+    }
 
 
 def _recoverable_fraction(
@@ -1230,7 +1237,8 @@ def run_recoverable_value_evaluation(args: argparse.Namespace) -> None:
     )
     source, payload = _load_raw(raw_path, "depi_recoverable_value_raw")
     required = _COMMON_ROW_FIELDS | {
-        "g1", "g2", "g3", "g4", "g4_selection_stability"
+        "g1", "g2", "g3", "g4", "g4_selection_stability",
+        "g1_action", "g2_action", "g3_action", "decision_intervention_surface",
     }
     rows = list(payload["rows"])
     for row in rows:
@@ -1244,6 +1252,10 @@ def run_recoverable_value_evaluation(args: argparse.Namespace) -> None:
             for name in ("g1", "g2", "g3", "g4", "g4_selection_stability")
         ):
             raise ValueError("G1--G4 returns must be finite.")
+        if row["decision_intervention_surface"] != "frozen_decision_head":
+            raise ValueError("Recoverable-value intervention surface differs.")
+        if any(not 0 <= int(row[name]) < 6 for name in ("g1_action", "g2_action", "g3_action")):
+            raise ValueError("Mechanism first-action intervention is invalid.")
     run_means = {
         name: float(np.mean(_run_means(rows, name))) for name in ("g1", "g2", "g3", "g4")
     }
@@ -1275,8 +1287,8 @@ def run_recoverable_value_evaluation(args: argparse.Namespace) -> None:
         "partner_manifest_sha256": payload["partner_manifest_sha256"],
         "conditions": {
             "g1": "legal_history",
-            "g2": "shuffled_capability_and_protocol_history",
-            "g3": "state_only_uniform_context",
+            "g2": "donor_context_frozen_head_first_action_then_source_continuation",
+            "g3": "zero_context_frozen_head_first_action_then_source_continuation",
             "g4": "fit_selected_cross_fitted_proxy_on_independent_evaluation_replicas",
         },
         "paired_crn": True,

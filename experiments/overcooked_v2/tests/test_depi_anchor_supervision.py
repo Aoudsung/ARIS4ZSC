@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+JAX = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 
 from src.path_c.anchor_sampling import (  # noqa: E402
@@ -21,8 +22,29 @@ from src.path_c.anchor_sampling import (  # noqa: E402
     predict_pair_comparator,
     run_disjoint_candidate_pairs,
     separation_terms_from_matched_pairs,
+    time_source_stratified_indexes,
 )
 from src.path_c.types import CounterfactualAnchorBatch, QuotientPairBatch  # noqa: E402
+
+
+def test_matched_candidate_stratification_preserves_partner_run_diversity() -> None:
+    run_ids = jnp.asarray(
+        [
+            [10_000, 10_001, 10_002, 10_000],
+            [10_000, 10_001, 10_002, 10_000],
+            [10_000, 10_001, 10_002, 10_000],
+            [10_000, 10_001, 10_002, 10_000],
+        ]
+    )
+    indexes = time_source_stratified_indexes(
+        JAX.random.PRNGKey(7),
+        time_count=4,
+        environment_count=4,
+        requested=4,
+        source_values=run_ids,
+    )
+    selected = np.asarray(run_ids).reshape((-1,))[np.asarray(indexes)]
+    assert np.unique(selected).size >= 2
 
 
 def test_anchor_rows_carry_scientific_identity_returns_and_provenance() -> None:
@@ -270,7 +292,7 @@ def test_ambiguous_and_invalid_pairs_receive_zero_separation_weight() -> None:
         equivalent_probability_max=0.55,
         distinct_probability_min=0.70,
         signature_threshold=1.0,
-        margin_scale=0.25,
+        margin=0.5,
     )
     np.testing.assert_allclose(np.asarray(terms.weights), [1.0, 2.0, 0.0, 0.0])
     assert float(terms.margin) == pytest.approx(0.5)

@@ -149,9 +149,9 @@ def run_upstream(args: argparse.Namespace) -> None:
     write_json(
         output / "resource_ledger.json",
         ResourceLedger(
-            partner_training_steps=int(result["effective_environment_steps"]),
-            partner_source_training_steps=int(result["effective_environment_steps"]),
+            upstream_partner_steps=int(result["effective_environment_steps"]),
             gpu_hours=gpu_hours_for_wall_seconds(wall_seconds),
+            wall_clock_hours=float(wall_seconds) / 3_600.0,
             peak_memory_bytes=peak_device_memory_bytes(),
             deployable_parameters=parameter_count(final_params),
         ).to_mapping(),

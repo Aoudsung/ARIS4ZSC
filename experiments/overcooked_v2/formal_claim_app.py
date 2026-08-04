@@ -9,6 +9,13 @@ from typing import Any, Mapping
 
 import numpy as np
 
+from experiments.overcooked_v2.calibration_app import (
+    POSTERIOR_CALIBRATION_SCHEMA_VERSION,
+)
+from experiments.overcooked_v2.identifiability_app import (
+    IDENTIFIABILITY_SCHEMA_VERSION,
+    RECOVERABLE_VALUE_SCHEMA_VERSION,
+)
 from experiments.overcooked_v2.resource_report_app import RESOURCE_METHODS
 from src.path_c.experiment import (
     METHOD_VERSION,
@@ -252,12 +259,32 @@ def _validate_resource_report(payload: Mapping[str, Any]) -> None:
         method = str(row["method"])
         if method in index:
             raise ValueError(f"Duplicate resource-report method: {method}")
+        derived = {
+            "run_count",
+            "marginal_training_steps_per_run",
+            "amortized_training_steps_per_run",
+            "fully_loaded_reproduction_steps",
+        }
         ledger = ResourceLedger.from_mapping(
-            {name: value for name, value in row.items() if name != "method"}
+            {
+                name: value
+                for name, value in row.items()
+                if name != "method" and name not in derived
+            }
         )
+        if (
+            set(row) != {"method", *derived, *ledger.to_mapping().keys()}
+            or int(row["run_count"]) <= 0
+            or float(row["marginal_training_steps_per_run"]) <= 0.0
+            or float(row["amortized_training_steps_per_run"])
+            < float(row["marginal_training_steps_per_run"])
+            or int(row["fully_loaded_reproduction_steps"]) <= 0
+        ):
+            raise ValueError(f"Formal resource cost views differ for {method}.")
         if (
             ledger.total_training_simulator_steps <= 0
             or ledger.deployable_parameters <= 0
+            or ledger.wall_clock_hours <= 0.0
             or ledger.inference_latency_ms <= 0.0
         ):
             raise ValueError(f"Formal resource row is incomplete for {method}.")
@@ -299,6 +326,7 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
         "b2_minus_actor_only",
         "b2_minus_no_separation",
         "b2_minus_no_capability",
+        "b2_minus_response_only_posterior",
     }
     if set(comparisons) != required:
         raise ValueError("Development matrix does not cover nested and total-budget contrasts.")
@@ -325,6 +353,7 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
         DEVELOPMENT_VARIANTS,
         _paired_bootstrap,
         _validate_development_raw_rows,
+        development_variants_for_k,
         validate_development_entry_alignment,
     )
 
@@ -475,7 +504,7 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
     expected_blocks = {
         (component_count, variant)
         for component_count in (2, 4, 8)
-        for variant in DEVELOPMENT_VARIANTS
+        for variant in development_variants_for_k(component_count)
     }
     if observed_blocks != expected_blocks:
         raise ValueError("Development evaluator artifacts do not cover all K/variants.")
@@ -491,6 +520,7 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
     if not isinstance(diagnostic_refs, list) or len(diagnostic_refs) != 30:
         raise ValueError("Development component diagnostics must cover 3 K values x 10 seeds.")
     signatures_by_k: dict[int, dict[int, Any]] = {2: {}, 4: {}, 8: {}}
+    panel_identity_by_k: dict[int, tuple[Any, Any]] = {}
     for index, ref in enumerate(diagnostic_refs):
         diagnostic_path = _validate_source_ref(
             ref, label=f"development.component-diagnostic.{index}"
@@ -504,14 +534,14 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
         if (
             diagnostic_path
             != expected_run / "records" / "final_component_diagnostics.json"
-            or diagnostic.get("version") != 1
+            or diagnostic.get("version") != 2
             or diagnostic.get("artifact_type")
             != "depi_exchangeable_response_regime_diagnostics"
             or diagnostic.get("method") != METHOD_VERSION
             or diagnostic.get("method_variant") != "b2"
             or component_count not in signatures_by_k
             or seed not in seeds
-            or diagnostic.get("fresh_final_policy_anchors") is not True
+            or diagnostic.get("shared_final_diagnostic_panel") is not True
             or diagnostic.get("one_hot_component_intervention") is not True
             or seed in signatures_by_k[component_count]
         ):
@@ -519,8 +549,21 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
         validate_component_diagnostic_values(
             diagnostic, component_count=component_count
         )
+        panel_identity = (
+            diagnostic["diagnostic_panel_ids"],
+            diagnostic["diagnostic_panel_state_hashes"],
+        )
+        if component_count in panel_identity_by_k:
+            if panel_identity_by_k[component_count] != panel_identity:
+                raise ValueError("Cross-seed component diagnostic panels differ.")
+        else:
+            panel_identity_by_k[component_count] = panel_identity
+        _validate_source_ref(
+            diagnostic.get("diagnostic_panel_source"),
+            label=f"development.component-panel.{component_count}.{seed}",
+        )
         signatures_by_k[component_count][seed] = diagnostic[
-            "component_action_signatures"
+            "component_action_signatures_by_anchor"
         ]
     reported_stability = payload.get("component_permutation_aligned_stability")
     if not isinstance(reported_stability, Mapping):
@@ -543,7 +586,7 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
     if not isinstance(reported_xp, Mapping):
         raise ValueError("Development per-seed XP is missing.")
     for component_count in (2, 4, 8):
-        for variant in DEVELOPMENT_VARIANTS:
+        for variant in development_variants_for_k(component_count):
             values = np.asarray(
                 [score_index[(component_count, variant, seed)] for seed in seeds],
                 dtype=np.float64,
@@ -567,12 +610,27 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
         ("b2_minus_actor_only", "b2", "actor_only", 19),
         ("b2_minus_no_separation", "b2", "no_separation", 20),
         ("b2_minus_no_capability", "b2", "no_capability", 21),
+        (
+            "b2_minus_response_only_posterior",
+            "b2",
+            "response_only_posterior",
+            22,
+        ),
     )
     all_comparisons = payload.get("paired_increments_by_protocol_components")
     if not isinstance(all_comparisons, Mapping):
         raise ValueError("Development paired comparisons are missing.")
     for component_count in (2, 4, 8):
-        for name, left, right, bootstrap_seed in comparison_spec:
+        active_comparisons = (
+            comparison_spec
+            if component_count == 4
+            else (("b2_minus_b1", "b2", "b1", 11),)
+        )
+        if set(all_comparisons.get(str(component_count), {})) != {
+            row[0] for row in active_comparisons
+        }:
+            raise ValueError("Development K-specific comparison set differs.")
+        for name, left, right, bootstrap_seed in active_comparisons:
             differences = np.asarray(
                 [
                     score_index[(component_count, left, seed)]
@@ -668,7 +726,7 @@ def _validate_posterior_calibration(
     payload: Mapping[str, Any], *, layout: str
 ) -> bool:
     if (
-        payload.get("version") != 2
+        payload.get("version") != POSTERIOR_CALIBRATION_SCHEMA_VERSION
         or payload.get("artifact_type") != "depi_posterior_calibration"
         or payload.get("artifact_name") != "DEPI-Posterior-Calibration"
         or payload.get("method") != METHOD_VERSION
@@ -701,6 +759,8 @@ def _validate_posterior_calibration(
         or registration.get("coverage_targets") != ["relative_position", "direction"]
         or registration.get("primary_aggregation_unit") != "partner_run"
         or registration.get("secondary_aggregation_unit") != "episode"
+        or int(registration.get("minimum_positive_event_count", -1)) != 100
+        or int(registration.get("minimum_positive_event_count_per_family", -1)) != 20
     ):
         raise ValueError(f"Posterior-calibration registration differs on {layout}.")
     runs = payload.get("runs")
@@ -723,6 +783,39 @@ def _validate_posterior_calibration(
     contrasts = payload.get("run_bootstrap_contrast_95_ci")
     if not isinstance(intervals, Mapping) or not isinstance(contrasts, Mapping):
         raise ValueError(f"Posterior-calibration interval evidence is missing on {layout}.")
+    event_calibration = payload.get("event_calibration")
+    if not isinstance(event_calibration, Mapping):
+        raise ValueError(f"Posterior-calibration event diagnostics are missing on {layout}.")
+    observed_positive = sum(int(row["positive_event_count"]) for row in runs)
+    positive_by_family = {
+        family: sum(
+            int(row["positive_event_count"])
+            for row in runs
+            if str(row["partner_mechanism"]) == family
+        )
+        for family in {str(row["partner_mechanism"]) for row in runs}
+    }
+    event_estimable = bool(
+        observed_positive >= int(registration["minimum_positive_event_count"])
+        and positive_by_family
+        and min(positive_by_family.values())
+        >= int(registration["minimum_positive_event_count_per_family"])
+    )
+    reliability = event_calibration.get("reliability_curve")
+    if (
+        int(event_calibration.get("positive_event_count", -1)) != observed_positive
+        or event_calibration.get("positive_event_count_by_partner_family")
+        != positive_by_family
+        or event_calibration.get("status")
+        != ("estimable" if event_estimable else "not_estimable")
+        or not isinstance(reliability, list)
+        or len(reliability) != 10
+        or not isinstance(
+            event_calibration.get("partner_run_bootstrap_prevalence_95_ci"), list
+        )
+        or len(event_calibration["partner_run_bootstrap_prevalence_95_ci"]) != 2
+    ):
+        raise ValueError(f"Posterior-calibration event diagnostics differ on {layout}.")
     expected = {
         "log_score_vs_uniform": float(contrasts["log_score_minus_uniform"][1])
         <= -0.02,
@@ -731,12 +824,12 @@ def _validate_posterior_calibration(
         )
         <= -0.02,
         "position_coverage_in_band": float(intervals["coverage_position"][0])
-        <= 0.95
-        and float(intervals["coverage_position"][1]) >= 0.85,
+        >= 0.85
+        and float(intervals["coverage_position"][1]) <= 0.95,
         "direction_coverage_in_band": float(intervals["coverage_direction"][0])
-        <= 0.95
-        and float(intervals["coverage_direction"][1]) >= 0.85,
-        "event_brier": float(
+        >= 0.85
+        and float(intervals["coverage_direction"][1]) <= 0.95,
+        "event_brier": event_estimable and float(
             contrasts["event_brier_minus_registered_baseline"][1]
         )
         <= 0.0,
@@ -759,7 +852,12 @@ def _validate_layout_artifact(
         raise ValueError(f"{artifact_type} layout differs from its label.")
     if payload.get("artifact_type") != artifact_type:
         raise ValueError(f"{artifact_type} artifact identity differs.")
-    if payload.get("version") != 3 or payload.get("method_variant") != "b2":
+    expected_version = (
+        IDENTIFIABILITY_SCHEMA_VERSION
+        if artifact_type == "depi_identifiability_evaluation"
+        else RECOVERABLE_VALUE_SCHEMA_VERSION
+    )
+    if payload.get("version") != expected_version or payload.get("method_variant") != "b2":
         raise ValueError(f"{artifact_type} schema or B2 identity differs.")
     if payload.get("paired_crn") is not True:
         raise ValueError(f"{artifact_type} is not a paired-CRN evaluation.")

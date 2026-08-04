@@ -52,8 +52,9 @@ warmup、线性 annealing 和 Adam epsilon 1e-5。完整损失、anchor 和 cali
 配置及其加载时 fail-closed 校验为准。
 
 Official upstream SP 每 run 30,000,000 steps、OP 每 run 50,000,000 steps；训练池使用注册
-checkpoint stages 0.0、0.5、1.0。所有 DEPI、upstream、baseline、continuation 与 evaluation
-simulator transitions 都进入资源账本。
+checkpoint stages 0.0、0.5、1.0。所有 DEPI、upstream、baseline、comparator、continuation、
+final M1、component diagnostic、mechanism 与 evaluation simulator transitions 都进入资源
+账本，并同时报告 marginal、amortized 和 fully-loaded cost。
 
 ## 4. partner lineage 与隔离
 
@@ -82,12 +83,15 @@ role 重叠、另一 owner seed 的资源混入或 fresh run 回用均 fail clos
 1. Python 3.10 环境安装与依赖一致性检查；
 2. active source compile、全部 `test_depi_*.py`、CLI smoke 和 legacy-token CI gate；
 3. mechanical end-to-end；
-4. 单 CUDA `cuda-preflight`，覆盖一次真实 compiled rollout/update、checkpoint round-trip、
-   deployment round-trip 和峰值显存门；
-5. 冻结 K/方法无关 comparator；执行 R0/B0/B1/B2、R0-extra/B0-extra/B1-extra 与六项注册
-   机制消融 × K={2,4,8} × seed indexes 0--9 的 development matrix、raw evaluator、component
-   diagnostics 和 paired summary；
-6. 只在未观察正式结果时完成方法/合同 freeze，并提交 clean commit。
+4. 单 CUDA `cuda-preflight` 必须接收真实冻结 comparator 与 reference ego checkpoint，覆盖
+   comparator contract、真实 rollout、anchor collection/prediction/separation、PPO、auxiliary
+   transaction、checkpoint save/restore、deployment export、fresh-final M1 和峰值显存门；
+5. 冻结 K/方法无关 comparator；K=4、seed indexes 0--9 执行 R0/B0/B1/B2、三项 extra controls
+   与七项注册机制消融，K=2/8 只执行 B1/B2 sensitivity；完成 raw evaluator、共享-panel
+   component diagnostics 和 paired summary；
+6. 完成 development-only decision coverage bank、`p_stay={0.90,0.97,0.99}` sensitivity，以及
+   三个同 pool/budget/capacity 的诚实仓内 contemporary proxies；这些 proxy 不作为已发表方法复现；
+7. 只在未观察正式结果时完成方法/合同 freeze，并提交 clean commit。
 
 任一门失败则不得开始正式 confirmatory runs。B3 保持 `not_implemented`，不构成冻结条件。
 
@@ -99,7 +103,7 @@ role 重叠、另一 owner seed 的资源混入或 fresh run 回用均 fail clos
 upstream
   -> build-partner-manifest / validate-manifest
   -> collect-pair-comparator-source -> fit-pair-comparator
-  -> cuda-preflight
+  -> cuda-preflight (real comparator branch)
   -> train
   -> build-depi-policy-manifest
   -> calibrate-posterior

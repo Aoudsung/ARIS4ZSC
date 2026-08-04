@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CONFIG_VERSION = 17
-METHOD_VERSION = "depi_instant_partner_exact_filter_decision_supervision_v7"
-CHECKPOINT_SCHEMA_VERSION = 7
+CONFIG_VERSION = 18
+METHOD_VERSION = "depi_decision_consistent_evidence_gated_filter_v8"
+CHECKPOINT_SCHEMA_VERSION = 8
 MECHANISM_ABLATION_VARIANTS = (
     "deterministic_context",
     "decision_only",
@@ -19,6 +19,7 @@ MECHANISM_ABLATION_VARIANTS = (
     "actor_only",
     "no_separation",
     "no_capability",
+    "response_only_posterior",
 )
 METHOD_VARIANTS = ("r0", "b0", "b1", "b2", *MECHANISM_ABLATION_VARIANTS, "b3")
 MANIFEST_VERSION = 4
@@ -103,6 +104,9 @@ class ModelConfig:
     response_hidden_dim: int
     modulation_rank: int
     action_embedding_dim: int
+    protocol_stay_probability: float
+    evidence_gated_transition: bool
+    capability_evidence_mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,14 +137,17 @@ class LossV2Config:
     combined_policy_kl_threshold: float
     rank_hinge_margin: float
     rank_hinge_advantage_gap: float
-    separation_margin_scale: float
     decision_policy_weight: float
     decision_policy_temperature: float
     capability_consistency_weight: float
     capability_prediction_weight: float
     capability_variance_weight: float
+    capability_covariance_weight: float
     capability_variance_floor: float
     component_signature_weight: float
+    posterior_decision_weight: float
+    posterior_decision_temperature: float
+    separation_margin: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +168,10 @@ class AnchorConfig:
     signature_distance_threshold: float
     m1_spearman_threshold: float
     m1_minimum_anchor_fraction: float
+    task_match_epsilon: float
+    endpoint_task_match_epsilon: float
+    episode_time_tolerance: int
+    maximum_age_updates: int
 
 @dataclass(frozen=True, slots=True)
 class PartnerPoolConfig:
@@ -189,6 +200,8 @@ class PosteriorCalibrationConfig:
     brier_ratio: float
     primary_unit: str
     secondary_unit: str
+    minimum_positive_event_count: int
+    minimum_positive_event_count_per_family: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -518,6 +531,80 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
     return config
 
 
+def run_config_from_mapping(payload: Mapping[str, Any]) -> RunConfig:
+    """Reconstruct an exact resolved config embedded in an immutable artifact."""
+
+    top = _exact_fields(
+        payload,
+        {"version", *RunConfig.__dataclass_fields__},
+        "resolved configuration",
+    )
+    if int(top["version"]) != CONFIG_VERSION:
+        raise ValueError("Resolved deployment config version differs.")
+    environment = _exact_fields(
+        top["environment"], set(EnvironmentConfig.__dataclass_fields__), "environment"
+    )
+    model = _exact_fields(top["model"], set(ModelConfig.__dataclass_fields__), "model")
+    ppo = _exact_fields(top["ppo"], set(PPOConfig.__dataclass_fields__), "ppo")
+    loss_v2 = _exact_fields(
+        top["loss_v2"], set(LossV2Config.__dataclass_fields__), "loss_v2"
+    )
+    anchors = _exact_fields(
+        top["anchors"], set(AnchorConfig.__dataclass_fields__), "anchors"
+    )
+    pool = _exact_fields(
+        top["partner_pool"], set(PartnerPoolConfig.__dataclass_fields__), "partner_pool"
+    )
+    calibration = _exact_fields(
+        top["posterior_calibration"],
+        set(PosteriorCalibrationConfig.__dataclass_fields__),
+        "posterior_calibration",
+    )
+    training = _exact_fields(
+        top["training"], set(TrainingConfig.__dataclass_fields__), "training"
+    )
+    evaluation = _exact_fields(
+        top["evaluation"], set(EvaluationConfig.__dataclass_fields__), "evaluation"
+    )
+    upstream = _exact_fields(
+        top["upstream"], set(UpstreamConfig.__dataclass_fields__), "upstream"
+    )
+    protocol = _exact_fields(
+        top["official_protocol"],
+        set(OfficialProtocolConfig.__dataclass_fields__),
+        "official_protocol",
+    )
+    config = RunConfig(
+        run_kind=str(top["run_kind"]),
+        method_variant=str(top["method_variant"]),
+        environment=EnvironmentConfig(**environment),
+        model=ModelConfig(**model),
+        ppo=PPOConfig(**ppo),
+        loss_v2=LossV2Config(**loss_v2),
+        anchors=AnchorConfig(**anchors),
+        partner_pool=PartnerPoolConfig(
+            **{
+                **pool,
+                "checkpoint_stages": tuple(pool["checkpoint_stages"]),
+            }
+        ),
+        posterior_calibration=PosteriorCalibrationConfig(**calibration),
+        training=TrainingConfig(**training),
+        evaluation=EvaluationConfig(**evaluation),
+        upstream=UpstreamConfig(
+            **{
+                **upstream,
+                "checkpoint_progress": tuple(upstream["checkpoint_progress"]),
+            }
+        ),
+        official_protocol=OfficialProtocolConfig(**protocol),
+    )
+    validate_config(config)
+    if config.to_mapping() != dict(payload):
+        raise ValueError("Resolved deployment config does not round-trip exactly.")
+    return config
+
+
 
 def validate_config(config: RunConfig) -> None:
     if config.method_variant not in METHOD_VARIANTS:
@@ -549,12 +636,18 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("DEPI fixes instant_partner_dim=32 (METHOD_SPEC §1.1).")
     if config.model.component_embedding_dim != 16:
         raise ValueError("DEPI fixes component_embedding_dim=16 (METHOD_SPEC §1.1).")
-    if config.model.capability_dim != 16:
-        raise ValueError("DEPI fixes capability_dim=16 (METHOD_SPEC §1.1).")
+    if config.model.capability_dim != 4:
+        raise ValueError("DEPI fixes semantic capability_dim=4 (METHOD_SPEC §1.1).")
     if config.model.capability_hidden_dim != 64:
         raise ValueError("DEPI fixes capability_hidden_dim=64 (METHOD_SPEC §1.1).")
     if config.model.modulation_rank <= 0:
         raise ValueError("Low-rank actor modulation needs positive rank.")
+    if config.model.protocol_stay_probability not in (0.90, 0.97, 0.99):
+        raise ValueError("Protocol sensitivity supports p_stay in {0.90,0.97,0.99}.")
+    if not config.model.evidence_gated_transition:
+        raise ValueError("DEPI requires identity dynamics when partner evidence is absent.")
+    if config.model.capability_evidence_mode != "partner_planes_only":
+        raise ValueError("Capability evidence must exclude ego/task observation deltas.")
 
     if not 0.0 < config.ppo.gamma <= 1.0:
         raise ValueError("gamma must lie in (0, 1].")
@@ -577,22 +670,25 @@ def validate_config(config: RunConfig) -> None:
         "combined_policy_kl_threshold": 0.04,
         "rank_hinge_margin": 0.1,
         "rank_hinge_advantage_gap": 2.0,
-        "separation_margin_scale": 0.25,
         "decision_policy_weight": 0.25,
         "decision_policy_temperature": 1.0,
         "capability_consistency_weight": 0.01,
         "capability_prediction_weight": 0.1,
         "capability_variance_weight": 0.01,
+        "capability_covariance_weight": 0.01,
         "capability_variance_floor": 0.05,
         "component_signature_weight": 0.25,
+        "posterior_decision_weight": 0.25,
+        "posterior_decision_temperature": 1.0,
+        "separation_margin": 0.5,
     }
     for name, expected in frozen_loss_v2.items():
         if getattr(config.loss_v2, name) != expected:
             raise ValueError(f"DEPI loss_v2 field {name} must equal {expected!r}.")
 
     registered_shape = config.run_kind != "mechanical"
-    if registered_shape and config.anchors.interval_updates != 16:
-        raise ValueError("DEPI training anchors run every 16 outer updates.")
+    if registered_shape and config.anchors.interval_updates != 4:
+        raise ValueError("DEPI training anchors refresh every 4 outer updates.")
     expected_anchor_shape = (
         (4, 2) if config.run_kind == "development" else (32, 16)
     )
@@ -612,6 +708,13 @@ def validate_config(config: RunConfig) -> None:
         config.anchors.continuation_horizon != 128 or config.anchors.probe_steps != 16
     ):
         raise ValueError("DEPI anchors require horizon 128 and 16 evidence steps.")
+    if (
+        config.anchors.task_match_epsilon != 4.0
+        or config.anchors.endpoint_task_match_epsilon != 4.0
+        or config.anchors.episode_time_tolerance != 0
+        or config.anchors.maximum_age_updates != 4
+    ):
+        raise ValueError("DEPI task matching and anchor lifetime registration differs.")
     if config.anchors.return_lower_bound >= config.anchors.return_upper_bound:
         raise ValueError("Anchor return bounds are reversed.")
     frozen_anchor_comparator = {
@@ -670,6 +773,11 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Posterior-calibration coverage band is fixed at [0.85, 0.95].")
     if calibration.primary_unit != "partner_run" or calibration.secondary_unit != "episode":
         raise ValueError("Posterior calibration uses partner-run/episode hierarchy.")
+    if (
+        calibration.minimum_positive_event_count != 100
+        or calibration.minimum_positive_event_count_per_family != 20
+    ):
+        raise ValueError("Posterior event-calibration sample floors differ.")
     if config.run_kind == "formal" and (
         calibration.minimum_run_count != 20
         or calibration.episodes_per_run != 64
@@ -1378,6 +1486,7 @@ __all__ = [
     "TrainingConfig",
     "UpstreamConfig",
     "load_config",
+    "run_config_from_mapping",
     "load_partner_manifest",
     "official_training_key",
     "official_training_domain_keys",

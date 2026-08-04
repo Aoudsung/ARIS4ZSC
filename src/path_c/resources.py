@@ -25,9 +25,18 @@ class ResourceLedger:
     counterfactual_continuation_steps: int = 0
     matched_pair_probe_steps: int = 0
     upstream_partner_steps: int = 0
+    comparator_history_collection_steps: int = 0
+    comparator_continuation_steps: int = 0
+    reference_ego_upstream_steps: int = 0
+    final_m1_steps: int = 0
+    component_diagnostic_steps: int = 0
+    mechanism_evaluation_steps: int = 0
+    shared_pretraining_cost: int = 0
     calibration_steps: int = 0
     evaluation_steps: int = 0
     gpu_hours: float = 0.0
+    comparator_gpu_hours: float = 0.0
+    wall_clock_hours: float = 0.0
     peak_memory_bytes: int = 0
     deployable_parameters: int = 0
     training_only_parameters: int = 0
@@ -40,6 +49,13 @@ class ResourceLedger:
             "counterfactual_continuation_steps",
             "matched_pair_probe_steps",
             "upstream_partner_steps",
+            "comparator_history_collection_steps",
+            "comparator_continuation_steps",
+            "reference_ego_upstream_steps",
+            "final_m1_steps",
+            "component_diagnostic_steps",
+            "mechanism_evaluation_steps",
+            "shared_pretraining_cost",
             "calibration_steps",
             "evaluation_steps",
             "peak_memory_bytes",
@@ -50,9 +66,15 @@ class ResourceLedger:
             value = getattr(self, name)
             if isinstance(value, bool) or int(value) != value or value < 0:
                 raise ValueError(f"Resource field {name} must be a non-negative integer.")
-        for name in ("gpu_hours", "inference_latency_ms"):
+        for name in (
+            "gpu_hours",
+            "comparator_gpu_hours",
+            "wall_clock_hours",
+            "inference_latency_ms",
+        ):
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"Resource field {name} must be non-negative.")
+
     @property
     def total_training_simulator_steps(self) -> int:
         return int(
@@ -61,13 +83,59 @@ class ResourceLedger:
             + self.counterfactual_continuation_steps
             + self.matched_pair_probe_steps
             + self.upstream_partner_steps
+            + self.comparator_history_collection_steps
+            + self.comparator_continuation_steps
+            + self.reference_ego_upstream_steps
+            + self.shared_pretraining_cost
             + self.calibration_steps
+        )
+
+    @property
+    def marginal_training_simulator_steps(self) -> int:
+        return int(
+            self.ego_policy_steps
+            + self.ego_initialization_steps
+            + self.counterfactual_continuation_steps
+            + self.matched_pair_probe_steps
+            + self.calibration_steps
+        )
+
+    @property
+    def shared_training_simulator_steps(self) -> int:
+        return int(
+            self.upstream_partner_steps
+            + self.comparator_history_collection_steps
+            + self.comparator_continuation_steps
+            + self.reference_ego_upstream_steps
+            + self.shared_pretraining_cost
+        )
+
+    @property
+    def fully_loaded_simulator_steps(self) -> int:
+        return int(
+            self.total_training_simulator_steps
+            + self.final_m1_steps
+            + self.component_diagnostic_steps
+            + self.mechanism_evaluation_steps
+            + self.evaluation_steps
+        )
+
+    def amortized_training_simulator_steps(self, *, shared_reuse_count: int) -> float:
+        reuse = int(shared_reuse_count)
+        if reuse <= 0:
+            raise ValueError("Shared resource reuse count must be positive.")
+        return float(
+            self.marginal_training_simulator_steps
+            + self.shared_training_simulator_steps / reuse
         )
 
     def to_mapping(self) -> Mapping[str, Any]:
         return {
             **asdict(self),
             "total_training_simulator_steps": self.total_training_simulator_steps,
+            "marginal_training_simulator_steps": self.marginal_training_simulator_steps,
+            "shared_training_simulator_steps": self.shared_training_simulator_steps,
+            "fully_loaded_simulator_steps": self.fully_loaded_simulator_steps,
         }
 
     def plus(self, **increments: int | float) -> "ResourceLedger":
@@ -82,12 +150,23 @@ class ResourceLedger:
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ResourceLedger":
         fields = set(cls.__dataclass_fields__)
-        accepted = fields | {"total_training_simulator_steps"}
+        accepted = fields | {
+            "total_training_simulator_steps",
+            "marginal_training_simulator_steps",
+            "shared_training_simulator_steps",
+            "fully_loaded_simulator_steps",
+        }
         if not isinstance(payload, Mapping) or set(payload) != accepted:
             raise ValueError("Resource ledger fields differ from the registered schema.")
         ledger = cls(**{name: payload[name] for name in fields})
         if int(payload["total_training_simulator_steps"]) != ledger.total_training_simulator_steps:
             raise ValueError("Resource ledger total is inconsistent with its components.")
+        if int(payload["marginal_training_simulator_steps"]) != ledger.marginal_training_simulator_steps:
+            raise ValueError("Resource ledger marginal total is inconsistent.")
+        if int(payload["shared_training_simulator_steps"]) != ledger.shared_training_simulator_steps:
+            raise ValueError("Resource ledger shared total is inconsistent.")
+        if int(payload["fully_loaded_simulator_steps"]) != ledger.fully_loaded_simulator_steps:
+            raise ValueError("Resource ledger fully-loaded total is inconsistent.")
         return ledger
 
 
@@ -111,9 +190,18 @@ def aggregate_resource_ledgers(ledgers: Sequence[ResourceLedger]) -> ResourceLed
         counterfactual_continuation_steps=sum(item.counterfactual_continuation_steps for item in values),
         matched_pair_probe_steps=sum(item.matched_pair_probe_steps for item in values),
         upstream_partner_steps=sum(item.upstream_partner_steps for item in values),
+        comparator_history_collection_steps=sum(item.comparator_history_collection_steps for item in values),
+        comparator_continuation_steps=sum(item.comparator_continuation_steps for item in values),
+        reference_ego_upstream_steps=sum(item.reference_ego_upstream_steps for item in values),
+        final_m1_steps=sum(item.final_m1_steps for item in values),
+        component_diagnostic_steps=sum(item.component_diagnostic_steps for item in values),
+        mechanism_evaluation_steps=sum(item.mechanism_evaluation_steps for item in values),
+        shared_pretraining_cost=sum(item.shared_pretraining_cost for item in values),
         calibration_steps=sum(item.calibration_steps for item in values),
         evaluation_steps=sum(item.evaluation_steps for item in values),
         gpu_hours=sum(item.gpu_hours for item in values),
+        comparator_gpu_hours=sum(item.comparator_gpu_hours for item in values),
+        wall_clock_hours=sum(item.wall_clock_hours for item in values),
         peak_memory_bytes=max(item.peak_memory_bytes for item in values),
         deployable_parameters=(0 if not deployable else next(iter(deployable))),
         training_only_parameters=(

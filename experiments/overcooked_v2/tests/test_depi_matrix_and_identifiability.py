@@ -31,6 +31,9 @@ from experiments.overcooked_v2.formal_claim_app import (  # noqa: E402
 from experiments.overcooked_v2.official_evaluation_app import (  # noqa: E402
     _load_policy_manifest,
 )
+from experiments.overcooked_v2.identifiability_app import (  # noqa: E402
+    IDENTIFIABILITY_SCHEMA_VERSION,
+)
 from src.path_c.experiment import (  # noqa: E402
     MECHANISM_ABLATION_VARIANTS,
     METHOD_VERSION,
@@ -69,11 +72,23 @@ def test_comparator_source_rows_require_independent_replica_signatures() -> None
                     float((index + 1) % 6 == action) for action in range(6)
                 ],
                 "partner_run_id": f"run-{index % 8}",
+                "partner_mechanism": "rnn-sp" if index % 2 == 0 else "rnn-op",
+                "task_features": [float(index % 4), 0.0],
+                "episode_time": index,
+                "recipe_order_state": f"{index % 4:064x}",
+                "ego_role": index % 2,
+                "instant_partner_features": [0.0, 1.0],
+                "task_state_hash": f"{index + 1:064x}",
+                "history_observations": [[[0.0, 1.0]]],
+                "history_actions": [0],
+                "current_observation": [[0.0, 1.0]],
             }
         )
-    features, fit_signatures, evaluation_signatures, runs = comparator_source_rows(
-        rows, label="fixture"
-    )
+    parsed = comparator_source_rows(rows, label="fixture")
+    features = parsed["history_features"]
+    fit_signatures = parsed["fit_signatures"]
+    evaluation_signatures = parsed["evaluation_signatures"]
+    runs = parsed["partner_run_ids"]
     assert features.shape == (MINIMUM_HISTORIES_PER_SPLIT, 2)
     assert fit_signatures.shape == evaluation_signatures.shape == (
         MINIMUM_HISTORIES_PER_SPLIT,
@@ -271,7 +286,7 @@ def test_development_matrix_rejects_budget_sampler_capacity_and_key_drift() -> N
             "partner_sampler_sha256": "same",
             "total_training_simulator_steps": 120 if (
                 variant in {"r0_extra", "b0_extra", "b1_extra"}
-                or variant in {"b2", "decision_only", "q_only", "actor_only", "no_separation", "no_capability"}
+                    or variant in {"b2", "decision_only", "q_only", "actor_only", "no_separation", "no_capability", "response_only_posterior"}
             ) else 100,
             "ppo_training_steps": (
                 120 if variant in {"r0_extra", "b0_extra", "b1_extra"} else 100
@@ -282,7 +297,8 @@ def test_development_matrix_rejects_budget_sampler_capacity_and_key_drift() -> N
                 "q_only",
                 "actor_only",
                 "no_separation",
-                "no_capability",
+                    "no_capability",
+                    "response_only_posterior",
             } else 0,
             "deployable_parameters": 200,
             "episode_key_domains": {"evaluation": [1, 2]},
@@ -346,7 +362,7 @@ def test_formal_claim_rejects_handwritten_scores_and_validates_mechanism_artifac
     common = {
         "method": METHOD_VERSION,
         "layout": "test_time_simple",
-        "version": 3,
+        "version": IDENTIFIABILITY_SCHEMA_VERSION,
         "method_variant": "b2",
         "paired_crn": True,
         "resource_ledger": {"continuation_steps": 10, "total_simulator_steps": 20},
@@ -462,7 +478,7 @@ def test_formal_claim_rejects_handwritten_common_and_calibration_booleans() -> N
     with pytest.raises(ValueError, match="source tree"):
         _validate_posterior_calibration(
             {
-                "version": 2,
+                "version": 3,
                 "artifact_type": "depi_posterior_calibration",
                 "artifact_name": "DEPI-Posterior-Calibration",
                 "method": METHOD_VERSION,

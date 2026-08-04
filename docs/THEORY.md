@@ -20,6 +20,9 @@ pi_new = softmax(log(pi_bar)+ell)
 
 该定理只相对于注册 response model 成立。固定 T 不依赖 ego action，因此它不能证明主动
 protocol formation；held-out calibration 也只能检验 posterior-predictive distribution。
+evidence gate 在没有新合法伙伴证据时令 prediction 为 identity，因此任意长遮挡都保持当前
+posterior；这只消除“遮挡导致自动遗忘”，不证明有证据时的 emission 正确。`p_stay` 的性能
+与 false-switch/re-identification 仍需注册敏感性实验。
 
 ## 2. component 置换对称性
 
@@ -55,8 +58,9 @@ Capability evidence、protocol emission 和 instant geometry 都只由 L1–L5 �
 输出仍属于合法 ego history。伙伴动作只存在于 simulator world update，不进入部署图。
 
 每 16 步发布只证明 actor-visible `u` 的数值在窗口内固定，不证明它表示稳定 capability。
-零向量仍是 consistency loss 的可行解，但不再是窗口统计 prediction objective 的最优解；
-variance floor 又惩罚跨发布低方差。由于这些统计只固定前四坐标且受观测条件限制，
+零向量仍是 consistency loss 的可行解，但不再是四个窗口统计 prediction objective 的最优解；
+不使用 run ID 的 batch variance floor 惩罚低方差，covariance penalty 抑制坐标冗余。由于这些
+统计受可见性条件限制，
 variance/norm/collapse、`swap-u` 和 no-capability 消融仍是必要经验诊断。
 
 ## 5. joint likelihood 不重复计数 visibility event
@@ -74,10 +78,12 @@ event head 不读 task features；kinematic head 可读 stopped frame。这防�
 centered empirical signature 消除了所有动作共享的 return offset。相同 signature 表示在
 注册 horizon/continuation policy 下动作排序和差值相同，且不要求 partner identity 相同。
 
-one-hot `z=k` 经共享 critic 得到 `S_k`，训练只要求 posterior mixture `sum_k pi_k S_k`
-逼近 empirical signature。这个约束在 component 同时置换时保持不变，所以它建立直接的
-decision coupling，但不能打破 index 不可识别性，也不能单独保证各 component 不合并；后者
-只能由 pairwise divergence、one-hot intervention 与跨 seed permutation alignment 诊断。
+one-hot `z=k` 经共享 critic 得到 `S_k`。训练同时要求 posterior mixture
+`sum_k pi_k S_k` 逼近 empirical signature，并用 permutation-equivariant fit-replica
+responsibility `q^A` 最小化 `KL(sg(q^A)||pi)`。两者在 component 同时置换时保持不变，所以
+decision evidence 可训练 posterior，但不能打破 index 不可识别性，也不能单独保证各 component
+不合并；后者仍由 held-out response/decision gain、pairwise divergence、one-hot intervention
+与共享 panel 的跨 seed permutation alignment 诊断。
 
 用 MAD 和一次正确交付尺度下限归一化后，actor target 对 raw reward 单位变化更稳定；
 top-action stability 和 policy-drift weight 控制 noisy/off-policy anchors，但都不保证非凸优化
@@ -90,7 +96,8 @@ KL(pi_old||pi_new)=sum_a pi_old(a)[log pi_old(a)-log pi_new(a)] >= 0
 ```
 
 有限精度容差外，该量不会像 executed-action Monte Carlo 差那样因抽样而为负。固定一次
-auxiliary transaction 使 response/capability exposure 不随 PPO early stop 改变。
+auxiliary transaction 使 response/capability exposure 不随 PPO early stop 改变；事务前后
+另算一次 exact KL，超注册阈值则整次回滚，因此最终执行策略不会绕过该独立 trust region。
 
 ## 7. 预算与嵌套识别
 

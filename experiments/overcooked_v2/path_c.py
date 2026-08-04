@@ -36,6 +36,20 @@ from experiments.overcooked_v2.development_matrix_app import (
     run_development_matrix,
     summarize_development_matrix,
 )
+from experiments.overcooked_v2.decision_coverage_app import (
+    build_decision_coverage_source,
+    summarize_decision_coverage,
+)
+from experiments.overcooked_v2.protocol_sensitivity_app import (
+    collect_protocol_sensitivity_sequences,
+    run_protocol_sensitivity_matrix,
+    summarize_protocol_sensitivity,
+)
+from experiments.overcooked_v2.contemporary_baseline_app import (
+    CONTEMPORARY_PROXY_METHODS,
+    run_build_contemporary_proxy_manifest,
+    run_common_proxy_evaluation,
+)
 from src.path_c.experiment import (
     ENGINEERING_SEED_INDEX,
     RUN_KINDS,
@@ -81,6 +95,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     scientific_dry_run.add_argument("--partner-manifest", required=True)
     scientific_dry_run.add_argument("--pair-comparator", required=True)
+    scientific_dry_run.add_argument(
+        "--comparator-reference-ego-checkpoint", required=True
+    )
     scientific_dry_run.add_argument("--resume", action="store_true", default=False)
     scientific_dry_run.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
@@ -123,6 +140,35 @@ def _parser() -> argparse.ArgumentParser:
     baseline.add_argument("--depi-deployment")
     baseline.add_argument("--output", required=True)
     baseline.set_defaults(function=run_official_baseline, manages_output=True)
+
+    proxy_manifest = commands.add_parser("build-contemporary-proxy-manifest")
+    proxy_manifest.add_argument(
+        "--method", choices=CONTEMPORARY_PROXY_METHODS, required=True
+    )
+    proxy_manifest.add_argument("--config", required=True)
+    proxy_manifest.add_argument("--depi-reference-manifest", required=True)
+    proxy_manifest.add_argument("--deployments", nargs=10, required=True)
+    proxy_manifest.add_argument("--output", required=True)
+    proxy_manifest.set_defaults(
+        function=run_build_contemporary_proxy_manifest, manages_output=False
+    )
+
+    proxy_common = commands.add_parser("evaluate-common-proxies")
+    proxy_common.add_argument("--config", required=True)
+    proxy_common.add_argument("--partner-manifest", required=True)
+    proxy_common.add_argument(
+        "--policy-manifest",
+        action="append",
+        required=True,
+        help="METHOD=/policy_manifest.json; provide all three proxy methods",
+    )
+    proxy_common.add_argument("--output", required=True)
+    proxy_common.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    proxy_common.set_defaults(
+        function=run_common_proxy_evaluation, manages_output=True
+    )
 
     validate = commands.add_parser("validate-manifest")
     validate.add_argument("--config", required=True)
@@ -175,6 +221,73 @@ def _parser() -> argparse.ArgumentParser:
     comparator.add_argument("--output", required=True)
     comparator.set_defaults(function=fit_frozen_pair_comparator, manages_output=True)
 
+    coverage_source = commands.add_parser("build-decision-coverage-source")
+    coverage_source.add_argument("--source", required=True)
+    coverage_source.add_argument(
+        "--partition", choices=("fit", "validation"), required=True
+    )
+    coverage_source.add_argument(
+        "--role",
+        choices=("training_support", "development_coverage"),
+        required=True,
+    )
+    coverage_source.add_argument("--output", required=True)
+    coverage_source.set_defaults(
+        function=build_decision_coverage_source, manages_output=False
+    )
+
+    coverage_report = commands.add_parser("summarize-decision-coverage")
+    coverage_report.add_argument("--training-source", required=True)
+    coverage_report.add_argument("--coverage-source", required=True)
+    coverage_report.add_argument("--task-epsilon", type=float, default=4.0)
+    coverage_report.add_argument("--signature-threshold", type=float, default=1.0)
+    coverage_report.add_argument("--output", required=True)
+    coverage_report.set_defaults(
+        function=summarize_decision_coverage, manages_output=True
+    )
+
+    protocol_sequences = commands.add_parser(
+        "collect-protocol-sensitivity-sequences"
+    )
+    protocol_sequences.add_argument("--config", required=True)
+    protocol_sequences.add_argument("--training-run", required=True)
+    protocol_sequences.add_argument("--panel-comparator", required=True)
+    protocol_sequences.add_argument("--output", required=True)
+    protocol_sequences.set_defaults(
+        function=collect_protocol_sensitivity_sequences, manages_output=False
+    )
+
+    protocol_sensitivity = commands.add_parser("summarize-protocol-sensitivity")
+    protocol_sensitivity.add_argument(
+        "--input",
+        action="append",
+        required=True,
+        help="P_STAY=/path/to/sequence-artifact.json; provide 0.90, 0.97, 0.99",
+    )
+    protocol_sensitivity.add_argument("--output", required=True)
+    protocol_sensitivity.set_defaults(
+        function=summarize_protocol_sensitivity, manages_output=True
+    )
+
+    protocol_matrix = commands.add_parser("run-protocol-sensitivity-matrix")
+    protocol_matrix.add_argument("--config", required=True)
+    protocol_matrix.add_argument("--partner-manifest", required=True)
+    protocol_matrix.add_argument("--pair-comparator", required=True)
+    protocol_matrix.add_argument(
+        "--comparator-reference-ego-checkpoint", required=True
+    )
+    protocol_matrix.add_argument(
+        "--seed-index", action="append", type=int, choices=range(10), required=True
+    )
+    protocol_matrix.add_argument("--resume", action="store_true", default=False)
+    protocol_matrix.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    protocol_matrix.add_argument("--output", required=True)
+    protocol_matrix.set_defaults(
+        function=run_protocol_sensitivity_matrix, manages_output=True
+    )
+
     train = commands.add_parser("train")
     train.add_argument("--config", required=True)
     train.add_argument("--partner-manifest", required=True)
@@ -188,6 +301,7 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--run-kind", choices=RUN_KINDS, required=True)
     train.add_argument("--output", required=True)
     train.add_argument("--pair-comparator")
+    train.add_argument("--comparator-reference-ego-checkpoint")
     train.add_argument("--resume", action="store_true")
     train.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
@@ -210,6 +324,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     matrix.add_argument("--output", required=True)
     matrix.add_argument("--pair-comparator", required=True)
+    matrix.add_argument("--comparator-reference-ego-checkpoint", required=True)
     matrix.add_argument("--resume", action="store_true")
     matrix.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
@@ -234,6 +349,7 @@ def _parser() -> argparse.ArgumentParser:
             "actor_only",
             "no_separation",
             "no_capability",
+            "response_only_posterior",
         ),
         required=True,
     )
@@ -256,6 +372,10 @@ def _parser() -> argparse.ArgumentParser:
     cuda_preflight = commands.add_parser("cuda-preflight")
     cuda_preflight.add_argument("--config", required=True)
     cuda_preflight.add_argument("--partner-manifest", required=True)
+    cuda_preflight.add_argument("--pair-comparator", required=True)
+    cuda_preflight.add_argument(
+        "--comparator-reference-ego-checkpoint", required=True
+    )
     cuda_preflight.add_argument(
         "--seed-index",
         type=int,

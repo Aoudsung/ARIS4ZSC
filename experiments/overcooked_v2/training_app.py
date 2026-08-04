@@ -25,12 +25,21 @@ from experiments.overcooked_v2.deployment import (
     export_deployment_bundle,
     load_deployment,
 )
-from experiments.overcooked_v2.comparator_app import load_frozen_pair_comparator
+from experiments.overcooked_v2.comparator_app import (
+    load_component_diagnostic_panel,
+    load_frozen_pair_comparator,
+)
+from src.path_c.comparator_contract import (
+    comparator_contract_for_run,
+    comparator_reference_policy_set_hash,
+)
+from src.path_c.continuation import ContinuationContract
 from experiments.overcooked_v2.official_adapter import (
     FrozenPartnerPool,
     VectorEnvironment,
     validate_official_runtime,
 )
+from experiments.overcooked_v2.official_policy import OfficialDEPIPolicy
 from src.path_c.anchor_sampling import (
     COMPARATOR_RUN_ID_CAPACITY,
     FrozenPairComparator,
@@ -78,6 +87,7 @@ from src.path_c.resources import (
     ResourceLedger,
     configure_bundled_cuda_toolchain,
     gpu_hours_for_wall_seconds,
+    measure_policy_inference_latency_ms,
     parameter_count,
     peak_device_memory_bytes,
     require_single_cuda_worker,
@@ -92,6 +102,7 @@ from src.path_c.storage import (
     pytree_fingerprint,
     restore_latest_checkpoint,
     save_checkpoint,
+    sha256_path,
     training_identity,
     validate_formal_repository_state,
     validate_registered_python_runtime,
@@ -263,7 +274,7 @@ def _fingerprint_words(tree: Any) -> np.ndarray:
 def _empty_supervision_payload(
     *, config: Any, observation_shape: tuple[int, ...]
 ) -> tuple[Any, Any, FrozenPairComparator]:
-    """Fixed-shape inactive values used by checkpoint schema 7."""
+    """Fixed-shape inactive values used by checkpoint schema 8."""
 
     import jax.numpy as jnp
 
@@ -308,6 +319,12 @@ def _empty_supervision_payload(
         fit_replica_returns_by_action=jnp.zeros(
             (anchor_count, 6, int(config.anchors.fit_replicas)),
             dtype=jnp.float32,
+        ),
+        collection_policy_fingerprint=jnp.zeros(
+            (anchor_count, 2), dtype=jnp.uint32
+        ),
+        collection_context_fingerprint=jnp.zeros(
+            (anchor_count, 2), dtype=jnp.uint32
         ),
     )
     pair_policy = jax_tree_take(policy, pair_count)
@@ -597,10 +614,14 @@ def _validate_preflight_roundtrips(
     }
 
 
-def _upstream_partner_cost(runs: tuple[Any, ...], *, formal: bool) -> tuple[int, Any]:
+def _upstream_partner_cost(
+    runs: tuple[Any, ...], *, formal: bool
+) -> tuple[int, float, float, Any]:
     """Read explicit upstream ledgers; never invent hidden population cost."""
 
     total = 0
+    gpu_hours = 0.0
+    wall_clock_hours = 0.0
     records = []
     seen: set[str] = set()
     for run in runs:
@@ -619,22 +640,57 @@ def _upstream_partner_cost(runs: tuple[Any, ...], *, formal: bool) -> tuple[int,
             records.append({"parent": parent, "status": "missing_explicit_ledger"})
             continue
         payload = json.loads(ledger_path.read_text(encoding="utf-8"))
-        value = payload.get(
-            "total_training_simulator_steps",
-            payload.get("effective_environment_steps", payload.get("actual_timesteps")),
+        try:
+            registered_ledger = ResourceLedger.from_mapping(payload)
+        except (TypeError, ValueError):
+            registered_ledger = None
+        value = (
+            registered_ledger.total_training_simulator_steps
+            if registered_ledger is not None
+            else payload.get(
+                "effective_environment_steps", payload.get("actual_timesteps")
+            )
         )
         if value is None:
             records.append({"parent": parent, "status": "ledger_has_no_step_total"})
             continue
         total += int(value)
+        if registered_ledger is not None:
+            gpu_hours += float(registered_ledger.gpu_hours)
+            wall_clock_hours += float(registered_ledger.wall_clock_hours)
         records.append(
-            {"parent": parent, "status": "counted", "steps": int(value), "path": str(ledger_path)}
+            {
+                "parent": parent,
+                "status": (
+                    "counted" if registered_ledger is not None else "legacy_ledger"
+                ),
+                "steps": int(value),
+                "path": str(ledger_path),
+            }
         )
     if formal and any(record["status"] != "counted" for record in records):
         raise RuntimeError(
             "Formal DEPI resource accounting requires explicit upstream partner ledgers."
         )
-    return total, records
+    return total, gpu_hours, wall_clock_hours, records
+
+
+def _comparator_shared_resources(path: str | Path) -> ResourceLedger:
+    """Read the validated shared-cost ledger embedded in a frozen comparator."""
+
+    payload = json.loads(Path(path).resolve().read_text(encoding="utf-8"))
+    registration = payload.get("source_registration")
+    if not isinstance(registration, Mapping):
+        raise ValueError("Frozen comparator has no shared-resource registration.")
+    ledger = ResourceLedger.from_mapping(registration.get("resource_ledger"))
+    if (
+        ledger.comparator_history_collection_steps <= 0
+        or ledger.comparator_continuation_steps <= 0
+        or ledger.reference_ego_upstream_steps <= 0
+        or ledger.shared_pretraining_cost <= 0
+    ):
+        raise ValueError("Frozen comparator shared-resource ledger is incomplete.")
+    return ledger
 
 
 def _all_finite(tree: Any) -> bool:
@@ -660,7 +716,8 @@ def _account_runtime_resources(
     """Add one non-overlapping process interval to the checkpointed ledger."""
 
     ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
-        gpu_hours=gpu_hours_for_wall_seconds(float(elapsed_wall_seconds))
+        gpu_hours=gpu_hours_for_wall_seconds(float(elapsed_wall_seconds)),
+        wall_clock_hours=float(elapsed_wall_seconds) / 3_600.0,
     )
     ledger = ResourceLedger(
         **{
@@ -748,15 +805,22 @@ def run_training(args: argparse.Namespace) -> None:
     # decision-mechanism ablations. R0/B0/B1 never collect and discard them.
     anchor_enabled = bool(config.anchors.enabled) and anchor_supervision_enabled
     pair_comparator_path = getattr(args, "pair_comparator", None)
+    comparator_reference_checkpoint = getattr(
+        args, "comparator_reference_ego_checkpoint", None
+    )
     if (
         anchor_supervision_enabled
         and config.run_kind in {"development", "formal"}
-        and not preflight
         and not pair_comparator_path
     ):
         raise ValueError(
             "Registered anchor-supervised development/formal training requires a frozen "
             "--pair-comparator artifact fitted before ego training."
+        )
+    if pair_comparator_path and not comparator_reference_checkpoint:
+        raise ValueError(
+            "A frozen comparator requires --comparator-reference-ego-checkpoint "
+            "to bind its reference-policy lineage."
         )
     pretrained_comparator = bool(pair_comparator_path)
     cuda_toolchain = None
@@ -785,6 +849,19 @@ def run_training(args: argparse.Namespace) -> None:
         owner_seed_index=int(args.seed_index),
         formal=(config.run_kind == "formal" and not preflight),
     )
+    comparator_contract = None
+    if pair_comparator_path:
+        reference_checkpoint_sha = sha256_path(
+            Path(str(comparator_reference_checkpoint)).resolve()
+        )
+        comparator_contract = comparator_contract_for_run(
+            config=config,
+            manifest=manifest,
+            reference_policy_set_hash=comparator_reference_policy_set_hash(
+                reference_checkpoint_sha256=reference_checkpoint_sha,
+                manifest=manifest,
+            ),
+        )
     output = Path(args.output).resolve()
     environment = VectorEnvironment.create(config)
     observation_shape = environment.observation_shape
@@ -828,6 +905,14 @@ def run_training(args: argparse.Namespace) -> None:
                 else {
                     "path": str(Path(pair_comparator_path).resolve()),
                     "sha256": sha256_path(Path(pair_comparator_path).resolve()),
+                    "contract": comparator_contract.to_mapping(),
+                    "contract_fingerprint": comparator_contract.fingerprint,
+                    "reference_ego_checkpoint": {
+                        "path": str(
+                            Path(str(comparator_reference_checkpoint)).resolve()
+                        ),
+                        "sha256": reference_checkpoint_sha,
+                    },
                 }
             ),
         }
@@ -959,15 +1044,20 @@ def run_training(args: argparse.Namespace) -> None:
             ],
         },
     )
-    upstream_steps, upstream_records = _upstream_partner_cost(
+    (
+        upstream_steps,
+        upstream_gpu_hours,
+        upstream_wall_clock_hours,
+        upstream_records,
+    ) = _upstream_partner_cost(
         tuple(
             {
                 run.run_id: run
                 for run in (
                     *owner_runs,
                     *support_runs,
-                    *comparator_fit_runs,
-                    *comparator_validation_runs,
+                    *(() if pair_comparator_path else comparator_fit_runs),
+                    *(() if pair_comparator_path else comparator_validation_runs),
                 )
             }.values()
         ),
@@ -989,6 +1079,7 @@ def run_training(args: argparse.Namespace) -> None:
         response_hidden_dim=config.model.response_hidden_dim,
         modulation_rank=config.model.modulation_rank,
         action_embedding_dim=config.model.action_embedding_dim,
+        protocol_stay_probability=config.model.protocol_stay_probability,
         method_variant=config.method_variant,
     )
     ego_root = jnp.asarray(domains["ego"], dtype=jnp.uint32)
@@ -1130,11 +1221,31 @@ def run_training(args: argparse.Namespace) -> None:
         partner_functions=partner_functions,
         random_key=runner_key,
     )
+    comparator_shared = (
+        ResourceLedger()
+        if not pair_comparator_path
+        else _comparator_shared_resources(pair_comparator_path)
+    )
     initial_ledger = ResourceLedger(
         ego_initialization_steps=(
             0 if not new_run else environment.num_envs * config.training.rollout_length
         ),
         upstream_partner_steps=upstream_steps,
+        comparator_history_collection_steps=(
+            comparator_shared.comparator_history_collection_steps
+        ),
+        comparator_continuation_steps=(
+            comparator_shared.comparator_continuation_steps
+        ),
+        reference_ego_upstream_steps=(
+            comparator_shared.reference_ego_upstream_steps
+        ),
+        shared_pretraining_cost=comparator_shared.shared_pretraining_cost,
+        gpu_hours=upstream_gpu_hours + comparator_shared.gpu_hours,
+        comparator_gpu_hours=comparator_shared.comparator_gpu_hours,
+        wall_clock_hours=(
+            upstream_wall_clock_hours + comparator_shared.wall_clock_hours
+        ),
     )
     (
         empty_supervision_anchors,
@@ -1144,8 +1255,11 @@ def run_training(args: argparse.Namespace) -> None:
         config=config, observation_shape=observation_shape
     )
     if pair_comparator_path:
+        if comparator_contract is None:
+            raise RuntimeError("Comparator contract was not constructed.")
         empty_pair_comparator = load_frozen_pair_comparator(
             pair_comparator_path,
+            expected_contract=comparator_contract,
             expected_history_feature_dim=int(empty_pair_comparator.history_feature_dim),
         )
     template = TrainState(
@@ -1391,7 +1505,7 @@ def run_training(args: argparse.Namespace) -> None:
                     signature_threshold=float(
                         config.anchors.signature_distance_threshold
                     ),
-                    margin_scale=float(config.loss_v2.separation_margin_scale),
+                    margin=float(config.loss_v2.separation_margin),
                 )
             if anchor_supervision_enabled:
                 (
@@ -1460,6 +1574,19 @@ def run_training(args: argparse.Namespace) -> None:
                 )
             # M1 is a report-only model-quality diagnostic. A failed value
             # mechanism is recorded but never changes the training path.
+        anchor_age_updates = 0
+        if supervision_anchors is not None:
+            anchor_age_updates = update - int(
+                np.max(np.asarray(supervision_anchors.collection_update))
+            )
+            if anchor_age_updates > int(config.anchors.maximum_age_updates):
+                supervision_anchors = None
+                supervision_separation = None
+                supervision_readings = {
+                    **supervision_readings,
+                    "expired_anchor_batch": True,
+                    "anchor_age_updates": anchor_age_updates,
+                }
         schedule = environment_minibatch_schedule(
             jax.random.fold_in(
                 jnp.asarray(domains["ego"], dtype=jnp.uint32), 400_000 + update
@@ -1715,10 +1842,85 @@ def run_training(args: argparse.Namespace) -> None:
             frozen_comparator=state.current_pair_comparator,
         )
         del unused_final_pairs, unused_final_comparator
+        if pair_comparator_path:
+            diagnostic_panel = load_component_diagnostic_panel(
+                pair_comparator_path
+            )
+            panel_history_observations = jnp.asarray(
+                diagnostic_panel["history_observations"], dtype=jnp.float32
+            )
+            panel_history_actions = jnp.asarray(
+                diagnostic_panel["history_actions"], dtype=jnp.int32
+            )
+            panel_observations = jnp.asarray(
+                diagnostic_panel["current_observations"], dtype=jnp.float32
+            )
+            panel_count, panel_steps = panel_history_actions.shape
+            panel_state = initial_policy_state(
+                batch_size=panel_count,
+                observation_shape=observation_shape,
+                action_count=6,
+                task_hidden_dim=config.model.task_hidden_dim,
+                capability_hidden_dim=config.model.capability_hidden_dim,
+                capability_dim=config.model.capability_dim,
+                component_embedding_dim=config.model.component_embedding_dim,
+                protocol_components=config.model.protocol_components,
+            )
+            panel_previous_actions = jnp.concatenate(
+                (
+                    jnp.zeros((panel_count, 1), dtype=jnp.int32),
+                    panel_history_actions[:, :-1],
+                ),
+                axis=1,
+            )
+            panel_starts = jnp.zeros(
+                (panel_count, panel_steps), dtype=jnp.bool_
+            ).at[:, 0].set(True)
+            panel_state, unused_panel_context = model.apply(
+                {"params": state.params},
+                panel_state,
+                jnp.swapaxes(panel_history_observations, 0, 1),
+                jnp.swapaxes(panel_previous_actions, 0, 1),
+                jnp.swapaxes(panel_starts, 0, 1),
+                method=model.context_sequence,
+            )
+            del unused_panel_context
+            panel_state = panel_state._replace(
+                previous_action=panel_history_actions[:, -1],
+                episode_start=jnp.zeros((panel_count,), dtype=jnp.bool_),
+            )
+        else:
+            # Mechanical execution has no frozen comparator by construction.
+            # Its fresh final anchors still exercise the complete intervention
+            # path, but are explicitly non-shared and non-scientific.
+            panel_state = final_anchors.policy_states
+            panel_observations = jnp.asarray(
+                final_anchors.observations, dtype=jnp.float32
+            )
+            panel_ids = [
+                f"mechanical-anchor-{int(value)}"
+                for value in np.asarray(final_anchors.anchor_ids).reshape((-1,))
+            ]
+            context_fingerprints = np.asarray(
+                final_anchors.collection_context_fingerprint,
+                dtype=np.uint32,
+            ).reshape((-1, 2))
+            diagnostic_panel = {
+                "panel_ids": panel_ids,
+                "state_hashes": [
+                    f"{int(words[0]):08x}{int(words[1]):08x}"
+                    for words in context_fingerprints
+                ],
+                "source": {
+                    "artifact_type": "mechanical_final_anchor_batch",
+                    "shared_across_runs": False,
+                    "scientific_readout_allowed": False,
+                },
+            }
         _, final_component_output = model.apply(
             {"params": state.params},
-            final_anchors.policy_states,
-            final_anchors.observations,
+            panel_state,
+            panel_observations,
             method=model.component_intervention_step,
         )
         component_summary = component_intervention_summary(
@@ -1726,6 +1928,11 @@ def run_training(args: argparse.Namespace) -> None:
             policy_logits=final_component_output.policy_logits,
             protocol_probabilities=(
                 final_component_output.protocol_probabilities
+            ),
+            diagnostic_panel_ids=diagnostic_panel["panel_ids"],
+            diagnostic_panel_state_hashes=diagnostic_panel["state_hashes"],
+            component_embeddings=model.apply(
+                {"params": state.params}, method=model.component_embedding_matrix
             ),
         )
         from src.path_c.response_targets import (
@@ -1736,10 +1943,10 @@ def run_training(args: argparse.Namespace) -> None:
         for action in range(6):
             _, response_intervention = model.apply(
                 {"params": state.params},
-                final_anchors.policy_states,
-                final_anchors.observations,
+                panel_state,
+                panel_observations,
                 jnp.full(
-                    final_anchors.observations.shape[0],
+                    panel_observations.shape[0],
                     action,
                     dtype=jnp.int32,
                 ),
@@ -1757,17 +1964,17 @@ def run_training(args: argparse.Namespace) -> None:
         write_json(
             output / "records" / "final_component_diagnostics.json",
             {
-                "version": 1,
+                "version": 2,
                 "artifact_type": "depi_exchangeable_response_regime_diagnostics",
                 "method": METHOD_VERSION,
                 "method_variant": config.method_variant,
                 "seed_index": int(args.seed_index),
                 "protocol_components": int(config.model.protocol_components),
                 "model_fingerprint": final_model_fingerprint,
-                "fresh_final_policy_anchors": True,
+                "shared_final_diagnostic_panel": True,
+                "diagnostic_panel_source": diagnostic_panel["source"],
                 "one_hot_component_intervention": True,
                 "component_indexes_are_exchangeable": True,
-                "anchor_ids": _host(final_anchors.anchor_ids),
                 **component_summary,
             },
         )
@@ -1812,6 +2019,11 @@ def run_training(args: argparse.Namespace) -> None:
             "deployment_params_fingerprint": final_model_fingerprint,
             "anchor_collection_policy_fingerprint": final_model_fingerprint,
             "continuation_policy_fingerprint": final_model_fingerprint,
+            "continuation_contract": ContinuationContract(
+                gamma=float(config.ppo.gamma),
+                horizon=int(config.anchors.continuation_horizon),
+                continuation_policy_fingerprint=final_model_fingerprint,
+            ).to_mapping(),
             "partner_panel_fingerprint": sha256_path(
                 Path(args.partner_manifest).resolve()
             ),
@@ -1853,11 +2065,12 @@ def run_training(args: argparse.Namespace) -> None:
             m1_history=final_history,
             resource_ledger=ResourceLedger.from_mapping(state.resource_ledger)
             .plus(
-                evaluation_steps=(
+                final_m1_steps=(
                     config.environment.num_envs * config.training.rollout_length
                     + int(final_anchor_budget["counterfactual_continuation_steps"])
                     + int(final_anchor_budget["matched_pair_probe_steps"])
-                )
+                ),
+                component_diagnostic_steps=0,
             )
             .to_mapping(),
         )
@@ -1886,6 +2099,16 @@ def run_training(args: argparse.Namespace) -> None:
     training_only_count = parameter_count(state.target_params) + parameter_count(
         state.bootstrap_encoder_params
     )
+    final_deployment = Deployment(
+        ego_run_id=str(args.ego_run_id),
+        config=config,
+        model=model,
+        params=state.params,
+    )
+    inference_latency_ms = measure_policy_inference_latency_ms(
+        OfficialDEPIPolicy(final_deployment),
+        np.zeros(observation_shape, dtype=np.float32),
+    )
     now = time.perf_counter()
     state = _account_runtime_resources(
         state, elapsed_wall_seconds=now - wall_accounted_at
@@ -1899,6 +2122,7 @@ def run_training(args: argparse.Namespace) -> None:
             },
             "deployable_parameters": deployable_count,
             "training_only_parameters": training_only_count,
+            "inference_latency_ms": inference_latency_ms,
         }
     )
     state = state._replace(resource_ledger=ledger.to_mapping())
@@ -1945,12 +2169,7 @@ def run_training(args: argparse.Namespace) -> None:
         export_deployment_bundle(
             deployment_directory,
             source_training_run=output,
-            deployment=Deployment(
-                ego_run_id=str(args.ego_run_id),
-                config=config,
-                model=model,
-                params=state.params,
-            ),
+            deployment=final_deployment,
         )
     if preflight:
         if peak_device_memory_bytes() >= FORMAL_PEAK_MEMORY_LIMIT_BYTES:
@@ -1962,12 +2181,49 @@ def run_training(args: argparse.Namespace) -> None:
             deployment_directory=deployment_directory,
             config=config,
         )
+        required_acceptance_artifacts = {
+            "run_identity": output / "run_identity.json",
+            "resolved_config": output / "resolved_config.json",
+            "resolved_partner_manifest": output / "resolved_partner_manifest.json",
+            "resource_ledger": output / "resource_ledger.json",
+            "fresh_final_m1": output / "m1_gate.json",
+            "component_diagnostics": (
+                output / "records" / "final_component_diagnostics.json"
+            ),
+            "deployment_bundle": (
+                deployment_directory / "deployment_bundle.json"
+            ),
+        }
+        missing_acceptance = [
+            name for name, path in required_acceptance_artifacts.items()
+            if not path.is_file()
+        ]
+        if missing_acceptance:
+            raise RuntimeError(
+                "CUDA comparator preflight did not complete all registered stages: "
+                f"{missing_acceptance}."
+            )
         write_json(
             output / "cuda_preflight_report.json",
             {
                 **metadata,
                 **roundtrip_report,
+                "repository_commit": identity["runtime"]["repository_commit"],
+                "config_fingerprint": config.fingerprint,
+                "partner_manifest_sha256": identity["partner_manifest"]["sha256"],
+                "pair_comparator_sha256": identity["frozen_pair_comparator"]["sha256"],
+                "pair_comparator_contract_fingerprint": identity[
+                    "frozen_pair_comparator"
+                ]["contract_fingerprint"],
                 "compiled_rollout_update_count": 1,
+                "real_anchor_collection_passed": True,
+                "comparator_prediction_and_separation_passed": True,
+                "ppo_and_auxiliary_transactions_passed": True,
+                "fresh_final_m1_passed": True,
+                "acceptance_artifacts": {
+                    name: {"path": str(path), "sha256": sha256_path(path)}
+                    for name, path in required_acceptance_artifacts.items()
+                },
                 "peak_memory_gate_passed": True,
                 "peak_memory_limit_bytes": FORMAL_PEAK_MEMORY_LIMIT_BYTES,
                 "observed_peak_memory_bytes": peak_device_memory_bytes(),

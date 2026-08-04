@@ -10,7 +10,13 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from experiments.overcooked_v2.deployment import load_deployment
+from experiments.overcooked_v2.deployment import (
+    load_deployment,
+    load_self_contained_deployment,
+)
+from experiments.overcooked_v2.contemporary_baseline_app import (
+    CONTEMPORARY_PROXY_METHODS,
+)
 from experiments.overcooked_v2.official_adapter import (
     _official_symbol,
     official_policy,
@@ -346,13 +352,19 @@ def _load_policy_manifest(path: str | Path, *, expected_layout: str) -> Mapping[
     method = str(payload.get("method", "")) if isinstance(payload, Mapping) else ""
     if method in EXTENDED_METHODS:
         expected.add("capacity_match")
+    if method in CONTEMPORARY_PROXY_METHODS:
+        expected.add("proxy_metadata")
     if method == "depi":
         expected.update({"deployment_parameter_count", "m1_final_evaluations"})
     if not isinstance(payload, Mapping) or set(payload) != expected:
         raise ValueError("Policy manifest fields differ from the formal schema.")
     if int(payload["version"]) != 1 or str(payload["layout"]) != expected_layout:
         raise ValueError("Policy manifest version/layout mismatch.")
-    if str(payload["method"]) not in (*FORMAL_METHODS, *EXTENDED_METHODS):
+    if str(payload["method"]) not in (
+        *FORMAL_METHODS,
+        *EXTENDED_METHODS,
+        *CONTEMPORARY_PROXY_METHODS,
+    ):
         raise ValueError("Policy manifest method is not registered.")
     if method in EXTENDED_METHODS:
         match = payload["capacity_match"]
@@ -370,6 +382,42 @@ def _load_policy_manifest(path: str | Path, *, expected_layout: str) -> Mapping[
             raise ValueError("IPPO-Large capacity mismatch metadata is inconsistent.")
     if method == "depi" and int(payload["deployment_parameter_count"]) <= 0:
         raise ValueError("DEPI deployment parameter count must be positive.")
+    if method in CONTEMPORARY_PROXY_METHODS:
+        metadata = payload["proxy_metadata"]
+        if (
+            not isinstance(metadata, Mapping)
+            or set(metadata)
+            != {
+                "is_proxy",
+                "not_a_published_method_reproduction",
+                "closest_in_repository_variant",
+                "description",
+                "legal_information_boundary",
+                "partner_manifest_sha256",
+                "ego_policy_steps_per_run",
+                "deployable_parameter_count",
+                "depi_reference_manifest",
+                "same_training_partner_pool",
+                "same_ego_interaction_budget",
+                "same_deployable_capacity",
+            }
+            or metadata["is_proxy"] is not True
+            or metadata["not_a_published_method_reproduction"] is not True
+            or metadata["same_training_partner_pool"] is not True
+            or metadata["same_ego_interaction_budget"] is not True
+            or metadata["same_deployable_capacity"] is not True
+            or int(metadata["ego_policy_steps_per_run"]) <= 0
+            or int(metadata["deployable_parameter_count"]) <= 0
+        ):
+            raise ValueError("Contemporary baseline proxy metadata differs.")
+        reference = metadata["depi_reference_manifest"]
+        if (
+            not isinstance(reference, Mapping)
+            or set(reference) != {"path", "sha256"}
+            or sha256_path(Path(str(reference["path"])).resolve())
+            != reference["sha256"]
+        ):
+            raise ValueError("Contemporary baseline DEPI reference differs.")
     if str(payload["policy_kind"]) not in {"official_ppo", "depi_deployment"}:
         raise ValueError("Policy manifest has an unknown policy kind.")
     if str(payload["official_source_commit"]) != OFFICIAL_SOURCE_COMMIT:
@@ -475,7 +523,11 @@ def _load_policies(manifest: Mapping[str, Any], config: RunConfig) -> tuple[Any,
             official_config, params = restore_official_checkpoint(path)
             policy = official_policy(params, official_config)
         else:
-            deployment = load_deployment(path, config)
+            deployment = (
+                load_self_contained_deployment(path)
+                if str(manifest["method"]) in CONTEMPORARY_PROXY_METHODS
+                else load_deployment(path, config)
+            )
             policy = OfficialDEPIPolicy(deployment)
             assert_official_policy_surface(policy)
         policies.append(policy)

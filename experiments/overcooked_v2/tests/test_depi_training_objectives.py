@@ -76,6 +76,7 @@ def test_component_signature_constraint_targets_the_posterior_mixture() -> None:
                 raw_q1=target,
                 raw_q2=target,
                 policy_logits=jnp.zeros((1, 6)),
+                context_summary=jnp.zeros((1, 2)),
             )
 
     anchors = SimpleNamespace(
@@ -88,6 +89,7 @@ def test_component_signature_constraint_targets_the_posterior_mixture() -> None:
         return_squared_sum_by_action=2.0 * jnp.square(target),
         fit_replica_returns_by_action=None,
         collection_policy_logits=jnp.zeros((1, 6)),
+        collection_context_fingerprint=jnp.zeros((1, 2), dtype=jnp.uint32),
     )
     loss_config = SimpleNamespace(
         rank_hinge_margin=0.1,
@@ -118,6 +120,19 @@ def test_component_signature_constraint_targets_the_posterior_mixture() -> None:
     )
     assert float(mismatched) > float(matched)
     assert float(mismatched_metrics["component_signature_loss"]) > 0.0
+
+    response_only, response_only_metrics = signature_anchor_objective(
+        model=FakeModel(jnp.asarray([[0.75, 0.25]])),
+        params={},
+        anchors=anchors,
+        loss_v2=loss_config,
+        critic_enabled=True,
+        actor_enabled=False,
+        posterior_decision_enabled=False,
+    )
+    assert float(mismatched_metrics["posterior_decision_loss"]) > 0.0
+    assert float(response_only_metrics["posterior_decision_loss"]) == 0.0
+    assert float(response_only) < float(mismatched)
 
 
 def _small_model_and_params():

@@ -1,11 +1,11 @@
-"""DEPI combined-loss training (METHOD_SPEC §3).
+"""DEPI PPO-scan plus one independently trust-regioned auxiliary transaction.
 
 L = L_PPO + lambda_A * L_signature + lambda_R * L_response + lambda_S * L_separation
 
-All four terms are evaluated at the current parameters inside one
-``jax.value_and_grad`` and a single gradient step updates every trainable
-parameter (§3.3).  The eight-objective PCGrad / snapshot-gradient machinery is
-abolished.  After each combined update the rollout batch reports
+PPO minibatches are followed by one full-batch response/decision transaction.
+Each transaction is differentiated once; the auxiliary transaction is rolled
+back if its own exact categorical policy KL exceeds the registered bound.
+After each update the rollout batch reports
 ``combined_policy_kl`` (exact behaviour-vs-updated categorical policy KL,
 including every context-pathway effect); exceeding the registered threshold
 terminates the remaining minibatches of the current PPO epoch (§3.4).
@@ -27,19 +27,20 @@ RESPONSE_VARIANTS = frozenset(
         "actor_only",
         "no_separation",
         "no_capability",
+        "response_only_posterior",
     }
 )
 CAPABILITY_VARIANTS = RESPONSE_VARIANTS - {"no_capability"}
 ANCHOR_VARIANTS = frozenset(
-    {"b2", "decision_only", "q_only", "actor_only", "no_separation", "no_capability"}
+    {"b2", "decision_only", "q_only", "actor_only", "no_separation", "no_capability", "response_only_posterior"}
 )
 CRITIC_SIGNATURE_VARIANTS = frozenset(
-    {"b2", "q_only", "no_separation", "no_capability"}
+    {"b2", "q_only", "no_separation", "no_capability", "response_only_posterior"}
 )
 ACTOR_DECISION_VARIANTS = frozenset(
-    {"b2", "decision_only", "actor_only", "no_separation", "no_capability"}
+    {"b2", "decision_only", "actor_only", "no_separation", "no_capability", "response_only_posterior"}
 )
-SEPARATION_VARIANTS = frozenset({"b2", "no_capability"})
+SEPARATION_VARIANTS = frozenset({"b2", "no_capability", "response_only_posterior"})
 AUXILIARY_VARIANTS = RESPONSE_VARIANTS | ANCHOR_VARIANTS
 
 
@@ -287,10 +288,9 @@ def capability_auxiliary_objective(
     initial_steps: Any,
     episode_starts: Any,
     transition_mask: Any,
-    partner_run_ids: Any | None = None,
     variance_floor: float,
     update_period: int = 16,
-) -> tuple[Any, Any, Mapping[str, Any]]:
+) -> tuple[Any, Any, Any, Mapping[str, Any]]:
     """Direct semantic prediction plus variance-floor anti-collapse objective.
 
     At each complete 16-step publication window, coordinates 0:4 of ``u``
@@ -426,51 +426,38 @@ def capability_auxiliary_objective(
     )
 
     published_weight = publication.astype(jnp.float32)
-    run_ids = (
-        jnp.arange(values.shape[1], dtype=jnp.int32)[None]
-        if partner_run_ids is None
-        else jnp.asarray(partner_run_ids, dtype=jnp.int32)
-    )
-    run_ids = jnp.broadcast_to(run_ids, publication.shape)
-    # Aggregate publication values by training partner run before applying the
-    # floor.  This is a true cross-partner floor, rather than rewarding
-    # within-partner temporal noise.  Runtime run IDs deliberately occupy a
-    # source-specific range (the registered static pool starts at 10_000), so
-    # remove the shared offset before segmenting.  Equality is preserved and
-    # the registered <=128-member static pool then fits the fixed JAX shape.
-    partner_capacity = 128
-    dense_run_ids = run_ids - jnp.min(run_ids)
-    valid_run = (dense_run_ids >= 0) & (dense_run_ids < partner_capacity)
-    flat_weight = (published_weight * valid_run.astype(jnp.float32)).reshape(-1)
-    flat_ids = jnp.where(valid_run, dense_run_ids, 0).reshape(-1)
+    # Batch-level VICReg deliberately has no partner-run/lineage input.  The
+    # semantic coordinates must vary across legal published samples without
+    # becoming a learned run fingerprint.
+    flat_weight = published_weight.reshape(-1)
     flat_values = values.reshape((-1, values.shape[-1]))
-    partner_weight = jax.ops.segment_sum(
-        flat_weight, flat_ids, num_segments=partner_capacity
+    sample_count = jnp.sum(flat_weight)
+    mean = jnp.sum(flat_weight[:, None] * flat_values, axis=0) / jnp.maximum(
+        sample_count, 1.0
     )
-    partner_sum = jax.ops.segment_sum(
-        flat_weight[:, None] * flat_values,
-        flat_ids,
-        num_segments=partner_capacity,
-    )
-    partner_mean = partner_sum / jnp.maximum(partner_weight[:, None], 1.0)
-    partner_present = (partner_weight > 0.0).astype(jnp.float32)
-    partner_count = jnp.sum(partner_present)
-    mean = jnp.sum(partner_present[:, None] * partner_mean, axis=0) / jnp.maximum(
-        partner_count, 1.0
-    )
+    centered_values = flat_values - mean
     variance = jnp.sum(
-        partner_present[:, None] * jnp.square(partner_mean - mean), axis=0
-    ) / jnp.maximum(partner_count, 1.0)
+        flat_weight[:, None] * jnp.square(centered_values), axis=0
+    ) / jnp.maximum(sample_count, 1.0)
     standard_deviation = jnp.sqrt(variance + 1.0e-8)
     variance_loss = jnp.mean(
         jnp.square(jnp.maximum(float(variance_floor) - standard_deviation, 0.0))
     )
-    return prediction_loss, variance_loss, {
+    covariance = (
+        (flat_weight[:, None] * centered_values).T @ centered_values
+        / jnp.maximum(sample_count - 1.0, 1.0)
+    )
+    off_diagonal = covariance - jnp.diag(jnp.diag(covariance))
+    covariance_loss = jnp.sum(jnp.square(off_diagonal)) / jnp.maximum(
+        values.shape[-1] * (values.shape[-1] - 1), 1
+    )
+    return prediction_loss, variance_loss, covariance_loss, {
         "capability_semantic_prediction_loss": prediction_loss,
         "capability_variance_floor_loss": variance_loss,
+        "capability_covariance_loss": covariance_loss,
         "capability_minimum_published_std": jnp.min(standard_deviation),
         "capability_publication_count": jnp.sum(published_weight),
-        "capability_published_partner_count": partner_count,
+        "capability_published_sample_count": sample_count,
     }
 
 
@@ -482,6 +469,7 @@ def signature_anchor_objective(
     loss_v2: Any,
     critic_enabled: bool = True,
     actor_enabled: bool = True,
+    posterior_decision_enabled: bool = True,
 ):
     """Unified legal-anchor decision loss for critic and actor."""
 
@@ -497,6 +485,7 @@ def signature_anchor_objective(
             "signature_huber_loss": zero,
             "signature_hinge_loss": zero,
             "component_signature_loss": zero,
+            "posterior_decision_loss": zero,
             "component_pairwise_action_signature_divergence": zero,
             "component_one_hot_actor_tv": zero,
             "component_one_hot_top_action_disagreement": zero,
@@ -509,6 +498,7 @@ def signature_anchor_objective(
             "decision_confidence_q90": zero,
             "anchor_policy_drift_kl": zero,
             "anchor_drift_weight": zero,
+            "anchor_context_fingerprint_match_fraction": zero,
             "decision_effective_anchor_count": zero,
         }
     _, signature_output = model.apply(
@@ -525,6 +515,12 @@ def signature_anchor_objective(
     )
     _, component_output = model.apply(
         {"params": parameters_for_loss(params, loss_name="signature")},
+        anchors.policy_states,
+        anchors.observations,
+        method=model.component_intervention_step,
+    )
+    _, posterior_output = model.apply(
+        {"params": parameters_for_loss(params, loss_name="posterior_decision")},
         anchors.policy_states,
         anchors.observations,
         method=model.component_intervention_step,
@@ -571,6 +567,37 @@ def signature_anchor_objective(
         component_mask
         * huber(posterior_mixed_signature - component_target)
     ) / jnp.maximum(jnp.sum(component_mask), 1.0)
+    decision_component_signatures = jax.lax.stop_gradient(
+        jnp.asarray(posterior_output.action_signatures, dtype=jnp.float32)
+    )
+    squared_error = jnp.sum(
+        component_mask[..., None, :]
+        * jnp.square(
+            decision_component_signatures - component_target[..., None, :]
+        ),
+        axis=-1,
+    ) / jnp.maximum(jnp.sum(component_mask, axis=-1, keepdims=True), 1.0)
+    q_decision = jax.lax.stop_gradient(
+        jax.nn.softmax(
+            -squared_error
+            / float(getattr(loss_v2, "posterior_decision_temperature", 1.0)),
+            axis=-1,
+        )
+    )
+    posterior_probability = jnp.asarray(
+        posterior_output.protocol_probabilities, dtype=jnp.float32
+    )
+    posterior_decision_kl = jnp.sum(
+        q_decision
+        * (
+            jnp.log(jnp.maximum(q_decision, 1.0e-12))
+            - jnp.log(jnp.maximum(posterior_probability, 1.0e-12))
+        ),
+        axis=-1,
+    )
+    posterior_decision_loss = jnp.sum(anchor_valid * posterior_decision_kl) / jnp.maximum(
+        jnp.sum(anchor_valid), 1.0
+    )
     signature_delta = (
         component_signatures[..., :, None, :]
         - component_signatures[..., None, :, :]
@@ -653,6 +680,23 @@ def signature_anchor_objective(
         axis=-1,
     )
     drift_weight = jnp.exp(-drift_kl / 0.04) * anchor_valid
+    context = jnp.asarray(decision_output.context_summary, dtype=jnp.float32).reshape(
+        (anchor_valid.shape[0], -1)
+    )
+    quantized = jnp.rint(context * 10_000.0).astype(jnp.int32)
+    positions = jnp.arange(1, quantized.shape[-1] + 1, dtype=jnp.int32)
+    current_context_fingerprint = jnp.stack(
+        (
+            jnp.sum(quantized, axis=-1).astype(jnp.uint32),
+            jnp.sum(quantized * positions[None], axis=-1).astype(jnp.uint32),
+        ),
+        axis=-1,
+    )
+    context_fingerprint_match = jnp.all(
+        current_context_fingerprint
+        == jnp.asarray(anchors.collection_context_fingerprint, dtype=jnp.uint32),
+        axis=-1,
+    ).astype(jnp.float32)
     combined_confidence = confidence * drift_weight
     policy_coupling = decision_policy_loss(
         policy_logits=decision_output.policy_logits,
@@ -698,12 +742,19 @@ def signature_anchor_objective(
     total = (
         critic_weight * (q_total + component_signature_weight * component_fit)
         + actor_weight * policy_weight * policy_coupling
+        + (1.0 if posterior_decision_enabled else 0.0)
+        * float(getattr(loss_v2, "posterior_decision_weight", 0.25))
+        * posterior_decision_loss
     )
     return total, {
         "signature_loss": total,
         "signature_huber_loss": critic_weight * fit,
         "signature_hinge_loss": critic_weight * hinge_loss,
         "component_signature_loss": critic_weight * component_fit,
+        "posterior_decision_loss": (
+            (1.0 if posterior_decision_enabled else 0.0)
+            * posterior_decision_loss
+        ),
         "component_pairwise_action_signature_divergence": action_signature_divergence,
         "component_one_hot_actor_tv": actor_tv,
         "component_one_hot_top_action_disagreement": top_action_disagreement,
@@ -720,6 +771,10 @@ def signature_anchor_objective(
         / jnp.maximum(jnp.sum(anchor_valid), 1.0),
         "anchor_drift_weight": jnp.sum(drift_weight)
         / jnp.maximum(jnp.sum(anchor_valid), 1.0),
+        "anchor_context_fingerprint_match_fraction": jnp.sum(
+            anchor_valid * context_fingerprint_match
+        )
+        / jnp.maximum(jnp.sum(anchor_valid), 1.0),
         "decision_effective_anchor_count": jnp.square(confidence_sum)
         / jnp.maximum(confidence_square_sum, 1.0e-8),
     }
@@ -735,15 +790,18 @@ def separation_loss(
 ) -> Any:
     """L_separation on matched pairs (§3.2).
 
-    Observable-equivalent pairs (``equivalent_mask``) contribute
-    ``||c_i - c_j||^2``; decision-distinct pairs contribute
-    ``max(0, m - ||c_i - c_j||)`` with ``m`` the registered margin.
+    Observable-equivalent pairs (``equivalent_mask``) contribute squared
+    cosine distance; decision-distinct pairs contribute
+    ``max(0, m - d_cos(c_i,c_j))`` with ``m`` the registered margin.
     """
 
     import jax.numpy as jnp
 
-    delta = jnp.asarray(context_a, dtype=jnp.float32) - jnp.asarray(context_b, dtype=jnp.float32)
-    distance = jnp.sqrt(jnp.sum(jnp.square(delta), axis=-1) + 1.0e-12)
+    left = jnp.asarray(context_a, dtype=jnp.float32)
+    right = jnp.asarray(context_b, dtype=jnp.float32)
+    left = left / jnp.maximum(jnp.linalg.norm(left, axis=-1, keepdims=True), 1.0e-6)
+    right = right / jnp.maximum(jnp.linalg.norm(right, axis=-1, keepdims=True), 1.0e-6)
+    distance = 1.0 - jnp.sum(left * right, axis=-1)
     equivalent = jnp.asarray(equivalent_mask, dtype=jnp.bool_)
     margin_value = jnp.asarray(margin, dtype=jnp.float32)
     items = jnp.where(
@@ -757,7 +815,7 @@ def separation_loss(
 
 def separation_anchor_objective(
     *, model: Any, params: Any, separation_terms: Any
-) -> Any:
+) -> tuple[Any, Mapping[str, Any]]:
     """Evaluate matched-pair separation on the current parameters."""
 
     import jax.numpy as jnp
@@ -765,7 +823,13 @@ def separation_anchor_objective(
     from .gradient_routing import parameters_for_loss
 
     if separation_terms is None:
-        return jnp.asarray(0.0, dtype=jnp.float32)
+        zero = jnp.asarray(0.0, dtype=jnp.float32)
+        return zero, {
+            "protocol_equivalent_pair_distance": zero,
+            "protocol_distinct_pair_distance": zero,
+            "protocol_separation_margin_saturation_fraction": zero,
+            "protocol_separation_effective_pair_weight": zero,
+        }
     pair_count = jnp.asarray(separation_terms.equivalent_mask).shape[0]
     dropped = jnp.zeros((pair_count,), dtype=jnp.bool_)
     owned_params = parameters_for_loss(params, loss_name="separation")
@@ -783,13 +847,38 @@ def separation_anchor_objective(
         dropped,
         method=model.step,
     )
-    return separation_loss(
+    left = output_a.protocol_embedding
+    right = output_b.protocol_embedding
+    left = left / jnp.maximum(jnp.linalg.norm(left, axis=-1, keepdims=True), 1.0e-6)
+    right = right / jnp.maximum(jnp.linalg.norm(right, axis=-1, keepdims=True), 1.0e-6)
+    distance = 1.0 - jnp.sum(left * right, axis=-1)
+    equivalent = jnp.asarray(separation_terms.equivalent_mask, dtype=jnp.bool_)
+    weights = jnp.asarray(separation_terms.weights, dtype=jnp.float32)
+
+    def weighted_mean(mask: Any) -> Any:
+        selected = weights * jnp.asarray(mask, dtype=jnp.float32)
+        return jnp.sum(selected * distance) / jnp.maximum(jnp.sum(selected), 1.0)
+
+    loss = separation_loss(
         context_a=output_a.protocol_embedding,
         context_b=output_b.protocol_embedding,
         equivalent_mask=separation_terms.equivalent_mask,
         margin=separation_terms.margin,
         weights=separation_terms.weights,
     )
+    distinct = ~equivalent
+    distinct_weight = weights * distinct.astype(jnp.float32)
+    saturation = distance >= jnp.asarray(separation_terms.margin, dtype=jnp.float32)
+    metrics = {
+        "protocol_equivalent_pair_distance": weighted_mean(equivalent),
+        "protocol_distinct_pair_distance": weighted_mean(distinct),
+        "protocol_separation_margin_saturation_fraction": jnp.sum(
+            distinct_weight * saturation.astype(jnp.float32)
+        )
+        / jnp.maximum(jnp.sum(distinct_weight), 1.0),
+        "protocol_separation_effective_pair_weight": jnp.sum(weights),
+    }
+    return loss, metrics
 
 
 def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
@@ -814,11 +903,26 @@ def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
         batch.actions,
         method=model.response_sequence,
     )
+    _, no_component_prediction = model.apply(
+        {"params": parameters_for_loss(params, loss_name="response")},
+        batch.initial_policy_state,
+        batch.observations,
+        batch.previous_actions,
+        batch.episode_starts,
+        batch.actions,
+        method=model.response_sequence_without_component,
+    )
     planes = official_partner_observation_planes(batch.observations.shape[-1])
     targets = extract_partner_response_targets(
         batch.observations[:-1], batch.response_next_observations, planes=planes
     )
     losses = mixture_response_loss(prediction, targets, mask=batch.ppo_mask)
+    no_component_losses = mixture_response_loss(
+        no_component_prediction, targets, mask=batch.ppo_mask
+    )
+    event_weight = jnp.asarray(batch.ppo_mask, dtype=jnp.float32) * jnp.asarray(
+        targets.event_mask, dtype=jnp.float32
+    )
     return losses.total, {
         "response_total_loss": losses.total,
         "response_visibility_loss": losses.visibility,
@@ -826,6 +930,11 @@ def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
         "response_direction_loss": losses.direction,
         "response_inventory_loss": losses.inventory,
         "response_event_loss": losses.interaction_change,
+        "response_no_component_total_loss": no_component_losses.total,
+        "component_predictive_nll_gain": no_component_losses.total - losses.total,
+        "response_event_prevalence": jnp.sum(
+            event_weight * jnp.asarray(targets.interaction_change, dtype=jnp.float32)
+        ) / jnp.maximum(jnp.sum(event_weight), 1.0),
         "component_pairwise_response_divergence": (
             pairwise_component_response_divergence(
                 prediction, mask=batch.ppo_mask
@@ -918,11 +1027,12 @@ def compute_loss(
             loss_v2=config.loss_v2,
             critic_enabled=critic_signature_enabled,
             actor_enabled=actor_decision_enabled,
+            posterior_decision_enabled=variant != "response_only_posterior",
         )
-        separation = separation_anchor_objective(
+        separation, separation_values = separation_anchor_objective(
             model=model, params=params, separation_terms=separation_terms
         )
-        return signature, separation, signature_values
+        return signature, separation, {**signature_values, **separation_values}
 
     def inactive_anchor_terms(_: Any):
         return zero, zero, {
@@ -930,6 +1040,7 @@ def compute_loss(
             "signature_huber_loss": zero,
             "signature_hinge_loss": zero,
             "component_signature_loss": zero,
+            "posterior_decision_loss": zero,
             "component_pairwise_action_signature_divergence": zero,
             "component_one_hot_actor_tv": zero,
             "component_one_hot_top_action_disagreement": zero,
@@ -942,7 +1053,12 @@ def compute_loss(
             "decision_confidence_q90": zero,
             "anchor_policy_drift_kl": zero,
             "anchor_drift_weight": zero,
+            "anchor_context_fingerprint_match_fraction": zero,
             "decision_effective_anchor_count": zero,
+            "protocol_equivalent_pair_distance": zero,
+            "protocol_distinct_pair_distance": zero,
+            "protocol_separation_margin_saturation_fraction": zero,
+            "protocol_separation_effective_pair_weight": zero,
         }
 
     if anchors is None and separation_terms is None:
@@ -967,6 +1083,7 @@ def compute_loss(
     (
         capability_prediction,
         capability_variance,
+        capability_covariance,
         capability_metrics,
     ) = capability_auxiliary_objective(
         capability_sequence=output.capability[:-1],
@@ -977,7 +1094,6 @@ def compute_loss(
         initial_steps=batch.initial_policy_state.capability_carry.steps,
         episode_starts=batch.episode_starts[:-1],
         transition_mask=batch.ppo_mask,
-        partner_run_ids=batch.partner_run_ids,
         variance_floor=float(
             getattr(config.loss_v2, "capability_variance_floor", 0.05)
         ),
@@ -988,6 +1104,9 @@ def compute_loss(
     )
     component_utilization = jnp.mean(
         posterior, axis=tuple(range(posterior.ndim - 1))
+    )
+    component_geometry = model.apply(
+        {"params": params}, method=model.component_embedding_matrix
     )
     total = (
         jnp.asarray(ppo_active, dtype=jnp.float32) * ppo_total
@@ -1010,6 +1129,10 @@ def compute_loss(
         + capability_weight
         * float(getattr(config.loss_v2, "capability_variance_weight", 0.01))
         * capability_variance
+        * jnp.asarray(response_active, dtype=jnp.float32)
+        + capability_weight
+        * float(getattr(config.loss_v2, "capability_covariance_weight", 0.01))
+        * capability_covariance
         * jnp.asarray(response_active, dtype=jnp.float32)
     )
     anchor_valid_count = (
@@ -1051,6 +1174,7 @@ def compute_loss(
                 "actor_only": 6,
                 "no_separation": 7,
                 "no_capability": 8,
+                "response_only_posterior": 9,
             }[variant],
             dtype=jnp.float32,
         ),
@@ -1063,8 +1187,22 @@ def compute_loss(
             jnp.exp(posterior_entropy_values)
         ),
         "protocol_minimum_component_utilization": jnp.min(component_utilization),
-        "protocol_component_collapse_fraction": jnp.mean(
+        "posterior_high_confidence_fraction": jnp.mean(
             (jnp.max(posterior, axis=-1) > 0.98).astype(jnp.float32)
+        ),
+        "protocol_dominant_component_fraction": jnp.max(component_utilization),
+        "protocol_component_usage_entropy": -jnp.sum(
+            component_utilization
+            * jnp.log(jnp.maximum(component_utilization, 1.0e-12))
+        ),
+        "protocol_embedding_norm": jnp.mean(
+            jnp.linalg.norm(output.protocol_embedding[:-1], axis=-1)
+        ),
+        "protocol_component_embedding_minimum_norm": jnp.min(
+            jnp.linalg.norm(component_geometry, axis=-1)
+        ),
+        "protocol_component_embedding_maximum_norm": jnp.max(
+            jnp.linalg.norm(component_geometry, axis=-1)
         ),
         "capability_dimension_variance": jnp.mean(
             jnp.var(output.capability[:-1], axis=(0, 1))
@@ -1160,6 +1298,39 @@ def post_update_combined_policy_kl(*, model: Any, params: Any, batch: RolloutBat
     ) / jnp.maximum(jnp.sum(weight), 1.0)
 
 
+def policy_kl_between_params(
+    *, model: Any, before_params: Any, after_params: Any, batch: RolloutBatch
+) -> Any:
+    """Exact before/after categorical KL on one complete recurrent batch."""
+
+    import jax
+    import jax.numpy as jnp
+
+    def probabilities(params: Any) -> tuple[Any, Any]:
+        _, output = model.apply(
+            {"params": params},
+            batch.initial_policy_state,
+            batch.observations,
+            batch.previous_actions,
+            batch.episode_starts,
+            batch.context_dropout_masks,
+            method=model.sequence,
+        )
+        log_probability = jax.nn.log_softmax(output.policy_logits[:-1], axis=-1)
+        return jnp.exp(log_probability), log_probability
+
+    before_probability, before_log_probability = probabilities(before_params)
+    _, after_log_probability = probabilities(after_params)
+    weight = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    return jnp.sum(
+        weight
+        * jnp.sum(
+            before_probability * (before_log_probability - after_log_probability),
+            axis=-1,
+        )
+    ) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
 def apply_training_core_update(
     *,
     model: Any,
@@ -1203,12 +1374,14 @@ def apply_training_core_update(
                 loss_v2=config.loss_v2,
                 critic_enabled=variant in CRITIC_SIGNATURE_VARIANTS,
                 actor_enabled=variant in ACTOR_DECISION_VARIANTS,
+                posterior_decision_enabled=variant != "response_only_posterior",
             )
-            separation = separation_anchor_objective(
+            separation, unused_separation_metrics = separation_anchor_objective(
                 model=model,
                 params=candidate_params,
                 separation_terms=separation_terms,
             )
+            del unused_separation_metrics
             return (
                 float(config.loss_v2.signature_weight) * signature
                 + (1.0 if variant in SEPARATION_VARIANTS else 0.0)
@@ -1297,10 +1470,14 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
                 "response_total_loss": zero, "response_visibility_loss": zero,
                 "response_position_loss": zero, "response_direction_loss": zero,
                 "response_inventory_loss": zero, "response_event_loss": zero,
+                "response_no_component_total_loss": zero,
+                "component_predictive_nll_gain": zero,
+                "response_event_prevalence": zero,
                 "component_pairwise_response_divergence": zero,
                 "signature_loss": zero, "signature_huber_loss": zero,
                 "signature_hinge_loss": zero, "decision_policy_loss": zero,
                 "component_signature_loss": zero,
+                "posterior_decision_loss": zero,
                 "component_pairwise_action_signature_divergence": zero,
                 "component_one_hot_actor_tv": zero,
                 "component_one_hot_top_action_disagreement": zero,
@@ -1312,13 +1489,19 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
                 "decision_confidence_q90": zero,
                 "anchor_policy_drift_kl": zero,
                 "anchor_drift_weight": zero,
+                "anchor_context_fingerprint_match_fraction": zero,
                 "decision_effective_anchor_count": zero,
+                "protocol_equivalent_pair_distance": zero,
+                "protocol_distinct_pair_distance": zero,
+                "protocol_separation_margin_saturation_fraction": zero,
+                "protocol_separation_effective_pair_weight": zero,
                 "capability_consistency_loss": zero,
                 "capability_semantic_prediction_loss": zero,
                 "capability_variance_floor_loss": zero,
+                "capability_covariance_loss": zero,
                 "capability_minimum_published_std": zero,
                 "capability_publication_count": zero,
-                "capability_published_partner_count": zero,
+                "capability_published_sample_count": zero,
                 "anchor_effective_sample_size": zero,
                 "anchor_use_count_max": zero,
                 "anchor_auxiliary_actual_total_weight": zero,
@@ -1328,7 +1511,12 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
                 "mean_posterior_entropy": zero, "context_dropout_fraction": zero,
                 "protocol_effective_component_count": zero,
                 "protocol_minimum_component_utilization": zero,
-                "protocol_component_collapse_fraction": zero,
+                "posterior_high_confidence_fraction": zero,
+                "protocol_dominant_component_fraction": zero,
+                "protocol_component_usage_entropy": zero,
+                "protocol_embedding_norm": zero,
+                "protocol_component_embedding_minimum_norm": zero,
+                "protocol_component_embedding_maximum_norm": zero,
                 "capability_dimension_variance": zero,
                 "capability_mean_norm": zero,
                 "method_variant_code": zero,
@@ -1350,6 +1538,7 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
     (final, _), metrics = jax.lax.scan(
         one, (core, jnp.asarray(True)), (flat, scan_indexes)
     )
+    metrics = {**metrics, "ppo_policy_kl": metrics["combined_policy_kl"]}
     variant = str(getattr(config, "method_variant", "r0")).lower()
     if variant in AUXILIARY_VARIANTS:
         auxiliary_final, auxiliary_metrics = apply_training_core_update(
@@ -1367,6 +1556,29 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
             response_active=True,
             enforce_kl_stop=False,
         )
+        auxiliary_policy_kl = policy_kl_between_params(
+            model=model,
+            before_params=final.params,
+            after_params=auxiliary_final.params,
+            batch=batch,
+        )
+        auxiliary_accepted = (
+            jnp.isfinite(auxiliary_policy_kl)
+            & (
+                auxiliary_policy_kl
+                <= float(config.loss_v2.combined_policy_kl_threshold)
+            )
+            & (auxiliary_metrics["nonfinite_update"] < 0.5)
+        )
+        auxiliary_final = jax.lax.cond(
+            auxiliary_accepted,
+            lambda _: auxiliary_final,
+            lambda _: final,
+            operand=None,
+        )
+        total_outer_policy_kl = post_update_combined_policy_kl(
+            model=model, params=auxiliary_final.params, batch=batch
+        )
         # Preserve the fixed scan shape expected by the compiled training
         # lifecycle while exposing the one fixed auxiliary transaction in its
         # first telemetry row. PPO stop telemetry remains untouched.
@@ -1377,11 +1589,15 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
             "response_direction_loss",
             "response_inventory_loss",
             "response_event_loss",
+            "response_no_component_total_loss",
+            "component_predictive_nll_gain",
+            "response_event_prevalence",
             "component_pairwise_response_divergence",
             "signature_loss",
             "signature_huber_loss",
             "signature_hinge_loss",
             "component_signature_loss",
+            "posterior_decision_loss",
             "component_pairwise_action_signature_divergence",
             "component_one_hot_actor_tv",
             "component_one_hot_top_action_disagreement",
@@ -1394,14 +1610,20 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
             "decision_confidence_q90",
             "anchor_policy_drift_kl",
             "anchor_drift_weight",
+            "anchor_context_fingerprint_match_fraction",
             "decision_effective_anchor_count",
+            "protocol_equivalent_pair_distance",
+            "protocol_distinct_pair_distance",
+            "protocol_separation_margin_saturation_fraction",
+            "protocol_separation_effective_pair_weight",
             "separation_loss",
             "capability_consistency_loss",
             "capability_semantic_prediction_loss",
             "capability_variance_floor_loss",
+            "capability_covariance_loss",
             "capability_minimum_published_std",
             "capability_publication_count",
-            "capability_published_partner_count",
+            "capability_published_sample_count",
             "anchor_effective_sample_size",
             "anchor_use_count_max",
             "anchor_auxiliary_actual_total_weight",
@@ -1415,7 +1637,26 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
             )
             for name, values in metrics.items()
         }
+        template_values = next(iter(metrics.values()))
+        metric_zeros = jnp.zeros_like(template_values)
+        metrics["auxiliary_policy_kl"] = metric_zeros.at[0].set(
+            auxiliary_policy_kl
+        )
+        metrics["total_outer_update_policy_kl"] = metric_zeros.at[0].set(
+            total_outer_policy_kl
+        )
+        metrics["auxiliary_update_accepted"] = metric_zeros.at[0].set(
+            auxiliary_accepted.astype(jnp.float32)
+        )
         final = auxiliary_final
+    else:
+        template_values = next(iter(metrics.values()))
+        metric_zeros = jnp.zeros_like(template_values)
+        metrics["auxiliary_policy_kl"] = metric_zeros
+        metrics["total_outer_update_policy_kl"] = metrics[
+            "combined_policy_kl"
+        ]
+        metrics["auxiliary_update_accepted"] = metric_zeros
     return final, metrics
 
 

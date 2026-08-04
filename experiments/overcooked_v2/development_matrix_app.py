@@ -43,6 +43,11 @@ DEVELOPMENT_VARIANTS = (
     *TOTAL_BUDGET_VARIANTS,
     *MECHANISM_ABLATION_VARIANTS,
 )
+K_SENSITIVITY_VARIANTS = ("b1", "b2")
+
+
+def development_variants_for_k(component_count: int) -> tuple[str, ...]:
+    return DEVELOPMENT_VARIANTS if int(component_count) == 4 else K_SENSITIVITY_VARIANTS
 
 
 def _b2_auxiliary_transition_budget(payload: Mapping[str, Any]) -> int:
@@ -83,9 +88,10 @@ def validate_development_entry_alignment(
     if not by_seed:
         raise ValueError("Development matrix has no run entries.")
     for (component_count, seed_index), rows in by_seed.items():
+        expected_variants = development_variants_for_k(component_count)
         if (
-            len(rows) != len(DEVELOPMENT_VARIANTS)
-            or {str(row["variant"]) for row in rows} != set(DEVELOPMENT_VARIANTS)
+            len(rows) != len(expected_variants)
+            or {str(row["variant"]) for row in rows} != set(expected_variants)
         ):
             raise RuntimeError(
                 "Every development seed must cover core and total-budget variants exactly once."
@@ -110,6 +116,15 @@ def validate_development_entry_alignment(
                 )
 
         indexed = {str(row["variant"]): row for row in rows}
+        if component_count != 4:
+            if (
+                int(indexed["b1"]["ppo_training_steps"])
+                != int(indexed["b2"]["ppo_training_steps"])
+                or int(indexed["b1"]["auxiliary_training_steps"]) != 0
+                or int(indexed["b2"]["auxiliary_training_steps"]) <= 0
+            ):
+                raise RuntimeError("K sensitivity B1/B2 budgets differ.")
+            continue
         core_ppo = {
             int(indexed[variant]["ppo_training_steps"])
             for variant in CORE_DEVELOPMENT_VARIANTS
@@ -198,7 +213,7 @@ def run_development_matrix(args: argparse.Namespace) -> None:
         raise ValueError("Development sensitivity must cover K in {2,4,8} exactly once.")
     entries = []
     for component_count in component_counts:
-        for variant in DEVELOPMENT_VARIANTS:
+        for variant in development_variants_for_k(component_count):
             variant_config = (
                 output / "configs" / f"k-{component_count}" / f"{variant}.yaml"
             )
@@ -226,6 +241,11 @@ def run_development_matrix(args: argparse.Namespace) -> None:
                         output=str(run_directory),
                         pair_comparator=(
                             str(args.pair_comparator)
+                            if variant.removesuffix("_extra") in ANCHOR_VARIANTS
+                            else None
+                        ),
+                        comparator_reference_ego_checkpoint=(
+                            str(args.comparator_reference_ego_checkpoint)
                             if variant.removesuffix("_extra") in ANCHOR_VARIANTS
                             else None
                         ),
@@ -299,10 +319,22 @@ def run_development_matrix(args: argparse.Namespace) -> None:
             "r0_extra": "r0_with_b2_cost_reallocated_to_ordinary_ppo",
             "b0_extra": "b0_with_b2_cost_reallocated_to_ordinary_ppo",
             "b1_extra": "b1_with_b2_cost_reallocated_to_ordinary_ppo",
+            "deterministic_context": "continuous_context_without_exact_filter",
+            "decision_only": "decision_supervision_without_response_filtering",
+            "q_only": "decision_supervision_without_actor_target",
+            "actor_only": "decision_actor_target_without_signature_critic",
+            "no_separation": "decision_supervision_without_pair_separation",
+            "no_capability": "decision_supervision_without_capability_pathway",
+            "response_only_posterior": "posterior_without_decision_responsibility_kl",
             "b3": "not_implemented_action_conditioned_voi",
         },
         "b3_status": "not_implemented",
         "protocol_component_sensitivity": list(component_counts),
+        "resource_allocation": {
+            "k4_main_and_mechanism_variants": list(DEVELOPMENT_VARIANTS),
+            "k2_k8_sensitivity_variants": list(K_SENSITIVITY_VARIANTS),
+            "not_a_cartesian_product": True,
+        },
         "entries": entries,
         "budget_capacity_and_key_matching_passed": True,
     }
@@ -714,7 +746,7 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
                 score_index[(component_count, variant, seed)][
                     "evaluation_key_schedule_sha256"
                 ]
-                for variant in DEVELOPMENT_VARIANTS
+                for variant in development_variants_for_k(component_count)
             }
             if len(schedules) != 1:
                 raise ValueError("Paired variants do not share evaluation episode keys.")
@@ -729,14 +761,14 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
                 ],
                 dtype=np.float64,
             )
-            for variant in DEVELOPMENT_VARIANTS
+            for variant in development_variants_for_k(component_count)
         }
         for component_count in component_counts
     }
     comparisons_by_k = {}
     for component_count, values in values_by_k.items():
         comparisons = {}
-        for name, left, right, seed in (
+        comparisons_to_run = (
             ("b0_minus_r0", "b0", "r0", 9),
             ("b1_minus_b0", "b1", "b0", 10),
             ("b2_minus_b1", "b2", "b1", 11),
@@ -750,7 +782,11 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
             ("b2_minus_actor_only", "b2", "actor_only", 19),
             ("b2_minus_no_separation", "b2", "no_separation", 20),
             ("b2_minus_no_capability", "b2", "no_capability", 21),
-        ):
+            ("b2_minus_response_only_posterior", "b2", "response_only_posterior", 22),
+        ) if component_count == 4 else (
+            ("b2_minus_b1", "b2", "b1", 11),
+        )
+        for name, left, right, seed in comparisons_to_run:
             point, interval = _paired_bootstrap(
                 values[left] - values[right], seed=seed + 100 * component_count
             )
@@ -772,7 +808,7 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
             )
             payload = json.loads(diagnostic_path.read_text(encoding="utf-8"))
             if (
-                payload.get("version") != 1
+                payload.get("version") != 2
                 or payload.get("artifact_type")
                 != "depi_exchangeable_response_regime_diagnostics"
                 or payload.get("method") != METHOD_VERSION
@@ -780,14 +816,24 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
                 or int(payload.get("seed_index", -1)) != seed
                 or int(payload.get("protocol_components", -1))
                 != component_count
-                or payload.get("fresh_final_policy_anchors") is not True
+                or payload.get("shared_final_diagnostic_panel") is not True
                 or payload.get("one_hot_component_intervention") is not True
             ):
                 raise ValueError("Final component diagnostic identity differs.")
             validate_component_diagnostic_values(
                 payload, component_count=component_count
             )
-            signatures[seed] = payload["component_action_signatures"]
+            if seed == seeds[0]:
+                shared_panel_ids = payload["diagnostic_panel_ids"]
+                shared_panel_hashes = payload["diagnostic_panel_state_hashes"]
+            elif (
+                payload["diagnostic_panel_ids"] != shared_panel_ids
+                or payload["diagnostic_panel_state_hashes"] != shared_panel_hashes
+            ):
+                raise ValueError("Cross-seed component panels are not identical.")
+            signatures[seed] = payload[
+                "component_action_signatures_by_anchor"
+            ]
             component_sources.append(
                 {
                     "path": str(diagnostic_path),

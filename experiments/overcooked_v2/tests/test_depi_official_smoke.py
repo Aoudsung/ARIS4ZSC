@@ -209,6 +209,7 @@ def test_real_official_continuations_fit_and_validate_pair_comparator() -> None:
             fit_replicas=2,
             evaluation_replicas=2,
             continuation_horizon=8,
+            gamma=0.99,
         )
         return (
             np.asarray(pair_legal_history_features(recorded["history"])),

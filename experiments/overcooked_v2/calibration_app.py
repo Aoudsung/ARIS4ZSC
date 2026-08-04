@@ -55,7 +55,7 @@ from src.path_c.experiment import (
 )
 from src.path_c.external_partner import make_external_partner_functions
 from src.path_c.protocol_encoder import posterior_entropy
-from src.path_c.resources import ResourceLedger
+from src.path_c.resources import ResourceLedger, gpu_hours_for_wall_seconds
 from src.path_c.runner import collect_rollout, initialize_runner
 from src.path_c.storage import (
     calibration_identity,
@@ -71,6 +71,7 @@ from src.path_c.types import ContextOutput
 
 
 POSTERIOR_CALIBRATION_ARTIFACT_NAME = "DEPI-Posterior-Calibration"
+POSTERIOR_CALIBRATION_SCHEMA_VERSION = 3
 _MECHANISM_ALIASES = {
     "rnn-sp": "sp",
     "sp": "sp",
@@ -422,6 +423,76 @@ def _aggregate_metrics(
     }
 
 
+def _event_calibration_diagnostics(
+    payloads: list[Mapping[str, Any]], *, bin_count: int = 10
+) -> Mapping[str, Any]:
+    probabilities = np.concatenate(
+        [np.asarray(payload["event_probabilities"]).reshape((-1,)) for payload in payloads]
+    )
+    labels = np.concatenate(
+        [np.asarray(payload["event_labels"]).reshape((-1,)) for payload in payloads]
+    )
+    mask = np.concatenate(
+        [np.asarray(payload["event_mask"]).reshape((-1,)) for payload in payloads]
+    ) > 0.5
+    probabilities = probabilities[mask]
+    labels = labels[mask]
+    if probabilities.size == 0:
+        edges = np.linspace(0.0, 1.0, int(bin_count) + 1)
+        return {
+            "positive_brier": None,
+            "negative_brier": None,
+            "event_prevalence": None,
+            "reliability_curve": [
+                {
+                    "bin_low": float(edges[index]),
+                    "bin_high": float(edges[index + 1]),
+                    "count": 0,
+                    "mean_probability": None,
+                    "event_frequency": None,
+                }
+                for index in range(int(bin_count))
+            ],
+        }
+    positive = labels > 0.5
+    negative = ~positive
+    edges = np.linspace(0.0, 1.0, int(bin_count) + 1)
+    indexes = np.minimum(
+        np.searchsorted(edges, probabilities, side="right") - 1,
+        int(bin_count) - 1,
+    )
+    reliability = []
+    for index in range(int(bin_count)):
+        selected = indexes == index
+        reliability.append(
+            {
+                "bin_low": float(edges[index]),
+                "bin_high": float(edges[index + 1]),
+                "count": int(np.sum(selected)),
+                "mean_probability": (
+                    None if not np.any(selected) else float(np.mean(probabilities[selected]))
+                ),
+                "event_frequency": (
+                    None if not np.any(selected) else float(np.mean(labels[selected]))
+                ),
+            }
+        )
+    return {
+        "positive_brier": (
+            None
+            if not np.any(positive)
+            else float(np.mean(np.square(1.0 - probabilities[positive])))
+        ),
+        "negative_brier": (
+            None
+            if not np.any(negative)
+            else float(np.mean(np.square(probabilities[negative])))
+        ),
+        "event_prevalence": float(np.mean(labels)),
+        "reliability_curve": reliability,
+    }
+
+
 def _run_level_summary(
     episode_matrices: list[np.ndarray], *, bootstrap_replicates: int, seed: int
 ) -> tuple[Mapping[str, float], Mapping[str, list[float]]]:
@@ -569,6 +640,13 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
             "protocol_embedding_norm": float(
                 np.linalg.norm(payload["mean_posterior_mixture_summary"])
             ),
+            "positive_event_count": int(
+                np.sum(
+                    np.asarray(payload["event_labels"])
+                    * np.asarray(payload["event_mask"])
+                )
+            ),
+            "valid_event_count": int(np.sum(np.asarray(payload["event_mask"]))),
         }
         row.update({key: float(value) for key, value in metrics.items()})
         table.append(row)
@@ -592,6 +670,45 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
     pooled_descriptive = _aggregate_metrics(
         payloads, credibility=float(calibration.credibility)
     )
+    positive_event_count = int(sum(row["positive_event_count"] for row in table))
+    positive_by_family = {
+        family: int(
+            sum(
+                row["positive_event_count"]
+                for row in table
+                if row["partner_mechanism"] == family
+            )
+        )
+        for family in sorted({str(row["partner_mechanism"]) for row in table})
+    }
+    event_estimable = bool(
+        positive_event_count >= int(calibration.minimum_positive_event_count)
+        and positive_by_family
+        and min(positive_by_family.values())
+        >= int(calibration.minimum_positive_event_count_per_family)
+    )
+    event_diagnostics = _event_calibration_diagnostics(payloads)
+    run_prevalence = np.asarray(
+        [
+            row["positive_event_count"] / max(row["valid_event_count"], 1)
+            for row in table
+        ],
+        dtype=np.float64,
+    )
+    prevalence_rng = np.random.default_rng(int(calibration.bootstrap_seed) + 2)
+    prevalence_draws = np.mean(
+        run_prevalence[
+            prevalence_rng.integers(
+                0,
+                run_prevalence.size,
+                size=(int(calibration.bootstrap_replicates), run_prevalence.size),
+            )
+        ],
+        axis=1,
+    )
+    event_prevalence_interval = [
+        float(value) for value in np.quantile(prevalence_draws, (0.025, 0.975))
+    ]
     pass_flags = {
         "log_score_vs_uniform": bool(
             contrast_ci["log_score_minus_uniform"][1]
@@ -603,22 +720,27 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
         ),
         "position_coverage_in_band": bool(
             run_bootstrap_ci["coverage_position"][0]
-            <= float(calibration.coverage_high)
-            and run_bootstrap_ci["coverage_position"][1]
             >= float(calibration.coverage_low)
+            and run_bootstrap_ci["coverage_position"][1]
+            <= float(calibration.coverage_high)
         ),
         "direction_coverage_in_band": bool(
             run_bootstrap_ci["coverage_direction"][0]
-            <= float(calibration.coverage_high)
-            and run_bootstrap_ci["coverage_direction"][1]
             >= float(calibration.coverage_low)
+            and run_bootstrap_ci["coverage_direction"][1]
+            <= float(calibration.coverage_high)
         ),
-        "event_brier": bool(
+        "event_brier": bool(event_estimable and (
             contrast_ci["event_brier_minus_registered_baseline"][1] <= 0.0
-        ),
+        )),
     }
     overall_pass = bool(all(pass_flags.values()))
-    ledger = ResourceLedger(calibration_steps=attempted)
+    elapsed_wall_seconds = time.perf_counter() - started
+    ledger = ResourceLedger(
+        calibration_steps=attempted,
+        gpu_hours=gpu_hours_for_wall_seconds(elapsed_wall_seconds),
+        wall_clock_hours=elapsed_wall_seconds / 3_600.0,
+    )
     config_path = Path(args.config).resolve()
     manifest_path = Path(args.partner_manifest).resolve()
     training_path = Path(args.training_run).resolve()
@@ -628,7 +750,7 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
     write_json(
         output / "posterior_calibration.json",
         {
-            "version": 2,
+            "version": POSTERIOR_CALIBRATION_SCHEMA_VERSION,
             "artifact_type": "depi_posterior_calibration",
             "artifact_name": POSTERIOR_CALIBRATION_ARTIFACT_NAME,
             "method": METHOD_VERSION,
@@ -680,11 +802,26 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
                 "secondary_aggregation_unit": calibration.secondary_unit,
                 "root_seed_offset": int(calibration.root_seed_offset),
                 "protocol_component_count": int(config.model.protocol_components),
+                "minimum_positive_event_count": int(
+                    calibration.minimum_positive_event_count
+                ),
+                "minimum_positive_event_count_per_family": int(
+                    calibration.minimum_positive_event_count_per_family
+                ),
             },
             "aggregate": aggregate,
             "run_bootstrap_95_ci": run_bootstrap_ci,
             "run_bootstrap_contrast_95_ci": contrast_ci,
             "pooled_descriptive": pooled_descriptive,
+            "event_calibration": {
+                "status": "estimable" if event_estimable else "not_estimable",
+                "positive_event_count": positive_event_count,
+                "positive_event_count_by_partner_family": positive_by_family,
+                **event_diagnostics,
+                "partner_run_bootstrap_prevalence_95_ci": (
+                    event_prevalence_interval
+                ),
+            },
             "pass": {**pass_flags, "overall": bool(overall_pass)},
             "runs": table,
         },
@@ -696,7 +833,7 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
             "artifact_name": POSTERIOR_CALIBRATION_ARTIFACT_NAME,
             "partner_run_blocks": len(runs),
             "calibration_rows": len(table),
-            "wall_seconds": time.perf_counter() - started,
+            "wall_seconds": elapsed_wall_seconds,
             "scientific_readout": config.run_kind == "formal",
             "scientific_readout_allowed": config.run_kind == "formal",
             "calibration_pass": bool(overall_pass),
@@ -717,5 +854,6 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
 
 __all__ = [
     "POSTERIOR_CALIBRATION_ARTIFACT_NAME",
+    "POSTERIOR_CALIBRATION_SCHEMA_VERSION",
     "run_posterior_calibration",
 ]

@@ -7,7 +7,7 @@
 
 | 轨道 | 状态 | 含义 |
 |---|---|---|
-| 方法实现 | 审查优化已接线 | R0/B0–B2 严格矩阵、六项同容量机制消融、total-budget controls、capability semantic/variance 防坍缩、component signature/response divergence/one-hot/cross-seed 对齐诊断、真实冻结 comparator、fresh-final M1 和模块化 claim 均有 active code path |
+| 方法实现 | 审查优化已接线 | R0/B0–B2 分层矩阵、七项同容量机制消融、total-budget controls、decision-consistent posterior、evidence-gated filter、无 run-ID 的 capability anti-collapse、共享 panel component diagnostics、task-matched comparator、fresh-final M1 和模块化 claim 均有 active code path |
 | 本地验证 | 通过 | active source compile 和全量 DEPI tests 通过；CLI 及静态一致性门通过。本地 Python 3.13 结果只是工程验证，不替代注册 Python 3.10/CUDA 接受运行 |
 | 三层执行链 | 已接线、未远程执行 | CPU Official/anchor/comparator 集成测试已接线；workflow_dispatch 自托管单 GPU preflight 与两 ego `scientific-dry-run` 编排已注册。当前状态不能替代远程 CUDA/完整 dry-run 的实际产物 |
 | 开发证据 | 未生成 | 尚无可用于嵌套增量和总预算对照裁决的完整 raw-backed paired matrix artifact |
@@ -24,7 +24,7 @@ legacy，不进入当前 claim。
 
 1. 在注册运行时执行 [`../FORMAL_EXPERIMENT_PROTOCOL.md`](../FORMAL_EXPERIMENT_PROTOCOL.md)
    要求的 mechanical E2E 与 CUDA preflight；
-2. 先采集并冻结 comparator，再执行 [`../research/DEVELOPMENT_MATRIX.md`](../research/DEVELOPMENT_MATRIX.md)，裁决嵌套增量、六项消融与总预算对照；
+2. 先采集并冻结 comparator，再执行 [`../research/DEVELOPMENT_MATRIX.md`](../research/DEVELOPMENT_MATRIX.md)，裁决嵌套增量、七项消融、K sensitivity 与总预算对照；
 3. 仅在开发门完成、合同复核且仓库 clean committed 后冻结正式执行；
 4. 无论机制门结果如何，都按 [`../EVALUATION_SPEC.md`](../EVALUATION_SPEC.md) 报告普通 XP。
 

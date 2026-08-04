@@ -2,8 +2,8 @@
 
 `authoritative: true`
 
-当前身份：`depi_instant_partner_exact_filter_decision_supervision_v7`，配置版本 17，checkpoint
-schema 7，partner manifest schema 4，deployment bundle schema 8。旧 artifact 一律 fail
+当前身份：`depi_decision_consistent_evidence_gated_filter_v8`，配置版本 18，checkpoint
+schema 8，partner manifest schema 4，deployment bundle schema 9。旧 artifact 一律 fail
 closed。
 
 ## 1. 容量匹配的 R0/B0–B2 骨架
@@ -12,7 +12,7 @@ closed。
 
 - task encoder：Official CNN trunk + GRU-128；
 - memoryless instant-partner encoder：当前 other-agent planes -> 32 维 `r_t`；
-- capability encoder：GRU-64 -> 16 维 `u_t`；
+- capability encoder：GRU-64 -> 4 维 `u_t`；
 - K 个 16 维 exchangeable response-regime embeddings；
 - 一个 actor 和一个 dueling critic，输入 `(x_t,concat(r_t,u_t,c_t))`；
 - joint response decoder。
@@ -42,28 +42,31 @@ PolicyState 保存 `task_carry`、`capability_carry`、`protocol_carry`、`conte
 CapabilityEncoder 每步读取：
 
 ```text
-e_t = (o_t-o_{t-1}, embed(a^ego_{t-1}), episode_start)
+e_t = (partner_planes(o_t)-partner_planes(o_{t-1}),
+       embed(a^ego_{t-1}), episode_start)
 ```
 
 hidden 每步更新，published `u_t` 每 16 个 episode-local steps 更新；episode start 清零。
-除相邻发布窗口的 consistency 外，前四个坐标直接预测仅由最近完整合法窗口复算的
+除相邻发布窗口的 consistency 外，全部四个坐标直接预测仅由最近完整合法窗口复算的
 visibility、visible movement、visible inventory-holding 与 visible inventory-change rates（线性
-映射到 `[-1,1]`）；所有发布坐标按 partner-run group mean 施加跨伙伴 standard-deviation
-floor。训练 metrics 报告 semantic prediction loss、variance-floor loss、minimum published
-std、publication/partner count、dimension variance 与 mean norm。该目标排除了“仅靠
+映射到 `[-1,1]`）。所有发布样本使用不含 run ID 的 batch standard-deviation floor，并对
+off-diagonal covariance 加惩罚。训练 metrics 报告 semantic prediction、variance-floor、
+covariance、minimum published std、publication count、dimension variance 与 mean norm。该目标排除了“仅靠
 consistency 即可取全零”的最优解，但
-不把其余坐标或整个 `u_t` 宣称为可唯一识别的人类能力；机制评估仍单独报告 `swap-u` 与
+不把 `u_t` 宣称为可唯一识别的人类能力；机制评估仍单独报告 `swap-u` 与
 `no-capability`。
 
-固定 sticky matrix 的对角为 0.9，其余质量均分。唯一 filter 为：
+主设置 sticky matrix 的对角为 0.97，其余质量均分；开发敏感性固定为
+`p_stay in {0.90,0.97,0.99}`。唯一 filter 为：
 
 ```text
-pi_bar_t = pi_{t-1} @ T
+pi_bar_t = evidence_valid ? (pi_{t-1} @ T) : pi_{t-1}
 pi_t = softmax(log(pi_bar_t) + ell_t)
 c_t = sum_k pi_t,k m_k
 ```
 
-episode start 使用 uniform prior 并跳过跨 episode emission。transition 不读 task、ego action
+episode start 使用 uniform prior 并跳过跨 episode emission；不可见或没有新合法伙伴证据时
+使用 identity transition，遮挡本身不遗忘 posterior。transition 不读 task、ego action
 或 response，也不学习；所以本节只实现 online response-regime inference，不实现 active
 protocol formation。
 
@@ -80,8 +83,13 @@ log p(y|H,a) = logsumexp_k(log pi_k + log p_k(y))
 ```
 
 visibility transition 不能进入 event。运动学 trunk 读
-`(sg[frame_t],m_k,u_t,a_t)`；event trunk 只读 `(m_k,u_t,a_t)`。decoder 不读 task features，
+`(sg[frame_t],m_k,u_t,a_t)`；event trunk 读取 `(m_k,u_t,a_t,sg[压缩物理协变量])`；该协变量是固定的
+channel-wise spatial mean/max 摘要，不经过 task encoder，也不保留逐格 frame。decoder 不读 task features，
 response gradient 也不拥有 task encoder。
+
+每次 response transaction 同时计算共享条件下的 no-component likelihood，并报告
+`NLL_no_component-NLL_full`、event prevalence、正/负 Brier 与 reliability。该对照是诊断，
+不得用人为拉大 component divergence 代替 held-out predictive gain。
 
 component 仅称 exchangeable response regimes。训练与 deployment 复用同一
 `sticky_transition_matrix`、`exact_bayes_filter_step`、response target 和 joint likelihood。
@@ -96,12 +104,16 @@ categorical KL：
 mean_t sum_a pi_old(a|H_t) * [log pi_old(a|H_t)-log pi_new(a|H_t)]
 ```
 
-不得用 executed-action Monte Carlo 差替代。KL 超阈只缩短当前/下一 PPO exposure；NaN/Inf
-才触发数值失败。
+不得用 executed-action Monte Carlo 差替代。PPO KL 超阈缩短当前/下一 PPO exposure；NaN/Inf
+触发数值失败。
 
 所有启用 response、capability 或 decision 目标的层级都在 PPO scan 后固定执行一次 auxiliary
 optimizer transaction。无论 PPO early stop 发生在第几个 epoch，辅助目标每个 outer update 的
 exposure 都恰好一次；R0/B0 不执行辅助事务。
+
+辅助事务前后独立计算完整 categorical KL。若 `auxiliary_policy_kl>0.04`、非有限或事务报告
+数值失败，则整次 auxiliary 参数/optimizer state 回滚。metrics 分别记录
+`ppo_policy_kl`、`auxiliary_policy_kl`、`total_outer_update_policy_kl` 与接受标志。
 
 参数所有权为：
 
@@ -116,6 +128,11 @@ exposure 都恰好一次；R0/B0 不执行辅助事务。
 owner distillation 只能更新 task/instant encoder 与 actor，并必须同时验证参数变化和 KL 下降。
 
 ## 5. decision target、置信度与陈旧性
+
+训练 anchor、冻结 comparator、final M1、BR-Prox、identifiability 与 recoverable-value 均使用
+`ContinuationContract` 定义的同一折扣 raw-return estimand。artifact 必须逐字绑定 gamma、
+horizon、terminal handling、continuation-policy fingerprint 及互斥 fit/evaluation key domains；
+不兼容 artifact 一律拒绝。
 
 对每个 anchor 的 all-action returns 先 centered，再用：
 
@@ -135,6 +152,10 @@ metrics 至少报告 target entropy、top-action stability、confidence q10/q50/
 drift weight 和 effective anchor count。训练 anchors 可在 trigger 间复用，但不能以不衰减权重
 无限维持 off-policy 标签。
 
+anchor artifact 必须记录 collection update 以及 policy/context/target fingerprints。训练
+anchor 最大年龄为 4 个 outer updates；超过即清空并重新采集。首动作 KL 仍作连续 drift
+权重，但不能越过最大年龄；必须报告 context fingerprint match 与 effective sample size。
+
 每个 exchangeable component 的显式 signature 定义为共享 conservative critic 在 one-hot
 `z=k`（即 `c=m_k`）干预下的 centered action values：
 
@@ -147,6 +168,16 @@ sum_k stop_gradient(pi_k) S_k(x,u,a) ~= A_empirical(a)
 utilization、effective count/collapse、pairwise response divergence、pairwise action-signature
 divergence、one-hot `z=k` 对 actor ordering/TV 的影响；跨 seed 只允许先做 permutation alignment
 再报告稳定性。
+
+对 fit replicas 构造：
+
+```text
+q^A_k proportional exp(-||S_k-A_empirical||^2 / tau_A)
+L_posterior-decision = KL(stop_gradient(q^A) || pi_t)
+```
+
+evaluation replicas 不能进入该训练目标。`response_only_posterior` 消融只关闭这条 KL，保留
+response posterior；其余 component 置换对称性不变。
 
 ## 6. anchor 密度与双重预算公平性
 
@@ -169,8 +200,11 @@ comparator 在 ego matrix 训练前单独采集并拟合：`collect-pair-compara
 Official reference ego checkpoint，与 manifest 中互斥的 comparator-fit/validation partner
 parents 在真实 simulator 中记录完整 16 步合法历史和 all-action continuations；source artifact
 绑定 reference checkpoint、partner manifest、Official commit、config fingerprint、key schedule
-与 simulator resource ledger。随后 `fit-pair-comparator` 只接受该严格 schema。状态匹配使用固定 simulator task-only planes，不用
-learned task embedding。输入 feature 只含合法可复算 history；label 为：
+与 simulator resource ledger。随后 `fit-pair-comparator` 只接受该严格 schema。source 每行
+保存固定 simulator task-only feature、episode time、recipe/order hash、ego role、即时伙伴
+feature、task-state hash 和完整合法 history。fit/validation 内分别执行跨 run mutual
+nearest-neighbour matching，并要求注册 task epsilon、episode-time tolerance、recipe/order
+regime 与 ego role。输入 comparator feature 只含合法可复算 history；label 为：
 
 ```text
 1[ L2-distance(centered empirical action signatures) > registered threshold ]
@@ -184,6 +218,8 @@ decision 或 separation supervision。
 
 matched-pair 分类仍保留 equivalent/distinct/ambiguous；ambiguous、invalid、padding 和 lineage
 重叠 pair 权重为零。分类 probability 与 empirical signature distance 必须共同满足注册阈值。
+训练 probe 结束后还必须重新满足 endpoint task epsilon、episode-time tolerance 与同一
+recipe/order regime；失败 pair 直接无效，不为凑固定预算填充。
 
 ## 8. final-policy M1
 
@@ -207,9 +243,11 @@ seed 绑定 M1 路径、SHA 和 deployment fingerprint。
 
 - `UCB(NLL_model-NLL_uniform) <= -0.02`；
 - `UCB(NLL_model-NLL_no_history) <= -0.02`；
-- position/direction coverage interval 与 `[0.85,0.95]` 相交；
+- position/direction coverage 的整个 95% interval 包含于 `[0.85,0.95]`；
 - `UCB(Brier_event-0.9*Brier_prior) <= 0`。
 
+event gate 还要求总正事件至少 100、每个伙伴 family 至少 20；不足输出 `not_estimable`。
+artifact 同时保存 prevalence bootstrap interval、positive/negative Brier 和 reliability curve。
 该 artifact 名称和论文措辞只能是 posterior-predictive calibration。
 
 ## 10. partner sampling
@@ -236,13 +274,29 @@ deployment 白名单包含 task encoder、instant partner encoder、capability e
 embeddings、actor、critic、response decoder；不含 anchors、comparator 或 bootstrap members。
 
 可执行主层级为 R0/B0/B1/B2；同容量机制消融为 `deterministic_context`、`decision_only`、
-`q_only`、`actor_only`、`no_separation`、`no_capability`。B3 始终抛
-`NotImplementedError`。六项消融只允许 development，正式配置固定 B2。
+`q_only`、`actor_only`、`no_separation`、`no_capability`、`response_only_posterior`。B3 始终抛
+`NotImplementedError`。七项消融只允许 development，正式配置固定 B2。
 
 开发链为 `collect-pair-comparator-source -> fit-pair-comparator -> run-development-matrix -> evaluate-development-matrix ->
 summarize-development-matrix`。summary 只接受 evaluator directories，必须从 raw episode
-parquet 重算 XP；自由格式 score JSON 无效。机制 artifact schema 为 3。
-开发结论固定使用 seed indexes 0--9；每个 B2 final run 还必须提供 component diagnostic artifact。
+parquet 重算 XP；自由格式 score JSON 无效。机制 artifact schema 为 4。
+开发主矩阵固定 K=4、seed indexes 0--9，运行 core 与 extra controls；七项机制消融只在 K=4；
+K=2/8 只运行 B1/B2。每个 B2 final run 还必须在 comparator validation histories 生成的共享
+只读 panel 上提供 component diagnostic artifact；alignment 输入为 `[anchor,K,action]`，并报告
+minimum utilization、effective count、dominant fraction 和 usage entropy。
+
+`build-decision-coverage-source`/`summarize-decision-coverage` 只接受 lineage-disjoint 的
+development coverage bank，报告 signature/nearest/top-action/state-conditional/per-family gap。
+`run-protocol-sensitivity-matrix` 对三个注册 `p_stay` 训练 B2 并在同一合法 panel 报告遮挡长度、
+posterior memory、false switch 与 re-identification。
+
+同期方法只注册 `history-context-proxy`、`recbayes-filter-proxy` 与
+`deterministic-context-proxy`。manifest 必须绑定 DEPI reference manifest，并机械验证同一训练
+pool、ego interaction steps 和 deployable parameter count；它们是仓内 proxy，不是论文方法复现。
+
+资源账本区分 marginal、shared、amortized 与 fully-loaded cost；comparator history/continuation、
+reference ego/upstream parents、final M1、component diagnostic、mechanism evaluation、GPU hours、
+peak memory 与 inference latency 均独立列项。
 `scientific-dry-run` 使用两个 ego、少量 fresh partners 和真实 Official simulator 串起训练、
 calibration、development score、identifiability、recoverable value 与 claim-style report；其所有
 输出固定 `scientific_readout_allowed=false`，不能进入正式 claim builder。

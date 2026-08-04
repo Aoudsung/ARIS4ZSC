@@ -75,12 +75,16 @@ def _metrics(
         "response_direction_loss": zero,
         "response_inventory_loss": zero,
         "response_event_loss": zero,
+        "response_no_component_total_loss": zero,
+        "component_predictive_nll_gain": zero,
+        "response_event_prevalence": zero,
         "component_pairwise_response_divergence": zero,
         "signature_loss": zero,
         "signature_huber_loss": zero,
         "signature_hinge_loss": zero,
         "decision_policy_loss": zero,
         "component_signature_loss": zero,
+        "posterior_decision_loss": zero,
         "component_pairwise_action_signature_divergence": zero,
         "component_one_hot_actor_tv": zero,
         "component_one_hot_top_action_disagreement": zero,
@@ -92,14 +96,20 @@ def _metrics(
         "decision_confidence_q90": zero,
         "anchor_policy_drift_kl": zero,
         "anchor_drift_weight": zero,
+        "anchor_context_fingerprint_match_fraction": zero,
         "decision_effective_anchor_count": zero,
         "separation_loss": zero,
+        "protocol_equivalent_pair_distance": zero,
+        "protocol_distinct_pair_distance": zero,
+        "protocol_separation_margin_saturation_fraction": zero,
+        "protocol_separation_effective_pair_weight": zero,
         "capability_consistency_loss": zero,
         "capability_semantic_prediction_loss": zero,
         "capability_variance_floor_loss": zero,
+        "capability_covariance_loss": zero,
         "capability_minimum_published_std": zero,
         "capability_publication_count": zero,
-        "capability_published_partner_count": zero,
+        "capability_published_sample_count": zero,
         "anchor_effective_sample_size": zero,
         "anchor_use_count_max": zero,
         "anchor_auxiliary_actual_total_weight": zero,
@@ -113,7 +123,12 @@ def _metrics(
         "mean_posterior_entropy": zero,
         "protocol_effective_component_count": zero,
         "protocol_minimum_component_utilization": zero,
-        "protocol_component_collapse_fraction": zero,
+        "posterior_high_confidence_fraction": zero,
+        "protocol_dominant_component_fraction": zero,
+        "protocol_component_usage_entropy": zero,
+        "protocol_embedding_norm": zero,
+        "protocol_component_embedding_minimum_norm": zero,
+        "protocol_component_embedding_maximum_norm": zero,
         "capability_dimension_variance": zero,
         "capability_mean_norm": zero,
         "context_dropout_fraction": zero,
@@ -134,6 +149,16 @@ def test_cuda_scan_preserves_all_minibatch_updates_in_order(
         return next_core, _metrics(next_core.params["weight"])
 
     monkeypatch.setattr(training, "apply_training_core_update", toy_update)
+    monkeypatch.setattr(
+        training,
+        "policy_kl_between_params",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    monkeypatch.setattr(
+        training,
+        "post_update_combined_policy_kl",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
     core = TrainingCoreState(
         params={"weight": jnp.asarray(0.0)},
         target_params={"weight": jnp.asarray(9.0)},
@@ -171,6 +196,16 @@ def test_combined_policy_kl_early_stop_aborts_remaining_minibatches(
         return next_core, _metrics(value, kl_stop=kl_stop)
 
     monkeypatch.setattr(training, "apply_training_core_update", toy_update)
+    monkeypatch.setattr(
+        training,
+        "policy_kl_between_params",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    monkeypatch.setattr(
+        training,
+        "post_update_combined_policy_kl",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
     core = TrainingCoreState(
         params={"weight": jnp.asarray(0.0)},
         target_params={"weight": jnp.asarray(0.0)},
@@ -277,6 +312,16 @@ def test_auxiliary_payload_has_one_fixed_transaction_after_ppo_scan(
         return core, metrics
 
     monkeypatch.setattr(training, "apply_training_core_update", toy_update)
+    monkeypatch.setattr(
+        training,
+        "policy_kl_between_params",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    monkeypatch.setattr(
+        training,
+        "post_update_combined_policy_kl",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
     core = TrainingCoreState(
         params={"weight": jnp.asarray(0.0)},
         target_params={"weight": jnp.asarray(0.0)},
@@ -288,7 +333,55 @@ def test_auxiliary_payload_has_one_fixed_transaction_after_ppo_scan(
         optimizer=None,
         batch=_batch(),
         schedule=jnp.asarray([[0, 1], [2, 3], [0, 2]], dtype=jnp.int32),
-        config=SimpleNamespace(ppo=SimpleNamespace(), method_variant="b2"),
+        config=SimpleNamespace(
+            ppo=SimpleNamespace(),
+            loss_v2=SimpleNamespace(combined_policy_kl_threshold=0.04),
+            method_variant="b2",
+        ),
         anchors="global-anchor-payload",
     )
     assert np.asarray(metrics["decision_supervision_confidence"]).tolist() == [1.0, 0.0, 0.0]
+
+
+def test_auxiliary_transaction_is_rolled_back_when_its_exact_kl_exceeds_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def toy_update(*, core, auxiliary_active, **unused):
+        increment = jnp.asarray(auxiliary_active, dtype=jnp.float32)
+        next_core = core._replace(
+            params={"weight": core.params["weight"] + increment}
+        )
+        return next_core, _metrics(next_core.params["weight"])
+
+    monkeypatch.setattr(training, "apply_training_core_update", toy_update)
+    monkeypatch.setattr(
+        training,
+        "policy_kl_between_params",
+        lambda **unused: jnp.asarray(0.05, dtype=jnp.float32),
+    )
+    monkeypatch.setattr(
+        training,
+        "post_update_combined_policy_kl",
+        lambda **unused: jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    core = TrainingCoreState(
+        params={"weight": jnp.asarray(0.0)},
+        target_params={"weight": jnp.asarray(0.0)},
+        ppo_optimizer_state=jnp.asarray(0),
+    )
+    result, metrics = training.scan_training_updates(
+        model=None,
+        core=core,
+        optimizer=None,
+        batch=_batch(),
+        schedule=jnp.asarray([[0, 1]], dtype=jnp.int32),
+        config=SimpleNamespace(
+            ppo=SimpleNamespace(),
+            loss_v2=SimpleNamespace(combined_policy_kl_threshold=0.04),
+            method_variant="b2",
+        ),
+        anchors="global-anchor-payload",
+    )
+    assert float(result.params["weight"]) == 0.0
+    assert np.asarray(metrics["auxiliary_update_accepted"]).tolist() == [0.0]
+    assert np.asarray(metrics["auxiliary_policy_kl"]).tolist() == pytest.approx([0.05])
