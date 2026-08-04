@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       config:
-        description: "Unified formal configuration"
+        description: "Unified mechanical CUDA-preflight configuration"
         required: true
-        default: "experiments/overcooked_v2/configs/delta_unified_simple_formal.yaml"
+        default: "experiments/overcooked_v2/configs/delta_unified_simple_mechanical.yaml"
         type: string
       partner_manifest:
         description: "Absolute partner manifest on the self-hosted runner"
