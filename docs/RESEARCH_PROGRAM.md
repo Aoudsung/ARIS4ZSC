@@ -1,53 +1,83 @@
-# DEPI 研究计划
+# Unified DELTA-ZSC 研究计划
 
-本计划只记录研究阶段与决策逻辑。所有注册数字、seed、预算、版本和门限都只链接权威合同，
-避免产生第二个容易漂移的来源。
+本文件记录研究推进顺序，不重复权威文档中的公式、阈值或预算。
 
 ## 当前目标
 
-在 OvercookedV2 Test-Time Protocol Formation 固定任务上，先证明当前实现忠实满足
-[`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) 和 [`METHOD_SPEC.md`](METHOD_SPEC.md)，再用
-[`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 检验 B1 的结构增量、B2 的决策监督增量以及
-held-out partner performance。机制归因必须闭合“合法历史—posterior/context—empirical
-action ordering—真实 continuation—XP”链条。
+在固定OvercookedV2 Test-Time Protocol Formation上，检验以下完整因果链：
 
-## 阶段与决策
+```text
+合法伙伴response
+ -> joint latent belief
+ -> posterior action value
+ -> KL-bounded analytic policy change
+ -> source-world continuation gain
+ -> held-out XP
+```
 
-### R0：实现一致性
+唯一核心结果仍是held-out benchmark performance。理论、calibration和机制测量用于解释performance，而不是替代performance或延迟端到端模型运行。
 
-代码、配置、checkpoint/deployment schema、CLI、测试和 active 文档使用同一方法身份；删除
-被取代的生成式训练状态、连续 latent、重复 optimizer 和不可达模块；通过静态禁词、compile、
-全量 CPU 单测与 checkpoint/resume/deployment round-trip。
+## 研究阶段
 
-### R1：机械与 CUDA acceptance
+### A. 工程闭合
 
-按 [`FORMAL_EXPERIMENT_PROTOCOL.md`](FORMAL_EXPERIMENT_PROTOCOL.md) 运行 mechanical E2E 和
-单 CUDA preflight。若 exact filter、joint likelihood、combined update、anchor continuation、
-resume 或显存门任一失败，返回实现修复，不进入科学比较。
+- active source compile；
+- unified unit/integration tests；
+- mechanical real-environment run；
+- single-GPU CUDA acceptance；
+- checkpoint/resume与deployment roundtrip。
 
-### R2：开发可证伪矩阵
+这些结果只证明代码可执行。
 
-执行 [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md)。先看 B1−B0 是否支持
-结构隔离，再看 B2−B1 是否支持 decision supervision；同时检查 K sensitivity、posterior
-calibration、M1 和真实 continuation 机制读数。失败即记录相应 falsifier，不通过调整正式 seed
-或报告口径挽救。
+### B. Development
 
-### R3：冻结与正式执行
+- base、response-only、joint paired seeds；
+- joint deployment同时评估joint与full；
+- 验证同seed base parameter fingerprints一致；
+- 完成decision-emission independent-replica诊断；
+- 完成K={2,4,8}受控诊断；
+- 估计run-level variance和资源。
 
-只有 R0–R2 的预注册门完成、合同无歧义且仓库 clean committed 后才 freeze。正式运行之后不再
-改变方法、依赖、配置、伙伴 panel 或统计。所有失败节点保留，所有 benchmark 结果发布。
+Development保持完整端到端系统，不采用逐组件实现或“失败即永久阻断”的工程门。发现问题时优先修正joint probability model、数据合法性或analytic decision operator，禁止重新堆叠独立loss。
 
-### R4：claim 边界
+### C. 方法冻结
 
-formal claim report 自动消费 Official、Common-Partner、容量、资源、开发矩阵、calibration、
-identifiability 和 recoverable-value artifacts。性能门与机制门分开；机制门失败时只撤回机制
-措辞，不删除性能结果。B3 在真实 action-conditioned value-of-information 实现、测试和新
-预注册完成前始终不进入结论。
+在查看confirmatory结果前冻结：
 
-## 停止规则
+- commit；
+- K/H/delta；
+- configs；
+- partner manifests；
+- evaluation keys；
+- H1/H2/H3统计；
+- baseline集合；
+-资源报告口径。
 
-- 出现 F1+ 信息泄漏、partner lineage 重叠、标签使用学习价值、正式 seed 替换或 artifact
-  伪造：该实验系列无效，停止汇总。
-- 开发增量、calibration 或机制控制失败：接受反证，定位具体链路；不得直接扩大正式算力。
-- 正式运行数值失败：按合同报告，禁止改变方法后续跑同一注册节点。
-- 只有新假设、独立版本和新的事前合同才能启动下一实验系列。
+### D. Formal
+
+- 双布局、10 seeds训练base/response-only/joint；
+- raw Official/Common-Partner evaluation；
+- joint bundle解析评估full；
+- held-out calibration；
+- causal belief evaluation；
+- 三假设hierarchical summary；
+- 完整资源与失败记录。
+
+## 决策原则
+
+1. **Performance优先。** 中间诊断只服务于理解和提高held-out XP。
+2. **单一原理优先。** 新机制必须从joint latent model或KL-constrained decision problem推导。
+3. **数据合法性优先。** 先修estimand、lineage、CRN和统计单位，再讨论网络结构。
+4. **简单解释优先。** 同等性能下选择更少component、更小模型和更低成本。
+5. **失败可发表性不是方法设计目标。** 不以“即使方法失败仍可写measurement paper”为中心组织当前项目。
+6. **正式结果不可用于方法调参。** 失败后进入新method版本和新confirmatory实验。
+
+## 论文目标
+
+只有以下证据同时成立，才形成完整方法论文：
+
+- H1：Full DELTA在强外部基线上取得物质性能增量；
+- H2：joint response-decision training优于response-only；
+- H3：正确belief在source-world干预下具有正因果决策价值。
+
+论文贡献不以模块数量表达，而以统一模型、合法部署和实证闭环表达。
