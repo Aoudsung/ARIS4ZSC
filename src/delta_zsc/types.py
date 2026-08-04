@@ -101,18 +101,19 @@ class DecisionAnchorBatch(NamedTuple):
 
 
 class UnifiedTrainState(NamedTuple):
-    """Two-estimator training state.
+    """Complete resume-equivalent training state.
 
     Base PPO and latent maximum-likelihood estimation have independent parameter
-    trees and optimizer moments.  This removes loss-weight and Adam-moment
-    coupling between task competence and partner inference.
+    trees and optimizer moments.  The full runner state, including environment,
+    partner carry, legal ego history, roles, and random key, is checkpointed so
+    interrupted and uninterrupted runs are scientifically equivalent.
     """
 
     base_params: Any
     latent_params: Any
     base_optimizer_state: Any
     latent_optimizer_state: Any
-    agent_state: AgentState
+    runner_state: Any
     random_key: Any
     environment_steps: Any
     update_count: Any
