@@ -14,7 +14,7 @@ capability encoder, context dropout, or loss-weighted control path remains.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any
 
 from .behavior_statistics import (
     behavior_features,
@@ -24,12 +24,7 @@ from .behavior_statistics import (
 from .filtering import filter_step, initial_belief, transition_matrix
 from .mirror_policy import expected_action_values, kl_constrained_policy
 from .response_model import response_emission_class, response_log_probability
-from .types import (
-    AgentOutput,
-    AgentState,
-    BasePolicyOutput,
-    LatentOutput,
-)
+from .types import AgentOutput, AgentState, BasePolicyOutput, LatentOutput
 from .voi import coarse_response_probability, myopic_value_of_information
 
 
@@ -81,38 +76,36 @@ def base_policy_model_class() -> Any:
                 output_dim=self.instant_partner_dim,
                 name="instant_partner_encoder",
             )
-
-        def _heads(self, task_features: Any, instant_partner: Any) -> tuple[Any, Any]:
-            combined = jnp.concatenate((task_features, instant_partner), axis=-1)
-            hidden = nn.relu(
-                nn.Dense(
-                    self.task_hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="policy_hidden_0",
-                )(combined)
+            self.policy_hidden_0 = nn.Dense(
+                self.task_hidden_dim,
+                kernel_init=orthogonal(jnp.sqrt(2.0)),
+                bias_init=zeros,
+                name="policy_hidden_0",
             )
-            hidden = nn.relu(
-                nn.Dense(
-                    self.task_hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="policy_hidden_1",
-                )(hidden)
+            self.policy_hidden_1 = nn.Dense(
+                self.task_hidden_dim,
+                kernel_init=orthogonal(jnp.sqrt(2.0)),
+                bias_init=zeros,
+                name="policy_hidden_1",
             )
-            logits = nn.Dense(
+            self.policy_logits = nn.Dense(
                 self.action_count,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="base_policy_logits",
-            )(hidden)
-            value = nn.Dense(
+            )
+            self.state_value = nn.Dense(
                 1,
                 kernel_init=orthogonal(1.0),
                 bias_init=zeros,
                 name="base_state_value",
-            )(hidden)[..., 0]
-            return logits, value
+            )
+
+        def _heads(self, task_features: Any, instant_partner: Any) -> tuple[Any, Any]:
+            combined = jnp.concatenate((task_features, instant_partner), axis=-1)
+            hidden = nn.relu(self.policy_hidden_0(combined))
+            hidden = nn.relu(self.policy_hidden_1(hidden))
+            return self.policy_logits(hidden), self.state_value(hidden)[..., 0]
 
         def step(
             self,
@@ -185,20 +178,73 @@ def latent_coordination_model_class() -> Any:
                 name="response_emission",
             )
 
-        def transition(self) -> Any:
-            def initializer(key: Any, shape: tuple[int, ...], dtype: Any) -> Any:
+            def transition_initializer(
+                key: Any, shape: tuple[int, ...], dtype: Any
+            ) -> Any:
                 del key
-                # A weak identity-biased initialization, not a fixed transition
-                # or a scanned method hyperparameter.  Maximum likelihood is
-                # free to move every entry.
                 return jnp.eye(shape[0], dtype=dtype) * 2.0
 
-            logits = self.param(
+            self.transition_logits = self.param(
                 "transition_logits",
-                initializer,
+                transition_initializer,
                 (self.component_count, self.component_count),
             )
-            return transition_matrix(logits)
+            self.decision_component_embeddings = self.param(
+                "decision_component_embeddings",
+                nn.initializers.normal(0.02),
+                (self.component_count, self.latent_hidden_dim),
+            )
+            self.decision_base_hidden_0 = nn.Dense(
+                self.latent_hidden_dim,
+                kernel_init=orthogonal(jnp.sqrt(2.0)),
+                bias_init=zeros,
+                name="decision_base_hidden_0",
+            )
+            self.decision_base_hidden_1 = nn.Dense(
+                self.latent_hidden_dim,
+                kernel_init=orthogonal(jnp.sqrt(2.0)),
+                bias_init=zeros,
+                name="decision_base_hidden_1",
+            )
+            self.decision_base_mean = nn.Dense(
+                self.action_count,
+                kernel_init=orthogonal(0.01),
+                bias_init=zeros,
+                name="decision_base_mean",
+            )
+            self.decision_base_log_scale = nn.Dense(
+                self.action_count,
+                kernel_init=zeros,
+                bias_init=nn.initializers.constant(1.0),
+                name="decision_base_log_scale",
+            )
+            self.decision_residual_hidden_0 = nn.Dense(
+                self.latent_hidden_dim,
+                kernel_init=orthogonal(jnp.sqrt(2.0)),
+                bias_init=zeros,
+                name="decision_residual_hidden_0",
+            )
+            self.decision_residual_hidden_1 = nn.Dense(
+                self.latent_hidden_dim,
+                kernel_init=orthogonal(jnp.sqrt(2.0)),
+                bias_init=zeros,
+                name="decision_residual_hidden_1",
+            )
+            self.decision_residual_mean = nn.Dense(
+                self.action_count,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="decision_residual_mean",
+            )
+            self.decision_residual_log_scale = nn.Dense(
+                self.action_count,
+                kernel_init=zeros,
+                bias_init=zeros,
+                name="decision_residual_log_scale",
+            )
+
+        def transition(self) -> Any:
+            return transition_matrix(self.transition_logits)
 
         def response_logits(
             self,
@@ -215,11 +261,7 @@ def latent_coordination_model_class() -> Any:
                 include_component_residual=include_component_residual,
             )
 
-        def response_all_actions(
-            self,
-            frame: Any,
-            behavior: Any,
-        ) -> Any:
+        def response_all_actions(self, frame: Any, behavior: Any) -> Any:
             frame_array = jnp.asarray(frame)
             behavior_array = jnp.asarray(behavior)
             lead = behavior_array.shape[:-1]
@@ -261,42 +303,18 @@ def latent_coordination_model_class() -> Any:
                 raise ValueError("Decision-emission context axes differ.")
             lead = task.shape[:-1]
             common = jnp.concatenate((task, instant, statistics), axis=-1)
-            hidden = nn.tanh(
-                nn.Dense(
-                    self.latent_hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="decision_base_hidden_0",
-                )(common)
-            )
-            hidden = nn.tanh(
-                nn.Dense(
-                    self.latent_hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="decision_base_hidden_1",
-                )(hidden)
-            )
-            base_mean = nn.Dense(
-                self.action_count,
-                kernel_init=orthogonal(0.01),
-                bias_init=zeros,
-                name="decision_base_mean",
-            )(hidden)
-            base_log_scale = nn.Dense(
-                self.action_count,
-                kernel_init=zeros,
-                bias_init=nn.initializers.constant(1.0),
-                name="decision_base_log_scale",
-            )(hidden)
+            hidden = nn.tanh(self.decision_base_hidden_0(common))
+            hidden = nn.tanh(self.decision_base_hidden_1(hidden))
+            base_mean = self.decision_base_mean(hidden)
+            base_log_scale = self.decision_base_log_scale(hidden)
 
-            components = self.param(
-                "decision_component_embeddings",
-                nn.initializers.normal(0.02),
-                (self.component_count, self.latent_hidden_dim),
-            )
-            components = components / jnp.maximum(
-                jnp.linalg.norm(components, axis=-1, keepdims=True), 1.0e-6
+            components = self.decision_component_embeddings / jnp.maximum(
+                jnp.linalg.norm(
+                    self.decision_component_embeddings,
+                    axis=-1,
+                    keepdims=True,
+                ),
+                1.0e-6,
             )
             common_k = jnp.broadcast_to(
                 common[..., None, :],
@@ -306,40 +324,22 @@ def latent_coordination_model_class() -> Any:
                 components.reshape((1,) * len(lead) + components.shape),
                 lead + components.shape,
             )
+            residual_input = jnp.concatenate((common_k, components_k), axis=-1)
             residual_hidden = nn.tanh(
-                nn.Dense(
-                    self.latent_hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="decision_residual_hidden_0",
-                )(jnp.concatenate((common_k, components_k), axis=-1))
+                self.decision_residual_hidden_0(residual_input)
             )
             residual_hidden = nn.tanh(
-                nn.Dense(
-                    self.latent_hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="decision_residual_hidden_1",
-                )(residual_hidden)
+                self.decision_residual_hidden_1(residual_hidden)
             )
-            residual_mean = nn.Dense(
-                self.action_count,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="decision_residual_mean",
-            )(residual_hidden)
-            residual_log_scale = nn.Dense(
-                self.action_count,
-                kernel_init=zeros,
-                bias_init=zeros,
-                name="decision_residual_log_scale",
-            )(residual_hidden)
+            residual_mean = self.decision_residual_mean(residual_hidden)
+            residual_log_scale = self.decision_residual_log_scale(residual_hidden)
             if not include_component_residual:
                 residual_mean = jnp.zeros_like(residual_mean)
                 residual_log_scale = jnp.zeros_like(residual_log_scale)
-            mean = base_mean[..., None, :] + residual_mean
-            log_scale = base_log_scale[..., None, :] + residual_log_scale
-            return mean, log_scale
+            return (
+                base_mean[..., None, :] + residual_mean,
+                base_log_scale[..., None, :] + residual_log_scale,
+            )
 
         def initialize_all(
             self,
@@ -350,15 +350,12 @@ def latent_coordination_model_class() -> Any:
             behavior: Any,
             previous_action: Any,
         ) -> tuple[Any, Any, Any, Any]:
-            transition = self.transition()
-            response = self.response_logits(
-                previous_frame, behavior, previous_action
+            return (
+                self.transition(),
+                self.response_logits(previous_frame, behavior, previous_action),
+                self.decision_emission(task_features, instant_partner, behavior),
+                self.response_all_actions(current_frame, behavior),
             )
-            decision = self.decision_emission(
-                task_features, instant_partner, behavior
-            )
-            all_actions = self.response_all_actions(current_frame, behavior)
-            return transition, response, decision, all_actions
 
     _LATENT_CLASS = LatentCoordinationModel
     return LatentCoordinationModel
@@ -428,9 +425,7 @@ class UnifiedAgent:
         targets = extract_partner_response_targets(
             state.previous_observation, observation, planes=planes
         )
-        response_log_likelihood = response_log_probability(
-            response_logits, targets
-        )
+        response_log_likelihood = response_log_probability(response_logits, targets)
         response_log_likelihood = jnp.where(
             jnp.asarray(state.episode_start, dtype=jnp.bool_)[..., None],
             jnp.zeros_like(response_log_likelihood),
@@ -478,21 +473,20 @@ class UnifiedAgent:
             ).value
 
         if normalized_variant in {BASE_VARIANT, RESPONSE_ONLY_VARIANT}:
-            mirror_logits = base.base_logits
-            base_probability = jax.nn.softmax(base.base_logits, axis=-1)
+            adapted_logits = base.base_logits
             adaptation_temperature = jnp.full(
                 base.base_logits.shape[:-1], jnp.inf, dtype=jnp.float32
             )
-            adaptation_kl = jnp.zeros(base.base_logits.shape[:-1], dtype=jnp.float32)
+            adaptation_kl = jnp.zeros(
+                base.base_logits.shape[:-1], dtype=jnp.float32
+            )
         else:
-            bayes_values = expected_values + float(self.gamma) * voi
             mirror = kl_constrained_policy(
                 base.base_logits,
-                bayes_values,
+                expected_values + float(self.gamma) * voi,
                 kl_budget=float(self.adaptation_kl_budget),
             )
-            mirror_logits = mirror.logits
-            base_probability = mirror.probabilities
+            adapted_logits = mirror.logits
             adaptation_temperature = mirror.temperature
             adaptation_kl = mirror.kl_to_base
 
@@ -516,7 +510,7 @@ class UnifiedAgent:
                 decision_log_scale=decision_log_scale,
                 expected_action_values=expected_values,
                 value_of_information=voi,
-                adapted_logits=mirror_logits,
+                adapted_logits=adapted_logits,
                 adaptation_temperature=adaptation_temperature,
                 adaptation_kl=adaptation_kl,
             ),
@@ -587,8 +581,6 @@ def initialize_parameters(
     example_state: AgentState,
     example_observation: Any,
 ) -> tuple[Any, Any]:
-    import jax.numpy as jnp
-
     base_variables = base_model.init(
         base_key,
         example_state.task_carry,
@@ -596,14 +588,13 @@ def initialize_parameters(
         example_state.episode_start,
         method=base_model.initialize_all,
     )
-    next_carry, base_output = base_model.apply(
+    _, base_output = base_model.apply(
         base_variables,
         example_state.task_carry,
         example_observation,
         example_state.episode_start,
         method=base_model.step,
     )
-    del next_carry
     statistics = behavior_features(example_state.behavior)
     latent_variables = latent_model.init(
         latent_key,
