@@ -17,6 +17,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from experiments.overcooked_v2.official_adapter import FrozenPartnerPool, VectorEnvironment
+from src.delta_zsc.config import METHOD_VERSION
 from src.delta_zsc.deployment import load_deployment
 from src.delta_zsc.filtering import sequence_log_likelihood
 from src.delta_zsc.response_model import response_log_probability
@@ -29,25 +30,29 @@ from src.path_c.storage import runtime_provenance, sha256_path
 
 
 def _environment(config: Any, num_envs: int) -> VectorEnvironment:
-    shim = SimpleNamespace(
-        environment=SimpleNamespace(
-            layout=config.environment.layout,
-            episode_steps=config.environment.episode_steps,
-            agent_view_size=config.environment.agent_view_size,
-            indicate_successful_delivery=config.environment.indicate_successful_delivery,
-            num_envs=int(num_envs),
+    return VectorEnvironment.create(
+        SimpleNamespace(
+            environment=SimpleNamespace(
+                layout=config.environment.layout,
+                episode_steps=config.environment.episode_steps,
+                agent_view_size=config.environment.agent_view_size,
+                indicate_successful_delivery=(
+                    config.environment.indicate_successful_delivery
+                ),
+                num_envs=int(num_envs),
+            )
         )
     )
-    return VectorEnvironment.create(shim)
 
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def _score_block(deployment: Any, batch: Any) -> Mapping[str, float]:
-    import jax
     import jax.numpy as jnp
     from jax.scipy.special import logsumexp
 
@@ -122,11 +127,17 @@ def _score_block(deployment: Any, batch: Any) -> Mapping[str, float]:
     }
 
 
-def _bootstrap(rows: list[Mapping[str, float]], *, replicates: int, seed: int) -> Mapping[str, Any]:
+def _bootstrap(
+    rows: list[Mapping[str, float]], *, replicates: int, seed: int
+) -> Mapping[str, Any]:
     names = tuple(rows[0])
-    matrix = np.asarray([[row[name] for name in names] for row in rows], dtype=np.float64)
+    matrix = np.asarray(
+        [[row[name] for name in names] for row in rows], dtype=np.float64
+    )
     rng = np.random.default_rng(int(seed))
-    indexes = rng.integers(0, matrix.shape[0], size=(int(replicates), matrix.shape[0]))
+    indexes = rng.integers(
+        0, matrix.shape[0], size=(int(replicates), matrix.shape[0])
+    )
     draws = np.mean(matrix[indexes], axis=1)
     low, high = np.quantile(draws, (0.025, 0.975), axis=0)
     mean = np.mean(matrix, axis=0)
@@ -144,7 +155,8 @@ def run_calibration(args: Any) -> None:
     import jax.numpy as jnp
 
     started = time.perf_counter()
-    deployment = load_deployment(args.deployment)
+    deployment_path = Path(args.deployment).resolve()
+    deployment = load_deployment(deployment_path)
     config = deployment.config
     manifest_path = Path(args.partner_manifest).resolve()
     manifest = load_partner_manifest(
@@ -155,6 +167,9 @@ def run_calibration(args: Any) -> None:
     runs = tuple(manifest.by_role("calibration"))
     if len(runs) < 4:
         raise ValueError("Calibration requires at least four independent partner runs.")
+    parents = [str(run.parent_training_run_id) for run in runs]
+    if len(parents) != len(set(parents)):
+        raise ValueError("Calibration partner parents must be independent.")
     episodes_per_run = int(getattr(args, "episodes_per_run", 32))
     if episodes_per_run <= 0:
         raise ValueError("episodes_per_run must be positive.")
@@ -194,17 +209,22 @@ def run_calibration(args: Any) -> None:
             shaping_factor=0.0,
             record_anchor_state=False,
         )
-        score = _score_block(deployment, batch)
         rows.append(
             {
                 "partner_run_id": str(run.run_id),
+                "partner_parent_run_id": str(run.parent_training_run_id),
                 "partner_mechanism": str(run.generation_mechanism),
-                **score,
+                **_score_block(deployment, batch),
             }
         )
         total_steps += episodes_per_run * config.environment.episode_steps
+    excluded = {
+        "partner_run_id",
+        "partner_parent_run_id",
+        "partner_mechanism",
+    }
     numeric = [
-        {key: float(value) for key, value in row.items() if key not in {"partner_run_id", "partner_mechanism"}}
+        {key: float(value) for key, value in row.items() if key not in excluded}
         for row in rows
     ]
     summary = _bootstrap(
@@ -226,7 +246,8 @@ def run_calibration(args: Any) -> None:
             "version": 1,
             "artifact_type": "unified_delta_posterior_predictive_calibration",
             "diagnostic_only": True,
-            "method": deployment.config.fingerprint,
+            "method": METHOD_VERSION,
+            "config_fingerprint": config.fingerprint,
             "variant": deployment.variant,
             "layout": config.environment.layout,
             "run_count": len(rows),
@@ -234,8 +255,8 @@ def run_calibration(args: Any) -> None:
             "summary": summary,
             "sources": {
                 "deployment": {
-                    "path": str(Path(args.deployment).resolve()),
-                    "sha256": sha256_path(args.deployment),
+                    "path": str(deployment_path),
+                    "sha256": sha256_path(deployment_path),
                 },
                 "partner_manifest": {
                     "path": str(manifest_path),
