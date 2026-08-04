@@ -83,15 +83,21 @@ class RolloutBatch(NamedTuple):
 
 
 class DecisionAnchorBatch(NamedTuple):
-    """Privileged training evidence from real CRN all-action continuations."""
+    """Privileged decision observations aligned to one rollout.
 
-    task_features: Any
-    instant_partner: Any
-    behavior_features: Any
-    response_belief: Any
+    ``time_indexes`` and ``lane_indexes`` locate the legal states inside the
+    rollout.  The latent forward algorithm recomputes task features, behaviour
+    statistics, response beliefs, and decision emissions under the current
+    parameters.  No stale stored posterior or learned comparator is needed.
+    """
+
+    time_indexes: Any
+    lane_indexes: Any
     centered_returns: Any
     standard_errors: Any
     action_mask: Any
+    fit_replica_returns: Any
+    evaluation_returns: Any
 
 
 class UnifiedTrainState(NamedTuple):
