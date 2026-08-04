@@ -21,6 +21,7 @@ def test_active_package_contains_no_retired_patch_chain_tokens() -> None:
 
 
 def test_base_and_latent_optimizers_are_distinct() -> None:
+    import jax
     import jax.numpy as jnp
 
     from src.delta_zsc.training import make_optimizer
@@ -40,7 +41,11 @@ def test_base_and_latent_optimizers_are_distinct() -> None:
         adam_epsilon=1e-5,
     )
     assert base_optimizer is not latent_optimizer
-    assert base_state != latent_state
+    base_shapes = [tuple(leaf.shape) for leaf in jax.tree_util.tree_leaves(base_state)]
+    latent_shapes = [tuple(leaf.shape) for leaf in jax.tree_util.tree_leaves(latent_state)]
+    assert (2,) in base_shapes
+    assert (3,) in latent_shapes
+    assert base_shapes != latent_shapes
 
 
 def test_decision_anchor_schema_has_no_stale_posterior_or_comparator() -> None:
