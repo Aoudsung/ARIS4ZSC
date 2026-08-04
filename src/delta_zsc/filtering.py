@@ -53,13 +53,13 @@ def filter_step(
     *,
     episode_start: Any = False,
 ) -> FilterStep:
-    """One physical-time Chapman-Kolmogorov/Bayes update.
+    """One online observation update.
 
-    Missing response factors are represented by zero log likelihood inside the
-    emission model.  The state transition is never disabled merely because the
-    partner is occluded; negative visibility remains legitimate evidence.
-    Episode starts use the registered uniform prior directly and do not apply a
-    fictitious pre-episode transition.
+    At an episode start there is no pre-episode transition or response.  The
+    current observation therefore starts from the uniform prior.  At all other
+    physical steps the learned transition is applied before the response
+    correction.  Occlusion masks only unavailable response factors; it never
+    disables the state transition or negative visibility evidence.
     """
 
     from jax.scipy.special import logsumexp
@@ -74,8 +74,7 @@ def filter_step(
         raise ValueError("Response likelihood must have one value per component.")
     start = jnp.asarray(episode_start, dtype=jnp.bool_)
     uniform = jnp.full_like(previous, 1.0 / float(previous.shape[-1]))
-    transitioned = previous @ matrix
-    predictive = jnp.where(start[..., None], uniform, transitioned)
+    predictive = jnp.where(start[..., None], uniform, previous @ matrix)
     log_joint = jnp.log(jnp.maximum(predictive, 1.0e-30)) + likelihood
     log_evidence = logsumexp(log_joint, axis=-1)
     posterior = jnp.exp(log_joint - log_evidence[..., None])
@@ -127,15 +126,18 @@ def sequence_log_likelihood(
     response_log_likelihood: Any,
     episode_starts: Any,
     valid_mask: Any,
+    initial_belief: Any | None = None,
     decision_log_likelihood: Any | None = None,
     decision_mask: Any | None = None,
 ) -> SequenceLikelihood:
     """Forward algorithm for the single joint latent-variable objective.
 
-    Response observations occur at every valid transition.  Privileged
-    counterfactual decision observations occur only where ``decision_mask`` is
-    true.  Their likelihood multiplies the response likelihood under the same
-    latent component; there is no comparator, pseudo-label, or separation loss.
+    The sequence is aligned to action transitions.  At a transition whose
+    current state is an episode start, the current mode prior is uniform and is
+    then propagated through the learned physical-time transition before the
+    next response is observed.  Privileged counterfactual decision observations
+    occur only where ``decision_mask`` is true and multiply the response
+    likelihood under the same component.
     """
 
     import jax
@@ -164,34 +166,41 @@ def sequence_log_likelihood(
             raise ValueError("Decision evidence axes differ from response evidence.")
 
     batch_shape = response.shape[1:-1]
-    initial = jnp.broadcast_to(log_uniform, batch_shape + (count,))
+    if initial_belief is None:
+        initial_probability = jnp.broadcast_to(
+            jnp.exp(log_uniform), batch_shape + (count,)
+        )
+    else:
+        initial_probability = jnp.asarray(initial_belief, dtype=jnp.float32)
+        if initial_probability.shape != batch_shape + (count,):
+            raise ValueError("Initial belief does not match the rollout batch.")
+        initial_probability = initial_probability / jnp.maximum(
+            jnp.sum(initial_probability, axis=-1, keepdims=True), 1.0e-12
+        )
+    initial_log = jnp.log(jnp.maximum(initial_probability, 1.0e-30))
 
     def one(log_previous: Any, items: tuple[Any, Any, Any, Any, Any]):
         response_t, decision_t, decision_valid_t, start_t, valid_t = items
-        transitioned = logsumexp(
-            log_previous[..., :, None] + log_transition,
+        current_prior = jnp.where(start_t[..., None], log_uniform, log_previous)
+        log_predictive = logsumexp(
+            current_prior[..., :, None] + log_transition,
             axis=-2,
         )
-        log_predictive = jnp.where(start_t[..., None], log_uniform, transitioned)
         response_joint = log_predictive + response_t
         response_evidence = logsumexp(response_joint, axis=-1)
         joint = response_joint + decision_valid_t[..., None] * decision_t
         joint_evidence = logsumexp(joint, axis=-1)
         posterior = joint - joint_evidence[..., None]
-        posterior = jnp.where(valid_t[..., None] > 0.0, posterior, log_predictive)
+        posterior = jnp.where(valid_t[..., None] > 0.0, posterior, current_prior)
         response_term = -valid_t * response_evidence
         decision_term = -valid_t * decision_valid_t * (
             joint_evidence - response_evidence
         )
-        return posterior, (
-            posterior,
-            response_term,
-            decision_term,
-        )
+        return posterior, (posterior, response_term, decision_term)
 
     final_log_posterior, (posterior_log, response_terms, decision_terms) = jax.lax.scan(
         one,
-        initial,
+        initial_log,
         (response, decision, decision_valid, starts, valid),
     )
     response_count = jnp.sum(valid)
