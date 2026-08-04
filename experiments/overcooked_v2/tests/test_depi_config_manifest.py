@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from experiments.overcooked_v2.deployment import DEPLOYMENT_BUNDLE_VERSION
+from experiments.overcooked_v2.development_matrix_app import _variant_config
+
 from src.path_c.experiment import (
     CHECKPOINT_SCHEMA_VERSION,
     CONFIG_VERSION,
@@ -22,6 +25,7 @@ from src.path_c.experiment import (
     official_training_key,
     validate_config,
     validate_partner_manifest,
+    validate_seed_training_manifest,
 )
 from src.path_c.response_targets import official_partner_observation_planes
 from src.path_c.storage import sha256_path
@@ -32,14 +36,23 @@ CONFIGS = ROOT / "experiments" / "overcooked_v2" / "configs"
 
 
 def test_registered_identity_and_budgets_are_current() -> None:
-    assert CONFIG_VERSION == 15
-    assert CHECKPOINT_SCHEMA_VERSION == 5
-    assert MANIFEST_VERSION == 3
-    assert METHOD_VERSION == "depi_exact_filter_decision_supervision_v5"
+    assert CONFIG_VERSION == 17
+    assert CHECKPOINT_SCHEMA_VERSION == 7
+    assert MANIFEST_VERSION == 4
+    assert METHOD_VERSION == "depi_instant_partner_exact_filter_decision_supervision_v7"
     assert OFFICIAL_PROTOCOL_VERSION == "overcooked_v2_iclr2025_5ce1707_v1"
     assert RUN_BUDGETS["mechanical"].environment_steps == 1_024
     assert RUN_BUDGETS["development"].environment_steps == 1_228_800
     assert RUN_BUDGETS["formal"].environment_steps == 29_949_952
+
+
+def test_readme_identity_cannot_drift_from_code_authority() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"METHOD_VERSION = {METHOD_VERSION}" in readme
+    assert f"CONFIG_VERSION = {CONFIG_VERSION}" in readme
+    assert f"CHECKPOINT_SCHEMA_VERSION = {CHECKPOINT_SCHEMA_VERSION}" in readme
+    assert f"MANIFEST_VERSION = {MANIFEST_VERSION}" in readme
+    assert f"deployment bundle schema：`{DEPLOYMENT_BUNDLE_VERSION}`" in readme
 
 
 @pytest.mark.parametrize(
@@ -59,6 +72,7 @@ def test_every_active_config_loads_under_its_registered_budget(
     assert config.environment.num_envs == environment_count
     assert config.method_variant == "b2"
     assert config.model.protocol_components == 4
+    assert config.model.instant_partner_dim == 32
     assert config.partner_pool.enabled
     assert config.partner_pool.heuristic_family_test_only
     assert len(config.fingerprint) == 64
@@ -81,6 +95,36 @@ def test_formal_decision_calibration_and_statistics_registration() -> None:
     }
 
 
+def test_total_budget_controls_replace_b2_auxiliary_cost_with_exact_ppo_steps(
+    tmp_path: Path,
+) -> None:
+    source = CONFIGS / "depi_simple_development.yaml"
+    r0_path = tmp_path / "r0_extra.yaml"
+    b0_path = tmp_path / "b0_extra.yaml"
+    b1_path = tmp_path / "b1_extra.yaml"
+    _variant_config(source, r0_path, "r0_extra", 4)
+    _variant_config(source, b0_path, "b0_extra", 4)
+    _variant_config(source, b1_path, "b1_extra", 4)
+    r0 = load_config(r0_path, run_kind="development")
+    b0 = load_config(b0_path, run_kind="development")
+    b1 = load_config(b1_path, run_kind="development")
+    assert r0.method_variant == "r0"
+    assert b0.method_variant == "b0"
+    assert b1.method_variant == "b1"
+    assert r0.training.extra_ppo_environment_steps == 737_920
+    assert b0.training.extra_ppo_environment_steps == 737_920
+    assert b1.training.extra_ppo_environment_steps == 737_920
+    assert (
+        r0.training.environment_steps
+        == b0.training.environment_steps
+        == b1.training.environment_steps
+        == 1_966_720
+    )
+    assert r0.training.environment_steps % (
+        r0.environment.num_envs * r0.training.rollout_length
+    ) == 640
+
+
 def test_b3_and_nonregistered_formal_component_count_fail_closed() -> None:
     config = load_config(CONFIGS / "depi_simple_formal.yaml", run_kind="formal")
     with pytest.raises(NotImplementedError, match="B3"):
@@ -99,6 +143,103 @@ def test_official_plane_contract_and_training_keys_are_exact() -> None:
     assert len({official_training_key(index) for index in range(10)}) == 10
     with pytest.raises(ValueError, match="0..9"):
         official_training_key(-1)
+
+
+def test_validate_seed_training_manifest_formal_full_fixture() -> None:
+    """Exercise the complete formal-only validator, including config use."""
+
+    rows: list[PartnerRun] = []
+    serial = 1
+
+    def add(
+        *,
+        role: str,
+        mechanism: str,
+        parent: str,
+        stage: float = 1.0,
+        family: str = "default",
+        seed_index: int | None = None,
+        owner: int | None = None,
+    ) -> None:
+        nonlocal serial
+        key = (
+            official_training_key(seed_index)
+            if seed_index is not None
+            else (700_000 + serial, 800_000 + serial)
+        )
+        rows.append(
+            PartnerRun(
+                run_id=f"formal-{serial}",
+                role=role,
+                checkpoint=Path(f"/tmp/formal-checkpoint-{serial}"),
+                checkpoint_sha256=f"{serial:064x}",
+                parent_training_run_id=parent,
+                generation_mechanism=mechanism,
+                checkpoint_stage=stage,
+                hyperparameter_family=family,
+                seed=serial,
+                seed_index=seed_index,
+                jax_prng_key=key,
+                owner_seed_index=owner,
+                co_training_group_id=f"formal-group-{role}-{parent}",
+                partner_type_id=None,
+            )
+        )
+        serial += 1
+
+    add(
+        role="owner_source",
+        mechanism="rnn-sp",
+        parent="owner-parent-0",
+        seed_index=0,
+        owner=0,
+    )
+    for mechanism in ("rnn-sp", "rnn-op"):
+        for parent_index in range(10):
+            parent = f"support-{mechanism}-{parent_index}"
+            for stage in (0.0, 0.5, 1.0):
+                add(
+                    role="development_support",
+                    mechanism=mechanism,
+                    parent=parent,
+                    stage=stage,
+                    seed_index=parent_index,
+                )
+    for width_index in range(2):
+        add(
+            role="development_support",
+            mechanism="rnn-op",
+            parent=f"support-op-width-{width_index}",
+            family=f"width-{width_index}",
+            seed_index=8 + width_index,
+        )
+    for role in ("comparator_fit", "comparator_validation"):
+        for index in range(8):
+            add(
+                role=role,
+                mechanism="sp" if index < 4 else "op",
+                parent=f"{role}-parent-{index}",
+            )
+    for mechanism in ("sp", "op", "sa", "fcp"):
+        for index in range(5):
+            add(
+                role="calibration",
+                mechanism=mechanism,
+                parent=f"calibration-{mechanism}-{index}",
+            )
+    for index in range(2):
+        add(
+            role="confirmatory",
+            mechanism="sp" if index == 0 else "op",
+            parent=f"confirmatory-{index}",
+        )
+    config = load_config(CONFIGS / "depi_simple_formal.yaml", run_kind="formal")
+    validate_seed_training_manifest(
+        PartnerManifest(layout="test_time_simple", runs=tuple(rows)),
+        config=config,
+        owner_seed_index=0,
+        formal=True,
+    )
 
 
 def _run(index: int, role: str, *, parent: str | None = None) -> PartnerRun:

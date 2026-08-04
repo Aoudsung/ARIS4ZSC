@@ -124,6 +124,7 @@ class CompiledCallable:
 class CompiledTrainingKernels:
     rollout_minimal: CompiledCallable
     rollout_anchor_full: CompiledCallable
+    rollout_tail: CompiledCallable
     rollout_support: CompiledCallable
     target_context_sequence: CompiledCallable
     ppo_scan: CompiledCallable
@@ -238,12 +239,29 @@ def build_training_kernels(
             separation_terms=separation_terms,
         )
 
+    vector_block_steps = int(config.environment.num_envs) * int(
+        config.training.rollout_length
+    )
+    tail_transition_count = int(config.training.environment_steps) % vector_block_steps
+    tail_length = (
+        int(config.training.rollout_length)
+        if tail_transition_count == 0
+        else tail_transition_count // int(config.environment.num_envs)
+    )
+    if tail_length <= 0:
+        raise ValueError("The configured training budget must contain whole vector steps.")
+
     return CompiledTrainingKernels(
         rollout_minimal=CompiledCallable(
             "rollout_minimal", rollout("minimal", config.training.rollout_length)
         ),
         rollout_anchor_full=CompiledCallable(
             "rollout_anchor_full", rollout("anchor_full", config.training.rollout_length)
+        ),
+        # Total-budget R0/B0/B1 controls can end on a partial vector rollout. It
+        # remains a fixed-shape executable and is never used for B2 anchors.
+        rollout_tail=CompiledCallable(
+            "rollout_tail", rollout("minimal", tail_length)
         ),
         rollout_support=CompiledCallable(
             "rollout_support", rollout("support", config.environment.episode_steps)

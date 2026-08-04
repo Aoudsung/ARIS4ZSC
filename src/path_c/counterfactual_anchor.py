@@ -581,6 +581,7 @@ def collect_counterfactual_anchors(
             int(evaluation_replicas),
             dtype=jnp.int32,
         ),
+        fit_replica_returns_by_action=fit_returns,
     )
 
 

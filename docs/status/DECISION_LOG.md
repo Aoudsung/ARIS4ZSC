@@ -57,6 +57,23 @@
 
 ---
 
+## D4 — 2026-08-04 审查后方法边界与部署白名单更正
+
+- **日期**：2026-08-04
+- **性质**：实现/主张边界决策（非科学证据）
+- **来源**：《当前仍存在的问题》及同轮代码、权威规格修订。
+
+**登记内容**：近期路线保留固定 sticky transition，将主张收缩为注册离散 response model 下的
+decision-equivalent online inference，不声称 B3/主动协议形成。component 统一改称
+exchangeable response regimes。为保留合法即时控制，部署图新增无 carry 的 instant-partner
+encoder；因此 D3 所述“五个子树白名单维持现状”已被新方法身份取代。当前 deployment schema
+白名单以 `METHOD_SPEC.md` 为准，包含 task、instant、capability、component、actor、critic、
+response decoder 七个子树。
+
+**备注**：本条只更正后续执行口径，不证明性能、校准或机制结论。
+
+---
+
 ## 后续条目结构（预留）
 
 后续每条决策按以下格式追加，只增不改：

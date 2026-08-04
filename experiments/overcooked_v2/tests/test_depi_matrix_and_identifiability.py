@@ -11,8 +11,14 @@ import pytest
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 
+from experiments.overcooked_v2.comparator_app import (  # noqa: E402
+    MINIMUM_HISTORIES_PER_SPLIT,
+    _rows as comparator_source_rows,
+)
 from experiments.overcooked_v2.development_matrix_app import (  # noqa: E402
+    CORE_DEVELOPMENT_VARIANTS,
     DEVELOPMENT_VARIANTS,
+    _validate_development_raw_rows,
     validate_development_entry_alignment,
 )
 from experiments.overcooked_v2.formal_claim_app import (  # noqa: E402
@@ -26,8 +32,15 @@ from experiments.overcooked_v2.official_evaluation_app import (  # noqa: E402
     _load_policy_manifest,
 )
 from src.path_c.experiment import (  # noqa: E402
+    MECHANISM_ABLATION_VARIANTS,
     METHOD_VERSION,
     OFFICIAL_SOURCE_COMMIT,
+)
+from src.path_c.component_diagnostics import (  # noqa: E402
+    best_permutation_alignment,
+    component_intervention_summary,
+    permutation_aligned_component_stability,
+    validate_component_diagnostic_values,
 )
 from src.path_c.identifiability_controls import (  # noqa: E402
     continuation_swap_causal_consistency,
@@ -43,6 +56,69 @@ from src.path_c.model import (  # noqa: E402
 )
 from src.path_c.resources import parameter_count  # noqa: E402
 from src.path_c.storage import sha256_path  # noqa: E402
+
+
+def test_comparator_source_rows_require_independent_replica_signatures() -> None:
+    rows = []
+    for index in range(MINIMUM_HISTORIES_PER_SPLIT):
+        rows.append(
+            {
+                "history_features": [float(index % 3), float(index % 5)],
+                "fit_returns_by_action": [float(index % 6 == action) for action in range(6)],
+                "evaluation_returns_by_action": [
+                    float((index + 1) % 6 == action) for action in range(6)
+                ],
+                "partner_run_id": f"run-{index % 8}",
+            }
+        )
+    features, fit_signatures, evaluation_signatures, runs = comparator_source_rows(
+        rows, label="fixture"
+    )
+    assert features.shape == (MINIMUM_HISTORIES_PER_SPLIT, 2)
+    assert fit_signatures.shape == evaluation_signatures.shape == (
+        MINIMUM_HISTORIES_PER_SPLIT,
+        6,
+    )
+    assert np.any(fit_signatures != evaluation_signatures)
+    assert np.unique(runs).size == 8
+
+
+def test_development_raw_rows_require_every_ordered_pair_and_episode_once() -> None:
+    schedule = "a" * 64
+    rows = [
+        {
+            "variant": "b2",
+            "protocol_components": 4,
+            "left_seed_index": left,
+            "right_seed_index": right,
+            "left_role": 0,
+            "right_role": 1,
+            "episode_index": episode,
+            "raw_return": float(left - right),
+            "evaluation_key_schedule_sha256": schedule,
+        }
+        for left in range(10)
+        for right in range(10)
+        for episode in range(500)
+    ]
+    scores = _validate_development_raw_rows(
+        rows,
+        variant="b2",
+        protocol_components=4,
+        seed_indexes=range(10),
+        schedule_sha256=schedule,
+    )
+    assert set(scores) == set(range(10))
+    broken = list(rows)
+    broken[-1] = dict(broken[-2])
+    with pytest.raises(ValueError, match="duplicated"):
+        _validate_development_raw_rows(
+            broken,
+            variant="b2",
+            protocol_components=4,
+            seed_indexes=range(10),
+            schedule_sha256=schedule,
+        )
 
 
 def _model_params(variant: str):
@@ -81,8 +157,21 @@ def _model_params(variant: str):
 
 
 def test_b0_b1_b2_are_first_class_and_capacity_matched_while_b3_fails() -> None:
-    assert DEVELOPMENT_VARIANTS == ("b0", "b1", "b2")
-    counts = [parameter_count(_model_params(variant)) for variant in DEVELOPMENT_VARIANTS]
+    assert CORE_DEVELOPMENT_VARIANTS == ("r0", "b0", "b1", "b2")
+    assert DEVELOPMENT_VARIANTS == (
+        "r0",
+        "b0",
+        "b1",
+        "b2",
+        "r0_extra",
+        "b0_extra",
+        "b1_extra",
+        *MECHANISM_ABLATION_VARIANTS,
+    )
+    counts = [
+        parameter_count(_model_params(variant))
+        for variant in (*CORE_DEVELOPMENT_VARIANTS, *MECHANISM_ABLATION_VARIANTS)
+    ]
     assert len(set(counts)) == 1
     with pytest.raises(NotImplementedError, match="B3"):
         build_model(
@@ -129,6 +218,50 @@ def test_identifiability_primitives_are_paired_and_directional() -> None:
     assert consistency == 1.0
 
 
+def test_component_diagnostics_are_permutation_invariant_and_interventional() -> None:
+    reference = np.asarray(
+        [[1.0, 0.0, -1.0], [0.0, 2.0, -2.0], [-3.0, 1.0, 2.0]]
+    )
+    candidate = reference[[2, 0, 1]]
+    order, error = best_permutation_alignment(reference, candidate)
+    assert order == (1, 2, 0)
+    assert error == 0.0
+    stability = permutation_aligned_component_stability(
+        {0: reference, 1: candidate}
+    )
+    assert stability["permutation_aligned_rmse"] == 0.0
+    assert stability["permutation_aligned_stability"] == 1.0
+
+    summary = component_intervention_summary(
+        action_signatures=np.stack((reference, reference + 0.5), axis=0),
+        policy_logits=np.asarray(
+            [
+                [[6.0, 0.0, 0.0], [0.0, 6.0, 0.0], [0.0, 0.0, 6.0]],
+                [[5.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 5.0]],
+            ]
+        ),
+        protocol_probabilities=np.asarray(
+            [[0.2, 0.3, 0.5], [0.4, 0.4, 0.2]]
+        ),
+    )
+    assert len(summary["component_action_signatures"]) == 3
+    assert sum(summary["component_utilization"]) == pytest.approx(1.0)
+    assert summary["mean_pairwise_action_signature_divergence"] > 0.0
+    assert summary["mean_pairwise_one_hot_actor_tv"] > 0.9
+    assert summary["one_hot_top_action_disagreement_fraction"] == 1.0
+    complete = {
+        **summary,
+        "mean_pairwise_response_divergence_all_actions": 0.25,
+    }
+    validate_component_diagnostic_values(complete, component_count=3, action_count=3)
+    with pytest.raises(ValueError, match="probabilities"):
+        validate_component_diagnostic_values(
+            {**complete, "component_utilization": [1.0, 1.0, 1.0]},
+            component_count=3,
+            action_count=3,
+        )
+
+
 def test_development_matrix_rejects_budget_sampler_capacity_and_key_drift() -> None:
     entries = [
         {
@@ -136,7 +269,21 @@ def test_development_matrix_rejects_budget_sampler_capacity_and_key_drift() -> N
             "protocol_components": 4,
             "seed_index": 0,
             "partner_sampler_sha256": "same",
-            "total_training_simulator_steps": 100,
+            "total_training_simulator_steps": 120 if (
+                variant in {"r0_extra", "b0_extra", "b1_extra"}
+                or variant in {"b2", "decision_only", "q_only", "actor_only", "no_separation", "no_capability"}
+            ) else 100,
+            "ppo_training_steps": (
+                120 if variant in {"r0_extra", "b0_extra", "b1_extra"} else 100
+            ),
+            "auxiliary_training_steps": 20 if variant in {
+                "b2",
+                "decision_only",
+                "q_only",
+                "actor_only",
+                "no_separation",
+                "no_capability",
+            } else 0,
             "deployable_parameters": 200,
             "episode_key_domains": {"evaluation": [1, 2]},
         }
@@ -145,7 +292,6 @@ def test_development_matrix_rejects_budget_sampler_capacity_and_key_drift() -> N
     validate_development_entry_alignment(entries)
     for field, changed in (
         ("partner_sampler_sha256", "different"),
-        ("total_training_simulator_steps", 101),
         ("deployable_parameters", 201),
         ("episode_key_domains", {"evaluation": [2, 1]}),
     ):
@@ -153,9 +299,19 @@ def test_development_matrix_rejects_budget_sampler_capacity_and_key_drift() -> N
         broken[-1][field] = changed
         with pytest.raises(RuntimeError, match="differs"):
             validate_development_entry_alignment(broken)
+    broken = [dict(row) for row in entries]
+    broken[-1]["total_training_simulator_steps"] = 121
+    with pytest.raises(RuntimeError, match="total simulator budgets differ"):
+        validate_development_entry_alignment(broken)
+    broken = [dict(row) for row in entries]
+    next(row for row in broken if row["variant"] == "b1_extra")[
+        "ppo_training_steps"
+    ] = 121
+    with pytest.raises(RuntimeError, match="exactly replace"):
+        validate_development_entry_alignment(broken)
 
 
-def test_formal_claim_consumes_only_hash_bound_mechanism_artifacts(
+def test_formal_claim_rejects_handwritten_scores_and_validates_mechanism_artifacts(
     tmp_path: Path,
 ) -> None:
     matrix_path = tmp_path / "matrix.json"
@@ -184,12 +340,13 @@ def test_formal_claim_consumes_only_hash_bound_mechanism_artifacts(
             "scores": {"path": str(scores_path), "sha256": sha256_path(scores_path)},
         },
     }
-    assert _validate_development_matrix(development)
+    with pytest.raises(ValueError, match="Development-matrix summary identity"):
+        _validate_development_matrix(development)
 
     common = {
         "method": METHOD_VERSION,
         "layout": "test_time_simple",
-        "version": 2,
+        "version": 3,
         "method_variant": "b2",
         "paired_crn": True,
         "resource_ledger": {"continuation_steps": 10, "total_simulator_steps": 20},
@@ -216,24 +373,24 @@ def test_formal_claim_consumes_only_hash_bound_mechanism_artifacts(
         "artifact_type": "depi_identifiability_evaluation",
         "task_leakage": {
             "representation_shuffle_drift": 0.0,
-            "balanced_accuracy": 0.5,
+            "learned_representation_balanced_accuracy": 0.55,
+            "task_state_baseline_balanced_accuracy": 0.52,
+            "excess_balanced_accuracy": 0.03,
             "chance_accuracy": 0.5,
-            "maximum_excess_over_chance": 0.05,
+            "maximum_excess_over_task_state": 0.05,
         },
-        "history_shuffle": {
+        "protocol_state_transplant": {
             "mean_return_drop": 2.0,
             "bootstrap_99_percent_ci": [1.0, 3.0],
         },
         "context_swap": {
             "measurement": "real_crn_all_action_continuation",
-            "swap_c_continuation_consistency": 0.8,
-            "registered_swap_c_threshold": 0.5,
+            "source_world_value_alignment_bootstrap_99_percent_ci": [0.5, 2.0],
         },
         "pass": {
-            "task_channel_isolation": True,
-            "task_leakage_probe": True,
-            "history_shuffle": True,
-            "swap_c_causal_consistency": True,
+            "task_excess_leakage": True,
+            "protocol_state_transplant": True,
+            "source_world_context_value": True,
             "overall": True,
         },
         "source": {
@@ -250,10 +407,13 @@ def test_formal_claim_consumes_only_hash_bound_mechanism_artifacts(
             "g1_minus_g3": {"bootstrap_99_percent_ci": [1.0, 2.0]},
             "g4_minus_g1": {"point_difference": 0.0},
         },
+        "cross_fitted_proxy": {
+            "mean_top_action_selection_stability": 0.75,
+            "not_a_mathematical_upper_bound": True,
+        },
         "pass": {
             "legal_history_beats_shuffled": True,
             "legal_history_beats_state_only": True,
-            "oracle_is_upper_bound": True,
             "recoverable_fraction_estimable": True,
             "overall": True,
         },
@@ -334,6 +494,25 @@ def _write_depi_manifest_with_final_m1(root: Path, *, layout: str) -> Path:
             "update": 10,
             "final_checkpoint_condition": True,
             "model_fingerprint": fingerprint,
+            "deployment_params_fingerprint": fingerprint,
+            "anchor_collection_policy_fingerprint": fingerprint,
+            "continuation_policy_fingerprint": fingerprint,
+            "partner_panel_fingerprint": "a" * 64,
+            "fit_key_domain": {
+                "name": "audit_anchor/final_fit",
+                "root": [1, 2],
+                "lane_key_derivation": "fold_in(root,100003),fold_in(replica_index)",
+                "replica_index_range": [0, 4],
+            },
+            "evaluation_key_domain": {
+                "name": "audit_anchor/final_evaluation",
+                "root": [1, 2],
+                "lane_key_derivation": "fold_in(root,100003),fold_in(replica_index)",
+                "replica_index_range": [4, 12],
+            },
+            "fresh_final_anchor": True,
+            "bootstrap_reinitialized_after_deployment_freeze": True,
+            "bootstrap_training": {"loss": 0.1},
             "m1_gate_passed": True,
             "m1_path_passing_fractions": [0.9, 0.9, 0.9, 0.9],
             "m1_path_mean_spearman": [0.8, 0.8, 0.8, 0.8],

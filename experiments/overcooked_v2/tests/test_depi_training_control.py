@@ -41,7 +41,7 @@ def _batch(time_count: int = 2, lane_count: int = 4) -> RolloutBatch:
         dones=jnp.zeros_like(transition, dtype=jnp.bool_),
         old_log_probabilities=jnp.zeros_like(transition),
         old_values=states,
-        behavior_probabilities=jnp.full_like(transition, 0.5),
+        behavior_probabilities=jnp.full(transition.shape + (6,), 1.0 / 6.0),
         ppo_mask=jnp.ones_like(transition),
         partner_sources=jnp.zeros((time_count, lane_count), dtype=jnp.int32),
         partner_members=jnp.zeros((time_count, lane_count), dtype=jnp.int32),
@@ -75,13 +75,31 @@ def _metrics(
         "response_direction_loss": zero,
         "response_inventory_loss": zero,
         "response_event_loss": zero,
+        "component_pairwise_response_divergence": zero,
         "signature_loss": zero,
         "signature_huber_loss": zero,
         "signature_hinge_loss": zero,
         "decision_policy_loss": zero,
+        "component_signature_loss": zero,
+        "component_pairwise_action_signature_divergence": zero,
+        "component_one_hot_actor_tv": zero,
+        "component_one_hot_top_action_disagreement": zero,
         "decision_supervision_confidence": zero,
+        "decision_target_entropy": zero,
+        "decision_top_action_stability": zero,
+        "decision_confidence_q10": zero,
+        "decision_confidence_q50": zero,
+        "decision_confidence_q90": zero,
+        "anchor_policy_drift_kl": zero,
+        "anchor_drift_weight": zero,
+        "decision_effective_anchor_count": zero,
         "separation_loss": zero,
         "capability_consistency_loss": zero,
+        "capability_semantic_prediction_loss": zero,
+        "capability_variance_floor_loss": zero,
+        "capability_minimum_published_std": zero,
+        "capability_publication_count": zero,
+        "capability_published_partner_count": zero,
         "anchor_effective_sample_size": zero,
         "anchor_use_count_max": zero,
         "anchor_auxiliary_actual_total_weight": zero,
@@ -93,6 +111,11 @@ def _metrics(
         "mean_raw_reward": zero,
         "mean_shaped_reward": zero,
         "mean_posterior_entropy": zero,
+        "protocol_effective_component_count": zero,
+        "protocol_minimum_component_utilization": zero,
+        "protocol_component_collapse_fraction": zero,
+        "capability_dimension_variance": zero,
+        "capability_mean_norm": zero,
         "context_dropout_fraction": zero,
         "method_variant_code": zero,
         "combined_policy_kl": zero,
@@ -243,11 +266,15 @@ def test_context_dropout_mask_is_a_replayed_batch_field() -> None:
     assert sliced.context_dropout_masks.shape == (3, 2)
 
 
-def test_global_anchor_payload_is_active_only_once_per_outer_update(
+def test_auxiliary_payload_has_one_fixed_transaction_after_ppo_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def toy_update(*, core, auxiliary_active, **unused):
-        return core, _metrics(jnp.asarray(auxiliary_active, dtype=jnp.float32))
+        metrics = _metrics(jnp.asarray(0.0, dtype=jnp.float32))
+        metrics["decision_supervision_confidence"] = jnp.asarray(
+            auxiliary_active, dtype=jnp.float32
+        )
+        return core, metrics
 
     monkeypatch.setattr(training, "apply_training_core_update", toy_update)
     core = TrainingCoreState(
@@ -261,7 +288,7 @@ def test_global_anchor_payload_is_active_only_once_per_outer_update(
         optimizer=None,
         batch=_batch(),
         schedule=jnp.asarray([[0, 1], [2, 3], [0, 2]], dtype=jnp.int32),
-        config=SimpleNamespace(ppo=SimpleNamespace()),
+        config=SimpleNamespace(ppo=SimpleNamespace(), method_variant="b2"),
         anchors="global-anchor-payload",
     )
-    assert np.asarray(metrics["actor_loss"]).tolist() == [1.0, 0.0, 0.0]
+    assert np.asarray(metrics["decision_supervision_confidence"]).tolist() == [1.0, 0.0, 0.0]

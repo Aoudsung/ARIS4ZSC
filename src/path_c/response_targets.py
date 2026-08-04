@@ -168,10 +168,9 @@ def extract_partner_response_targets(
         jnp.rint(before_interaction) != jnp.rint(after_interaction), axis=-1
     )
     visible_inventory_change = previous_visible & visible & visible_inventory_change
-    # Only reproducible observation-level events are declared: a partner
-    # becoming visible/invisible or a visible inventory transition.  Intent
-    # labels such as yielding, contention, and waiting are deliberately absent.
-    interaction_change = (previous_visible != visible) | visible_inventory_change
+    # Visibility transitions belong exclusively to the visibility head.  The
+    # event head is evaluated only when inventory is observable at both ends.
+    interaction_change = visible_inventory_change
     return PartnerResponseTargets(
         visibility=visible.astype(jnp.float32),
         relative_position=position.astype(jnp.int32),
@@ -179,7 +178,7 @@ def extract_partner_response_targets(
         inventory=inventory.astype(jnp.int32),
         interaction_change=interaction_change.astype(jnp.float32),
         visible_mask=visible.astype(jnp.float32),
-        event_mask=jnp.ones_like(visible, dtype=jnp.float32),
+        event_mask=(previous_visible & visible).astype(jnp.float32),
     )
 
 
@@ -376,6 +375,64 @@ def mixture_response_loss(
     )
 
 
+def pairwise_component_response_divergence(
+    prediction: ResponsePrediction,
+    *,
+    mask: Any | None = None,
+) -> Any:
+    """Permutation-invariant mean pairwise symmetric KL across regimes.
+
+    This is a diagnostic of whether the response decoder actually uses the
+    exchangeable component axis.  It does not assign names to components and
+    it never enters posterior filtering or deployment decisions.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    def categorical_symmetric_kl(logits: Any) -> Any:
+        log_probability = jax.nn.log_softmax(
+            jnp.asarray(logits, dtype=jnp.float32), axis=-1
+        )
+        probability = jnp.exp(log_probability)
+        forward = jnp.sum(
+            probability[..., :, None, :]
+            * (
+                log_probability[..., :, None, :]
+                - log_probability[..., None, :, :]
+            ),
+            axis=-1,
+        )
+        return 0.5 * (forward + jnp.swapaxes(forward, -1, -2))
+
+    def bernoulli_logits(logits: Any) -> Any:
+        value = jnp.asarray(logits, dtype=jnp.float32)
+        return jnp.stack((jnp.zeros_like(value), value), axis=-1)
+
+    divergences = (
+        categorical_symmetric_kl(bernoulli_logits(prediction.visibility_logit)),
+        categorical_symmetric_kl(prediction.relative_position_logits),
+        categorical_symmetric_kl(prediction.direction_logits),
+        jnp.mean(
+            categorical_symmetric_kl(
+                jnp.swapaxes(prediction.inventory_logits, -3, -2)
+            ),
+            axis=-3,
+        ),
+        categorical_symmetric_kl(
+            bernoulli_logits(prediction.interaction_change_logit)
+        ),
+    )
+    combined = sum(divergences) / float(len(divergences))
+    component_count = combined.shape[-1]
+    off_diagonal = 1.0 - jnp.eye(component_count, dtype=jnp.float32)
+    lead_weight = jnp.ones(combined.shape[:-2], dtype=jnp.float32)
+    if mask is not None:
+        lead_weight = jnp.asarray(mask, dtype=jnp.float32)
+    weight = lead_weight[..., None, None] * off_diagonal
+    return jnp.sum(weight * combined) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
 __all__ = [
     "PARTNER_DIRECTION_CLASSES",
     "PARTNER_INVENTORY_FACTOR_CLASSES",
@@ -388,4 +445,5 @@ __all__ = [
     "extract_partner_response_targets",
     "mixture_response_loss",
     "official_partner_observation_planes",
+    "pairwise_component_response_divergence",
 ]

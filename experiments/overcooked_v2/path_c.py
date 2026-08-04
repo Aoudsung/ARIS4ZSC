@@ -6,9 +6,14 @@ import argparse
 from pathlib import Path
 
 from experiments.overcooked_v2.calibration_app import run_posterior_calibration
+from experiments.overcooked_v2.comparator_app import (
+    collect_pair_comparator_source,
+    fit_frozen_pair_comparator,
+)
 from experiments.overcooked_v2.common_partner_app import run_common_partner_evaluation
 from experiments.overcooked_v2.manifest_app import add_manifest_command
 from experiments.overcooked_v2.mechanical_e2e_app import run_mechanical_e2e
+from experiments.overcooked_v2.scientific_dry_run_app import run_scientific_dry_run
 from experiments.overcooked_v2.official_baseline_app import run_official_baseline
 from experiments.overcooked_v2.official_br_prox_app import run_common_br_prox
 from experiments.overcooked_v2.official_evaluation_app import (
@@ -27,6 +32,7 @@ from experiments.overcooked_v2.identifiability_app import (
     run_recoverable_value_evaluation,
 )
 from experiments.overcooked_v2.development_matrix_app import (
+    evaluate_development_matrix,
     run_development_matrix,
     summarize_development_matrix,
 )
@@ -64,6 +70,25 @@ def _parser() -> argparse.ArgumentParser:
     )
     mechanical.add_argument("--output", required=True)
     mechanical.set_defaults(function=run_mechanical_e2e, manages_output=True)
+
+    scientific_dry_run = commands.add_parser("scientific-dry-run")
+    scientific_dry_run.add_argument(
+        "--config",
+        default=(
+            "experiments/overcooked_v2/configs/"
+            "depi_simple_mechanical_e2e.yaml"
+        ),
+    )
+    scientific_dry_run.add_argument("--partner-manifest", required=True)
+    scientific_dry_run.add_argument("--pair-comparator", required=True)
+    scientific_dry_run.add_argument("--resume", action="store_true", default=False)
+    scientific_dry_run.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    scientific_dry_run.add_argument("--output", required=True)
+    scientific_dry_run.set_defaults(
+        function=run_scientific_dry_run, manages_output=True
+    )
 
     upstream = commands.add_parser("upstream")
     upstream.add_argument("--config", required=True)
@@ -125,12 +150,30 @@ def _parser() -> argparse.ArgumentParser:
         if args.seed_index is not None:
             validate_seed_training_manifest(
                 manifest,
+                config=config,
                 owner_seed_index=int(args.seed_index),
                 formal=(args.run_kind == "formal"),
             )
         print(f"Valid DEPI manifest: {len(manifest.runs)} runs")
 
     validate.set_defaults(function=validate_manifest, manages_output=False)
+
+    comparator_source = commands.add_parser("collect-pair-comparator-source")
+    comparator_source.add_argument("--config", required=True)
+    comparator_source.add_argument("--partner-manifest", required=True)
+    comparator_source.add_argument("--reference-ego-checkpoint", required=True)
+    comparator_source.add_argument("--output", required=True)
+    comparator_source.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    comparator_source.set_defaults(
+        function=collect_pair_comparator_source, manages_output=True
+    )
+
+    comparator = commands.add_parser("fit-pair-comparator")
+    comparator.add_argument("--source", required=True)
+    comparator.add_argument("--output", required=True)
+    comparator.set_defaults(function=fit_frozen_pair_comparator, manages_output=True)
 
     train = commands.add_parser("train")
     train.add_argument("--config", required=True)
@@ -144,6 +187,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--run-kind", choices=RUN_KINDS, required=True)
     train.add_argument("--output", required=True)
+    train.add_argument("--pair-comparator")
     train.add_argument("--resume", action="store_true")
     train.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
@@ -165,15 +209,45 @@ def _parser() -> argparse.ArgumentParser:
         help="Repeat exactly for K=2,4,8; omitted runs the full sensitivity set.",
     )
     matrix.add_argument("--output", required=True)
+    matrix.add_argument("--pair-comparator", required=True)
     matrix.add_argument("--resume", action="store_true")
     matrix.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
     )
     matrix.set_defaults(function=run_development_matrix, manages_output=True)
 
+    matrix_evaluate = commands.add_parser("evaluate-development-matrix")
+    matrix_evaluate.add_argument("--matrix", required=True)
+    matrix_evaluate.add_argument(
+        "--variant",
+        choices=(
+            "r0",
+            "b0",
+            "b1",
+            "b2",
+            "r0_extra",
+            "b0_extra",
+            "b1_extra",
+            "deterministic_context",
+            "decision_only",
+            "q_only",
+            "actor_only",
+            "no_separation",
+            "no_capability",
+        ),
+        required=True,
+    )
+    matrix_evaluate.add_argument(
+        "--protocol-components", type=int, choices=(2, 4, 8), required=True
+    )
+    matrix_evaluate.add_argument("--output", required=True)
+    matrix_evaluate.set_defaults(
+        function=evaluate_development_matrix, manages_output=True
+    )
+
     matrix_summary = commands.add_parser("summarize-development-matrix")
     matrix_summary.add_argument("--matrix", required=True)
-    matrix_summary.add_argument("--scores", required=True)
+    matrix_summary.add_argument("--evaluation", action="append", required=True)
     matrix_summary.add_argument("--output", required=True)
     matrix_summary.set_defaults(
         function=summarize_development_matrix, manages_output=True

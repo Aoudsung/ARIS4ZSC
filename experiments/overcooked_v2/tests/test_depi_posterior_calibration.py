@@ -112,6 +112,7 @@ def test_no_history_counterfactual_resets_every_partner_history_carrier() -> Non
             if method.__name__ == "context_sequence":
                 return None, ContextOutput(
                     task_features=jnp.ones((2, 1, 3)),
+                    instant_partner=jnp.ones((2, 1, 2)),
                     capability=jnp.ones((2, 1, 2)) * 7.0,
                     protocol_probabilities=jnp.asarray(
                         [[[0.9, 0.1]], [[0.8, 0.2]]], dtype=jnp.float32

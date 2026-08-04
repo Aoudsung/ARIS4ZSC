@@ -708,63 +708,34 @@ def pair_feature_rows(left_history: Any, right_history: Any) -> Any:
     return np.concatenate((np.abs(left - right), left * right), axis=-1)
 
 
-def decision_signature_prototypes(
-    signatures: Any, *, component_count: int
-) -> Any:
-    """Deterministic farthest-first prototypes from empirical continuations."""
-
-    import numpy as np
-
-    values = np.asarray(signatures, dtype=np.float64)
-    if values.ndim != 2 or values.shape[0] < 2:
-        raise ValueError("Decision-regime development needs at least two signatures.")
-    target_count = min(int(component_count), max(values.shape[0] // 2, 2))
-    first = int(np.argmax(np.linalg.norm(values - values.mean(axis=0), axis=-1)))
-    selected = [first]
-    while len(selected) < target_count:
-        distance = np.min(
-            np.linalg.norm(values[:, None, :] - values[selected][None, :, :], axis=-1),
-            axis=-1,
-        )
-        distance[selected] = -np.inf
-        candidate = int(np.argmax(distance))
-        if not np.isfinite(distance[candidate]) or distance[candidate] <= 1.0e-8:
-            break
-        selected.append(candidate)
-    if len(selected) < 2:
-        raise ValueError("Empirical continuation signatures contain no distinct regimes.")
-    return values[np.asarray(selected, dtype=np.int64)]
-
-
-def assign_decision_signature_regimes(signatures: Any, prototypes: Any) -> Any:
-    """Assign signatures to the nearest frozen empirical prototype."""
-
-    import numpy as np
-
-    values = np.asarray(signatures, dtype=np.float64)
-    centers = np.asarray(prototypes, dtype=np.float64)
-    if values.ndim != 2 or centers.ndim != 2 or values.shape[1] != centers.shape[1]:
-        raise ValueError("Decision signatures and prototypes do not align.")
-    distance = np.linalg.norm(values[:, None, :] - centers[None, :, :], axis=-1)
-    return np.argmin(distance, axis=-1).astype(np.int32)
-
-
-def decision_regime_pair_dataset(
+def decision_distinction_pair_dataset(
     history_features: Any,
-    regime_labels: Any,
+    decision_signatures: Any,
     *,
+    signature_distance_threshold: float,
     block_ids: Any | None = None,
-    maximum_pairs: int = 512,
+    maximum_pairs: int = 32_768,
     require_both_classes: bool = True,
 ) -> tuple[Any, Any, Any]:
-    """Construct pair rows labelled by empirical decision-signature regime."""
+    """Build K-independent comparator labels from empirical action geometry.
+
+    The binary estimand is fixed before fitting: two legal histories are
+    decision-distinct exactly when the Euclidean distance between their
+    centered all-action continuation signatures exceeds the registered
+    threshold.  No model component count, prototype, or learned task feature
+    enters label construction.
+    """
 
     import numpy as np
 
     features = np.asarray(history_features, dtype=np.float64)
-    regimes = np.asarray(regime_labels, dtype=np.int64).reshape((-1,))
-    if features.ndim != 2 or features.shape[0] != regimes.shape[0]:
-        raise ValueError("History features and regime labels must align.")
+    signatures = np.asarray(decision_signatures, dtype=np.float64)
+    if (
+        features.ndim != 2
+        or signatures.ndim != 2
+        or features.shape[0] != signatures.shape[0]
+    ):
+        raise ValueError("Comparator histories and decision signatures must align.")
     blocks = (
         np.arange(features.shape[0], dtype=np.int64)
         if block_ids is None
@@ -778,7 +749,8 @@ def decision_regime_pair_dataset(
     for left in range(features.shape[0]):
         for right in range(left + 1, features.shape[0]):
             rows.append(pair_feature_rows(features[left], features[right]))
-            labels.append(float(regimes[left] != regimes[right]))
+            distance = float(np.linalg.norm(signatures[left] - signatures[right]))
+            labels.append(float(distance > float(signature_distance_threshold)))
             pair_blocks.append(
                 "|".join(sorted((str(blocks[left]), str(blocks[right]))))
             )
@@ -791,9 +763,7 @@ def decision_regime_pair_dataset(
     matrix = np.stack(rows)
     target = np.asarray(labels, dtype=np.float64)
     if require_both_classes and np.unique(target).size != 2:
-        raise ValueError(
-            "Comparator development split must contain same- and different-regime pairs."
-        )
+        raise ValueError("Comparator fitting requires both decision classes.")
     return matrix, target, np.asarray(pair_blocks, dtype=object)
 
 
@@ -864,8 +834,8 @@ def fit_pair_comparator(
 ) -> FrozenPairComparator:
     """Fit on explicit pair rows/labels and freeze against a disjoint split.
 
-    Labels must be derived from decision-signature regimes by the caller; run
-    identity is intentionally absent from this API.
+    Labels must be derived directly from the registered empirical signature
+    distance; run identity is intentionally absent from this API.
     """
 
     import numpy as np
@@ -1239,12 +1209,13 @@ def collect_anchor_batch(
     candidate_observations = gather_time_lanes(
         records["observations"], candidate_indexes
     )
-    _, candidate_output = model.apply(
-        {"params": target_params},
-        candidate_world.ego_state,
-        candidate_observations,
-        jnp.zeros((candidate_count,), dtype=jnp.bool_),
-        method=model.step,
+    from .task_encoder import task_only_observation
+
+    # State matching uses a fixed simulator-derived feature space shared by
+    # every method/K: the current legal task planes. Learned representations
+    # would change the estimand across variants.
+    fixed_candidate_features = task_only_observation(candidate_observations).reshape(
+        (candidate_count, -1)
     )
     candidate_run_ids = np.asarray(
         gather_time_lanes(records["partner_run_ids"], candidate_indexes)
@@ -1267,7 +1238,7 @@ def collect_anchor_batch(
     )
     if manifest_partitioned:
         pair_matrix = manifest_partitioned_candidate_pairs(
-            jax.lax.stop_gradient(candidate_output.task_features),
+            jax.lax.stop_gradient(fixed_candidate_features),
             candidate_run_ids,
             candidate_partition_ids,
             pair_count=pair_count,
@@ -1275,7 +1246,7 @@ def collect_anchor_batch(
         )
     else:
         pair_matrix = run_disjoint_candidate_pairs(
-            jax.lax.stop_gradient(candidate_output.task_features),
+            jax.lax.stop_gradient(fixed_candidate_features),
             candidate_run_ids,
             pair_count=pair_count,
             development_pair_count=(
@@ -1369,7 +1340,7 @@ def collect_anchor_batch(
     right = left + 1
     signatures = centered_action_values(combined.fit_returns_by_action)
     # Comparator development and use are disjoint at the anchor-pair level.
-    # The first half supplies empirical continuation-signature regimes; only
+    # The first half supplies empirical continuation-signature distances; only
     # the second half may enter L_separation.
     comparator = frozen_comparator
     pair_probabilities = np.full((pair_count,), 0.5, dtype=np.float32)
@@ -1434,22 +1405,21 @@ def collect_anchor_batch(
         )
         development_signatures = lane_signatures[:development_lane_count]
         development_run_ids = matched_run_ids[:development_lane_count]
-        prototypes = decision_signature_prototypes(
-            development_signatures[fit_lane_mask],
-            component_count=int(config.model.protocol_components),
-        )
-        regime_labels = assign_decision_signature_regimes(
-            development_signatures, prototypes
-        )
-        fit_rows, fit_labels, fit_blocks = decision_regime_pair_dataset(
+        fit_rows, fit_labels, fit_blocks = decision_distinction_pair_dataset(
             development_features[fit_lane_mask],
-            regime_labels[fit_lane_mask],
+            development_signatures[fit_lane_mask],
+            signature_distance_threshold=float(
+                config.anchors.signature_distance_threshold
+            ),
             block_ids=development_run_ids[fit_lane_mask],
         )
         validation_rows, validation_labels, validation_blocks = (
-            decision_regime_pair_dataset(
+            decision_distinction_pair_dataset(
                 development_features[validation_lane_mask],
-                regime_labels[validation_lane_mask],
+                development_signatures[validation_lane_mask],
+                signature_distance_threshold=float(
+                    config.anchors.signature_distance_threshold
+                ),
                 block_ids=development_run_ids[validation_lane_mask],
                 require_both_classes=False,
             )
@@ -1613,7 +1583,7 @@ def collect_anchor_batch(
         ],
         "comparator_holdout_accuracy": comparator_validation_accuracy,
         "comparator_holdout_accuracy_interval": comparator_validation_interval,
-        "comparator_target": "different_empirical_decision_signature_regime",
+        "comparator_target": "k_independent_empirical_signature_distance",
         "comparator_development_pairs": int(pair_count // 2 if pair_count >= 4 else 0),
         "comparator_training_pairs": int(np.sum(training_pair_mask)),
         "expected_comparator_training_pairs": int(expected_training_pair_count),
@@ -1697,9 +1667,7 @@ __all__ = [
     "ProbeHistory",
     "classify_matched_pairs",
     "collect_anchor_batch",
-    "decision_regime_pair_dataset",
-    "decision_signature_prototypes",
-    "assign_decision_signature_regimes",
+    "decision_distinction_pair_dataset",
     "fit_pair_comparator",
     "manifest_partitioned_candidate_pairs",
     "gather_time_lanes",

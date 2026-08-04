@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aris4zsc"
 version = "0.3.0"
-description = "DELTA-ZSC V6 end-to-end Bayes coordination experiments"
+description = "DEPI exact-filter decision-supervision coordination experiments"
 requires-python = ">=3.10,<3.11"
 dependencies = [
   "numpy>=1.24,<2",

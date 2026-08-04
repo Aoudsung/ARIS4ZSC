@@ -1,7 +1,7 @@
 """The single static partner-pool implementation used by DEPI.
 
-The only B0--B2 training distribution is the manifest-backed,
-family/stage/run-stratified pool below;
+The only R0/B0--B2 training distribution is the manifest-backed,
+mechanism/family/stage/run-stratified pool below;
 the family-disjoint test split is represented by two checkpoint-free Official
 heuristics.
 """
@@ -58,9 +58,10 @@ def _normalized_mechanism(value: str) -> str:
 def build_partner_pool(config: Any, manifest: Any, split: str) -> tuple[PartnerPoolMember, ...]:
     """Build the sole family/stage/seed-stratified partner distribution.
 
-    A family is the pair ``(mechanism, hyperparameter_family)``. Sampling is
-    uniform over families, then stages within a family, then runs (seeds)
-    within a stage. The heuristic family is excluded from training and
+    Sampling is uniform over mechanisms, then hyperparameter families within
+    a mechanism, stages within a family, and runs within a stage.  Adding an
+    OP width family therefore cannot silently increase total OP probability.
+    The heuristic family is excluded from training and
     accepted only in family-disjoint test splits.
     """
 
@@ -129,37 +130,48 @@ def build_partner_pool(config: Any, manifest: Any, split: str) -> tuple[PartnerP
     if not candidates:
         raise ValueError(f"Partner pool split {split_name!r} is empty.")
 
-    families = sorted({(mechanism, hyperparameter_family)
-                       for _, hyperparameter_family, mechanism, _ in candidates})
+    mechanisms = sorted({mechanism for _, _, mechanism, _ in candidates})
     members: list[PartnerPoolMember] = []
-    for mechanism, hyperparameter_family in families:
-        family_rows = [
-            row
-            for row in candidates
-            if row[2] == mechanism and row[1] == hyperparameter_family
-        ]
-        family_stages = sorted({row[3] for row in family_rows})
-        family_id = f"{mechanism}:{hyperparameter_family}"
-        for stage in family_stages:
-            stage_rows = [row for row in family_rows if row[3] == stage]
-            probability = (
-                1.0 / len(families) / len(family_stages) / len(stage_rows)
-            )
-            for run, _, _, _ in stage_rows:
-                members.append(
-                    PartnerPoolMember(
-                        run_id=str(run.run_id),
-                        parent_training_run_id=str(run.parent_training_run_id),
-                        family_id=family_id,
-                        hyperparameter_family=hyperparameter_family,
-                        mechanism=mechanism,
-                        checkpoint_stage=stage,
-                        seed=int(run.seed),
-                        checkpoint=Path(run.checkpoint),
-                        split=split_name,
-                        probability=probability,
-                    )
+    for mechanism in mechanisms:
+        mechanism_families = sorted(
+            {
+                hyperparameter_family
+                for _, hyperparameter_family, row_mechanism, _ in candidates
+                if row_mechanism == mechanism
+            }
+        )
+        for hyperparameter_family in mechanism_families:
+            family_rows = [
+                row
+                for row in candidates
+                if row[2] == mechanism and row[1] == hyperparameter_family
+            ]
+            family_stages = sorted({row[3] for row in family_rows})
+            family_id = f"{mechanism}:{hyperparameter_family}"
+            for stage in family_stages:
+                stage_rows = [row for row in family_rows if row[3] == stage]
+                probability = (
+                    1.0
+                    / len(mechanisms)
+                    / len(mechanism_families)
+                    / len(family_stages)
+                    / len(stage_rows)
                 )
+                for run, _, _, _ in stage_rows:
+                    members.append(
+                        PartnerPoolMember(
+                            run_id=str(run.run_id),
+                            parent_training_run_id=str(run.parent_training_run_id),
+                            family_id=family_id,
+                            hyperparameter_family=hyperparameter_family,
+                            mechanism=mechanism,
+                            checkpoint_stage=stage,
+                            seed=int(run.seed),
+                            checkpoint=Path(run.checkpoint),
+                            split=split_name,
+                            probability=probability,
+                        )
+                    )
     total = sum(member.probability for member in members)
     if abs(total - 1.0) > 1.0e-9:
         raise AssertionError("Static partner-pool probabilities must sum to one.")

@@ -88,6 +88,15 @@ def _validate_final_m1_payload(
         "update",
         "final_checkpoint_condition",
         "model_fingerprint",
+        "deployment_params_fingerprint",
+        "anchor_collection_policy_fingerprint",
+        "continuation_policy_fingerprint",
+        "partner_panel_fingerprint",
+        "fit_key_domain",
+        "evaluation_key_domain",
+        "fresh_final_anchor",
+        "bootstrap_reinitialized_after_deployment_freeze",
+        "bootstrap_training",
         "m1_gate_passed",
         "m1_path_passing_fractions",
         "m1_path_mean_spearman",
@@ -113,6 +122,15 @@ def _validate_final_m1_payload(
         or not history
         or final.get("final_checkpoint_condition") is not True
         or final.get("model_fingerprint") != model_fingerprint
+        or final.get("deployment_params_fingerprint") != model_fingerprint
+        or final.get("anchor_collection_policy_fingerprint") != model_fingerprint
+        or final.get("continuation_policy_fingerprint") != model_fingerprint
+        or final.get("fresh_final_anchor") is not True
+        or final.get("bootstrap_reinitialized_after_deployment_freeze") is not True
+        or not isinstance(final.get("partner_panel_fingerprint"), str)
+        or len(final.get("partner_panel_fingerprint", "")) != 64
+        or not isinstance(final.get("fit_key_domain"), Mapping)
+        or not isinstance(final.get("evaluation_key_domain"), Mapping)
         or not np.isclose(
             float(final.get("m1_spearman_threshold", -1.0)),
             M1_SPEARMAN_THRESHOLD,
@@ -125,6 +143,32 @@ def _validate_final_m1_payload(
         )
     ):
         raise ValueError("Final-checkpoint M1 artifact identity differs.")
+    fit_domain = final["fit_key_domain"]
+    evaluation_domain = final["evaluation_key_domain"]
+    domain_fields = {
+        "name", "root", "lane_key_derivation", "replica_index_range"
+    }
+    if (
+        set(fit_domain) != domain_fields
+        or set(evaluation_domain) != domain_fields
+        or fit_domain["name"] == evaluation_domain["name"]
+        or fit_domain["root"] != evaluation_domain["root"]
+        or fit_domain["lane_key_derivation"]
+        != "fold_in(root,100003),fold_in(replica_index)"
+        or evaluation_domain["lane_key_derivation"]
+        != fit_domain["lane_key_derivation"]
+        or not isinstance(fit_domain["replica_index_range"], list)
+        or not isinstance(evaluation_domain["replica_index_range"], list)
+        or len(fit_domain["replica_index_range"]) != 2
+        or len(evaluation_domain["replica_index_range"]) != 2
+        or int(fit_domain["replica_index_range"][0]) != 0
+        or int(fit_domain["replica_index_range"][1]) <= 0
+        or int(fit_domain["replica_index_range"][1])
+        != int(evaluation_domain["replica_index_range"][0])
+        or int(evaluation_domain["replica_index_range"][1])
+        <= int(evaluation_domain["replica_index_range"][0])
+    ):
+        raise ValueError("Final-checkpoint M1 fit/evaluation key domains overlap.")
     arrays = {
         name: final.get(name)
         for name in (

@@ -202,12 +202,18 @@ def capability_encoder_classes() -> Any:
             next_carry, hidden = nn.GRUCell(
                 features=self.hidden_dim, name="capability_gru"
             )(hidden_carry, projected)
-            candidate = nn.Dense(
-                self.output_dim,
-                kernel_init=orthogonal(0.1),
-                bias_init=zeros,
-                name="capability_output",
-            )(hidden)
+            # The published representation is bounded because its first four
+            # coordinates are directly supervised against registered rolling
+            # observable rates in [-1, 1].  This is not a free prediction head:
+            # the deployable coordinates themselves carry the semantic target.
+            candidate = jnp.tanh(
+                nn.Dense(
+                    self.output_dim,
+                    kernel_init=orthogonal(0.1),
+                    bias_init=zeros,
+                    name="capability_output",
+                )(hidden)
+            )
             next_steps = steps + jnp.asarray(1, dtype=steps.dtype)
             publish = (next_steps % int(CAPABILITY_UPDATE_PERIOD)) == 0
             capability = jnp.where(publish[..., None], candidate, published)

@@ -207,7 +207,7 @@ def test_actual_model_optimizer_update_is_resume_equivalent(tmp_path: Path) -> N
         dones=jnp.zeros((2, 2), dtype=jnp.bool_),
         old_log_probabilities=jnp.full((2, 2), -np.log(6.0)),
         old_values=jnp.zeros((3, 2)),
-        behavior_probabilities=jnp.full((2, 2), 1.0 / 6.0),
+        behavior_probabilities=jnp.full((2, 2, 6), 1.0 / 6.0),
         ppo_mask=jnp.ones((2, 2)),
         partner_sources=jnp.zeros((2, 2), dtype=jnp.int32),
         partner_members=jnp.zeros((2, 2), dtype=jnp.int32),

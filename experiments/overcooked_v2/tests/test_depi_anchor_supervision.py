@@ -13,7 +13,7 @@ from src.path_c.anchor_sampling import (  # noqa: E402
     PAIR_EQUIVALENT,
     PAIR_FRACTION_ORDER,
     classify_matched_pairs,
-    decision_regime_pair_dataset,
+    decision_distinction_pair_dataset,
     fit_pair_comparator,
     mask_supervision_partner_runs,
     manifest_partitioned_candidate_pairs,
@@ -47,36 +47,51 @@ def test_anchor_rows_carry_scientific_identity_returns_and_provenance() -> None:
     assert "partner_codes" not in fields
 
 
-def test_pair_dataset_has_one_label_per_row_and_uses_regime_not_run_identity() -> None:
-    history = np.asarray([[0.0], [0.1], [3.0], [3.1]])
-    regimes = np.asarray([0, 0, 1, 1])
-    rows, labels, blocks = decision_regime_pair_dataset(
-        history, regimes, block_ids=np.asarray([10, 11, 20, 21])
+def test_frozen_comparator_target_is_direct_k_independent_signature_distance() -> None:
+    history = np.asarray([[0.0], [0.1], [2.0], [2.1]])
+    signatures = np.asarray(
+        [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0, 0.0, 0.0, -0.1],
+            [2.0, -2.0, 0.0, 0.0, 0.0, 0.0],
+            [2.1, -2.0, 0.0, 0.0, 0.0, -0.1],
+        ]
+    )
+    rows, labels, blocks = decision_distinction_pair_dataset(
+        history,
+        signatures,
+        signature_distance_threshold=1.0,
+        block_ids=np.asarray([10, 11, 20, 21]),
     )
     assert rows.shape == (6, 2)
     assert labels.shape == blocks.shape == (6,)
-    assert set(labels.tolist()) == {0.0, 1.0}
-    # Changing run labels leaves the scientific target unchanged.
-    _, relabelled, _ = decision_regime_pair_dataset(
-        history, regimes, block_ids=np.asarray([110, 111, 120, 121])
-    )
-    np.testing.assert_array_equal(labels, relabelled)
+    expected = []
+    for left in range(4):
+        for right in range(left + 1, 4):
+            expected.append(float(np.linalg.norm(signatures[left] - signatures[right]) > 1.0))
+    np.testing.assert_array_equal(labels, np.asarray(expected))
 
 
 def _fitted_comparator():
     train_history = np.asarray([[0.0, 0.0], [0.2, 0.1], [3.0, 3.0], [3.2, 3.1]])
-    train_regimes = np.asarray([0, 0, 1, 1])
+    train_signatures = np.asarray([[0.0, 0.0], [0.1, -0.1], [2.0, -2.0], [2.1, -2.1]])
     validation_history = np.asarray(
         [[0.1, -0.1], [0.3, 0.0], [2.9, 3.1], [3.1, 2.9]]
     )
-    validation_regimes = np.asarray([0, 0, 1, 1])
-    train_rows, train_labels, train_blocks = decision_regime_pair_dataset(
-        train_history, train_regimes, block_ids=np.asarray([1, 1, 2, 2])
+    validation_signatures = np.asarray(
+        [[0.0, 0.1], [0.1, 0.0], [1.9, -2.0], [2.0, -2.1]]
+    )
+    train_rows, train_labels, train_blocks = decision_distinction_pair_dataset(
+        train_history,
+        train_signatures,
+        signature_distance_threshold=1.0,
+        block_ids=np.asarray([1, 1, 2, 2]),
     )
     validation_rows, validation_labels, validation_blocks = (
-        decision_regime_pair_dataset(
+        decision_distinction_pair_dataset(
             validation_history,
-            validation_regimes,
+            validation_signatures,
+            signature_distance_threshold=1.0,
             block_ids=np.asarray([3, 3, 4, 4]),
             require_both_classes=True,
         )

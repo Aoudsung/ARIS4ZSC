@@ -47,9 +47,15 @@ class PolicyState(NamedTuple):
 
 
 class ContextOutput(NamedTuple):
-    """METHOD_SPEC §1.4: ContextOutput carries (task_features, u, pi, c)."""
+    """Legal decision context ``(x_t, r_t, u_t, pi_t, c_t)``.
+
+    ``instant_partner`` is computed from the current observation only.  It has
+    no recurrent carry, so current collision/inventory geometry is available
+    without opening a second partner-history path.
+    """
 
     task_features: Any
+    instant_partner: Any
     capability: Any
     protocol_probabilities: Any
     protocol_embedding: Any
@@ -57,6 +63,7 @@ class ContextOutput(NamedTuple):
 
 class ModelOutput(NamedTuple):
     task_features: Any
+    instant_partner: Any
     capability: Any
     protocol_probabilities: Any
     protocol_embedding: Any
@@ -67,6 +74,22 @@ class ModelOutput(NamedTuple):
     raw_q1: Any
     raw_q2: Any
     action_values: Any
+
+
+class ComponentInterventionOutput(NamedTuple):
+    """One-hot ``z=k`` interventions evaluated through the shared heads.
+
+    The component axis is immediately before the action axis.  These values
+    are diagnostics and anchor-supervision targets; component indexes remain
+    exchangeable and are compared across runs only after permutation
+    alignment.
+    """
+
+    protocol_probabilities: Any
+    policy_logits: Any
+    raw_q1: Any
+    raw_q2: Any
+    action_signatures: Any
 
 
 class RolloutBatch(NamedTuple):
@@ -120,6 +143,7 @@ class CounterfactualAnchorBatch(NamedTuple):
     action_mask: Any
     evaluation_returns_by_action: Any = None
     evaluation_replica_count: Any = None
+    fit_replica_returns_by_action: Any = None
 
 
 class QuotientPairBatch(NamedTuple):
@@ -165,7 +189,7 @@ class SeparationTerms(NamedTuple):
 
 
 class TrainState(NamedTuple):
-    """Complete DEPI scientific state (checkpoint schema 5).
+    """Complete DEPI scientific state (checkpoint schema 7).
 
     Every value capable of changing the next outer update is explicit.  Dead
     per-head optimizers, reward-shaping EMAs, synthetic-partner state, and
@@ -218,6 +242,7 @@ class TrainingUpdate(NamedTuple):
 
 __all__ = [
     "CapabilityCarry",
+    "ComponentInterventionOutput",
     "ContextOutput",
     "CounterfactualAnchorBatch",
     "LossBundle",

@@ -1,115 +1,120 @@
 # THEORY：DEPI 的有限理论保证与限制
 
-本文只证明当前实现可由结构与代数直接保证的性质，不把优化成功、泛化或高回报当作定理。
-科学对象和可证伪主张以 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) 为准，算法细节以
+本文只证明由当前结构和代数直接保证的性质。科学对象以
+[`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) 为准，算法以
 [`METHOD_SPEC.md`](METHOD_SPEC.md) 为准。
 
 ## 1. 精确离散滤波
 
-设 `pi` 为 K 维概率向量，sticky transition matrix `T` 每行非负且和为 1，emission
-log-likelihood `ell` 有限。预测与更新为
+若 `pi` 是概率向量、sticky matrix `T` 行随机且严格为正、emission log-likelihood `ell`
+有限，则：
 
 ```text
 pi_bar = pi @ T
-pi_new[k] = exp(log(pi_bar[k]) + ell[k]) / Z
+pi_new = softmax(log(pi_bar)+ell)
 ```
 
-因为 `pi_bar[k] >= 0` 且 `sum_k pi_bar[k]=1`，而 sticky matrix 的每个元素严格为正，所以
-`pi_bar[k]>0`。有限 `ell` 使每个未归一化权重为正，`Z>0`；故 `pi_new` 非负且总和严格为 1。
-这正是一次 Chapman–Kolmogorov prediction 后接一次 Bayes correction。实现若再乘一次 `T`、
-按错误轴归一化或把 `pi_new` 当 logits 再 softmax，便不再是该滤波器。
+中 `pi_bar` 严格为正且和为 1，归一化常数有限为正，所以 `pi_new` 仍是严格正的概率向量。
+这恰好是一次 Chapman–Kolmogorov prediction 后接一次 Bayes correction。重复乘 T、按错误
+轴归一化或把 posterior 再当 logits softmax 都不再是该滤波器。
 
-episode start 使用 uniform prior 并跳过跨 episode emission，因此过去 episode 的观测不可能
-通过 protocol carry 影响新 episode 的 posterior。数值实现使用 log-domain normalization，
-但浮点非有限值仍按正式 failure policy 处理，而非静默重置。
+该定理只相对于注册 response model 成立。固定 T 不依赖 ego action，因此它不能证明主动
+protocol formation；held-out calibration 也只能检验 posterior-predictive distribution。
 
 ## 2. component 置换对称性
 
-对任意 permutation matrix `P`，同时变换
+对 permutation matrix `P` 同时变换：
 
 ```text
-pi' = pi P
-M' = P^T M
-T' = P^T T P
-ell' = ell P
+pi'=pi P, M'=P^T M, T'=P^T T P, ell'=ell P
 ```
 
-则 `c = pi M = pi' M'`，mixture likelihood 和 actor/critic 输入保持不变。正式 sticky matrix
-对所有非对角元素相同，也满足 `T'=T`。因此 component label 不可识别，只有由 empirical
-decision signature 定义的等价类可比较。这给出禁止 raw-index accuracy 和训练期标签对齐的
-理论依据。
+则 `pi M=pi'M'`，mixture likelihood 与 actor/critic 输入不变。对称 sticky T 还满足
+`T'=T`。因此 component index 不可识别；当前 component 只能称 exchangeable response
+regimes，不能声称其 index 是伙伴类型或 value-signature prototype。
 
-## 3. 结构信息隔离保证
+## 3. task 与 instant-partner 通路保证
 
-B1/B2 在 task encoder 之前用固定 channel contract 把 other-agent position、direction 和
-inventory planes 清零。记该投影为 `P_task(o)`，则任意只在这些被遮蔽 planes 上不同的
-`o,o'` 满足 `P_task(o)=P_task(o')`。在相同 task carry 下，确定性 task recurrence 的下一
-carry 与输出必相同。
-
-该保证只覆盖显式 semantic planes 和单步计算图；它不自动证明其余物理 planes 与伙伴行为
-统计独立，也不证明 capability/protocol 路径语义正确。因此仍需 task leakage probe、history
-shuffle 和真实 continuation 控制。B0 故意保留完整当前观测进入 task GRU，用于量化结构隔离
-本身的增量。
-
-## 4. 合法历史与时标
-
-CapabilityEncoder 的证据只由连续 ego observations、ego previous action 和 episode-start
-标志构成，所以按归纳法，其 hidden 与 published `u` 都是 L1–L5 的函数。exact filter 的
-emission target 也只由连续局部 observations 复算，故 posterior `pi` 和 `c` 同样是合法历史
-的函数。伙伴动作仅存在于 simulator transition 内，既不进入模型也不进入 comparator artifact。
-
-每 16 步发布 `u` 只是一个结构时标，不足以推出 `u` 必然表示稳定 capability；`swap-u` 与
-一致性读数负责检验该解释。每步更新 `pi` 也不推出它必然追踪动态 protocol；校准、`swap-c`
-和 recoverable-value 控制负责检验。
-
-## 5. 联合 likelihood 的一致混合
-
-给定 component `z=k`，response target 的条件因子相加得到一个 component-specific
-log-likelihood `log p_k(y)`。随后
+B0–B2 在 task encoder 前应用固定投影 `P_task`，清除显式 other-agent position、direction、
+inventory planes。若 `o,o'` 仅在这些 planes 上不同，则同一 task carry 下：
 
 ```text
-log p(y|H,a) = logsumexp_k(log pi[k] + log p_k(y))
+P_task(o)=P_task(o') => next_task_carry(o)=next_task_carry(o')
 ```
 
-只 marginalize 一次。不可见时屏蔽 position、direction 和 inventory 条件项，visibility
-仍计分，因此不会把“不可见”同时作为 visibility 与任意位置标签重复计算。position、direction、
-inventory 和 event 全部保留相同 K 轴，避免先对各 head 独立混合后拼成不存在的联合模型。
+`r_t=f_instant(o_t^partner)` 的函数签名没有 carry 或历史参数，所以它只能是当前伙伴 planes
+的函数。两点结合给出“当前几何可用、显式伙伴序列不进入 task recurrence”的结构保证。
 
-这只是 proper-likelihood 结构；若模型错设或数据覆盖不足，并不保证 posterior calibration。
+这不保证 task carry 与伙伴历史统计独立。伙伴会合法改变未遮蔽的任务世界，故其后果仍可
+被 `x_t` 记录；task probe 必须以固定 task-state probe 为 baseline，而不能以 chance 为唯一
+失败标准。
 
-## 6. 决策等价与监督
+## 4. 合法历史与 capability 限制
 
-centered empirical signature
+Capability evidence、protocol emission 和 instant geometry 都只由 L1–L5 构造，按归纳法其
+输出仍属于合法 ego history。伙伴动作只存在于 simulator world update，不进入部署图。
+
+每 16 步发布只证明 actor-visible `u` 的数值在窗口内固定，不证明它表示稳定 capability。
+零向量仍是 consistency loss 的可行解，但不再是窗口统计 prediction objective 的最优解；
+variance floor 又惩罚跨发布低方差。由于这些统计只固定前四坐标且受观测条件限制，
+variance/norm/collapse、`swap-u` 和 no-capability 消融仍是必要经验诊断。
+
+## 5. joint likelihood 不重复计数 visibility event
+
+每个 component 先形成完整条件 log-likelihood，再对 K 做一次 logsumexp。position、direction
+和 inventory 只在 current visible 时计分；event 只在 previous/current 都 visible 时计入
+visible inventory change。进入/离开视野只进入 visibility head。因此同一个 visibility
+transition 不会被 visibility 与 event 重复计分。
+
+event head 不读 task features；kinematic head 可读 stopped frame。这防止 response objective
+通过 task trunk 建立旁路，但不保证模型设定正确或 component 一定被利用。
+
+## 6. 决策等价、尺度和精确 KL
+
+centered empirical signature 消除了所有动作共享的 return offset。相同 signature 表示在
+注册 horizon/continuation policy 下动作排序和差值相同，且不要求 partner identity 相同。
+
+one-hot `z=k` 经共享 critic 得到 `S_k`，训练只要求 posterior mixture `sum_k pi_k S_k`
+逼近 empirical signature。这个约束在 component 同时置换时保持不变，所以它建立直接的
+decision coupling，但不能打破 index 不可识别性，也不能单独保证各 component 不合并；后者
+只能由 pairwise divergence、one-hot intervention 与跨 seed permutation alignment 诊断。
+
+用 MAD 和一次正确交付尺度下限归一化后，actor target 对 raw reward 单位变化更稳定；
+top-action stability 和 policy-drift weight 控制 noisy/off-policy anchors，但都不保证非凸优化
+成功。
+
+完整行为分布给出精确：
 
 ```text
-A(H,a) = G(H,a) - mean_b G(H,b)
+KL(pi_old||pi_new)=sum_a pi_old(a)[log pi_old(a)-log pi_new(a)] >= 0
 ```
 
-消除了对所有动作相同的 return offset。若两段历史的 A 相同，则在注册 continuation horizon
-与目标策略下，它们给出相同动作排序和差值，因而对该有限决策问题等价。反之，任一动作差异
-证明存在 decision-relevant distinction。该关系不要求也不允许使用 partner identity。
+有限精度容差外，该量不会像 executed-action Monte Carlo 差那样因抽样而为负。固定一次
+auxiliary transaction 使 response/capability exposure 不随 PPO early stop 改变。
 
-Q-signature fit、排序 hinge 和 actor target KL 使 empirical continuation 标签能够产生决策
-梯度；stop-gradient target 防止 actor 反向改变标签。参数所有权保证 response NLL 不更新 task
-encoder，Q signature 不更新 response decoder，所有 loss 又在同一次 optimizer transaction 的
-同一参数快照上计算。它保证计算语义一致，但不保证非凸优化找到全局最优。
+## 7. 预算与嵌套识别
 
-## 7. 因果归因的必要条件
+B0 与 B1 具有同一 task/instant 接线，B1 只打开 `u,c`；B2 再打开 decision/separation，故
+`B1-B0`、`B2-B1` 分别对应注册增量。R0 的完整 task history 是外部 reference，不能把
+`R0->B1` 当单组件差。
 
-随机化、容量和 key 匹配的 B0–B2 增量可排除已注册的预算与容量混杂；同状态 CRN history
-shuffle 和 context swap 可降低环境噪声；G1–G4 可区分“环境中没有可恢复信号”和“模型未恢复
-信号”。这些条件共同支持有限范围的机制归因，但仍依赖伙伴 panel、状态匹配质量、continuation
-horizon 和统计功效。它们不是对所有未知伙伴的普遍因果定理。
+core matrix 匹配主 PPO transitions，回答额外监督是否有用；R0-extra/B0-extra/B1-extra 以普通 PPO 精确
+替换 B2 的额外 simulator cost，回答相同总交互下是否优于更多数据。两种 estimand 不可混写。
 
-## 8. 明确不作的保证
+## 8. 因果读数与 G4 边界
 
-当前方法不保证：
+source-world context value 比较的是同一实际世界中两种 action distributions 在同一
+all-action value vector 上的差，避免要求 donor context 在 source partner 下仍保持 donor
+世界语义。它仍依赖 task-state matching、positivity、continuation horizon 和 panel 覆盖，
+不是普遍因果定理。
 
-- component 与人类可命名协议一一对应；
-- posterior 在未通过 held-out gate 前已校准；
-- response event 等价于意图；
-- 更低 response NLL 必然提高回报；
-- B2 必然优于 B0/B1 或任何正式基线；
-- B3 的主动信息价值已经实现。
+G4 在 noisy fit replicas 上选择动作、在独立 replicas 上评估。cross-fitting 降低同样本选择
+偏差，但不能保证 G4≥G1。recoverable ratio 只有在 run-level denominator bootstrap LCB 达
+阈值时可估；否则必须输出 not estimable。
 
-这些都是实验问题；反例必须按 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 原样报告。
+## 9. 明确不保证
+
+当前方法不保证 component 有人类可命名语义、posterior 在未通过 gate 前已校准、`u` 在所有
+未见分布上都不坍缩、
+response NLL 改善必然提高回报、B2 优于 R0/B0/B1/extra controls，或 B3 已实现。所有反例和
+失败节点必须按 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 原样报告。

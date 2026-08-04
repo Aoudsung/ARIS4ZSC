@@ -1,8 +1,8 @@
 """One low-rank continuously context-conditioned coordination actor.
 
 METHOD_SPEC §1.3: the actor interface is ``(task_features, context)`` with
-``context = concat(u, c_t)`` (32 dimensions).  Low-rank modulation is kept:
-``task_basis(x) ⊙ context_gain(concat(u, c))``.  Still a single actor for all
+``context = concat(r_t, u, c_t)``.  Low-rank modulation is kept:
+``task_basis(x) ⊙ context_gain(concat(r, u, c))``.  Still a single actor for all
 partner types/sources.
 """
 

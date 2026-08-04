@@ -76,7 +76,21 @@ def test_pool_is_uniform_by_family_then_stage_and_run() -> None:
         )
         for family in ("sp:default", "op:default", "op:wide-a", "op:wide-b")
     }
-    assert family_mass == pytest.approx({family: 0.25 for family in family_mass})
+    assert family_mass == pytest.approx(
+        {
+            "sp:default": 0.5,
+            "op:default": 1.0 / 6.0,
+            "op:wide-a": 1.0 / 6.0,
+            "op:wide-b": 1.0 / 6.0,
+        }
+    )
+    mechanism_mass = {
+        mechanism: sum(
+            member.probability for member in members if member.mechanism == mechanism
+        )
+        for mechanism in ("sp", "op")
+    }
+    assert mechanism_mass == pytest.approx({"sp": 0.5, "op": 0.5})
     assert all(member.split == "train" and member.checkpoint is not None for member in members)
 
 

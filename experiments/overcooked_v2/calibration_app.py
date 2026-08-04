@@ -39,7 +39,6 @@ from experiments.overcooked_v2.official_adapter import (
 )
 from src.path_c.protocol_mixture import mixture_summary
 from src.path_c.calibration import (
-    calibration_pass_decision,
     event_brier_score,
     highest_probability_set_coverage,
     per_step_log_score,
@@ -47,7 +46,6 @@ from src.path_c.calibration import (
     uniform_prior_log_score,
 )
 from src.path_c.experiment import (
-    ENGINEERING_SEED_INDEX,
     METHOD_VERSION,
     OFFICIAL_PROTOCOL_VERSION,
     OFFICIAL_SOURCE_COMMIT,
@@ -83,11 +81,11 @@ _MECHANISM_ALIASES = {
     "fcp": "fcp",
 }
 def _owned_calibration_runs(manifest: Any, seed_index: int) -> tuple[Any, ...]:
-    owner = None if int(seed_index) == ENGINEERING_SEED_INDEX else int(seed_index)
+    del seed_index
     return tuple(
         run
         for run in manifest.by_role("calibration")
-        if run.owner_seed_index == owner
+        if run.owner_seed_index is None
     )
 
 
@@ -211,6 +209,7 @@ def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any
     )
     sliced = ContextOutput(
         context.task_features[:-1],
+        context.instant_partner[:-1],
         context.capability[:-1],
         context.protocol_probabilities[:-1],
         context.protocol_embedding[:-1],
@@ -222,6 +221,7 @@ def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any
     )
     no_history_context = ContextOutput(
         task_features=sliced.task_features,
+        instant_partner=sliced.instant_partner,
         capability=jnp.zeros_like(sliced.capability),
         protocol_probabilities=uniform,
         protocol_embedding=mixture_summary(uniform, component_matrix),
@@ -453,6 +453,50 @@ def _run_level_summary(
     )
 
 
+def _run_level_contrast_intervals(
+    episode_matrices: list[np.ndarray],
+    *,
+    bootstrap_replicates: int,
+    seed: int,
+    brier_ratio: float,
+) -> Mapping[str, list[float]]:
+    """Paired run/episode bootstrap intervals used by the registered gate."""
+
+    indexes = {name: index for index, name in enumerate(_METRIC_NAMES)}
+    rng = np.random.default_rng(int(seed))
+    draws = np.empty((int(bootstrap_replicates), 3), dtype=np.float64)
+    for replicate in range(int(bootstrap_replicates)):
+        selected_runs = rng.integers(
+            0, len(episode_matrices), size=len(episode_matrices)
+        )
+        sampled = []
+        for run_index in selected_runs:
+            episodes = episode_matrices[int(run_index)]
+            selected_episodes = rng.integers(
+                0, episodes.shape[0], size=episodes.shape[0]
+            )
+            sampled.append(episodes[selected_episodes].mean(axis=0))
+        mean = np.mean(sampled, axis=0)
+        draws[replicate] = (
+            mean[indexes["log_score"]]
+            - mean[indexes["uniform_baseline_log_score"]],
+            mean[indexes["log_score"]]
+            - mean[indexes["no_history_baseline_log_score"]],
+            mean[indexes["event_brier"]]
+            - float(brier_ratio) * mean[indexes["prior_baseline_brier"]],
+        )
+    low, high = np.quantile(draws, (0.025, 0.975), axis=0)
+    names = (
+        "log_score_minus_uniform",
+        "log_score_minus_no_history",
+        "event_brier_minus_registered_baseline",
+    )
+    return {
+        name: [float(lo), float(hi)]
+        for name, lo, hi in zip(names, low, high, strict=True)
+    }
+
+
 def run_posterior_calibration(args: argparse.Namespace) -> None:
     import jax
     import jax.numpy as jnp
@@ -469,6 +513,11 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
         verify_files=not bool(args.skip_manifest_hash_check),
     )
     runs = _owned_calibration_runs(manifest, int(args.seed_index))
+    maximum_runs = getattr(args, "maximum_runs", None)
+    if maximum_runs is not None:
+        if config.run_kind != "mechanical":
+            raise ValueError("Calibration run limiting is mechanical-only.")
+        runs = runs[: int(maximum_runs)]
     _validate_calibration_runs(runs, formal=config.run_kind == "formal")
     calibration = config.posterior_calibration
     if len(runs) < calibration.minimum_run_count:
@@ -523,59 +572,52 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
         }
         row.update({key: float(value) for key, value in metrics.items()})
         table.append(row)
-    aggregate, run_bootstrap_ci = _run_level_summary(
-        [
+    episode_matrices = [
             _episode_metric_matrix(
                 payload, credibility=float(calibration.credibility)
             )
             for payload in payloads
-        ],
+        ]
+    aggregate, run_bootstrap_ci = _run_level_summary(
+        episode_matrices,
         bootstrap_replicates=int(calibration.bootstrap_replicates),
         seed=int(calibration.bootstrap_seed),
+    )
+    contrast_ci = _run_level_contrast_intervals(
+        episode_matrices,
+        bootstrap_replicates=int(calibration.bootstrap_replicates),
+        seed=int(calibration.bootstrap_seed) + 1,
+        brier_ratio=float(calibration.brier_ratio),
     )
     pooled_descriptive = _aggregate_metrics(
         payloads, credibility=float(calibration.credibility)
     )
     pass_flags = {
         "log_score_vs_uniform": bool(
-            aggregate["log_score"]
-            <= aggregate["uniform_baseline_log_score"]
-            - float(calibration.log_score_margin)
+            contrast_ci["log_score_minus_uniform"][1]
+            <= -float(calibration.log_score_margin)
         ),
         "log_score_vs_no_history": bool(
-            aggregate["log_score"]
-            <= aggregate["no_history_baseline_log_score"]
-            - float(calibration.log_score_margin)
+            contrast_ci["log_score_minus_no_history"][1]
+            <= -float(calibration.log_score_margin)
         ),
         "position_coverage_in_band": bool(
-            float(calibration.coverage_low)
-            <= aggregate["coverage_position"]
+            run_bootstrap_ci["coverage_position"][0]
             <= float(calibration.coverage_high)
+            and run_bootstrap_ci["coverage_position"][1]
+            >= float(calibration.coverage_low)
         ),
         "direction_coverage_in_band": bool(
-            float(calibration.coverage_low)
-            <= aggregate["coverage_direction"]
+            run_bootstrap_ci["coverage_direction"][0]
             <= float(calibration.coverage_high)
+            and run_bootstrap_ci["coverage_direction"][1]
+            >= float(calibration.coverage_low)
         ),
         "event_brier": bool(
-            aggregate["event_brier"]
-            <= float(calibration.brier_ratio)
-            * aggregate["prior_baseline_brier"]
+            contrast_ci["event_brier_minus_registered_baseline"][1] <= 0.0
         ),
     }
-    overall_pass = calibration_pass_decision(
-        model_log_score=aggregate["log_score"],
-        uniform_baseline_log_score=aggregate["uniform_baseline_log_score"],
-        no_history_baseline_log_score=aggregate["no_history_baseline_log_score"],
-        position_coverage=aggregate["coverage_position"],
-        direction_coverage=aggregate["coverage_direction"],
-        event_brier=aggregate["event_brier"],
-        prior_baseline_brier=aggregate["prior_baseline_brier"],
-        log_score_margin=float(calibration.log_score_margin),
-        coverage_low=float(calibration.coverage_low),
-        coverage_high=float(calibration.coverage_high),
-        brier_ratio=float(calibration.brier_ratio),
-    )
+    overall_pass = bool(all(pass_flags.values()))
     ledger = ResourceLedger(calibration_steps=attempted)
     config_path = Path(args.config).resolve()
     manifest_path = Path(args.partner_manifest).resolve()
@@ -592,6 +634,7 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
             "method": METHOD_VERSION,
             "method_variant": config.method_variant,
             "layout": config.environment.layout,
+            "scientific_readout_allowed": config.run_kind == "formal",
             "official_protocol_version": OFFICIAL_PROTOCOL_VERSION,
             "official_source_commit": OFFICIAL_SOURCE_COMMIT,
             "config_fingerprint": config.fingerprint,
@@ -640,6 +683,7 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
             },
             "aggregate": aggregate,
             "run_bootstrap_95_ci": run_bootstrap_ci,
+            "run_bootstrap_contrast_95_ci": contrast_ci,
             "pooled_descriptive": pooled_descriptive,
             "pass": {**pass_flags, "overall": bool(overall_pass)},
             "runs": table,
@@ -653,7 +697,8 @@ def run_posterior_calibration(args: argparse.Namespace) -> None:
             "partner_run_blocks": len(runs),
             "calibration_rows": len(table),
             "wall_seconds": time.perf_counter() - started,
-            "scientific_readout": True,
+            "scientific_readout": config.run_kind == "formal",
+            "scientific_readout_allowed": config.run_kind == "formal",
             "calibration_pass": bool(overall_pass),
             "note": (
                 "METHOD_SPEC §2.4 held-out calibration readout; failure "

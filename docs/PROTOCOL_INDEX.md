@@ -7,8 +7,8 @@
 
 1. [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md)：问题定义、L1–L5 合法信息边界、estimand、
    因果链与 falsifiers。
-2. [`METHOD_SPEC.md`](METHOD_SPEC.md)：B0–B2 可执行结构、exact filter、joint likelihood、
-   训练目标、anchor、M1、calibration、静态伙伴池和部署状态。
+2. [`METHOD_SPEC.md`](METHOD_SPEC.md)：R0/B0–B2 嵌套结构、机制消融、capability 防坍缩、
+   component 干预诊断、exact filter、anchor、M1、calibration 和部署状态。
 3. [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md)：Official/Common-Partner 矩阵、统计单位、门限
    与机制控制。
 4. [`FORMAL_EXPERIMENT_PROTOCOL.md`](FORMAL_EXPERIMENT_PROTOCOL.md)：正式软件、硬件、seed、
@@ -17,8 +17,8 @@
 ## 理论与研究执行
 
 - [`THEORY.md`](THEORY.md)：可由当前结构证明的有限保证及不作出的保证。
-- [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md)：B0–B2 × K sensitivity
-  的运行和 paired artifact 合同。
+- [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md)：嵌套 core、总预算对照、
+  六项机制消融、K sensitivity 与 raw-evaluator/component-diagnostic artifact 合同。
 - [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md)：正式
   inference 与 claim gate 的预注册摘要。
 - [`RESEARCH_PROGRAM.md`](RESEARCH_PROGRAM.md)：当前阶段、下一决策点和停止规则；只链接注册

@@ -25,6 +25,7 @@ from experiments.overcooked_v2.deployment import (
     export_deployment_bundle,
     load_deployment,
 )
+from experiments.overcooked_v2.comparator_app import load_frozen_pair_comparator
 from experiments.overcooked_v2.official_adapter import (
     FrozenPartnerPool,
     VectorEnvironment,
@@ -44,6 +45,7 @@ from src.path_c.compiled_kernels import (
     build_training_kernels,
     configure_persistent_compilation_cache,
 )
+from src.path_c.component_diagnostics import component_intervention_summary
 from src.path_c.experiment import (
     CONFIG_VERSION,
     CHECKPOINT_SCHEMA_VERSION,
@@ -98,6 +100,8 @@ from src.path_c.storage import (
     write_jsonl,
 )
 from src.path_c.training import (
+    ANCHOR_VARIANTS,
+    SEPARATION_VARIANTS,
     adapt_effective_update_epochs,
     environment_minibatch_schedule,
     make_optimizer,
@@ -259,7 +263,7 @@ def _fingerprint_words(tree: Any) -> np.ndarray:
 def _empty_supervision_payload(
     *, config: Any, observation_shape: tuple[int, ...]
 ) -> tuple[Any, Any, FrozenPairComparator]:
-    """Fixed-shape inactive values used by checkpoint schema 5."""
+    """Fixed-shape inactive values used by checkpoint schema 7."""
 
     import jax.numpy as jnp
 
@@ -301,6 +305,10 @@ def _empty_supervision_payload(
         action_mask=jnp.zeros((anchor_count, 6), dtype=jnp.bool_),
         evaluation_returns_by_action=jnp.zeros_like(zeros_action),
         evaluation_replica_count=jnp.zeros((anchor_count, 6), dtype=jnp.int32),
+        fit_replica_returns_by_action=jnp.zeros(
+            (anchor_count, 6, int(config.anchors.fit_replicas)),
+            dtype=jnp.float32,
+        ),
     )
     pair_policy = jax_tree_take(policy, pair_count)
     separation = SeparationTerms(
@@ -734,11 +742,23 @@ def run_training(args: argparse.Namespace) -> None:
     scope = str(getattr(args, "_execution_scope", "training"))
     preflight = scope == CUDA_PREFLIGHT_SCOPE
     config = load_config(args.config, run_kind=args.run_kind)
-    # Every B0--B2 run spends the same registered anchor-continuation
-    # simulator budget.  Only B2 is allowed to turn those measurements into
-    # decision supervision; B0/B1 collect them as compute/budget controls.
-    anchor_enabled = bool(config.anchors.enabled)
-    decision_supervision_enabled = config.method_variant == "b2"
+    anchor_supervision_enabled = config.method_variant in ANCHOR_VARIANTS
+    separation_supervision_enabled = config.method_variant in SEPARATION_VARIANTS
+    # Counterfactual continuations are collected only by B2 and the registered
+    # decision-mechanism ablations. R0/B0/B1 never collect and discard them.
+    anchor_enabled = bool(config.anchors.enabled) and anchor_supervision_enabled
+    pair_comparator_path = getattr(args, "pair_comparator", None)
+    if (
+        anchor_supervision_enabled
+        and config.run_kind in {"development", "formal"}
+        and not preflight
+        and not pair_comparator_path
+    ):
+        raise ValueError(
+            "Registered anchor-supervised development/formal training requires a frozen "
+            "--pair-comparator artifact fitted before ego training."
+        )
+    pretrained_comparator = bool(pair_comparator_path)
     cuda_toolchain = None
     if config.run_kind == "formal" or os.environ.get("DEPI_REQUIRE_CUDA") == "1":
         cuda_toolchain = configure_bundled_cuda_toolchain()
@@ -761,6 +781,7 @@ def run_training(args: argparse.Namespace) -> None:
     )
     validate_seed_training_manifest(
         manifest,
+        config=config,
         owner_seed_index=int(args.seed_index),
         formal=(config.run_kind == "formal" and not preflight),
     )
@@ -801,6 +822,14 @@ def run_training(args: argparse.Namespace) -> None:
             "model_structure_fingerprint": structure_fingerprint,
             "compilation_cache": cache,
             "scientific_readout_allowed": False,
+            "frozen_pair_comparator": (
+                None
+                if not pair_comparator_path
+                else {
+                    "path": str(Path(pair_comparator_path).resolve()),
+                    "sha256": sha256_path(Path(pair_comparator_path).resolve()),
+                }
+            ),
         }
     )
     ensure_run_identity(output, identity)
@@ -818,8 +847,16 @@ def run_training(args: argparse.Namespace) -> None:
     owner_pool = _pool(owner_runs)
     support_manifest = type(manifest)(manifest.layout, support_runs)
     support_members = build_partner_pool(config, support_manifest, "train")
-    comparator_fit_runs = tuple(manifest.by_role("comparator_fit"))
-    comparator_validation_runs = tuple(manifest.by_role("comparator_validation"))
+    comparator_fit_runs = (
+        tuple(manifest.by_role("comparator_fit"))
+        if anchor_supervision_enabled and not pretrained_comparator
+        else ()
+    )
+    comparator_validation_runs = (
+        tuple(manifest.by_role("comparator_validation"))
+        if anchor_supervision_enabled and not pretrained_comparator
+        else ()
+    )
     comparator_fit_members = (
         build_partner_pool(config, manifest, "comparator_fit")
         if comparator_fit_runs
@@ -891,7 +928,7 @@ def run_training(args: argparse.Namespace) -> None:
         output / "partner_pool.json",
         {
             "split": "train",
-            "sampling": "family_then_stage_then_seed_uniform",
+            "sampling": "mechanism_then_family_then_stage_then_run_uniform",
             "comparator_lane_allocation_before_freeze": (
                 {"support": "6/8", "comparator_fit": "1/8", "comparator_validation": "1/8"}
                 if comparator_fit_members
@@ -942,6 +979,7 @@ def run_training(args: argparse.Namespace) -> None:
         observation_shape=observation_shape,
         action_count=6,
         task_hidden_dim=config.model.task_hidden_dim,
+        instant_partner_dim=config.model.instant_partner_dim,
         capability_hidden_dim=config.model.capability_hidden_dim,
         capability_dim=config.model.capability_dim,
         protocol_components=config.model.protocol_components,
@@ -977,7 +1015,7 @@ def run_training(args: argparse.Namespace) -> None:
     bootstrap_params: Any = ()
     bootstrap_optimizer_states: Any = ()
     bootstrap_sampling_counters = jnp.zeros((0,), dtype=jnp.int32)
-    if anchor_enabled and decision_supervision_enabled:
+    if anchor_enabled and anchor_supervision_enabled:
         (
             bootstrap_models,
             bootstrap_params,
@@ -989,9 +1027,12 @@ def run_training(args: argparse.Namespace) -> None:
             example_observation=initial_observations[:, 0],
             action_count=6,
         )
-    total_updates = config.training.environment_steps // (
+    rollout_transition_count = (
         config.environment.num_envs * config.training.rollout_length
     )
+    total_updates = (
+        config.training.environment_steps + rollout_transition_count - 1
+    ) // rollout_transition_count
 
     new_run = not bool(args.resume)
     if new_run:
@@ -1102,6 +1143,11 @@ def run_training(args: argparse.Namespace) -> None:
     ) = _empty_supervision_payload(
         config=config, observation_shape=observation_shape
     )
+    if pair_comparator_path:
+        empty_pair_comparator = load_frozen_pair_comparator(
+            pair_comparator_path,
+            expected_history_feature_dim=int(empty_pair_comparator.history_feature_dim),
+        )
     template = TrainState(
         params=params,
         target_params=jax.tree_util.tree_map(jnp.copy, params),
@@ -1175,7 +1221,7 @@ def run_training(args: argparse.Namespace) -> None:
     # terms supervise every combined-loss update until the next anchor trigger
     # refreshes them; both stay None while anchors are disabled.
     supervision_active = (
-        decision_supervision_enabled
+        anchor_supervision_enabled
         and int(np.asarray(state.anchor_sampling_counter)) > 0
     )
     supervision_anchors = (
@@ -1221,8 +1267,31 @@ def run_training(args: argparse.Namespace) -> None:
             state.effective_environment_steps,
             horizon=config.upstream.reward_shaping_horizon,
         )
-        anchor_trigger = anchor_enabled and update % config.anchors.interval_updates == 0
-        rollout_kernel = kernels.rollout_anchor_full if anchor_trigger else kernels.rollout_minimal
+        remaining_environment_steps = config.training.environment_steps - int(
+            np.asarray(state.effective_environment_steps)
+        )
+        if remaining_environment_steps <= 0:
+            raise RuntimeError("Training loop exceeded the configured PPO transition budget.")
+        rollout_step_count = min(
+            rollout_transition_count, remaining_environment_steps
+        )
+        if rollout_step_count % config.environment.num_envs:
+            raise RuntimeError("PPO transition budget does not contain whole vector steps.")
+        tail_rollout = rollout_step_count != rollout_transition_count
+        anchor_trigger = (
+            anchor_enabled
+            and not tail_rollout
+            and update % config.anchors.interval_updates == 0
+        )
+        rollout_kernel = (
+            kernels.rollout_tail
+            if tail_rollout
+            else (
+                kernels.rollout_anchor_full
+                if anchor_trigger
+                else kernels.rollout_minimal
+            )
+        )
         (rollout_result, elapsed) = _phase(
             output,
             name="rollout",
@@ -1297,11 +1366,11 @@ def run_training(args: argparse.Namespace) -> None:
             )
             phase_times["counterfactual_anchor"] = elapsed
             anchors, quotient_pairs, anchor_budget, next_pair_comparator = anchor_result
-            supervision_anchors = anchors if decision_supervision_enabled else None
+            supervision_anchors = anchors if anchor_supervision_enabled else None
             supervision_separation = None
             supervision_readings = dict(state.supervision_readings)
             if (
-                decision_supervision_enabled
+                separation_supervision_enabled
                 and quotient_pairs.comparator_distinct_probability is not None
             ):
                 # §5.3 -> §3.2: matched-pair classification feeds L_separation.
@@ -1324,7 +1393,7 @@ def run_training(args: argparse.Namespace) -> None:
                     ),
                     margin_scale=float(config.loss_v2.separation_margin_scale),
                 )
-            if decision_supervision_enabled:
+            if anchor_supervision_enabled:
                 (
                     bootstrap_params,
                     bootstrap_optimizer_states,
@@ -1444,8 +1513,10 @@ def run_training(args: argparse.Namespace) -> None:
             next_pair_comparator = state.current_pair_comparator
 
         completed_steps = int(np.asarray(runner.effective_environment_steps))
+        if completed_steps != int(np.asarray(state.effective_environment_steps)) + rollout_step_count:
+            raise RuntimeError("Rollout accounting differs from the configured vector-step budget.")
         ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
-            ego_policy_steps=config.environment.num_envs * config.training.rollout_length,
+            ego_policy_steps=rollout_step_count,
             counterfactual_continuation_steps=int(
                 anchor_budget["counterfactual_continuation_steps"]
             ),
@@ -1583,16 +1654,154 @@ def run_training(args: argparse.Namespace) -> None:
             # a second final evaluation or exhaust the fixed checkpoint ledger.
             final_m1_payload = existing_final
     if (
-        decision_supervision_enabled
+        anchor_supervision_enabled
         and int(np.asarray(state.anchor_sampling_counter)) > 0
         and final_m1_payload is None
     ):
+        # Final M1 is a fresh, final-policy measurement.  It never reuses the
+        # last training anchor, target-policy continuation, or trained
+        # bootstrap members.
+        final_anchor_root = jax.random.fold_in(
+            jnp.asarray(domains["audit_anchor"], dtype=jnp.uint32),
+            int(np.asarray(state.update_count)),
+        )
+        final_partner_parameters = jnp.asarray(
+            int(state.current_pair_comparator.development_row_count) > 0,
+            dtype=jnp.bool_,
+        )
+        final_rollout_runner, final_rollout_batch, final_records = (
+            kernels.rollout_anchor_full(
+                state.runner_state,
+                state.params,
+                state.params,
+                final_partner_parameters,
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jax.random.fold_in(final_anchor_root, 1),
+                jnp.asarray(0.0, dtype=jnp.float32),
+            )
+        )
+        del final_rollout_runner, final_rollout_batch
+        if anchor_microbatch is None:
+            anchor_microbatch = preflight_anchor_microbatch_from_records(
+                records=final_records,
+                target_params=state.params,
+                partner_parameters=final_partner_parameters,
+                config=config,
+                chunk_kernel=anchor_kernel,
+                key=jax.random.fold_in(final_anchor_root, 2),
+            )
+        (
+            final_anchors,
+            unused_final_pairs,
+            final_anchor_budget,
+            unused_final_comparator,
+        ) = collect_anchor_batch(
+            anchor_domain=int(np.asarray(state.update_count)) + 1,
+            key=jax.random.fold_in(final_anchor_root, 3),
+            records=final_records,
+            environment=environment,
+            model=model,
+            target_params=state.params,
+            config=config,
+            partner_functions=partner_functions,
+            partner_parameters=final_partner_parameters,
+            collection_update=int(np.asarray(state.update_count)),
+            target_fingerprint=jnp.asarray(
+                _fingerprint_words(state.params), dtype=jnp.uint32
+            ),
+            microbatch_size=anchor_microbatch,
+            anchor_functions=anchor_functions,
+            chunk_kernel=anchor_kernel,
+            frozen_comparator=state.current_pair_comparator,
+        )
+        del unused_final_pairs, unused_final_comparator
+        _, final_component_output = model.apply(
+            {"params": state.params},
+            final_anchors.policy_states,
+            final_anchors.observations,
+            method=model.component_intervention_step,
+        )
+        component_summary = component_intervention_summary(
+            action_signatures=final_component_output.action_signatures,
+            policy_logits=final_component_output.policy_logits,
+            protocol_probabilities=(
+                final_component_output.protocol_probabilities
+            ),
+        )
+        from src.path_c.response_targets import (
+            pairwise_component_response_divergence,
+        )
+
+        response_divergences = []
+        for action in range(6):
+            _, response_intervention = model.apply(
+                {"params": state.params},
+                final_anchors.policy_states,
+                final_anchors.observations,
+                jnp.full(
+                    final_anchors.observations.shape[0],
+                    action,
+                    dtype=jnp.int32,
+                ),
+                method=model.response_intervention_step,
+            )
+            response_divergences.append(
+                pairwise_component_response_divergence(response_intervention)
+            )
+        component_summary = {
+            **component_summary,
+            "mean_pairwise_response_divergence_all_actions": float(
+                np.asarray(jnp.mean(jnp.stack(response_divergences)))
+            ),
+        }
+        write_json(
+            output / "records" / "final_component_diagnostics.json",
+            {
+                "version": 1,
+                "artifact_type": "depi_exchangeable_response_regime_diagnostics",
+                "method": METHOD_VERSION,
+                "method_variant": config.method_variant,
+                "seed_index": int(args.seed_index),
+                "protocol_components": int(config.model.protocol_components),
+                "model_fingerprint": final_model_fingerprint,
+                "fresh_final_policy_anchors": True,
+                "one_hot_component_intervention": True,
+                "component_indexes_are_exchangeable": True,
+                "anchor_ids": _host(final_anchors.anchor_ids),
+                **component_summary,
+            },
+        )
+        (
+            final_bootstrap_models,
+            final_bootstrap_params,
+            final_bootstrap_states,
+            final_bootstrap_counters,
+        ) = initialize_bootstrap_value_ensemble(
+            key=jax.random.fold_in(final_anchor_root, 4),
+            example_policy_state=final_anchors.policy_states,
+            example_observation=final_anchors.observations,
+            action_count=6,
+        )
+        (
+            final_bootstrap_params,
+            unused_final_bootstrap_states,
+            unused_final_bootstrap_counters,
+            final_bootstrap_metrics,
+        ) = train_bootstrap_value_ensemble(
+            models=final_bootstrap_models,
+            params=final_bootstrap_params,
+            optimizer_states=final_bootstrap_states,
+            sampling_counters=final_bootstrap_counters,
+            anchors=final_anchors,
+            key=jax.random.fold_in(final_anchor_root, 5),
+        )
+        del unused_final_bootstrap_states, unused_final_bootstrap_counters
         final_gate = evaluate_m1_gate_on_anchor_batch(
             model=model,
             params=state.params,
-            bootstrap_models=bootstrap_models,
-            bootstrap_params=state.bootstrap_encoder_params,
-            anchors=state.supervision_anchor_batch,
+            bootstrap_models=final_bootstrap_models,
+            bootstrap_params=final_bootstrap_params,
+            anchors=final_anchors,
             spearman_threshold=float(config.anchors.m1_spearman_threshold),
             minimum_anchor_fraction=float(config.anchors.m1_minimum_anchor_fraction),
         )
@@ -1600,6 +1809,31 @@ def run_training(args: argparse.Namespace) -> None:
             "update": int(np.asarray(state.update_count)),
             "final_checkpoint_condition": True,
             "model_fingerprint": final_model_fingerprint,
+            "deployment_params_fingerprint": final_model_fingerprint,
+            "anchor_collection_policy_fingerprint": final_model_fingerprint,
+            "continuation_policy_fingerprint": final_model_fingerprint,
+            "partner_panel_fingerprint": sha256_path(
+                Path(args.partner_manifest).resolve()
+            ),
+            "fit_key_domain": {
+                "name": "audit_anchor/final_fit",
+                "root": [int(value) for value in np.asarray(final_anchor_root)],
+                "lane_key_derivation": "fold_in(root,100003),fold_in(replica_index)",
+                "replica_index_range": [0, int(config.anchors.fit_replicas)],
+            },
+            "evaluation_key_domain": {
+                "name": "audit_anchor/final_evaluation",
+                "root": [int(value) for value in np.asarray(final_anchor_root)],
+                "lane_key_derivation": "fold_in(root,100003),fold_in(replica_index)",
+                "replica_index_range": [
+                    int(config.anchors.fit_replicas),
+                    int(config.anchors.fit_replicas)
+                    + int(config.anchors.evaluation_replicas),
+                ],
+            },
+            "fresh_final_anchor": True,
+            "bootstrap_reinitialized_after_deployment_freeze": True,
+            "bootstrap_training": _host(final_bootstrap_metrics),
             **m1_gate_report(final_gate),
         }
         final_history_index = int(np.asarray(state.m1_summary_state["evaluations"]))
@@ -1608,13 +1842,7 @@ def run_training(args: argparse.Namespace) -> None:
             index=final_history_index,
             update=int(np.asarray(state.update_count)),
             result=final_gate,
-            bootstrap_training_metrics={
-                # This is an evaluation-only row; no bootstrap optimization is
-                # performed after the final policy update.  Keep the fixed
-                # checkpoint state finite and record that fact explicitly in
-                # the enclosing final payload instead of using NaN sentinels.
-                "bootstrap_training_loss": jnp.zeros((3,), dtype=jnp.float32)
-            },
+            bootstrap_training_metrics=final_bootstrap_metrics,
             supervision_readings=state.supervision_readings,
         )
         state = state._replace(
@@ -1623,6 +1851,15 @@ def run_training(args: argparse.Namespace) -> None:
                 "latest_passed": final_gate.passed,
             },
             m1_history=final_history,
+            resource_ledger=ResourceLedger.from_mapping(state.resource_ledger)
+            .plus(
+                evaluation_steps=(
+                    config.environment.num_envs * config.training.rollout_length
+                    + int(final_anchor_budget["counterfactual_continuation_steps"])
+                    + int(final_anchor_budget["matched_pair_probe_steps"])
+                )
+            )
+            .to_mapping(),
         )
         m1_history = _m1_history_records(
             final_history,
@@ -1674,7 +1911,7 @@ def run_training(args: argparse.Namespace) -> None:
         params=state.params,
         anchors=(
             state.supervision_anchor_batch
-            if decision_supervision_enabled
+            if anchor_supervision_enabled
             and int(np.asarray(state.anchor_sampling_counter)) > 0
             else None
         ),

@@ -8,9 +8,9 @@ The decoder implements the per-component likelihood
 * Kinematic components 1-4 (visibility, relative position, direction,
   inventory) read the stop-gradient frame feature ``sg[frame_t]`` -- predicting
   kinematics requires a coordinate frame -- plus ``(m_k, u, a^ego)``.
-* Component 5 (observable interaction event) reads ``(sg[x_t], m_k, u,
-  a^ego)``.  The stopped task state supplies physical feasibility without
-  allowing the likelihood loss to update or bypass the isolated task trunk.
+* Component 5 (observable interaction event) reads only ``(m_k, u, a^ego)``.
+  It cannot bypass the isolated task trunk or let task-state consequences
+  dominate the response-regime likelihood.
 
 All five heads emit a trailing ``K`` component axis so that
 ``response_targets.mixture_response_loss`` can form the proper mixture NLL
@@ -68,7 +68,6 @@ def response_decoder_class() -> Any:
         def __call__(
             self,
             frame_features: Any,
-            task_features: Any,
             component_embeddings: Any,
             capability: Any,
             actions: Any,
@@ -78,7 +77,6 @@ def response_decoder_class() -> Any:
             Args:
                 frame_features: ``sg[frame_t]``; the caller applies
                     stop-gradient.  Any spatial axes are flattened.
-                task_features: ``sg[x_t]`` physical task-state condition.
                 component_embeddings: matrix ``(K, D)`` of protocol component
                     embeddings ``m_k``.
                 capability: partner capability embedding ``u``.
@@ -89,7 +87,6 @@ def response_decoder_class() -> Any:
             """
 
             frame = jnp.asarray(frame_features, dtype=jnp.float32)
-            task = jnp.asarray(task_features, dtype=jnp.float32)
             components = jnp.asarray(component_embeddings, dtype=jnp.float32)
             u = jnp.asarray(capability, dtype=jnp.float32)
             action = jnp.asarray(actions, dtype=jnp.int32)
@@ -98,7 +95,7 @@ def response_decoder_class() -> Any:
             component_count, component_dim = components.shape
             lead = action.shape
             frame = frame.reshape(lead + (-1,))
-            if u.shape[:-1] != lead or task.shape[:-1] != lead:
+            if u.shape[:-1] != lead:
                 raise ValueError("Response decoder batch axes differ.")
 
             action_embedding = nn.Embed(
@@ -115,7 +112,6 @@ def response_decoder_class() -> Any:
             broadcast_u = add_component_axis(u, component_count)
             broadcast_action = add_component_axis(action_embedding, component_count)
             broadcast_frame = add_component_axis(frame, component_count)
-            broadcast_task = add_component_axis(task, component_count)
 
             # Kinematic trunk: [sg(frame), m_k, u, a] (components 1-4).
             kinematic_input = jnp.concatenate(
@@ -166,11 +162,9 @@ def response_decoder_class() -> Any:
                         PARTNER_INVENTORY_FACTOR_CLASSES)
             )
 
-            # Event head: stopped task state gives physical conditioning; it
-            # cannot update the task encoder through this likelihood path.
+            # Event head: response-regime, capability, and ego action only.
             event_input = jnp.concatenate(
                 (
-                    broadcast_task,
                     broadcast_components,
                     broadcast_u,
                     broadcast_action,

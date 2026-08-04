@@ -1,4 +1,4 @@
-version: 15
+version: 17
 method_variant: b2
 
 environment:
@@ -12,6 +12,7 @@ environment:
 
 model:
   task_hidden_dim: 128
+  instant_partner_dim: 32
   capability_hidden_dim: 64
   capability_dim: 16
   protocol_components: 4
@@ -49,12 +50,16 @@ loss_v2:
   decision_policy_weight: 0.25
   decision_policy_temperature: 1.0
   capability_consistency_weight: 0.01
+  capability_prediction_weight: 0.1
+  capability_variance_weight: 0.01
+  capability_variance_floor: 0.05
+  component_signature_weight: 0.25
 
 anchors:
   enabled: true
   interval_updates: 16
-  ordinary_states: 32
-  matched_history_pairs: 16
+  ordinary_states: 4
+  matched_history_pairs: 2
   fit_replicas: 4
   evaluation_replicas: 8
   continuation_horizon: 128
@@ -68,7 +73,7 @@ anchors:
   m1_spearman_threshold: 0.8
   m1_minimum_anchor_fraction: 0.9
 
-# §7.3 static wide partner pool: default B0–B2 partner distribution.
+# Registered hierarchical static partner pool: default R0/B0–B2 distribution.
 partner_pool:
   enabled: true
   checkpoint_stages: [0.0, 0.5, 1.0]
@@ -90,6 +95,7 @@ posterior_calibration:
   secondary_unit: episode
 
 training:
+  extra_ppo_environment_steps: 0
   rollout_length: 256
   context_dropout_initial: 0.30
   context_dropout_final: 0.10

@@ -13,8 +13,11 @@ from typing import Any
 
 LOSS_OWNERSHIP: dict[str, tuple[str, ...]] = {
     "task_encoder": ("ppo", "signature", "decision", "owner_distillation"),
+    "instant_partner_encoder": (
+        "ppo", "signature", "decision", "owner_distillation"
+    ),
     "capability_encoder": (
-        "ppo", "response", "signature", "decision", "separation"
+        "ppo", "response", "capability", "signature", "decision", "separation"
     ),
     "protocol_component_embeddings": (
         "ppo",

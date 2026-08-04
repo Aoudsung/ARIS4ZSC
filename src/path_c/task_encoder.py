@@ -1,10 +1,10 @@
 """Task-state encoders for the DEPI development matrix.
 
-For B1/B2 the recurrent task pathway receives the current observation after
-all other-agent semantic planes have been zeroed.  Consequently neither an
-explicit history carrier nor a sequence of visible partner states can enter
-its GRU.  B0 deliberately keeps the complete observation as the full-history
-capacity control.
+For B0--B2 the recurrent task pathway receives the current observation after
+all explicit other-agent semantic planes have been zeroed. The guarantee is
+limited to that direct input wire: legal partner-caused changes in the task
+world remain observable. R0 keeps the complete observation as the strong
+full-history reference.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from typing import Any
 
 _TASK_CELL: Any | None = None
 _TASK_SCAN: Any | None = None
+_INSTANT_ENCODER: Any | None = None
 
 
 def official_partner_channel_indexes(channel_count: int) -> tuple[int, ...]:
@@ -21,7 +22,7 @@ def official_partner_channel_indexes(channel_count: int) -> tuple[int, ...]:
     At commit ``5ce1707`` each agent block is
     ``position[1], direction[4], inventory[num_ingredients+2]`` and the full
     observation has ``27 + 4*num_ingredients`` channels.  Failing this exact
-    relation is safer than silently leaking partner history into the task GRU.
+    relation is safer than silently adding a direct partner-plane history wire.
     """
 
     channels = int(channel_count)
@@ -57,6 +58,54 @@ def instantaneous_partner_observation(observation: Any) -> Any:
     obs = jnp.asarray(observation, dtype=jnp.float32)
     partner_channels = official_partner_channel_indexes(obs.shape[-1])
     return obs[..., list(partner_channels)]
+
+
+def instant_partner_encoder_class() -> Any:
+    """Return the memoryless current-partner encoder used by B0--B2.
+
+    The module receives only the pinned other-agent semantic planes.  No
+    carry, previous observation, previous action, or observation delta is an
+    argument, which makes its no-history property structural.
+    """
+
+    global _INSTANT_ENCODER
+    if _INSTANT_ENCODER is not None:
+        return _INSTANT_ENCODER
+
+    import flax.linen as nn
+    import jax.numpy as jnp
+    from flax.linen.initializers import orthogonal, zeros
+
+    class InstantPartnerEncoder(nn.Module):
+        output_dim: int
+
+        @nn.compact
+        def __call__(self, observation: Any) -> Any:
+            partner = instantaneous_partner_observation(observation)
+            batch_axes = partner.shape[:-3]
+            encoded = nn.relu(
+                nn.Conv(
+                    features=16,
+                    kernel_size=(3, 3),
+                    kernel_init=orthogonal(jnp.sqrt(2.0)),
+                    bias_init=zeros,
+                    name="current_partner_conv",
+                )(partner)
+            )
+            encoded = encoded.reshape(batch_axes + (-1,))
+            return nn.LayerNorm(name="current_partner_layer_norm")(
+                nn.relu(
+                    nn.Dense(
+                        self.output_dim,
+                        kernel_init=orthogonal(jnp.sqrt(2.0)),
+                        bias_init=zeros,
+                        name="current_partner_dense",
+                    )(encoded)
+                )
+            )
+
+    _INSTANT_ENCODER = InstantPartnerEncoder
+    return InstantPartnerEncoder
 
 
 def task_encoder_classes() -> tuple[Any, Any]:
@@ -145,6 +194,7 @@ def initial_task_carry(batch_size: int, hidden_dim: int) -> Any:
 
 __all__ = [
     "initial_task_carry",
+    "instant_partner_encoder_class",
     "instantaneous_partner_observation",
     "official_partner_channel_indexes",
     "task_encoder_classes",

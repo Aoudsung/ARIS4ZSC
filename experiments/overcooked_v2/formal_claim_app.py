@@ -7,8 +7,9 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 from experiments.overcooked_v2.resource_report_app import RESOURCE_METHODS
-from src.path_c.calibration import calibration_pass_decision
 from src.path_c.experiment import (
     METHOD_VERSION,
     OFFICIAL_PROTOCOL_VERSION,
@@ -275,7 +276,7 @@ def _validate_resource_report(payload: Mapping[str, Any]) -> None:
 
 def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
     if (
-        payload.get("version") != 1
+        payload.get("version") != 2
         or payload.get("artifact_type") != "depi_development_matrix_summary"
         or payload.get("method") != METHOD_VERSION
         or payload.get("b3_status") != "not_implemented"
@@ -284,22 +285,311 @@ def _validate_development_matrix(payload: Mapping[str, Any]) -> bool:
     comparisons = payload.get("primary_k4_paired_increments")
     if not isinstance(comparisons, Mapping):
         raise ValueError("Development matrix has no paired increments.")
-    required = {"b1_minus_b0", "b2_minus_b1", "b2_minus_b0"}
+    required = {
+        "b0_minus_r0",
+        "b1_minus_b0",
+        "b2_minus_b1",
+        "b2_minus_b0",
+        "b2_minus_r0_total_budget",
+        "b2_minus_b0_total_budget",
+        "b2_minus_b1_total_budget",
+        "b2_minus_deterministic_context",
+        "b2_minus_decision_only",
+        "b2_minus_q_only",
+        "b2_minus_actor_only",
+        "b2_minus_no_separation",
+        "b2_minus_no_capability",
+    }
     if set(comparisons) != required:
-        raise ValueError("Development matrix does not cover B0--B2 increments.")
-    _validate_source_tree(payload.get("sources"), label="development")
-    matrix_path = Path(str(payload["sources"]["matrix"]["path"])).resolve()
-    scores_path = Path(str(payload["sources"]["scores"]["path"])).resolve()
+        raise ValueError("Development matrix does not cover nested and total-budget contrasts.")
+    sources = payload.get("sources")
+    if not isinstance(sources, Mapping) or set(sources) != {
+        "matrix",
+        "evaluations",
+        "component_diagnostics",
+    }:
+        raise ValueError("Development summary sources are malformed.")
+    matrix_path = _validate_source_ref(
+        sources["matrix"], label="development.matrix"
+    )
     matrix = _json(matrix_path)
-    scores = _json(scores_path)
     if (
         matrix.get("artifact_type") != "depi_development_matrix"
-        or scores.get("artifact_type") != "depi_development_scores"
         or matrix.get("method") != METHOD_VERSION
     ):
         raise ValueError("Development summary sources have different identities.")
     if matrix.get("budget_capacity_and_key_matching_passed") is not True:
         raise ValueError("Development matrix did not establish budget/capacity/key matching.")
+
+    from experiments.overcooked_v2.development_matrix_app import (
+        DEVELOPMENT_VARIANTS,
+        _paired_bootstrap,
+        _validate_development_raw_rows,
+        validate_development_entry_alignment,
+    )
+
+    matrix_entries = matrix.get("entries")
+    if not isinstance(matrix_entries, list):
+        raise ValueError("Development matrix entries are missing.")
+    validate_development_entry_alignment(matrix_entries)
+    evaluation_refs = sources["evaluations"]
+    if not isinstance(evaluation_refs, list) or not evaluation_refs:
+        raise ValueError("Development summary has no evaluator artifacts.")
+    score_index: dict[tuple[int, str, int], float] = {}
+    observed_blocks: set[tuple[int, str]] = set()
+    for index, ref in enumerate(evaluation_refs):
+        artifact_path = _validate_source_ref(
+            ref, label=f"development.evaluations.{index}"
+        )
+        evaluation = _json(artifact_path)
+        if (
+            evaluation.get("version") != 2
+            or evaluation.get("artifact_type") != "depi_development_evaluation"
+            or evaluation.get("method") != METHOD_VERSION
+            or evaluation.get("matrix", {}).get("sha256") != sha256_path(matrix_path)
+        ):
+            raise ValueError("Development evaluator artifact identity differs.")
+        evaluation_identity = _json(artifact_path.parent / "run_identity.json")
+        if (
+            evaluation_identity.get("stage") != "evaluate-development-matrix"
+            or evaluation_identity.get("method") != METHOD_VERSION
+            or evaluation_identity.get("matrix", {}).get("sha256")
+            != sha256_path(matrix_path)
+        ):
+            raise ValueError("Development evaluator run identity differs.")
+        evaluation_ledger = ResourceLedger.from_mapping(
+            _json(artifact_path.parent / "resource_ledger.json")
+        )
+        variant = str(evaluation.get("variant"))
+        component_count = int(evaluation.get("protocol_components", -1))
+        if variant not in DEVELOPMENT_VARIANTS or component_count not in {2, 4, 8}:
+            raise ValueError("Development evaluator block is outside the matrix.")
+        block = (component_count, variant)
+        if block in observed_blocks:
+            raise ValueError("Duplicate development evaluator block.")
+        observed_blocks.add(block)
+        raw_ref = evaluation.get("raw_episodes")
+        raw_path = _validate_source_ref(
+            raw_ref, label=f"development.raw.{component_count}.{variant}"
+        )
+        raw_rows = read_parquet(raw_path)
+        deployments = evaluation.get("deployments")
+        if not isinstance(deployments, list) or len(deployments) != 10:
+            raise ValueError("Development evaluation must contain ten ego seeds.")
+        matrix_index = {
+            (
+                int(row["protocol_components"]),
+                str(row["variant"]),
+                int(row["seed_index"]),
+            ): row
+            for row in matrix_entries
+        }
+        for deployment in deployments:
+            deployment_fields = {
+                "seed_index",
+                "path",
+                "sha256",
+                "config_fingerprint",
+                "training_run",
+                "run_identity",
+                "resource_ledger",
+                "partner_sampler",
+            }
+            if not isinstance(deployment, Mapping) or set(deployment) != deployment_fields:
+                raise ValueError("Development deployment source is malformed.")
+            if sha256_path(deployment["path"]) != deployment["sha256"]:
+                raise ValueError("Development deployment source hash changed.")
+            seed_index = int(deployment["seed_index"])
+            entry = matrix_index.get((component_count, variant, seed_index))
+            if entry is None:
+                raise ValueError("Development deployment is not a matrix entry.")
+            training_run = Path(str(deployment["training_run"])).resolve()
+            if (
+                training_run != Path(str(entry["run"])).resolve()
+                or Path(str(deployment["path"])).resolve()
+                != training_run / "final_deployment"
+                or deployment["config_fingerprint"] != entry["config_fingerprint"]
+                or sha256_path(Path(str(entry["config"]["path"])).resolve())
+                != entry["config"]["sha256"]
+            ):
+                raise ValueError("Development deployment does not match its matrix run.")
+            identity_path = _validate_source_ref(
+                deployment["run_identity"],
+                label=f"development.run-identity.{component_count}.{variant}.{seed_index}",
+            )
+            resource_path = _validate_source_ref(
+                deployment["resource_ledger"],
+                label=f"development.resource.{component_count}.{variant}.{seed_index}",
+            )
+            sampler_path = _validate_source_ref(
+                deployment["partner_sampler"],
+                label=f"development.sampler.{component_count}.{variant}.{seed_index}",
+            )
+            identity = _json(identity_path)
+            training_ledger = ResourceLedger.from_mapping(_json(resource_path))
+            if (
+                identity_path != training_run / "run_identity.json"
+                or resource_path != training_run / "resource_ledger.json"
+                or sampler_path != training_run / "partner_pool.json"
+                or sha256_path(identity_path) != entry["run_identity_sha256"]
+                or sha256_path(sampler_path) != entry["partner_sampler_sha256"]
+                or identity.get("stage") != "train"
+                or identity.get("method") != METHOD_VERSION
+                or identity.get("method_variant") != variant.removesuffix("_extra")
+                or int(identity.get("seed_index", -1)) != seed_index
+                or identity.get("config_fingerprint")
+                != deployment["config_fingerprint"]
+                or training_ledger.ego_policy_steps
+                != int(entry["ppo_training_steps"])
+                or training_ledger.counterfactual_continuation_steps
+                + training_ledger.matched_pair_probe_steps
+                != int(entry["auxiliary_training_steps"])
+                or training_ledger.total_training_simulator_steps
+                != int(entry["total_training_simulator_steps"])
+            ):
+                raise ValueError("Development training lineage or ledger differs.")
+        policy_count = len(deployments)
+        expected_rows = policy_count * policy_count * 500
+        if (
+            evaluation_ledger.evaluation_steps != expected_rows * 400
+            or ResourceLedger.from_mapping(evaluation.get("resource_ledger", {}))
+            != evaluation_ledger
+        ):
+            raise ValueError("Development evaluator resource ledger differs.")
+        schedule_sha = evaluation.get("episode_key_schedule_sha256")
+        if (
+            len(raw_rows) != expected_rows
+            or int(evaluation.get("episode_count", -1)) != expected_rows
+        ):
+            raise ValueError("Development raw evaluator rows are incomplete.")
+        scores = _validate_development_raw_rows(
+            raw_rows,
+            variant=variant,
+            protocol_components=component_count,
+            seed_indexes=[int(row["seed_index"]) for row in deployments],
+            schedule_sha256=str(schedule_sha),
+        )
+        for deployment in deployments:
+            seed = int(deployment["seed_index"])
+            score_index[(component_count, variant, seed)] = scores[seed]
+    expected_blocks = {
+        (component_count, variant)
+        for component_count in (2, 4, 8)
+        for variant in DEVELOPMENT_VARIANTS
+    }
+    if observed_blocks != expected_blocks:
+        raise ValueError("Development evaluator artifacts do not cover all K/variants.")
+    seeds = sorted({int(row["seed_index"]) for row in matrix_entries})
+    if seeds != list(range(10)):
+        raise ValueError("Development inference requires registered seeds 0--9.")
+    from src.path_c.component_diagnostics import (
+        permutation_aligned_component_stability,
+        validate_component_diagnostic_values,
+    )
+
+    diagnostic_refs = sources["component_diagnostics"]
+    if not isinstance(diagnostic_refs, list) or len(diagnostic_refs) != 30:
+        raise ValueError("Development component diagnostics must cover 3 K values x 10 seeds.")
+    signatures_by_k: dict[int, dict[int, Any]] = {2: {}, 4: {}, 8: {}}
+    for index, ref in enumerate(diagnostic_refs):
+        diagnostic_path = _validate_source_ref(
+            ref, label=f"development.component-diagnostic.{index}"
+        )
+        diagnostic = _json(diagnostic_path)
+        component_count = int(diagnostic.get("protocol_components", -1))
+        seed = int(diagnostic.get("seed_index", -1))
+        expected_run = Path(
+            str(matrix_index.get((component_count, "b2", seed), {}).get("run", ""))
+        ).resolve()
+        if (
+            diagnostic_path
+            != expected_run / "records" / "final_component_diagnostics.json"
+            or diagnostic.get("version") != 1
+            or diagnostic.get("artifact_type")
+            != "depi_exchangeable_response_regime_diagnostics"
+            or diagnostic.get("method") != METHOD_VERSION
+            or diagnostic.get("method_variant") != "b2"
+            or component_count not in signatures_by_k
+            or seed not in seeds
+            or diagnostic.get("fresh_final_policy_anchors") is not True
+            or diagnostic.get("one_hot_component_intervention") is not True
+            or seed in signatures_by_k[component_count]
+        ):
+            raise ValueError("Development component diagnostic identity differs.")
+        validate_component_diagnostic_values(
+            diagnostic, component_count=component_count
+        )
+        signatures_by_k[component_count][seed] = diagnostic[
+            "component_action_signatures"
+        ]
+    reported_stability = payload.get("component_permutation_aligned_stability")
+    if not isinstance(reported_stability, Mapping):
+        raise ValueError("Permutation-aligned component stability is missing.")
+    for component_count, signatures in signatures_by_k.items():
+        recomputed = permutation_aligned_component_stability(signatures)
+        if reported_stability.get(str(component_count)) != recomputed:
+            raise ValueError("Permutation-aligned component stability was not recomputed.")
+    expected_scores = {
+        (
+            int(row["protocol_components"]),
+            str(row["variant"]),
+            int(row["seed_index"]),
+        )
+        for row in matrix_entries
+    }
+    if set(score_index) != expected_scores:
+        raise ValueError("Development raw scores do not cover the matrix entries.")
+    reported_xp = payload.get("xp_by_protocol_components")
+    if not isinstance(reported_xp, Mapping):
+        raise ValueError("Development per-seed XP is missing.")
+    for component_count in (2, 4, 8):
+        for variant in DEVELOPMENT_VARIANTS:
+            values = np.asarray(
+                [score_index[(component_count, variant, seed)] for seed in seeds],
+                dtype=np.float64,
+            )
+            row = reported_xp[str(component_count)][variant]
+            if not np.allclose(np.asarray(row["per_seed"]), values) or not np.isclose(
+                float(row["mean"]), float(np.mean(values))
+            ):
+                raise ValueError("Development XP was not recomputed from raw rows.")
+    comparison_spec = (
+        ("b0_minus_r0", "b0", "r0", 9),
+        ("b1_minus_b0", "b1", "b0", 10),
+        ("b2_minus_b1", "b2", "b1", 11),
+        ("b2_minus_b0", "b2", "b0", 12),
+        ("b2_minus_r0_total_budget", "b2", "r0_extra", 13),
+        ("b2_minus_b0_total_budget", "b2", "b0_extra", 14),
+        ("b2_minus_b1_total_budget", "b2", "b1_extra", 15),
+        ("b2_minus_deterministic_context", "b2", "deterministic_context", 16),
+        ("b2_minus_decision_only", "b2", "decision_only", 17),
+        ("b2_minus_q_only", "b2", "q_only", 18),
+        ("b2_minus_actor_only", "b2", "actor_only", 19),
+        ("b2_minus_no_separation", "b2", "no_separation", 20),
+        ("b2_minus_no_capability", "b2", "no_capability", 21),
+    )
+    all_comparisons = payload.get("paired_increments_by_protocol_components")
+    if not isinstance(all_comparisons, Mapping):
+        raise ValueError("Development paired comparisons are missing.")
+    for component_count in (2, 4, 8):
+        for name, left, right, bootstrap_seed in comparison_spec:
+            differences = np.asarray(
+                [
+                    score_index[(component_count, left, seed)]
+                    - score_index[(component_count, right, seed)]
+                    for seed in seeds
+                ]
+            )
+            point, interval = _paired_bootstrap(
+                differences, seed=bootstrap_seed + 100 * component_count
+            )
+            reported = all_comparisons[str(component_count)][name]
+            if not np.isclose(float(reported["paired_mean_increment"]), point) or not np.allclose(
+                np.asarray(reported["bootstrap_99_percent_ci"]), interval
+            ):
+                raise ValueError("Development comparison was not derived from raw rows.")
+    if payload.get("primary_k4_paired_increments") != all_comparisons["4"]:
+        raise ValueError("Development K=4 primary comparisons differ from the matrix.")
     return bool(
         comparisons["b1_minus_b0"]["bootstrap_99_percent_ci"][0] > 0.0
         and comparisons["b2_minus_b1"]["bootstrap_99_percent_ci"][0] > 0.0
@@ -429,33 +719,29 @@ def _validate_posterior_calibration(
     aggregate = payload.get("aggregate")
     if not isinstance(aggregate, Mapping):
         raise ValueError(f"Posterior-calibration aggregate is missing on {layout}.")
+    intervals = payload.get("run_bootstrap_95_ci")
+    contrasts = payload.get("run_bootstrap_contrast_95_ci")
+    if not isinstance(intervals, Mapping) or not isinstance(contrasts, Mapping):
+        raise ValueError(f"Posterior-calibration interval evidence is missing on {layout}.")
     expected = {
-        "log_score_vs_uniform": float(aggregate["log_score"])
-        <= float(aggregate["uniform_baseline_log_score"]) - 0.02,
-        "log_score_vs_no_history": float(aggregate["log_score"])
-        <= float(aggregate["no_history_baseline_log_score"]) - 0.02,
-        "position_coverage_in_band": 0.85
-        <= float(aggregate["coverage_position"])
-        <= 0.95,
-        "direction_coverage_in_band": 0.85
-        <= float(aggregate["coverage_direction"])
-        <= 0.95,
-        "event_brier": float(aggregate["event_brier"])
-        <= 0.90 * float(aggregate["prior_baseline_brier"]),
+        "log_score_vs_uniform": float(contrasts["log_score_minus_uniform"][1])
+        <= -0.02,
+        "log_score_vs_no_history": float(
+            contrasts["log_score_minus_no_history"][1]
+        )
+        <= -0.02,
+        "position_coverage_in_band": float(intervals["coverage_position"][0])
+        <= 0.95
+        and float(intervals["coverage_position"][1]) >= 0.85,
+        "direction_coverage_in_band": float(intervals["coverage_direction"][0])
+        <= 0.95
+        and float(intervals["coverage_direction"][1]) >= 0.85,
+        "event_brier": float(
+            contrasts["event_brier_minus_registered_baseline"][1]
+        )
+        <= 0.0,
     }
-    expected_overall = calibration_pass_decision(
-        model_log_score=float(aggregate["log_score"]),
-        uniform_baseline_log_score=float(aggregate["uniform_baseline_log_score"]),
-        no_history_baseline_log_score=float(aggregate["no_history_baseline_log_score"]),
-        position_coverage=float(aggregate["coverage_position"]),
-        direction_coverage=float(aggregate["coverage_direction"]),
-        event_brier=float(aggregate["event_brier"]),
-        prior_baseline_brier=float(aggregate["prior_baseline_brier"]),
-        log_score_margin=0.02,
-        coverage_low=0.85,
-        coverage_high=0.95,
-        brier_ratio=0.90,
-    )
+    expected_overall = bool(all(expected.values()))
     pass_payload = payload.get("pass")
     if not isinstance(pass_payload, Mapping) or any(
         pass_payload.get(name) is not value for name, value in expected.items()
@@ -473,7 +759,7 @@ def _validate_layout_artifact(
         raise ValueError(f"{artifact_type} layout differs from its label.")
     if payload.get("artifact_type") != artifact_type:
         raise ValueError(f"{artifact_type} artifact identity differs.")
-    if payload.get("version") != 2 or payload.get("method_variant") != "b2":
+    if payload.get("version") != 3 or payload.get("method_variant") != "b2":
         raise ValueError(f"{artifact_type} schema or B2 identity differs.")
     if payload.get("paired_crn") is not True:
         raise ValueError(f"{artifact_type} is not a paired-CRN evaluation.")
@@ -507,42 +793,37 @@ def _validate_layout_artifact(
         ):
             raise ValueError("Context swap is not based on real continuations.")
         task = payload.get("task_leakage", {})
-        shuffle = payload.get("history_shuffle", {})
+        transplant = payload.get("protocol_state_transplant", {})
         swap = payload.get("context_swap", {})
         expected_flags = {
-            "task_channel_isolation": float(
-                task.get("representation_shuffle_drift", float("inf"))
+            "task_excess_leakage": float(
+                task.get("excess_balanced_accuracy", float("inf"))
             )
-            <= 1.0e-7,
-            "task_leakage_probe": float(
-                task.get("balanced_accuracy", float("inf"))
-            )
-            <= float(task.get("chance_accuracy", float("-inf")))
-            + float(task.get("maximum_excess_over_chance", float("-inf"))),
-            "history_shuffle": float(
-                shuffle.get("mean_return_drop", float("-inf"))
+            <= float(task.get("maximum_excess_over_task_state", float("-inf"))),
+            "protocol_state_transplant": float(
+                transplant.get("mean_return_drop", float("-inf"))
             )
             > 0.0
             and float(
-                shuffle.get("bootstrap_99_percent_ci", [float("-inf")])[0]
+                transplant.get("bootstrap_99_percent_ci", [float("-inf")])[0]
             )
             > 0.0,
-            "swap_c_causal_consistency": float(
-                swap.get("swap_c_continuation_consistency", float("-inf"))
-            )
-            > float(swap.get("registered_swap_c_threshold", float("inf"))),
+            "source_world_context_value": float(
+                swap.get(
+                    "source_world_value_alignment_bootstrap_99_percent_ci",
+                    [float("-inf")],
+                )[0]
+            ) > 0.0,
         }
         expected_flags["overall"] = bool(all(expected_flags.values()))
         if payload.get("pass") != expected_flags:
             raise ValueError("Identifiability pass fields are not metric-derived.")
     if artifact_type == "depi_recoverable_value_evaluation":
         fraction = payload.get("recoverable_fraction")
-        if (
-            not isinstance(fraction, Mapping)
-            or fraction.get("estimable") is not True
-            or float(fraction.get("signal_threshold", -1.0)) != 20.0
-        ):
-            raise ValueError("Recoverable-value rho is absent or unregistered.")
+        if not isinstance(fraction, Mapping) or float(
+            fraction.get("signal_threshold", -1.0)
+        ) != 20.0:
+            raise ValueError("Recoverable-value rho registration differs.")
         comparisons = payload.get("comparisons", {})
         expected_flags = {
             "legal_history_beats_shuffled": float(
@@ -555,14 +836,17 @@ def _validate_layout_artifact(
                 .get("bootstrap_99_percent_ci", [float("-inf")])[0]
             )
             > 0.0,
-            "oracle_is_upper_bound": float(
-                comparisons.get("g4_minus_g1", {}).get(
-                    "point_difference", float("-inf")
-                )
-            )
-            >= 0.0,
             "recoverable_fraction_estimable": bool(fraction["estimable"]),
         }
+        proxy = payload.get("cross_fitted_proxy")
+        if (
+            not isinstance(proxy, Mapping)
+            or proxy.get("not_a_mathematical_upper_bound") is not True
+            or not 0.0
+            <= float(proxy.get("mean_top_action_selection_stability", -1.0))
+            <= 1.0
+        ):
+            raise ValueError("Cross-fitted proxy diagnostics are malformed.")
         expected_flags["overall"] = bool(all(expected_flags.values()))
         if payload.get("pass") != expected_flags:
             raise ValueError("Recoverable-value pass fields are not metric-derived.")
@@ -663,6 +947,21 @@ def run_formal_claim_report(args: argparse.Namespace) -> None:
         and identifiability_passed
         and recoverable_passed
     )
+    primary_development = development["primary_k4_paired_increments"]
+    filter_architecture_passed = bool(
+        primary_development["b1_minus_b0"]["bootstrap_99_percent_ci"][0]
+        > 0.0
+    )
+    decision_increment_passed = bool(
+        primary_development["b2_minus_b1"]["bootstrap_99_percent_ci"][0]
+        > 0.0
+    )
+    decision_cost_efficiency_passed = bool(
+        primary_development["b2_minus_b1_total_budget"][
+            "bootstrap_99_percent_ci"
+        ][0]
+        > 0.0
+    )
     sources = {
         **{name: _source(path) for name, path in paths.items()},
         "common": {layout: _source(path) for layout, path in common_paths.items()},
@@ -686,7 +985,36 @@ def run_formal_claim_report(args: argparse.Namespace) -> None:
         "posterior_calibration_gate_passed": calibration_passed,
         "identifiability_gate_passed": identifiability_passed,
         "recoverable_value_gate_passed": recoverable_passed,
+        # Retained only as a backwards-compatible aggregate diagnostic. It
+        # never suppresses or rewrites an independently supported claim below.
         "mechanism_claims_unlocked": mechanism_passed,
+        "aggregate_diagnostic_only": True,
+        "claims": {
+            "performance_claim": official_passed,
+            "decision_supervision_claim": bool(
+                decision_increment_passed and final_m1_passed
+            ),
+            "decision_supervision_cost_efficiency_claim": bool(
+                decision_cost_efficiency_passed and final_m1_passed
+            ),
+            "filter_architecture_claim": filter_architecture_passed,
+            "predictive_calibration_claim": calibration_passed,
+            "history_dependence_claim": bool(
+                all(
+                    payload.get("pass", {}).get("protocol_state_transplant") is True
+                    for payload in identifiability.values()
+                )
+            ),
+            "context_causal_value_claim": bool(
+                all(
+                    payload.get("pass", {}).get("source_world_context_value") is True
+                    for payload in identifiability.values()
+                )
+            ),
+            "recoverable_value_claim": recoverable_passed,
+            "capacity_explanation_rejected": capacity_passed,
+            "common_partner_generalization_claim": common_passed,
+        },
         "b3_status": "not_implemented",
         "worst_mechanism_margins_point_only": {
             layout: payload.get("worst_mechanism_margin_point")
@@ -694,11 +1022,9 @@ def run_formal_claim_report(args: argparse.Namespace) -> None:
         },
         "sources": sources,
         "claim_boundary": (
-            "Benchmark scores are always reported. Protocol-mechanism attribution "
-            "requires paired B0--B2 increments, posterior calibration, task leakage, "
-            "history shuffle, final-checkpoint M1, real-continuation context swap, "
-            "common-partner, capacity, "
-            "recoverable-value, and resource evidence on both layouts."
+            "Each claim is governed only by its named evidence. The legacy aggregate "
+            "conjunction is diagnostic-only and never revokes an independently "
+            "supported performance or mechanism statement."
         ),
     }
     output = Path(args.output).resolve()
@@ -719,11 +1045,14 @@ def run_formal_claim_report(args: argparse.Namespace) -> None:
         f"- Final-checkpoint M1: `{final_m1_passed}`",
         f"- Common partner: `{common_passed}`",
         f"- Capacity control: `{capacity_passed}`",
-        f"- B0--B2 paired increments: `{development_passed}`",
+        f"- Filter architecture (B1-B0): `{filter_architecture_passed}`",
+        f"- Decision supervision increment (B2-B1): `{decision_increment_passed}`",
+        f"- Decision supervision cost efficiency (B2-B1-extra): "
+        f"`{decision_cost_efficiency_passed}`",
         f"- Posterior calibration: `{calibration_passed}`",
         f"- Identifiability controls: `{identifiability_passed}`",
         f"- Recoverable value G1--G4: `{recoverable_passed}`",
-        f"- Mechanism claims unlocked: `{mechanism_passed}`",
+        f"- Aggregate diagnostic only: `{mechanism_passed}`",
         "",
         "B3 remains explicitly not implemented and is never presented as a completed layer.",
     ]

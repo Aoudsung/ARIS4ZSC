@@ -23,7 +23,12 @@ from experiments.overcooked_v2.common_partner_app import (
     _official_environment,
     _validate_common_panel,
 )
-from experiments.overcooked_v2.official_adapter import validate_official_runtime
+from experiments.overcooked_v2.deployment import load_deployment
+from experiments.overcooked_v2.official_adapter import (
+    official_policy,
+    restore_official_checkpoint,
+    validate_official_runtime,
+)
 from experiments.overcooked_v2.official_br_prox_app import (
     _stack_initial_hstate,
     empirical_all_action_continuations_from_snapshots,
@@ -43,7 +48,6 @@ from src.path_c.experiment import (
 )
 from src.path_c.identifiability_controls import (
     LEAKAGE_PROBE_EXCESS_THRESHOLD,
-    PROTOCOL_SWAP_CONSISTENCY_THRESHOLD,
     SHUFFLE_EPSILON_QUANTILE,
     balanced_linear_probe_accuracy,
     continuation_swap_causal_consistency,
@@ -61,9 +65,9 @@ from src.path_c.storage import (
 )
 
 
-IDENTIFIABILITY_SCHEMA_VERSION = 2
-RECOVERABLE_VALUE_SCHEMA_VERSION = 2
-MECHANISM_RAW_SCHEMA_VERSION = 2
+IDENTIFIABILITY_SCHEMA_VERSION = 3
+RECOVERABLE_VALUE_SCHEMA_VERSION = 3
+MECHANISM_RAW_SCHEMA_VERSION = 3
 
 
 _RAW_BASE_FIELDS = {
@@ -223,6 +227,26 @@ def _task_features(policy: Any, hstate: Any, observation: Any) -> np.ndarray:
     return np.asarray(output.task_features, dtype=np.float64)
 
 
+def _policy_probabilities(policy: Any, hstate: Any, observation: Any) -> np.ndarray:
+    """Read the deployed action distribution without sampling an action."""
+
+    import jax
+    import jax.numpy as jnp
+
+    if not isinstance(policy, OfficialDEPIPolicy):
+        raise TypeError("Mechanism controls require a DEPI deployment policy.")
+    state = _squeeze_official_hstate(hstate)
+    count = int(np.asarray(observation).shape[0])
+    _, output = policy.deployment.model.apply(
+        {"params": policy.deployment.params},
+        state,
+        jnp.asarray(observation),
+        jnp.zeros((count,), dtype=jnp.bool_),
+        method=policy.deployment.model.step,
+    )
+    return np.asarray(jax.nn.softmax(output.policy_logits, axis=-1), dtype=np.float64)
+
+
 def _history_intervention(
     source: Any,
     donor: Any,
@@ -317,35 +341,93 @@ def collect_mechanism_raw_artifacts(
     partner_manifest_path: str | Path,
     output: str | Path,
     skip_manifest_hash_check: bool = False,
+    dry_run_training_runs: Sequence[str | Path] | None = None,
+    dry_run_partner_count: int = 2,
+    dry_run_episodes: int = 50,
 ) -> Mapping[str, Path]:
     """Collect both mechanism artifacts from real Official continuations."""
 
     import jax
     import jax.numpy as jnp
 
-    validate_formal_repository_state()
-    validate_registered_python_runtime()
+    dry_run = dry_run_training_runs is not None
+    if not dry_run:
+        validate_formal_repository_state()
+        validate_registered_python_runtime()
     validate_official_runtime()
-    config = load_config(config_path, run_kind="formal")
+    config = load_config(config_path, run_kind="mechanical" if dry_run else "formal")
     if config.method_variant != "b2":
         raise ValueError("Mechanism attribution is registered only for the B2 deployment.")
+    root = Path(output).resolve()
+    root.mkdir(parents=True, exist_ok=True)
     policy_path = Path(policy_manifest_path).resolve()
     partner_path = Path(partner_manifest_path).resolve()
-    manifest = _load_policy_manifest(
-        policy_path, expected_layout=config.environment.layout
-    )
-    if manifest["method"] != "depi" or manifest["policy_kind"] != "depi_deployment":
-        raise ValueError("Mechanism controls require the ten-run DEPI policy manifest.")
     partner_manifest = load_partner_manifest(
         partner_path,
         expected_layout=config.environment.layout,
         verify_files=not bool(skip_manifest_hash_check),
     )
-    trained_partners = _validate_common_panel(
-        partner_manifest, {"depi": manifest}
-    )
-    partners, partner_policies = _load_common_panel_policies(trained_partners)
-    ego_policies = _load_policies(manifest, config)
+    if dry_run:
+        training_runs = tuple(Path(value).resolve() for value in dry_run_training_runs or ())
+        if len(training_runs) != 2:
+            raise ValueError("Scientific dry run requires exactly two ego training runs.")
+        runs = []
+        ego_policies = []
+        for index, training_run in enumerate(training_runs):
+            deployment_path = training_run / "final_deployment"
+            deployment = load_deployment(deployment_path, config)
+            ego_policies.append(OfficialDEPIPolicy(deployment))
+            runs.append(
+                {
+                    "run_index": index,
+                    "run_id": deployment.ego_run_id,
+                    "checkpoint": str(deployment_path),
+                    "checkpoint_sha256": sha256_path(deployment_path),
+                }
+            )
+        manifest = {
+            "method": "depi",
+            "policy_kind": "depi_deployment",
+            "runs": runs,
+        }
+        write_json(
+            policy_path,
+            {
+                "version": 1,
+                "artifact_type": "depi_scientific_dry_run_policy_manifest",
+                "method": METHOD_VERSION,
+                "layout": config.environment.layout,
+                "runs": runs,
+                "scientific_readout_allowed": False,
+            },
+        )
+        partners = tuple(partner_manifest.by_role("confirmatory"))[
+            : int(dry_run_partner_count)
+        ]
+        if len(partners) < 2 or len(
+            {run.parent_training_run_id for run in partners}
+        ) != len(partners):
+            raise ValueError(
+                "Scientific dry run needs at least two independent fresh confirmatory partners."
+            )
+        partner_policies = []
+        for run in partners:
+            partner_config, partner_params = restore_official_checkpoint(run.checkpoint)
+            partner_policies.append(official_policy(partner_params, partner_config))
+        partners = tuple(partners)
+        partner_policies = tuple(partner_policies)
+        ego_policies = tuple(ego_policies)
+    else:
+        manifest = _load_policy_manifest(
+            policy_path, expected_layout=config.environment.layout
+        )
+        if manifest["method"] != "depi" or manifest["policy_kind"] != "depi_deployment":
+            raise ValueError("Mechanism controls require the ten-run DEPI policy manifest.")
+        trained_partners = _validate_common_panel(
+            partner_manifest, {"depi": manifest}
+        )
+        partners, partner_policies = _load_common_panel_policies(trained_partners)
+        ego_policies = _load_policies(manifest, config)
     environment = _official_environment(config)
     anchors = int(config.evaluation.mechanism_anchors_per_pairing)
     fit_replicas = int(config.evaluation.mechanism_fit_replicas)
@@ -385,7 +467,11 @@ def collect_mechanism_raw_artifacts(
                     root_key=root,
                     anchors=anchors,
                     continuation_horizon=horizon,
-                    episodes=int(config.evaluation.episodes_per_pairing),
+                    episodes=(
+                        int(dry_run_episodes)
+                        if dry_run
+                        else int(config.evaluation.episodes_per_pairing)
+                    ),
                 )
                 selected = recorded["selected"]
                 ego_hstate = (
@@ -489,6 +575,16 @@ def collect_mechanism_raw_artifacts(
                         "agent_0" if ego_role == 0 else "agent_1"
                     ],
                 )
+                from src.path_c.task_encoder import task_only_observation
+
+                snapshot_observations = np.asarray(
+                    snapshot["selected"]["observations"][
+                        "agent_0" if ego_role == 0 else "agent_1"
+                    ]
+                )
+                fixed_task_state_features = np.asarray(
+                    task_only_observation(snapshot_observations)
+                ).reshape((anchors, -1))
                 for local_index, global_index in enumerate(source_global):
                     donor_global = int(donor_by_source[global_index])
                     leakage_rows.append(
@@ -500,6 +596,13 @@ def collect_mechanism_raw_artifacts(
                             "ego_run_id": ego_run_id,
                             "partner_run_label": snapshot["partner_run_id"],
                             "donor_partner_run_id": str(all_partner_ids[donor_global]),
+                            "episode_group_id": (
+                                f"{ego_run_id}:r{ego_role}:p{snapshot['partner_index']}:"
+                                f"e{int(np.asarray(snapshot['episode_indexes'])[local_index])}"
+                            ),
+                            "task_state_features": fixed_task_state_features[
+                                local_index
+                            ].tolist(),
                             "task_features": all_features[global_index].tolist(),
                             "task_features_history_shuffled": (
                                 all_shuffled_features[local_index].tolist()
@@ -589,6 +692,12 @@ def collect_mechanism_raw_artifacts(
                 source_observations = selected["observations"][
                     "agent_0" if ego_role == 0 else "agent_1"
                 ]
+                original_policy_probabilities = _policy_probabilities(
+                    ego_policy, source_state, source_observations
+                )
+                swapped_c_policy_probabilities = _policy_probabilities(
+                    ego_policy, swap_c_state, source_observations
+                )
                 shuffled_features = _task_features(
                     ego_policy, history_state, source_observations
                 )
@@ -673,6 +782,12 @@ def collect_mechanism_raw_artifacts(
                             ).tolist(),
                             "swap_c_source_signature": source_signature[index].tolist(),
                             "swap_c_target_signature": target_signature[index].tolist(),
+                            "original_policy_probabilities": (
+                                original_policy_probabilities[index].tolist()
+                            ),
+                            "swap_c_policy_probabilities": (
+                                swapped_c_policy_probabilities[index].tolist()
+                            ),
                         }
                     )
                     recoverable_rows.append(
@@ -688,12 +803,33 @@ def collect_mechanism_raw_artifacts(
                             "g4": float(
                                 legal["oracle_evaluation_return"][int(local_index)]
                             ),
+                            "g4_selection_stability": float(
+                                np.mean(
+                                    np.argmax(
+                                        legal["fit_replica_returns_by_action"][
+                                            int(local_index)
+                                        ],
+                                        axis=0,
+                                    )
+                                    == int(legal["fit_oracle_action"][int(local_index)])
+                                )
+                            ),
                         }
                     )
 
-    if len({row["ego_run_id"] for row in identifiability_rows}) != 10:
-        raise RuntimeError("Mechanism collection did not retain matched rows for all ten egos.")
+    expected_ego_count = 2 if dry_run else 10
+    if len({row["ego_run_id"] for row in identifiability_rows}) != expected_ego_count:
+        raise RuntimeError(
+            "Mechanism collection did not retain matched rows for every ego."
+        )
     registration = _collector_registration(config)
+    if dry_run:
+        registration = {
+            **registration,
+            "execution_scope": "two-ego-real-simulator-scientific-dry-run",
+            "episodes_per_pairing": int(dry_run_episodes),
+            "scientific_readout_allowed": False,
+        }
     resource_ledger = {
         "trajectory_replay_steps": int(trajectory_replay_steps),
         "continuation_steps": int(continuation_steps),
@@ -712,8 +848,6 @@ def collect_mechanism_raw_artifacts(
         "registration": registration,
         "resource_ledger": resource_ledger,
     }
-    root = Path(output).resolve()
-    root.mkdir(parents=True, exist_ok=True)
     ident_path = root / "depi_identifiability_raw.json"
     recoverable_path = root / "depi_recoverable_value_raw.json"
     write_json(
@@ -796,11 +930,15 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
         "swap_c_returns_by_action",
         "swap_c_source_signature",
         "swap_c_target_signature",
+        "original_policy_probabilities",
+        "swap_c_policy_probabilities",
     }
     rows = list(payload["rows"])
     for row in rows:
         if not isinstance(row, Mapping) or set(row) != required:
-            raise ValueError("Identifiability raw row fields differ from schema 2.")
+            raise ValueError(
+                f"Identifiability raw row fields differ from schema {MECHANISM_RAW_SCHEMA_VERSION}."
+            )
         _validate_common_row(row)
         if float(row["task_match_distance"]) > float(row["task_match_epsilon"]):
             raise ValueError("Context swap pair is not task-state matched.")
@@ -813,6 +951,8 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
             "swap_c_returns_by_action",
             "swap_c_source_signature",
             "swap_c_target_signature",
+            "original_policy_probabilities",
+            "swap_c_policy_probabilities",
         ):
             values = np.asarray(row[name], dtype=np.float64)
             if values.shape != (6,) or not np.all(np.isfinite(values)):
@@ -824,6 +964,8 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
         "ego_run_id",
         "partner_run_label",
         "donor_partner_run_id",
+        "episode_group_id",
+        "task_state_features",
         "task_features",
         "task_features_history_shuffled",
     }
@@ -833,19 +975,58 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
         not isinstance(row, Mapping) or set(row) != leakage_required
         for row in leakage_rows
     ):
-        raise ValueError("Task-leakage raw rows differ from schema 2.")
+        raise ValueError(
+            f"Task-leakage raw rows differ from schema {MECHANISM_RAW_SCHEMA_VERSION}."
+        )
     task_features = np.asarray(
         [row["task_features"] for row in leakage_rows], dtype=np.float64
+    )
+    task_state_features = np.asarray(
+        [row["task_state_features"] for row in leakage_rows], dtype=np.float64
     )
     shuffled_features = np.asarray(
         [row["task_features_history_shuffled"] for row in leakage_rows],
         dtype=np.float64,
     )
     labels = np.asarray([row["partner_run_label"] for row in leakage_rows])
+    probe_groups = np.asarray([row["episode_group_id"] for row in leakage_rows])
     class_count = int(np.unique(labels).size)
     if class_count < 2:
         raise ValueError("Task leakage control needs at least two held-out partner runs.")
-    leakage_accuracy = float(balanced_linear_probe_accuracy(task_features, labels))
+    scientific_readout_allowed = bool(
+        payload["registration"].get("scientific_readout_allowed", True)
+    )
+    probe_fold_count = 5
+    if not scientific_readout_allowed:
+        # The two-ego rehearsal has one small anchor per partner/role.  It
+        # still performs a genuinely group-held-out probe, but it may not
+        # impersonate the registered five-fold scientific estimator.
+        minimum_groups = min(
+            np.unique(probe_groups[labels == label]).size
+            for label in np.unique(labels)
+        )
+        probe_fold_count = min(probe_fold_count, int(minimum_groups))
+        if probe_fold_count < 2:
+            raise ValueError(
+                "Scientific dry-run leakage probe needs two independent groups per class."
+            )
+    leakage_accuracy = float(
+        balanced_linear_probe_accuracy(
+            task_features,
+            labels,
+            group_ids=probe_groups,
+            fold_count=probe_fold_count,
+        )
+    )
+    task_state_baseline_accuracy = float(
+        balanced_linear_probe_accuracy(
+            task_state_features,
+            labels,
+            group_ids=probe_groups,
+            fold_count=probe_fold_count,
+        )
+    )
+    excess_leakage_accuracy = leakage_accuracy - task_state_baseline_accuracy
     leakage_chance = 1.0 / class_count
     task_drift = float(
         task_representation_drift_under_shuffle(task_features, shuffled_features)
@@ -866,21 +1047,49 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
         source_signature=stack("swap_u_source_signature"),
         target_signature=stack("swap_u_target_signature"),
     )
-    swap_c = continuation_swap_causal_consistency(
+    swap_c_directional_descriptive = continuation_swap_causal_consistency(
         swapped_returns_by_action=stack("swap_c_returns_by_action"),
         original_returns_by_action=stack("swap_c_original_returns_by_action"),
         source_signature=stack("swap_c_source_signature"),
         target_signature=stack("swap_c_target_signature"),
     )
+    original_policy = stack("original_policy_probabilities")
+    swapped_c_policy = stack("swap_c_policy_probabilities")
+    source_values = stack("swap_c_original_returns_by_action")
+    context_sensitivity = float(
+        np.mean(0.5 * np.sum(np.abs(original_policy - swapped_c_policy), axis=-1))
+    )
+    alignment_rows = np.sum(
+        (original_policy - swapped_c_policy) * source_values, axis=-1
+    )
+    alignment_by_run = np.asarray(
+        [
+            np.mean(
+                alignment_rows[
+                    np.asarray([str(item["ego_run_id"]) == run for item in rows])
+                ]
+            )
+            for run in sorted({str(item["ego_run_id"]) for item in rows})
+        ],
+        dtype=np.float64,
+    )
+    rng = np.random.default_rng(77)
+    alignment_draws = rng.integers(
+        0,
+        alignment_by_run.size,
+        size=(9_999, alignment_by_run.size),
+    )
+    alignment_bootstrap = np.mean(alignment_by_run[alignment_draws], axis=-1)
+    alignment_ci = [
+        float(np.quantile(alignment_bootstrap, 0.005)),
+        float(np.quantile(alignment_bootstrap, 0.995)),
+    ]
     pass_flags = {
-        "task_channel_isolation": bool(task_drift <= 1.0e-7),
-        "task_leakage_probe": bool(
-            leakage_accuracy <= leakage_chance + LEAKAGE_PROBE_EXCESS_THRESHOLD
+        "task_excess_leakage": bool(
+            excess_leakage_accuracy <= LEAKAGE_PROBE_EXCESS_THRESHOLD
         ),
-        "history_shuffle": bool(shuffle_drop > 0.0 and shuffle_low > 0.0),
-        "swap_c_causal_consistency": bool(
-            swap_c > PROTOCOL_SWAP_CONSISTENCY_THRESHOLD
-        ),
+        "protocol_state_transplant": bool(shuffle_drop > 0.0 and shuffle_low > 0.0),
+        "source_world_context_value": bool(alignment_ci[0] > 0.0),
     }
     result = {
         "version": IDENTIFIABILITY_SCHEMA_VERSION,
@@ -891,24 +1100,32 @@ def run_identifiability_evaluation(args: argparse.Namespace) -> None:
         "policy_manifest_sha256": payload["policy_manifest_sha256"],
         "partner_manifest_sha256": payload["partner_manifest_sha256"],
         "paired_crn": True,
+        "scientific_readout_allowed": scientific_readout_allowed,
         "run_count": len({str(row["ego_run_id"]) for row in rows}),
         "row_count": len(rows),
         "task_leakage": {
             "row_count": len(leakage_rows),
+            "group_held_out_fold_count": probe_fold_count,
             "representation_shuffle_drift": task_drift,
-            "balanced_accuracy": leakage_accuracy,
+            "learned_representation_balanced_accuracy": leakage_accuracy,
+            "task_state_baseline_balanced_accuracy": task_state_baseline_accuracy,
+            "excess_balanced_accuracy": excess_leakage_accuracy,
             "chance_accuracy": leakage_chance,
-            "maximum_excess_over_chance": LEAKAGE_PROBE_EXCESS_THRESHOLD,
+            "maximum_excess_over_task_state": LEAKAGE_PROBE_EXCESS_THRESHOLD,
         },
-        "history_shuffle": {
+        "protocol_state_transplant": {
             "mean_return_drop": shuffle_drop,
             "bootstrap_99_percent_ci": [shuffle_low, shuffle_high],
             "primary_unit": "ego_run",
         },
         "context_swap": {
             "swap_u_continuation_consistency": swap_u,
-            "swap_c_continuation_consistency": swap_c,
-            "registered_swap_c_threshold": PROTOCOL_SWAP_CONSISTENCY_THRESHOLD,
+            "swap_c_donor_direction_consistency_descriptive": (
+                swap_c_directional_descriptive
+            ),
+            "action_distribution_total_variation": context_sensitivity,
+            "source_world_value_alignment": float(np.mean(alignment_by_run)),
+            "source_world_value_alignment_bootstrap_99_percent_ci": alignment_ci,
             "measurement": "real_crn_all_action_continuation",
             "task_match_epsilon_quantile": SHUFFLE_EPSILON_QUANTILE,
         },
@@ -943,37 +1160,62 @@ def _paired_run_bootstrap(
 def _recoverable_fraction(
     rows: Sequence[Mapping[str, Any]], *, threshold: float, seed: int = 4
 ) -> Mapping[str, Any]:
-    grouped: dict[str, list[float]] = {}
-    signal_count = 0
-    for row in rows:
-        denominator = float(row["g4"]) - float(row["g2"])
-        if denominator < float(threshold):
-            continue
-        signal_count += 1
-        grouped.setdefault(str(row["ego_run_id"]), []).append(
-            (float(row["g1"]) - float(row["g2"])) / denominator
-        )
-    run_values = np.asarray(
-        [np.mean(grouped[name]) for name in sorted(grouped)], dtype=np.float64
+    run_ids = sorted({str(row["ego_run_id"]) for row in rows})
+    numerator = np.asarray(
+        [
+            np.mean(
+                [
+                    float(row["g1"]) - float(row["g2"])
+                    for row in rows
+                    if str(row["ego_run_id"]) == run
+                ]
+            )
+            for run in run_ids
+        ],
+        dtype=np.float64,
+    )
+    denominator = np.asarray(
+        [
+            np.mean(
+                [
+                    float(row["g4"]) - float(row["g2"])
+                    for row in rows
+                    if str(row["ego_run_id"]) == run
+                ]
+            )
+            for run in run_ids
+        ],
+        dtype=np.float64,
+    )
+    rng = np.random.default_rng(int(seed))
+    draws = rng.integers(0, len(run_ids), size=(9_999, len(run_ids)))
+    denominator_draws = np.mean(denominator[draws], axis=1)
+    denominator_interval = [
+        float(np.quantile(denominator_draws, 0.005)),
+        float(np.quantile(denominator_draws, 0.995)),
+    ]
+    estimable = bool(
+        len(run_ids) >= 2 and denominator_interval[0] >= float(threshold)
     )
     result: dict[str, Any] = {
-        "definition": "(G1-G2)/(G4-G2) on states with G4-G2 >= threshold",
+        "definition": "run-level (G1-G2)/(G4-G2) when LCB(G4-G2) >= threshold",
         "signal_threshold": float(threshold),
-        "signal_row_count": int(signal_count),
+        "denominator_point": float(np.mean(denominator)),
+        "denominator_bootstrap_99_percent_ci": denominator_interval,
         "total_row_count": int(len(rows)),
-        "signal_fraction": float(signal_count / max(len(rows), 1)),
-        "signal_run_count": int(run_values.size),
+        "signal_run_count": int(len(run_ids)),
         "primary_unit": "ego_run",
-        "estimable": bool(run_values.size >= 2),
+        "estimable": estimable,
         "point": None,
         "bootstrap_99_percent_ci": None,
     }
-    if run_values.size < 2:
+    if not estimable:
         return result
-    rng = np.random.default_rng(int(seed))
-    draws = rng.integers(0, run_values.size, size=(9_999, run_values.size))
-    boot = np.mean(run_values[draws], axis=1)
-    result["point"] = float(np.mean(run_values))
+    ratio = np.mean(numerator) / np.mean(denominator)
+    boot = np.mean(numerator[draws], axis=1) / np.maximum(
+        np.mean(denominator[draws], axis=1), 1.0e-8
+    )
+    result["point"] = float(ratio)
     result["bootstrap_99_percent_ci"] = [
         float(np.quantile(boot, 0.005)),
         float(np.quantile(boot, 0.995)),
@@ -987,13 +1229,20 @@ def run_recoverable_value_evaluation(args: argparse.Namespace) -> None:
         args, artifact="recoverable_value", output=output
     )
     source, payload = _load_raw(raw_path, "depi_recoverable_value_raw")
-    required = _COMMON_ROW_FIELDS | {"g1", "g2", "g3", "g4"}
+    required = _COMMON_ROW_FIELDS | {
+        "g1", "g2", "g3", "g4", "g4_selection_stability"
+    }
     rows = list(payload["rows"])
     for row in rows:
         if not isinstance(row, Mapping) or set(row) != required:
-            raise ValueError("Recoverable-value raw row fields differ from schema 2.")
+            raise ValueError(
+                f"Recoverable-value raw row fields differ from schema {MECHANISM_RAW_SCHEMA_VERSION}."
+            )
         _validate_common_row(row)
-        if not all(np.isfinite(float(row[name])) for name in ("g1", "g2", "g3", "g4")):
+        if not all(
+            np.isfinite(float(row[name]))
+            for name in ("g1", "g2", "g3", "g4", "g4_selection_stability")
+        ):
             raise ValueError("G1--G4 returns must be finite.")
     run_means = {
         name: float(np.mean(_run_means(rows, name))) for name in ("g1", "g2", "g3", "g4")
@@ -1014,8 +1263,6 @@ def run_recoverable_value_evaluation(args: argparse.Namespace) -> None:
             "bootstrap_99_percent_ci"
         ][0]
         > 0.0,
-        "oracle_is_upper_bound": comparisons["g4_minus_g1"]["point_difference"]
-        >= 0.0,
         "recoverable_fraction_estimable": bool(recoverable["estimable"]),
     }
     result = {
@@ -1030,11 +1277,20 @@ def run_recoverable_value_evaluation(args: argparse.Namespace) -> None:
             "g1": "legal_history",
             "g2": "shuffled_capability_and_protocol_history",
             "g3": "state_only_uniform_context",
-            "g4": "fit_selected_oracle_on_independent_evaluation_replicas",
+            "g4": "fit_selected_cross_fitted_proxy_on_independent_evaluation_replicas",
         },
         "paired_crn": True,
+        "scientific_readout_allowed": bool(
+            payload["registration"].get("scientific_readout_allowed", True)
+        ),
         "run_level_means": run_means,
         "comparisons": comparisons,
+        "cross_fitted_proxy": {
+            "mean_top_action_selection_stability": float(
+                np.mean([row["g4_selection_stability"] for row in rows])
+            ),
+            "not_a_mathematical_upper_bound": True,
+        },
         "recoverable_fraction": recoverable,
         "pass": {**pass_flags, "overall": bool(all(pass_flags.values()))},
         "source": {"path": str(source), "sha256": sha256_path(source)},

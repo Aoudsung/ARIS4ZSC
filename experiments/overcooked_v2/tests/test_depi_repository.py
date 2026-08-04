@@ -40,11 +40,15 @@ def test_cli_help_imports_without_initializing_optional_runtime() -> None:
     for command in (
         "build-partner-manifest",
         "mechanical-e2e",
+        "scientific-dry-run",
         "validate-manifest",
         "upstream",
         "train-official-baseline",
         "train",
+        "collect-pair-comparator-source",
+        "fit-pair-comparator",
         "run-development-matrix",
+        "evaluate-development-matrix",
         "summarize-development-matrix",
         "cuda-preflight",
         "calibrate-posterior",
@@ -69,6 +73,10 @@ def test_ci_targets_real_tests_and_active_branch() -> None:
     )
     assert 'branches: ["agent/delta-zsc-v5"]' in workflow
     assert "test_depi_*.py" in workflow
+    assert "runs-on: [self-hosted, linux, x64, gpu]" in workflow
+    assert "JAX_PLATFORMS: cuda" in workflow
+    assert "cuda-preflight" in workflow
+    assert "scientific-dry-run --help" in workflow
     assert list(
         (ROOT / "experiments" / "overcooked_v2" / "tests").glob(
             "test_depi_*.py"
@@ -77,6 +85,42 @@ def test_ci_targets_real_tests_and_active_branch() -> None:
     project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'requires-python = ">=3.10,<3.11"' in project
     assert project.count("5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e") == 2
+
+
+def test_scientific_dry_run_is_small_complete_and_non_evidentiary() -> None:
+    from experiments.overcooked_v2.scientific_dry_run_app import (
+        DRY_RUN_EGO_SEEDS,
+        DRY_RUN_EPISODES,
+        DRY_RUN_FRESH_PARTNERS,
+        DRY_RUN_STAGE_ORDER,
+    )
+
+    assert DRY_RUN_EGO_SEEDS == (0, 1)
+    assert DRY_RUN_EPISODES == 50
+    assert DRY_RUN_FRESH_PARTNERS == 2
+    assert DRY_RUN_STAGE_ORDER == (
+        "two_ego_training",
+        "fresh_partner_posterior_calibration",
+        "raw_development_evaluation",
+        "real_crn_mechanism_collection",
+        "identifiability",
+        "recoverable_value",
+        "dry_run_claim_report",
+    )
+    source = (
+        ROOT / "experiments" / "overcooked_v2" / "scientific_dry_run_app.py"
+    ).read_text(encoding="utf-8")
+    calibration_source = (
+        ROOT / "experiments" / "overcooked_v2" / "calibration_app.py"
+    ).read_text(encoding="utf-8")
+    assert '"scientific_readout_allowed": False' in source
+    assert (
+        '"scientific_readout_allowed": config.run_kind == "formal"'
+        in calibration_source
+    )
+    assert "official_pairing_rollouts" in source
+    assert '"formal_claim_report_rehearsal": True' in source
+    assert '"performance_claim"' in source
 
 
 def test_active_source_contains_no_retired_v4_or_v5_control_semantics() -> None:

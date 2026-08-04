@@ -57,16 +57,18 @@ simulator transitions 都进入资源账本。
 
 ## 4. partner lineage 与隔离
 
-正式 manifest schema 为 3。每个资源必须包含 layout、role、mechanism、hyperparameter
+正式 manifest schema 为 4。每个资源必须包含 layout、role、mechanism、hyperparameter
 family、stage、seed/run lineage、checkpoint path 与 SHA-256。每个 DEPI owner seed 恰有一个
 独立 owner-SP source；support、comparator fit、comparator validation、posterior calibration
 和 confirmatory runs 按 manifest 规则互斥。
 
-schema 3 的角色名固定为 `owner_source`、`development_support`、`comparator_fit`、
+schema 4 的角色名固定为 `owner_source`、`development_support`、`comparator_fit`、
 `comparator_validation`、`calibration`、`confirmatory`。正式 comparator fit 与 validation
-各至少使用两个 fresh、独立、final-stage SP/OP parent runs；不得复用 Official seed index。
-首次冻结前的 `6/8 : 1/8 : 1/8` support/fit/validation lane 分配以及冻结后只在 episode
-boundary 回收 comparator lanes 的规则由 [`METHOD_SPEC.md`](METHOD_SPEC.md) §6 固定。
+各至少使用八个 fresh、独立、final-stage partner parents；不得复用 Official seed index。
+comparator 必须在 ego development/formal training 前由固定 Official reference ego 与独立
+fit/validation partners 通过 `collect-pair-comparator-source` 采集，再由该 source artifact 拟合并冻结；
+正式 B2 入口没有冻结 artifact 时 fail closed，禁止在 update 0 临时拟合。calibration panel
+由所有 ego seeds 共享，每种机制五个独立 parents，且 `owner_seed_index=None`。
 
 正式训练池由 SP/OP 各 10 个独立 parent runs 的三个阶段，以及两个独立 final-stage OP
 width variants 构成。heuristic family 只进入 Common-Partner 测试。任何 hash 缺失、文件变化、
@@ -82,7 +84,9 @@ role 重叠、另一 owner seed 的资源混入或 fresh run 回用均 fail clos
 3. mechanical end-to-end；
 4. 单 CUDA `cuda-preflight`，覆盖一次真实 compiled rollout/update、checkpoint round-trip、
    deployment round-trip 和峰值显存门；
-5. B0–B2 × K={2,4,8} 开发矩阵及 paired summary；
+5. 冻结 K/方法无关 comparator；执行 R0/B0/B1/B2、R0-extra/B0-extra/B1-extra 与六项注册
+   机制消融 × K={2,4,8} × seed indexes 0--9 的 development matrix、raw evaluator、component
+   diagnostics 和 paired summary；
 6. 只在未观察正式结果时完成方法/合同 freeze，并提交 clean commit。
 
 任一门失败则不得开始正式 confirmatory runs。B3 保持 `not_implemented`，不构成冻结条件。
@@ -94,6 +98,7 @@ role 重叠、另一 owner seed 的资源混入或 fresh run 回用均 fail clos
 ```text
 upstream
   -> build-partner-manifest / validate-manifest
+  -> collect-pair-comparator-source -> fit-pair-comparator
   -> cuda-preflight
   -> train
   -> build-depi-policy-manifest
@@ -115,18 +120,21 @@ run identity、输入 hash 和 resource ledger；后续 stage 只读取已冻结
 
 Official 每个 ego/partner/layout/role pairing 固定 500 episodes。正式主比较、Common-Partner
 panel、capacity control、BR-Prox、posterior calibration、identifiability、recoverable-value
-和 B0–B2 开发增量必须满足 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md)。正式 scoreboard
+和嵌套 development 增量必须满足 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md)。正式 scoreboard
 固定 9,999 次 node bootstrap、单侧 95% LCB、独立 run 推断，并同时检查 20-point point-estimate
 物质效应。
 
-每个 DEPI formal ego run 还必须在最终 policy update 后执行 M1；其 model fingerprint
-必须与 deployment bundle 一致。DEPI policy manifest 必须绑定两个布局各 10 个
+每个 DEPI formal ego run 还必须在最终 policy update 后用 deployment params 重新采集 fresh
+anchors、重新初始化 bootstrap members，并以不重叠 fit/evaluation replica domains 执行 M1；
+collection、continuation 和 model fingerprints 必须与 deployment bundle 一致。DEPI policy
+manifest 必须绑定两个布局各 10 个
 M1 artifact 的路径和 SHA-256，formal claim report 必须从 Official raw identity 回溯并
-重新校验。任一 seed 未通过只锁住机制归因，不得中止或替换训练结果。
+重新校验。任一 seed 未通过只使 final-M1/decision-supervision 对应证据失败，不得中止或
+替换训练结果。
 
 不得只发布均值。原始 per-episode returns、run-level nodes、置信界、失败节点、资源和 lineage
-均须保留。两个布局中任一机制门失败，formal claim report 必须锁住机制归因，但仍发布所有
-benchmark 结果。
+均须保留。formal claim report 输出独立主张向量；局部机制失败只影响对应主张。兼容的全局
+conjunction 仅作 aggregate diagnostic，不能锁住其他已独立成立的 benchmark/机制结果。
 
 ## 8. 合同变更与结果有效性
 

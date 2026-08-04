@@ -32,6 +32,7 @@ from src.path_c.training import categorical_log_probability
 
 DEPLOYABLE_PARAM_NAMES = (
     "task_encoder",
+    "instant_partner_encoder",
     "capability_encoder",
     "protocol_component_embeddings",
     "universal_actor",
@@ -41,7 +42,7 @@ DEPLOYABLE_PARAM_NAMES = (
     # training-only auxiliary head.
     "response_decoder",
 )
-DEPLOYMENT_BUNDLE_VERSION = 6
+DEPLOYMENT_BUNDLE_VERSION = 8
 PRIMARY_ARTIFACT_NAME = "DEPI"
 
 
@@ -61,6 +62,7 @@ def _build_model(
         observation_shape=observation_shape,
         action_count=action_count,
         task_hidden_dim=config.model.task_hidden_dim,
+        instant_partner_dim=config.model.instant_partner_dim,
         capability_hidden_dim=config.model.capability_hidden_dim,
         capability_dim=config.model.capability_dim,
         protocol_components=config.model.protocol_components,

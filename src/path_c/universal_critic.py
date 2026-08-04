@@ -1,9 +1,9 @@
 """Dueling critic for DEPI (METHOD_SPEC §1.3/§1.4).
 
 ``UniversalDuelingCritic(task_features, context)`` outputs (V, Q1, Q2) with
-``context = concat(u, c_t)`` (32 dimensions).  The ``shaped_belief_embedding``
+``context = concat(r_t, u, c_t)``.  The ``shaped_belief_embedding``
 special case is removed: every head conditions on the same
-``[x_t; u; c_t]`` context.  Head names are retained because the parameter
+``[x_t; r_t; u; c_t]`` context.  Head names are retained because the parameter
 ownership table (METHOD_SPEC §3.4) routes ``shaped_*`` gradients to the PPO
 loss and ``raw_q*`` gradients to the signature loss.
 """

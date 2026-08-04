@@ -1,17 +1,14 @@
-"""Three identifiability controls (METHOD_SPEC §4).
+"""Pure-array primitives for the registered identifiability controls.
 
 All primitives are pure array functions: ``identifiability_app.py`` feeds them
 precomputed task features, contexts and signatures so that every reading can
 be reproduced offline from recorded checkpoints.
 
-* §4.1 task-history leakage control -- structural isolation is enforced by the
-  input wiring of ``model.py``; this module provides the audit readouts:
-  ``task_repr_drift_under_shuffle`` and ``leakage_probe_accuracy``
-  (registered target <= 0.55, chance 0.5; above -> SCIENTIFIC_SPEC Φ4).
-* §4.2 history shuffle control -- ``history_shuffle_drop`` with paired
-  bootstrap CI (9999 replications); drop <= 0 or CI crossing zero -> Φ2.
-* §4.3 context swap control -- ``protocol_swap_causal_consistency``
-  (registered target > 0.65, chance 0.5; <= 0.5 -> Φ3).
+The app compares a group-held-out learned task probe with a fixed legal
+task-state baseline, reports protocol-state transplant effects, and evaluates
+source-world context value with real all-action continuations. Legacy helper
+names remain only where tests/offline artifacts need backwards-compatible pure
+math functions; they are not the current causal estimands.
 """
 
 from __future__ import annotations
@@ -44,14 +41,15 @@ def balanced_linear_probe_accuracy(
     features: Any,
     run_ids: Any,
     *,
+    group_ids: Any | None = None,
     fold_count: int = 5,
     ridge: float = 1.0e-3,
 ) -> Any:
     """§4.1(b): held-out balanced linear probe of partner run identity from x_t.
 
-    Deterministic stratified k-fold; per-class balanced accuracy averaged over
-    folds.  A task representation that leaks partner history scores far above
-    the 0.5 chance level.
+    Deterministic group-held-out stratified k-fold; per-class balanced accuracy
+    is averaged over folds. The empirical gate compares this learned-feature
+    score with the identical probe on fixed legal task-state planes.
     """
 
     import numpy as np
@@ -63,9 +61,27 @@ def balanced_linear_probe_accuracy(
     if class_count < 2:
         raise ValueError("Leakage probe needs at least two partner runs.")
     fold_assignment = np.zeros_like(encoded)
+    groups = (
+        np.arange(encoded.size)
+        if group_ids is None
+        else np.asarray(group_ids).reshape((-1,))
+    )
+    if groups.shape != encoded.shape:
+        raise ValueError("Leakage-probe groups must align with feature rows.")
+    # Assign whole episodes/blocks to folds within each class.  Snapshot-level
+    # splitting would leak nearly identical temporal neighbours across train
+    # and test sets and overstate partner-run decoding.
     for class_index in range(class_count):
         indexes = np.flatnonzero(encoded == class_index)
-        fold_assignment[indexes] = np.arange(indexes.size) % int(fold_count)
+        class_groups = np.unique(groups[indexes])
+        if class_groups.size < int(fold_count):
+            raise ValueError(
+                "Each partner class needs at least one independent group per fold."
+            )
+        for group_offset, group in enumerate(class_groups):
+            fold_assignment[indexes[groups[indexes] == group]] = (
+                group_offset % int(fold_count)
+            )
     predictions = np.zeros_like(encoded)
     one_hot = np.eye(class_count)[encoded]
     for fold in range(int(fold_count)):

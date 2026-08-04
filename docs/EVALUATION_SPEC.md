@@ -2,114 +2,121 @@
 
 `authoritative: true`
 
-本文件固定性能结论、机制归因和统计判定的边界。实现常量和配置字段由
-[`src/path_c/experiment.py`](../src/path_c/experiment.py) 单点校验；报告不得以聚合表替代原始
-run-level artifact，也不得在看见结果后更换统计单位或阈值。
+本文件固定性能、组件增量和机制读数的统计边界。实现常量由
+[`src/path_c/experiment.py`](../src/path_c/experiment.py) 单点校验；summary 不得替代原始
+run/episode artifact。
 
-## 1. 两类结论必须分开
+## 1. 结论分层
 
-1. **benchmark 结论**：DEPI 在固定 Official protocol 和 Common-Partner panel 上的 held-out
-   XP 表现。无论机制门是否通过，该结果都必须完整报告。
-2. **机制结论**：性能提升来自合法历史中的 capability/protocol 推断及其决策作用。只有开发
-   增量、校准、可识别性、可恢复价值、容量和资源门在两个布局全部通过时才能作此归因。
+- benchmark、Common-Partner、filter architecture、decision supervision、decision-supervision
+  cost efficiency、predictive
+  calibration、history dependence、source-world context value、recoverable value 和 capacity
+  是独立主张。
+- 每项只由自己的注册证据决定。任何局部失败不得隐藏 XP，也不得撤销另一项已成立结论。
+- `mechanism_claims_unlocked` 仅保留为 aggregate diagnostic，不是论文主张总开关。
 
-测试通过、latent 聚类、内部 Q、entropy、单个 seed 或单个布局均不构成科学结论。
+测试通过、latent 聚类、内部 Q、entropy、单 seed 或单布局都不是科学结论。
 
 ## 2. Official 主评估
 
 - 布局：`test_time_simple`、`test_time_wide`；
-- ego：10 个正式 seed index，固定为 0–9；
+- ego：正式 seed index 0–9；
 - 每个 ego/partner/layout/role pairing：500 个 400-step episodes；
-- 指标：未重塑的 simulator return；双方角色都评估；
-- root evaluation seed：0；每个 pairing 的 episode-key schedule 必须写入并校验 hash；
-- 原始节点必须保留 ego run、partner run、layout、role、episode returns、checkpoint hash、
-  manifest hash 和 key-schedule lineage。
+- 指标：未重塑 simulator return；两种角色均评估；
+- root seed 与 key schedule 由正式合同固定并写入 hash；
+- raw 节点保存 ego/partner run、layout、role、episode returns、checkpoint/manifest hash 和
+  key lineage。
 
-Official summary 只能消费完整的原始节点。缺失、重复、跨布局、跨 checkpoint 或 key schedule
-不一致均 fail closed。SP 结果只作为正常 comparator，不得替代任何数值失败的 DEPI seed。
+Official summary 只消费完整 raw nodes。缺失、重复、跨布局、跨 checkpoint 或 key 不一致都
+fail closed。正式数值失败按原样保留。
 
-## 3. Common-Partner panel
+## 3. Common-Partner 与 BR-Prox
 
-Common-Partner 是机制族留出测试，不能与训练、comparator fit、posterior calibration 的 parent
-runs 重叠。每个布局包含 SP、state-augmented、OP、FCP 四种机制，各至少 4 个独立 partner
-runs，并在双方角色上评估；另报告 greedy courier 和 stationary helper 两个 deterministic
-Official-plane heuristic。正式支持固定为 10 个独立 ego runs、至少 4 个机制、每机制至少
-4 个独立 partner runs。
+Common-Partner parents 必须与 support、comparator 和 calibration lineage-disjoint。每布局
+覆盖 SP、state-augmented、OP、FCP 四种机制及两个 deterministic Official-plane heuristics，
+并在双方角色评估。
 
-BR-Prox 使用同一真实状态的 all-action continuation，必须单独报告 empirical action-value
-regret；它不能由 critic prediction、actor logits 或 policy entropy替代。
+BR-Prox 使用同一真实状态的 all-action continuation，报告 empirical action-value regret；
+critic、logits 或 entropy 不能替代。
 
-## 4. 正式统计单位与门
+## 4. 正式统计单位
 
-主配置固定 `inference_mode: independent_run`。partner-run/ego-run 节点是推断单位，episode
-只在节点内聚合；不得把 episode 当独立样本扩大有效样本量。正式 scoreboard 使用 9,999 次
-node bootstrap 和单侧 95% 下置信界。
+主模式为 independent run。ego-run/partner-run 是推断单位，episode 仅在节点内聚合。正式
+scoreboard 使用注册次数的 node bootstrap 和单侧 LCB。superiority 同时要求 LCB 大于零与
+注册物质效应；不得 post-hoc 选 seed、伙伴、布局或统计模式。
 
-对注册 superiority contrast，同时要求：
+## 5. 开发矩阵与双重预算
+
+每个 K∈{2,4,8}、固定 paired seed indexes 0--9，执行：
 
 ```text
-one-sided LCB > 0
-point estimate >= 20 raw-return points
+core: R0, B0, B1, B2
+total-budget controls: R0-extra, B0-extra, B1-extra
+mechanism ablations: deterministic-context, decision-only, Q-only, actor-only,
+                     no-separation, no-capability
 ```
 
-20 分等于一次正确交付的注册物质效应。当前 `minimum_effect_rule` 固定为
-`point_estimate`；若未来改用下置信界，必须在看见新结果前同步修改权威规格、配置、测试和
-证据账本。任何 post-hoc partner 筛选、seed 替换、布局合并或统计模式切换均无效。
+所有格共享 partner sampler、deployable capacity、训练/评估 key domains、Official 环境和
+评估定义。core 四格共享主 PPO transition budget；B2 的 anchor/probe 成本额外列账。
+`R0-extra/B0-extra/B1-extra` 不采 anchors，而把 B2 的同一额外 transition 数用于普通 PPO；其 total
+training simulator steps 必须与 B2 精确相等。
 
-## 5. B0–B2 开发矩阵
+主嵌套 contrasts 为 `B1-B0` 和 `B2-B1`；`B0-R0` 只比较结构基座与 full-history reference。
+必须同时报告 `B2-R0-extra`、`B2-B0-extra`、`B2-B1-extra` 以及 B2 对六项机制消融的 paired
+contrast，避免把额外数据成本或较简单机制误写为算法增益。
 
-开发矩阵对 B0、B1、B2 和 K={2,4,8} 全组合执行。每个 K/seed 内三种方法必须具有相同：
+每个 K/variant 必须由 `evaluate-development-matrix` 生成 raw episode parquet、run identity、
+deployment hashes、config fingerprint、key schedule 和 resource ledger。summary 只接受这些
+evaluation directories，并从 raw rows 重算 per-seed 双角色 XP 与 99% paired intervals。
+自由格式 `depi_development_scores.json`、训练曲线或手写 `xp_mean` 一律无效。
 
-- 静态伙伴 sampler artifact；
-- simulator-transition 训练预算；
-- deployable parameter capacity；
-- 训练与评估随机键域；
-- Official 环境、rollout 和评估定义。
+每个 K 的 B2 必须覆盖十个 final-policy component diagnostic artifacts；summary 从 one-hot
+signature 重新执行 permutation alignment，报告跨 seed stability，并验证 utilization、pairwise
+response/action divergence 和 actor intervention 均来自 fresh final anchors。
 
-同 seed、同 evaluation key schedule 做 paired contrast，使用 9,999 次 seed-block bootstrap
-给出 99% 区间。K=4 是正式主设置；机制主张要求 K=4 的 `B1-B0` 和 `B2-B1` 两个区间下界
-均大于零。B3 当前为 `not_implemented`，不能进入矩阵或报告为零增益层。
+K=4 是主设置。`B1-B0` 下界是否为正只决定 filter architecture claim；`B2-B1` 下界与 final
+M1 只决定 decision-supervision claim。B3 不进入矩阵。
 
-## 6. posterior calibration
+## 6. posterior-predictive calibration
 
-每个布局使用与训练隔离的 fresh SP/OP/SA/FCP parent runs：每族 5 个、每 run 64 episodes，
-共至少 20 个 run blocks。primary unit 为 partner run，secondary unit 为 episode；9,999 次
-bootstrap 必须先按 run、再按 run 内 episode 重采样。
+每布局使用共享且 lineage-disjoint 的 SP/OP/SA/FCP panel。primary unit 为 partner run，
+secondary unit 为 episode；bootstrap 先抽 run，再抽 run 内 episode。
 
-正式 gate 同时要求：
+gate 使用 run-level interval，而非聚合点估计：
 
-- posterior-predictive joint NLL 分别优于 uniform-mixture 和 no-history baseline 至少
-  0.02 nats/step；
-- position 与 direction 的 90% highest-probability-set coverage 均在 [0.85, 0.95]；
-- event Brier 不高于 prior baseline 的 0.90 倍。
+- model-minus-uniform NLL 的 UCB 不高于 `-0.02`；
+- model-minus-no-history NLL 的 UCB 不高于 `-0.02`；
+- position/direction 的 90% HPS coverage interval 与注册 coverage band 相交；
+- event Brier 相对注册 prior baseline 的 contrast UCB 不高于零。
 
-评分必须复用 deployment exact filter 的共享 joint likelihood；component index accuracy、
-pooled episode p-value 和只保留位置 coverage 的版本均禁止。
+评分复用 deployment filter/joint likelihood。component index accuracy 与 pooled episode p-value
+禁止进入 gate。
 
 ## 7. 机制控制
 
-前四项在每个布局均需独立 schema artifact：
+每个布局生成独立 schema-3 raw/summary artifacts：
 
-- task leakage：partner-plane 扰动不改变 task pathway，held-out run probe 不得越过注册门；
-- history shuffle：同 checkpoint、当前状态、伙伴、role 和 CRN keys 下替换合法 history carry；
-- `swap-u` / `swap-c`：task-state matched 的跨-run context swap，使用真实 all-action
-  continuation 判定方向；
-- recoverable value：同 checkpoint 和 keys 报 G1 legal-history、G2 shuffled-history、
-  G3 state-only、G4 oracle-continuation，并在 `G4-G2 >= 20` 的 signal states 上报告恢复率；
+- **task excess leakage**：按 episode group-held-out CV，比较 learned representation 与固定
+  task-state planes 的 balanced accuracy；excess 不得超过注册阈值。
+- **protocol-state transplant**：同 checkpoint、source world/partner/role/keys 下替换合法
+  recurrent context，报告 ego-run paired drop 及 99% 区间。
+- **context sensitivity**：报告原始/交换 `c` 的 action-distribution TV，作描述性分段效应。
+- **source-world context value**：在 source all-action returns 上计算
+  `(pi_correct-pi_swapped)·G_source`，以 ego-run bootstrap LCB 判门。
+- **recoverable value**：G4 名称固定为 fit-selected cross-fitted proxy，不是 oracle upper
+  bound；报告 top-action selection stability。只有 `LCB(G4-G2)` 达注册阈值才计算 rho。
+- **final M1**：必须使用 final-policy fresh anchors、重新初始化的 bootstrap members 和不重叠
+  replica index domains；所有 policy fingerprints 与 deployment 一致。
 
-M1 则必须在每个 formal ego run 的最后 policy update 之后重新计算，报告
-posterior path 与三个独立 bootstrap members 的 tie-aware Spearman、top-action
-agreement 和 empirical value regret。该 artifact 的 model fingerprint 必须与导出
-deployment 一致，两个布局各 10 个 seed 的路径和 SHA-256 由 DEPI policy manifest
-绑定；formal claim builder 必须从 Official raw identity 重新校验这些节点。
+G4 偶尔低于 G1 不构成 schema 失败，也不作 pass gate。task representation 在 carry
+transplant 下的恒等不变只作描述性/结构测试，不重复算一项经验门。
 
-这些控制失败时 benchmark 仍需报告，但 formal claim report 必须保持
-`mechanism_claims_unlocked=false`。
+## 8. 容量、资源与来源闭合
 
-## 8. 容量、资源与产物
+资源报告至少分列：ego PPO、owner initialization、upstream partner、counterfactual
+continuation、matched probe、calibration、evaluation、GPU hours、peak memory、deployable 与
+training-only parameters。失败/恢复历史也必须保留。
 
-容量控制报告 deployable parameters、training-only parameters 和 comparator 容量；资源报告
-至少包含 training simulator steps、anchor continuation steps、evaluation steps、GPU hours、
-peak memory 和失败/恢复历史。所有 summary 必须保存输入路径与 SHA-256，并校验 method、布局、
-policy manifest、final-checkpoint M1 和 partner manifest lineage。没有真实 artifact 时不得用手写 JSON、空数组、
-占位布尔值或文档声明代替。
+所有 summary 必须验证输入路径与 SHA、method、布局、deployment、config、partner panel、
+episode count/roles/keys 和资源账本。formal claim builder 应再次从 raw sources 重算可重算
+布尔值；不存在真实 artifact 时，不得以空数组、手写 JSON 或占位 pass 替代。

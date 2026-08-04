@@ -23,7 +23,10 @@ from src.path_c.model import (  # noqa: E402
 )
 from src.path_c.storage import pytree_fingerprint  # noqa: E402
 import src.path_c.training as training  # noqa: E402
-from src.path_c.training import decision_policy_loss  # noqa: E402
+from src.path_c.training import (  # noqa: E402
+    decision_policy_loss,
+    signature_anchor_objective,
+)
 from src.path_c.types import LossBundle, TrainingCoreState  # noqa: E402
 
 
@@ -46,6 +49,75 @@ def test_empirical_decision_target_has_a_live_actor_gradient() -> None:
     after = objective(logits - 0.5 * gradient)
     assert float(jnp.linalg.norm(gradient)) > 0.0
     assert float(after) < float(before)
+
+
+def test_component_signature_constraint_targets_the_posterior_mixture() -> None:
+    target = jnp.asarray([[2.0, -2.0, 0.0, 0.0, 0.0, 0.0]])
+    delta = jnp.asarray([[1.0, -1.0, 0.0, 0.0, 0.0, 0.0]])
+
+    class FakeModel:
+        step = object()
+        component_intervention_step = object()
+
+        def __init__(self, posterior):
+            self.posterior = posterior
+
+        def apply(self, variables, states, observations, *, method):
+            del variables, states, observations
+            if method is self.component_intervention_step:
+                return None, SimpleNamespace(
+                    protocol_probabilities=self.posterior,
+                    action_signatures=jnp.stack(
+                        (target + delta, target - delta), axis=-2
+                    ),
+                    policy_logits=jnp.zeros((1, 2, 6)),
+                )
+            return None, SimpleNamespace(
+                raw_q1=target,
+                raw_q2=target,
+                policy_logits=jnp.zeros((1, 6)),
+            )
+
+    anchors = SimpleNamespace(
+        policy_states=None,
+        observations=None,
+        fit_returns_by_action=target,
+        action_mask=jnp.ones((1, 6), dtype=jnp.bool_),
+        replica_count=jnp.asarray([2]),
+        return_sum_by_action=2.0 * target,
+        return_squared_sum_by_action=2.0 * jnp.square(target),
+        fit_replica_returns_by_action=None,
+        collection_policy_logits=jnp.zeros((1, 6)),
+    )
+    loss_config = SimpleNamespace(
+        rank_hinge_margin=0.1,
+        rank_hinge_advantage_gap=2.0,
+        decision_policy_temperature=1.0,
+        decision_policy_weight=0.25,
+        component_signature_weight=1.0,
+    )
+    matched, matched_metrics = signature_anchor_objective(
+        model=FakeModel(jnp.asarray([[0.5, 0.5]])),
+        params={},
+        anchors=anchors,
+        loss_v2=loss_config,
+        critic_enabled=True,
+        actor_enabled=False,
+    )
+    mismatched, mismatched_metrics = signature_anchor_objective(
+        model=FakeModel(jnp.asarray([[0.75, 0.25]])),
+        params={},
+        anchors=anchors,
+        loss_v2=loss_config,
+        critic_enabled=True,
+        actor_enabled=False,
+    )
+    assert float(matched) == pytest.approx(0.0, abs=1.0e-7)
+    assert float(matched_metrics["component_signature_loss"]) == pytest.approx(
+        0.0, abs=1.0e-7
+    )
+    assert float(mismatched) > float(matched)
+    assert float(mismatched_metrics["component_signature_loss"]) > 0.0
 
 
 def _small_model_and_params():
@@ -165,3 +237,39 @@ def test_combined_policy_kl_is_computed_from_candidate_parameters(
     assert float(metrics["combined_policy_kl"]) == pytest.approx(0.2)
     assert float(metrics["kl_early_stop"]) == 1.0
     assert float(metrics["nonfinite_failure"]) == 0.0
+
+
+def test_post_update_kl_is_exact_categorical_and_independent_of_sampled_action() -> None:
+    old = jnp.asarray([[[0.7, 0.2, 0.1], [0.2, 0.3, 0.5]]])
+    new = jnp.asarray([[[0.4, 0.4, 0.2], [0.1, 0.2, 0.7]]])
+    # The model sequence has a T+1 output; the final bootstrap row is ignored.
+    logits = jnp.concatenate((jnp.log(new), jnp.zeros((1, 2, 3))), axis=0)
+
+    class FakeModel:
+        sequence = object()
+
+        def apply(self, variables, *unused, **kwargs):
+            del variables, unused, kwargs
+            return None, SimpleNamespace(policy_logits=logits)
+
+    batch_fields = dict(
+        initial_policy_state=None,
+        observations=jnp.zeros((2, 2, 1)),
+        previous_actions=jnp.zeros((2, 2), dtype=jnp.int32),
+        episode_starts=jnp.zeros((2, 2), dtype=jnp.bool_),
+        context_dropout_masks=jnp.zeros((2, 2), dtype=jnp.bool_),
+        behavior_probabilities=old,
+        ppo_mask=jnp.ones((1, 2)),
+    )
+    first = SimpleNamespace(actions=jnp.asarray([[0, 1]]), **batch_fields)
+    second = SimpleNamespace(actions=jnp.asarray([[2, 2]]), **batch_fields)
+    observed_first = training.post_update_combined_policy_kl(
+        model=FakeModel(), params={}, batch=first
+    )
+    observed_second = training.post_update_combined_policy_kl(
+        model=FakeModel(), params={}, batch=second
+    )
+    expected = jnp.mean(jnp.sum(old * (jnp.log(old) - jnp.log(new)), axis=-1))
+    assert float(observed_first) == pytest.approx(float(expected), abs=1.0e-7)
+    assert float(observed_second) == pytest.approx(float(expected), abs=1.0e-7)
+    assert float(observed_first) >= 0.0

@@ -9,11 +9,19 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CONFIG_VERSION = 15
-METHOD_VERSION = "depi_exact_filter_decision_supervision_v5"
-CHECKPOINT_SCHEMA_VERSION = 5
-METHOD_VARIANTS = ("b0", "b1", "b2", "b3")
-MANIFEST_VERSION = 3
+CONFIG_VERSION = 17
+METHOD_VERSION = "depi_instant_partner_exact_filter_decision_supervision_v7"
+CHECKPOINT_SCHEMA_VERSION = 7
+MECHANISM_ABLATION_VARIANTS = (
+    "deterministic_context",
+    "decision_only",
+    "q_only",
+    "actor_only",
+    "no_separation",
+    "no_capability",
+)
+METHOD_VARIANTS = ("r0", "b0", "b1", "b2", *MECHANISM_ABLATION_VARIANTS, "b3")
+MANIFEST_VERSION = 4
 OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
 OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
 OFFICIAL_TRAINING_ROOT_SEED = 42
@@ -85,6 +93,7 @@ class EnvironmentConfig:
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     task_hidden_dim: int
+    instant_partner_dim: int
     capability_hidden_dim: int
     capability_dim: int
     protocol_components: int
@@ -128,6 +137,10 @@ class LossV2Config:
     decision_policy_weight: float
     decision_policy_temperature: float
     capability_consistency_weight: float
+    capability_prediction_weight: float
+    capability_variance_weight: float
+    capability_variance_floor: float
+    component_signature_weight: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +164,7 @@ class AnchorConfig:
 
 @dataclass(frozen=True, slots=True)
 class PartnerPoolConfig:
-    """Static wide partner pool, the default B0–B2 partner distribution
+    """Static wide partner pool, the default R0/B0–B2 partner distribution
     (METHOD_SPEC §7.3): SP/OP multi-seed runs x checkpoint stages, OP width
     variants, and a heuristic family held out exclusively for testing."""
 
@@ -180,6 +193,7 @@ class PosteriorCalibrationConfig:
 
 @dataclass(frozen=True, slots=True)
 class TrainingConfig:
+    extra_ppo_environment_steps: int
     environment_steps: int
     minibatches_per_epoch: int
     checkpoint_interval_environment_steps: int
@@ -483,7 +497,10 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         posterior_calibration=PosteriorCalibrationConfig(**calibration_payload),
         training=TrainingConfig(
             **training_payload,
-            environment_steps=budget.environment_steps,
+            environment_steps=(
+                budget.environment_steps
+                + int(training_payload["extra_ppo_environment_steps"])
+            ),
             minibatches_per_epoch=budget.minibatches_per_epoch,
             checkpoint_interval_environment_steps=(
                 budget.checkpoint_interval_environment_steps
@@ -509,6 +526,8 @@ def validate_config(config: RunConfig) -> None:
         raise NotImplementedError(
             "B3 action-conditioned VOI is explicitly not implemented; it cannot be run."
         )
+    if config.run_kind == "formal" and config.method_variant != "b2":
+        raise ValueError("The confirmatory formal method is frozen to B2.")
     if config.environment.layout not in LAYOUTS:
         raise ValueError(f"Unknown OvercookedV2 layout: {config.environment.layout}")
     if config.environment.agent_view_size != 2:
@@ -526,6 +545,8 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("DEPI development sensitivity supports K in {2,4,8}.")
     if config.run_kind == "formal" and config.model.protocol_components != 4:
         raise ValueError("The preregistered formal DEPI configuration fixes K=4.")
+    if config.model.instant_partner_dim != 32:
+        raise ValueError("DEPI fixes instant_partner_dim=32 (METHOD_SPEC §1.1).")
     if config.model.component_embedding_dim != 16:
         raise ValueError("DEPI fixes component_embedding_dim=16 (METHOD_SPEC §1.1).")
     if config.model.capability_dim != 16:
@@ -560,6 +581,10 @@ def validate_config(config: RunConfig) -> None:
         "decision_policy_weight": 0.25,
         "decision_policy_temperature": 1.0,
         "capability_consistency_weight": 0.01,
+        "capability_prediction_weight": 0.1,
+        "capability_variance_weight": 0.01,
+        "capability_variance_floor": 0.05,
+        "component_signature_weight": 0.25,
     }
     for name, expected in frozen_loss_v2.items():
         if getattr(config.loss_v2, name) != expected:
@@ -568,12 +593,17 @@ def validate_config(config: RunConfig) -> None:
     registered_shape = config.run_kind != "mechanical"
     if registered_shape and config.anchors.interval_updates != 16:
         raise ValueError("DEPI training anchors run every 16 outer updates.")
+    expected_anchor_shape = (
+        (4, 2) if config.run_kind == "development" else (32, 16)
+    )
     if registered_shape and (
-        config.anchors.ordinary_states != 32
-        or config.anchors.matched_history_pairs != 16
+        config.anchors.ordinary_states != expected_anchor_shape[0]
+        or config.anchors.matched_history_pairs != expected_anchor_shape[1]
         or config.anchors.fit_replicas != 4
     ):
-        raise ValueError("DEPI anchors require 32 ordinary, 16 matched pairs and 4 fit replicas.")
+        raise ValueError(
+            "DEPI anchor states must match the registered per-million-PPO-transition density."
+        )
     if registered_shape and config.anchors.evaluation_replicas != 8:
         raise ValueError("DEPI M1 evaluation requires 8 independent replicas.")
     if not 1 <= config.anchors.continuation_horizon <= config.environment.episode_steps:
@@ -606,7 +636,7 @@ def validate_config(config: RunConfig) -> None:
 
     if not config.partner_pool.enabled:
         raise ValueError(
-            "The §7.3 static wide partner pool is the default B0–B2 partner "
+            "The registered static wide partner pool is the default R0/B0–B2 partner "
             "distribution and stays enabled."
         )
     if tuple(config.partner_pool.checkpoint_stages) != (0.0, 0.5, 1.0):
@@ -619,7 +649,7 @@ def validate_config(config: RunConfig) -> None:
             "algorithm family (family-disjoint declaration)."
         )
     if not config.partner_pool.family_uniform_sampling:
-        raise ValueError("Partner-pool sampling is uniform across families.")
+        raise ValueError("Partner-pool registered hierarchical sampling must stay enabled.")
 
     calibration = config.posterior_calibration
     if calibration.minimum_run_count < 2 or calibration.episodes_per_run <= 0:
@@ -670,6 +700,39 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Registered DEPI static partner-resource counts changed.")
     if config.training.rollout_length <= 0:
         raise ValueError("Training rollout length must be positive.")
+    extra_steps = int(config.training.extra_ppo_environment_steps)
+    if extra_steps < 0 or extra_steps % config.environment.num_envs:
+        raise ValueError("Extra PPO steps must be non-negative whole vector steps.")
+    if extra_steps:
+        if config.method_variant not in {"r0", "b0", "b1"}:
+            raise ValueError("Only R0/B0/B1 total-budget controls may add PPO steps.")
+        base = RUN_BUDGETS[config.run_kind]
+        base_updates = base.environment_steps // (
+            base.num_envs * config.training.rollout_length
+        )
+        trigger_count = (
+            base_updates + int(config.anchors.interval_updates) - 1
+        ) // int(config.anchors.interval_updates)
+        expected_extra = trigger_count * (
+            (
+                int(config.anchors.ordinary_states)
+                + 2 * int(config.anchors.matched_history_pairs)
+            )
+            * OFFICIAL_ACTION_COUNT
+            * (
+                int(config.anchors.fit_replicas)
+                + int(config.anchors.evaluation_replicas)
+            )
+            * int(config.anchors.continuation_horizon)
+            + 2
+            * int(config.anchors.matched_history_pairs)
+            * int(config.anchors.probe_steps)
+        )
+        if extra_steps != expected_extra:
+            raise ValueError(
+                "Total-budget control PPO steps must equal the B2 "
+                "continuation/probe transition cost exactly."
+            )
     if config.evaluation.episodes_per_pairing <= 0:
         raise ValueError("Evaluation episodes_per_pairing must be positive.")
     if config.evaluation.bootstrap_replicates <= 0:
@@ -787,8 +850,14 @@ def validate_config(config: RunConfig) -> None:
             raise ValueError(f"Official protocol field {name} must equal {expected!r}.")
 
     rollout_steps = config.environment.num_envs * config.training.rollout_length
-    if config.training.environment_steps % rollout_steps:
-        raise ValueError("Training budget must contain whole vectorized rollouts.")
+    base_environment_steps = (
+        config.training.environment_steps
+        - config.training.extra_ppo_environment_steps
+    )
+    if base_environment_steps % rollout_steps:
+        raise ValueError("Base training budget must contain whole vectorized rollouts.")
+    if config.training.environment_steps % config.environment.num_envs:
+        raise ValueError("Training budget must contain whole vector steps.")
     if config.environment.num_envs % config.training.minibatches_per_epoch:
         raise ValueError("Environment lanes must divide exactly into minibatches.")
     if config.training.checkpoint_interval_environment_steps % rollout_steps:
@@ -1111,12 +1180,15 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
 def validate_seed_training_manifest(
     manifest: PartnerManifest,
     *,
+    config: RunConfig,
     owner_seed_index: int,
     formal: bool,
 ) -> None:
     """Enforce the lineage-disjoint, static DEPI training distribution."""
 
     validate_partner_manifest(manifest)
+    if config.environment.layout != manifest.layout:
+        raise ValueError("Seed training manifest layout differs from the run config.")
     owner = int(owner_seed_index)
     if formal and not 0 <= owner < OFFICIAL_TRAINING_RUN_COUNT:
         raise ValueError("Formal DEPI owner seed must lie in 0..9.")
@@ -1180,9 +1252,9 @@ def validate_seed_training_manifest(
         ):
             if any(run.owner_seed_index is not None for run in runs):
                 raise ValueError(f"Formal {role} runs must be shared and ego-owner independent.")
-            if len({run.parent_training_run_id for run in runs}) < 2:
+            if len({run.parent_training_run_id for run in runs}) < 8:
                 raise ValueError(
-                    f"Formal {role} needs at least two independent fresh parent runs."
+                    f"Formal {role} needs at least eight independent fresh parent runs."
                 )
             if len(runs) > config.environment.num_envs // 8:
                 raise ValueError(
@@ -1241,10 +1313,12 @@ def validate_seed_training_manifest(
                 "Formal static support needs exactly two independent final-stage OP width variants."
             )
 
-        calibration = tuple(
-            run for run in owned if run.role == "calibration"
-        )
+        calibration = tuple(manifest.by_role("calibration"))
         if calibration:
+            if any(run.owner_seed_index is not None for run in calibration):
+                raise ValueError(
+                    "The formal calibration panel is shared across ego seeds."
+                )
             observed = {name: 0 for name in ("sp", "op", "sa", "fcp")}
             for run in calibration:
                 mechanism = mechanism_alias.get(run.generation_mechanism)
@@ -1271,6 +1345,7 @@ __all__ = [
     "MANIFEST_VERSION",
     "METHOD_VERSION",
     "METHOD_VARIANTS",
+    "MECHANISM_ABLATION_VARIANTS",
     "CHECKPOINT_SCHEMA_VERSION",
     "OFFICIAL_ACTION_COUNT",
     "OFFICIAL_EPISODE_STEPS",

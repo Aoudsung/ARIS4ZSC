@@ -21,14 +21,10 @@ Official、Common-Partner、capacity、BR-Prox、calibration 和 mechanism artif
 seed、同 episode keys 的 paired increment；正式不同方法若没有合法一一配对关系，则保持
 independent-run inference，不通过任意排序制造配对。
 
-结论分三层：
-
-1. 描述性：均值、run-level dispersion 和完整 interval；
-2. benchmark superiority：注册统计门通过；
-3. protocol-mechanism attribution：benchmark 之外，开发、校准、identifiability、
-   recoverable-value、容量和资源门在两个布局全部通过。
-
-较高层失败不删除较低层结果。
+formal artifact 输出独立主张向量：benchmark、filter architecture、decision supervision、
+posterior-predictive calibration、history dependence、source-world context value、recoverable
+value、capacity 和 Common-Partner。每项只由对应注册 evidence 判定；兼容的全局 conjunction
+仅作 aggregate diagnostic。任一失败不删除其他结果。
 
 ## 3. Common-Partner 与 baseline 公平性
 
@@ -43,12 +39,13 @@ confirmatory 的 run-disjointness 在 manifest 层校验，不在分析后删除
 ## 4. calibration 与机制统计
 
 calibration 使用 partner run 为 primary block、episode 为 secondary block 的层级重采样；
-pooled score 只作描述。NLL、两个运动学 coverage 和 event Brier 同时进入 gate，不对成功子集
-作选择性报告。
+pooled score 只作描述。NLL/Brier contrasts 的 UCB 与两项 coverage interval 进入 gate，不对
+成功子集作选择性报告。
 
-history shuffle、context swap 和 G1–G4 使用固定 checkpoint、matched current state 与共同
-随机数 continuation。报告 unit 是独立 partner/ego run block；单状态、单 anchor 或 replica
-不能被当作新的独立 run。M1 的多个 bootstrap members 是诊断路径，不是额外正式 seeds。
+protocol-state transplant、source-world context value 和 G1–G4 使用固定 checkpoint、matched
+current state 与共同随机数 continuation。G4 是 cross-fitted proxy 而非 upper bound；rho 仅在
+denominator LCB 达阈值时可估。报告 unit 是独立 ego/partner run block；单状态、anchor 或
+replica 不能被当作新 run。M1 members 是诊断路径，不是额外 seeds。
 
 ## 5. 缺失、失败与分析冻结
 

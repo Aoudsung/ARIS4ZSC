@@ -213,7 +213,10 @@ def collect_rollout(
             lambda key, logits: jax.random.categorical(key, logits)
         )(ego_keys, output.policy_logits)
         log_probability = categorical_log_probability(output.policy_logits, ego_action)
-        behavior_probability = jnp.exp(log_probability)
+        # Retain the complete behaviour distribution so the post-update
+        # trust-region diagnostic is the exact categorical KL, not a sampled
+        # action estimator.
+        behavior_probability = jax.nn.softmax(output.policy_logits, axis=-1)
         partner_action, stepped_partner, partner_context, _ = (
             partner_functions.step(
                 partner_parameters,

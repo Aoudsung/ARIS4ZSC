@@ -28,6 +28,7 @@ from experiments.overcooked_v2.official_adapter import (
 )
 from experiments.overcooked_v2.official_evaluation_app import FORMAL_METHODS, _load_policies
 from experiments.overcooked_v2.official_policy import OfficialDEPIPolicy
+from src.path_c.anchor_sampling import ProbeHistory
 from src.path_c.evaluation import br_prox
 from src.path_c.experiment import OFFICIAL_EVALUATION_ROOT_SEED, load_config, load_partner_manifest
 from src.path_c.resources import ResourceLedger
@@ -300,6 +301,100 @@ def record_official_anchor_snapshots(
     }
 
 
+def record_official_history_anchor_snapshots(
+    *,
+    left: Any,
+    right: Any,
+    ego_role: int,
+    environment: Any,
+    root_key: Any,
+    anchors: int,
+    history_steps: int,
+    continuation_horizon: int,
+    episodes: int = 500,
+) -> Mapping[str, Any]:
+    """Replay fixed-policy histories for the external pair comparator.
+
+    Unlike the training-time matched probe, this collector samples only times
+    with a complete preceding legal-history window and a complete future
+    continuation window.  It returns ego observations/actions only; partner
+    actions and partner identity never enter the comparator features.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    role = int(ego_role)
+    episode_count = int(episodes)
+    anchor_count = int(anchors)
+    past = int(history_steps)
+    future = int(continuation_horizon)
+    if role not in {0, 1}:
+        raise ValueError("ego_role must be zero or one.")
+    if min(episode_count, anchor_count, past, future) <= 0:
+        raise ValueError(
+            "Comparator episodes, anchors, history, and continuation must be positive."
+        )
+    eligible_time_count = int(environment.max_steps) - past - future + 1
+    if eligible_time_count <= 0:
+        raise ValueError("Comparator history plus continuation exceeds the episode.")
+    flat_count = eligible_time_count * episode_count
+    if anchor_count > flat_count:
+        raise ValueError("Requested more comparator histories than legal states.")
+
+    episode_keys = jax.random.split(root_key, episode_count)
+    selection_key = jax.random.fold_in(root_key, 0x434F4D50)
+    flat_indexes = jnp.sort(
+        jax.random.choice(
+            selection_key,
+            flat_count,
+            shape=(anchor_count,),
+            replace=False,
+        )
+    )
+    time_indexes = past + flat_indexes // episode_count
+    episode_indexes = flat_indexes % episode_count
+    selected_episode_keys = episode_keys[episode_indexes]
+    records = _record_trajectories(
+        left=left,
+        right=right,
+        environment=environment,
+        episode_keys=selected_episode_keys,
+    )
+    lane_indexes = jnp.arange(anchor_count, dtype=jnp.int32)
+    selected = _gather_time_episode(records, time_indexes, lane_indexes)
+    agent = "agent_0" if role == 0 else "agent_1"
+    action_field = "left_action" if role == 0 else "right_action"
+    observation_rows = []
+    action_rows = []
+    for offset in range(past):
+        history_time = time_indexes - past + offset
+        observation_rows.append(
+            records["observations"][agent][history_time, lane_indexes]
+        )
+        action_rows.append(records[action_field][history_time, lane_indexes])
+    history = ProbeHistory(
+        ego_actions=jnp.stack(action_rows, axis=1),
+        ego_observations=jnp.stack(observation_rows, axis=1),
+    )
+    anchor_episode_keys = episode_keys[episode_indexes]
+    anchor_roots = jax.vmap(
+        lambda key, time: jax.random.fold_in(
+            jax.random.fold_in(key, 0x434F4D50), time
+        )
+    )(anchor_episode_keys, time_indexes.astype(jnp.uint32))
+    if bool(np.any(np.asarray(selected["done"]["__all__"]))):
+        raise RuntimeError("A comparator snapshot was terminal before intervention.")
+    return {
+        "selected": selected,
+        "history": history,
+        "flat_indexes": flat_indexes,
+        "time_indexes": time_indexes,
+        "episode_indexes": episode_indexes,
+        "anchor_roots": anchor_roots,
+    }
+
+
 def empirical_all_action_continuations_from_snapshots(
     *,
     left: Any,
@@ -447,7 +542,9 @@ def empirical_all_action_continuations_from_snapshots(
     rows = np.arange(anchor_count)
     return {
         "fit_returns_by_action": fit,
+        "fit_replica_returns_by_action": values[..., :fit_count],
         "evaluation_returns_by_action": evaluation,
+        "evaluation_replica_returns_by_action": values[..., fit_count:],
         "selected_action": selected_host,
         "selected_evaluation_return": evaluation[rows, selected_host],
         "fit_oracle_action": oracle,
@@ -726,6 +823,7 @@ def run_common_br_prox(args: argparse.Namespace) -> None:
 
 __all__ = [
     "empirical_all_action_continuations_from_snapshots",
+    "record_official_history_anchor_snapshots",
     "empirical_official_br_prox_pairing",
     "record_official_anchor_snapshots",
     "run_common_br_prox",
