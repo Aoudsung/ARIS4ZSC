@@ -1,67 +1,151 @@
-# DEPI 开发矩阵执行规格
+# Unified DELTA-ZSC 开发矩阵
 
-本文件是 [`METHOD_SPEC.md`](../METHOD_SPEC.md) 与
-[`EVALUATION_SPEC.md`](../EVALUATION_SPEC.md) 的执行说明；注册数字以权威文档、配置和
-fail-closed 代码为准。
+`authoritative: false`
 
-## 1. 问题
+本文件是 `EVALUATION_SPEC.md` 的执行说明，不新增方法、阈值或论文claim。
 
-- `B0-R0`：task-only recurrence + instantaneous partner branch 能否与强 full-history RNN
-  竞争？该差值不是组件严格增量。
-- `B1-B0`：打开 capability/exact response filter 后是否有正增量？
-- `B2-B1`：真实 continuation 的 decision supervision 是否有额外正增量？
-- `B2-R0/B0/B1-extra`：相同总 simulator cost 下，监督是否优于更多普通 PPO 数据？
-- K sensitivity：以上结论是否只依赖一个 latent component count？
-- 七项机制消融：deterministic context、decision-only、Q-only、actor-only、no-separation、
-  no-capability、response-only-posterior 是否排除了更简单解释？
+## 1. 目标
 
-B3 未实现，不进入任何格。
+开发实验只回答四个必要问题：
 
-## 2. 格与共同控制
+1. base policy能否形成可靠任务能力；
+2. response latent model能否从合法历史预测伙伴响应；
+3. privileged decision emission是否带来joint相对response-only的XP增量；
+4. joint参数开启解析VOI后是否进一步改善或损害performance。
 
-K=4/seed 执行 R0、B0、B1、B2、R0-extra、B0-extra、B1-extra，以及 deterministic-context、
-decision-only、Q-only、actor-only、no-separation、no-capability、response-only-posterior。
-K=2/8 只执行 B1/B2 sensitivity。所有格共享 partner sampler、deployable capacity、named key
-domains、Official 环境和 evaluator。
+不再逐条验证旧审稿补丁。
 
-core 四格的主 PPO transitions 相同；B2 continuation/probe 额外列账。R0/B0/B1 不采集后
-丢弃 anchors。extra 两格用普通 PPO 精确替换 B2 的 auxiliary transition cost，并与 B2 的
-total training simulator steps 相等。tail 不足标准 rollout 时使用注册 fixed-shape tail
-kernel，不能向上取整成本。
+## 2. 主矩阵
 
-## 3. 训练
+每个layout使用paired seeds 0–4：
 
-先用独立 comparator-fit/validation parents 和固定 Official reference ego checkpoint 运行
-`collect-pair-comparator-source`，再以生成的严格 source 运行 `fit-pair-comparator`。随后
-`run-development-matrix` 接收 development config、partner manifest、冻结 comparator、固定
-seed indexes 0--9 和输出目录。命令按注册分层矩阵生成 config 并调用同一训练
-入口。
+| Training | Evaluation policies | 科学作用 |
+|---|---|---|
+| `base` | base | 无历史适应基座 |
+| `response_only` | response-only | response inference但无decision adaptation |
+| `joint` | joint、full | decision-emitting latent；full只开启解析VOI |
 
-`development_matrix.json` 每格绑定 run identity、config path/hash/fingerprint、partner pool
-hash、resource ledger、PPO/auxiliary/total steps、deployable capacity 和 episode-key domains。
-写 artifact 前逐 seed fail-closed 验证双重预算、容量、sampler 和 keys。
+每layout只有15个训练run，而不是旧版的大规模variant笛卡尔积。
 
-## 4. raw evaluator
+## 3. 强制一致性
 
-对每个 K/variant 运行一次 `evaluate-development-matrix`。它加载该格所有 deployment，使用
-固定 Official evaluator 对全部有序 policy pairs 运行注册 episodes，并保存：
+同layout/seed的base、response-only、joint必须共享：
 
-- `episode_returns.parquet`：left/right seed、两种角色、有序 pairing、episode index、raw
-  return、key-schedule hash；
-- `development_evaluation.json`：matrix/config/deployment hashes、episode count、schedule、
-  raw parquet hash；
-- run identity 与 resource ledger。
+- config中除variant外的全部字段；
+- partner manifest与sampler；
+- rollout/environment/action keys；
+- base initialization；
+- PPO minibatch permutations；
+- PPO steps；
+- base optimizer。
 
-不得提交自由格式 score JSON。
+由于latent model不会影响training behavior policy，同seed三条run的final base parameter fingerprint必须完全一致。任何不一致表示代码路径泄漏，不能进入统计summary。
 
-## 5. summary
+## 4. Development evaluation
 
-`summarize-development-matrix` 只接受完整 evaluation directories。它重新验证 deployment/raw
-hash、episode 数、双方角色与 schedule，并从 episode rows 内部重算每 seed XP。对每个 K
-生成 `B0-R0`、`B1-B0`、`B2-B1`、`B2-B0`、`B2-R0-extra`、`B2-B0-extra`、`B2-B1-extra` 和
-B2 对七项机制消融的 paired 99% interval。B2 的 final component diagnostics 在同一只读
-comparator validation history panel 上生成 `[anchor,K,action]` 张量，对每个 K 执行
-permutation-aligned cross-seed stability 重算。
+每个deployment在同一development-only partner panel上：
 
-formal claim builder 再次回溯这些 raw rows 并重算 summary；手写均值、boolean 或区间不能
-解锁任何主张。负结果、跨零、缺格和失败 seed 必须保留。
+- 双角色；
+- 每pairing 100 episodes；
+- shared episode keys；
+- raw unshaped return；
+-保存per-episode parquet。
+
+主要paired contrasts：
+
+```text
+joint - response_only
+full - joint
+full - base
+```
+
+其中只有 `joint-response_only` 对应H2机制pilot；其他用于性能和VOI诊断。
+
+## 5. K诊断
+
+在预注册的一个layout和seeds 0–4，仅训练joint：
+
+```text
+K=2
+K=4
+K=8
+```
+
+比较：
+
+- held-out response NLL；
+- decision NLL与evaluation-replica ordering；
+- joint XP；
+- belief utilization；
+- inference latency；
+- fully loaded cost。
+
+K选择不能只依据最高XP；若多个K统计接近，选择更小模型。K在confirmatory前冻结。
+
+## 6. Pilot功效
+
+以paired seed difference估计：
+
+\[
+\hat\sigma_\Delta
+=SD(J_{joint,s}-J_{response,s}).
+\]
+
+使用20分最小效果、预注册alpha和目标power估计正式seed数。正式协议已固定10 seeds；pilot只用于判断development是否需要从5扩展到10，而不改变正式规模。
+
+## 7. Anchor预算
+
+joint训练每隔固定outer updates从当前base rollout采集anchors。anchors：
+
+- 只用当前rollout；
+-一次性进入当前latent update；
+- 不matched、不pair、不replay；
+- fit/evaluation replicas分离；
+- 所有action branches共享CRN。
+
+Development记录effective anchor count、standard errors、decision NLL和额外simulator steps。若anchor噪声过高，应修改采样数的统计设计，而不是增加confidence loss。
+
+## 8. 失败解释
+
+- response-only response NLL无增量：response model或伙伴分布不支持latent modes；
+- joint decision NLL好但XP无增量：decision geometry未转化为有效KL adaptation；
+- joint优于response-only但causal belief value≤0：增量可能来自其他训练效应，H3不成立；
+- full低于joint：myopic VOI近似不适用，保留joint为passive方法；
+- full与joint相同且VOI≈0：当前response不提供可利用主动信息；
+- base很弱：先修复基础任务训练，不通过加大adaptation弥补。
+
+任何失败都不得触发旧式“新增一个loss和一个消融”的默认响应。
+
+## 9. 资源上限
+
+开发主矩阵：
+
+```text
+3 training variants × 5 seeds × 2 layouts = 30 runs
+```
+
+K诊断：
+
+```text
+3 K values × 5 seeds × 1 layout = 15 joint runs
+```
+
+其中K=4主joint可复用，新增约10 runs。总开发训练不超过40个独立run；full不训练。
+
+这使development规模足以估计关键增量，同时避免旧版数百run矩阵。
+
+## 10. 输出
+
+每个run生成：
+
+```text
+run_identity.json
+partner_pool.json
+metrics.jsonl
+checkpoints/
+final_deployment/
+resource_ledger.json
+training_summary.json
+```
+
+每个evaluation生成raw parquet、identity、summary和resource ledger。开发summary必须验证base fingerprints和paired keys，不接受手工score文件。
