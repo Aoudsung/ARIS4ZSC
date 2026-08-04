@@ -1,7 +1,7 @@
-"""DEPI deployable model: three-pathway recurrent policy (METHOD_SPEC §1).
+"""Executable B0--B2 model family for DEPI (METHOD_SPEC §1/§8).
 
-One task encoder (x_t), one capability encoder (u) and one protocol encoder
-(pi_t over K=4 regimes) share the single actor/critic interface
+One task encoder (x_t), one capability encoder (u), and one exact protocol
+filter (pi_t over K=4 exchangeable components) share the actor/critic interface
 ``(task_features, context=concat(u, c_t))``.  The observation difference is
 computed inside the capability/protocol pathway; the task pathway only ever
 sees the current observation (structural input-layer isolation, §1.1/§1.2).
@@ -29,31 +29,35 @@ def _model_class() -> Any:
     import jax
     import jax.numpy as jnp
 
-    from .belief_set_encoder import mixture_summary, prior_mixture_summary
+    from .protocol_mixture import mixture_summary, prior_mixture_summary
     from .protocol_encoder import (
         capability_encoder_classes,
+        exact_bayes_filter_step,
         posterior_entropy,
-        protocol_encoder_classes,
     )
     from .response_decoder import response_decoder_class
-    from .response_targets import ResponsePrediction
+    from .response_targets import (
+        ResponsePrediction,
+        component_joint_log_probability,
+        extract_partner_response_targets,
+        official_partner_observation_planes,
+    )
     from .task_encoder import task_encoder_classes
     from .universal_actor import universal_actor_class
     from .universal_critic import universal_critic_class
 
     TaskCell, _ = task_encoder_classes()
     CapabilityCell = capability_encoder_classes()
-    ProtocolCell = protocol_encoder_classes()
     Actor = universal_actor_class()
     Critic = universal_critic_class()
     Decoder = response_decoder_class()
 
-    class DELTAZSCModel(nn.Module):
+    class DEPIModel(nn.Module):
+        method_variant: str
         observation_shape: tuple[int, ...]
         action_count: int
         task_hidden_dim: int
         capability_hidden_dim: int
-        protocol_hidden_dim: int
         capability_dim: int
         protocol_components: int
         component_embedding_dim: int
@@ -66,6 +70,7 @@ def _model_class() -> Any:
         def setup(self) -> None:
             self.task_cell = TaskCell(
                 hidden_dim=self.task_hidden_dim,
+                mask_partner_history=self.method_variant != "b0",
                 name="task_encoder",
             )
             self.capability_cell = CapabilityCell(
@@ -74,13 +79,6 @@ def _model_class() -> Any:
                 action_count=self.action_count,
                 action_embedding_dim=self.action_embedding_dim,
                 name="capability_encoder",
-            )
-            self.protocol_cell = ProtocolCell(
-                hidden_dim=self.protocol_hidden_dim,
-                component_count=self.protocol_components,
-                action_count=self.action_count,
-                action_embedding_dim=self.action_embedding_dim,
-                name="protocol_encoder",
             )
             # Shared K x D component embeddings m_k (METHOD_SPEC §1.1); the
             # posterior-mean context c_t and the response mixture both read it.
@@ -131,22 +129,54 @@ def _model_class() -> Any:
             next_capability_carry, capability = self.capability_cell(
                 state.capability_carry, evidence
             )
-            # ``protocol_carry`` stores (gru_hidden, previous posterior): the
-            # amortized filter recursion feeds pi_{t-1} back into the GRU input
-            # and the log-sticky correction (METHOD_SPEC §2.3).
-            protocol_gru_carry, previous_probs = state.protocol_carry
-            previous_probs = jnp.asarray(previous_probs, dtype=jnp.float32)
+            # ``protocol_carry`` is exactly the previous categorical
+            # posterior.  There is no recurrent recognition-network carry in
+            # the deployable policy: the shared response likelihood supplies
+            # only the newly observed emission evidence and the registered
+            # sticky transition is applied exactly once.
+            previous_probs = jnp.asarray(
+                state.protocol_carry, dtype=jnp.float32
+            )
             # Episode starts restart the filter from the uniform prior (§2.1).
             previous_probs = jnp.where(
                 start[..., None],
                 jnp.full_like(previous_probs, 1.0 / float(self.protocol_components)),
                 previous_probs,
             )
-            next_protocol_gru_carry, protocol_logits = self.protocol_cell(
-                protocol_gru_carry, evidence + (previous_probs,)
-            )
-            protocol_probabilities = jax.nn.softmax(protocol_logits, axis=-1)
             component_matrix = self._component_matrix()
+            previous_capability = state.context_summary[..., : self.capability_dim]
+            emission_values = self.decoder(
+                jax.lax.stop_gradient(state.previous_observation),
+                jax.lax.stop_gradient(state.task_carry),
+                component_matrix,
+                previous_capability,
+                jnp.where(start, 0, state.previous_action),
+            )
+            emission_prediction = ResponsePrediction(
+                posterior_log_probabilities=jnp.log(
+                    jnp.maximum(previous_probs, 1.0e-12)
+                ),
+                visibility_logit=emission_values[0],
+                relative_position_logits=emission_values[1],
+                direction_logits=emission_values[2],
+                inventory_logits=emission_values[3],
+                interaction_change_logit=emission_values[4],
+            )
+            planes = official_partner_observation_planes(observation.shape[-1])
+            observed_response = extract_partner_response_targets(
+                state.previous_observation, observation, planes=planes
+            )
+            emission_log_likelihood = component_joint_log_probability(
+                emission_prediction, observed_response
+            )
+            filtered = exact_bayes_filter_step(
+                previous_probs, emission_log_likelihood
+            )
+            protocol_probabilities = jnp.where(
+                start[..., None],
+                jnp.full_like(filtered, 1.0 / float(self.protocol_components)),
+                filtered,
+            )
             protocol_embedding = mixture_summary(
                 protocol_probabilities, component_matrix
             )
@@ -157,7 +187,7 @@ def _model_class() -> Any:
             next_state = PolicyState(
                 task_carry=next_task_carry,
                 capability_carry=next_capability_carry,
-                protocol_carry=(next_protocol_gru_carry, protocol_probabilities),
+                protocol_carry=protocol_probabilities,
                 context_summary=summary,
                 previous_observation=observation.astype(
                     state.previous_observation.dtype
@@ -196,6 +226,11 @@ def _model_class() -> Any:
                 context=context, context_dropout_mask=context_dropout_mask
             )
             summary = jnp.concatenate((behavior_capability, behavior_embedding), axis=-1)
+            # B0 is the capacity-matched full-observation recurrent PPO
+            # baseline.  Its actor/critic cannot consume explicit protocol
+            # state even though inert matching parameters remain present.
+            if self.method_variant == "b0":
+                summary = jnp.zeros_like(summary)
             logits = self.actor(context.task_features, summary)
             state_value, raw_q1, raw_q2 = self.critic(context.task_features, summary)
             return ModelOutput(
@@ -291,6 +326,7 @@ def _model_class() -> Any:
             component_matrix = self._component_matrix()
             values = self.decoder(
                 jax.lax.stop_gradient(frame_features),
+                jax.lax.stop_gradient(context.task_features),
                 component_matrix,
                 context.capability,
                 action,
@@ -382,8 +418,8 @@ def _model_class() -> Any:
                 context_dropout_masks,
             )
 
-    _MODEL_CLASS = DELTAZSCModel
-    return DELTAZSCModel
+    _MODEL_CLASS = DEPIModel
+    return DEPIModel
 
 
 def build_model(
@@ -392,7 +428,6 @@ def build_model(
     action_count: int,
     task_hidden_dim: int,
     capability_hidden_dim: int,
-    protocol_hidden_dim: int,
     capability_dim: int,
     protocol_components: int,
     component_embedding_dim: int,
@@ -401,21 +436,76 @@ def build_model(
     response_hidden_dim: int,
     modulation_rank: int,
     action_embedding_dim: int,
+    method_variant: str = "b2",
 ) -> Any:
+    kwargs = {
+        "observation_shape": observation_shape,
+        "action_count": action_count,
+        "task_hidden_dim": task_hidden_dim,
+        "capability_hidden_dim": capability_hidden_dim,
+        "capability_dim": capability_dim,
+        "protocol_components": protocol_components,
+        "component_embedding_dim": component_embedding_dim,
+        "actor_hidden_dim": actor_hidden_dim,
+        "critic_hidden_dim": critic_hidden_dim,
+        "response_hidden_dim": response_hidden_dim,
+        "modulation_rank": modulation_rank,
+        "action_embedding_dim": action_embedding_dim,
+    }
+    variant = str(method_variant).lower()
+    if variant == "b0":
+        return build_b0_full_history_ppo(**kwargs)
+    if variant == "b1":
+        return build_b1_protocol_architecture(**kwargs)
+    if variant == "b2":
+        return build_b2_decision_supervision(**kwargs)
+    if variant == "b3":
+        return build_b3_active_voi()
+    raise ValueError("method_variant must be one of b0, b1, b2, b3.")
+
+
+def _build_variant(*, method_variant: str, **kwargs: Any) -> Any:
     return _model_class()(
-        observation_shape=tuple(int(value) for value in observation_shape),
-        action_count=int(action_count),
-        task_hidden_dim=int(task_hidden_dim),
-        capability_hidden_dim=int(capability_hidden_dim),
-        protocol_hidden_dim=int(protocol_hidden_dim),
-        capability_dim=int(capability_dim),
-        protocol_components=int(protocol_components),
-        component_embedding_dim=int(component_embedding_dim),
-        actor_hidden_dim=int(actor_hidden_dim),
-        critic_hidden_dim=int(critic_hidden_dim),
-        response_hidden_dim=int(response_hidden_dim),
-        modulation_rank=int(modulation_rank),
-        action_embedding_dim=int(action_embedding_dim),
+        method_variant=method_variant,
+        observation_shape=tuple(int(value) for value in kwargs["observation_shape"]),
+        action_count=int(kwargs["action_count"]),
+        task_hidden_dim=int(kwargs["task_hidden_dim"]),
+        capability_hidden_dim=int(kwargs["capability_hidden_dim"]),
+        capability_dim=int(kwargs["capability_dim"]),
+        protocol_components=int(kwargs["protocol_components"]),
+        component_embedding_dim=int(kwargs["component_embedding_dim"]),
+        actor_hidden_dim=int(kwargs["actor_hidden_dim"]),
+        critic_hidden_dim=int(kwargs["critic_hidden_dim"]),
+        response_hidden_dim=int(kwargs["response_hidden_dim"]),
+        modulation_rank=int(kwargs["modulation_rank"]),
+        action_embedding_dim=int(kwargs["action_embedding_dim"]),
+    )
+
+
+def build_b0_full_history_ppo(**kwargs: Any) -> Any:
+    """Capacity-matched full-observation recurrent PPO baseline."""
+
+    return _build_variant(method_variant="b0", **kwargs)
+
+
+def build_b1_protocol_architecture(**kwargs: Any) -> Any:
+    """Structurally isolated task/protocol architecture trained by PPO."""
+
+    return _build_variant(method_variant="b1", **kwargs)
+
+
+def build_b2_decision_supervision(**kwargs: Any) -> Any:
+    """B1 architecture with legal all-action decision supervision."""
+
+    return _build_variant(method_variant="b2", **kwargs)
+
+
+def build_b3_active_voi(**unused_kwargs: Any) -> Any:
+    """Fail closed until action-conditioned value of information exists."""
+
+    del unused_kwargs
+    raise NotImplementedError(
+        "B3 action-conditioned VOI is not implemented and cannot produce a model."
     )
 
 
@@ -426,17 +516,13 @@ def initial_policy_state(
     action_count: int,
     task_hidden_dim: int,
     capability_hidden_dim: int,
-    protocol_hidden_dim: int,
     capability_dim: int,
     component_embedding_dim: int,
     protocol_components: int = 4,
 ) -> PolicyState:
     import jax.numpy as jnp
 
-    from .protocol_encoder import (
-        initial_capability_carry,
-        initial_protocol_carry,
-    )
+    from .protocol_encoder import initial_capability_carry
     from .task_encoder import initial_task_carry
 
     count = int(batch_size)
@@ -445,14 +531,13 @@ def initial_policy_state(
     prior_summary = jnp.zeros((count, int(capability_dim) + int(component_embedding_dim)), dtype=jnp.float32)
     return PolicyState(
         task_carry=initial_task_carry(count, task_hidden_dim),
-        capability_carry=initial_capability_carry(count, capability_hidden_dim),
-        protocol_carry=(
-            initial_protocol_carry(count, protocol_hidden_dim),
-            jnp.full(
-                (count, int(protocol_components)),
-                1.0 / float(protocol_components),
-                dtype=jnp.float32,
-            ),
+        capability_carry=initial_capability_carry(
+            count, capability_hidden_dim, capability_dim
+        ),
+        protocol_carry=jnp.full(
+            (count, int(protocol_components)),
+            1.0 / float(protocol_components),
+            dtype=jnp.float32,
         ),
         context_summary=prior_summary,
         previous_observation=jnp.zeros(
@@ -481,6 +566,10 @@ def initialize_model_parameters(
 
 __all__ = [
     "ModelOutput",
+    "build_b0_full_history_ppo",
+    "build_b1_protocol_architecture",
+    "build_b2_decision_supervision",
+    "build_b3_active_voi",
     "build_model",
     "initial_policy_state",
     "initialize_model_parameters",

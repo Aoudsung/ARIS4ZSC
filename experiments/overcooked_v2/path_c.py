@@ -1,18 +1,18 @@
-"""Single command entry for DELTA-ZSC V6 E2E."""
+"""Single command entry for DEPI."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from experiments.overcooked_v2.calibration_app import run_safety_calibration
+from experiments.overcooked_v2.calibration_app import run_posterior_calibration
 from experiments.overcooked_v2.common_partner_app import run_common_partner_evaluation
 from experiments.overcooked_v2.manifest_app import add_manifest_command
 from experiments.overcooked_v2.mechanical_e2e_app import run_mechanical_e2e
 from experiments.overcooked_v2.official_baseline_app import run_official_baseline
 from experiments.overcooked_v2.official_br_prox_app import run_common_br_prox
 from experiments.overcooked_v2.official_evaluation_app import (
-    run_build_delta_policy_manifest,
+    run_build_depi_policy_manifest,
     run_capacity_summary,
     run_official_evaluation,
     run_official_summary,
@@ -22,6 +22,14 @@ from experiments.overcooked_v2.signal_audit_app import run_signal_audit
 from experiments.overcooked_v2.upstream_app import run_upstream
 from experiments.overcooked_v2.resource_report_app import run_resource_report
 from experiments.overcooked_v2.formal_claim_app import run_formal_claim_report
+from experiments.overcooked_v2.identifiability_app import (
+    run_identifiability_evaluation,
+    run_recoverable_value_evaluation,
+)
+from experiments.overcooked_v2.development_matrix_app import (
+    run_development_matrix,
+    summarize_development_matrix,
+)
 from src.path_c.experiment import (
     ENGINEERING_SEED_INDEX,
     RUN_KINDS,
@@ -44,11 +52,11 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         default=(
             "experiments/overcooked_v2/configs/"
-            "delta_zsc_simple_mechanical_e2e.yaml"
+            "depi_simple_mechanical_e2e.yaml"
         ),
     )
     mechanical.add_argument("--partner-manifest", required=True)
-    mechanical.add_argument("--ego-run-id", default="delta-zsc-v6-engineering")
+    mechanical.add_argument("--ego-run-id", default="depi-engineering")
     mechanical.add_argument("--require-cuda", action="store_true", default=False)
     mechanical.add_argument("--resume", action="store_true", default=False)
     mechanical.add_argument(
@@ -87,7 +95,7 @@ def _parser() -> argparse.ArgumentParser:
     baseline.add_argument("--fcp-population")
     baseline.add_argument("--fcp-population-ledger")
     baseline.add_argument("--training-lineage-manifest")
-    baseline.add_argument("--delta-deployment")
+    baseline.add_argument("--depi-deployment")
     baseline.add_argument("--output", required=True)
     baseline.set_defaults(function=run_official_baseline, manages_output=True)
 
@@ -99,7 +107,7 @@ def _parser() -> argparse.ArgumentParser:
         "--seed-index",
         type=int,
         choices=(ENGINEERING_SEED_INDEX, *range(10)),
-        help="Required for per-seed V6 initialization and training manifests.",
+        help="Required for per-seed DEPI initialization and training manifests.",
     )
     validate.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
@@ -113,14 +121,14 @@ def _parser() -> argparse.ArgumentParser:
             verify_files=not bool(args.skip_manifest_hash_check),
         )
         if args.run_kind == "formal" and args.seed_index is None:
-            raise ValueError("Formal V6 manifest validation requires --seed-index.")
+            raise ValueError("Formal DEPI manifest validation requires --seed-index.")
         if args.seed_index is not None:
             validate_seed_training_manifest(
                 manifest,
                 owner_seed_index=int(args.seed_index),
                 formal=(args.run_kind == "formal"),
             )
-        print(f"Valid DELTA-ZSC manifest: {len(manifest.runs)} runs")
+        print(f"Valid DEPI manifest: {len(manifest.runs)} runs")
 
     validate.set_defaults(function=validate_manifest, manages_output=False)
 
@@ -142,6 +150,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     train.set_defaults(function=run_training, manages_output=True)
 
+    matrix = commands.add_parser("run-development-matrix")
+    matrix.add_argument("--config", required=True)
+    matrix.add_argument("--partner-manifest", required=True)
+    matrix.add_argument(
+        "--seed-index", type=int, action="append", required=True, choices=range(10)
+    )
+    matrix.add_argument(
+        "--protocol-components",
+        type=int,
+        action="append",
+        choices=(2, 4, 8),
+        default=None,
+        help="Repeat exactly for K=2,4,8; omitted runs the full sensitivity set.",
+    )
+    matrix.add_argument("--output", required=True)
+    matrix.add_argument("--resume", action="store_true")
+    matrix.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    matrix.set_defaults(function=run_development_matrix, manages_output=True)
+
+    matrix_summary = commands.add_parser("summarize-development-matrix")
+    matrix_summary.add_argument("--matrix", required=True)
+    matrix_summary.add_argument("--scores", required=True)
+    matrix_summary.add_argument("--output", required=True)
+    matrix_summary.set_defaults(
+        function=summarize_development_matrix, manages_output=True
+    )
+
     cuda_preflight = commands.add_parser("cuda-preflight")
     cuda_preflight.add_argument("--config", required=True)
     cuda_preflight.add_argument("--partner-manifest", required=True)
@@ -152,7 +189,7 @@ def _parser() -> argparse.ArgumentParser:
         default=ENGINEERING_SEED_INDEX,
     )
     cuda_preflight.add_argument(
-        "--ego-run-id", default="delta-zsc-formal-cuda-preflight"
+        "--ego-run-id", default="depi-formal-cuda-preflight"
     )
     cuda_preflight.add_argument("--output", required=True)
     cuda_preflight.add_argument(
@@ -165,7 +202,7 @@ def _parser() -> argparse.ArgumentParser:
         resume=False,
     )
 
-    calibrate = commands.add_parser("calibrate-safety")
+    calibrate = commands.add_parser("calibrate-posterior")
     calibrate.add_argument("--config", required=True)
     calibrate.add_argument("--partner-manifest", required=True)
     calibrate.add_argument("--training-run", required=True)
@@ -180,18 +217,44 @@ def _parser() -> argparse.ArgumentParser:
     calibrate.add_argument(
         "--skip-manifest-hash-check", action="store_true", default=False
     )
-    calibrate.set_defaults(function=run_safety_calibration, manages_output=True)
+    calibrate.set_defaults(function=run_posterior_calibration, manages_output=True)
 
     audit = commands.add_parser("audit-signals")
     audit.add_argument("--training-run", required=True)
     audit.add_argument("--output", required=True)
     audit.set_defaults(function=run_signal_audit, manages_output=True)
 
-    delta_manifest = commands.add_parser("build-delta-policy-manifest")
-    delta_manifest.add_argument("--deployments", nargs=10, required=True)
-    delta_manifest.add_argument("--output", required=True)
-    delta_manifest.set_defaults(
-        function=run_build_delta_policy_manifest, manages_output=False
+    identifiability = commands.add_parser("evaluate-identifiability")
+    identifiability.add_argument("--raw-input")
+    identifiability.add_argument("--config")
+    identifiability.add_argument("--policy-manifest")
+    identifiability.add_argument("--partner-manifest")
+    identifiability.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    identifiability.add_argument("--output", required=True)
+    identifiability.set_defaults(
+        function=run_identifiability_evaluation, manages_output=True
+    )
+
+    recoverable = commands.add_parser("evaluate-recoverable-value")
+    recoverable.add_argument("--raw-input")
+    recoverable.add_argument("--config")
+    recoverable.add_argument("--policy-manifest")
+    recoverable.add_argument("--partner-manifest")
+    recoverable.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    recoverable.add_argument("--output", required=True)
+    recoverable.set_defaults(
+        function=run_recoverable_value_evaluation, manages_output=True
+    )
+
+    depi_manifest = commands.add_parser("build-depi-policy-manifest")
+    depi_manifest.add_argument("--deployments", nargs=10, required=True)
+    depi_manifest.add_argument("--output", required=True)
+    depi_manifest.set_defaults(
+        function=run_build_depi_policy_manifest, manages_output=False
     )
 
     official = commands.add_parser("evaluate-official")
@@ -207,6 +270,12 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="LAYOUT:METHOD=/official/evaluation/directory; provide all ten",
     )
+    official_summary.add_argument(
+        "--config",
+        action="append",
+        required=True,
+        help="LAYOUT=/formal/config.yaml; provide Simple and Wide preregistrations",
+    )
     official_summary.add_argument("--output", required=True)
     official_summary.set_defaults(function=run_official_summary, manages_output=True)
 
@@ -215,7 +284,7 @@ def _parser() -> argparse.ArgumentParser:
         "--result",
         action="append",
         required=True,
-        help="LAYOUT:METHOD=/official/evaluation/directory; DELTA and IPPO-Large on both layouts",
+        help="LAYOUT:METHOD=/official/evaluation/directory; DEPI and IPPO-Large on both layouts",
     )
     capacity_summary.add_argument("--output", required=True)
     capacity_summary.set_defaults(function=run_capacity_summary, manages_output=True)
@@ -267,7 +336,13 @@ def _parser() -> argparse.ArgumentParser:
     claims.add_argument("--common-wide", required=True)
     claims.add_argument("--capacity-summary", required=True)
     claims.add_argument("--resource-report", required=True)
-    claims.add_argument("--ablation-gate")
+    claims.add_argument("--development-matrix", required=True)
+    claims.add_argument("--posterior-calibration-simple", required=True)
+    claims.add_argument("--posterior-calibration-wide", required=True)
+    claims.add_argument("--identifiability-simple", required=True)
+    claims.add_argument("--identifiability-wide", required=True)
+    claims.add_argument("--recoverable-value-simple", required=True)
+    claims.add_argument("--recoverable-value-wide", required=True)
     claims.add_argument("--output", required=True)
     claims.set_defaults(function=run_formal_claim_report, manages_output=True)
 

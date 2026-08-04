@@ -1,51 +1,53 @@
-# 研究总纲
+# DEPI 研究计划
 
-本仓库文档体系的入口。2026-08-03 文档重构后，体系顶层是研究方案，契约内容降级为确认轨协议附卷。
+本计划只记录研究阶段与决策逻辑。所有注册数字、seed、预算、版本和门限都只链接权威合同，
+避免产生第二个容易漂移的来源。
 
-## 这个研究想干什么
+## 当前目标
 
-一句话：搞清楚零样本协调的差距到底在哪一环，然后按证据决定往哪押注。
+在 OvercookedV2 Test-Time Protocol Formation 固定任务上，先证明当前实现忠实满足
+[`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) 和 [`METHOD_SPEC.md`](METHOD_SPEC.md)，再用
+[`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 检验 B1 的结构增量、B2 的决策监督增量以及
+held-out partner performance。机制归因必须闭合“合法历史—posterior/context—empirical
+action ordering—真实 continuation—XP”链条。
 
-过去的文档体系把工程契约放在顶层：注册身份、门控、冻结协议写满了三份主文档，真正的科学问题压在 legacy 归档里。重构把顺序翻了过来。现在顶层是候选论点、判决性实验和理论预测，契约退到附卷，只管"S5 正式实验怎么做才有效"。
+## 阶段与决策
 
-中心论点状态（2026-08-03 裁决与人类复议）：主论点 Θ2（信息时序定理生态验证），次论点 Θ5（分解链诊断）；**Θ3 复活为方法载体论点**（V6 端到端 Bayes 协调为载体，复议依据见 [THESIS_CANDIDATES](research/THESIS_CANDIDATES.md) 末节）。核心原则：在 OvercookedV2 benchmark 中超越 SOTA 的 performance 是唯一核心目标，方法轨是唯一关键路径，理论/诊断轨为并行旁路、无阻塞权。
+### R0：实现一致性
 
-## 当前阶段与唯一下一步
+代码、配置、checkpoint/deployment schema、CLI、测试和 active 文档使用同一方法身份；删除
+被取代的生成式训练状态、连续 latent、重复 optimizer 和不可达模块；通过静态禁词、compile、
+全量 CPU 单测与 checkpoint/resume/deployment round-trip。
 
-探索轨，论点已裁决。唯一下一步：方法轨关键路径——执行 M1 preflight（V6 单 seed，价值排序 preflight 门槛值跑前入台账；失败则换载体，不停止目标）。并行旁路（不阻塞方法轨）：E5 插入式 Bayes 路由器对撞（H3/P4，见 [TRAJECTORY_AND_ESTIMATION_SPEC](research/TRAJECTORY_AND_ESTIMATION_SPEC.md) §5）、旁路诊断写表（Θ5 面板读数回填）。详见[仪表盘](status/DASHBOARD.md)。
+### R1：机械与 CUDA acceptance
 
-## 研究层文档地图
+按 [`FORMAL_EXPERIMENT_PROTOCOL.md`](FORMAL_EXPERIMENT_PROTOCOL.md) 运行 mechanical E2E 和
+单 CUDA preflight。若 exact filter、joint likelihood、combined update、anchor continuation、
+resume 或显存门任一失败，返回实现修复，不进入科学比较。
 
-| 文档 | 一句话定位 |
-|---|---|
-| [research/THESIS_CANDIDATES](research/THESIS_CANDIDATES.md) | 五个候选论点、falsifier、四维评估、裁决留空 |
-| [research/RESEARCH_THESIS](research/RESEARCH_THESIS.md) | 中心论点，初版只含已排除假说，裁决后展开 |
-| [research/LITERATURE_MATRIX](research/LITERATURE_MATRIX.md) | 文献卡片与生态位图谱 |
-| [research/EXPERIMENT_LADDER](research/EXPERIMENT_LADDER.md) | S1 到 S5 判决性实验阶梯 |
-| [research/THEORY_PREDICTIONS](research/THEORY_PREDICTIONS.md) | 理论的定量预测表与失配条款 |
-| [research/PAPER_STANDARD](research/PAPER_STANDARD.md) | 顶会标准：主张层级、定理清单、基线注册、表图设计与审稿防御 |
-| [research/SOTA_BASELINE](research/SOTA_BASELINE.md) | SOTA 基线注册专页：布局映射、已发表数值、判决式与口径偏移披露 |
-| [research/TRACKS_AND_GOVERNANCE](research/TRACKS_AND_GOVERNANCE.md) | 探索轨与确认轨规则、晋升门 |
-| [status/DASHBOARD](status/DASHBOARD.md) | 活仪表盘，当前阶段与唯一下一步 |
-| [status/EVIDENCE_LEDGER](status/EVIDENCE_LEDGER.md) | 只追加证据台账 |
+### R2：开发可证伪矩阵
 
-## 确认轨冻结协议（语义降级声明）
+执行 [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md)。先看 B1−B0 是否支持
+结构隔离，再看 B2−B1 是否支持 decision supervision；同时检查 K sensitivity、posterior
+calibration、M1 和真实 continuation 机制读数。失败即记录相应 falsifier，不通过调整正式 seed
+或报告口径挽救。
 
-以下三份文档的定位从"体系顶层设计"改写为**确认轨冻结协议**：它们定义 S5 正式实验的方法、矩阵与统计纪律，不再承担研究方案的职能。确认轨 commit 冻结前可正常修订，冻结后不得再改。
+### R3：冻结与正式执行
 
-- [theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md](theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md)，确认轨绑定设计。
-- [FORMAL_EXPERIMENT_PROTOCOL.md](FORMAL_EXPERIMENT_PROTOCOL.md)，S5 矩阵、记分板与 claim boundary。
-- [theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md)，方法内部引理。
+只有 R0–R2 的预注册门完成、合同无歧义且仓库 clean committed 后才 freeze。正式运行之后不再
+改变方法、依赖、配置、伙伴 panel 或统计。所有失败节点保留，所有 benchmark 结果发布。
 
-完整编目与解冻流程见 [PROTOCOL_INDEX](PROTOCOL_INDEX.md)。
+### R4：claim 边界
 
-## 归档层
+formal claim report 自动消费 Official、Common-Partner、容量、资源、开发矩阵、calibration、
+identifiability 和 recoverable-value artifacts。性能门与机制门分开；机制门失败时只撤回机制
+措辞，不删除性能结果。B3 在真实 action-conditioned value-of-information 实现、测试和新
+预注册完成前始终不进入结论。
 
-- [legacy/v44](legacy/v44/README.md)，V4.4 研究线全量归档，只读，断链不修。本方案的理论资产（信息价值分解链、TV 匹配界、历史需求定理）与三条负面证据都出自这里，引用时带证据指针。
-- [legacy/v5_r3](legacy/v5_r3/README.md)，根级旧副本归档，非权威。
+## 停止规则
 
-## 阅读顺序建议
-
-第一次读：本文档，然后 THESIS_CANDIDATES，然后 EXPERIMENT_LADDER。
-要动手做实验：EXPERIMENT_LADDER 找到所在级，对照 TRACKS_AND_GOVERNANCE 的轨道规则。
-要改方法：先读 PROTOCOL_INDEX 确认哪些文件碰不得。
+- 出现 F1+ 信息泄漏、partner lineage 重叠、标签使用学习价值、正式 seed 替换或 artifact
+  伪造：该实验系列无效，停止汇总。
+- 开发增量、calibration 或机制控制失败：接受反证，定位具体链路；不得直接扩大正式算力。
+- 正式运行数值失败：按合同报告，禁止改变方法后续跑同一注册节点。
+- 只有新假设、独立版本和新的事前合同才能启动下一实验系列。

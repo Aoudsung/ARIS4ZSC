@@ -53,6 +53,7 @@ class PartnerResponseTargets(NamedTuple):
     inventory: Any
     interaction_change: Any
     visible_mask: Any
+    event_mask: Any
 
 
 def official_partner_observation_planes(channel_count: int) -> PartnerObservationPlanes:
@@ -127,7 +128,7 @@ def extract_partner_response_targets(
         raise ValueError("Partner response observations have incompatible shapes.")
     height, width, channels = current.shape[-3:]
     if (height, width) != (5, 5):
-        raise ValueError("V6 response contract is registered for a 5x5 Official view.")
+        raise ValueError("DEPI response contract is registered for a 5x5 Official view.")
     planes.validate(channels)
 
     previous_visible_plane = previous[..., planes.visibility_channel] > 0
@@ -163,10 +164,14 @@ def extract_partner_response_targets(
         * visible_plane[..., None],
         axis=(-3, -2),
     )
-    interaction_change = jnp.any(
+    visible_inventory_change = jnp.any(
         jnp.rint(before_interaction) != jnp.rint(after_interaction), axis=-1
     )
-    interaction_change = previous_visible & visible & interaction_change
+    visible_inventory_change = previous_visible & visible & visible_inventory_change
+    # Only reproducible observation-level events are declared: a partner
+    # becoming visible/invisible or a visible inventory transition.  Intent
+    # labels such as yielding, contention, and waiting are deliberately absent.
+    interaction_change = (previous_visible != visible) | visible_inventory_change
     return PartnerResponseTargets(
         visibility=visible.astype(jnp.float32),
         relative_position=position.astype(jnp.int32),
@@ -174,6 +179,7 @@ def extract_partner_response_targets(
         inventory=inventory.astype(jnp.int32),
         interaction_change=interaction_change.astype(jnp.float32),
         visible_mask=visible.astype(jnp.float32),
+        event_mask=jnp.ones_like(visible, dtype=jnp.float32),
     )
 
 
@@ -196,15 +202,6 @@ def _binary_cross_entropy(logits: Any, labels: Any) -> Any:
     )
 
 
-def _categorical_log_probability(logits: Any, labels: Any) -> Any:
-    import jax.nn as jnn
-    import jax.numpy as jnp
-
-    prediction = jnp.asarray(logits, dtype=jnp.float32)
-    label = jnp.asarray(labels, dtype=jnp.int32)
-    return jnp.take_along_axis(jnn.log_softmax(prediction, axis=-1), label[..., None], axis=-1)[..., 0]
-
-
 def _bernoulli_log_probability(logits: Any, labels: Any) -> Any:
     import jax.numpy as jnp
 
@@ -215,6 +212,31 @@ def _bernoulli_log_probability(logits: Any, labels: Any) -> Any:
         - prediction * target
         + jnp.log1p(jnp.exp(-jnp.abs(prediction)))
     )
+
+
+def _component_categorical_log_probability(
+    logits: Any, labels: Any, *, factorized: bool = False
+) -> Any:
+    """Return target log probability while preserving the component axis K."""
+
+    import jax.nn as jnn
+    import jax.numpy as jnp
+
+    prediction = jnp.asarray(logits, dtype=jnp.float32)
+    label = jnp.asarray(labels, dtype=jnp.int32)
+    if factorized:
+        # logits [..., K, F, C], labels [..., F]
+        index = jnp.broadcast_to(
+            label[..., None, :, None], prediction.shape[:-1] + (1,)
+        )
+    else:
+        # logits [..., K, C], labels [...]
+        index = jnp.broadcast_to(
+            label[..., None, None], prediction.shape[:-1] + (1,)
+        )
+    return jnp.take_along_axis(
+        jnn.log_softmax(prediction, axis=-1), index, axis=-1
+    )[..., 0]
 
 
 def _mixture_log_probability(
@@ -240,6 +262,51 @@ def _masked_mean(values: Any, mask: Any | None) -> Any:
     return jnp.sum(weight * array) / jnp.maximum(jnp.sum(weight), 1.0)
 
 
+def component_joint_log_probability(
+    prediction: ResponsePrediction,
+    targets: PartnerResponseTargets,
+) -> Any:
+    """Log p(y | z=k, H, a) for the one shared latent component.
+
+    Every response head is combined *before* the single mixture
+    marginalization.  Consequently one component must jointly explain the
+    complete visible response, rather than allowing a different component for
+    each head.  Position is conditional on visibility, so the not-visible
+    position class is never double-counted.
+    """
+
+    import jax.numpy as jnp
+
+    visible = jnp.asarray(targets.visible_mask, dtype=jnp.float32)
+    visibility_target = jnp.asarray(targets.visibility, dtype=jnp.float32)[..., None]
+    event_target = jnp.asarray(targets.interaction_change, dtype=jnp.float32)[..., None]
+    visibility_lp = _bernoulli_log_probability(
+        prediction.visibility_logit, visibility_target
+    )
+    position_lp = _component_categorical_log_probability(
+        prediction.relative_position_logits, targets.relative_position
+    )
+    direction_lp = _component_categorical_log_probability(
+        prediction.direction_logits, targets.direction
+    )
+    inventory_lp = jnp.sum(
+        _component_categorical_log_probability(
+            prediction.inventory_logits, targets.inventory, factorized=True
+        ),
+        axis=-1,
+    )
+    event_lp = _bernoulli_log_probability(
+        prediction.interaction_change_logit, event_target
+    )
+    visible_component = visible[..., None]
+    event_valid = jnp.asarray(targets.event_mask, dtype=jnp.float32)[..., None]
+    return (
+        visibility_lp
+        + visible_component * (position_lp + direction_lp + inventory_lp)
+        + event_valid * event_lp
+    )
+
+
 def mixture_response_loss(
     prediction: ResponsePrediction,
     targets: PartnerResponseTargets,
@@ -248,50 +315,64 @@ def mixture_response_loss(
 ) -> PartnerResponseLosses:
     """Proper mixture negative log-likelihood L_response (METHOD_SPEC §2.3).
 
-    Per step the loss is
-    ``-[log p(vis) + log p(pos) + visible * (log p(dir) + log p(inv) + log p(event))]``
-    with every term marginalized over the K protocol components via
-    ``logsumexp(log pi_t + log p_k)``.  Direction/inventory/event terms are
-    only scored while the partner is visible (their labels are defined by the
-    visible partner planes).
+    A single component jointly explains all heads and the component is then
+    marginalized exactly once.  This is the registered shared-latent mixture
+    likelihood, not a sum of independently marginalized head losses.
     """
 
     import jax.numpy as jnp
 
     log_pi = prediction.posterior_log_probabilities
     visible = jnp.asarray(targets.visible_mask, dtype=jnp.float32)
+    component_logp = component_joint_log_probability(prediction, targets)
+    joint_lp = _mixture_log_probability(log_pi, component_logp)
+    per_step_nll = -joint_lp
+    total = _masked_mean(per_step_nll, mask)
+
+    # Head metrics are descriptive posterior-predictive marginals.  They do
+    # not contribute separately to ``total``.
     visibility_lp = _mixture_log_probability(
-        log_pi, _bernoulli_log_probability(prediction.visibility_logit, targets.visibility)
+        log_pi,
+        _bernoulli_log_probability(
+            prediction.visibility_logit,
+            jnp.asarray(targets.visibility, dtype=jnp.float32)[..., None],
+        ),
     )
     position_lp = _mixture_log_probability(
         log_pi,
-        _categorical_log_probability(prediction.relative_position_logits, targets.relative_position),
+        _component_categorical_log_probability(
+            prediction.relative_position_logits, targets.relative_position
+        ),
     )
     direction_lp = _mixture_log_probability(
-        log_pi, _categorical_log_probability(prediction.direction_logits, targets.direction)
+        log_pi,
+        _component_categorical_log_probability(
+            prediction.direction_logits, targets.direction
+        ),
     )
-    inventory_component_lp = jnp.sum(
-        _categorical_log_probability(prediction.inventory_logits, targets.inventory),
-        axis=-1,
+    inventory_lp = _mixture_log_probability(
+        log_pi,
+        jnp.sum(
+            _component_categorical_log_probability(
+                prediction.inventory_logits, targets.inventory, factorized=True
+            ),
+            axis=-1,
+        ),
     )
-    inventory_lp = _mixture_log_probability(log_pi, inventory_component_lp)
     event_lp = _mixture_log_probability(
         log_pi,
         _bernoulli_log_probability(
-            prediction.interaction_change_logit, targets.interaction_change
+            prediction.interaction_change_logit,
+            jnp.asarray(targets.interaction_change, dtype=jnp.float32)[..., None],
         ),
     )
-    per_step_nll = -(
-        visibility_lp + position_lp + visible * (direction_lp + inventory_lp + event_lp)
-    )
-    total = _masked_mean(per_step_nll, mask)
     return PartnerResponseLosses(
         total,
         _masked_mean(-visibility_lp, mask),
-        _masked_mean(-position_lp, mask),
+        _masked_mean(-visible * position_lp, mask),
         _masked_mean(-visible * direction_lp, mask),
         _masked_mean(-visible * inventory_lp, mask),
-        _masked_mean(-visible * event_lp, mask),
+        _masked_mean(-jnp.asarray(targets.event_mask) * event_lp, mask),
     )
 
 
@@ -303,6 +384,7 @@ __all__ = [
     "PartnerResponseLosses",
     "PartnerResponseTargets",
     "ResponsePrediction",
+    "component_joint_log_probability",
     "extract_partner_response_targets",
     "mixture_response_loss",
     "official_partner_observation_planes",

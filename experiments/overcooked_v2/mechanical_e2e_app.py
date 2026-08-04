@@ -1,4 +1,4 @@
-"""Mechanical end-to-end harness for the single DELTA-ZSC V6 algorithm."""
+"""Mechanical end-to-end harness for DEPI."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from src.path_c.storage import read_run_identity, write_json
 
 
 def run_mechanical_e2e(args: argparse.Namespace) -> None:
-    """Run the actual V6 loop and verify its mandatory terminal artifacts.
+    """Run the actual DEPI loop and verify its mandatory terminal artifacts.
 
     This harness never substitutes a fixture policy or a fallback deployment.
     CUDA can be made mandatory with ``--require-cuda``; the same fail-closed
@@ -24,7 +24,7 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
     output = Path(args.output).resolve()
     training_output = output / "training"
     if bool(getattr(args, "require_cuda", False)):
-        os.environ["DELTA_REQUIRE_CUDA"] = "1"
+        os.environ["DEPI_REQUIRE_CUDA"] = "1"
     training_args = argparse.Namespace(
         config=args.config,
         partner_manifest=args.partner_manifest,
@@ -50,11 +50,11 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
     )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
-        raise RuntimeError(f"Mechanical V6 flow omitted artifacts: {missing}")
+        raise RuntimeError(f"Mechanical DEPI flow omitted artifacts: {missing}")
     identity = read_run_identity(training_output)
-    # §6 extended M1 gate readout: the training loop writes one gate record
+    # §7 extended M1 gate readout: the training loop writes one gate record
     # per anchor trigger; the mechanical harness reports it without judging
-    # it (gate failure blocks formal runs inside run_training itself).
+    # it because M1 is a diagnostic rather than a training blocker.
     m1_gate_path = training_output / "m1_gate.json"
     m1_gate_payload = (
         json.loads(m1_gate_path.read_text(encoding="utf-8"))
@@ -67,9 +67,9 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
         )
     )
     if identity.get("method") != METHOD_VERSION:
-        raise RuntimeError("Mechanical training identity is not V6.")
-    if deployment.get("artifact_name") != "DELTA-ZSC-E2E":
-        raise RuntimeError("Mechanical flow did not export the single E2E actor.")
+        raise RuntimeError("Mechanical training identity is not DEPI.")
+    if deployment.get("artifact_name") != "DEPI":
+        raise RuntimeError("Mechanical flow did not export the DEPI actor.")
     report = {
         "method": METHOD_VERSION,
         "status": "complete",
@@ -95,7 +95,7 @@ def run_mechanical_e2e(args: argparse.Namespace) -> None:
         "note": "Mechanical completion proves execution, not ZSC effectiveness.",
     }
     write_json(output / "mechanical_e2e_report.json", report)
-    print(f"Complete V6 mechanical E2E: {output}")
+    print(f"Complete DEPI mechanical E2E: {output}")
 
 
 __all__ = ["run_mechanical_e2e"]

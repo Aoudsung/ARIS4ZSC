@@ -1,26 +1,15 @@
-"""Capability and protocol encoders for DEPI (METHOD_SPEC §1.1/§2).
+"""Capability state and exact categorical protocol filtering for DEPI.
 
-Implements the two partner-side legal-history pathways:
+``CapabilityEncoderCell`` is the sole learned recurrent partner-history
+encoder.  The protocol state has no recognition GRU or hidden dimension: its
+complete carry is the categorical posterior itself, updated by the registered
+transition matrix and the shared response likelihood.
 
-* ``CapabilityEncoderCell`` -- GRU-64 recurrent encoder producing the stable
-  partner capability/tendency embedding ``u`` (16 dimensions).
-* ``ProtocolEncoderCell`` -- GRU-128 amortized recursive Bayes filter
-  producing the categorical posterior ``pi_t`` over ``K=4`` protocol regimes.
-
-Both cells consume the same evidence vector ``e_t = (o_t - o_{t-1},
-a^{ego}_{t-1} embedding, episode_start)``.  The observation difference is the
-only legal carrier of partner behaviour inside the ego view (METHOD_SPEC §1.1
-decision record); the task pathway never reads it.
-
-The sticky transition prior P(z_{t+1}|z_t) with P(stay)=0.9 and
-P(jump to each other)=0.1/3 is a registered constant; it is never learned
+The sticky transition prior P(z_{t+1}|z_t) with P(stay)=0.9 and equal mass on
+the other components is a registered constant; it is never learned
 (METHOD_SPEC §2.1).  The predictive step and the log-sticky correction applied
-to the posterior logits are parameter-free constant mappings.
-
-METHOD_SPEC §2.5: uncertainty comes from (i) the bounded posterior entropy
-H(q_t) and (ii) a B=3 bootstrap history-encoder ensemble whose epistemic
-readout is the mean total-variation distance of the member posteriors.  Both
-are report-only quantities and never enter any loss weight.
+to the posterior logits are parameter-free constant mappings.  Posterior
+entropy is a report-only uncertainty reading and never enters a loss weight.
 """
 
 from __future__ import annotations
@@ -29,29 +18,46 @@ from typing import Any
 
 PROTOCOL_COMPONENTS = 4
 STICKY_SELF_PROBABILITY = 0.9
-STICKY_JUMP_PROBABILITY = 0.1 / 3.0
-BOOTSTRAP_MEMBER_COUNT = 3
-BOOTSTRAP_DROPOUT_RATE = 0.1
+CAPABILITY_UPDATE_PERIOD = 16
 
 _CAPABILITY_CELL: Any | None = None
-_PROTOCOL_CELL: Any | None = None
 
 
 def sticky_predictive(previous_probabilities: Any) -> Any:
     """Exact one-step predictive distribution of the sticky HMM prior.
 
-    p_pred,k = 0.9 * pi_{t-1,k} + (0.1/3) * sum_j pi_{t-1,j}.  This is a
-    parameter-free constant mixing (METHOD_SPEC §2.1/§2.3).
+    This is an explicit multiplication by the registered row-stochastic
+    transition matrix.  The off-diagonal contribution excludes the current
+    component; no later softmax repairs an invalid probability mass.
     """
 
     import jax.numpy as jnp
 
     previous = jnp.asarray(previous_probabilities, dtype=jnp.float32)
-    mass = jnp.sum(previous, axis=-1, keepdims=True)
-    return (
-        float(STICKY_SELF_PROBABILITY) * previous
-        + float(STICKY_JUMP_PROBABILITY) * mass
+    transition = sticky_transition_matrix(
+        previous.shape[-1], stay=STICKY_SELF_PROBABILITY
     )
+    return previous @ transition
+
+
+def sticky_transition_matrix(
+    component_count: int = PROTOCOL_COMPONENTS,
+    *,
+    stay: float = STICKY_SELF_PROBABILITY,
+) -> Any:
+    """Return the symmetric row-stochastic sticky transition matrix."""
+
+    import jax.numpy as jnp
+
+    count = int(component_count)
+    stay_probability = float(stay)
+    if count < 2:
+        raise ValueError("A sticky transition requires at least two components.")
+    if not 0.0 <= stay_probability <= 1.0:
+        raise ValueError("Sticky self-transition probability must lie in [0, 1].")
+    jump = (1.0 - stay_probability) / float(count - 1)
+    matrix = jnp.full((count, count), jump, dtype=jnp.float32)
+    return matrix.at[jnp.diag_indices(count)].set(stay_probability)
 
 
 def sticky_predictive_log_probabilities(previous_probabilities: Any) -> Any:
@@ -71,20 +77,18 @@ def exact_bayes_filter_step(
 ) -> Any:
     """Reference exact filtering recursion for the synthetic-HMM unit test.
 
-    posterior ∝ (T^T pi_{t-1}) ⊙ likelihood.  The amortized ProtocolEncoderCell
-    reproduces this recursion with the same constant predictive step; this
-    helper is the ground-truth comparator (METHOD_SPEC §2.3).
+    posterior ∝ (T^T pi_{t-1}) ⊙ likelihood.  Both training and deployment
+    call this exact log-domain update (METHOD_SPEC §2.3).
     """
 
     import jax.nn as jnn
     import jax.numpy as jnp
 
     predictive = sticky_predictive(previous_probabilities)
-    unnormalized = predictive * jnp.exp(
-        jnp.asarray(log_likelihood, dtype=jnp.float32)
-    )
     return jnn.softmax(
-        jnp.log(jnp.maximum(unnormalized, 1.0e-30)), axis=-1
+        jnp.log(jnp.maximum(predictive, 1.0e-30))
+        + jnp.asarray(log_likelihood, dtype=jnp.float32),
+        axis=-1,
     )
 
 
@@ -95,29 +99,6 @@ def posterior_entropy(probabilities: Any) -> Any:
 
     probs = jnp.asarray(probabilities, dtype=jnp.float32)
     return -jnp.sum(probs * jnp.log(jnp.maximum(probs, 1.0e-12)), axis=-1)
-
-
-def ensemble_total_variation(member_probabilities: Any) -> Any:
-    """Epistemic readout of the B-member bootstrap ensemble.
-
-    ``member_probabilities`` has shape (B, ..., K); the readout is the mean
-    pairwise total-variation distance, report-only (METHOD_SPEC §2.5 item 2).
-    """
-
-    import jax.numpy as jnp
-
-    members = jnp.asarray(member_probabilities, dtype=jnp.float32)
-    count = members.shape[0]
-    if count < 2:
-        return jnp.zeros(members.shape[1:-1], dtype=jnp.float32)
-    distances = []
-    for index in range(count):
-        for other in range(index + 1, count):
-            distances.append(
-                0.5 * jnp.sum(jnp.abs(members[index] - members[other]), axis=-1)
-            )
-    stacked = jnp.stack(distances, axis=0)
-    return jnp.mean(stacked, axis=0)
 
 
 def _evidence_vector(
@@ -208,157 +189,46 @@ def capability_encoder_classes() -> Any:
                 )(evidence)
             )
             projected = nn.LayerNorm(name="evidence_layer_norm")(projected)
-            carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
+            from .types import CapabilityCarry
+
+            hidden_carry, published, steps = carry
+            hidden_carry = jnp.where(
+                start[..., None], jnp.zeros_like(hidden_carry), hidden_carry
+            )
+            published = jnp.where(
+                start[..., None], jnp.zeros_like(published), published
+            )
+            steps = jnp.where(start, jnp.zeros_like(steps), steps)
             next_carry, hidden = nn.GRUCell(
                 features=self.hidden_dim, name="capability_gru"
-            )(carry, projected)
-            capability = nn.Dense(
+            )(hidden_carry, projected)
+            candidate = nn.Dense(
                 self.output_dim,
                 kernel_init=orthogonal(0.1),
                 bias_init=zeros,
                 name="capability_output",
             )(hidden)
-            return next_carry, capability
+            next_steps = steps + jnp.asarray(1, dtype=steps.dtype)
+            publish = (next_steps % int(CAPABILITY_UPDATE_PERIOD)) == 0
+            capability = jnp.where(publish[..., None], candidate, published)
+            return CapabilityCarry(next_carry, capability, next_steps), capability
 
     _CAPABILITY_CELL = CapabilityEncoderCell
     return CapabilityEncoderCell
 
 
-def protocol_encoder_classes() -> Any:
-    global _PROTOCOL_CELL
-    if _PROTOCOL_CELL is not None:
-        return _PROTOCOL_CELL
-
-    import flax.linen as nn
-    import jax.numpy as jnp
-    from flax.linen.initializers import orthogonal, zeros
-
-    class ProtocolEncoderCell(nn.Module):
-        """Amortized recursive Bayes filter over K protocol regimes.
-
-        The GRU input carries the evidence plus the previous posterior; the
-        posterior logits receive the parameter-free log-sticky predictive
-        correction (METHOD_SPEC §2.3).  ``h_0`` maps to the prior because the
-        initial carry is zero and the initial previous posterior is uniform.
-        """
-
-        hidden_dim: int
-        component_count: int
-        action_count: int
-        action_embedding_dim: int
-
-        @nn.compact
-        def __call__(
-            self,
-            carry: Any,
-            inputs: tuple[Any, Any, Any, Any, Any],
-        ) -> tuple[Any, Any]:
-            (
-                previous_observation,
-                observation,
-                previous_action,
-                episode_start,
-                previous_probabilities,
-            ) = inputs
-            action = jnp.asarray(previous_action, dtype=jnp.int32)
-            start = jnp.asarray(episode_start, dtype=jnp.bool_)
-            previous_probs = jnp.asarray(previous_probabilities, dtype=jnp.float32)
-            evidence = _evidence_vector(
-                module=self,
-                previous_observation=previous_observation,
-                observation=observation,
-                previous_action=action,
-                episode_start=start,
-                action_count=self.action_count,
-                action_embedding_dim=self.action_embedding_dim,
-                embedding_name="protocol_action_embedding",
-            )
-            projected = nn.relu(
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=orthogonal(jnp.sqrt(2.0)),
-                    bias_init=zeros,
-                    name="evidence_projection",
-                )(evidence)
-            )
-            projected = nn.LayerNorm(name="evidence_layer_norm")(projected)
-            gru_input = jnp.concatenate((projected, previous_probs), axis=-1)
-            carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
-            next_carry, hidden = nn.GRUCell(
-                features=self.hidden_dim, name="protocol_gru"
-            )(carry, gru_input)
-            logits = nn.Dense(
-                self.component_count,
-                kernel_init=orthogonal(0.01),
-                bias_init=zeros,
-                name="posterior_logits",
-            )(hidden)
-            # Constant log-sticky predictive correction; no learned parameters
-            # (METHOD_SPEC §2.1/§2.3 decision record).
-            correction = sticky_predictive_log_probabilities(previous_probs)
-            return next_carry, logits + correction
-
-    _PROTOCOL_CELL = ProtocolEncoderCell
-    return ProtocolEncoderCell
-
-
-def bootstrap_protocol_ensemble_class() -> Any:
-    """B=3 independently initialized protocol encoders (METHOD_SPEC §2.5)."""
-
-    import flax.linen as nn
-    import jax
+def initial_capability_carry(
+    batch_size: int, hidden_dim: int, output_dim: int = 16
+) -> Any:
     import jax.numpy as jnp
 
-    class BootstrapProtocolEnsemble(nn.Module):
-        hidden_dim: int
-        component_count: int
-        action_count: int
-        action_embedding_dim: int
-        member_count: int = BOOTSTRAP_MEMBER_COUNT
-        dropout_rate: float = BOOTSTRAP_DROPOUT_RATE
+    from .types import CapabilityCarry
 
-        @nn.compact
-        def __call__(
-            self,
-            carries: Any,
-            inputs: tuple[Any, Any, Any, Any, Any],
-            training: bool = True,
-        ) -> tuple[Any, Any]:
-            ProtocolCell = protocol_encoder_classes()
-            next_carries = []
-            posteriors = []
-            for member in range(int(self.member_count)):
-                cell = ProtocolCell(
-                    hidden_dim=self.hidden_dim,
-                    component_count=self.component_count,
-                    action_count=self.action_count,
-                    action_embedding_dim=self.action_embedding_dim,
-                    name=f"bootstrap_member_{member}",
-                )
-                next_carry, logits = cell(carries[member], inputs)
-                logits = nn.Dropout(
-                    rate=float(self.dropout_rate), deterministic=not training
-                )(logits)
-                next_carries.append(next_carry)
-                posteriors.append(logits)
-            probabilities = [
-                jax.nn.softmax(logits, axis=-1) for logits in posteriors
-            ]
-            return tuple(next_carries), jnp.stack(probabilities, axis=0)
-
-    return BootstrapProtocolEnsemble
-
-
-def initial_capability_carry(batch_size: int, hidden_dim: int) -> Any:
-    import jax.numpy as jnp
-
-    return jnp.zeros((int(batch_size), int(hidden_dim)), dtype=jnp.float32)
-
-
-def initial_protocol_carry(batch_size: int, hidden_dim: int) -> Any:
-    import jax.numpy as jnp
-
-    return jnp.zeros((int(batch_size), int(hidden_dim)), dtype=jnp.float32)
+    return CapabilityCarry(
+        hidden=jnp.zeros((int(batch_size), int(hidden_dim)), dtype=jnp.float32),
+        published=jnp.zeros((int(batch_size), int(output_dim)), dtype=jnp.float32),
+        steps=jnp.zeros((int(batch_size),), dtype=jnp.int32),
+    )
 
 
 def initial_protocol_probabilities(
@@ -374,21 +244,16 @@ def initial_protocol_probabilities(
 
 
 __all__ = [
-    "BOOTSTRAP_DROPOUT_RATE",
-    "BOOTSTRAP_MEMBER_COUNT",
+    "CAPABILITY_UPDATE_PERIOD",
     "PROTOCOL_COMPONENTS",
-    "STICKY_JUMP_PROBABILITY",
     "STICKY_SELF_PROBABILITY",
-    "bootstrap_protocol_ensemble_class",
     "capability_encoder_classes",
-    "ensemble_total_variation",
     "exact_bayes_filter_step",
     "initial_capability_carry",
-    "initial_protocol_carry",
     "initial_protocol_probabilities",
     "posterior_entropy",
-    "protocol_encoder_classes",
     "sticky_predictive",
     "sticky_predictive_log_probabilities",
+    "sticky_transition_matrix",
     "uniform_prior",
 ]

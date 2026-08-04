@@ -1,32 +1,31 @@
-# 研究仪表盘
+# DEPI 状态面板
 
-活文档，上限 150 行。只写三样：当前阶段，判据状态，唯一下一步。
-历史结论去[证据台账](EVIDENCE_LEDGER.md)，研究内容去 [RESEARCH_PROGRAM](../RESEARCH_PROGRAM.md)。
+更新时间：2026-08-04。此页只报告状态，不复制权威合同中的版本、seed、预算或阈值，也不把
+工程验证写成科学证据。
 
-## 当前阶段
+## 当前状态
 
-探索轨，论点已裁决（2026-08-03）。主论点 Θ2（信息时序定理生态验证），次论点 Θ5（分解链诊断）。Θ1 判死（迁移差 −83.60，停机效力仅限 Θ1），Θ3 复活为方法载体论点（人类复议推翻传递性门控连带出局），Θ4 挂起；论文形态恢复含 L4（方法 SOTA），DELTA-ZSC-E2E 作为 SOTA 竞争者出场，SOTA 注册基线见 [SOTA_BASELINE](../research/SOTA_BASELINE.md)。快照基线 commit `6b9f598`，后续成果见 commit `eeca646` 及之后。
+| 轨道 | 状态 | 含义 |
+|---|---|---|
+| 方法实现 | 修订已接线 | exact filter、joint likelihood、结构隔离、decision-to-actor、checkpoint state、manifest-disjoint comparator、final-checkpoint M1 证据链、静态伙伴池和机制评估均已有 active code path |
+| 本地验证 | 通过 | active source compile 和全量 DEPI tests 通过；CLI 及静态一致性门通过。本地 Python 3.13 结果只是工程验证，不替代注册 Python 3.10/CUDA 接受运行 |
+| CUDA acceptance | 未执行 | 当前状态不能替代注册的单 CUDA preflight |
+| 开发证据 | 未生成 | 尚无可用于 B0–B2 增量裁决的完整 paired matrix artifact |
+| 正式证据 | 未生成 | 尚无冻结协议下的 Official/Common-Partner/formal claim artifact |
+| B3 | 未实现 | 明确 fail closed，不计作完成方法层级 |
 
-## 判据状态
+## 当前 claim 边界
 
-| 判据 | 状态 |
-|---|---|
-| 文献矩阵生态位图谱定稿 | 初稿完成，待复核 |
-| 顶会标准方案（PAPER_STANDARD） | 已就位，T2/T3/T4 已形式化 |
-| S2 理论工具验证 | 通过，180/180 |
-| S1 pilot | 通过，行数与标记完整 |
-| S1 全量面板（200,000 行） | 完成，读数入台账 |
-| S1 迁移值分析 | 完成，迁移差 −83.60，Θ1 判死 |
-| 论点裁决 | 完成：主 Θ2、次 Θ5，候选集冻结 |
-| 生态 (Δ, κ, TV) 估计（H2 验证） | 完成：类型 κ̂=0.137，个体 κ̂ 均值 0.099，Δ̂=27.3 |
-| E5 插入式 Bayes 路由器对撞（H3/P4） | 未开始 |
-| V6 价值排序 preflight（M1，Spearman 门槛） | 激活：随 Θ3 复活恢复，整级降级为 preflight（门槛值跑前入台账；失败则换载体，不停止目标） |
+可以声称当前工作区已把审查问题转化为可执行结构与验证接口；不能声称 DEPI 已提升 XP、已超过
+baseline、posterior 已通过校准或机制归因成立。历史探索结果只保留在 append-only ledger 与
+legacy，不进入当前 claim。
 
-## 唯一下一步
+## 下一步
 
-方法轨关键路径（唯一关键路径）：M1 preflight——V6 单 seed 机械跑，价值排序 preflight 门槛（held-out 延续动作排序 Spearman 与预测覆盖率）跑前入台账；失败则换载体，不停止超越 SOTA 的目标。见 [EXPERIMENT_LADDER](../research/EXPERIMENT_LADDER.md) S3。
+1. 在注册运行时执行 [`../FORMAL_EXPERIMENT_PROTOCOL.md`](../FORMAL_EXPERIMENT_PROTOCOL.md)
+   要求的 mechanical E2E 与 CUDA preflight；
+2. 执行 [`../research/DEVELOPMENT_MATRIX.md`](../research/DEVELOPMENT_MATRIX.md)，先裁决逐级增量；
+3. 仅在开发门完成、合同复核且仓库 clean committed 后冻结正式执行；
+4. 无论机制门结果如何，都按 [`../EVALUATION_SPEC.md`](../EVALUATION_SPEC.md) 报告普通 XP。
 
-并行旁路（对方法轨无阻塞权）：
-
-- E5：插入式 Bayes 路由器对撞（H3/P4，实测回收值对理论值 Δ̂·TV̂(t)/2，判据 [0.5,1.5]），见 [TRAJECTORY_AND_ESTIMATION_SPEC](../research/TRAJECTORY_AND_ESTIMATION_SPEC.md) §5。
-- 旁路诊断写表：Θ5 面板读数回填（S1 全量面板与 E0 结构分析入表图设计）。
+权威入口见 [`../PROTOCOL_INDEX.md`](../PROTOCOL_INDEX.md)。

@@ -1,27 +1,14 @@
-"""Stable CUDA executable boundaries for the DEPI foundation update.
-
-The active default path compiles only rollout, target-context and the
-combined four-loss PPO scan (METHOD_SPEC §3.3).  The legacy V6 kernels
-(detached raw-Q retrace, counterfactual anchor heads, separate response
-head updates, belief-objective gradient collection and decision-regret
-shaping) are disconnected from the default path by task #10's §5–§7
-boundary: their slots are ``None`` unless a future task re-enables them.
-"""
+"""Stable CUDA executable boundaries for the active DEPI update."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
 import json
-import math
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from .runner import (
-    DECISION_REGRET_STATE_CHUNK_SIZE,
-    collect_rollout,
-    target_context_sequence,
-)
+from .runner import collect_rollout, target_context_sequence
 from .training import scan_training_updates
 
 
@@ -140,15 +127,6 @@ class CompiledTrainingKernels:
     rollout_support: CompiledCallable
     target_context_sequence: CompiledCallable
     ppo_scan: CompiledCallable
-    # Legacy V6 kernels; disconnected until §5–§7 lands (task #13 boundary).
-    regret_chunk: CompiledCallable | None = None
-    regret_finalize: CompiledCallable | None = None
-    raw_q_retrace_update: CompiledCallable | None = None
-    anchor_head_update: CompiledCallable | None = None
-    response_head_update: CompiledCallable | None = None
-    belief_rollout_objectives: CompiledCallable | None = None
-    belief_anchor_objectives: CompiledCallable | None = None
-    belief_apply: CompiledCallable | None = None
 
     def metadata(self) -> Mapping[str, Any]:
         return {
@@ -182,7 +160,7 @@ def configure_persistent_compilation_cache(
     root = (
         Path(cache_root).expanduser()
         if cache_root is not None
-        else Path.home() / ".cache" / "delta_zsc" / "jax_compilation"
+        else Path.home() / ".cache" / "depi" / "jax_compilation"
     )
     directory = root / digest
     directory.mkdir(parents=True, exist_ok=True)
@@ -205,9 +183,8 @@ def build_training_kernels(
 ) -> CompiledTrainingKernels:
     """Build the finite family of fixed-shape DEPI CUDA programs.
 
-    Only the active §1–§4 kernels are compiled.  All legacy V6 auxiliary
-    kernels are returned as ``None`` so that importing this module never
-    touches the deprecated belief/raw-Q/response-head objectives.
+    Only active rollout, context, combined-update, and real-continuation
+    programs are represented by this object.
     """
 
     def rollout(mode: str, length: int) -> Callable[..., Any]:
@@ -272,10 +249,9 @@ def build_training_kernels(
             "rollout_support", rollout("support", config.environment.episode_steps)
         ),
         target_context_sequence=CompiledCallable("target_context_sequence", context),
-        # The frozen EMA target is consumed again by dense raw-Q immediately
-        # after PPO.  Donating the containing core would invalidate those
-        # aliased buffers on CUDA, so this boundary deliberately does not
-        # donate its input tree.
+        # The frozen EMA target is consumed again by the anchor evaluator after
+        # PPO. Donating the containing core would invalidate aliased buffers on
+        # CUDA, so this boundary deliberately does not donate its input tree.
         ppo_scan=CompiledCallable("ppo_scan", ppo_scan),
     )
 
@@ -293,8 +269,10 @@ def build_anchor_chunk_kernel(
         rollout_flat_indexes: Any,
         policy_states: Any,
         observations: Any,
-        partner_codes: Any,
         partner_sources: Any,
+        partner_members: Any,
+        partner_family_ids: Any,
+        partner_checkpoint_stages: Any,
         partner_run_ids: Any,
     ) -> Any:
         return collect_counterfactual_anchors(
@@ -304,13 +282,15 @@ def build_anchor_chunk_kernel(
             rollout_flat_indexes=rollout_flat_indexes,
             policy_states=policy_states,
             observations=observations,
-            partner_codes=partner_codes,
             partner_sources=partner_sources,
+            partner_members=partner_members,
+            partner_family_ids=partner_family_ids,
+            partner_checkpoint_stages=partner_checkpoint_stages,
             partner_run_ids=partner_run_ids,
             functions=functions,
             action_count=6,
             fit_replicas=config.anchors.fit_replicas,
-            evaluation_replicas=0,
+            evaluation_replicas=config.anchors.evaluation_replicas,
             continuation_horizon=config.anchors.continuation_horizon,
             discount=config.ppo.gamma,
             runtime=runtime,
@@ -323,75 +303,10 @@ def build_anchor_chunk_kernel(
     )
 
 
-def attach_chunked_regret_with_kernels(
-    *,
-    kernels: CompiledTrainingKernels,
-    batch: Any,
-    target_params: Any,
-    key: Any,
-    action_range_ema: Any,
-    effective_steps: Any,
-    state_chunk_size: int = DECISION_REGRET_STATE_CHUNK_SIZE,
-) -> tuple[Any, Mapping[str, Any]]:
-    """Legacy V6 decision-regret shaping; disconnected from the DEPI path."""
-
-    if kernels.regret_chunk is None or kernels.regret_finalize is None:
-        raise RuntimeError(
-            "Decision-regret shaping stays disabled until the §5–§7 geometry "
-            "fixes land (METHOD_SPEC §7.3; boundary of task #10)."
-        )
-    import jax
-    import jax.numpy as jnp
-
-    context = kernels.target_context_sequence(target_params, batch)
-    features = jnp.asarray(context.task_features)
-    prefix = features.shape[:-1]
-    state_count = int(math.prod(prefix))
-    chunk_size = int(state_chunk_size)
-    padded_count = ((state_count + chunk_size - 1) // chunk_size) * chunk_size
-    padding = padded_count - state_count
-    keys = jnp.concatenate(
-        (
-            jax.random.split(key, state_count),
-            jnp.zeros((padding, 2), dtype=jnp.uint32),
-        ),
-        axis=0,
-    )
-
-    def flatten_pad(value: Any) -> Any:
-        array = jnp.asarray(value)
-        flat = array.reshape((state_count,) + array.shape[len(prefix):])
-        return jnp.pad(flat, ((0, padding),) + ((0, 0),) * (flat.ndim - 1))
-
-    flat = (
-        flatten_pad(context.task_features),
-        flatten_pad(context.belief_mean),
-        flatten_pad(context.belief_log_standard_deviation),
-    )
-    regret_chunks, range_chunks = [], []
-    for start in range(0, padded_count, chunk_size):
-        stop = start + chunk_size
-        regret, action_range = kernels.regret_chunk(
-            target_params,
-            flat[0][start:stop],
-            flat[1][start:stop],
-            flat[2][start:stop],
-            keys[start:stop],
-        )
-        regret_chunks.append(regret)
-        range_chunks.append(action_range)
-    regrets = jnp.concatenate(regret_chunks)[:state_count].reshape(prefix)
-    ranges = jnp.concatenate(range_chunks)[:state_count].reshape(prefix)
-    return kernels.regret_finalize(
-        batch, regrets, ranges, action_range_ema, effective_steps
-    )
-
-
 __all__ = [
     "CompiledCallable",
     "CompiledMemoryLimitError",
     "CompiledTrainingKernels",
-    "attach_chunked_regret_with_kernels",
     "build_anchor_chunk_kernel",
     "build_training_kernels",
     "configure_persistent_compilation_cache",

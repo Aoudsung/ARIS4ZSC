@@ -1,4 +1,4 @@
-"""Adapters exposing frozen official policies through DELTA-ZSC PartnerFunctions."""
+"""Adapters exposing frozen Official policies through DEPI PartnerFunctions."""
 
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ def make_external_partner_functions(
     *,
     pool: Any,
     member_indexes: Any,
-    latent_dim: int,
-    code_dim: int,
     run_ids: Any | None = None,
+    family_ids: Any | None = None,
+    checkpoint_stages: Any | None = None,
 ) -> PartnerFunctions:
     """Create a fixed-member vectorized external partner runtime.
 
@@ -41,6 +41,16 @@ def make_external_partner_functions(
         members_template
         if run_ids is None
         else jnp.asarray(run_ids, dtype=jnp.int32)
+    )
+    family_template = (
+        jnp.asarray(0, dtype=jnp.int32)
+        if family_ids is None
+        else jnp.asarray(family_ids, dtype=jnp.int32)
+    )
+    stage_template = (
+        jnp.asarray(1.0, dtype=jnp.float32)
+        if checkpoint_stages is None
+        else jnp.asarray(checkpoint_stages, dtype=jnp.float32)
     )
 
 
@@ -103,11 +113,9 @@ def make_external_partner_functions(
         count = state.member.shape[0]
         return {
             "source": jnp.full((count,), 2, dtype=jnp.int32),
-            "code": jnp.full(
-                (count, int(code_dim)), jnp.nan, dtype=jnp.float32
-            ),
-            "generator_logits": jnp.zeros((count, 6), dtype=jnp.float32),
-            "generator_value": jnp.zeros((count,), dtype=jnp.float32),
+            "member": state.member,
+            "family_id": jnp.broadcast_to(family_template, (count,)),
+            "checkpoint_stage": jnp.broadcast_to(stage_template, (count,)),
         }
 
     return PartnerFunctions(

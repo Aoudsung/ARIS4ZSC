@@ -1,10 +1,10 @@
-"""Immutable PyTree records for DEPI (DELTA-ZSC foundation batch).
+"""Immutable PyTree records for DEPI.
 
 METHOD_SPEC §1 defines the three scientific objects x_t / u / c_t with
 structural input-layer isolation.  The deployable policy carries one task
-encoder, one capability encoder and one protocol encoder; training-only
-objects are explicit so that deployment pruning and checkpoint identity can be
-checked mechanically.
+encoder, one capability encoder, and the exact categorical protocol posterior;
+training-only objects are explicit so deployment pruning and checkpoint
+identity can be checked mechanically.
 """
 
 from __future__ import annotations
@@ -12,17 +12,18 @@ from __future__ import annotations
 from typing import Any, Mapping, NamedTuple
 
 
-class ProtocolContext(NamedTuple):
-    """Recurrent state of the capability and protocol pathways.
+class CapabilityCarry(NamedTuple):
+    """Slow-timescale capability state.
 
-    METHOD_SPEC §1.1: u is the stable partner-capability embedding (16) and
-    pi is the categorical protocol posterior over K=4 regimes.
+    Evidence is accumulated every step in ``hidden`` but the actor-visible
+    ``published`` embedding changes only at registered window boundaries.
+    This prevents the stable capability path from becoming a second dynamic
+    protocol encoder.
     """
 
-    capability_carry: Any
-    protocol_carry: Any
-    capability: Any
-    protocol_logits: Any
+    hidden: Any
+    published: Any
+    steps: Any
 
 
 class PolicyState(NamedTuple):
@@ -31,7 +32,9 @@ class PolicyState(NamedTuple):
     METHOD_SPEC §1.4 field list: (task_carry, capability_carry,
     protocol_carry, context_summary, previous_observation, previous_action,
     episode_start).  ``context_summary`` stores concat(u, c) from the last
-    step (32 dimensions) for deployment continuity.
+    step (32 dimensions) for deployment continuity. ``protocol_carry`` is
+    the categorical posterior itself; no recognition-network hidden state is
+    carried by the deployable policy.
     """
 
     task_carry: Any
@@ -66,20 +69,6 @@ class ModelOutput(NamedTuple):
     action_values: Any
 
 
-class PartnerGeneratorState(NamedTuple):
-    carry: Any
-    code: Any
-    episode_start: Any
-
-
-class PartnerGeneratorOutput(NamedTuple):
-    logits: Any
-    value: Any
-    action: Any
-    log_probability: Any
-    entropy: Any
-
-
 class RolloutBatch(NamedTuple):
     """Recurrent PPO batch with T+1 legal-history states and T transitions."""
 
@@ -93,29 +82,32 @@ class RolloutBatch(NamedTuple):
     rewards: Any
     official_shaped_rewards: Any
     official_shaping_factors: Any
-    decision_regret_shaping: Any
     shaped_rewards: Any
     dones: Any
     old_log_probabilities: Any
     old_values: Any
     behavior_probabilities: Any
     ppo_mask: Any
-    partner_codes: Any
     partner_sources: Any
+    partner_members: Any
+    partner_family_ids: Any
+    partner_checkpoint_stages: Any
     partner_run_ids: Any
     initial_policy_state: PolicyState
     initial_target_policy_state: PolicyState
 
 
 class CounterfactualAnchorBatch(NamedTuple):
-    """Soft-policy-drift replay rows for real-return all-action supervision."""
+    """Fixed real-return all-action supervision collected at an outer update."""
 
     anchor_ids: Any
     rollout_flat_indexes: Any
     policy_states: PolicyState
     observations: Any
-    partner_codes: Any
     partner_sources: Any
+    partner_members: Any
+    partner_family_ids: Any
+    partner_checkpoint_stages: Any
     partner_run_ids: Any
     fit_returns_by_action: Any
     return_sum_by_action: Any
@@ -126,12 +118,14 @@ class CounterfactualAnchorBatch(NamedTuple):
     collection_target_fingerprint: Any
     matched_pair_ids: Any
     action_mask: Any
+    evaluation_returns_by_action: Any = None
+    evaluation_replica_count: Any = None
 
 
 class QuotientPairBatch(NamedTuple):
     """Matched-pair payload for the §5.3 frozen comparator data path.
 
-    ``comparator_accuracy``/``ego_state_*``/``probe_observations`` stay
+    ``comparator_distinct_probability``/``ego_state_*``/``probe_observations`` stay
     ``None`` for legacy constructions; the §5 anchor pipeline fills them so
     ``separation_terms_from_matched_pairs`` can build the ``SeparationTerms``
     payload consumed inside the jit-compiled combined-loss scan.
@@ -141,10 +135,11 @@ class QuotientPairBatch(NamedTuple):
     anchor_index_b: Any
     decision_distance: Any
     weights: Any
-    comparator_accuracy: Any = None
+    comparator_distinct_probability: Any = None
     ego_state_a: Any = None
     ego_state_b: Any = None
     probe_observations: Any = None
+    pair_valid: Any = None
 
 
 class SeparationTerms(NamedTuple):
@@ -166,51 +161,37 @@ class SeparationTerms(NamedTuple):
     equivalent_mask: Any
     weights: Any
     margin: Any
-
-
-class CalibrationArtifact(NamedTuple):
-    """Optional E2E+Safety wrapper; never part of the primary method."""
-
-    alpha: Any
-    gain_residual_radius: Any
-    support_threshold: Any
-    support_mean: Any
-    support_precision: Any
-    support_distance_scale: Any
-    calibration_run_count: Any
-    model_fingerprint: Any
+    pair_valid: Any = None
 
 
 class TrainState(NamedTuple):
-    """Complete V6 checkpoint state; deliberately incompatible with V5."""
+    """Complete DEPI scientific state (checkpoint schema 5).
+
+    Every value capable of changing the next outer update is explicit.  Dead
+    per-head optimizers, reward-shaping EMAs, synthetic-partner state, and
+    obsolete anchor-buffer state are not represented.
+    """
 
     params: Any
     target_params: Any
 
     ppo_optimizer_state: Any
-    raw_q_optimizer_state: Any
-    response_optimizer_state: Any
-    belief_optimizer_state: Any
-    generator_optimizer_state: Any
 
-    generator_params: Any
-    generator_target_params: Any
-    generator_competence_multiplier: Any
-    generator_cvar_ema: Any
-    external_reference_cvar_ema: Any
-
-    anchor_replay: Any
+    supervision_anchor_batch: Any
+    current_separation_terms: Any
+    current_pair_comparator: Any
+    supervision_readings: Any
     anchor_sampling_counter: Any
+    anchor_microbatch_size: Any
+    effective_update_epochs: Any
 
-    belief_gradient_norm_ema: Any
-    action_range_ema: Any
-    anchor_advantage_scale_ema: Any
+    bootstrap_encoder_params: Any
+    bootstrap_optimizer_states: Any
+    bootstrap_sampling_counters: Any
+    m1_summary_state: Any
+    m1_history: Any
 
     ppo_optimizer_step: Any
-    raw_q_optimizer_step: Any
-    response_optimizer_step: Any
-    belief_optimizer_step: Any
-    generator_optimizer_step: Any
 
     runner_state: Any
     random_domains: Any
@@ -225,20 +206,6 @@ class TrainingCoreState(NamedTuple):
     ppo_optimizer_state: Any
 
 
-class GeneratorCoreState(NamedTuple):
-    params: Any
-    target_params: Any
-    optimizer_state: Any
-
-
-class AuxiliaryCoreState(NamedTuple):
-    params: Any
-    raw_q_optimizer_state: Any
-    response_optimizer_state: Any
-    raw_q_optimizer_step: Any
-    response_optimizer_step: Any
-
-
 class LossBundle(NamedTuple):
     total: Any
     metrics: Mapping[str, Any]
@@ -249,33 +216,13 @@ class TrainingUpdate(NamedTuple):
     metrics: Mapping[str, Any]
 
 
-class EvaluationRow(NamedTuple):
-    ego_run_id: str
-    partner_run_id: str
-    partner_mechanism: str
-    episode_index: int
-    episode_seed: int
-    raw_return: float
-    correct_deliveries: int
-    wrong_deliveries: int
-    mean_belief_uncertainty: float
-    mean_predicted_gain: float
-    negative_transfer: bool
-
-
 __all__ = [
-    "AuxiliaryCoreState",
-    "CalibrationArtifact",
+    "CapabilityCarry",
     "ContextOutput",
     "CounterfactualAnchorBatch",
-    "EvaluationRow",
-    "GeneratorCoreState",
     "LossBundle",
     "ModelOutput",
-    "PartnerGeneratorOutput",
-    "PartnerGeneratorState",
     "PolicyState",
-    "ProtocolContext",
     "QuotientPairBatch",
     "RolloutBatch",
     "TrainingCoreState",

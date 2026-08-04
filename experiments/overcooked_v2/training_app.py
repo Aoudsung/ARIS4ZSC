@@ -1,4 +1,4 @@
-"""DELTA-ZSC V6 end-to-end Bayes Coordination training lifecycle.
+"""DEPI exact-filter decision-supervision training lifecycle.
 
 Every outer update executes the same learning system.  Signal audits never
 control losses, partner sampling, checkpoint selection, or deployment.
@@ -20,38 +20,33 @@ import numpy as np
 
 from experiments.overcooked_v2.deployment import (
     Deployment,
+    deployment_action,
     deployable_parameters,
     export_deployment_bundle,
+    load_deployment,
 )
 from experiments.overcooked_v2.official_adapter import (
     FrozenPartnerPool,
     VectorEnvironment,
     validate_official_runtime,
 )
-from src.path_c.anchor_replay import (
-    AnchorReplayState,
-    append_replay_batch,
-    policy_drift_age_weights,
-    replay_fingerprint,
-    sample_replay_batch,
-)
 from src.path_c.anchor_sampling import (
-    AnchorRuntime,
+    COMPARATOR_RUN_ID_CAPACITY,
+    FrozenPairComparator,
     collect_anchor_batch,
-    collect_diversity_bank_signatures,
     make_anchor_functions,
     preflight_anchor_microbatch_from_records,
     separation_terms_from_matched_pairs,
 )
 from src.path_c.base_distillation import collect_owner_behavior, distill_owner_actor
 from src.path_c.compiled_kernels import (
-    CompiledCallable,
     build_anchor_chunk_kernel,
     build_training_kernels,
     configure_persistent_compilation_cache,
 )
 from src.path_c.experiment import (
     CONFIG_VERSION,
+    CHECKPOINT_SCHEMA_VERSION,
     ENGINEERING_SEED_INDEX,
     METHOD_VERSION,
     OFFICIAL_SOURCE_COMMIT,
@@ -62,41 +57,20 @@ from src.path_c.experiment import (
     official_training_key,
     validate_seed_training_manifest,
 )
-from src.path_c.generator_training import (
-    distill_generator_sources,
-    source_code_anchors,
-    update_generator,
+from src.path_c.m1_gate import (
+    evaluate_m1_gate_on_anchor_batch,
+    initialize_bootstrap_value_ensemble,
+    m1_gate_report,
+    train_bootstrap_value_ensemble,
 )
-from src.path_c.m1_gate import evaluate_m1_gate_on_anchor_batch, m1_gate_report
 from src.path_c.model import (
     build_model,
     initial_policy_state,
     initialize_model_parameters,
 )
-from src.path_c.partner_episode import (
-    collect_complete_external_episodes,
-    collect_complete_generator_episodes,
-    complete_episode_raw_returns,
-    lower_tail_cvar,
-    update_competence_dual,
-    validate_complete_episode_batch,
-)
-from src.path_c.partner_generator import (
-    build_partner_generator,
-    initialize_generator_parameters,
-    sample_partner_codes,
-)
 from src.path_c.partner_sources import (
-    MixedPartnerParameters,
-    make_mixed_partner_functions,
+    build_partner_pool,
     make_static_pool_partner_functions,
-    soft_generator_mixture,
-)
-from src.path_c.raw_q import centered
-from src.path_c.protocol_encoder import (
-    bootstrap_protocol_ensemble_class,
-    initial_protocol_carry,
-    initial_protocol_probabilities,
 )
 from src.path_c.resources import (
     ResourceLedger,
@@ -107,7 +81,6 @@ from src.path_c.resources import (
     require_single_cuda_worker,
 )
 from src.path_c.runner import (
-    DECISION_REGRET_STATE_CHUNK_SIZE,
     context_dropout_probability,
     initialize_runner,
 )
@@ -125,16 +98,17 @@ from src.path_c.storage import (
     write_jsonl,
 )
 from src.path_c.training import (
+    adapt_effective_update_epochs,
     environment_minibatch_schedule,
     make_optimizer,
     official_reward_shaping_factor,
     polyak_update,
 )
-from src.path_c.types import CounterfactualAnchorBatch, TrainState
+from src.path_c.types import CounterfactualAnchorBatch, SeparationTerms, TrainState
 
 
 FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 2**20
-CUDA_PREFLIGHT_SCOPE = "v6_formal_cuda_single_update_preflight"
+CUDA_PREFLIGHT_SCOPE = "depi_formal_cuda_single_update_preflight"
 
 
 def _utc_now() -> str:
@@ -260,7 +234,7 @@ def _owned_runs(manifest: Any, role: str, seed_index: int) -> tuple[Any, ...]:
 
 def _pool(runs: tuple[Any, ...]) -> FrozenPartnerPool:
     if not runs:
-        raise ValueError("A required V6 frozen-partner pool is empty.")
+        raise ValueError("A required DEPI frozen-partner pool is empty.")
     return FrozenPartnerPool.from_checkpoints(
         [run.checkpoint for run in runs],
         parent_training_run_ids=[run.parent_training_run_id for run in runs],
@@ -282,165 +256,242 @@ def _fingerprint_words(tree: Any) -> np.ndarray:
     return np.frombuffer(digest, dtype=">u4").astype(np.uint32)
 
 
-def _empty_replay(
-    *,
-    capacity: int,
-    observation_shape: tuple[int, ...],
-    code_dim: int,
-    model_config: Any,
-) -> AnchorReplayState:
-    import jax
+def _empty_supervision_payload(
+    *, config: Any, observation_shape: tuple[int, ...]
+) -> tuple[Any, Any, FrozenPairComparator]:
+    """Fixed-shape inactive values used by checkpoint schema 5."""
+
     import jax.numpy as jnp
 
-    count = int(capacity)
+    anchor_count = int(config.anchors.ordinary_states) + 2 * int(
+        config.anchors.matched_history_pairs
+    )
+    pair_count = int(config.anchors.matched_history_pairs)
     policy = initial_policy_state(
-        batch_size=count,
+        batch_size=anchor_count,
         observation_shape=observation_shape,
         action_count=6,
-        task_hidden_dim=model_config.task_hidden_dim,
-        capability_hidden_dim=model_config.capability_hidden_dim,
-        protocol_hidden_dim=model_config.protocol_hidden_dim,
-        capability_dim=model_config.capability_dim,
-        component_embedding_dim=model_config.component_embedding_dim,
-        protocol_components=model_config.protocol_components,
+        task_hidden_dim=config.model.task_hidden_dim,
+        capability_hidden_dim=config.model.capability_hidden_dim,
+        capability_dim=config.model.capability_dim,
+        component_embedding_dim=config.model.component_embedding_dim,
+        protocol_components=config.model.protocol_components,
     )
-    zeros_action = jnp.zeros((count, 6), dtype=jnp.float32)
-    batch = CounterfactualAnchorBatch(
-        anchor_ids=jnp.zeros((count,), dtype=jnp.int64),
-        rollout_flat_indexes=jnp.zeros((count,), dtype=jnp.int32),
+    zeros_action = jnp.zeros((anchor_count, 6), dtype=jnp.float32)
+    anchors = CounterfactualAnchorBatch(
+        anchor_ids=jnp.full((anchor_count,), -1, dtype=jnp.int32),
+        rollout_flat_indexes=jnp.zeros((anchor_count,), dtype=jnp.int32),
         policy_states=policy,
-        observations=jnp.zeros((count,) + observation_shape, dtype=jnp.float32),
-        partner_codes=jnp.zeros((count, int(code_dim)), dtype=jnp.float32),
-        partner_sources=jnp.zeros((count,), dtype=jnp.int32),
-        partner_run_ids=jnp.zeros((count,), dtype=jnp.int32),
+        observations=jnp.zeros((anchor_count,) + observation_shape, dtype=jnp.float32),
+        partner_sources=jnp.zeros((anchor_count,), dtype=jnp.int32),
+        partner_members=jnp.zeros((anchor_count,), dtype=jnp.int32),
+        partner_family_ids=jnp.zeros((anchor_count,), dtype=jnp.int32),
+        partner_checkpoint_stages=jnp.ones(
+            (anchor_count,), dtype=jnp.float32
+        ),
+        partner_run_ids=jnp.zeros((anchor_count,), dtype=jnp.int32),
         fit_returns_by_action=zeros_action,
         return_sum_by_action=zeros_action,
         return_squared_sum_by_action=zeros_action,
-        replica_count=jnp.zeros((count, 6), dtype=jnp.int32),
+        replica_count=jnp.zeros((anchor_count, 6), dtype=jnp.int32),
         collection_policy_logits=zeros_action,
-        collection_update=jnp.zeros((count,), dtype=jnp.int32),
-        collection_target_fingerprint=jnp.zeros((count, 2), dtype=jnp.uint32),
-        matched_pair_ids=jnp.full((count,), -1, dtype=jnp.int32),
-        action_mask=jnp.zeros((count, 6), dtype=jnp.bool_),
+        collection_update=jnp.zeros((anchor_count,), dtype=jnp.int32),
+        collection_target_fingerprint=jnp.zeros((anchor_count, 2), dtype=jnp.uint32),
+        matched_pair_ids=jnp.full((anchor_count,), -1, dtype=jnp.int32),
+        action_mask=jnp.zeros((anchor_count, 6), dtype=jnp.bool_),
+        evaluation_returns_by_action=jnp.zeros_like(zeros_action),
+        evaluation_replica_count=jnp.zeros((anchor_count, 6), dtype=jnp.int32),
     )
-    return AnchorReplayState(
-        batch=batch,
-        item_count=jnp.asarray(0, dtype=jnp.int32),
-        capacity=count,
-        use_counts=jnp.zeros((count,), dtype=jnp.int32),
+    pair_policy = jax_tree_take(policy, pair_count)
+    separation = SeparationTerms(
+        ego_state_a=pair_policy,
+        ego_state_b=pair_policy,
+        probe_observations=jnp.zeros(
+            (2, pair_count) + observation_shape, dtype=jnp.float32
+        ),
+        equivalent_mask=jnp.zeros((pair_count,), dtype=jnp.bool_),
+        weights=jnp.zeros((pair_count,), dtype=jnp.float32),
+        margin=jnp.asarray(0.0, dtype=jnp.float32),
+        pair_valid=jnp.zeros((pair_count,), dtype=jnp.bool_),
     )
-
-
-def _identity_fingerprint(identity: Mapping[str, Any]) -> str:
-    payload = json.dumps(dict(identity), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _source_batch_identity_path(path: Path) -> Path:
-    return path.parent / f"{path.name}.identity.json"
-
-
-def _save_source_batch(
-    path: Path, batch: Any, *, run_identity: Mapping[str, Any]
-) -> None:
-    import orbax.checkpoint as ocp
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ocp.PyTreeCheckpointer().save(str(path), batch, force=True)
-    write_json_atomic(
-        _source_batch_identity_path(path),
-        {
-            "schema": "delta_zsc_v6_generator_source_batch_v1",
-            "method": METHOD_VERSION,
-            "config_version": CONFIG_VERSION,
-            "run_identity_sha256": _identity_fingerprint(run_identity),
-            "batch_fingerprint": pytree_fingerprint(batch),
-        },
+    ingredient_count = (int(observation_shape[-1]) - 27) // 4
+    history_dim = int(config.anchors.probe_steps) * (38 + ingredient_count + 2)
+    comparator = FrozenPairComparator(
+        weights=jnp.zeros((2 * history_dim,), dtype=jnp.float32),
+        bias=jnp.asarray(0.0, dtype=jnp.float32),
+        train_accuracy=jnp.asarray(jnp.nan, dtype=jnp.float32),
+        validation_accuracy=jnp.asarray(jnp.nan, dtype=jnp.float32),
+        validation_accuracy_interval=(float("nan"), float("nan")),
+        history_feature_dim=history_dim,
+        pair_feature_dim=2 * history_dim,
+        development_row_count=0,
+        validation_row_count=0,
+        validation_partner_run_count=0,
+        development_partner_run_ids=jnp.full(
+            (COMPARATOR_RUN_ID_CAPACITY,), -1, dtype=jnp.int32
+        ),
+        development_partner_run_count=0,
     )
+    return anchors, separation, comparator
 
 
-def _load_source_batch(path: Path, *, run_identity: Mapping[str, Any]) -> Any:
-    import orbax.checkpoint as ocp
+def _empty_m1_history(capacity: int) -> Mapping[str, Any]:
+    """Fixed-shape M1 ledger stored atomically inside ``TrainState``."""
 
-    if not path.is_dir():
-        raise FileNotFoundError(f"Generator initialization replay is missing: {path}")
-    identity_path = _source_batch_identity_path(path)
-    if not identity_path.is_file():
-        raise RuntimeError("Generator initialization replay has no V6 identity sidecar.")
-    expected = json.loads(identity_path.read_text(encoding="utf-8"))
-    if expected.get("schema") != "delta_zsc_v6_generator_source_batch_v1":
-        raise RuntimeError("Generator initialization replay uses an incompatible schema.")
-    if expected.get("method") != METHOD_VERSION or int(
-        expected.get("config_version", -1)
-    ) != CONFIG_VERSION:
-        raise RuntimeError("Generator initialization replay is not a V6 artifact.")
-    if expected.get("run_identity_sha256") != _identity_fingerprint(run_identity):
-        raise RuntimeError("Generator initialization replay belongs to another run identity.")
-    restored = ocp.PyTreeCheckpointer().restore(str(path))
-    if isinstance(restored, Mapping):
-        from src.path_c.base_distillation import OwnerBehaviorBatch
+    import jax.numpy as jnp
 
-        restored = OwnerBehaviorBatch(**restored)
-    if expected.get("batch_fingerprint") != pytree_fingerprint(restored):
-        raise RuntimeError("Generator initialization replay fingerprint differs from its sidecar.")
-    return restored
+    count = max(int(capacity), 1)
+    nan = jnp.full
+    return {
+        "updates": jnp.full((count,), -1, dtype=jnp.int32),
+        "passed": jnp.zeros((count,), dtype=jnp.bool_),
+        "path_passing_fractions": nan((count, 4), jnp.nan, dtype=jnp.float32),
+        "path_mean_spearman": nan((count, 4), jnp.nan, dtype=jnp.float32),
+        "path_top_action_agreement": nan((count, 4), jnp.nan, dtype=jnp.float32),
+        "path_mean_value_regret": nan((count, 4), jnp.nan, dtype=jnp.float32),
+        "bootstrap_training_loss": nan((count, 3), jnp.nan, dtype=jnp.float32),
+        "pair_class_fractions": nan((count, 3), jnp.nan, dtype=jnp.float32),
+        "irreducible_ambiguity_fraction": nan(
+            (count,), jnp.nan, dtype=jnp.float32
+        ),
+        "separation_margin": nan((count,), jnp.nan, dtype=jnp.float32),
+        "valid_pair_fraction": nan((count,), jnp.nan, dtype=jnp.float32),
+    }
+
+
+def _append_m1_history(
+    history: Mapping[str, Any],
+    *,
+    index: int,
+    update: int,
+    result: Any,
+    bootstrap_training_metrics: Mapping[str, Any],
+    supervision_readings: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Return a fixed-shape ledger with one deterministic slot replaced."""
+
+    import jax.numpy as jnp
+
+    if not 0 <= int(index) < int(np.asarray(history["updates"]).shape[0]):
+        raise RuntimeError("M1 checkpoint history capacity is exhausted.")
+    values = dict(history)
+    values["updates"] = values["updates"].at[index].set(int(update))
+    values["passed"] = values["passed"].at[index].set(result.passed)
+    for name in (
+        "path_passing_fractions",
+        "path_mean_spearman",
+        "path_top_action_agreement",
+        "path_mean_value_regret",
+    ):
+        values[name] = values[name].at[index].set(getattr(result, name))
+    values["bootstrap_training_loss"] = values["bootstrap_training_loss"].at[
+        index
+    ].set(bootstrap_training_metrics["bootstrap_training_loss"])
+    for name in (
+        "pair_class_fractions",
+        "irreducible_ambiguity_fraction",
+        "separation_margin",
+        "valid_pair_fraction",
+    ):
+        values[name] = values[name].at[index].set(
+            jnp.asarray(supervision_readings[name])
+        )
+    return values
+
+
+def _m1_history_records(
+    history: Mapping[str, Any], *, count: int
+) -> list[dict[str, Any]]:
+    """Materialize the checkpoint ledger as the human-readable JSON report."""
+
+    host = _host(history)
+    records: list[dict[str, Any]] = []
+    for index in range(int(count)):
+        records.append(
+            {
+                "update": int(host["updates"][index]),
+                "passed": bool(host["passed"][index]),
+                "path_passing_fractions": host["path_passing_fractions"][index],
+                "path_mean_spearman": host["path_mean_spearman"][index],
+                "path_top_action_agreement": host[
+                    "path_top_action_agreement"
+                ][index],
+                "path_mean_value_regret": host["path_mean_value_regret"][index],
+                "bootstrap_training_loss": host["bootstrap_training_loss"][index],
+                "separation_readings": {
+                    "pair_class_fractions": host["pair_class_fractions"][index],
+                    "irreducible_ambiguity_fraction": host[
+                        "irreducible_ambiguity_fraction"
+                    ][index],
+                    "separation_margin": host["separation_margin"][index],
+                    "valid_pair_fraction": host["valid_pair_fraction"][index],
+                },
+            }
+        )
+    return records
+
+
+def jax_tree_take(tree: Any, count: int) -> Any:
+    import jax
+    import jax.numpy as jnp
+
+    return jax.tree_util.tree_map(lambda value: jnp.asarray(value)[: int(count)], tree)
 
 
 def _checkpoint_identity(state: TrainState) -> Mapping[str, Any]:
     """Fingerprint every value whose restoration can change the next update.
 
     The sidecar is intentionally stricter than Orbax's structural restore.  In
-    particular it binds recurrent/random state, all moving statistics and the
-    continuously trained generator.  A V5 checkpoint therefore cannot be
-    adopted merely because a subset of parameter leaves happens to match.
+    particular it binds recurrent/random state, supervision state, and every
+    optimizer.  A checkpoint from a previous method cannot be adopted merely
+    because a subset of parameter leaves happens to match.
     """
 
     return {
         "method": METHOD_VERSION,
         "config_version": CONFIG_VERSION,
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
         "update_count": int(np.asarray(state.update_count)),
         "effective_environment_steps": int(
             np.asarray(state.effective_environment_steps)
         ),
         "params": pytree_fingerprint(state.params),
         "target_params": pytree_fingerprint(state.target_params),
-        "generator_params": pytree_fingerprint(state.generator_params),
-        "generator_target_params": pytree_fingerprint(state.generator_target_params),
         "ppo_optimizer_state": pytree_fingerprint(state.ppo_optimizer_state),
-        "raw_q_optimizer_state": pytree_fingerprint(state.raw_q_optimizer_state),
-        "response_optimizer_state": pytree_fingerprint(state.response_optimizer_state),
-        "belief_optimizer_state": pytree_fingerprint(state.belief_optimizer_state),
-        "generator_optimizer_state": pytree_fingerprint(state.generator_optimizer_state),
-        "anchor_replay": replay_fingerprint(state.anchor_replay),
-        "generator_competence_multiplier": pytree_fingerprint(
-            state.generator_competence_multiplier
+        "supervision_anchor_batch": pytree_fingerprint(
+            state.supervision_anchor_batch
         ),
-        "generator_cvar_ema": pytree_fingerprint(state.generator_cvar_ema),
-        "external_reference_cvar_ema": pytree_fingerprint(
-            state.external_reference_cvar_ema
+        "current_separation_terms": pytree_fingerprint(
+            state.current_separation_terms
         ),
+        "current_pair_comparator": pytree_fingerprint(
+            state.current_pair_comparator
+        ),
+        "supervision_readings": pytree_fingerprint(state.supervision_readings),
         "anchor_sampling_counter": int(np.asarray(state.anchor_sampling_counter)),
-        "belief_gradient_norm_ema": pytree_fingerprint(
-            state.belief_gradient_norm_ema
+        "anchor_microbatch_size": int(np.asarray(state.anchor_microbatch_size)),
+        "effective_update_epochs": int(np.asarray(state.effective_update_epochs)),
+        "bootstrap_encoder_params": pytree_fingerprint(
+            state.bootstrap_encoder_params
         ),
-        "action_range_ema": pytree_fingerprint(state.action_range_ema),
-        "anchor_advantage_scale_ema": pytree_fingerprint(
-            state.anchor_advantage_scale_ema
+        "bootstrap_optimizer_states": pytree_fingerprint(
+            state.bootstrap_optimizer_states
         ),
+        "bootstrap_sampling_counters": pytree_fingerprint(
+            state.bootstrap_sampling_counters
+        ),
+        "m1_summary_state": pytree_fingerprint(state.m1_summary_state),
+        "m1_history": pytree_fingerprint(state.m1_history),
         "runner_state": pytree_fingerprint(state.runner_state),
         "optimizer_steps": {
             "ppo": int(np.asarray(state.ppo_optimizer_step)),
-            "raw_q": int(np.asarray(state.raw_q_optimizer_step)),
-            "response": int(np.asarray(state.response_optimizer_step)),
-            "belief": int(np.asarray(state.belief_optimizer_step)),
-            "generator": int(np.asarray(state.generator_optimizer_step)),
         },
         "random_domains": _host(state.random_domains),
         "resource_ledger": dict(state.resource_ledger),
     }
 
 
-def _save_v6_checkpoint(manager: Any, output: Path, state: TrainState) -> None:
+def _save_depi_checkpoint(manager: Any, output: Path, state: TrainState) -> None:
     step = int(np.asarray(state.effective_environment_steps))
     save_checkpoint(manager, step=step, state=state)
     write_json(
@@ -449,7 +500,7 @@ def _save_v6_checkpoint(manager: Any, output: Path, state: TrainState) -> None:
     )
 
 
-def _restore_v6_checkpoint(
+def _restore_depi_checkpoint(
     manager: Any, output: Path, template: TrainState
 ) -> TrainState | None:
     restored = restore_latest_checkpoint(manager, item=template)
@@ -460,14 +511,82 @@ def _restore_v6_checkpoint(
         state = TrainState(*state) if isinstance(state, tuple) else TrainState(**state)
     path = output / "checkpoint_identities" / f"{step:012d}.json"
     if not path.is_file():
-        raise RuntimeError("V6 checkpoint has no atomic resume identity.")
+        raise RuntimeError("DEPI checkpoint has no atomic resume identity.")
     expected = json.loads(path.read_text(encoding="utf-8"))
     observed = json.loads(json.dumps(_checkpoint_identity(state), sort_keys=True))
     if expected != observed:
-        raise RuntimeError("Checkpoint parameters, replay, RNG, or optimizer identity differs.")
+        raise RuntimeError(
+            "Checkpoint parameters, supervision state, RNG, or optimizer identity differs."
+        )
     if int(np.asarray(state.effective_environment_steps)) != int(step):
-        raise RuntimeError("Checkpoint step disagrees with V6 TrainState.")
+        raise RuntimeError("Checkpoint step disagrees with DEPI TrainState.")
     return state
+
+
+def _validate_preflight_roundtrips(
+    *,
+    manager: Any,
+    output: Path,
+    state: TrainState,
+    deployment_directory: Path,
+    config: Any,
+) -> Mapping[str, Any]:
+    """Fail closed on both §5 preflight persistence round-trips.
+
+    The checkpoint validator fingerprints every continuation-relevant state
+    field.  The deployment validator restores only the registered whitelist,
+    checks its fingerprint, and executes one real policy forward from the
+    checkpointed runner carry and observation.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    restored = _restore_depi_checkpoint(manager, output, state)
+    if restored is None:
+        raise RuntimeError("CUDA preflight checkpoint round-trip produced no state.")
+    expected_checkpoint = _checkpoint_identity(state)
+    observed_checkpoint = _checkpoint_identity(restored)
+    if expected_checkpoint != observed_checkpoint:
+        raise RuntimeError("CUDA preflight checkpoint round-trip is not exact.")
+
+    loaded = load_deployment(deployment_directory, config)
+    expected_deployment_fingerprint = pytree_fingerprint(
+        deployable_parameters(state.params)
+    )
+    observed_deployment_fingerprint = pytree_fingerprint(loaded.params)
+    if observed_deployment_fingerprint != expected_deployment_fingerprint:
+        raise RuntimeError("CUDA preflight deployment round-trip is not exact.")
+
+    runner = restored.runner_state
+    lane_count = int(jnp.asarray(runner.ego_roles).shape[0])
+    lanes = jnp.arange(lane_count, dtype=jnp.int32)
+    observations = runner.observations[lanes, runner.ego_roles]
+    keys = jax.random.split(jax.random.PRNGKey(0), lane_count)
+    stepped, actions, output_values, log_probability = deployment_action(
+        deployment=loaded,
+        state=runner.ego_policy,
+        observation=observations,
+        keys=keys,
+    )
+    forward_values = {
+        "stepped_state": stepped,
+        "actions": actions,
+        "policy_logits": output_values.policy_logits,
+        "state_value": output_values.state_value,
+        "protocol_probabilities": output_values.protocol_probabilities,
+        "log_probability": log_probability,
+    }
+    if not _all_finite(forward_values):
+        raise RuntimeError("CUDA preflight deployment forward is non-finite.")
+    return {
+        "checkpoint_roundtrip_passed": True,
+        "checkpoint_state_fingerprint": pytree_fingerprint(restored),
+        "deployment_roundtrip_passed": True,
+        "deployment_params_fingerprint": observed_deployment_fingerprint,
+        "deployment_forward_passed": True,
+        "deployment_forward_lane_count": lane_count,
+    }
 
 
 def _upstream_partner_cost(runs: tuple[Any, ...], *, formal: bool) -> tuple[int, Any]:
@@ -505,7 +624,7 @@ def _upstream_partner_cost(runs: tuple[Any, ...], *, formal: bool) -> tuple[int,
         )
     if formal and any(record["status"] != "counted" for record in records):
         raise RuntimeError(
-            "Formal V6 resource accounting requires explicit upstream partner ledgers."
+            "Formal DEPI resource accounting requires explicit upstream partner ledgers."
         )
     return total, records
 
@@ -549,16 +668,6 @@ def _account_runtime_resources(
     return state._replace(resource_ledger=ledger.to_mapping())
 
 
-def _tree_average(trees: list[Any]) -> Any:
-    import jax
-
-    if not trees:
-        raise ValueError("Cannot average an empty gradient sequence.")
-    return jax.tree_util.tree_map(
-        lambda *values: sum(values) / float(len(values)), *trees
-    )
-
-
 def _anchor_policy_logits(model: Any, params: Any, anchors: Any) -> Any:
     import jax.numpy as jnp
 
@@ -573,43 +682,33 @@ def _anchor_policy_logits(model: Any, params: Any, anchors: Any) -> Any:
     return output.policy_logits
 
 
-def _external_cvar_from_rollout(records: Mapping[str, Any], level: float) -> float | None:
-    completed = np.asarray(records["completed_returns"])
-    mask = np.asarray(records["completed_mask"], dtype=bool)
-    source = np.asarray(records["partner_source"])
-    values = completed[mask & (source == 2)]
-    if values.size == 0:
-        return None
-    return lower_tail_cvar(values.tolist(), level=float(level))
-
-
 def _write_training_support_latents(
-    output: Path, *, model: Any, params: Any, replay: AnchorReplayState, config: Any
+    output: Path, *, model: Any, params: Any, anchors: Any, config: Any
 ) -> None:
     """Persist final-model support without adding simulator interaction.
 
-    The optional safety wrapper must be calibrated against the primary model's
-    actual training support.  Re-encoding the fixed replay under final
-    parameters avoids mixing latent coordinates from earlier checkpoints.
+    Posterior calibration must use the primary model's actual training
+    support. Re-encoding the fixed anchor set under final parameters avoids mixing
+    latent coordinates from earlier checkpoints.
     """
 
     import jax
     import jax.numpy as jnp
 
-    count = int(np.asarray(replay.item_count))
-    if count < 2:
+    if anchors is None:
         write_json(
             output / "records" / "training_support_latents.json",
             {
                 "method": METHOD_VERSION,
                 "config_fingerprint": config.fingerprint,
                 "model_fingerprint": pytree_fingerprint(deployable_parameters(params)),
-                "row_count": count,
-                "status": "skipped_empty_replay",
+                "row_count": 0,
+                "status": "skipped_no_supervision_anchors",
             },
         )
         return
-    batch = jax.tree_util.tree_map(lambda value: value[:count], replay.batch)
+    count = int(np.asarray(anchors.anchor_ids).shape[0])
+    batch = anchors
     unused_state, output_values = model.apply(
         {"params": params},
         batch.policy_states,
@@ -635,10 +734,13 @@ def run_training(args: argparse.Namespace) -> None:
     scope = str(getattr(args, "_execution_scope", "training"))
     preflight = scope == CUDA_PREFLIGHT_SCOPE
     config = load_config(args.config, run_kind=args.run_kind)
-    generator_enabled = bool(config.partner_generator.enabled)
+    # Every B0--B2 run spends the same registered anchor-continuation
+    # simulator budget.  Only B2 is allowed to turn those measurements into
+    # decision supervision; B0/B1 collect them as compute/budget controls.
     anchor_enabled = bool(config.anchors.enabled)
+    decision_supervision_enabled = config.method_variant == "b2"
     cuda_toolchain = None
-    if config.run_kind == "formal" or os.environ.get("DELTA_REQUIRE_CUDA") == "1":
+    if config.run_kind == "formal" or os.environ.get("DEPI_REQUIRE_CUDA") == "1":
         cuda_toolchain = configure_bundled_cuda_toolchain()
 
     import jax
@@ -648,7 +750,7 @@ def run_training(args: argparse.Namespace) -> None:
         validate_formal_repository_state()
         validate_registered_python_runtime()
     cuda = None
-    if config.run_kind == "formal" or os.environ.get("DELTA_REQUIRE_CUDA") == "1":
+    if config.run_kind == "formal" or os.environ.get("DEPI_REQUIRE_CUDA") == "1":
         cuda = require_single_cuda_worker()
     official_runtime = validate_official_runtime() if config.run_kind == "formal" else None
 
@@ -685,7 +787,7 @@ def run_training(args: argparse.Namespace) -> None:
         official_commit=OFFICIAL_SOURCE_COMMIT,
         config_fingerprint=config.fingerprint,
         model_structure_fingerprint=structure_fingerprint,
-        cache_root=os.environ.get("DELTA_JAX_COMPILATION_CACHE"),
+        cache_root=os.environ.get("DEPI_JAX_COMPILATION_CACHE"),
     )
     identity.update(
         {
@@ -707,15 +809,131 @@ def run_training(args: argparse.Namespace) -> None:
     write_json(output / "runtime_gpu.json", cuda or _gpu_snapshot())
 
     owner_runs = _owned_runs(manifest, "owner_source", int(args.seed_index))
-    init_runs = _owned_runs(manifest, "generator_init_source", int(args.seed_index))
-    support_runs = _owned_runs(manifest, "development_support", int(args.seed_index))
-    owner_pool, init_pool, external_pool = (
-        _pool(owner_runs),
-        _pool(init_runs),
-        _pool(support_runs),
+    support_runs = tuple(
+        run
+        for run in manifest.runs
+        if run.role == "development_support"
+        and run.owner_seed_index in (None, int(args.seed_index))
+    )
+    owner_pool = _pool(owner_runs)
+    support_manifest = type(manifest)(manifest.layout, support_runs)
+    support_members = build_partner_pool(config, support_manifest, "train")
+    comparator_fit_runs = tuple(manifest.by_role("comparator_fit"))
+    comparator_validation_runs = tuple(manifest.by_role("comparator_validation"))
+    comparator_fit_members = (
+        build_partner_pool(config, manifest, "comparator_fit")
+        if comparator_fit_runs
+        else ()
+    )
+    comparator_validation_members = (
+        build_partner_pool(config, manifest, "comparator_validation")
+        if comparator_validation_runs
+        else ()
+    )
+    if bool(comparator_fit_members) != bool(comparator_validation_members):
+        raise RuntimeError("Comparator fit and validation pools must either both exist or both be absent.")
+    if config.run_kind == "formal" and comparator_fit_members:
+        reserved_lane_count = config.environment.num_envs // 8
+        for label, members in (
+            ("comparator_fit", comparator_fit_members),
+            ("comparator_validation", comparator_validation_members),
+        ):
+            if min(member.probability for member in members) < 1.0 / reserved_lane_count:
+                raise RuntimeError(
+                    f"Formal {label} stratification cannot guarantee every run in its reserved lanes."
+                )
+    static_members = (
+        *support_members,
+        *comparator_fit_members,
+        *comparator_validation_members,
+    )
+    if any(member.checkpoint is None for member in static_members):
+        raise RuntimeError("A training partner-pool member has no frozen checkpoint.")
+    support_external_pool = FrozenPartnerPool.from_checkpoints(
+        [member.checkpoint for member in support_members],
+        parent_training_run_ids=[
+            member.parent_training_run_id for member in support_members
+        ],
+    )
+    external_pool = FrozenPartnerPool.from_checkpoints(
+        [member.checkpoint for member in static_members],
+        parent_training_run_ids=[
+            member.parent_training_run_id for member in static_members
+        ],
+    )
+    static_member_probabilities = np.asarray(
+        [member.probability for member in static_members], dtype=np.float32
+    )
+    static_member_sampling_groups = np.asarray(
+        [
+            0 if index < len(support_members) else (
+                1
+                if index < len(support_members) + len(comparator_fit_members)
+                else 2
+            )
+            for index in range(len(static_members))
+        ],
+        dtype=np.int32,
+    )
+    family_index = {
+        family: index
+        for index, family in enumerate(
+            sorted({member.family_id for member in static_members})
+        )
+    }
+    static_member_family_ids = np.asarray(
+        [family_index[member.family_id] for member in static_members], dtype=np.int32
+    )
+    static_member_stages = np.asarray(
+        [member.checkpoint_stage for member in static_members], dtype=np.float32
+    )
+    write_json(
+        output / "partner_pool.json",
+        {
+            "split": "train",
+            "sampling": "family_then_stage_then_seed_uniform",
+            "comparator_lane_allocation_before_freeze": (
+                {"support": "6/8", "comparator_fit": "1/8", "comparator_validation": "1/8"}
+                if comparator_fit_members
+                else {"support": "8/8"}
+            ),
+            "members": [
+                {
+                    "run_id": member.run_id,
+                    "family_id": member.family_id,
+                    "hyperparameter_family": getattr(
+                        member, "hyperparameter_family", "default"
+                    ),
+                    "mechanism": member.mechanism,
+                    "checkpoint_stage": member.checkpoint_stage,
+                    "seed": member.seed,
+                    "probability": member.probability,
+                    "partition": (
+                        "support"
+                        if static_member_sampling_groups[index] == 0
+                        else (
+                            "comparator_fit"
+                            if static_member_sampling_groups[index] == 1
+                            else "comparator_validation"
+                        )
+                    ),
+                }
+                for index, member in enumerate(static_members)
+            ],
+        },
     )
     upstream_steps, upstream_records = _upstream_partner_cost(
-        tuple({run.run_id: run for run in (*owner_runs, *init_runs, *support_runs)}.values()),
+        tuple(
+            {
+                run.run_id: run
+                for run in (
+                    *owner_runs,
+                    *support_runs,
+                    *comparator_fit_runs,
+                    *comparator_validation_runs,
+                )
+            }.values()
+        ),
         formal=(config.run_kind == "formal" and not preflight),
     )
     write_json(output / "upstream_cost_manifest.json", {"runs": upstream_records})
@@ -725,7 +943,6 @@ def run_training(args: argparse.Namespace) -> None:
         action_count=6,
         task_hidden_dim=config.model.task_hidden_dim,
         capability_hidden_dim=config.model.capability_hidden_dim,
-        protocol_hidden_dim=config.model.protocol_hidden_dim,
         capability_dim=config.model.capability_dim,
         protocol_components=config.model.protocol_components,
         component_embedding_dim=config.model.component_embedding_dim,
@@ -734,25 +951,9 @@ def run_training(args: argparse.Namespace) -> None:
         response_hidden_dim=config.model.response_hidden_dim,
         modulation_rank=config.model.modulation_rank,
         action_embedding_dim=config.model.action_embedding_dim,
+        method_variant=config.method_variant,
     )
-    generator = None
-    generator_environment = None
-    if generator_enabled:
-        generator = build_partner_generator(
-            observation_shape=observation_shape,
-            action_count=6,
-            code_dim=config.partner_generator.code_dim,
-            hidden_dim=config.partner_generator.hidden_dim,
-            modulation_rank=config.partner_generator.modulation_rank,
-        )
-        generator_environment = VectorEnvironment(
-            environment.environment,
-            int(config.partner_generator.episodes_per_update),
-            int(config.partner_generator.episode_steps),
-        )
-
     ego_root = jnp.asarray(domains["ego"], dtype=jnp.uint32)
-    generator_root = jnp.asarray(domains["generator"], dtype=jnp.uint32)
     reset_key, model_key, runner_key = jax.random.split(ego_root, 3)
     unused_state, initial_observations = environment.reset(reset_key)
     del unused_state
@@ -762,7 +963,6 @@ def run_training(args: argparse.Namespace) -> None:
         action_count=6,
         task_hidden_dim=config.model.task_hidden_dim,
         capability_hidden_dim=config.model.capability_hidden_dim,
-        protocol_hidden_dim=config.model.protocol_hidden_dim,
         capability_dim=config.model.capability_dim,
         component_embedding_dim=config.model.component_embedding_dim,
         protocol_components=config.model.protocol_components,
@@ -773,55 +973,26 @@ def run_training(args: argparse.Namespace) -> None:
         example_state=example_policy,
         example_observation=initial_observations[:, 0],
     )
-    bootstrap_ensemble = None
-    bootstrap_params = None
-    if anchor_enabled:
-        # §6 hypothesis path (ii): B=3 independently initialized protocol
-        # encoders re-filter the same real anchor history.  The ensemble is
-        # report-only; the training loop never applies gradients to it.
-        bootstrap_ensemble = bootstrap_protocol_ensemble_class()(
-            hidden_dim=config.model.protocol_hidden_dim,
-            component_count=config.model.protocol_components,
+    bootstrap_models: Any = ()
+    bootstrap_params: Any = ()
+    bootstrap_optimizer_states: Any = ()
+    bootstrap_sampling_counters = jnp.zeros((0,), dtype=jnp.int32)
+    if anchor_enabled and decision_supervision_enabled:
+        (
+            bootstrap_models,
+            bootstrap_params,
+            bootstrap_optimizer_states,
+            bootstrap_sampling_counters,
+        ) = initialize_bootstrap_value_ensemble(
+            key=jax.random.fold_in(model_key, 60),
+            example_policy_state=example_policy,
+            example_observation=initial_observations[:, 0],
             action_count=6,
-            action_embedding_dim=config.model.action_embedding_dim,
         )
-        member_count = int(getattr(bootstrap_ensemble, "member_count", 3))
-        bootstrap_carries = tuple(
-            initial_protocol_carry(environment.num_envs, config.model.protocol_hidden_dim)
-            for _ in range(member_count)
-        )
-        bootstrap_inputs = (
-            initial_observations[:, 0],
-            initial_observations[:, 0],
-            jnp.zeros((environment.num_envs,), dtype=jnp.int32),
-            jnp.ones((environment.num_envs,), dtype=jnp.bool_),
-            initial_protocol_probabilities(
-                (environment.num_envs,), config.model.protocol_components
-            ),
-        )
-        bootstrap_params = bootstrap_ensemble.init(
-            jax.random.fold_in(model_key, 60),
-            bootstrap_carries,
-            bootstrap_inputs,
-            False,
-        )["params"]
-    initial_generator_params = (
-        initialize_generator_parameters(
-            generator,
-            key=jax.random.fold_in(generator_root, 0),
-            observation_shape=observation_shape,
-            code_dim=config.partner_generator.code_dim,
-            batch_size=config.partner_generator.episodes_per_update,
-            hidden_dim=config.partner_generator.hidden_dim,
-        )
-        if generator_enabled
-        else None
-    )
     total_updates = config.training.environment_steps // (
         config.environment.num_envs * config.training.rollout_length
     )
 
-    source_cache = output / "training_cache" / "generator_source_batch"
     new_run = not bool(args.resume)
     if new_run:
         if (output / "checkpoints").exists() and any((output / "checkpoints").iterdir()):
@@ -833,9 +1004,22 @@ def run_training(args: argparse.Namespace) -> None:
             function=lambda: collect_owner_behavior(
                 environment=environment,
                 owner_pool=owner_pool,
-                partner_pool=external_pool,
+                partner_pool=support_external_pool,
                 length=config.training.rollout_length,
                 key=jax.random.fold_in(ego_root, 1),
+                partner_members=jax.random.categorical(
+                    jax.random.fold_in(ego_root, 101),
+                    jnp.log(
+                        jnp.maximum(
+                            jnp.asarray(
+                                [member.probability for member in support_members],
+                                dtype=jnp.float32,
+                            ),
+                            1.0e-12,
+                        )
+                    ),
+                    shape=(environment.num_envs,),
+                ).astype(jnp.int32),
             ),
         )
         del unused
@@ -865,7 +1049,6 @@ def run_training(args: argparse.Namespace) -> None:
                     action_count=6,
                     task_hidden_dim=config.model.task_hidden_dim,
                     capability_hidden_dim=config.model.capability_hidden_dim,
-                    protocol_hidden_dim=config.model.protocol_hidden_dim,
                     capability_dim=config.model.capability_dim,
                     component_embedding_dim=config.model.component_embedding_dim,
                     protocol_components=config.model.protocol_components,
@@ -876,98 +1059,9 @@ def run_training(args: argparse.Namespace) -> None:
             ),
         )
         del unused_owner_state, unused
-
-        code_anchors = source_code_anchors(4, config.partner_generator.code_dim)
-        if generator_enabled:
-            episode_count = config.partner_generator.episodes_per_update
-            if episode_count % 4:
-                raise ValueError("Generator source initialization needs balanced SP/OP/SA/FCP lanes.")
-            members = jnp.tile(jnp.arange(4, dtype=jnp.int32), episode_count // 4)
-            source_batch, unused = _phase(
-                output,
-                name="generator_initialization_collection",
-                update=0,
-                function=lambda: collect_owner_behavior(
-                    environment=generator_environment,
-                    owner_pool=init_pool,
-                    partner_pool=owner_pool,
-                    length=config.partner_generator.episode_steps,
-                    key=jax.random.fold_in(generator_root, 1),
-                    owner_members=members,
-                ),
-            )
-            del unused
-            _save_source_batch(source_cache, source_batch, run_identity=identity)
-            init_generator_optimizer, init_generator_state = make_optimizer(
-                initial_generator_params,
-                learning_rate=config.ppo.learning_rate,
-                gradient_clip_norm=config.ppo.gradient_clip_norm,
-                adam_epsilon=config.ppo.adam_epsilon,
-            )
-            generator_init_schedule = environment_minibatch_schedule(
-                jax.random.fold_in(generator_root, 2),
-                environment_count=episode_count,
-                minibatches_per_epoch=config.partner_generator.environment_minibatches,
-                update_epochs=config.partner_generator.update_epochs,
-            )
-            (
-                generator_params,
-                unused_generator_init_state,
-                generator_initialization_metrics,
-            ), unused = _phase(
-                output,
-                name="generator_source_distillation",
-                update=0,
-                function=lambda: distill_generator_sources(
-                    generator=generator,
-                    params=initial_generator_params,
-                    batch=source_batch,
-                    code_anchors=code_anchors,
-                    optimizer=init_generator_optimizer,
-                    optimizer_state=init_generator_state,
-                    schedule=generator_init_schedule,
-                    hidden_dim=config.partner_generator.hidden_dim,
-                ),
-            )
-            del unused_generator_init_state, unused
-            external_returns, unused = _phase(
-                output,
-                name="external_reference_initialization",
-                update=0,
-                function=lambda: collect_complete_external_episodes(
-                    environment=generator_environment,
-                    model=model,
-                    ego_params=params,
-                    model_config=config.model,
-                    external_pool=external_pool,
-                    key=jax.random.fold_in(generator_root, 3),
-                ),
-            )
-            del unused
-            reference_cvar = lower_tail_cvar(
-                np.asarray(external_returns.raw_returns).tolist(),
-                level=config.partner_generator.cvar_level,
-            )
-        else:
-            generator_params = initial_generator_params
-            generator_initialization_metrics = {
-                "generator_source_distillation_kl": jnp.asarray(np.nan)
-            }
-            reference_cvar = 0.0
     else:
         params = initial_params
-        generator_params = initial_generator_params
-        source_batch = (
-            _load_source_batch(source_cache, run_identity=identity)
-            if generator_enabled
-            else None
-        )
         owner_metrics = {"owner_distillation_kl": jnp.asarray(np.nan)}
-        generator_initialization_metrics = {
-            "generator_source_distillation_kl": jnp.asarray(np.nan)
-        }
-        reference_cvar = 0.0
-        code_anchors = source_code_anchors(4, config.partner_generator.code_dim)
 
     ppo_optimizer, ppo_state = make_optimizer(
         params,
@@ -980,50 +1074,14 @@ def run_training(args: argparse.Namespace) -> None:
         minibatches_per_epoch=config.training.minibatches_per_epoch,
         update_epochs=config.ppo.update_epochs,
     )
-    raw_q_optimizer, raw_q_state = make_optimizer(
-        params,
-        learning_rate=config.ppo.learning_rate,
-        gradient_clip_norm=config.ppo.gradient_clip_norm,
-        adam_epsilon=config.ppo.adam_epsilon,
-    )
-    response_optimizer, response_state = make_optimizer(
-        params,
-        learning_rate=config.ppo.learning_rate,
-        gradient_clip_norm=config.ppo.gradient_clip_norm,
-        adam_epsilon=config.ppo.adam_epsilon,
-    )
-    belief_optimizer, belief_state = make_optimizer(
-        params,
-        learning_rate=config.ppo.learning_rate,
-        gradient_clip_norm=config.ppo.gradient_clip_norm,
-        adam_epsilon=config.ppo.adam_epsilon,
-    )
-    generator_optimizer, generator_state = (
-        make_optimizer(
-            generator_params,
-            learning_rate=config.ppo.learning_rate,
-            gradient_clip_norm=config.ppo.gradient_clip_norm,
-            adam_epsilon=config.ppo.adam_epsilon,
-            anneal_learning_rate=config.ppo.anneal_learning_rate,
-            warmup_fraction=config.ppo.lr_warmup_fraction,
-            update_count=total_updates,
-            minibatches_per_epoch=(
-                config.partner_generator.environment_minibatches
-            ),
-            update_epochs=config.partner_generator.update_epochs,
-        )
-        if generator_enabled
-        else (None, None)
-    )
-    partner_functions = (
-        make_mixed_partner_functions(
-            generator=generator,
-            generator_hidden_dim=config.partner_generator.hidden_dim,
-            generator_code_dim=config.partner_generator.code_dim,
-            external_pool=external_pool,
-        )
-        if generator_enabled
-        else make_static_pool_partner_functions(external_pool=external_pool)
+    partner_functions = make_static_pool_partner_functions(
+        external_pool=external_pool,
+        member_probabilities=static_member_probabilities,
+        member_family_ids=static_member_family_ids,
+        member_checkpoint_stages=static_member_stages,
+        member_sampling_groups=(
+            static_member_sampling_groups if comparator_fit_members else None
+        ),
     )
     runner = initialize_runner(
         environment=environment,
@@ -1031,74 +1089,61 @@ def run_training(args: argparse.Namespace) -> None:
         partner_functions=partner_functions,
         random_key=runner_key,
     )
-    replay = _empty_replay(
-        capacity=config.anchors.replay_capacity,
-        observation_shape=observation_shape,
-        code_dim=config.partner_generator.code_dim,
-        model_config=config.model,
-    )
     initial_ledger = ResourceLedger(
         ego_initialization_steps=(
             0 if not new_run else environment.num_envs * config.training.rollout_length
         ),
-        generator_initialization_steps=(
-            0
-            if (not new_run or not generator_enabled)
-            else 2
-            * config.partner_generator.episodes_per_update
-            * config.partner_generator.episode_steps
-        ),
         upstream_partner_steps=upstream_steps,
     )
-    # Frozen V6 belief-objective keys kept only for checkpoint identity
-    # stability; the belief-gradient mechanism itself is abolished (§3.3).
-    norm_ema = {
-        name: jnp.asarray(1.0, dtype=jnp.float32)
-        for name in (
-            "ppo",
-            "raw_q",
-            "counterfactual",
-            "response",
-            "decision_equivalence",
-            "information_bottleneck",
-            "q_policy",
-            "robust",
-        )
-    }
+    (
+        empty_supervision_anchors,
+        empty_separation_terms,
+        empty_pair_comparator,
+    ) = _empty_supervision_payload(
+        config=config, observation_shape=observation_shape
+    )
     template = TrainState(
         params=params,
         target_params=jax.tree_util.tree_map(jnp.copy, params),
         ppo_optimizer_state=ppo_state,
-        raw_q_optimizer_state=raw_q_state,
-        response_optimizer_state=response_state,
-        belief_optimizer_state=belief_state,
-        generator_optimizer_state=generator_state,
-        generator_params=generator_params,
-        generator_target_params=jax.tree_util.tree_map(jnp.copy, generator_params),
-        generator_competence_multiplier=jnp.asarray(0.0, dtype=jnp.float32),
-        generator_cvar_ema=jnp.asarray(reference_cvar, dtype=jnp.float32),
-        external_reference_cvar_ema=jnp.asarray(reference_cvar, dtype=jnp.float32),
-        anchor_replay=replay,
+        supervision_anchor_batch=empty_supervision_anchors,
+        current_separation_terms=empty_separation_terms,
+        current_pair_comparator=empty_pair_comparator,
+        supervision_readings={
+            "pair_class_fractions": jnp.zeros((3,), dtype=jnp.float32),
+            "irreducible_ambiguity_fraction": jnp.asarray(0.0, dtype=jnp.float32),
+            "separation_margin": jnp.asarray(0.0, dtype=jnp.float32),
+            "valid_pair_fraction": jnp.asarray(0.0, dtype=jnp.float32),
+        },
         anchor_sampling_counter=jnp.asarray(0, dtype=jnp.int32),
-        belief_gradient_norm_ema=norm_ema,
-        action_range_ema=jnp.asarray(1.0, dtype=jnp.float32),
-        anchor_advantage_scale_ema=jnp.asarray(1.0, dtype=jnp.float32),
-        ppo_optimizer_step=jnp.asarray(0, dtype=jnp.int64),
-        raw_q_optimizer_step=jnp.asarray(0, dtype=jnp.int64),
-        response_optimizer_step=jnp.asarray(0, dtype=jnp.int64),
-        belief_optimizer_step=jnp.asarray(0, dtype=jnp.int64),
-        generator_optimizer_step=jnp.asarray(0, dtype=jnp.int64),
+        anchor_microbatch_size=jnp.asarray(0, dtype=jnp.int32),
+        effective_update_epochs=jnp.asarray(
+            config.ppo.update_epochs, dtype=jnp.int32
+        ),
+        bootstrap_encoder_params=bootstrap_params,
+        bootstrap_optimizer_states=bootstrap_optimizer_states,
+        bootstrap_sampling_counters=bootstrap_sampling_counters,
+        m1_summary_state={
+            "evaluations": jnp.asarray(0, dtype=jnp.int32),
+            "latest_passed": jnp.asarray(False),
+        },
+        m1_history=_empty_m1_history(
+            (total_updates + int(config.anchors.interval_updates) - 1)
+            // int(config.anchors.interval_updates)
+            + 1
+        ),
+        ppo_optimizer_step=jnp.asarray(0, dtype=jnp.int32),
         runner_state=runner,
         random_domains={name: jnp.asarray(value, dtype=jnp.uint32) for name, value in domains.items()},
         update_count=jnp.asarray(0, dtype=jnp.int32),
-        effective_environment_steps=jnp.asarray(0, dtype=jnp.int64),
+        effective_environment_steps=jnp.asarray(0, dtype=jnp.int32),
         resource_ledger=initial_ledger.to_mapping(),
     )
     manager = orbax_manager(output / "checkpoints")
     if args.resume:
-        restored = _restore_v6_checkpoint(manager, output, template)
+        restored = _restore_depi_checkpoint(manager, output, template)
         if restored is None:
-            raise FileNotFoundError("--resume requested but no V6 checkpoint exists.")
+            raise FileNotFoundError("--resume requested but no DEPI checkpoint exists.")
         state = restored
     else:
         state = template
@@ -1113,7 +1158,6 @@ def run_training(args: argparse.Namespace) -> None:
     )
     anchor_functions = None
     anchor_kernel = None
-    anchor_logits_kernel = None
     if anchor_enabled:
         anchor_functions = make_anchor_functions(
             model=model,
@@ -1126,84 +1170,47 @@ def run_training(args: argparse.Namespace) -> None:
             config=config,
             memory_limit_bytes=FORMAL_PEAK_MEMORY_LIMIT_BYTES,
         )
-        anchor_logits_kernel = CompiledCallable(
-            "anchor_policy_logits",
-            lambda candidate, batch: _anchor_policy_logits(model, candidate, batch),
-        )
-    generator_collect_kernel = None
-    generator_update_kernel = None
-    if generator_enabled:
-        generator_collect_kernel = CompiledCallable(
-            "generator_episode_collection",
-            lambda ego, gen, codes, key, version, factor: collect_complete_generator_episodes(
-                environment=generator_environment,
-                model=model,
-                ego_params=ego,
-                model_config=config.model,
-                generator=generator,
-                generator_params=gen,
-                codes=codes,
-                key=key,
-                parameter_version_id=version,
-                official_shaping_factor=factor,
-            ),
-        )
-        generator_update_kernel = CompiledCallable(
-            "generator_ppo_scan",
-            lambda gen, opt_state, episodes, source, schedule, progress, multiplier, reference, bank: update_generator(
-                generator=generator,
-                params=gen,
-                optimizer_state=opt_state,
-                optimizer=generator_optimizer,
-                batch=episodes,
-                source_batch=source,
-                code_anchors=code_anchors,
-                schedule=schedule,
-                config=config,
-                progress=progress,
-                competence_multiplier=multiplier,
-                reference_cvar=reference,
-                bank_signatures=bank,
-            ),
-        )
 
     # §3.3/§5: the most recent anchor batch and its matched-pair separation
     # terms supervise every combined-loss update until the next anchor trigger
     # refreshes them; both stay None while anchors are disabled.
-    supervision_anchors = None
-    supervision_separation = None
-    supervision_readings: dict[str, Any] = {}
-    diversity_bank_signatures = None
-    m1_history: list[dict[str, Any]] = []
-    anchor_microbatch = None
+    supervision_active = (
+        decision_supervision_enabled
+        and int(np.asarray(state.anchor_sampling_counter)) > 0
+    )
+    supervision_anchors = (
+        state.supervision_anchor_batch if supervision_active else None
+    )
+    supervision_separation = (
+        state.current_separation_terms if supervision_active else None
+    )
+    supervision_readings: dict[str, Any] = dict(state.supervision_readings)
+    m1_history_path = output / "m1_gate.json"
+    m1_history = _m1_history_records(
+        state.m1_history,
+        count=int(np.asarray(state.m1_summary_state["evaluations"])),
+    )
+    stored_microbatch = int(np.asarray(state.anchor_microbatch_size))
+    anchor_microbatch = stored_microbatch if stored_microbatch > 0 else None
     start_update = int(np.asarray(state.update_count))
     last_update = min(total_updates, start_update + 1) if preflight else total_updates
     wall_started = time.perf_counter()
     wall_accounted_at = wall_started
     # §3.4: when the combined-policy-KL gate fires inside the scan, shrink the
     # next update's epoch count (floor 2) and recover one epoch per clean update.
-    effective_update_epochs = int(config.ppo.update_epochs)
+    effective_update_epochs = int(np.asarray(state.effective_update_epochs))
+    bootstrap_params = state.bootstrap_encoder_params
+    bootstrap_optimizer_states = state.bootstrap_optimizer_states
+    bootstrap_sampling_counters = state.bootstrap_sampling_counters
 
     for update in range(start_update, last_update):
         phase_times: dict[str, float] = {}
         snapshot_params = state.params
         snapshot_target = state.target_params
-        progress = jnp.asarray(update / float(max(total_updates, 1)), dtype=jnp.float32)
-        if generator_enabled:
-            probabilities = soft_generator_mixture(
-                progress=progress,
-                generator_cvar_ema=state.generator_cvar_ema,
-                reference_cvar_ema=state.external_reference_cvar_ema,
-                maximum_probability=config.partner_generator.maximum_generator_probability,
-                ramp_fraction=config.partner_generator.mixture_ramp_fraction,
-                competence_temperature=config.partner_generator.competence_temperature,
-            )
-            partner_parameters = MixedPartnerParameters(
-                state.generator_params, state.generator_target_params, probabilities
-            )
-        else:
-            probabilities = {}
-            partner_parameters = None
+        partner_parameters = jnp.asarray(
+            int(state.current_pair_comparator.development_row_count) > 0,
+            dtype=jnp.bool_,
+        )
         dropout = context_dropout_probability(
             state.effective_environment_steps,
             total_steps=config.training.environment_steps,
@@ -1236,17 +1243,15 @@ def run_training(args: argparse.Namespace) -> None:
         phase_times["rollout"] = elapsed
         runner, batch, records = rollout_result
         if batch is None:
-            raise RuntimeError("Training rollout did not return the V6 PPO batch.")
+            raise RuntimeError("Training rollout did not return the DEPI PPO batch.")
 
-        # Decision-regret shaping is disconnected from the DEPI foundation
-        # path (METHOD_SPEC §3.3 abolishes the regret potential; §7 boundary).
-        regret_metrics = {"action_range_ema": state.action_range_ema}
-        next_replay = state.anchor_replay
+        next_pair_comparator = state.current_pair_comparator
+        next_m1_summary = state.m1_summary_state
+        next_m1_history = state.m1_history
         anchor_budget = {
             "counterfactual_continuation_steps": 0,
-            "matched_code_probe_steps": 0,
+            "matched_pair_probe_steps": 0,
         }
-        bank_continuation_steps = 0
         if anchor_trigger:
             if anchor_microbatch is None:
                 anchor_microbatch = preflight_anchor_microbatch_from_records(
@@ -1283,14 +1288,22 @@ def run_training(args: argparse.Namespace) -> None:
                     microbatch_size=anchor_microbatch,
                     anchor_functions=anchor_functions,
                     chunk_kernel=anchor_kernel,
+                    frozen_comparator=(
+                        state.current_pair_comparator
+                        if int(state.current_pair_comparator.development_row_count) > 0
+                        else None
+                    ),
                 ),
             )
             phase_times["counterfactual_anchor"] = elapsed
-            anchors, quotient_pairs, anchor_budget = anchor_result
-            supervision_anchors = anchors
+            anchors, quotient_pairs, anchor_budget, next_pair_comparator = anchor_result
+            supervision_anchors = anchors if decision_supervision_enabled else None
             supervision_separation = None
-            supervision_readings = {}
-            if quotient_pairs.comparator_accuracy is not None:
+            supervision_readings = dict(state.supervision_readings)
+            if (
+                decision_supervision_enabled
+                and quotient_pairs.comparator_distinct_probability is not None
+            ):
                 # §5.3 -> §3.2: matched-pair classification feeds L_separation.
                 # Only the classification (masks/weights/margin) is built here;
                 # the loss forward passes run inside the jit-compiled scan on
@@ -1300,126 +1313,84 @@ def run_training(args: argparse.Namespace) -> None:
                     supervision_readings,
                 ) = separation_terms_from_matched_pairs(
                     quotient=quotient_pairs,
-                    equivalent_accuracy_max=float(
-                        config.anchors.observable_equivalent_accuracy_max
+                    equivalent_probability_max=float(
+                        config.anchors.observable_equivalent_probability_max
                     ),
-                    distinct_accuracy_min=float(
-                        config.anchors.decision_distinct_accuracy_min
+                    distinct_probability_min=float(
+                        config.anchors.decision_distinct_probability_min
                     ),
                     signature_threshold=float(
                         config.anchors.signature_distance_threshold
                     ),
                     margin_scale=float(config.loss_v2.separation_margin_scale),
                 )
-            # §6 extended M1 gate: posterior-mean path plus every bootstrap
-            # member path against the shared CRN all-action signatures.
-            (gate_result, elapsed) = _phase(
-                output,
-                name="m1_gate",
-                update=update,
-                function=lambda: evaluate_m1_gate_on_anchor_batch(
-                    model=model,
-                    params=snapshot_params,
-                    bootstrap_ensemble=bootstrap_ensemble,
-                    bootstrap_params=bootstrap_params,
+            if decision_supervision_enabled:
+                (
+                    bootstrap_params,
+                    bootstrap_optimizer_states,
+                    bootstrap_sampling_counters,
+                    bootstrap_training_metrics,
+                ) = train_bootstrap_value_ensemble(
+                    models=bootstrap_models,
+                    params=bootstrap_params,
+                    optimizer_states=bootstrap_optimizer_states,
+                    sampling_counters=bootstrap_sampling_counters,
                     anchors=anchors,
-                    spearman_threshold=float(config.anchors.m1_spearman_threshold),
-                    minimum_anchor_fraction=float(
-                        config.anchors.m1_minimum_anchor_fraction
-                    ),
-                ),
-            )
-            phase_times["m1_gate"] = elapsed
-            gate_payload = {
-                "update": update + 1,
-                **m1_gate_report(gate_result),
-                "separation_readings": _host(supervision_readings),
-            }
-            m1_history.append(gate_payload)
-            write_json(
-                output / "m1_gate.json",
-                {
-                    "specification": "METHOD_SPEC §6 extended M1 gate",
-                    "history": m1_history,
-                    "latest": gate_payload,
-                },
-            )
-            if (
-                not bool(np.asarray(gate_result.passed))
-                and config.run_kind == "formal"
-                and not preflight
-            ):
-                raise RuntimeError(
-                    "§6 extended M1 gate failed: both the posterior-mean path "
-                    "and every bootstrap member path must reach Spearman >= "
-                    "0.8 on >= 90% of anchor states before a formal run may "
-                    "proceed."
-                )
-            if generator_enabled:
-                # §7.2 shared-state diversity bank: real all-action
-                # continuations of the diversity codes on identical legal
-                # anchor snapshots.
-                diversity_codes = sample_partner_codes(
-                    jax.random.fold_in(
-                        jnp.asarray(domains["training_anchor"], dtype=jnp.uint32),
-                        50_000 + update,
-                    ),
-                    batch_size=config.partner_generator.diversity_codes_per_update,
-                    code_dim=config.partner_generator.code_dim,
-                )
-                diversity_bank_signatures = collect_diversity_bank_signatures(
-                    anchor_domain=update + 1,
                     key=jax.random.fold_in(
                         jnp.asarray(domains["training_anchor"], dtype=jnp.uint32),
-                        51_000 + update,
+                        900_000 + update,
                     ),
-                    records=records,
-                    codes=diversity_codes,
-                    functions=anchor_functions,
-                    runtime=AnchorRuntime(snapshot_target, partner_parameters),
-                    config=config,
-                    microbatch_size=anchor_microbatch,
-                    chunk_kernel=anchor_kernel,
                 )
-                bank_continuation_steps = (
-                    int(config.partner_generator.diversity_bank_size)
-                    * int(config.partner_generator.diversity_codes_per_update)
-                    * 6
-                    * int(config.anchors.fit_replicas)
-                    * int(config.anchors.continuation_horizon)
-                )
-            next_replay = append_replay_batch(
-                next_replay,
-                batch=anchors,
-                capacity=config.anchors.replay_capacity,
-            )
-
-        replay_samples: list[Any] = []
-        replay_weights: list[Any] = []
-        sampled_replay = next_replay
-        if anchor_enabled:
-            for replay_index in range(config.loss.raw_q_updates_per_outer_update):
-                sampled_replay, sample = sample_replay_batch(
-                    sampled_replay,
-                    key=jax.random.fold_in(
-                        jnp.asarray(domains["anchor_replay"], dtype=jnp.uint32),
-                        update * config.loss.raw_q_updates_per_outer_update + replay_index,
+                # §6 M1 uses independent evaluation replicas and is report-only.
+                (gate_result, elapsed) = _phase(
+                    output,
+                    name="m1_gate",
+                    update=update,
+                    function=lambda: evaluate_m1_gate_on_anchor_batch(
+                        model=model,
+                        params=snapshot_params,
+                        bootstrap_models=bootstrap_models,
+                        bootstrap_params=bootstrap_params,
+                        anchors=anchors,
+                        spearman_threshold=float(config.anchors.m1_spearman_threshold),
+                        minimum_anchor_fraction=float(
+                            config.anchors.m1_minimum_anchor_fraction
+                        ),
                     ),
-                    batch_size=config.anchors.replay_minibatch_size,
                 )
-                current_logits = anchor_logits_kernel(snapshot_params, sample)
-                weights = policy_drift_age_weights(
-                    current_policy_logits=current_logits,
-                    collection_policy_logits=sample.collection_policy_logits,
-                    current_update=update,
-                    collection_update=sample.collection_update,
-                    kl_decay=config.anchors.policy_kl_decay,
-                    age_decay_updates=config.anchors.age_decay_updates,
-                    minimum_weight=config.anchors.minimum_replay_weight,
+                phase_times["m1_gate"] = elapsed
+                gate_payload = {
+                    "update": update + 1,
+                    **m1_gate_report(gate_result),
+                    **_host(bootstrap_training_metrics),
+                    "separation_readings": _host(supervision_readings),
+                }
+                next_m1_summary = {
+                    "evaluations": state.m1_summary_state["evaluations"] + 1,
+                    "latest_passed": gate_result.passed,
+                }
+                next_m1_history = _append_m1_history(
+                    state.m1_history,
+                    index=int(np.asarray(state.m1_summary_state["evaluations"])),
+                    update=update + 1,
+                    result=gate_result,
+                    bootstrap_training_metrics=bootstrap_training_metrics,
+                    supervision_readings=supervision_readings,
                 )
-                replay_samples.append(sample)
-                replay_weights.append(weights)
-
+                m1_history = _m1_history_records(
+                    next_m1_history,
+                    count=int(np.asarray(next_m1_summary["evaluations"])),
+                )
+                write_json(
+                    m1_history_path,
+                    {
+                        "specification": "METHOD_SPEC §7 extended M1 gate",
+                        "history": m1_history,
+                        "latest": gate_payload,
+                    },
+                )
+            # M1 is a report-only model-quality diagnostic. A failed value
+            # mechanism is recorded but never changes the training path.
         schedule = environment_minibatch_schedule(
             jax.random.fold_in(
                 jnp.asarray(domains["ego"], dtype=jnp.uint32), 400_000 + update
@@ -1454,189 +1425,80 @@ def run_training(args: argparse.Namespace) -> None:
             )
         # §3.4 combined-policy-KL gate: adapt the next update's epoch count
         # (shrink towards the floor of two, recover one epoch per clean update).
-        kl_stop_fraction = float(np.mean(np.asarray(ppo_metrics["kl_early_stop"])))
-        if kl_stop_fraction > 0.5:
-            effective_update_epochs = max(2, effective_update_epochs - 1)
-        elif effective_update_epochs < int(config.ppo.update_epochs):
-            effective_update_epochs += 1
-        # The single combined four-loss gradient step (METHOD_SPEC §3.3)
-        # replaces every detached head update; the legacy raw-Q/anchor/
-        # response/belief optimizers stay frozen for checkpoint identity.
+        (
+            effective_update_epochs,
+            kl_stop_fraction,
+            kl_stop_occurred,
+        ) = adapt_effective_update_epochs(
+            ppo_metrics["kl_early_stop"],
+            current_epochs=effective_update_epochs,
+            maximum_epochs=int(config.ppo.update_epochs),
+        )
+        # The single combined objective has one optimizer state.
         next_params = ppo_core.params
-        next_raw_q_state = state.raw_q_optimizer_state
-        next_response_state = state.response_optimizer_state
-        next_belief_state = state.belief_optimizer_state
 
-        if generator_enabled:
-            generator_codes = sample_partner_codes(
-                jax.random.fold_in(generator_root, 500_000 + update),
-                batch_size=config.partner_generator.episodes_per_update,
-                code_dim=config.partner_generator.code_dim,
-            )
-            (generator_episodes, elapsed) = _phase(
-                output,
-                name="generator_collection",
-                update=update,
-                function=lambda: generator_collect_kernel(
-                    next_params,
-                    state.generator_params,
-                    generator_codes,
-                    jax.random.fold_in(generator_root, 600_000 + update),
-                    jnp.asarray(update, dtype=jnp.int32),
-                    shaping_factor,
-                ),
-            )
-            phase_times["generator_collection"] = elapsed
-            validate_complete_episode_batch(generator_episodes)
-            generator_schedule = environment_minibatch_schedule(
-                jax.random.fold_in(generator_root, 700_000 + update),
-                environment_count=config.partner_generator.episodes_per_update,
-                minibatches_per_epoch=config.partner_generator.environment_minibatches,
-                update_epochs=config.partner_generator.update_epochs,
-            )
-            (generator_result, elapsed) = _phase(
-                output,
-                name="generator_ppo",
-                update=update,
-                function=lambda: generator_update_kernel(
-                    state.generator_params,
-                    state.generator_optimizer_state,
-                    generator_episodes,
-                    source_batch,
-                    generator_schedule,
-                    progress,
-                    state.generator_competence_multiplier,
-                    state.external_reference_cvar_ema,
-                    diversity_bank_signatures,
-                ),
-            )
-            phase_times["generator_ppo"] = elapsed
-            next_generator_params, next_generator_optimizer_state, generator_metrics = generator_result
-            generator_returns = complete_episode_raw_returns(generator_episodes)
-            generator_cvar = lower_tail_cvar(
-                generator_returns.tolist(), level=config.partner_generator.cvar_level
-            )
-            generator_cvar_ema = (
-                config.partner_generator.cvar_ema_decay * state.generator_cvar_ema
-                + (1.0 - config.partner_generator.cvar_ema_decay) * generator_cvar
-            )
-            external_cvar = _external_cvar_from_rollout(
-                records, config.partner_generator.cvar_level
-            )
-            external_reference_cvar_ema = state.external_reference_cvar_ema
-            if external_cvar is not None:
-                external_reference_cvar_ema = (
-                    config.partner_generator.cvar_ema_decay
-                    * state.external_reference_cvar_ema
-                    + (1.0 - config.partner_generator.cvar_ema_decay) * external_cvar
-                )
-            next_dual = update_competence_dual(
-                state.generator_competence_multiplier,
-                reference_cvar=external_reference_cvar_ema,
-                generator_cvar=generator_cvar_ema,
-                learning_rate=config.partner_generator.lagrangian_learning_rate,
-                maximum=config.partner_generator.competence_multiplier_maximum,
-            )
-            next_generator_target = polyak_update(
-                state.generator_target_params,
-                next_generator_params,
-                config.partner_generator.target_polyak_coefficient,
-            )
-        else:
-            generator_metrics = {}
-            generator_cvar = float("nan")
-            generator_cvar_ema = state.generator_cvar_ema
-            external_reference_cvar_ema = state.external_reference_cvar_ema
-            next_dual = state.generator_competence_multiplier
-            next_generator_params = state.generator_params
-            next_generator_optimizer_state = state.generator_optimizer_state
-            next_generator_target = state.generator_target_params
         next_target_params = polyak_update(
             state.target_params, next_params, config.ppo.polyak_coefficient
         )
+        if next_pair_comparator is None:
+            next_pair_comparator = state.current_pair_comparator
 
-        if replay_samples:
-            empirical_scale = np.asarray(
-                jnp.mean(jnp.linalg.norm(centered(replay_samples[0].fit_returns_by_action), axis=-1))
-            )
-            next_advantage_scale = (
-                0.99 * state.anchor_advantage_scale_ema + 0.01 * float(empirical_scale)
-            )
-        else:
-            next_advantage_scale = float(np.asarray(state.anchor_advantage_scale_ema))
         completed_steps = int(np.asarray(runner.effective_environment_steps))
         ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
             ego_policy_steps=config.environment.num_envs * config.training.rollout_length,
-            generator_training_steps=(
-                config.partner_generator.episodes_per_update
-                * config.partner_generator.episode_steps
-                if generator_enabled
-                else 0
-            ),
             counterfactual_continuation_steps=int(
                 anchor_budget["counterfactual_continuation_steps"]
-            )
-            + bank_continuation_steps,
-            matched_code_probe_steps=int(anchor_budget["matched_code_probe_steps"]),
+            ),
+            matched_pair_probe_steps=int(anchor_budget["matched_pair_probe_steps"]),
         )
         ppo_applied = int(
-            np.asarray(jnp.sum(ppo_metrics["optimizer_applied"], dtype=jnp.int64))
+            np.asarray(jnp.sum(ppo_metrics["optimizer_applied"], dtype=jnp.int32))
         )
         state = state._replace(
             params=next_params,
             target_params=next_target_params,
             ppo_optimizer_state=ppo_core.ppo_optimizer_state,
-            raw_q_optimizer_state=next_raw_q_state,
-            response_optimizer_state=next_response_state,
-            belief_optimizer_state=next_belief_state,
-            generator_optimizer_state=next_generator_optimizer_state,
-            generator_params=next_generator_params,
-            generator_target_params=next_generator_target,
-            generator_competence_multiplier=next_dual,
-            generator_cvar_ema=jnp.asarray(generator_cvar_ema),
-            external_reference_cvar_ema=jnp.asarray(external_reference_cvar_ema),
-            anchor_replay=sampled_replay,
+            supervision_anchor_batch=(
+                supervision_anchors
+                if supervision_anchors is not None
+                else state.supervision_anchor_batch
+            ),
+            current_separation_terms=(
+                supervision_separation
+                if supervision_separation is not None
+                else state.current_separation_terms
+            ),
+            current_pair_comparator=next_pair_comparator,
+            supervision_readings=supervision_readings,
             anchor_sampling_counter=(
                 state.anchor_sampling_counter + int(anchor_trigger)
             ),
-            belief_gradient_norm_ema=state.belief_gradient_norm_ema,
-            action_range_ema=regret_metrics["action_range_ema"],
-            anchor_advantage_scale_ema=jnp.asarray(next_advantage_scale),
-            ppo_optimizer_step=state.ppo_optimizer_step + ppo_applied,
-            raw_q_optimizer_step=state.raw_q_optimizer_step,
-            response_optimizer_step=state.response_optimizer_step,
-            belief_optimizer_step=state.belief_optimizer_step,
-            generator_optimizer_step=(
-                state.generator_optimizer_step
-                + (
-                    config.partner_generator.update_epochs
-                    * config.partner_generator.environment_minibatches
-                    if generator_enabled
-                    else 0
-                )
+            anchor_microbatch_size=jnp.asarray(
+                0 if anchor_microbatch is None else anchor_microbatch,
+                dtype=jnp.int32,
             ),
+            effective_update_epochs=jnp.asarray(
+                effective_update_epochs, dtype=jnp.int32
+            ),
+            bootstrap_encoder_params=bootstrap_params,
+            bootstrap_optimizer_states=bootstrap_optimizer_states,
+            bootstrap_sampling_counters=bootstrap_sampling_counters,
+            m1_summary_state=next_m1_summary,
+            m1_history=next_m1_history,
+            ppo_optimizer_step=state.ppo_optimizer_step + ppo_applied,
             runner_state=runner,
             update_count=jnp.asarray(update + 1, dtype=jnp.int32),
-            effective_environment_steps=jnp.asarray(completed_steps, dtype=jnp.int64),
+            effective_environment_steps=jnp.asarray(completed_steps, dtype=jnp.int32),
             resource_ledger=ledger.to_mapping(),
         )
-        if not _all_finite(
-            (
-                state.params,
-                state.target_params,
-                state.generator_params,
-                state.generator_target_params,
-                state.generator_competence_multiplier,
-                state.generator_cvar_ema,
-            )
-        ):
-            raise FloatingPointError("NaN or Inf entered the V6 training state.")
+        if not _all_finite((state.params, state.target_params)):
+            raise FloatingPointError("NaN or Inf entered the DEPI training state.")
 
         metrics = {
             "method": METHOD_VERSION,
             "update_count": update + 1,
             "effective_environment_steps": completed_steps,
-            "partner_source_probabilities": _host(probabilities),
+            "partner_source": "registered_static_pool",
             "context_dropout_probability": float(np.asarray(dropout)),
             "official_shaping_factor": float(np.asarray(shaping_factor)),
             # Four-loss combined objective metrics (§3): PPO, signature,
@@ -1644,6 +1506,7 @@ def run_training(args: argparse.Namespace) -> None:
             # entropy, all recorded per minibatch inside the scan.
             "ppo": _host(_mean_metrics(ppo_metrics)),
             "combined_policy_kl_stop_fraction": kl_stop_fraction,
+            "combined_policy_kl_stop_occurred": kl_stop_occurred,
             "effective_update_epochs": int(effective_update_epochs),
             # §5 anchor supervision readouts (per-anchor-trigger refresh; the
             # carried supervision payload trains every combined-loss update).
@@ -1666,23 +1529,13 @@ def run_training(args: argparse.Namespace) -> None:
                 "readings": _host(supervision_readings),
             },
             "m1_gate": m1_history[-1] if m1_history else {"evaluated": False},
-            "generator": (
-                {
-                    **_host(generator_metrics),
-                    "raw_cvar": generator_cvar,
-                    "raw_cvar_ema": float(np.asarray(generator_cvar_ema)),
-                    "external_reference_cvar_ema": float(
-                        np.asarray(external_reference_cvar_ema)
-                    ),
-                    "competence_multiplier": float(np.asarray(next_dual)),
-                }
-                if generator_enabled
-                else {"enabled": False}
-            ),
-            "replay": {
-                "item_count": int(np.asarray(state.anchor_replay.item_count)),
-                "fingerprint": replay_fingerprint(state.anchor_replay),
+            "anchor_usage": {
                 "anchor_trigger": anchor_trigger,
+                "stored_anchor_count": (
+                    int(np.asarray(state.supervision_anchor_batch.anchor_ids).shape[0])
+                    if state.supervision_anchor_batch is not None
+                    else 0
+                ),
                 "invalid_matched_probe_states": int(
                     anchor_budget.get("invalid_matched_probe_states", 0)
                 ),
@@ -1707,15 +1560,94 @@ def run_training(args: argparse.Namespace) -> None:
                 state, elapsed_wall_seconds=now - wall_accounted_at
             )
             wall_accounted_at = now
-            _save_v6_checkpoint(manager, output, state)
+            _save_depi_checkpoint(manager, output, state)
+
+    final_m1_payload: Mapping[str, Any] | None = None
+    final_model_fingerprint = pytree_fingerprint(
+        deployable_parameters(state.params)
+    )
+    evaluation_count = int(np.asarray(state.m1_summary_state["evaluations"]))
+    if m1_history_path.is_file():
+        existing_m1 = json.loads(m1_history_path.read_text(encoding="utf-8"))
+        existing_final = existing_m1.get("final")
+        if (
+            existing_m1.get("version") == 1
+            and existing_m1.get("artifact_type") == "depi_final_m1_evaluation"
+            and isinstance(existing_final, Mapping)
+            and existing_final.get("final_checkpoint_condition") is True
+            and existing_final.get("model_fingerprint") == final_model_fingerprint
+            and isinstance(existing_m1.get("history"), list)
+            and len(existing_m1["history"]) == evaluation_count
+        ):
+            # A completed run resumed after the final checkpoint must not append
+            # a second final evaluation or exhaust the fixed checkpoint ledger.
+            final_m1_payload = existing_final
+    if (
+        decision_supervision_enabled
+        and int(np.asarray(state.anchor_sampling_counter)) > 0
+        and final_m1_payload is None
+    ):
+        final_gate = evaluate_m1_gate_on_anchor_batch(
+            model=model,
+            params=state.params,
+            bootstrap_models=bootstrap_models,
+            bootstrap_params=state.bootstrap_encoder_params,
+            anchors=state.supervision_anchor_batch,
+            spearman_threshold=float(config.anchors.m1_spearman_threshold),
+            minimum_anchor_fraction=float(config.anchors.m1_minimum_anchor_fraction),
+        )
+        final_m1_payload = {
+            "update": int(np.asarray(state.update_count)),
+            "final_checkpoint_condition": True,
+            "model_fingerprint": final_model_fingerprint,
+            **m1_gate_report(final_gate),
+        }
+        final_history_index = int(np.asarray(state.m1_summary_state["evaluations"]))
+        final_history = _append_m1_history(
+            state.m1_history,
+            index=final_history_index,
+            update=int(np.asarray(state.update_count)),
+            result=final_gate,
+            bootstrap_training_metrics={
+                # This is an evaluation-only row; no bootstrap optimization is
+                # performed after the final policy update.  Keep the fixed
+                # checkpoint state finite and record that fact explicitly in
+                # the enclosing final payload instead of using NaN sentinels.
+                "bootstrap_training_loss": jnp.zeros((3,), dtype=jnp.float32)
+            },
+            supervision_readings=state.supervision_readings,
+        )
+        state = state._replace(
+            m1_summary_state={
+                "evaluations": state.m1_summary_state["evaluations"] + 1,
+                "latest_passed": final_gate.passed,
+            },
+            m1_history=final_history,
+        )
+        m1_history = _m1_history_records(
+            final_history,
+            count=int(np.asarray(state.m1_summary_state["evaluations"])),
+        )
+        write_json(
+            m1_history_path,
+            {
+                "version": 1,
+                "artifact_type": "depi_final_m1_evaluation",
+                "method": METHOD_VERSION,
+                "method_variant": config.method_variant,
+                "layout": config.environment.layout,
+                "seed_index": int(args.seed_index),
+                "specification": "METHOD_SPEC §7 final-checkpoint M1 gate",
+                "history": m1_history,
+                "latest": final_m1_payload,
+                "final": final_m1_payload,
+            },
+        )
 
     final_step = int(np.asarray(state.effective_environment_steps))
-    elapsed_total = time.perf_counter() - wall_started
     deployable_count = parameter_count(deployable_parameters(state.params))
-    training_only_count = (
-        parameter_count(state.target_params)
-        + parameter_count(state.generator_params)
-        + parameter_count(state.generator_target_params)
+    training_only_count = parameter_count(state.target_params) + parameter_count(
+        state.bootstrap_encoder_params
     )
     now = time.perf_counter()
     state = _account_runtime_resources(
@@ -1734,42 +1666,37 @@ def run_training(args: argparse.Namespace) -> None:
     )
     state = state._replace(resource_ledger=ledger.to_mapping())
     if manager.latest_step() != final_step:
-        _save_v6_checkpoint(manager, output, state)
+        _save_depi_checkpoint(manager, output, state)
     write_json(output / "resource_ledger.json", ledger.to_mapping())
     _write_training_support_latents(
         output,
         model=model,
         params=state.params,
-        replay=state.anchor_replay,
+        anchors=(
+            state.supervision_anchor_batch
+            if decision_supervision_enabled
+            and int(np.asarray(state.anchor_sampling_counter)) > 0
+            else None
+        ),
         config=config,
     )
     metadata = {
         "method": METHOD_VERSION,
         "config_version": CONFIG_VERSION,
-        "artifact_name": "DELTA-ZSC-E2E",
+        "artifact_name": "DEPI",
+        "method_variant": config.method_variant,
         "seed_index": int(args.seed_index),
         "jax_prng_key": list(outer_key),
         "effective_environment_steps": final_step,
         "update_count": int(np.asarray(state.update_count)),
         "context_dropout_at_deployment": 0.0,
-        "decision_regret_state_chunk_size": DECISION_REGRET_STATE_CHUNK_SIZE,
         "anchor_microbatch": anchor_microbatch,
         "compiled_kernels": kernels.metadata(),
         "anchor_kernel": (
             list(anchor_kernel.metadata()) if anchor_kernel is not None else []
         ),
-        "generator_collection_kernel": (
-            list(generator_collect_kernel.metadata())
-            if generator_collect_kernel is not None
-            else []
-        ),
-        "generator_update_kernel": (
-            list(generator_update_kernel.metadata())
-            if generator_update_kernel is not None
-            else []
-        ),
         "owner_initialization": _host(owner_metrics),
-        "generator_initialization": _host(generator_initialization_metrics),
+        "partner_training_source": "registered_static_pool_only",
         "gpu": _gpu_snapshot(),
         "scientific_readout": False,
         "resume_allowed": not preflight,
@@ -1790,8 +1717,25 @@ def run_training(args: argparse.Namespace) -> None:
         )
     if preflight:
         if peak_device_memory_bytes() >= FORMAL_PEAK_MEMORY_LIMIT_BYTES:
-            raise RuntimeError("Formal V6 CUDA preflight exceeded 40,000 MiB.")
-        write_json(output / "cuda_preflight_report.json", metadata)
+            raise RuntimeError("Formal DEPI CUDA preflight exceeded 40,000 MiB.")
+        roundtrip_report = _validate_preflight_roundtrips(
+            manager=manager,
+            output=output,
+            state=state,
+            deployment_directory=deployment_directory,
+            config=config,
+        )
+        write_json(
+            output / "cuda_preflight_report.json",
+            {
+                **metadata,
+                **roundtrip_report,
+                "compiled_rollout_update_count": 1,
+                "peak_memory_gate_passed": True,
+                "peak_memory_limit_bytes": FORMAL_PEAK_MEMORY_LIMIT_BYTES,
+                "observed_peak_memory_bytes": peak_device_memory_bytes(),
+            },
+        )
     write_json_atomic(
         output / "phase_status.json",
         {
@@ -1802,7 +1746,7 @@ def run_training(args: argparse.Namespace) -> None:
             "gpu": _gpu_snapshot(),
         },
     )
-    print(f"Complete DELTA-ZSC V6 E2E run: {output}")
+    print(f"Complete DEPI training run: {output}")
 
 
 def run_cuda_preflight(args: argparse.Namespace) -> None:

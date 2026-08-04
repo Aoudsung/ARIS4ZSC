@@ -1,4 +1,4 @@
-"""Post-training, read-only V6 mechanism report."""
+"""Post-training, read-only DEPI mechanism diagnostics."""
 
 from __future__ import annotations
 
@@ -43,14 +43,14 @@ def run_signal_audit(args: argparse.Namespace) -> None:
     source = Path(args.training_run).resolve()
     identity = read_run_identity(source)
     if identity.get("method") != METHOD_VERSION or identity.get("stage") != "train":
-        raise ValueError("Signal audit accepts only V6 training runs.")
+        raise ValueError("Signal audit accepts only active DEPI training runs.")
     records = []
     for path in sorted((source / "records" / "metrics").glob("update_*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 records.append(json.loads(line))
     if not records:
-        raise FileNotFoundError("Training run has no per-update V6 metrics.")
+        raise FileNotFoundError("Training run has no per-update DEPI metrics.")
     report = {
         "method": METHOD_VERSION,
         "training_run": str(source),
@@ -59,54 +59,65 @@ def run_signal_audit(args: argparse.Namespace) -> None:
         "affects_checkpoint_selection": False,
         "affects_deployment": False,
         "mechanism_readouts": {
-            "C0_task_competence_context": {
+            "task_and_policy": {
                 "raw_reward": _summary(_nested(records, "ppo", "mean_raw_reward")),
                 "policy_entropy": _summary(_nested(records, "ppo", "entropy")),
-            },
-            "C1_partner_decision_heterogeneity": {
-                "anchor_action_range": _summary(
-                    _nested(records, "counterfactual", "anchor_empirical_action_range")
+                "post_update_policy_kl": _summary(
+                    _nested(records, "ppo", "combined_policy_kl")
                 ),
             },
-            "C2_raw_q_quality": {
-                "retrace_loss": _summary(_nested(records, "raw_q", "raw_q_retrace_loss")),
-                "action_range": _summary(_nested(records, "raw_q", "raw_q_action_range_mean")),
-                "head_disagreement": _summary(
-                    _nested(records, "raw_q", "raw_q_head_disagreement")
+            "exact_protocol_filter": {
+                "posterior_entropy": _summary(
+                    _nested(records, "ppo", "mean_posterior_entropy")
+                ),
+                "response_joint_nll": _summary(
+                    _nested(records, "ppo", "response_total_loss")
+                ),
+                "capability_consistency": _summary(
+                    _nested(records, "ppo", "capability_consistency_loss")
                 ),
             },
-            "C3_online_belief_recovery": {
-                "posterior_uncertainty": _summary(
-                    _nested(records, "ppo", "mean_belief_uncertainty")
+            "decision_supervision": {
+                "signature_loss": _summary(
+                    _nested(records, "ppo", "signature_loss")
                 ),
-                "information_bottleneck": _summary(
-                    _nested(records, "belief_objective_losses", "information_bottleneck")
+                "actor_decision_kl": _summary(
+                    _nested(records, "ppo", "decision_policy_loss")
                 ),
-            },
-            "C4_belief_conditioned_control": {
-                "q_policy_weight": _summary(
-                    _nested(records, "ppo", "q_policy_weight_mean")
+                "anchor_effective_sample_size": _summary(
+                    _nested(records, "ppo", "anchor_effective_sample_size")
                 ),
-                "context_robustness_kl": _summary(
-                    _nested(records, "ppo", "robust_generalist_kl")
+                "auxiliary_gradient_norm": _summary(
+                    _nested(records, "ppo", "auxiliary_gradient_norm")
                 ),
             },
-            "C5_information_value": {
-                "decision_regret": _summary(
-                    _nested(records, "regret", "mean_decision_regret")
+            "matched_pair_separation": {
+                "loss": _summary(_nested(records, "ppo", "separation_loss")),
+                "ambiguity_fraction": _summary(
+                    _nested(
+                        records,
+                        "anchor_supervision",
+                        "readings",
+                        "irreducible_ambiguity_fraction",
+                    )
                 ),
-                "regret_shaping": _summary(
-                    _nested(records, "regret", "mean_decision_regret_shaping")
+            },
+            "m1_independent_value_diagnostic": {
+                "evaluations": int(
+                    sum(bool(row.get("m1_gate", {}).get("evaluated", True)) for row in records)
                 ),
+                "latest": records[-1].get("m1_gate", {}),
             },
         },
         "note": (
-            "C0-C5 labels are retrospective mechanism readouts only. They did not "
-            "enable, disable, select, replace, or export any policy."
+            "These training diagnostics do not establish mechanism attribution. "
+            "Use evaluate-identifiability and evaluate-recoverable-value for the "
+            "registered held-out causal controls."
         ),
     }
-    write_json(Path(args.output).resolve() / "signal_audit.json", report)
-    print(f"Complete read-only V6 signal audit: {Path(args.output).resolve()}")
+    output = Path(args.output).resolve()
+    write_json(output / "signal_audit.json", report)
+    print(f"Complete read-only DEPI signal audit: {output}")
 
 
 __all__ = ["run_signal_audit"]

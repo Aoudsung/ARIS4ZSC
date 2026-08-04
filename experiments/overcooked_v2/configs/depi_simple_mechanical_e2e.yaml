@@ -1,0 +1,137 @@
+version: 15
+method_variant: b2
+
+environment:
+  layout: test_time_simple
+  agent_view_size: 2
+  indicate_successful_delivery: true
+  negative_rewards: true
+  random_agent_positions: true
+  sample_recipe_on_delivery: true
+  episode_steps: 400
+
+model:
+  task_hidden_dim: 128
+  capability_hidden_dim: 64
+  capability_dim: 16
+  protocol_components: 4
+  component_embedding_dim: 16
+  actor_hidden_dim: 128
+  critic_hidden_dim: 128
+  response_hidden_dim: 128
+  modulation_rank: 8
+  action_embedding_dim: 16
+
+ppo:
+  update_epochs: 4
+  learning_rate: 0.00025
+  gradient_clip_norm: 0.25
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_clip_epsilon: 0.2
+  entropy_weight: 0.01
+  value_weight: 0.5
+  normalize_advantages: true
+  polyak_coefficient: 0.005
+  lr_warmup_fraction: 0.05
+  anneal_learning_rate: true
+  adam_epsilon: 0.00001
+
+loss_v2:
+  signature_weight: 1.0
+  response_weight: 1.0
+  separation_weight: 0.1
+  combined_policy_kl_threshold: 0.04
+  rank_hinge_margin: 0.1
+  rank_hinge_advantage_gap: 2.0
+  separation_margin_scale: 0.25
+  decision_policy_weight: 0.25
+  decision_policy_temperature: 1.0
+  capability_consistency_weight: 0.01
+
+anchors:
+  enabled: true
+  interval_updates: 2
+  ordinary_states: 2
+  matched_history_pairs: 1
+  fit_replicas: 1
+  evaluation_replicas: 1
+  continuation_horizon: 8
+  probe_steps: 2
+  return_lower_bound: -400.0
+  return_upper_bound: 400.0
+  # §5.3 frozen comparator thresholds and the §6 extended M1 gate.
+  observable_equivalent_probability_max: 0.55
+  decision_distinct_probability_min: 0.70
+  signature_distance_threshold: 1.0
+  m1_spearman_threshold: 0.8
+  m1_minimum_anchor_fraction: 0.9
+
+# §7.3 static wide partner pool: default B0–B2 partner distribution.
+partner_pool:
+  enabled: true
+  checkpoint_stages: [0.0, 0.5, 1.0]
+  heuristic_family_test_only: true
+  family_uniform_sampling: true
+
+posterior_calibration:
+  minimum_run_count: 2
+  episodes_per_run: 2
+  bootstrap_replicates: 32
+  bootstrap_seed: 0
+  root_seed_offset: 2000
+  credibility: 0.90
+  log_score_margin: 0.02
+  coverage_low: 0.85
+  coverage_high: 0.95
+  brier_ratio: 0.90
+  primary_unit: partner_run
+  secondary_unit: episode
+
+training:
+  rollout_length: 16
+  context_dropout_initial: 0.30
+  context_dropout_final: 0.10
+  owner_sources_per_seed: 1
+  support_parent_runs_per_family: 10
+  support_checkpoints_per_parent: 3
+  support_width_variants: 2
+  calibration_runs_per_family: 5
+
+evaluation:
+  episodes_per_pairing: 2
+  bootstrap_replicates: 32
+  evaluation_seed: 0
+  report_br_prox: true
+  br_prox_anchors_per_pairing: 1
+  br_prox_fit_replicas: 1
+  br_prox_evaluation_replicas: 1
+  br_prox_continuation_horizon: 8
+  mechanism_anchors_per_pairing: 1
+  mechanism_fit_replicas: 1
+  mechanism_evaluation_replicas: 1
+  mechanism_continuation_horizon: 8
+  recoverable_signal_threshold: 20.0
+  evaluate_both_roles: true
+  one_sided_alpha: 0.05
+  minimum_ego_runs: 1
+  minimum_partner_runs_per_mechanism: 1
+  minimum_mechanisms: 1
+  inference_mode: independent_run
+  superiority_lcb_threshold: 0.0
+  minimum_effect: 20.0
+  minimum_effect_rule: point_estimate
+
+upstream:
+  total_timesteps: 1024
+  reward_shaping_horizon: 512
+  checkpoint_progress: [0.0, 0.5, 1.0]
+
+official_protocol:
+  protocol_version: overcooked_v2_iclr2025_5ce1707_v1
+  source_commit: 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e
+  training_root_seed: 42
+  training_run_count: 10
+  evaluation_root_seed: 0
+  evaluation_episodes_per_pairing: 500

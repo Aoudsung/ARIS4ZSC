@@ -22,10 +22,8 @@ from typing import Any, Mapping, Sequence
 class ResourceLedger:
     ego_policy_steps: int = 0
     ego_initialization_steps: int = 0
-    generator_initialization_steps: int = 0
-    generator_training_steps: int = 0
     counterfactual_continuation_steps: int = 0
-    matched_code_probe_steps: int = 0
+    matched_pair_probe_steps: int = 0
     upstream_partner_steps: int = 0
     calibration_steps: int = 0
     evaluation_steps: int = 0
@@ -39,10 +37,8 @@ class ResourceLedger:
         integer_fields = (
             "ego_policy_steps",
             "ego_initialization_steps",
-            "generator_initialization_steps",
-            "generator_training_steps",
             "counterfactual_continuation_steps",
-            "matched_code_probe_steps",
+            "matched_pair_probe_steps",
             "upstream_partner_steps",
             "calibration_steps",
             "evaluation_steps",
@@ -62,10 +58,8 @@ class ResourceLedger:
         return int(
             self.ego_policy_steps
             + self.ego_initialization_steps
-            + self.generator_initialization_steps
-            + self.generator_training_steps
             + self.counterfactual_continuation_steps
-            + self.matched_code_probe_steps
+            + self.matched_pair_probe_steps
             + self.upstream_partner_steps
             + self.calibration_steps
         )
@@ -114,10 +108,8 @@ def aggregate_resource_ledgers(ledgers: Sequence[ResourceLedger]) -> ResourceLed
     return ResourceLedger(
         ego_policy_steps=sum(item.ego_policy_steps for item in values),
         ego_initialization_steps=sum(item.ego_initialization_steps for item in values),
-        generator_initialization_steps=sum(item.generator_initialization_steps for item in values),
-        generator_training_steps=sum(item.generator_training_steps for item in values),
         counterfactual_continuation_steps=sum(item.counterfactual_continuation_steps for item in values),
-        matched_code_probe_steps=sum(item.matched_code_probe_steps for item in values),
+        matched_pair_probe_steps=sum(item.matched_pair_probe_steps for item in values),
         upstream_partner_steps=sum(item.upstream_partner_steps for item in values),
         calibration_steps=sum(item.calibration_steps for item in values),
         evaluation_steps=sum(item.evaluation_steps for item in values),
@@ -192,7 +184,7 @@ def configure_bundled_cuda_toolchain() -> Mapping[str, Any]:
     CUDA 12.  This changes only compiler discovery, never model computation.
     """
 
-    override = os.environ.get("DELTA_CUDA_PTXAS", "").strip()
+    override = os.environ.get("DEPI_CUDA_PTXAS", "").strip()
     if override:
         candidate = Path(override).resolve()
     else:
@@ -228,7 +220,7 @@ def configure_bundled_cuda_toolchain() -> Mapping[str, Any]:
         os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = precision
     if precision != "highest":
         raise RuntimeError(
-            "Formal V6 CUDA execution requires "
+            "Formal DEPI CUDA execution requires "
             "JAX_DEFAULT_MATMUL_PRECISION=highest."
         )
     return {
@@ -251,13 +243,13 @@ def require_single_cuda_worker() -> Mapping[str, Any]:
     """
 
     required_environment = {
-        "physical_index": "DELTA_PHYSICAL_GPU_INDEX",
-        "uuid": "DELTA_PHYSICAL_GPU_UUID",
-        "name": "DELTA_GPU_NAME",
-        "total_memory_mib": "DELTA_GPU_TOTAL_MEMORY_MIB",
-        "start_memory_used_mib": "DELTA_GPU_START_MEMORY_USED_MIB",
-        "start_utilization_percent": "DELTA_GPU_START_UTILIZATION_PERCENT",
-        "volatile_uncorrectable_ecc": "DELTA_GPU_VOLATILE_UNCORRECTABLE_ECC",
+        "physical_index": "DEPI_PHYSICAL_GPU_INDEX",
+        "uuid": "DEPI_PHYSICAL_GPU_UUID",
+        "name": "DEPI_GPU_NAME",
+        "total_memory_mib": "DEPI_GPU_TOTAL_MEMORY_MIB",
+        "start_memory_used_mib": "DEPI_GPU_START_MEMORY_USED_MIB",
+        "start_utilization_percent": "DEPI_GPU_START_UTILIZATION_PERCENT",
+        "volatile_uncorrectable_ecc": "DEPI_GPU_VOLATILE_UNCORRECTABLE_ECC",
     }
     registered = {
         name: os.environ.get(environment_name, "").strip()
@@ -350,7 +342,7 @@ def gpu_hours_for_wall_seconds(
 ) -> float:
     seconds = float(wall_seconds)
     visible = gpu_device_count()
-    # The DELTA and upstream/calibration paths place one unsharded computation
+    # The DEPI and upstream/calibration paths place one unsharded computation
     # on JAX's default device. Multi-device Official trainers pass their device
     # count explicitly.
     devices = (1 if visible else 0) if device_count is None else int(device_count)
@@ -412,7 +404,7 @@ def official_main_steps(*, num_envs: int, rollout_length: int, updates: int) -> 
     return int(num_envs) * int(rollout_length) * int(updates)
 
 
-def delta_anchor_attempted_steps(
+def depi_anchor_attempted_steps(
     *,
     trigger_count: int,
     ordinary_worlds: int,
@@ -437,41 +429,43 @@ def delta_anchor_attempted_steps(
     return result
 
 
-def v6_anchor_attempted_steps(
+def depi_anchor_attempted_steps(
     *,
     trigger_count: int,
     ordinary_states: int = 32,
-    matched_code_pairs: int = 16,
+    matched_history_pairs: int = 16,
     action_count: int = 6,
     fit_replicas: int = 4,
+    evaluation_replicas: int = 8,
     continuation_horizon: int = 128,
     probe_steps: int = 16,
 ) -> tuple[int, int]:
-    """Exact continuation and legal-probe attempted transitions for V6."""
+    """Exact continuation and legal-probe attempted transitions for DEPI."""
 
     factors = (
         trigger_count,
         ordinary_states,
-        matched_code_pairs,
+        matched_history_pairs,
         action_count,
         fit_replicas,
+        evaluation_replicas,
         continuation_horizon,
         probe_steps,
     )
     if any(int(value) < 0 for value in factors):
-        raise ValueError("V6 anchor budget factors cannot be negative.")
-    worlds = int(ordinary_states) + 2 * int(matched_code_pairs)
+        raise ValueError("DEPI anchor budget factors cannot be negative.")
+    worlds = int(ordinary_states) + 2 * int(matched_history_pairs)
     continuation = (
         int(trigger_count)
         * worlds
         * int(action_count)
-        * int(fit_replicas)
+        * (int(fit_replicas) + int(evaluation_replicas))
         * int(continuation_horizon)
     )
     probes = (
         int(trigger_count)
         * 2
-        * int(matched_code_pairs)
+        * int(matched_history_pairs)
         * int(probe_steps)
     )
     return continuation, probes
@@ -480,8 +474,8 @@ def v6_anchor_attempted_steps(
 __all__ = [
     "ResourceLedger",
     "aggregate_resource_ledgers",
-    "delta_anchor_attempted_steps",
-    "v6_anchor_attempted_steps",
+    "depi_anchor_attempted_steps",
+    "depi_anchor_attempted_steps",
     "gpu_device_count",
     "gpu_hours_for_wall_seconds",
     "configure_bundled_cuda_toolchain",

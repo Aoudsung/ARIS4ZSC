@@ -1,104 +1,115 @@
-# EVALUATION_SPEC：DEPI 评估规格（伙伴划分、矩阵、判决统计、资源）
+# EVALUATION_SPEC：DEPI 评估与统计规格
 
-修订头：本文件于统一重构（`Rigor_与_Generality_统一优化_7f793915.md` I 节；外部评审归档 [`research/REVIEW_AND_SUGGESTION_2026.md`](research/REVIEW_AND_SUGGESTION_2026.md) §8/§10.6/§14）中创建，是四份权威文件之三：**伙伴划分、baseline、统计与资源**的唯一权威口径。问题与可证伪条件见 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md)；方法实现见 [`METHOD_SPEC.md`](METHOD_SPEC.md)；理论见 [`THEORY.md`](THEORY.md)。本文件只做汇聚与裁定，不复制被引文件的全文定义。
+`authoritative: true`
 
-用户裁定（已生效，直接约束本规格）：SOTA 判决走**路径 1**——固定 Official commit 重训/获取基线 run-level 节点、同 episode keys 配对/双样本层级推断（裁定记录见 [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md) 第五节，决策登记见 [`status/DECISION_LOG.md`](status/DECISION_LOG.md) D2）。
+本文件固定性能结论、机制归因和统计判定的边界。实现常量和配置字段由
+[`src/path_c/experiment.py`](../src/path_c/experiment.py) 单点校验；报告不得以聚合表替代原始
+run-level artifact，也不得在看见结果后更换统计单位或阈值。
 
-状态：`authoritative: true`。本规格与既有文档冲突时以本规格与 SCIENTIFIC_SPEC 为准。
+## 1. 两类结论必须分开
 
----
+1. **benchmark 结论**：DEPI 在固定 Official protocol 和 Common-Partner panel 上的 held-out
+   XP 表现。无论机制门是否通过，该结果都必须完整报告。
+2. **机制结论**：性能提升来自合法历史中的 capability/protocol 推断及其决策作用。只有开发
+   增量、校准、可识别性、可恢复价值、容量和资源门在两个布局全部通过时才能作此归因。
 
-## 一、伙伴划分与测试伙伴协议
+测试通过、latent 聚类、内部 Q、entropy、单个 seed 或单个布局均不构成科学结论。
 
-评估的划分纪律共三层，全部为强制项，缺一则该读数不得作为正式主张：
+## 2. Official 主评估
 
-| 划分层级 | 定义 | 权威出处 |
-|---|---|---|
-| **run-disjoint** | 测试伙伴与所有训练运行 disjoint（同一伙伴来源的不同训练运行之间也不得在训练与测试两侧同时出现）；跨方法共用同一测试集与同一组 episode keys | [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md) 第二节统一条件第 4 条 |
-| **algorithm-family-disjoint** | 测试伙伴所属算法族与训练伙伴分布的算法族不相交；中心主张的"可归因"要求在训练运行与算法族**均留出**的陌生伙伴上成立 | [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §3 中心主张 |
-| **heuristic 族 family-disjoint 测试族** | heuristic 族（脚本化伙伴：greedy courier、stationary helper）**整体留出为测试专用算法族**，不出现在训练中，是 family-disjoint 声明的载体 | [`METHOD_SPEC.md`](METHOD_SPEC.md) §7.3 静态广域伙伴集 |
+- 布局：`test_time_simple`、`test_time_wide`；
+- ego：10 个正式 seed index，固定为 0–9；
+- 每个 ego/partner/layout/role pairing：500 个 400-step episodes；
+- 指标：未重塑的 simulator return；双方角色都评估；
+- root evaluation seed：0；每个 pairing 的 episode-key schedule 必须写入并校验 hash；
+- 原始节点必须保留 ego run、partner run、layout、role、episode returns、checkpoint hash、
+  manifest hash 和 key-schedule lineage。
 
-配套规则：
+Official summary 只能消费完整的原始节点。缺失、重复、跨布局、跨 checkpoint 或 key schedule
+不一致均 fail closed。SP 结果只作为正常 comparator，不得替代任何数值失败的 DEPI seed。
 
-- 测试伙伴名单与 episode keys **跑前注册冻结**；校准集伙伴同为 run-disjoint 且算法族留出，episode key 流与训练/评估分离（根种子偏移 2000），见 [`METHOD_SPEC.md`](METHOD_SPEC.md) §2.4；
-- 身份重合污染对照（identity 格）必须逐格剔除或以污染对照读数显式呈现，历史教训（119.65 表观差距完全来自同 checkpoint 对角格）登记于 [`status/EVIDENCE_LEDGER.md`](status/EVIDENCE_LEDGER.md)；
-- 主读数 XP 按 Official 评估协议：每配对 500 回合、400 步/回合、双角色评估、布局 `test_time_simple` / `test_time_wide`（常量出处 `src/path_c/experiment.py`，定义以 [`FORMAL_EXPERIMENT_PROTOCOL.md`](FORMAL_EXPERIMENT_PROTOCOL.md) 为准）。
+## 3. Common-Partner panel
 
-## 二、B0–B3 统一开发矩阵要点
+Common-Partner 是机制族留出测试，不能与训练、comparator fit、posterior calibration 的 parent
+runs 重叠。每个布局包含 SP、state-augmented、OP、FCP 四种机制，各至少 4 个独立 partner
+runs，并在双方角色上评估；另报告 greedy courier 和 stationary helper 两个 deterministic
+Official-plane heuristic。正式支持固定为 10 个独立 ego runs、至少 4 个机制、每机制至少
+4 个独立 partner runs。
 
-矩阵语义、统一条件与取舍规则以 [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md) 为**唯一权威口径**，本节只列要点：
+BR-Prox 使用同一真实状态的 all-action continuation，必须单独报告 empirical action-value
+regret；它不能由 critic prediction、actor logits 或 policy entropy替代。
 
-1. **矩阵定义**：B0（full-history recurrent PPO 强制核心基线）→ B1（+ 显式 protocol encoder）→ B2（+ 合法 all-action value supervision）→ B3（+ action-conditioned VOI）；B_k 严格包含 B_{k−1}，不得跳级比较。组件映射见 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §7 与 [`METHOD_SPEC.md`](METHOD_SPEC.md) §8。
-2. **统一条件**（四方法共用，不得单独放宽）：相同训练伙伴分布、相同总 simulator transitions、相同 actor/critic 容量等级、相同 run-disjoint 测试伙伴、3–5 个开发 seed。
-3. **报告读数**：XP、history-shuffle drop、protocol-swap 因果效应、total compute（第四节全口径）。
-4. **取舍规则**：组件取舍由配对增量（同 seed、同 episode keys、同测试伙伴的 B_k − B_{k−1}）决定；**不设制度性停机门槛**；取舍记录只追加进 [`status/EVIDENCE_LEDGER.md`](status/EVIDENCE_LEDGER.md)。
-5. **治理冻结**：与本矩阵冲突的旧晋升/停机条款（含 EXPERIMENT_LADDER 相关条款）冻结，见 DEVELOPMENT_MATRIX 修订头与 [`research/TRACKS_AND_GOVERNANCE.md`](research/TRACKS_AND_GOVERNANCE.md) 修订段。
+## 4. 正式统计单位与门
 
-## 三、Baseline 集合与 SOTA 判决程序（路径 1 已裁定生效）
+主配置固定 `inference_mode: independent_run`。partner-run/ego-run 节点是推断单位，episode
+只在节点内聚合；不得把 episode 当独立样本扩大有效样本量。正式 scoreboard 使用 9,999 次
+node bootstrap 和单侧 95% 下置信界。
 
-### 3.1 Baseline 集合要求
+对注册 superiority contrast，同时要求：
 
-与路径 1 判决程序对齐（并同步登记于 [`research/PAPER_STANDARD.md`](research/PAPER_STANDARD.md) 修订段）：
+```text
+one-sided LCB > 0
+point estimate >= 20 raw-return points
+```
 
-| 基线 | 要求 | 依据 |
-|---|---|---|
-| **FCP、OP、SA** | **必训项**：在固定 Official commit 上重训/获取 run-level 节点，构成判决统计的基线节点（FCP 种群约 24 亿步/布局，为判决批前置最大成本项） | [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md) §5 路径 1 执行要点 1–2 |
-| **SP** | **必训项**：Official 配方协议内参照（现成 10 seed 可直接引用，按引用口径记账） | [`research/PAPER_STANDARD.md`](research/PAPER_STANDARD.md) §6 |
-| **MEP、PLASTIC、PECAN、GOAT** | **视可得性降级为外部参考**：不参与判决式；复现成本与协议可比性逐一核对后另行注册 | [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md) §2 路径 1 第 4 条（领域 SOTA 可比性核对） |
+20 分等于一次正确交付的注册物质效应。当前 `minimum_effect_rule` 固定为
+`point_estimate`；若未来改用下置信界，必须在看见新结果前同步修改权威规格、配置、测试和
+证据账本。任何 post-hoc partner 筛选、seed 替换、布局合并或统计模式切换均无效。
 
-### 3.2 判决程序（唯一生效口径）
+## 5. B0–B2 开发矩阵
 
-执行口径以 [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md) **第五节（裁定记录与路径 1 执行要点）**为唯一权威，要点：
+开发矩阵对 B0、B1、B2 和 K={2,4,8} 全组合执行。每个 K/seed 内三种方法必须具有相同：
 
-1. **Official commit 冻结**：基线节点与己方评估一律在 `OFFICIAL_SOURCE_COMMIT = 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`（`OFFICIAL_PROTOCOL_VERSION = overcooked_v2_iclr2025_5ce1707_v1`）上执行，冻结后不得更换；
-2. **run-level 节点**：统计单位为训练运行（run 级），checkpoint + 训练元数据按 run 粒度保存；
-3. **同 episode keys**：己方与基线在同一组 episode keys 上评估（500 episodes/格），做配对或双样本层级推断；
-4. **Table 2 仅 sanity check**：已发表数值（Simple 6±29、Wide 23±40）**降为外部 sanity check，不参与判决**；
-5. **共同禁令**：禁止"己方 bootstrap 区间减基线点估计 = 差值置信区间"的任何变体；"显著超过 SOTA"措辞仅在配对层级推断支持下使用。
+- 静态伙伴 sampler artifact；
+- simulator-transition 训练预算；
+- deployable parameter capacity；
+- 训练与评估随机键域；
+- Official 环境、rollout 和评估定义。
 
-### 3.3 Recoverable value 四格评估
+同 seed、同 evaluation key schedule 做 paired contrast，使用 9,999 次 seed-block bootstrap
+给出 99% 区间。K=4 是正式主设置；机制主张要求 K=4 的 `B1-B0` 和 `B2-B1` 两个区间下界
+均大于零。B3 当前为 `not_implemented`，不能进入矩阵或报告为零增益层。
 
-G1 legal-history / G2 shuffled-history / G3 state-only / G4 oracle-continuation 四格（同组测试伙伴与同组 episode keys）的定义与回收比例 ρ 以 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §5.2 为准；实现读数（shuffle 程序、swap 程序、leakage 审计）由 [`METHOD_SPEC.md`](METHOD_SPEC.md) §4 供给。
+## 6. posterior calibration
 
-## 四、可证伪判据汇总（指向 SCIENTIFIC_SPEC §6）
+每个布局使用与训练隔离的 fresh SP/OP/SA/FCP parent runs：每族 5 个、每 run 64 episodes，
+共至少 20 个 run blocks。primary unit 为 partner run，secondary unit 为 episode；9,999 次
+bootstrap 必须先按 run、再按 run 内 episode 重采样。
 
-正式主张只由 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §6.1 的判据产生；本节仅汇总索引，不重述判负读数细节：
+正式 gate 同时要求：
 
-| 编号 | 判据主题 | 评估承载（本规格对应节） |
-|---|---|---|
-| Φ1 | 协议机制无 XP 增益（B1−B0、B2−B1、B3−B2 配对增量全部 ≤ 0） | 第二节（B0–B3 矩阵）、第六节（δ_min） |
-| Φ2 | 历史信息无因果作用（history-shuffle drop 不显著） | 第三节 3.3（四格 G1−G2） |
-| Φ3 | 协议表征与价值排序脱钩（swap 因果一致率 ≤ 0.5） | 第三节 3.3 配套读数（METHOD_SPEC §4.3） |
-| Φ4 | 适应藏在 task 通路（leakage 审计超标） | METHOD_SPEC §4.1 审计程序 |
-| Φ5 | Bayes 语义不成立（校准协议不通过） | METHOD_SPEC §2.4 校准协议 |
-| Φ6 | 正式判决失败（路径 1 配对层级推断差值区间跨零） | 第三节 3.2 |
+- posterior-predictive joint NLL 分别优于 uniform-mixture 和 no-history baseline 至少
+  0.02 nats/step；
+- position 与 direction 的 90% highest-probability-set coverage 均在 [0.85, 0.95]；
+- event Brier 不高于 prior baseline 的 0.90 倍。
 
-## 五、资源全口径报告（六项）
+评分必须复用 deployment exact filter 的共享 joint likelihood；component index accuracy、
+pooled episode p-value 和只保留位置 coverage 的版本均禁止。
 
-每次矩阵跑动与判决批必须报告以下全量项目（定义与记账细则以 [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md) 第四节为唯一权威）：
+## 7. 机制控制
 
-1. **total transitions**（按来源分项：主训练 / 监督标签采集 / 生成器 / 评估 rollout；含约 38.9% 额外训练交互，不得只报主训练步数）；
-2. **upstream partner cost**（伙伴 checkpoint 上游训练成本，FCP 种群约 24 亿步/布局量级，按引用/自训分别记账）；
-3. **GPU-hours**（按设备型号与跑动分段）；
-4. **peak memory**（训练与评估峰值显存）；
-5. **参数量**（actor、critic、encoder/heads 分项）；
-6. **performance–compute frontier**（XP 对 total transitions 曲线，四方法同图）。
+前四项在每个布局均需独立 schema artifact：
 
-## 六、δ_min 与实质显著性
+- task leakage：partner-plane 扰动不改变 task pathway，held-out run probe 不得越过注册门；
+- history shuffle：同 checkpoint、当前状态、伙伴、role 和 CRN keys 下替换合法 history carry；
+- `swap-u` / `swap-c`：task-state matched 的跨-run context swap，使用真实 all-action
+  continuation 判定方向；
+- recoverable value：同 checkpoint 和 keys 报 G1 legal-history、G2 shuffled-history、
+  G3 state-only、G4 oracle-continuation，并在 `G4-G2 >= 20` 的 signal states 上报告恢复率；
 
-- **δ_min = 20.0**：一次正确交付的原始回报（`OFFICIAL_CORRECT_DELIVERY_REWARD`）；预注册定义与判决时"点估计 + 区间 + 是否超过 δ_min"三项并报的要求，以 [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md) 第一节为唯一权威；
-- δ_min 与统计程序一律**跑前**注册；事后更换须追加新条目入 [`status/EVIDENCE_LEDGER.md`](status/EVIDENCE_LEDGER.md)，不覆盖。
+M1 则必须在每个 formal ego run 的最后 policy update 之后重新计算，报告
+posterior path 与三个独立 bootstrap members 的 tie-aware Spearman、top-action
+agreement 和 empirical value regret。该 artifact 的 model fingerprint 必须与导出
+deployment 一致，两个布局各 10 个 seed 的路径和 SHA-256 由 DEPI policy manifest
+绑定；formal claim builder 必须从 Official raw identity 重新校验这些节点。
 
-## 七、探索轨读数调和规则（登记处）
+这些控制失败时 benchmark 仍需报告，但 formal claim report 必须保持
+`mechanism_claims_unlocked=false`。
 
-S1–S4 等探索轨产物一律标注 `scientific_readout_allowed: false`，不得直接用作论文有效性主张；与论文依赖的调和规则（治理侧见 [`research/TRACKS_AND_GOVERNANCE.md`](research/TRACKS_AND_GOVERNANCE.md) 修订段）：
+## 8. 容量、资源与产物
 
-1. 探索轨读数须经**正式重跑**（确认轨口径：同划分纪律、同 Official 评估协议、跑前注册）方可进入论文表图；
-2. 无法重跑的既有读数，只能按**预注册程序复核**（复核程序跑前注册入台账）后方可有限引用，并显式标注复核口径与残余局限；
-3. 两途皆未通过的读数只保留为台账条目与动因记录，不入论文。
-
-## 八、一致性声明
-
-- 伙伴划分与 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §3、[`METHOD_SPEC.md`](METHOD_SPEC.md) §7 逐项一致；矩阵与 [`research/DEVELOPMENT_MATRIX.md`](research/DEVELOPMENT_MATRIX.md) 完全一致，本文件不新增门控；
-- 判决统计与 [`research/STATISTICAL_PREREGISTRATION.md`](research/STATISTICAL_PREREGISTRATION.md) 路径 1（用户裁定生效）一致；理论预测与对撞 estimand 的口径边界见 [`THEORY.md`](THEORY.md)；
-- 本文件与既有文档冲突时以本文件与 SCIENTIFIC_SPEC 为准；冲突处置只追加登记入台账，不改写旧文。
+容量控制报告 deployable parameters、training-only parameters 和 comparator 容量；资源报告
+至少包含 training simulator steps、anchor continuation steps、evaluation steps、GPU hours、
+peak memory 和失败/恢复历史。所有 summary 必须保存输入路径与 SHA-256，并校验 method、布局、
+policy manifest、final-checkpoint M1 和 partner manifest lineage。没有真实 artifact 时不得用手写 JSON、空数组、
+占位布尔值或文档声明代替。

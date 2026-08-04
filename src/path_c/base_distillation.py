@@ -1,7 +1,7 @@
-"""Owner-SP behavioral initialization for the V6 single actor.
+"""Owner-SP behavioral initialization for the single DEPI actor.
 
 Only the Official policy surface (observation, done/carry and action logits) is
-recorded.  Environment state and partner identity never enter the DELTA model.
+recorded.  Environment state and partner identity never enter the DEPI model.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ def collect_owner_behavior(
     length: int,
     key: Any,
     owner_members: Any | None = None,
+    partner_members: Any | None = None,
 ) -> OwnerBehaviorBatch:
     """Collect exact stochastic owner-SP trajectories against qualified support."""
 
@@ -56,7 +57,13 @@ def collect_owner_behavior(
     )
     if owner_members.shape != (count,):
         raise ValueError("Owner member schedule must match the vector environment.")
-    partner_members = partner_pool.sample_members(partner_member_key, count)
+    partner_members = (
+        partner_pool.sample_members(partner_member_key, count)
+        if partner_members is None
+        else jnp.asarray(partner_members, dtype=jnp.int32)
+    )
+    if partner_members.shape != (count,):
+        raise ValueError("Support member schedule must match the vector environment.")
     owner_carry = owner_pool.initial_carry(count)
     partner_carry = partner_pool.initial_carry(count)
     starts = jnp.ones((count,), dtype=jnp.bool_)
@@ -143,7 +150,7 @@ def owner_behavior_loss(
     initial_state: Any,
     batch: OwnerBehaviorBatch,
 ) -> tuple[Any, dict[str, Any]]:
-    """Forward KL from the owner-SP source into the one V6 actor."""
+    """Forward KL from the owner-SP source into the one DEPI actor."""
 
     import jax
     import jax.numpy as jnp

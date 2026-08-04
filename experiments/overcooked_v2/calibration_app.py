@@ -1,21 +1,19 @@
-"""Held-out protocol calibration evaluation for DEPI (METHOD_SPEC §2.4).
+"""Held-out posterior calibration for DEPI (METHOD_SPEC §2.4).
 
-Migrated from the legacy V6 safety-wrapper app: the continuous Gaussian
-belief semantics (``prior_gaussian_summary``, ``belief_summary``/``belief_mean``
-latents, Mahalanobis support scoring, predicted/empirical policy gain) are
-replaced by the registered K=4 categorical protocol-posterior scoring rules:
+The command evaluates the categorical protocol posterior with one shared
+joint component likelihood.  Components are exchangeable; no algorithm family
+is assigned to a latent index.
 
 * primary   -- posterior-predictive log score (per-step NLL, nats);
 * secondary -- Brier score of the interaction_change event;
-* coverage  -- empirical coverage of the 90% highest-probability categorical
-  prediction sets, registered band [0.85, 0.95];
+* coverage  -- posterior-predictive 90% sets for position and direction;
 * gate      -- ``calibration_pass_decision`` (failure triggers SCIENTIFIC_SPEC
   Φ5 downgrade of the Bayes claim).
 
-The posterior context is the protocol mixture summary ``c_t = Σ_k π_{t,k} m_k``
-(``mixture_summary``); the prior context is the uniform-posterior mixture of
-§1.2/§2.1.  CLI wiring is unchanged: ``calibrate-safety`` in
-``experiments/overcooked_v2/path_c.py`` dispatches ``run_safety_calibration``.
+The no-history baseline retains the current physical frame but resets the
+posterior to uniform, capability to zero, and the protocol summary to its
+uniform-prior value.  Partner run is the primary aggregation unit; pooled
+scores are descriptive only.
 """
 
 from __future__ import annotations
@@ -39,17 +37,20 @@ from experiments.overcooked_v2.official_adapter import (
     VectorEnvironment,
     validate_official_runtime,
 )
-from src.path_c.belief_set_encoder import mixture_summary
+from src.path_c.protocol_mixture import mixture_summary
 from src.path_c.calibration import (
     calibration_pass_decision,
     event_brier_score,
     highest_probability_set_coverage,
     per_step_log_score,
+    posterior_predictive_probabilities,
     uniform_prior_log_score,
 )
 from src.path_c.experiment import (
     ENGINEERING_SEED_INDEX,
     METHOD_VERSION,
+    OFFICIAL_PROTOCOL_VERSION,
+    OFFICIAL_SOURCE_COMMIT,
     load_config,
     load_partner_manifest,
     official_training_domain_keys,
@@ -62,6 +63,7 @@ from src.path_c.storage import (
     calibration_identity,
     ensure_run_identity,
     pytree_fingerprint,
+    sha256_path,
     validate_formal_repository_state,
     validate_registered_python_runtime,
     write_json,
@@ -70,7 +72,7 @@ from src.path_c.storage import (
 from src.path_c.types import ContextOutput
 
 
-SAFETY_ARTIFACT_NAME = "DELTA-ZSC-E2E+Safety"
+POSTERIOR_CALIBRATION_ARTIFACT_NAME = "DEPI-Posterior-Calibration"
 _MECHANISM_ALIASES = {
     "rnn-sp": "sp",
     "sp": "sp",
@@ -80,16 +82,6 @@ _MECHANISM_ALIASES = {
     "sa": "sa",
     "fcp": "fcp",
 }
-# METHOD_SPEC §2.1 registered class anchors SP→1, OP→2, SA→3, FCP→4
-# (converted to zero-based posterior indexes).
-_REGIME_INDEX_BY_MECHANISM = {"sp": 0, "op": 1, "sa": 2, "fcp": 3}
-_REGISTERED_LOG_SCORE_MARGIN = 0.02
-_REGISTERED_COVERAGE_LOW = 0.85
-_REGISTERED_COVERAGE_HIGH = 0.95
-_REGISTERED_BRIER_RATIO = 0.90
-_REGISTERED_CREDIBILITY = 0.90
-
-
 def _owned_calibration_runs(manifest: Any, seed_index: int) -> tuple[Any, ...]:
     owner = None if int(seed_index) == ENGINEERING_SEED_INDEX else int(seed_index)
     return tuple(
@@ -102,12 +94,12 @@ def _owned_calibration_runs(manifest: Any, seed_index: int) -> tuple[Any, ...]:
 def _validate_calibration_runs(runs: tuple[Any, ...], *, formal: bool) -> None:
     parent_ids = [str(run.parent_training_run_id) for run in runs]
     if len(parent_ids) != len(set(parent_ids)):
-        raise ValueError("Safety calibration requires independent partner-run blocks.")
+        raise ValueError("Posterior calibration requires independent partner-run blocks.")
     if formal:
         counts = Counter(_MECHANISM_ALIASES.get(run.generation_mechanism) for run in runs)
         if counts != Counter({"sp": 5, "op": 5, "sa": 5, "fcp": 5}):
             raise ValueError(
-                "Formal V6 safety calibration requires five independent runs "
+                "Formal posterior calibration requires five independent runs "
                 "from each of SP, OP, SA, and FCP."
             )
 
@@ -123,7 +115,8 @@ def _collect_calibration_records(
     calibration_config = replace(
         config,
         environment=replace(
-            config.environment, num_envs=int(config.calibration.episodes_per_run)
+            config.environment,
+            num_envs=int(config.posterior_calibration.episodes_per_run),
         ),
     )
     environment = VectorEnvironment.create(calibration_config)
@@ -131,17 +124,9 @@ def _collect_calibration_records(
         (run.checkpoint,),
         parent_training_run_ids=(run.parent_training_run_id,),
     )
-    # DEPI replaces the deleted V6 Gaussian ``latent_dim`` with the context
-    # dimension concat(u, c_t) (METHOD_SPEC §1.1); the external-partner runtime
-    # only needs a size for its metadata slot.
-    context_dim = int(config.model.capability_dim) + int(
-        config.model.component_embedding_dim
-    )
     partner_functions = make_external_partner_functions(
         pool=pool,
         member_indexes=jnp.asarray(0, dtype=jnp.int32),
-        latent_dim=context_dim,
-        code_dim=config.partner_generator.code_dim,
         run_ids=jnp.asarray(run_numeric_id, dtype=jnp.int32),
     )
     runner_key, rollout_key = jax.random.split(key, 2)
@@ -169,70 +154,10 @@ def _collect_calibration_records(
         official_shaping_factor=0.0,
         record_mode="anchor_full",
     )
-    steps = int(config.calibration.episodes_per_run) * int(
+    steps = int(config.posterior_calibration.episodes_per_run) * int(
         config.environment.episode_steps
     )
     return batch, steps
-
-
-def _component_group_log_probabilities(prediction: Any, targets: Any) -> Any:
-    """Per-component (..., K) grouped log p_k(y_{t+1}).
-
-    Uses the same per-head log-probability primitives and the same
-    visibility masking as ``mixture_response_loss`` (METHOD_SPEC §2.3), with
-    the per-component grouping
-    ``log p(vis) + log p(pos) + visible * (log p(dir) + log p(inv) + log p(event))``.
-
-    Note on comparability: this grouping shares the *grouping structure* of
-    the trained NLL, but NOT its marginalization order.  Training
-    marginalizes each head separately (Σ_k logsumexp per head, then sums the
-    heads); the held-out score here first sums the heads inside each
-    component and marginalizes once.  The two are generally not numerically
-    identical (log of a sum ≠ sum of logs across mixture components), so the
-    held-out log score must be read as a same-family calibration quantity,
-    not as the exact trained NLL evaluated out-of-sample.
-    """
-
-    import jax.numpy as jnp
-
-    # Shared single-source-of-truth primitives of mixture_response_loss.
-    from src.path_c.response_targets import (
-        _bernoulli_log_probability,
-        _categorical_log_probability,
-    )
-
-    visibility = _bernoulli_log_probability(
-        prediction.visibility_logit, targets.visibility
-    )
-    position = _categorical_log_probability(
-        prediction.relative_position_logits, targets.relative_position
-    )
-    direction = _categorical_log_probability(
-        prediction.direction_logits, targets.direction
-    )
-    inventory = jnp.sum(
-        _categorical_log_probability(prediction.inventory_logits, targets.inventory),
-        axis=-1,
-    )
-    event = _bernoulli_log_probability(
-        prediction.interaction_change_logit, targets.interaction_change
-    )
-    visible = jnp.asarray(targets.visible_mask, dtype=jnp.float32)[..., None]
-    return visibility + position + visible * (direction + inventory + event)
-
-
-def _mixture_log_probability(
-    posterior_log_probabilities: Any, component_log_probabilities: Any
-) -> Any:
-    from jax.scipy.special import logsumexp
-
-    import jax.numpy as jnp
-
-    return logsumexp(
-        jnp.asarray(posterior_log_probabilities, dtype=jnp.float32)
-        + jnp.asarray(component_log_probabilities, dtype=jnp.float32),
-        axis=-1,
-    )
 
 
 def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any]:
@@ -247,9 +172,11 @@ def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any
     import jax.numpy as jnp
 
     from src.path_c.response_targets import (
+        component_joint_log_probability,
         extract_partner_response_targets,
         official_partner_observation_planes,
     )
+    from jax.scipy.special import logsumexp
 
     model = deployment.model
     params = deployment.params
@@ -266,19 +193,14 @@ def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any
     targets = extract_partner_response_targets(
         batch.observations[:-1], batch.response_next_observations, planes=planes
     )
-    component_log_probabilities = _component_group_log_probabilities(
-        prediction, targets
-    )
+    component_log_probabilities = component_joint_log_probability(prediction, targets)
     log_pi = prediction.posterior_log_probabilities
     posterior = jnp.exp(log_pi)
-    model_log_probabilities = _mixture_log_probability(log_pi, component_log_probabilities)
-    # Registered baseline 2 (§2.4): no-frame -- kinematic heads receive zero
-    # frame features; the protocol event head never reads the frame (§2.2).
-    # Side effect to keep in mind when reading this baseline: the posterior
-    # carried into ``sliced`` below was still produced by recursive Bayes
-    # filtering over the *real* observation sequence, i.e. the no-frame
-    # baseline removes frame evidence from the response heads only, while the
-    # protocol posterior keeps accumulating observation-driven updates.
+    model_log_probabilities = logsumexp(
+        log_pi + component_log_probabilities, axis=-1
+    )
+    # Build a real no-history counterfactual: physical task/frame features are
+    # retained, while every partner-history carrier is reset to its prior.
     _, context = model.apply(
         {"params": params},
         batch.initial_policy_state,
@@ -293,36 +215,55 @@ def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any
         context.protocol_probabilities[:-1],
         context.protocol_embedding[:-1],
     )
-    no_frame = model.apply(
+    component_matrix = params["protocol_component_embeddings"]["embedding"]
+    uniform = jnp.full_like(
+        sliced.protocol_probabilities,
+        1.0 / float(sliced.protocol_probabilities.shape[-1]),
+    )
+    no_history_context = ContextOutput(
+        task_features=sliced.task_features,
+        capability=jnp.zeros_like(sliced.capability),
+        protocol_probabilities=uniform,
+        protocol_embedding=mixture_summary(uniform, component_matrix),
+    )
+    no_history = model.apply(
         {"params": params},
-        sliced,
-        jnp.zeros_like(batch.observations[:-1]),
+        no_history_context,
+        batch.observations[:-1],
         batch.actions,
         method=model.response_from_context_and_action,
     )
-    no_frame_log_probabilities = _mixture_log_probability(
-        no_frame.posterior_log_probabilities,
-        _component_group_log_probabilities(no_frame, targets),
+    no_history_component_logp = component_joint_log_probability(no_history, targets)
+    no_history_log_probabilities = logsumexp(
+        no_history.posterior_log_probabilities + no_history_component_logp,
+        axis=-1,
     )
     event_sigmoid = jax.nn.sigmoid(prediction.interaction_change_logit)
-    component_matrix = params["protocol_component_embeddings"]["embedding"]
+    prior_event_sigmoid = jax.nn.sigmoid(no_history.interaction_change_logit)
     mean_posterior = jnp.mean(posterior, axis=(0, 1))
     return {
         "model_log_probabilities": np.asarray(model_log_probabilities),
         "component_log_probabilities": np.asarray(component_log_probabilities),
-        "no_frame_log_probabilities": np.asarray(no_frame_log_probabilities),
+        "no_history_log_probabilities": np.asarray(no_history_log_probabilities),
         "event_probabilities": np.asarray(jnp.sum(posterior * event_sigmoid, axis=-1)),
-        "prior_event_probabilities": np.asarray(jnp.mean(event_sigmoid, axis=-1)),
+        "prior_event_probabilities": np.asarray(
+            jnp.sum(uniform * prior_event_sigmoid, axis=-1)
+        ),
         "event_labels": np.asarray(targets.interaction_change),
         "position_probabilities": np.asarray(
-            jax.nn.softmax(prediction.relative_position_logits, axis=-1)
+            posterior_predictive_probabilities(
+                posterior, prediction.relative_position_logits
+            )
         ),
         "position_labels": np.asarray(targets.relative_position),
         "direction_probabilities": np.asarray(
-            jax.nn.softmax(prediction.direction_logits, axis=-1)
+            posterior_predictive_probabilities(
+                posterior, prediction.direction_logits
+            )
         ),
         "direction_labels": np.asarray(targets.direction),
         "visible_mask": np.asarray(targets.visible_mask),
+        "event_mask": np.asarray(targets.event_mask),
         "posterior_probabilities": np.asarray(posterior),
         "mean_posterior_entropy": float(jnp.mean(posterior_entropy(posterior))),
         "mean_posterior_mixture_summary": np.asarray(
@@ -331,81 +272,139 @@ def _score_calibration_block(*, deployment: Any, batch: Any) -> Mapping[str, Any
     }
 
 
-def _block_metrics(payload: Mapping[str, Any]) -> Mapping[str, float]:
-    """Per-block §2.4 readouts computed with the shared calibration primitives."""
+_METRIC_NAMES = (
+    "log_score",
+    "uniform_baseline_log_score",
+    "no_history_baseline_log_score",
+    "delta_nll_no_c",
+    "event_brier",
+    "prior_baseline_brier",
+    "coverage_position",
+    "coverage_direction",
+)
 
-    visible = payload["visible_mask"]
+
+def _metric_values(
+    payload: Mapping[str, Any], index: Any, *, credibility: float
+) -> Mapping[str, float]:
+    """Score one episode slice with the shared calibration primitives."""
+
+    visible = payload["visible_mask"][index]
+    event_valid = payload["event_mask"][index]
+    model_score = float(per_step_log_score(payload["model_log_probabilities"][index]))
+    no_history_score = float(
+        per_step_log_score(payload["no_history_log_probabilities"][index])
+    )
     return {
-        "log_score": float(per_step_log_score(payload["model_log_probabilities"])),
-        "uniform_log_score": float(
-            uniform_prior_log_score(payload["component_log_probabilities"])
+        "log_score": model_score,
+        "uniform_baseline_log_score": float(
+            uniform_prior_log_score(payload["component_log_probabilities"][index])
         ),
-        "no_frame_log_score": float(
-            per_step_log_score(payload["no_frame_log_probabilities"])
-        ),
+        "no_history_baseline_log_score": no_history_score,
+        "delta_nll_no_c": no_history_score - model_score,
         "event_brier": float(
             event_brier_score(
-                payload["event_probabilities"], payload["event_labels"], mask=visible
+                payload["event_probabilities"][index],
+                payload["event_labels"][index],
+                mask=event_valid,
             )
         ),
-        "prior_event_brier": float(
+        "prior_baseline_brier": float(
             event_brier_score(
-                payload["prior_event_probabilities"],
-                payload["event_labels"],
-                mask=visible,
+                payload["prior_event_probabilities"][index],
+                payload["event_labels"][index],
+                mask=event_valid,
             )
         ),
         "coverage_position": float(
             highest_probability_set_coverage(
-                payload["position_probabilities"],
-                payload["position_labels"],
-                credibility=_REGISTERED_CREDIBILITY,
+                payload["position_probabilities"][index],
+                payload["position_labels"][index],
+                credibility=float(credibility),
                 mask=visible,
             )
         ),
         "coverage_direction": float(
             highest_probability_set_coverage(
-                payload["direction_probabilities"],
-                payload["direction_labels"],
-                credibility=_REGISTERED_CREDIBILITY,
+                payload["direction_probabilities"][index],
+                payload["direction_labels"][index],
+                credibility=float(credibility),
                 mask=visible,
             )
         ),
     }
 
 
-def _aggregate_metrics(payloads: list[Mapping[str, Any]]) -> Mapping[str, float]:
-    """Pooled §2.4 readouts over all run-disjoint held-out blocks."""
+def _episode_metric_matrix(
+    payload: Mapping[str, Any], *, credibility: float = 0.90
+) -> np.ndarray:
+    """Return ``(episode, metric)`` scores; no long episode gets extra weight."""
+
+    shape = np.asarray(payload["model_log_probabilities"]).shape
+    if len(shape) != 2:
+        raise ValueError("Calibration log probabilities must have (time, episode) axes.")
+    rows = [
+        _metric_values(
+            payload, (slice(None), episode), credibility=float(credibility)
+        )
+        for episode in range(shape[1])
+    ]
+    return np.asarray(
+        [[row[name] for name in _METRIC_NAMES] for row in rows], dtype=np.float64
+    )
+
+
+def _block_metrics(
+    payload: Mapping[str, Any], *, credibility: float = 0.90
+) -> Mapping[str, float]:
+    """Partner-run mean with episodes as equal secondary units."""
+
+    mean = np.mean(
+        _episode_metric_matrix(payload, credibility=float(credibility)), axis=0
+    )
+    return {
+        name: float(value) for name, value in zip(_METRIC_NAMES, mean, strict=True)
+    }
+
+
+def _aggregate_metrics(
+    payloads: list[Mapping[str, Any]], *, credibility: float = 0.90
+) -> Mapping[str, float]:
+    """Pooled descriptive readouts; partner runs remain the primary unit."""
 
     def stacked(name: str) -> np.ndarray:
         return np.concatenate([payload[name] for payload in payloads], axis=0)
 
     visible = stacked("visible_mask")
+    event_valid = stacked("event_mask")
+    model_score = float(per_step_log_score(stacked("model_log_probabilities")))
+    no_history_score = float(
+        per_step_log_score(stacked("no_history_log_probabilities"))
+    )
     return {
-        "log_score": float(per_step_log_score(stacked("model_log_probabilities"))),
+        "log_score": model_score,
         "uniform_baseline_log_score": float(
             uniform_prior_log_score(stacked("component_log_probabilities"))
         ),
-        "no_frame_baseline_log_score": float(
-            per_step_log_score(stacked("no_frame_log_probabilities"))
-        ),
+        "no_history_baseline_log_score": no_history_score,
+        "delta_nll_no_c": no_history_score - model_score,
         "event_brier": float(
             event_brier_score(
-                stacked("event_probabilities"), stacked("event_labels"), mask=visible
+                stacked("event_probabilities"), stacked("event_labels"), mask=event_valid
             )
         ),
         "prior_baseline_brier": float(
             event_brier_score(
                 stacked("prior_event_probabilities"),
                 stacked("event_labels"),
-                mask=visible,
+                mask=event_valid,
             )
         ),
         "coverage_position": float(
             highest_probability_set_coverage(
                 stacked("position_probabilities"),
                 stacked("position_labels"),
-                credibility=_REGISTERED_CREDIBILITY,
+                credibility=float(credibility),
                 mask=visible,
             )
         ),
@@ -413,7 +412,7 @@ def _aggregate_metrics(payloads: list[Mapping[str, Any]]) -> Mapping[str, float]
             highest_probability_set_coverage(
                 stacked("direction_probabilities"),
                 stacked("direction_labels"),
-                credibility=_REGISTERED_CREDIBILITY,
+                credibility=float(credibility),
                 mask=visible,
             )
         ),
@@ -423,7 +422,38 @@ def _aggregate_metrics(payloads: list[Mapping[str, Any]]) -> Mapping[str, float]
     }
 
 
-def run_safety_calibration(args: argparse.Namespace) -> None:
+def _run_level_summary(
+    episode_matrices: list[np.ndarray], *, bootstrap_replicates: int, seed: int
+) -> tuple[Mapping[str, float], Mapping[str, list[float]]]:
+    """Two-level bootstrap: partner run first, episode second."""
+
+    matrix = np.stack([values.mean(axis=0) for values in episode_matrices])
+    if matrix.ndim != 2 or matrix.shape[0] < 2:
+        raise ValueError("Run-level calibration needs at least two partner runs.")
+    mean = matrix.mean(axis=0)
+    rng = np.random.default_rng(int(seed))
+    boot = np.empty((int(bootstrap_replicates), matrix.shape[1]), dtype=np.float64)
+    for replicate in range(int(bootstrap_replicates)):
+        selected_runs = rng.integers(0, matrix.shape[0], size=matrix.shape[0])
+        sampled_run_means = []
+        for run_index in selected_runs:
+            episodes = episode_matrices[int(run_index)]
+            selected_episodes = rng.integers(
+                0, episodes.shape[0], size=episodes.shape[0]
+            )
+            sampled_run_means.append(episodes[selected_episodes].mean(axis=0))
+        boot[replicate] = np.mean(sampled_run_means, axis=0)
+    low, high = np.quantile(boot, (0.025, 0.975), axis=0)
+    return (
+        {name: float(value) for name, value in zip(_METRIC_NAMES, mean, strict=True)},
+        {
+            name: [float(lo), float(hi)]
+            for name, lo, hi in zip(_METRIC_NAMES, low, high, strict=True)
+        },
+    )
+
+
+def run_posterior_calibration(args: argparse.Namespace) -> None:
     import jax
     import jax.numpy as jnp
 
@@ -440,7 +470,8 @@ def run_safety_calibration(args: argparse.Namespace) -> None:
     )
     runs = _owned_calibration_runs(manifest, int(args.seed_index))
     _validate_calibration_runs(runs, formal=config.run_kind == "formal")
-    if len(runs) < config.calibration.minimum_run_count:
+    calibration = config.posterior_calibration
+    if len(runs) < calibration.minimum_run_count:
         raise RuntimeError(
             "Held-out calibration has too few independent partner-run blocks; "
             "the §2.4 calibration readout is not exported."
@@ -459,9 +490,10 @@ def run_safety_calibration(args: argparse.Namespace) -> None:
     # Registered independent calibration key domain (root-seed separation from
     # training/evaluation streams; METHOD_SPEC §2.4).
     root = jnp.asarray(
-        official_training_domain_keys(int(args.seed_index))["calibration"],
+        official_training_domain_keys(int(args.seed_index))["posterior_calibration"],
         dtype=jnp.uint32,
     )
+    root = jax.random.fold_in(root, int(calibration.root_seed_offset))
     payloads: list[Mapping[str, Any]] = []
     table: list[Mapping[str, Any]] = []
     attempted = 0
@@ -476,15 +508,13 @@ def run_safety_calibration(args: argparse.Namespace) -> None:
         attempted += int(block_steps)
         payload = _score_calibration_block(deployment=deployment, batch=batch)
         payloads.append(payload)
-        metrics = _block_metrics(payload)
-        posterior = payload["posterior_probabilities"]
-        regime_index = _REGIME_INDEX_BY_MECHANISM.get(
-            _MECHANISM_ALIASES.get(run.generation_mechanism, run.generation_mechanism)
+        metrics = _block_metrics(
+            payload, credibility=float(calibration.credibility)
         )
         row: dict[str, Any] = {
             "partner_run_id": run.run_id,
             "partner_mechanism": run.generation_mechanism,
-            "episodes": int(config.calibration.episodes_per_run),
+            "episodes": int(calibration.episodes_per_run),
             "steps": int(block_steps),
             "posterior_entropy": float(payload["mean_posterior_entropy"]),
             "protocol_embedding_norm": float(
@@ -492,81 +522,134 @@ def run_safety_calibration(args: argparse.Namespace) -> None:
             ),
         }
         row.update({key: float(value) for key, value in metrics.items()})
-        if regime_index is not None:
-            row["regime_posterior_mass"] = float(posterior[..., regime_index].mean())
-            row["regime_argmax_accuracy"] = float(
-                (posterior.argmax(axis=-1) == regime_index).mean()
-            )
         table.append(row)
-    aggregate = _aggregate_metrics(payloads)
+    aggregate, run_bootstrap_ci = _run_level_summary(
+        [
+            _episode_metric_matrix(
+                payload, credibility=float(calibration.credibility)
+            )
+            for payload in payloads
+        ],
+        bootstrap_replicates=int(calibration.bootstrap_replicates),
+        seed=int(calibration.bootstrap_seed),
+    )
+    pooled_descriptive = _aggregate_metrics(
+        payloads, credibility=float(calibration.credibility)
+    )
     pass_flags = {
         "log_score_vs_uniform": bool(
             aggregate["log_score"]
-            <= aggregate["uniform_baseline_log_score"] - _REGISTERED_LOG_SCORE_MARGIN
+            <= aggregate["uniform_baseline_log_score"]
+            - float(calibration.log_score_margin)
         ),
-        "log_score_vs_no_frame": bool(
+        "log_score_vs_no_history": bool(
             aggregate["log_score"]
-            <= aggregate["no_frame_baseline_log_score"] - _REGISTERED_LOG_SCORE_MARGIN
+            <= aggregate["no_history_baseline_log_score"]
+            - float(calibration.log_score_margin)
         ),
-        "coverage_in_band": bool(
-            _REGISTERED_COVERAGE_LOW
+        "position_coverage_in_band": bool(
+            float(calibration.coverage_low)
             <= aggregate["coverage_position"]
-            <= _REGISTERED_COVERAGE_HIGH
+            <= float(calibration.coverage_high)
+        ),
+        "direction_coverage_in_band": bool(
+            float(calibration.coverage_low)
+            <= aggregate["coverage_direction"]
+            <= float(calibration.coverage_high)
         ),
         "event_brier": bool(
             aggregate["event_brier"]
-            <= _REGISTERED_BRIER_RATIO * aggregate["prior_baseline_brier"]
+            <= float(calibration.brier_ratio)
+            * aggregate["prior_baseline_brier"]
         ),
     }
     overall_pass = calibration_pass_decision(
         model_log_score=aggregate["log_score"],
         uniform_baseline_log_score=aggregate["uniform_baseline_log_score"],
-        no_frame_baseline_log_score=aggregate["no_frame_baseline_log_score"],
-        coverage=aggregate["coverage_position"],
+        no_history_baseline_log_score=aggregate["no_history_baseline_log_score"],
+        position_coverage=aggregate["coverage_position"],
+        direction_coverage=aggregate["coverage_direction"],
         event_brier=aggregate["event_brier"],
         prior_baseline_brier=aggregate["prior_baseline_brier"],
-        log_score_margin=_REGISTERED_LOG_SCORE_MARGIN,
-        coverage_low=_REGISTERED_COVERAGE_LOW,
-        coverage_high=_REGISTERED_COVERAGE_HIGH,
-        brier_ratio=_REGISTERED_BRIER_RATIO,
+        log_score_margin=float(calibration.log_score_margin),
+        coverage_low=float(calibration.coverage_low),
+        coverage_high=float(calibration.coverage_high),
+        brier_ratio=float(calibration.brier_ratio),
     )
+    ledger = ResourceLedger(calibration_steps=attempted)
+    config_path = Path(args.config).resolve()
+    manifest_path = Path(args.partner_manifest).resolve()
+    training_path = Path(args.training_run).resolve()
+    deployment_path = training_path / "final_deployment"
+    score_path = output / "calibration_scores.parquet"
+    write_parquet(score_path, table)
     write_json(
-        output / "held_out_calibration.json",
+        output / "posterior_calibration.json",
         {
-            "artifact_name": SAFETY_ARTIFACT_NAME,
+            "version": 2,
+            "artifact_type": "depi_posterior_calibration",
+            "artifact_name": POSTERIOR_CALIBRATION_ARTIFACT_NAME,
             "method": METHOD_VERSION,
+            "method_variant": config.method_variant,
+            "layout": config.environment.layout,
+            "official_protocol_version": OFFICIAL_PROTOCOL_VERSION,
+            "official_source_commit": OFFICIAL_SOURCE_COMMIT,
+            "config_fingerprint": config.fingerprint,
+            "sources": {
+                "config": {"path": str(config_path), "sha256": sha256_path(config_path)},
+                "training_run": {
+                    "path": str(training_path),
+                    "sha256": sha256_path(training_path),
+                },
+                "primary_deployment": {
+                    "path": str(deployment_path),
+                    "sha256": sha256_path(deployment_path),
+                },
+                "partner_manifest": {
+                    "path": str(manifest_path),
+                    "sha256": sha256_path(manifest_path),
+                },
+                "calibration_scores": {
+                    "path": str(score_path),
+                    "sha256": sha256_path(score_path),
+                },
+            },
+            "resource_ledger": ledger.to_mapping(),
             "protocol": (
-                "METHOD_SPEC §2.4 held-out calibration of the K=4 protocol "
+                "METHOD_SPEC §2.4 held-out calibration of the exchangeable protocol "
                 "posterior (log score primary, interaction-change Brier "
                 "secondary, 90% highest-probability-set coverage)"
             ),
-            "primary_deployment": str(
-                Path(args.training_run).resolve() / "final_deployment"
-            ),
+            "primary_deployment": str(deployment_path),
             "primary_artifact_name": PRIMARY_ARTIFACT_NAME,
             "model_fingerprint": pytree_fingerprint(
                 deployable_parameters(deployment.params)
             ),
             "registered": {
-                "log_score_margin": _REGISTERED_LOG_SCORE_MARGIN,
-                "coverage_low": _REGISTERED_COVERAGE_LOW,
-                "coverage_high": _REGISTERED_COVERAGE_HIGH,
-                "brier_ratio": _REGISTERED_BRIER_RATIO,
-                "credibility": _REGISTERED_CREDIBILITY,
-                "coverage_target": "relative_position",
+                "log_score_margin": float(calibration.log_score_margin),
+                "coverage_low": float(calibration.coverage_low),
+                "coverage_high": float(calibration.coverage_high),
+                "brier_ratio": float(calibration.brier_ratio),
+                "credibility": float(calibration.credibility),
+                "coverage_targets": ["relative_position", "direction"],
+                "no_history_frame_policy": "retain_current_physical_frame",
+                "primary_aggregation_unit": calibration.primary_unit,
+                "secondary_aggregation_unit": calibration.secondary_unit,
+                "root_seed_offset": int(calibration.root_seed_offset),
+                "protocol_component_count": int(config.model.protocol_components),
             },
             "aggregate": aggregate,
+            "run_bootstrap_95_ci": run_bootstrap_ci,
+            "pooled_descriptive": pooled_descriptive,
             "pass": {**pass_flags, "overall": bool(overall_pass)},
             "runs": table,
         },
     )
-    write_parquet(output / "calibration_scores.parquet", table)
-    ledger = ResourceLedger(calibration_steps=attempted)
     write_json(output / "resource_ledger.json", ledger.to_mapping())
     write_json(
         output / "run_metadata.json",
         {
-            "artifact_name": SAFETY_ARTIFACT_NAME,
+            "artifact_name": POSTERIOR_CALIBRATION_ARTIFACT_NAME,
             "partner_run_blocks": len(runs),
             "calibration_rows": len(table),
             "wall_seconds": time.perf_counter() - started,
@@ -587,4 +670,7 @@ def run_safety_calibration(args: argparse.Namespace) -> None:
     )
 
 
-__all__ = ["SAFETY_ARTIFACT_NAME", "run_safety_calibration"]
+__all__ = [
+    "POSTERIOR_CALIBRATION_ARTIFACT_NAME",
+    "run_posterior_calibration",
+]

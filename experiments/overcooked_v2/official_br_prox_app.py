@@ -16,17 +16,18 @@ from typing import Any, Mapping, NamedTuple
 import numpy as np
 
 from experiments.overcooked_v2.common_partner_app import (
+    COMMON_PARTNER_COUNT,
+    VIRTUAL_PARTNER_PANEL,
+    _load_common_panel_policies,
     _official_environment,
     _parse_manifests,
     _validate_common_panel,
 )
 from experiments.overcooked_v2.official_adapter import (
-    official_policy,
-    restore_official_checkpoint,
     validate_official_runtime,
 )
 from experiments.overcooked_v2.official_evaluation_app import FORMAL_METHODS, _load_policies
-from experiments.overcooked_v2.official_policy import OfficialDeltaPolicy
+from experiments.overcooked_v2.official_policy import OfficialDEPIPolicy
 from src.path_c.evaluation import br_prox
 from src.path_c.experiment import OFFICIAL_EVALUATION_ROOT_SEED, load_config, load_partner_manifest
 from src.path_c.resources import ResourceLedger
@@ -196,11 +197,11 @@ def _select_tree(active: Any, candidate: Any, current: Any) -> Any:
 
 
 def _record_forced_action(policy: Any, hstate: Any, action: Any) -> Any:
-    """Make the DELTA legal-history state reflect the forced diagnostic action."""
+    """Make the DEPI legal-history state reflect the forced diagnostic action."""
 
     import jax.numpy as jnp
 
-    if not isinstance(policy, OfficialDeltaPolicy):
+    if not isinstance(policy, OfficialDEPIPolicy):
         return hstate
     target = jnp.asarray(hstate.previous_action)
     expanded = jnp.asarray(action, dtype=jnp.int32).reshape(
@@ -224,6 +225,234 @@ def _shared_branch_roots(anchor_roots: Any, action_count: int, replicas: int) ->
         ).reshape((int(action_count) * int(replicas), 2))
 
     return jax.vmap(one)(anchor_roots).reshape((-1, 2))
+
+
+def record_official_anchor_snapshots(
+    *,
+    left: Any,
+    right: Any,
+    environment: Any,
+    root_key: Any,
+    anchors: int,
+    continuation_horizon: int,
+    episodes: int = 500,
+) -> Mapping[str, Any]:
+    """Replay legal Official histories and return continuation-safe snapshots.
+
+    Selection is fixed before simulation and uses the same episode-key schedule
+    as the Official evaluator.  A selected time index always leaves the full
+    registered continuation horizon in the episode, so no padded or already
+    terminal branch can enter a mechanism control.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    episode_count = int(episodes)
+    anchor_count = int(anchors)
+    horizon = int(continuation_horizon)
+    available_steps = int(environment.max_steps) - horizon + 1
+    if episode_count <= 0 or anchor_count <= 0 or horizon <= 0:
+        raise ValueError("Snapshot episodes, anchors, and horizon must be positive.")
+    if available_steps <= 0:
+        raise ValueError("Continuation horizon exceeds the Official episode.")
+    flat_count = available_steps * episode_count
+    if anchor_count > flat_count:
+        raise ValueError("Requested more mechanism anchors than legal states.")
+    episode_keys = jax.random.split(root_key, episode_count)
+    selection_key = jax.random.fold_in(root_key, 0x4D454348)
+    flat_indexes = jnp.sort(
+        jax.random.choice(
+            selection_key,
+            flat_count,
+            shape=(anchor_count,),
+            replace=False,
+        )
+    )
+    time_indexes = flat_indexes // episode_count
+    episode_indexes = flat_indexes % episode_count
+    selected_episode_keys = episode_keys[episode_indexes]
+    records = _record_trajectories(
+        left=left,
+        right=right,
+        environment=environment,
+        episode_keys=selected_episode_keys,
+    )
+    selected = _gather_time_episode(
+        records,
+        time_indexes,
+        jnp.arange(anchor_count, dtype=jnp.int32),
+    )
+    anchor_episode_keys = episode_keys[episode_indexes]
+    anchor_roots = jax.vmap(
+        lambda key, time: jax.random.fold_in(
+            jax.random.fold_in(key, 0x4D454348), time
+        )
+    )(anchor_episode_keys, time_indexes.astype(jnp.uint32))
+    if bool(np.any(np.asarray(selected["done"]["__all__"]))):
+        raise RuntimeError("A mechanism snapshot was terminal before intervention.")
+    return {
+        "selected": selected,
+        "flat_indexes": flat_indexes,
+        "time_indexes": time_indexes,
+        "episode_indexes": episode_indexes,
+        "anchor_roots": anchor_roots,
+    }
+
+
+def empirical_all_action_continuations_from_snapshots(
+    *,
+    left: Any,
+    right: Any,
+    ego_role: int,
+    environment: Any,
+    selected: Mapping[str, Any],
+    anchor_roots: Any,
+    fit_replicas: int,
+    evaluation_replicas: int,
+    continuation_horizon: int,
+    ego_hstate: Any | None = None,
+) -> Mapping[str, Any]:
+    """Evaluate all six forced ego actions with paired real continuations.
+
+    Fit replicas select the empirical oracle; a disjoint replica block reports
+    every action value.  ``ego_hstate`` may replace only the ego recurrent
+    state, which is the intervention surface used by history-shuffle,
+    state-only, swap-u, and swap-c controls.  The environment, partner state,
+    role, current observation, action keys, and continuation keys remain fixed.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    role = int(ego_role)
+    if role not in {0, 1}:
+        raise ValueError("ego_role must be zero or one.")
+    fit_count = int(fit_replicas)
+    evaluation_count = int(evaluation_replicas)
+    horizon = int(continuation_horizon)
+    if min(fit_count, evaluation_count, horizon) <= 0:
+        raise ValueError("Continuation replica counts and horizon must be positive.")
+    roots_array = jnp.asarray(anchor_roots, dtype=jnp.uint32)
+    anchor_count = int(roots_array.shape[0])
+    if roots_array.shape != (anchor_count, 2):
+        raise ValueError("Every continuation anchor needs one two-word root key.")
+    left_hstate = selected["left_hstate"]
+    right_hstate = selected["right_hstate"]
+    if ego_hstate is not None:
+        if role == 0:
+            left_hstate = ego_hstate
+        else:
+            right_hstate = ego_hstate
+
+    ego_name = "agent_0" if role == 0 else "agent_1"
+    ego_policy = left if role == 0 else right
+    selected_action_keys = jax.vmap(
+        lambda key: jax.random.fold_in(key, 0x4143544E)
+    )(roots_array)
+    selected_actions, unused_selected_states = _vmap_policy(
+        ego_policy,
+        selected["observations"][ego_name],
+        selected["done"][ego_name],
+        left_hstate if role == 0 else right_hstate,
+        selected_action_keys,
+    )
+    del unused_selected_states
+
+    replica_count = fit_count + evaluation_count
+    action_count = 6
+    repeats = action_count * replica_count
+    forced_actions = jnp.tile(
+        jnp.repeat(jnp.arange(action_count, dtype=jnp.int32), replica_count),
+        anchor_count,
+    )
+    roots = _shared_branch_roots(roots_array, action_count, replica_count)
+    branch = _BranchCarry(
+        observations=_repeat_tree(selected["observations"], repeats),
+        environment_state=_repeat_tree(selected["environment_state"], repeats),
+        done=_repeat_tree(selected["done"], repeats),
+        left_hstate=_repeat_tree(left_hstate, repeats),
+        right_hstate=_repeat_tree(right_hstate, repeats),
+        raw_return=jnp.zeros((anchor_count * repeats,), dtype=jnp.float32),
+    )
+
+    def advance(step: int, current: _BranchCarry) -> _BranchCarry:
+        active = ~jnp.asarray(current.done["__all__"], dtype=jnp.bool_)
+        lane_step_keys = jax.vmap(
+            lambda key: jax.random.fold_in(key, step)
+        )(roots)
+        split = jax.vmap(lambda key: jax.random.split(key, 2))(lane_step_keys)
+        sample_roots, environment_keys = split[:, 0], split[:, 1]
+        action_keys = jax.vmap(lambda key: jax.random.split(key, 2))(sample_roots)
+        left_action, next_left = _vmap_policy(
+            left,
+            current.observations["agent_0"],
+            current.done["agent_0"],
+            current.left_hstate,
+            action_keys[:, 0],
+        )
+        right_action, next_right = _vmap_policy(
+            right,
+            current.observations["agent_1"],
+            current.done["agent_1"],
+            current.right_hstate,
+            action_keys[:, 1],
+        )
+        first = step == 0
+        if role == 0:
+            left_action = jnp.where(first, forced_actions, left_action)
+            forced_left = _record_forced_action(left, next_left, forced_actions)
+            next_left = jax.tree_util.tree_map(
+                lambda forced, normal: jnp.where(first, forced, normal),
+                forced_left,
+                next_left,
+            )
+        else:
+            right_action = jnp.where(first, forced_actions, right_action)
+            forced_right = _record_forced_action(right, next_right, forced_actions)
+            next_right = jax.tree_util.tree_map(
+                lambda forced, normal: jnp.where(first, forced, normal),
+                forced_right,
+                next_right,
+            )
+        next_observations, next_state, rewards, next_done, unused_info = jax.vmap(
+            environment.step
+        )(
+            environment_keys,
+            current.environment_state,
+            {"agent_0": left_action, "agent_1": right_action},
+        )
+        del unused_info
+        candidate = _BranchCarry(
+            observations=next_observations,
+            environment_state=next_state,
+            done=next_done,
+            left_hstate=next_left,
+            right_hstate=next_right,
+            raw_return=current.raw_return
+            + jnp.where(active, rewards["agent_0"], 0.0),
+        )
+        return _select_tree(active, candidate, current)
+
+    final = jax.lax.fori_loop(0, horizon, advance, branch)
+    values = np.asarray(final.raw_return, dtype=np.float64).reshape(
+        (anchor_count, action_count, replica_count)
+    )
+    if not np.all(np.isfinite(values)):
+        raise RuntimeError("Mechanism continuation returned non-finite rewards.")
+    fit = np.mean(values[..., :fit_count], axis=-1)
+    evaluation = np.mean(values[..., fit_count:], axis=-1)
+    selected_host = np.asarray(selected_actions, dtype=np.int64).reshape(anchor_count)
+    oracle = np.argmax(fit, axis=-1)
+    rows = np.arange(anchor_count)
+    return {
+        "fit_returns_by_action": fit,
+        "evaluation_returns_by_action": evaluation,
+        "selected_action": selected_host,
+        "selected_evaluation_return": evaluation[rows, selected_host],
+        "fit_oracle_action": oracle,
+        "oracle_evaluation_return": evaluation[rows, oracle],
+    }
 
 
 def empirical_official_br_prox_pairing(
@@ -417,15 +646,13 @@ def run_common_br_prox(args: argparse.Namespace) -> None:
         "config_fingerprint": config.fingerprint,
         "panel_sha256": sha256_path(panel_path),
         "policy_manifests": manifests,
+        "virtual_partner_panel": VIRTUAL_PARTNER_PANEL,
         "root_key": [0, OFFICIAL_EVALUATION_ROOT_SEED],
         "scope": "one_action_deviation_with_frozen_deployed_continuation",
     }
     ensure_run_identity(output, identity)
     environment = _official_environment(config)
-    partner_policies = []
-    for run in partners:
-        official_config, params = restore_official_checkpoint(run.checkpoint)
-        partner_policies.append(official_policy(params, official_config))
+    partners, partner_policies = _load_common_panel_policies(partners)
     root_key = jax.random.PRNGKey(OFFICIAL_EVALUATION_ROOT_SEED)
     all_rows = []
     for method in FORMAL_METHODS:
@@ -481,7 +708,7 @@ def run_common_br_prox(args: argparse.Namespace) -> None:
     attempted = (
         len(FORMAL_METHODS)
         * 10
-        * 16
+        * COMMON_PARTNER_COUNT
         * 2
         * config.evaluation.br_prox_anchors_per_pairing
         * 6
@@ -497,4 +724,9 @@ def run_common_br_prox(args: argparse.Namespace) -> None:
     )
 
 
-__all__ = ["empirical_official_br_prox_pairing", "run_common_br_prox"]
+__all__ = [
+    "empirical_all_action_continuations_from_snapshots",
+    "empirical_official_br_prox_pairing",
+    "record_official_anchor_snapshots",
+    "run_common_br_prox",
+]

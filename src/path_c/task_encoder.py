@@ -1,9 +1,10 @@
-"""Deployable task-state encoder for DEPI.
+"""Task-state encoders for the DEPI development matrix.
 
-METHOD_SPEC §1.4: the task pathway input shrinks to ``o_t`` only.  The
-previous_action_embedding and action_projection wiring is deleted so that the
-task GRU structurally never touches any partner-history carrier (METHOD_SPEC
-§1.2 input-layer isolation).  The Official CNN trunk weights are untouched.
+For B1/B2 the recurrent task pathway receives the current observation after
+all other-agent semantic planes have been zeroed.  Consequently neither an
+explicit history carrier nor a sequence of visible partner states can enter
+its GRU.  B0 deliberately keeps the complete observation as the full-history
+capacity control.
 """
 
 from __future__ import annotations
@@ -12,6 +13,50 @@ from typing import Any
 
 _TASK_CELL: Any | None = None
 _TASK_SCAN: Any | None = None
+
+
+def official_partner_channel_indexes(channel_count: int) -> tuple[int, ...]:
+    """Return the pinned Official channels belonging to the other agent.
+
+    At commit ``5ce1707`` each agent block is
+    ``position[1], direction[4], inventory[num_ingredients+2]`` and the full
+    observation has ``27 + 4*num_ingredients`` channels.  Failing this exact
+    relation is safer than silently leaking partner history into the task GRU.
+    """
+
+    channels = int(channel_count)
+    remainder = channels - 27
+    if remainder < 0 or remainder % 4:
+        raise ValueError("Observation channels do not match the pinned Official layout.")
+    ingredient_count = remainder // 4
+    if ingredient_count <= 0:
+        raise ValueError("The pinned Official layout requires at least one ingredient.")
+    agent_block = ingredient_count + 7
+    return tuple(range(agent_block, 2 * agent_block))
+
+
+def task_only_observation(observation: Any) -> Any:
+    """Remove all current partner planes before the recurrent task pathway."""
+
+    import jax.numpy as jnp
+
+    obs = jnp.asarray(observation, dtype=jnp.float32)
+    if obs.ndim < 3:
+        raise ValueError("Official observations require spatial and channel axes.")
+    partner_channels = jnp.asarray(
+        official_partner_channel_indexes(obs.shape[-1]), dtype=jnp.int32
+    )
+    return obs.at[..., partner_channels].set(0.0)
+
+
+def instantaneous_partner_observation(observation: Any) -> Any:
+    """Keep only current other-agent planes for the non-recurrent branch."""
+
+    import jax.numpy as jnp
+
+    obs = jnp.asarray(observation, dtype=jnp.float32)
+    partner_channels = official_partner_channel_indexes(obs.shape[-1])
+    return obs[..., list(partner_channels)]
 
 
 def task_encoder_classes() -> tuple[Any, Any]:
@@ -25,6 +70,7 @@ def task_encoder_classes() -> tuple[Any, Any]:
 
     class TaskEncoderCell(nn.Module):
         hidden_dim: int
+        mask_partner_history: bool = True
 
         @nn.compact
         def __call__(
@@ -33,7 +79,11 @@ def task_encoder_classes() -> tuple[Any, Any]:
             inputs: tuple[Any, Any],
         ) -> tuple[Any, Any]:
             observation, episode_start = inputs
-            obs = jnp.asarray(observation, dtype=jnp.float32)
+            obs = (
+                task_only_observation(observation)
+                if self.mask_partner_history
+                else jnp.asarray(observation, dtype=jnp.float32)
+            )
             start = jnp.asarray(episode_start, dtype=jnp.bool_)
             batch_axes = obs.shape[:-3]
             if start.shape != batch_axes:
@@ -93,4 +143,10 @@ def initial_task_carry(batch_size: int, hidden_dim: int) -> Any:
     return jnp.zeros((int(batch_size), int(hidden_dim)), dtype=jnp.float32)
 
 
-__all__ = ["initial_task_carry", "task_encoder_classes"]
+__all__ = [
+    "initial_task_carry",
+    "instantaneous_partner_observation",
+    "official_partner_channel_indexes",
+    "task_encoder_classes",
+    "task_only_observation",
+]

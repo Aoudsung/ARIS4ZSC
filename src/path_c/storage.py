@@ -49,7 +49,7 @@ def _repository_state() -> tuple[str, bool]:
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise RuntimeError(
-            "Active DELTA code is not inside an auditable Git checkout."
+            "Active DEPI code is not inside an auditable Git checkout."
         ) from error
     return commit, dirty
 
@@ -57,7 +57,7 @@ def _repository_state() -> tuple[str, bool]:
 def validate_registered_python_runtime() -> None:
     if sys.version_info[:2] != (3, 10):
         raise RuntimeError(
-            "Formal DELTA/Official runs require the Official Python 3.10 runtime; "
+            "Formal DEPI/Official runs require the Official Python 3.10 runtime; "
             f"observed {sys.version_info.major}.{sys.version_info.minor}."
         )
 
@@ -67,10 +67,10 @@ def validate_formal_repository_state() -> None:
     if len(commit) != 40 or any(
         character not in "0123456789abcdef" for character in commit
     ):
-        raise RuntimeError("Formal DELTA repository commit is not a full Git SHA.")
+        raise RuntimeError("Formal DEPI repository commit is not a full Git SHA.")
     if dirty:
         raise RuntimeError(
-            "Formal runs require a clean committed DELTA checkout; uncommitted "
+            "Formal runs require a clean committed DEPI checkout; uncommitted "
             "code cannot be reconstructed from run_identity.json."
         )
 
@@ -85,6 +85,7 @@ def training_identity(
     return {
         "stage": "train",
         "method": METHOD_VERSION,
+        "method_variant": config.method_variant,
         "run_kind": config.run_kind,
         "layout": config.environment.layout,
         "config": config.to_mapping(),
@@ -174,7 +175,7 @@ def calibration_identity(
 ) -> Mapping[str, Any]:
     source = Path(training_run).resolve()
     return {
-        "stage": "calibrate",
+        "stage": "calibrate-posterior",
         "method": METHOD_VERSION,
         "run_kind": config.run_kind,
         "layout": config.environment.layout,
@@ -182,7 +183,7 @@ def calibration_identity(
         "config_fingerprint": config.fingerprint,
         "seed_index": int(seed_index),
         "jax_prng_key": list(
-            official_training_domain_keys(seed_index)["calibration"]
+            official_training_domain_keys(seed_index)["posterior_calibration"]
         ),
         "training_run": str(source),
         "training_identity": read_run_identity(source),
@@ -542,8 +543,8 @@ def anchor_snapshot_checklist(
 
 def anchor_comparator_registration(
     *,
-    equivalent_accuracy_max: float,
-    distinct_accuracy_min: float,
+    equivalent_probability_max: float,
+    distinct_probability_min: float,
     signature_distance_threshold: float,
     probe_steps: int,
 ) -> Mapping[str, Any]:
@@ -551,8 +552,12 @@ def anchor_comparator_registration(
     starts require a new ledger entry rather than silent edits."""
 
     return {
-        "observable_equivalent_accuracy_max": float(equivalent_accuracy_max),
-        "decision_distinct_accuracy_min": float(distinct_accuracy_min),
+        "observable_equivalent_probability_max": float(
+            equivalent_probability_max
+        ),
+        "decision_distinct_probability_min": float(
+            distinct_probability_min
+        ),
         "signature_distance_threshold": float(signature_distance_threshold),
         "probe_steps": int(probe_steps),
     }
@@ -567,7 +572,7 @@ def anchor_ledger_entry(
     irreducible_ambiguity_fraction: float | None = None,
     comparator_holdout_accuracy: float | None = None,
 ) -> Mapping[str, Any]:
-    """One replay-ledger row for an anchor collection (§5.3 readings).
+    """One evidence-ledger row for an anchor collection (§5.3 readings).
 
     Irreducible-ambiguity pairs are recorded here and never enter any
     separation or consistency loss.
@@ -586,12 +591,12 @@ def anchor_ledger_entry(
         entry["pair_class_fractions"] = {
             name: float(value)
             for name, value in zip(
-                ("observable_equivalent", "decision_distinct", "irreducible_ambiguity"),
+                ("equivalent", "distinct", "ambiguous"),
                 fractions,
                 strict=True,
             )
         }
-        entry["irreducible_ambiguity"] = float(
+        entry["ambiguous_fraction"] = float(
             fractions[2]
             if irreducible_ambiguity_fraction is None
             else irreducible_ambiguity_fraction

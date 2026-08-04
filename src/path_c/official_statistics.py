@@ -1,4 +1,4 @@
-"""Registered statistics for the two formal DELTA-ZSC scoreboards."""
+"""Registered statistics for the two formal DEPI scoreboards."""
 
 from __future__ import annotations
 
@@ -13,6 +13,33 @@ import numpy as np
 OFFICIAL_RUNS = 10
 OFFICIAL_EPISODES = 500
 OFFICIAL_BOOTSTRAP_REPLICATES = 9_999
+
+
+def registered_superiority_gate(
+    comparison: Mapping[str, Any],
+    *,
+    lcb_threshold: float,
+    minimum_effect: float,
+    minimum_effect_rule: str,
+) -> Mapping[str, bool]:
+    """Evaluate the common registered LCB and material-effect conjunction."""
+
+    lcb = float(comparison["one_sided_lcb"])
+    point = float(comparison["point_reference"])
+    if not np.isfinite(lcb) or not np.isfinite(point):
+        raise ValueError("Superiority comparison contains a non-finite statistic.")
+    lcb_passed = lcb > float(lcb_threshold)
+    if minimum_effect_rule == "point_estimate":
+        effect_passed = point >= float(minimum_effect)
+    elif minimum_effect_rule == "lower_confidence_bound":
+        effect_passed = lcb >= float(minimum_effect)
+    else:
+        raise ValueError("Unknown formal minimum-effect rule.")
+    return {
+        "passed": bool(lcb_passed and effect_passed),
+        "superiority_lcb_passed": bool(lcb_passed),
+        "minimum_effect_passed": bool(effect_passed),
+    }
 
 
 def registered_bootstrap_seed(*labels: str) -> int:
@@ -99,23 +126,25 @@ def _weighted_sp(cell_means: np.ndarray, weights: np.ndarray) -> float:
 def official_node_bootstrap(
     method_returns: Mapping[str, Any],
     *,
-    delta_method: str,
+    target_method: str,
     baseline_methods: Sequence[str],
     fcp_method: str,
     replicates: int = OFFICIAL_BOOTSTRAP_REPLICATES,
     seed: int,
     alpha: float = 0.05,
+    inference_mode: str = "independent_run",
 ) -> Mapping[str, Any]:
     """Node bootstrap with shared episode-index resampling.
 
-    Training nodes are sampled independently between methods.  The same
-    episode-index vector is used for every cell and method in one replicate,
-    preserving the matched Official environment-key condition.
+    ``independent_run`` samples training nodes independently between methods.
+    ``paired_run`` uses one shared node-weight vector for all methods and is
+    valid only when run indexes were preregistered as paired units.  Both modes
+    share the episode-index vector, preserving the common environment keys.
     """
 
-    names = (delta_method, *tuple(baseline_methods))
+    names = (target_method, *tuple(baseline_methods))
     if len(set(names)) != len(names):
-        raise ValueError("DELTA and baseline method names must be distinct.")
+        raise ValueError("DEPI and baseline method names must be distinct.")
     if fcp_method not in baseline_methods:
         raise ValueError("The competence comparator must be one of the baselines.")
     missing = set(names) - set(method_returns)
@@ -124,6 +153,9 @@ def official_node_bootstrap(
     cubes = {name: validate_official_return_cube(method_returns[name]) for name in names}
     if int(replicates) <= 0 or not 0.0 < float(alpha) < 1.0:
         raise ValueError("Bootstrap replicates and alpha are invalid.")
+    mode = str(inference_mode)
+    if mode not in {"independent_run", "paired_run"}:
+        raise ValueError("inference_mode must be independent_run or paired_run.")
 
     generator = np.random.default_rng(int(seed))
     deltas = np.empty(int(replicates), dtype=np.float64)
@@ -132,24 +164,34 @@ def official_node_bootstrap(
     sp_samples = {name: np.empty(int(replicates), dtype=np.float64) for name in names}
     for replicate in range(int(replicates)):
         episode_indexes = generator.integers(0, OFFICIAL_EPISODES, size=OFFICIAL_EPISODES)
+        shared_weights = (
+            _positive_node_weights(generator, OFFICIAL_RUNS)
+            if mode == "paired_run"
+            else None
+        )
         for name in names:
-            weights = _positive_node_weights(generator, OFFICIAL_RUNS)
+            weights = (
+                shared_weights
+                if shared_weights is not None
+                else _positive_node_weights(generator, OFFICIAL_RUNS)
+            )
             means = np.mean(cubes[name][:, :, episode_indexes], axis=-1)
             xp_samples[name][replicate] = _weighted_xp(means, weights)
             sp_samples[name][replicate] = _weighted_sp(means, weights)
-        deltas[replicate] = xp_samples[delta_method][replicate] - max(
+        deltas[replicate] = xp_samples[target_method][replicate] - max(
             xp_samples[name][replicate] for name in baseline_methods
         )
         competence[replicate] = (
-            sp_samples[delta_method][replicate] - sp_samples[fcp_method][replicate]
+            sp_samples[target_method][replicate] - sp_samples[fcp_method][replicate]
         )
     return {
         "replicates": int(replicates),
         "seed": int(seed),
         "alpha": float(alpha),
-        "delta_vs_best_baseline": {
+        "inference_mode": mode,
+        "depi_vs_best_baseline": {
             "point_reference": float(
-                official_scoreboard_summary(cubes[delta_method])["xp_mean"]
+                official_scoreboard_summary(cubes[target_method])["xp_mean"]
                 - max(
                     official_scoreboard_summary(cubes[name])["xp_mean"]
                     for name in baseline_methods
@@ -157,9 +199,9 @@ def official_node_bootstrap(
             ),
             "one_sided_lcb": float(np.quantile(deltas, alpha, method="lower")),
         },
-        "delta_sp_minus_fcp_sp": {
+        "depi_sp_minus_fcp_sp": {
             "point_reference": float(
-                official_scoreboard_summary(cubes[delta_method])["sp_mean"]
+                official_scoreboard_summary(cubes[target_method])["sp_mean"]
                 - official_scoreboard_summary(cubes[fcp_method])["sp_mean"]
             ),
             "one_sided_lcb": float(np.quantile(competence, alpha, method="lower")),
@@ -248,6 +290,7 @@ def common_partner_summary(
     expected_ego_runs: int = 10,
     expected_mechanisms: int = 4,
     expected_partners_per_mechanism: int = 4,
+    expected_partner_counts: Mapping[str, int] | None = None,
     expected_roles: int = 2,
     expected_episodes: int = 500,
 ) -> Mapping[str, Any]:
@@ -272,18 +315,32 @@ def common_partner_summary(
 
     if len(ego_ids) != expected_ego_runs:
         raise ValueError(f"Expected {expected_ego_runs} ego runs, got {len(ego_ids)}.")
-    if len(grouped) != expected_mechanisms:
+    expected_mechanism_count = (
+        len(expected_partner_counts)
+        if expected_partner_counts is not None
+        else int(expected_mechanisms)
+    )
+    if len(grouped) != expected_mechanism_count:
         raise ValueError(
-            f"Expected {expected_mechanisms} partner mechanisms, got {len(grouped)}."
+            f"Expected {expected_mechanism_count} partner mechanisms, got {len(grouped)}."
         )
+    if expected_partner_counts is not None and set(grouped) != set(
+        expected_partner_counts
+    ):
+        raise ValueError("Common-Partner mechanisms differ from the frozen panel.")
     expected_per_cell = expected_ego_runs * expected_episodes
     mechanism_means: dict[str, float] = {}
     partner_means = []
     for mechanism, partners in grouped.items():
-        if len(partners) != expected_partners_per_mechanism:
+        expected_partner_count = (
+            int(expected_partner_counts[mechanism])
+            if expected_partner_counts is not None
+            else int(expected_partners_per_mechanism)
+        )
+        if len(partners) != expected_partner_count:
             raise ValueError(
                 f"Mechanism {mechanism} has {len(partners)} partners, expected "
-                f"{expected_partners_per_mechanism}."
+                f"{expected_partner_count}."
             )
         current = []
         for partner, roles in partners.items():
@@ -322,17 +379,27 @@ def _common_array(
         str(row["partner_run_id"]): str(row["partner_mechanism"])
         for row in materialized
     }
-    if len(ego_ids) != 10 or len(partner_ids) != 16:
-        raise ValueError("Formal common panel requires 10 egos and 16 partners.")
+    if len(ego_ids) != 10 or len(partner_ids) not in {16, 18}:
+        raise ValueError("Formal common panel requires 10 egos and 16 or 18 partners.")
     mechanisms = tuple(sorted(set(mechanisms_by_partner.values())))
-    if len(mechanisms) != 4:
-        raise ValueError("Formal common panel requires four mechanisms.")
-    for mechanism in mechanisms:
-        if sum(mechanisms_by_partner[p] == mechanism for p in partner_ids) != 4:
-            raise ValueError("Each common-panel mechanism must contain four partners.")
+    observed_counts = {
+        mechanism: sum(
+            mechanisms_by_partner[partner] == mechanism for partner in partner_ids
+        )
+        for mechanism in mechanisms
+    }
+    expected_counts = {
+        **{mechanism: 4 for mechanism in mechanisms if mechanism != "heuristic"},
+        **({"heuristic": 2} if "heuristic" in mechanisms else {}),
+    }
+    if observed_counts != expected_counts:
+        raise ValueError(
+            "Common-panel family counts differ from four trained runs per "
+            "mechanism plus two heuristic policies."
+        )
     ego_index = {value: index for index, value in enumerate(ego_ids)}
     partner_index = {value: index for index, value in enumerate(partner_ids)}
-    array = np.full((10, 16, 2, 500), np.nan, dtype=np.float64)
+    array = np.full((10, len(partner_ids), 2, 500), np.nan, dtype=np.float64)
     for row in materialized:
         index = (
             ego_index[str(row["ego_run_id"])],
@@ -352,7 +419,7 @@ def _common_array(
 def common_partner_bootstrap(
     method_rows: Mapping[str, Iterable[Mapping[str, Any]]],
     *,
-    delta_method: str,
+    target_method: str,
     baseline_methods: Sequence[str],
     replicates: int = OFFICIAL_BOOTSTRAP_REPLICATES,
     seed: int,
@@ -360,13 +427,13 @@ def common_partner_bootstrap(
 ) -> Mapping[str, Any]:
     """Stratified common-panel bootstrap with matched episode resampling."""
 
-    names = (delta_method, *tuple(baseline_methods))
+    names = (target_method, *tuple(baseline_methods))
     rows_by_method = {name: list(method_rows[name]) for name in names}
     parsed = {name: _common_array(rows_by_method[name]) for name in names}
-    partner_ids = parsed[delta_method][2]
-    partner_mechanisms = parsed[delta_method][3]
+    partner_ids = parsed[target_method][2]
+    partner_mechanisms = parsed[target_method][3]
     for name in baseline_methods:
-        if parsed[name][2:] != parsed[delta_method][2:]:
+        if parsed[name][2:] != parsed[target_method][2:]:
             raise ValueError("All methods must face the identical common partner panel.")
     by_mechanism = {
         mechanism: np.asarray(
@@ -393,11 +460,17 @@ def common_partner_bootstrap(
                 values = values[..., episode_indexes]
                 mechanism_means.append(float(np.mean(values)))
             scores[name] = float(np.mean(mechanism_means))
-        deltas[replicate] = scores[delta_method] - max(
+        deltas[replicate] = scores[target_method] - max(
             scores[name] for name in baseline_methods
         )
+    expected_partner_counts = {
+        mechanism: len(indexes) for mechanism, indexes in by_mechanism.items()
+    }
     point = {
-        name: common_partner_summary(rows_by_method[name])[
+        name: common_partner_summary(
+            rows_by_method[name],
+            expected_partner_counts=expected_partner_counts,
+        )[
             "mean_common_partner_return"
         ]
         for name in names
@@ -406,7 +479,7 @@ def common_partner_bootstrap(
         "replicates": int(replicates),
         "seed": int(seed),
         "alpha": float(alpha),
-        "point_reference": float(point[delta_method] - max(point[name] for name in baseline_methods)),
+        "point_reference": float(point[target_method] - max(point[name] for name in baseline_methods)),
         "one_sided_lcb": float(np.quantile(deltas, alpha, method="lower")),
     }
 
@@ -421,6 +494,7 @@ __all__ = [
     "official_two_method_bootstrap",
     "official_pairings",
     "official_scoreboard_summary",
+    "registered_superiority_gate",
     "rows_to_official_cube",
     "registered_bootstrap_seed",
     "validate_official_return_cube",

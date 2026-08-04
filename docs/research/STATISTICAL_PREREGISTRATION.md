@@ -1,53 +1,62 @@
-# 统计预注册（SOTA 判决式）
+# DEPI 统计预注册摘要
 
-修订头：本文件于统一重构（Rigor × Generality 统一优化方案 F 节）中创建，承接第一轮审查的 P0 缺口（δ_min 与统计程序跑前预注册）。
+本页描述推断结构，不复制注册的版本、seed、episode 数、bootstrap 次数、阈值或预算。所有
+精确值以 [`EVALUATION_SPEC.md`](../EVALUATION_SPEC.md)、
+[`FORMAL_EXPERIMENT_PROTOCOL.md`](../FORMAL_EXPERIMENT_PROTOCOL.md) 和两个 formal config 为唯一
+来源；代码在加载时逐字段拒绝漂移。
 
-修订头（追加，2026-08-03）：用户裁定生效——路径 1 标记为**已裁定生效**，路径 2 标记为**备用（仅在路径 1 资源不可行并经新裁定后启用）**；裁定记录见本文件第五节，决策登记见 [DECISION_LOG](../status/DECISION_LOG.md) D2。原"pending 用户裁定"状态行按只追加纪律保留不动，以本节与第五节为准。
+## 1. 主结局与节点
 
-**状态：pending 用户裁定。** 下文两套判决程序并行注册，待用户裁定后二选一生效；未生效前任何判决式读数不得以"已预注册程序"名义引用。
+主结局是固定 Official episode horizon 的 raw simulator return。正式主分析使用
+`independent_run`：episode 先在 ego-run/partner-run/layout/role 节点内聚合，再对独立 run
+节点推断。episode 不是独立正式样本；pooled episode 标准误和逐帧样本量不得用于 superiority。
 
-## 一、δ_min 预注册
+Official、Common-Partner、capacity、BR-Prox、calibration 和 mechanism artifacts 都必须保留
+原始 run lineage、checkpoint/manifest hashes 与 episode-key schedule。缺失节点、重复 lineage
+或 hash 不一致时不做插补。
 
-- **δ_min = 20.0**：一次正确交付的原始回报，取自 `src/path_c/experiment.py` 常量 `OFFICIAL_CORRECT_DELIVERY_REWARD = 20.0`（另见 `OFFICIAL_EPISODES_PER_PAIRING = 500`、`OFFICIAL_EPISODE_STEPS = 400`、`LAYOUTS = ("test_time_simple", "test_time_wide")`）。
-- 该阈值在 S5 正式矩阵生成前注册，定义以 [FORMAL_EXPERIMENT_PROTOCOL](../FORMAL_EXPERIMENT_PROTOCOL.md) 为准；判决时须同时报告点估计、区间与"是否超过 δ_min"三项，不得只报其一。
+## 2. 主比较与多层结论
 
-## 二、判决程序（两套并行注册，待裁定二选一生效）
+性能结论按布局分别报告，并使用权威规格中的单侧下置信界与物质效应双门。开发矩阵使用同
+seed、同 episode keys 的 paired increment；正式不同方法若没有合法一一配对关系，则保持
+independent-run inference，不通过任意排序制造配对。
 
-### 路径 1：run-level 节点配对/层级推断（评审建议路径）
+结论分三层：
 
-1. 在**固定 Official commit**（`OFFICIAL_SOURCE_COMMIT = 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`，`OFFICIAL_PROTOCOL_VERSION = overcooked_v2_iclr2025_5ce1707_v1`）上重训/获取 FCP、OP、SA 的 run-level 节点（FCP 种群约 24 亿步/布局，为最大成本项，按 [DEVELOPMENT_MATRIX](DEVELOPMENT_MATRIX.md) 第四节全口径记账）；
-2. 己方与基线在**同 episode keys** 上评估，做配对或双样本层级推断（统计单位为训练运行，run 级）；
-3. 已发表 Table 2 数值（Simple 6±29、Wide 23±40，见 [SOTA_BASELINE](SOTA_BASELINE.md)）**降为外部 sanity check**，不参与判决；
-4. 同时区分"同 benchmark reference"与"领域 SOTA"：CooT / TALENTS / GOAT / ROTATE / UPD / ICRL4AHT 等 2025–26 工作逐一核对协议可比性后另行注册。
+1. 描述性：均值、run-level dispersion 和完整 interval；
+2. benchmark superiority：注册统计门通过；
+3. protocol-mechanism attribution：benchmark 之外，开发、校准、identifiability、
+   recoverable-value、容量和资源门在两个布局全部通过。
 
-### 路径 2：维持发表标量对标（承接 2026-08-03 裁决）
+较高层失败不删除较低层结果。
 
-1. 继续只对标已发表标量（Simple 6±29、Wide 23±40）；
-2. **判决措辞强制降级**为："超过已发表点估计（基线训练不确定性未计入，口径如实披露）"，不得使用"显著超过 SOTA"；
-3. 补报 **Welch 口径保守边际**（以发表均值±标准差为己方 run 分布参照的保守检验，预期边际量级 Simple +22 / Wide +31），作为敏感性披露；
-4. 论文与台账按此口径如实披露基线训练不确定性缺失。
+## 3. Common-Partner 与 baseline 公平性
 
-## 三、两路径共同禁令
+正式 comparator 由固定 Official commit 训练或从具有完整 lineage 的等价 Official artifact
+取得；published table 只能作为外部 sanity check，不能代替 run-level nodes。所有方法使用同一
+环境、role、episode keys、评估 horizon 和 raw-return 定义。FCP population 的训练成本、伙伴
+资源与选模成本必须进入账本。
 
-- **禁止**"己方 bootstrap 区间减基线点估计 = 差值置信区间"的任何变体：6±29 / 23±40 是已发表均值±标准差、无原始 run node，不能做配对 run-node bootstrap 差值区间，也不能把单边差值包装成置信区间。
-- δ_min 与本节统计程序一律**跑前**注册；事后更换程序须追加新条目入[证据台账](../status/EVIDENCE_LEDGER.md)，不覆盖。
+partner panel 按 mechanism family 和 parent run 留出。训练、comparator、calibration 与
+confirmatory 的 run-disjointness 在 manifest 层校验，不在分析后删除困难伙伴。
 
-## 四、生效机制
+## 4. calibration 与机制统计
 
-用户裁定后，本文件追加"裁定记录"条目（路径选择、日期、依据），未选路径标注为 `rejected` 并保留全文；被选路径成为 [SOTA_BASELINE](SOTA_BASELINE.md) 第三节判决式的执行口径。
+calibration 使用 partner run 为 primary block、episode 为 secondary block 的层级重采样；
+pooled score 只作描述。NLL、两个运动学 coverage 和 event Brier 同时进入 gate，不对成功子集
+作选择性报告。
 
-## 五、裁定记录（2026-08-03，用户裁定生效）
+history shuffle、context swap 和 G1–G4 使用固定 checkpoint、matched current state 与共同
+随机数 continuation。报告 unit 是独立 partner/ego run block；单状态、单 anchor 或 replica
+不能被当作新的独立 run。M1 的多个 bootstrap members 是诊断路径，不是额外正式 seeds。
 
-- **裁定日期**：2026-08-03；登记于 [DECISION_LOG](../status/DECISION_LOG.md) D2（用户对重构计划 F/C 节的科学裁定）。
-- **路径 1：已裁定生效（`effective`）。**
-- **路径 2：备用（`standby`）——仅在路径 1 资源不可行并经新裁定后启用**；全文按第四节生效机制保留不动，不按 `rejected` 注销。
+## 5. 缺失、失败与分析冻结
 
-### 路径 1 执行要点（生效口径）
+- numerical failure 保留为失败节点，不 restart、不替换；
+- 不按观察到的分数删除 partner、seed、role、layout 或 episode；
+- 不从多个 checkpoint 选择最佳者进入正式表；
+- 不在结果后更换 bootstrap unit、单双侧检验、最小效应规则或 claim gate；
+- 任何合同变更创建新方法身份和全新实验系列。
 
-1. **Official commit 冻结**：FCP/OP/SA 基线节点与己方评估一律在固定 Official commit（`OFFICIAL_SOURCE_COMMIT = 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`，`OFFICIAL_PROTOCOL_VERSION = overcooked_v2_iclr2025_5ce1707_v1`）上执行；冻结后不得换 commit，如需更换须追加新裁定入台账，不覆盖。
-2. **run-level 节点保存**：FCP 种群、OP、SA 的训练产物按 run 粒度保存节点（checkpoint + 训练元数据，统计单位为训练运行），FCP 种群重训（约 24 亿步/布局）为判决批前置成本项，按 [DEVELOPMENT_MATRIX](DEVELOPMENT_MATRIX.md) 第四节全口径记账、跑前登记预算。
-3. **同 episode keys**：己方与基线节点在同一组 episode keys 上评估（对齐 500 episodes/格口径），保证配对可比性。
-4. **配对/双样本层级推断**：在 run 级节点上做配对或双样本层级推断；"显著超过 SOTA"措辞仅在该配对推断支持下使用。
-5. **Table 2 仅作 sanity check**：已发表数值（Simple 6±29、Wide 23±40）降为外部 sanity check，不参与判决；第三节共同禁令（禁止用发表均值±标准差构造差值区间）继续适用。
-
-本裁定生效后，[SOTA_BASELINE](SOTA_BASELINE.md) 第三节判决式按路径 1 口径执行，待基线 run 节点就绪后按本预注册程序判决。
+正式 summary 和 claim builder 只消费 schema-valid 原始 artifacts，并写出所有输入的 SHA-256。
+手写布尔 gate、只含汇总均值的 CSV 或没有 lineage 的外部分数均不是正式证据。

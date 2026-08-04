@@ -1,11 +1,4 @@
-"""CUDA-friendly rollout; legacy particle regret paths raise explicitly.
-
-METHOD_SPEC §6 abolishes Q/regret computation on arbitrary Gaussian
-particles.  The legacy entry points below keep their importable names and
-signatures (checkpoint-era call sites and tests reference them) but raise an
-explicit not-enabled error; regret now exists only as a report-only readout
-over the closed hypothesis set (see ``regret_potential``).
-"""
+"""CUDA-friendly DEPI rollout over the legal ego information boundary."""
 
 from __future__ import annotations
 
@@ -15,10 +8,6 @@ from .counterfactual_anchor import tree_select
 from .model import initial_policy_state
 from .training import categorical_log_probability
 from .types import PolicyState, RolloutBatch
-
-
-DECISION_REGRET_STATE_CHUNK_SIZE = 4_096
-DECISION_REGRET_NUMERICAL_TILE_SIZE = 32
 
 
 class PartnerFunctions(NamedTuple):
@@ -66,7 +55,6 @@ def initialize_runner(
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
         capability_hidden_dim=model_config.capability_hidden_dim,
-        protocol_hidden_dim=model_config.protocol_hidden_dim,
         capability_dim=model_config.capability_dim,
         component_embedding_dim=model_config.component_embedding_dim,
         protocol_components=model_config.protocol_components,
@@ -79,8 +67,8 @@ def initialize_runner(
         partner_functions.initial_state(count, partner_key),
         official_ego_roles(count),
         jnp.zeros((count,), dtype=jnp.float32),
-        jnp.asarray(0, dtype=jnp.int64),
-        jnp.asarray(0, dtype=jnp.int64),
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
         next_key,
     )
 
@@ -137,7 +125,6 @@ def observe_policy_after_transition(
         action_count=6,
         task_hidden_dim=model_config.task_hidden_dim,
         capability_hidden_dim=model_config.capability_hidden_dim,
-        protocol_hidden_dim=model_config.protocol_hidden_dim,
         capability_dim=model_config.capability_dim,
         component_embedding_dim=model_config.component_embedding_dim,
         protocol_components=model_config.protocol_components,
@@ -227,7 +214,7 @@ def collect_rollout(
         )(ego_keys, output.policy_logits)
         log_probability = categorical_log_probability(output.policy_logits, ego_action)
         behavior_probability = jnp.exp(log_probability)
-        partner_action, stepped_partner, partner_context, partner_log_probability = (
+        partner_action, stepped_partner, partner_context, _ = (
             partner_functions.step(
                 partner_parameters,
                 current.partner_state,
@@ -297,7 +284,7 @@ def collect_rollout(
             next_partner,
             current.ego_roles,
             jnp.where(dones, 0.0, completed_return),
-            current.completed_episodes + jnp.sum(dones.astype(jnp.int64)),
+            current.completed_episodes + jnp.sum(dones.astype(jnp.int32)),
             current.effective_environment_steps + count,
             next_root,
         )
@@ -318,12 +305,19 @@ def collect_rollout(
             "old_log_probabilities": log_probability,
             "behavior_probabilities": behavior_probability,
             "old_values": output.state_value,
-            "ppo_mask": jnp.ones_like(raw_rewards, dtype=jnp.float32),
+            "ppo_mask": diagnostics.get(
+                "ppo_mask", jnp.ones_like(raw_rewards, dtype=jnp.float32)
+            ),
             "partner_run_ids": partner_functions.run_id(
                 partner_parameters, current.partner_state, partner_context
             ),
-            "partner_code": diagnostics["code"],
             "partner_source": diagnostics["source"],
+            "partner_member": diagnostics["member"],
+            "partner_family_id": diagnostics["family_id"],
+            "partner_checkpoint_stage": diagnostics["checkpoint_stage"],
+            "partner_partition": diagnostics.get(
+                "partition", jnp.zeros_like(ego_action, dtype=jnp.int32)
+            ),
             "completed_returns": jnp.where(dones, completed_return, 0.0),
             "completed_mask": dones,
         }
@@ -339,10 +333,6 @@ def collect_rollout(
             }
         return next_state, {
             **common,
-            "partner_actions": partner_action,
-            "partner_log_probabilities": partner_log_probability,
-            "partner_generator_logits": diagnostics["generator_logits"],
-            "partner_generator_value": diagnostics["generator_value"],
             "correct_deliveries": info["correct_delivery"],
             "wrong_deliveries": info["wrong_delivery"],
             "policy_logits": output.policy_logits,
@@ -359,7 +349,6 @@ def collect_rollout(
             "target_ego_policy_state": current.target_ego_policy,
             "partner_state": current.partner_state,
             "joint_observations": current.observations,
-            "partner_observations": partner_observation,
             "ego_roles": current.ego_roles,
         }
 
@@ -395,15 +384,16 @@ def collect_rollout(
         rewards=recorded["rewards"],
         official_shaped_rewards=recorded["official_shaped_rewards"],
         official_shaping_factors=recorded["official_shaping_factor"],
-        decision_regret_shaping=jnp.zeros_like(recorded["rewards"]),
         shaped_rewards=recorded["rewards"] + recorded["official_shaping_factor"] * recorded["official_shaped_rewards"],
         dones=recorded["dones"],
         old_log_probabilities=recorded["old_log_probabilities"],
         old_values=jnp.concatenate((recorded["old_values"], final_output.state_value[None]), axis=0),
         behavior_probabilities=recorded["behavior_probabilities"],
         ppo_mask=recorded["ppo_mask"],
-        partner_codes=recorded["partner_code"],
         partner_sources=recorded["partner_source"],
+        partner_members=recorded["partner_member"],
+        partner_family_ids=recorded["partner_family_id"],
+        partner_checkpoint_stages=recorded["partner_checkpoint_stage"],
         partner_run_ids=recorded["partner_run_ids"],
         initial_policy_state=initial_policy,
         initial_target_policy_state=initial_target_policy,
@@ -427,50 +417,6 @@ def collect_support_rollout(**kwargs: Any):
     return collect_rollout(**kwargs, record_mode="support")
 
 
-def decision_regret_chunk(
-    *,
-    model: Any,
-    target_params: Mapping[str, Any],
-    task_features: Any,
-    belief_mean: Any,
-    belief_log_standard_deviation: Any,
-    sample_keys: Any,
-    posterior_particles: int,
-) -> tuple[Any, Any]:
-    """Abolished (METHOD_SPEC §6): Q/regret on Gaussian particles is banned.
-
-    The signature survives for import compatibility; any call is an error.
-    """
-
-    del model, target_params, task_features, belief_mean
-    del belief_log_standard_deviation, sample_keys, posterior_particles
-    raise RuntimeError(
-        "METHOD_SPEC §6 abolishes Q/regret computation on arbitrary Gaussian "
-        "particles (no belief_mean/belief_log_standard_deviation path, no "
-        "posterior_particles). Regret is report-only over the closed "
-        "hypothesis set; see regret_potential.hypothesis_set_decision_regret."
-    )
-
-
-def chunked_decision_regret(
-    *,
-    model: Any,
-    target_params: Mapping[str, Any],
-    context: Any,
-    key: Any,
-    posterior_particles: int,
-    state_chunk_size: int = DECISION_REGRET_STATE_CHUNK_SIZE,
-) -> tuple[Any, Any]:
-    """Abolished (METHOD_SPEC §6); kept importable, always raises."""
-
-    del model, target_params, context, key, posterior_particles, state_chunk_size
-    raise RuntimeError(
-        "METHOD_SPEC §6 abolishes the particle decision-regret path; the "
-        "chunked variant cannot be re-enabled without a specification "
-        "amendment."
-    )
-
-
 def target_context_sequence(*, model: Any, target_params: Mapping[str, Any], batch: RolloutBatch) -> Any:
     _, context = model.apply(
         {"params": target_params},
@@ -483,85 +429,13 @@ def target_context_sequence(*, model: Any, target_params: Mapping[str, Any], bat
     return context
 
 
-def decision_regret_weight(*, effective_steps: Any, total_steps: int, maximum: float, midpoint: float, temperature: float) -> Any:
-    import jax
-    import jax.numpy as jnp
-
-    progress = jnp.asarray(effective_steps, dtype=jnp.float32) / float(max(total_steps, 1))
-    return float(maximum) * jax.nn.sigmoid((progress - float(midpoint)) / float(temperature))
-
-
-def finalize_decision_regret_shaping(
-    *,
-    batch: RolloutBatch,
-    regrets: Any,
-    action_ranges: Any,
-    action_range_ema: Any,
-    gamma: float,
-    weight: Any,
-    ema_decay: float = 0.99,
-) -> tuple[RolloutBatch, Mapping[str, Any]]:
-    import jax
-    import jax.numpy as jnp
-
-    values = jax.lax.stop_gradient(jnp.asarray(regrets, dtype=jnp.float32))
-    ranges = jax.lax.stop_gradient(jnp.asarray(action_ranges, dtype=jnp.float32))
-    next_scale = float(ema_decay) * jnp.asarray(action_range_ema) + (1.0 - float(ema_decay)) * jnp.mean(ranges)
-    normalized = values / (jnp.maximum(next_scale, 0.0) + 1.0e-3)
-    following = jnp.where(batch.dones, 0.0, normalized[1:])
-    unweighted = jnp.clip(normalized[:-1] - float(gamma) * following, -1.0, 1.0)
-    shaping = jnp.asarray(weight, dtype=jnp.float32) * unweighted
-    shaped = batch.shaped_rewards + shaping
-    return batch._replace(decision_regret_shaping=shaping, shaped_rewards=shaped), {
-        "mean_decision_regret": jnp.mean(values[:-1]),
-        "maximum_decision_regret": jnp.max(values[:-1]),
-        "mean_decision_regret_shaping": jnp.mean(shaping),
-        "mean_absolute_decision_regret_shaping": jnp.mean(jnp.abs(shaping)),
-        "rms_decision_regret_shaping": jnp.sqrt(jnp.mean(jnp.square(shaping))),
-        "decision_regret_weight": jnp.asarray(weight),
-        "action_range_ema": next_scale,
-        "mean_action_range": jnp.mean(ranges),
-        "mean_combined_training_reward": jnp.mean(shaped),
-    }
-
-
-def attach_decision_regret_shaping(
-    *,
-    batch: RolloutBatch,
-    model: Any,
-    target_params: Mapping[str, Any],
-    config: Any,
-    key: Any,
-    action_range_ema: Any = 1.0,
-    effective_steps: Any = 0,
-) -> tuple[RolloutBatch, Mapping[str, Any]]:
-    """Abolished (METHOD_SPEC §6): the particle regret-shaping attachment is
-    disconnected from the DEPI foundation path and cannot be re-enabled.
-    ``config.model.posterior_particles`` no longer exists."""
-
-    del batch, model, target_params, config, key, action_range_ema, effective_steps
-    raise RuntimeError(
-        "METHOD_SPEC §6 abolishes decision-regret shaping on Gaussian "
-        "particles; the DEPI path carries no posterior_particles config and "
-        "no particle Q evaluation. Report-only regret belongs to the anchor "
-        "hypothesis-set readout instead."
-    )
-
-
 __all__ = [
     "PartnerFunctions",
     "RunnerState",
-    "DECISION_REGRET_STATE_CHUNK_SIZE",
-    "DECISION_REGRET_NUMERICAL_TILE_SIZE",
-    "attach_decision_regret_shaping",
-    "chunked_decision_regret",
     "collect_rollout",
     "collect_rollout_minimal",
     "collect_support_rollout",
     "context_dropout_probability",
-    "decision_regret_chunk",
-    "decision_regret_weight",
-    "finalize_decision_regret_shaping",
     "initialize_runner",
     "official_ego_roles",
     "observe_policy_after_transition",

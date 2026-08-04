@@ -1,68 +1,115 @@
-# THEORY：DEPI 理论索引与适用边界
+# THEORY：DEPI 的有限理论保证与限制
 
-修订头：本文件于统一重构（`Rigor_与_Generality_统一优化_7f793915.md` D/I 节；外部评审归档 [`research/REVIEW_AND_SUGGESTION_2026.md`](research/REVIEW_AND_SUGGESTION_2026.md) §7/§14）中创建，是四份权威文件之四：**理论地图与适用边界**的唯一权威索引。本文件**不复制证明全文**，只给出定理定位、修订状态与禁用条款；证明全文以 [`theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md`](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md)（2026-08-03 修订版）为准。
+本文只证明当前实现可由结构与代数直接保证的性质，不把优化成功、泛化或高回报当作定理。
+科学对象和可证伪主张以 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) 为准，算法细节以
+[`METHOD_SPEC.md`](METHOD_SPEC.md) 为准。
 
-状态：`authoritative: true`。理论陈述的适用边界以本文件为准；旧文档中与本文件冲突的生态外推用法一律废止（逐条见第四节）。
+## 1. 精确离散滤波
 
----
+设 `pi` 为 K 维概率向量，sticky transition matrix `T` 每行非负且和为 1，emission
+log-likelihood `ell` 有限。预测与更新为
 
-## 一、理论地图总览
+```text
+pi_bar = pi @ T
+pi_new[k] = exp(log(pi_bar[k]) + ell[k]) / Z
+```
 
-| 定理 | 主题 | 修订状态 | 证明全文位置 |
-|---|---|---|---|
-| T1 | 分解链单调性 V_fix ≤ V_state ≤ V_hist ≤ V_HZ ≤ V_full | 有效（平凡，信息包含关系） | 历史登记于 [`research/PAPER_STANDARD.md`](research/PAPER_STANDARD.md) §5（支撑层） |
-| T2 | 二惯例 TV 精确式与匹配界 | **已降级**：仅二元等先验、一一对应模式、常数 gap Δ 特例有效 | [`theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md`](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md) §10.2 |
-| T3 | 历史样本复杂度 Θ(log(Δ/ε)/κ²) | **证明链已重建**（原不等式证伪），注册陈述不变 | 同上 §10.3 |
-| T4 | 路由紧上界与端到端等式 | 有效 | 同上 §10.4 |
-| D_V(t) | 一般情形 estimand：value-weighted distinguishability | 2026-08-03 注册，取代 E[Δ]·TV/2 | 同上 §10.2 适用范围声明 |
+因为 `pi_bar[k] >= 0` 且 `sum_k pi_bar[k]=1`，而 sticky matrix 的每个元素严格为正，所以
+`pi_bar[k]>0`。有限 `ell` 使每个未归一化权重为正，`Z>0`；故 `pi_new` 非负且总和严格为 1。
+这正是一次 Chapman–Kolmogorov prediction 后接一次 Bayes correction。实现若再乘一次 `T`、
+按错误轴归一化或把 `pi_new` 当 logits 再 softmax，便不再是该滤波器。
 
-定位说明：Θ2（信息时序理论）**降为支持性理论**，不再并列为中心论点；中心主张以 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §3 为准。
+episode start 使用 uniform prior 并跳过跨 episode emission，因此过去 episode 的观测不可能
+通过 protocol carry 影响新 episode 的 posterior。数值实现使用 log-domain normalization，
+但浮点非有限值仍按正式 failure policy 处理，而非静默重置。
 
-## 二、T3 修复后的样本复杂度（2026-08-03 修订版）
+## 2. component 置换对称性
 
-以 [`theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md`](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md) §10.3 修订版为唯一权威，要点：
+对任意 permutation matrix `P`，同时变换
 
-1. **原证明错误（已证伪）**：原必要性证明使用不等式 log((1+κ)/(1−κ))≤2κ，取 κ=1/2 时 log 3≈1.099>1，数值验证证伪；"紧口径 kl≤2κ²、分母 2"的表述一并废止。
-2. **重建链条**：由修正界 atanh(κ)≤κ/(1−κ²)（0≤κ<1）得 log((1+κ)/(1−κ))≤2κ/(1−κ²)≤(8/3)κ（0≤κ≤1/2），证明链经此界重建。
-3. **单步 KL 夹逼**（数值验证）：2κ²≤kl≤(8/3)κ²，kl/κ²∈[2.0000, 2.1972]（κ∈(0,1/2]）；必要性阶与 Hoeffding 充分性阶一致。
-4. **注册陈述（不变）**：必要性下界采用保守单步 KL≤4κ² 口径，
-   \[ n\ge\frac{\log(\Delta/(4\varepsilon))}{4\kappa^2}; \]
-   充分性 n≥2log(Δ/ε)/κ²；合为 Θ(log(Δ/ε)/κ²)，0<κ≤1/2、0<ε≤Δ/8。紧形式 n≥3log(Δ/(4ε))/(8κ²) 一并登记。
-5. **前提**：T3 的 κ 来自明确的 i.i.d. Bernoulli 证据模型；生态口径不满足该前提（见第四节禁用条款）。
+```text
+pi' = pi P
+M' = P^T M
+T' = P^T T P
+ell' = ell P
+```
 
-## 三、T2 降级与一般 estimand D_V(t)
+则 `c = pi M = pi' M'`，mixture likelihood 和 actor/critic 输入保持不变。正式 sticky matrix
+对所有非对角元素相同，也满足 `T'=T`。因此 component label 不可识别，只有由 empirical
+decision signature 定义的等价类可比较。这给出禁止 raw-index accuracy 和训练期标签对齐的
+理论依据。
 
-1. **T2 降级为二元常数-gap 特例**：TV 精确式（V_HZ−V_hist=Δ(1−TV)/2、V_hist−V_fix=Δ·TV/2、p_e*=(1−TV)/2）只在二元等先验、模式与惯例一一对应、所有历史上收益差为同一常数 Δ 的静态模型内成立（[`theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md`](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md) §10.2 适用范围声明）。
-2. **一般 estimand**（评审 §7.4；同步登记于 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §5.1）：
-   \[ D_V(t)=\frac12\int\Delta(h)\,\bigl|p_1^{\,t}(h)-p_0^{\,t}(h)\bigr|\,dh, \]
-   其中 h 为合法 ego 历史（SCIENTIFIC_SPEC §2 L1–L5 口径），p_i^t 为协议 i 诱导的合法历史前缀分布，Δ(h) 为历史 h 上的 payoff gap。仅当 Δ(h)≡Δ 常数时退化为 Δ·TV/2。
-3. **废止**："E[Δ(H)]·TV/2 = 分别平均再相乘"的用法在一般情形不成立，禁止用于生态任务（旧口径废止清单见 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §8）。
+## 3. 结构信息隔离保证
 
-## 四、生态 κ̂ 代理口径声明与禁用条款
+B1/B2 在 task encoder 之前用固定 channel contract 把 other-agent position、direction 和
+inventory planes 清零。记该投影为 `P_task(o)`，则任意只在这些被遮蔽 planes 上不同的
+`o,o'` 满足 `P_task(o)=P_task(o')`。在相同 task carry 下，确定性 task recurrence 的下一
+carry 与输出必相同。
 
-口径全文以 [`research/THEORY_PREDICTIONS.md`](research/THEORY_PREDICTIONS.md) 与 [`research/TRAJECTORY_AND_ESTIMATION_SPEC.md`](research/TRAJECTORY_AND_ESTIMATION_SPEC.md) 的 2026-08-03 修订版为准（两文件为支撑层，探索轨 `scientific_readout_allowed: false`），本文件登记其边界：
+该保证只覆盖显式 semantic planes 和单步计算图；它不自动证明其余物理 planes 与伙伴行为
+统计独立，也不证明 capability/protocol 路径语义正确。因此仍需 task leakage probe、history
+shuffle 和真实 continuation 控制。B0 故意保留完整当前观测进入 task GRU，用于量化结构隔离
+本身的增量。
 
-1. **κ̂ 降为代理量**：生态口径的单步边际 TV 不满足 T3 的 i.i.d. Bernoulli 前提——证据依赖当前环境状态、ego 之前的动作、时间、伙伴 RNN carry 与当前协议，既不独立也不同分布。
-2. **禁用条款**：**禁止**将生态 κ̂ 代入 Θ(log(Δ/ε)/κ²) 计算历史需求或做生态外推；据此已入台账的窗口读数（类型级约 220 步、个体级均值约 425 步、弱个体约 5000 步）全部建立在代理口径上，须按修正口径复核；复核完成前"425 步个体级窗口外"结论不得作为结论引用。
-3. **分类器误差只给 TV 下界**：TV=1−2p_e^* 只对最优 Bayes 分类器精确成立；有限样本经验分类器读数一律按 1−2p̂_e≤TV 的下界报告与使用，不得当作 TV 点估计。
-4. **partner-action oracle 禁令**：完整伙伴动作序列禁止作为主估计口径，只允许作为 unattainable oracle 参照并显式标注，不得用于生态外推、历史需求计算或主张（与 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §2 禁止项 F1 一致）。
+## 4. 合法历史与时标
 
-## 五、S2 定性：theorem unit test
+CapabilityEncoder 的证据只由连续 ego observations、ego previous action 和 episode-start
+标志构成，所以按归纳法，其 hidden 与 published `u` 都是 L1–L5 的函数。exact filter 的
+emission target 也只由连续局部 observations 复算，故 posterior `pi` 和 `c` 同样是合法历史
+的函数。伙伴动作仅存在于 simulator transition 内，既不进入模型也不进入 comparator artifact。
 
-S2 受控相图（180/180）是按 T2/T3 假设构造的 Bernoulli 特例，用同一 closed-form 公式生成并检查结果，只说明代码正确实现了注册恒等式，性质为 **theorem unit test**，**不是**对理论的独立数值验证；"主论点 Θ2 已验证"的表述收回（台账修正条目见 [`status/EVIDENCE_LEDGER.md`](status/EVIDENCE_LEDGER.md) 2026-08-03 DEPI 重构条目；同步声明见 [`research/THEORY_PREDICTIONS.md`](research/THEORY_PREDICTIONS.md) S2 降级段）。
+每 16 步发布 `u` 只是一个结构时标，不足以推出 `u` 必然表示稳定 capability；`swap-u` 与
+一致性读数负责检验该解释。每步更新 `pi` 也不推出它必然追踪动态 protocol；校准、`swap-c`
+和 recoverable-value 控制负责检验。
 
-## 六、各定理适用边界表
+## 5. 联合 likelihood 的一致混合
 
-| 定理 | 成立前提 | 有效范围 | 禁用场景 |
-|---|---|---|---|
-| T1 | 信息包含关系（无模型假设） | 分解链任意受控/生态任务 | 不得反向推出各层价值差的具体量级 |
-| T2 | 二元等先验、一一对应模式、常数 gap Δ、静态收益 | 受控特例；S2 自检 | 生态任务可恢复价值计算（改用 D_V(t)）；"分别平均再相乘"全面禁用 |
-| T3 | T2 模型 + n 个条件独立 Bernoulli 证据（参数 (1±κ)/2）、0<κ≤1/2、0<ε≤Δ/8 | 受控 i.i.d. 证据模型；注册上下界常数 | 生态 κ̂ 代入 Θ(log(Δ/ε)/κ²)；生态历史需求定量推断 |
-| T4 | 固定共同前缀 q 与切换时刻、模式库给定、只读官方历史 | 一般设定（学习路由器给出 V_hist 构造性下界） | 学习路由器失败不得解读为"无机会证书"（无机会须由受控上界或 run-disjoint 面板给出） |
-| D_V(t) | 合法历史前缀分布可估计、Δ(h) 可测 | 一般情形的预测与对撞 estimand | 禁止以完整伙伴动作 oracle 基底估计后冒充合法口径 |
+给定 component `z=k`，response target 的条件因子相加得到一个 component-specific
+log-likelihood `log p_k(y)`。随后
 
-## 七、一致性声明
+```text
+log p(y|H,a) = logsumexp_k(log pi[k] + log p_k(y))
+```
 
-- 本文件与 [`theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md`](theory/DELTA_ZSC_FOUNDATIONAL_THEORY_AND_PROOFS.md) 2026-08-03 修订版逐项一致（T3 重建、T2 降级、D_V 注册）；与 [`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md) §5.1（D_V）、§3（Θ2 降级）一致；
-- 生态预测 P1–P6 的口径修订以 [`research/THEORY_PREDICTIONS.md`](research/THEORY_PREDICTIONS.md) 修订版为准，本文件只登记边界不复述预测行；
-- 理论引用进入论文时须按 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 第七节探索轨读数调和规则处理；本文件与支撑层文档冲突时以本文件为准。
+只 marginalize 一次。不可见时屏蔽 position、direction 和 inventory 条件项，visibility
+仍计分，因此不会把“不可见”同时作为 visibility 与任意位置标签重复计算。position、direction、
+inventory 和 event 全部保留相同 K 轴，避免先对各 head 独立混合后拼成不存在的联合模型。
+
+这只是 proper-likelihood 结构；若模型错设或数据覆盖不足，并不保证 posterior calibration。
+
+## 6. 决策等价与监督
+
+centered empirical signature
+
+```text
+A(H,a) = G(H,a) - mean_b G(H,b)
+```
+
+消除了对所有动作相同的 return offset。若两段历史的 A 相同，则在注册 continuation horizon
+与目标策略下，它们给出相同动作排序和差值，因而对该有限决策问题等价。反之，任一动作差异
+证明存在 decision-relevant distinction。该关系不要求也不允许使用 partner identity。
+
+Q-signature fit、排序 hinge 和 actor target KL 使 empirical continuation 标签能够产生决策
+梯度；stop-gradient target 防止 actor 反向改变标签。参数所有权保证 response NLL 不更新 task
+encoder，Q signature 不更新 response decoder，所有 loss 又在同一次 optimizer transaction 的
+同一参数快照上计算。它保证计算语义一致，但不保证非凸优化找到全局最优。
+
+## 7. 因果归因的必要条件
+
+随机化、容量和 key 匹配的 B0–B2 增量可排除已注册的预算与容量混杂；同状态 CRN history
+shuffle 和 context swap 可降低环境噪声；G1–G4 可区分“环境中没有可恢复信号”和“模型未恢复
+信号”。这些条件共同支持有限范围的机制归因，但仍依赖伙伴 panel、状态匹配质量、continuation
+horizon 和统计功效。它们不是对所有未知伙伴的普遍因果定理。
+
+## 8. 明确不作的保证
+
+当前方法不保证：
+
+- component 与人类可命名协议一一对应；
+- posterior 在未通过 held-out gate 前已校准；
+- response event 等价于意图；
+- 更低 response NLL 必然提高回报；
+- B2 必然优于 B0/B1 或任何正式基线；
+- B3 的主动信息价值已经实现。
+
+这些都是实验问题；反例必须按 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 原样报告。

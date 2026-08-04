@@ -1,4 +1,4 @@
-"""Build immutable, hash-bound DELTA-ZSC partner manifests."""
+"""Build immutable, hash-bound DEPI partner manifests."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from src.path_c.experiment import (
 )
 from src.path_c.storage import sha256_path, write_json
 
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 
 
 def _exact_mapping(value: Any, expected: set[str], location: str) -> Mapping[str, Any]:
@@ -55,6 +55,8 @@ def build_partner_manifest(
         "checkpoint",
         "parent_training_run_id",
         "generation_mechanism",
+        "checkpoint_stage",
+        "hyperparameter_family",
         "seed",
         "seed_index",
         "jax_prng_key",
@@ -78,6 +80,8 @@ def build_partner_manifest(
                 checkpoint_sha256=sha256_path(checkpoint),
                 parent_training_run_id=str(item["parent_training_run_id"]),
                 generation_mechanism=str(item["generation_mechanism"]),
+                checkpoint_stage=float(item["checkpoint_stage"]),
+                hyperparameter_family=str(item["hyperparameter_family"]),
                 seed=int(item["seed"]),
                 seed_index=(
                     None if item["seed_index"] is None else int(item["seed_index"])

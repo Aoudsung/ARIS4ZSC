@@ -52,7 +52,7 @@ def _cuda_only_official_debug_callbacks_disabled() -> Any:
 
     The fixed Official trainer contains ``jax.debug.print`` calls and a
     ``jax.debug.callback(wandb.log, ...)``. JAX 0.4.38 places those host
-    callback operands on a local CPU device; a fail-closed DELTA worker with
+    callback operands on a local CPU device; a fail-closed DEPI worker with
     ``JAX_PLATFORMS=cuda`` intentionally exposes no such device. The callbacks
     are observational logging side effects and do not feed a value, random key,
     gradient, parameter, or checkpoint back into the training graph.
@@ -223,6 +223,13 @@ def _official_package_root() -> Path:
 def _official_symbol(module: str, name: str) -> Any:
     """Import one public symbol while containing the official relative import."""
 
+    # The pinned Official commit predates NumPy 2 and imports ``np.Inf``.
+    # Keep the compatibility shim at the integration boundary so neither the
+    # Official checkout nor DEPI's numerical code is silently rewritten.
+    import numpy as np
+
+    if not hasattr(np, "Inf"):
+        np.Inf = np.inf  # type: ignore[attr-defined]
     package_root = _official_package_root()
     ppo_directory = str(package_root / "ppo")
     inserted = ppo_directory not in sys.path
@@ -284,7 +291,7 @@ def compose_official_config(
             != int(config.training.environment_steps)
         ):
             raise ValueError(
-                "Mechanical upstream and DELTA trajectory budgets must match; "
+                "Mechanical upstream and DEPI trajectory budgets must match; "
                 "use the dedicated mechanical E2E config."
             )
         model = dict(result["model"])
@@ -590,7 +597,7 @@ def validate_official_partner_checkpoint(
     algorithm: str,
     seed_index: int,
 ) -> None:
-    """Bind one DELTA support checkpoint to its claimed Official recipe."""
+    """Bind one DEPI support checkpoint to its claimed Official recipe."""
 
     checkpoint_config, unused_params = restore_official_checkpoint(checkpoint_path)
     del unused_params
@@ -1165,7 +1172,7 @@ class FrozenPartnerPool:
         carry: Any,
         episode_start: Any,
     ) -> tuple[Any, Any, Any]:
-        """Return the exact Official recurrent logits for V6 initialization.
+        """Return the exact Official recurrent logits for DEPI initialization.
 
         This is a training-only observation/carry surface.  It neither samples
         an action nor exposes a partner identifier to the deployable policy.

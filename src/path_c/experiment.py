@@ -1,18 +1,19 @@
-"""Single configuration and manifest authority for DEPI (DELTA-ZSC foundation)."""
+"""Single configuration and manifest authority for DEPI."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import math
 import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-CONFIG_VERSION = 11
-METHOD_VERSION = "delta_zsc_depi_three_object_bayes_coordination"
-MANIFEST_VERSION = 2
+CONFIG_VERSION = 15
+METHOD_VERSION = "depi_exact_filter_decision_supervision_v5"
+CHECKPOINT_SCHEMA_VERSION = 5
+METHOD_VARIANTS = ("b0", "b1", "b2", "b3")
+MANIFEST_VERSION = 3
 OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
 OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
 OFFICIAL_TRAINING_ROOT_SEED = 42
@@ -46,8 +47,9 @@ RUN_KINDS = ("mechanical", "development", "formal")
 LAYOUTS = ("test_time_simple", "test_time_wide")
 PARTNER_ROLES = (
     "owner_source",
-    "generator_init_source",
     "development_support",
+    "comparator_fit",
+    "comparator_validation",
     "calibration",
     "confirmatory",
 )
@@ -84,7 +86,6 @@ class EnvironmentConfig:
 class ModelConfig:
     task_hidden_dim: int
     capability_hidden_dim: int
-    protocol_hidden_dim: int
     capability_dim: int
     protocol_components: int
     component_embedding_dim: int
@@ -114,31 +115,6 @@ class PPOConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class LossConfig:
-    """Deprecated V6 loss section; retained for exactly one release cycle."""
-
-    response_weight: float
-    raw_q_weight: float
-    counterfactual_weight: float
-    decision_equivalence_weight: float
-    q_policy_weight: float
-    q_policy_temperature: float
-    q_policy_gap_midpoint: float
-    q_policy_gap_temperature: float
-    q_policy_disagreement_temperature: float
-    information_bottleneck_weight: float
-    information_bottleneck_free_bits_per_dimension: float
-    robust_generalist_weight: float
-    policy_belief_gradient_scale: float
-    belief_gradient_ema_decay: float
-    decision_regret_weight_maximum: float
-    decision_regret_schedule_midpoint: float
-    decision_regret_schedule_temperature: float
-    response_updates_per_outer_update: int
-    raw_q_updates_per_outer_update: int
-
-
-@dataclass(frozen=True, slots=True)
 class LossV2Config:
     """Active DEPI objective weights and gates (METHOD_SPEC §3.1/§3.2/§3.4)."""
 
@@ -149,6 +125,9 @@ class LossV2Config:
     rank_hinge_margin: float
     rank_hinge_advantage_gap: float
     separation_margin_scale: float
+    decision_policy_weight: float
+    decision_policy_temperature: float
+    capability_consistency_weight: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,68 +135,19 @@ class AnchorConfig:
     enabled: bool
     interval_updates: int
     ordinary_states: int
-    matched_code_pairs: int
+    matched_history_pairs: int
     fit_replicas: int
+    evaluation_replicas: int
     continuation_horizon: int
     probe_steps: int
-    replay_capacity: int
-    replay_minibatch_size: int
-    policy_kl_decay: float
-    age_decay_updates: float
-    minimum_replay_weight: float
     return_lower_bound: float
     return_upper_bound: float
     # §5.3 frozen comparator thresholds and the §6 extended M1 gate.
-    observable_equivalent_accuracy_max: float
-    decision_distinct_accuracy_min: float
+    observable_equivalent_probability_max: float
+    decision_distinct_probability_min: float
     signature_distance_threshold: float
     m1_spearman_threshold: float
     m1_minimum_anchor_fraction: float
-
-    # Read-only aliases used by optional audit utilities.
-    @property
-    def states_per_interval(self) -> int:
-        return self.ordinary_states + 2 * self.matched_code_pairs
-
-    @property
-    def sampling_time_bins(self) -> int:
-        return 1
-
-    @property
-    def sampling_regret_bins(self) -> int:
-        return 1
-
-
-@dataclass(frozen=True, slots=True)
-class PartnerGeneratorConfig:
-    enabled: bool
-    code_dim: int
-    hidden_dim: int
-    modulation_rank: int
-    episodes_per_update: int
-    episode_steps: int
-    update_epochs: int
-    environment_minibatches: int
-    cvar_level: float
-    target_polyak_coefficient: float
-    maximum_generator_probability: float
-    mixture_ramp_fraction: float
-    competence_temperature: float
-    cvar_ema_decay: float
-    imitation_initial_weight: float
-    brdiv_maximum_weight: float
-    smoothness_weight: float
-    lagrangian_learning_rate: float
-    competence_multiplier_maximum: float
-    kernel_bandwidth: float
-    kernel_jitter: float
-    codes_per_update: int
-    # §7.2 shared-state diversity bank, code archive and backbone freeze.
-    diversity_bank_size: int
-    diversity_codes_per_update: int
-    code_archive_capacity: int
-    freeze_after_imitation: bool
-
 
 @dataclass(frozen=True, slots=True)
 class PartnerPoolConfig:
@@ -231,14 +161,21 @@ class PartnerPoolConfig:
     family_uniform_sampling: bool
 
 @dataclass(frozen=True, slots=True)
-class CalibrationConfig:
-    enabled: bool
-    alpha: float
-    support_quantile: float
+class PosteriorCalibrationConfig:
+    """Held-out posterior-predictive calibration preregistration."""
+
     minimum_run_count: int
-    block_unit: str
     episodes_per_run: int
-    anchors_per_run: int
+    bootstrap_replicates: int
+    bootstrap_seed: int
+    root_seed_offset: int
+    credibility: float
+    log_score_margin: float
+    coverage_low: float
+    coverage_high: float
+    brier_ratio: float
+    primary_unit: str
+    secondary_unit: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,9 +187,10 @@ class TrainingConfig:
     context_dropout_initial: float
     context_dropout_final: float
     owner_sources_per_seed: int
-    generator_init_sources_per_mechanism: int
-    development_runs_per_mechanism: int
-    calibration_runs_per_mechanism: int
+    support_parent_runs_per_family: int
+    support_checkpoints_per_parent: int
+    support_width_variants: int
+    calibration_runs_per_family: int
 
 @dataclass(frozen=True, slots=True)
 class EvaluationConfig:
@@ -264,11 +202,20 @@ class EvaluationConfig:
     br_prox_fit_replicas: int
     br_prox_evaluation_replicas: int
     br_prox_continuation_horizon: int
+    mechanism_anchors_per_pairing: int
+    mechanism_fit_replicas: int
+    mechanism_evaluation_replicas: int
+    mechanism_continuation_horizon: int
+    recoverable_signal_threshold: float
     evaluate_both_roles: bool
     one_sided_alpha: float
     minimum_ego_runs: int
     minimum_partner_runs_per_mechanism: int
     minimum_mechanisms: int
+    inference_mode: str
+    superiority_lcb_threshold: float
+    minimum_effect: float
+    minimum_effect_rule: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,15 +238,14 @@ class OfficialProtocolConfig:
 @dataclass(frozen=True, slots=True)
 class RunConfig:
     run_kind: str
+    method_variant: str
     environment: EnvironmentConfig
     model: ModelConfig
     ppo: PPOConfig
-    loss: LossConfig
     loss_v2: LossV2Config
     anchors: AnchorConfig
-    partner_generator: PartnerGeneratorConfig
     partner_pool: PartnerPoolConfig
-    calibration: CalibrationConfig
+    posterior_calibration: PosteriorCalibrationConfig
     training: TrainingConfig
     evaluation: EvaluationConfig
     upstream: UpstreamConfig
@@ -324,6 +270,8 @@ class PartnerRun:
     checkpoint_sha256: str
     parent_training_run_id: str
     generation_mechanism: str
+    checkpoint_stage: float
+    hyperparameter_family: str
     seed: int
     seed_index: int | None
     jax_prng_key: tuple[int, int] | None
@@ -392,7 +340,7 @@ def engineering_training_key() -> tuple[int, int]:
     """Named non-scientific key that cannot alias Official seed indices 0..9."""
 
     digest = hashlib.sha256(
-        b"delta-zsc-v6/end-to-end-bayes-coordination/engineering-seed"
+        b"depi/exact-filter-decision-supervision/engineering-seed"
     ).digest()
     return (
         int.from_bytes(digest[:4], "big"),
@@ -404,7 +352,7 @@ def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, in
     """Derive registered independent domains from one Official outer-run key.
 
     Domain integers are not hand-selected hyperparameters: each is the first
-    unsigned 32-bit word of SHA-256(``delta-zsc-v6/<domain>``), recorded in the
+    unsigned 32-bit word of SHA-256(``depi/<domain>``), recorded in the
     run identity together with the resulting JAX key.
     """
 
@@ -420,16 +368,15 @@ def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, in
     result: dict[str, tuple[int, int]] = {}
     for name in (
         "ego",
-        "generator",
         "training_anchor",
         "audit_anchor",
         "context_dropout",
-        "anchor_replay",
-        "response",
-        "calibration",
+        "posterior_calibration",
+        "identifiability",
+        "recoverable_value",
     ):
         tag = int.from_bytes(
-            hashlib.sha256(f"delta-zsc-v6/{name}".encode("utf-8")).digest()[:4],
+            hashlib.sha256(f"depi/{name}".encode("utf-8")).digest()[:4],
             "big",
         )
         key = np.asarray(jax.random.fold_in(root, tag), dtype=np.uint32)
@@ -439,7 +386,7 @@ def official_training_domain_keys(seed_index: int) -> Mapping[str, tuple[int, in
 
 
 def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
-    """Load config v11 and apply the registered run budget."""
+    """Load the active DEPI config and apply the registered run budget."""
 
     import yaml
 
@@ -451,15 +398,14 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         payload,
         {
             "version",
+            "method_variant",
             "environment",
             "model",
             "ppo",
-            "loss",
             "loss_v2",
             "anchors",
-            "partner_generator",
             "partner_pool",
-            "calibration",
+            "posterior_calibration",
             "training",
             "evaluation",
             "upstream",
@@ -468,7 +414,7 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
         "configuration",
     )
     if int(payload["version"]) != CONFIG_VERSION:
-        raise ValueError(f"The active DELTA-ZSC config version is {CONFIG_VERSION}.")
+        raise ValueError(f"The active DEPI config version is {CONFIG_VERSION}.")
 
     environment_payload = _exact_fields(
         payload["environment"],
@@ -485,21 +431,17 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
     )
     model_payload = _exact_fields(payload["model"], set(ModelConfig.__dataclass_fields__), "model")
     ppo_payload = _exact_fields(payload["ppo"], set(PPOConfig.__dataclass_fields__), "ppo")
-    loss_payload = _exact_fields(payload["loss"], set(LossConfig.__dataclass_fields__), "loss")
     loss_v2_payload = _exact_fields(
         payload["loss_v2"], set(LossV2Config.__dataclass_fields__), "loss_v2"
     )
     anchor_payload = _exact_fields(payload["anchors"], set(AnchorConfig.__dataclass_fields__), "anchors")
-    generator_payload = _exact_fields(
-        payload["partner_generator"],
-        set(PartnerGeneratorConfig.__dataclass_fields__),
-        "partner_generator",
-    )
     pool_payload = _exact_fields(
         payload["partner_pool"], set(PartnerPoolConfig.__dataclass_fields__), "partner_pool"
     )
     calibration_payload = _exact_fields(
-        payload["calibration"], set(CalibrationConfig.__dataclass_fields__), "calibration"
+        payload["posterior_calibration"],
+        set(PosteriorCalibrationConfig.__dataclass_fields__),
+        "posterior_calibration",
     )
     training_payload = _exact_fields(
         payload["training"], set(TrainingConfig.__dataclass_fields__) - {
@@ -523,23 +465,22 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
     budget = RUN_BUDGETS[run_kind]
     config = RunConfig(
         run_kind=run_kind,
+        method_variant=str(payload["method_variant"]).lower(),
         environment=EnvironmentConfig(
             **environment_payload,
             num_envs=budget.num_envs,
         ),
         model=ModelConfig(**model_payload),
         ppo=PPOConfig(**ppo_payload),
-        loss=LossConfig(**loss_payload),
         loss_v2=LossV2Config(**loss_v2_payload),
         anchors=AnchorConfig(**anchor_payload),
-        partner_generator=PartnerGeneratorConfig(**generator_payload),
         partner_pool=PartnerPoolConfig(
             enabled=bool(pool_payload["enabled"]),
             checkpoint_stages=tuple(float(value) for value in pool_payload["checkpoint_stages"]),
             heuristic_family_test_only=bool(pool_payload["heuristic_family_test_only"]),
             family_uniform_sampling=bool(pool_payload["family_uniform_sampling"]),
         ),
-        calibration=CalibrationConfig(**calibration_payload),
+        posterior_calibration=PosteriorCalibrationConfig(**calibration_payload),
         training=TrainingConfig(
             **training_payload,
             environment_steps=budget.environment_steps,
@@ -562,6 +503,12 @@ def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
 
 
 def validate_config(config: RunConfig) -> None:
+    if config.method_variant not in METHOD_VARIANTS:
+        raise ValueError(f"method_variant must be one of {METHOD_VARIANTS}.")
+    if config.method_variant == "b3":
+        raise NotImplementedError(
+            "B3 action-conditioned VOI is explicitly not implemented; it cannot be run."
+        )
     if config.environment.layout not in LAYOUTS:
         raise ValueError(f"Unknown OvercookedV2 layout: {config.environment.layout}")
     if config.environment.agent_view_size != 2:
@@ -575,16 +522,16 @@ def validate_config(config: RunConfig) -> None:
         and config.environment.indicate_successful_delivery
     ):
         raise ValueError("Formal OvercookedV2 environment flags must match Official.")
-    if config.model.protocol_components != 4:
-        raise ValueError("DEPI fixes protocol_components=4 (METHOD_SPEC §1.1).")
+    if config.model.protocol_components not in (2, 4, 8):
+        raise ValueError("DEPI development sensitivity supports K in {2,4,8}.")
+    if config.run_kind == "formal" and config.model.protocol_components != 4:
+        raise ValueError("The preregistered formal DEPI configuration fixes K=4.")
     if config.model.component_embedding_dim != 16:
         raise ValueError("DEPI fixes component_embedding_dim=16 (METHOD_SPEC §1.1).")
     if config.model.capability_dim != 16:
         raise ValueError("DEPI fixes capability_dim=16 (METHOD_SPEC §1.1).")
     if config.model.capability_hidden_dim != 64:
         raise ValueError("DEPI fixes capability_hidden_dim=64 (METHOD_SPEC §1.1).")
-    if config.model.protocol_hidden_dim != 128:
-        raise ValueError("DEPI fixes protocol_hidden_dim=128 (METHOD_SPEC §1.1).")
     if config.model.modulation_rank <= 0:
         raise ValueError("Low-rank actor modulation needs positive rank.")
 
@@ -597,36 +544,11 @@ def validate_config(config: RunConfig) -> None:
     if not 0.0 < config.ppo.polyak_coefficient <= 1.0:
         raise ValueError("Polyak coefficient must lie in (0, 1].")
     if config.ppo.polyak_coefficient != 0.005:
-        raise ValueError("V6 fixes the ego EMA target coefficient at 0.005.")
+        raise ValueError("DEPI fixes the ego EMA target coefficient at 0.005.")
     if not 0.0 <= config.ppo.lr_warmup_fraction < 1.0:
         raise ValueError("LR warmup fraction must lie in [0, 1).")
     if config.ppo.adam_epsilon <= 0.0:
         raise ValueError("Adam epsilon must be positive.")
-    frozen_losses = {
-        "response_weight": 1.0,
-        "raw_q_weight": 1.0,
-        "counterfactual_weight": 1.0,
-        "decision_equivalence_weight": 0.10,
-        "q_policy_weight": 0.25,
-        "q_policy_temperature": 1.0,
-        "q_policy_gap_midpoint": 1.0,
-        "q_policy_gap_temperature": 1.0,
-        "q_policy_disagreement_temperature": 5.0,
-        "information_bottleneck_weight": 0.001,
-        "information_bottleneck_free_bits_per_dimension": 0.1,
-        "robust_generalist_weight": 0.10,
-        "policy_belief_gradient_scale": 0.10,
-        "belief_gradient_ema_decay": 0.99,
-        "decision_regret_weight_maximum": 0.10,
-        "decision_regret_schedule_midpoint": 0.20,
-        "decision_regret_schedule_temperature": 0.05,
-        "response_updates_per_outer_update": 2,
-        "raw_q_updates_per_outer_update": 4,
-    }
-    for name, expected in frozen_losses.items():
-        if getattr(config.loss, name) != expected:
-            raise ValueError(f"V6 loss field {name} must equal {expected!r}.")
-
     frozen_loss_v2 = {
         "signature_weight": 1.0,
         "response_weight": 1.0,
@@ -635,91 +557,36 @@ def validate_config(config: RunConfig) -> None:
         "rank_hinge_margin": 0.1,
         "rank_hinge_advantage_gap": 2.0,
         "separation_margin_scale": 0.25,
+        "decision_policy_weight": 0.25,
+        "decision_policy_temperature": 1.0,
+        "capability_consistency_weight": 0.01,
     }
     for name, expected in frozen_loss_v2.items():
         if getattr(config.loss_v2, name) != expected:
             raise ValueError(f"DEPI loss_v2 field {name} must equal {expected!r}.")
 
-    if config.partner_generator.enabled:
-        raise ValueError(
-            "The learned partner generator stays disabled: the current tree "
-            "registers only SP/OP seeds, SA/FCP upstream sources are missing, "
-            "and the §7.3 static wide partner pool is the default "
-            "(METHOD_SPEC §7.3)."
-        )
-    if config.partner_generator.code_dim != 3:
-        raise ValueError(
-            "§7.1 fixes the generator code space to the 3-dimensional "
-            "tetrahedral simplex; code_dim must be 3."
-        )
-    if config.partner_generator.cvar_level != 0.20:
-        raise ValueError("V6 fixes generator competence to CVaR20.")
     registered_shape = config.run_kind != "mechanical"
-    if registered_shape and config.partner_generator.episodes_per_update != 32:
-        raise ValueError("V6 generator requires 32 complete episodes per outer update.")
-    if config.partner_generator.episode_steps != OFFICIAL_EPISODE_STEPS:
-        raise ValueError("Generator episodes must use all 400 Official steps.")
-    if registered_shape and config.partner_generator.update_epochs != 4:
-        raise ValueError("Generator PPO uses four Official update epochs.")
-    if registered_shape and config.partner_generator.environment_minibatches != 8:
-        raise ValueError("Generator PPO uses eight environment minibatches.")
-    if config.partner_generator.target_polyak_coefficient != 0.005:
-        raise ValueError("Generator EMA coefficient must remain 0.005.")
-    if config.partner_generator.maximum_generator_probability != 0.75:
-        raise ValueError("Generator mixture probability is capped at 0.75.")
-    if config.partner_generator.mixture_ramp_fraction != 0.30:
-        raise ValueError("Generator mixture ramp must finish at 30% of training.")
-    if config.partner_generator.competence_temperature != 20.0:
-        raise ValueError("Generator competence temperature equals one delivery reward.")
-    if not 0.0 < config.partner_generator.cvar_ema_decay < 1.0:
-        raise ValueError("Generator CVaR EMA decay must lie in (0,1).")
-    frozen_generator = {
-        "cvar_ema_decay": 0.95,
-        "imitation_initial_weight": 1.0,
-        "brdiv_maximum_weight": 1.0,
-        "smoothness_weight": 0.05,
-        "lagrangian_learning_rate": 0.01,
-        "competence_multiplier_maximum": 10.0,
-        "diversity_bank_size": 64,
-        "diversity_codes_per_update": 8,
-        "code_archive_capacity": 256,
-        "freeze_after_imitation": True,
-    }
-    for name, expected in frozen_generator.items():
-        if getattr(config.partner_generator, name) != expected:
-            raise ValueError(
-                f"V6 partner-generator field {name} must equal {expected!r}."
-            )
-    if registered_shape and config.partner_generator.codes_per_update != 32:
-        raise ValueError("V6 generator uses 32 continuous codes per outer update.")
-
     if registered_shape and config.anchors.interval_updates != 16:
-        raise ValueError("V6 training anchors run every 16 outer updates.")
+        raise ValueError("DEPI training anchors run every 16 outer updates.")
     if registered_shape and (
         config.anchors.ordinary_states != 32
-        or config.anchors.matched_code_pairs != 16
+        or config.anchors.matched_history_pairs != 16
         or config.anchors.fit_replicas != 4
     ):
-        raise ValueError("V6 anchors require 32 ordinary, 16 matched pairs and 4 replicas.")
+        raise ValueError("DEPI anchors require 32 ordinary, 16 matched pairs and 4 fit replicas.")
+    if registered_shape and config.anchors.evaluation_replicas != 8:
+        raise ValueError("DEPI M1 evaluation requires 8 independent replicas.")
     if not 1 <= config.anchors.continuation_horizon <= config.environment.episode_steps:
         raise ValueError("Anchor continuation horizon is outside the episode.")
     if registered_shape and (
         config.anchors.continuation_horizon != 128 or config.anchors.probe_steps != 16
     ):
-        raise ValueError("V6 anchors require horizon 128 and 16 evidence steps.")
-    if registered_shape and (
-        config.anchors.replay_capacity != 512
-        or config.anchors.replay_minibatch_size != 64
-        or config.anchors.policy_kl_decay != 0.05
-        or config.anchors.age_decay_updates != 64.0
-        or config.anchors.minimum_replay_weight != 0.001
-    ):
-        raise ValueError("V6 replay capacity and continuous decay constants are frozen.")
+        raise ValueError("DEPI anchors require horizon 128 and 16 evidence steps.")
     if config.anchors.return_lower_bound >= config.anchors.return_upper_bound:
         raise ValueError("Anchor return bounds are reversed.")
     frozen_anchor_comparator = {
-        "observable_equivalent_accuracy_max": 0.55,
-        "decision_distinct_accuracy_min": 0.70,
+        "observable_equivalent_probability_max": 0.55,
+        "decision_distinct_probability_min": 0.70,
         "signature_distance_threshold": 1.0,
     }
     for name, expected in frozen_anchor_comparator.items():
@@ -754,23 +621,34 @@ def validate_config(config: RunConfig) -> None:
     if not config.partner_pool.family_uniform_sampling:
         raise ValueError("Partner-pool sampling is uniform across families.")
 
-    if not 0.0 < config.calibration.alpha < 1.0:
-        raise ValueError("Conformal alpha must lie in (0, 1).")
-    if not 0.0 <= config.calibration.support_quantile < 1.0:
-        raise ValueError("Calibration support_quantile must lie in [0, 1).")
-    if config.calibration.block_unit != "partner_run":
-        raise ValueError("The registered calibration block unit is partner_run.")
-    minimum_for_finite_quantile = int(math.ceil(1.0 / config.calibration.alpha) - 1)
-    if config.calibration.minimum_run_count < minimum_for_finite_quantile:
+    calibration = config.posterior_calibration
+    if calibration.minimum_run_count < 2 or calibration.episodes_per_run <= 0:
         raise ValueError(
-            "Calibration minimum_run_count cannot yield a finite split-conformal "
-            f"quantile at alpha={config.calibration.alpha}; need at least "
-            f"{minimum_for_finite_quantile}."
+            "Posterior calibration requires at least two partner-run blocks and positive episodes."
         )
-    if config.calibration.episodes_per_run <= 0 or config.calibration.anchors_per_run <= 0:
-        raise ValueError("Calibration episodes and anchors per run must be positive.")
-    if config.run_kind == "formal" and config.calibration.enabled:
-        raise ValueError("Primary DELTA-ZSC-E2E formal runs cannot enable the safety wrapper.")
+    if calibration.bootstrap_replicates <= 0:
+        raise ValueError("Posterior-calibration bootstrap count must be positive.")
+    if calibration.root_seed_offset != 2_000:
+        raise ValueError("Posterior calibration uses the registered root-key offset 2000.")
+    if calibration.credibility != 0.90:
+        raise ValueError("Posterior calibration uses 90% highest-probability sets.")
+    if not 0.0 <= calibration.coverage_low <= calibration.coverage_high <= 1.0:
+        raise ValueError("Posterior-calibration coverage band is invalid.")
+    if calibration.log_score_margin != 0.02 or calibration.brier_ratio != 0.90:
+        raise ValueError("Posterior-calibration score thresholds differ from registration.")
+    if (calibration.coverage_low, calibration.coverage_high) != (0.85, 0.95):
+        raise ValueError("Posterior-calibration coverage band is fixed at [0.85, 0.95].")
+    if calibration.primary_unit != "partner_run" or calibration.secondary_unit != "episode":
+        raise ValueError("Posterior calibration uses partner-run/episode hierarchy.")
+    if config.run_kind == "formal" and (
+        calibration.minimum_run_count != 20
+        or calibration.episodes_per_run != 64
+        or calibration.bootstrap_replicates != 9_999
+    ):
+        raise ValueError(
+            "Formal posterior calibration requires 20 runs, 64 episodes per run, "
+            "and 9,999 hierarchical bootstrap replicates."
+        )
 
     if not (
         0.0 <= config.training.context_dropout_final
@@ -781,14 +659,15 @@ def validate_config(config: RunConfig) -> None:
         config.training.context_dropout_initial != 0.30
         or config.training.context_dropout_final != 0.10
     ):
-        raise ValueError("V6 context dropout is frozen at 0.30 -> 0.10.")
+        raise ValueError("DEPI context dropout is frozen at 0.30 -> 0.10.")
     if (
         config.training.owner_sources_per_seed != 1
-        or config.training.generator_init_sources_per_mechanism != 1
-        or config.training.development_runs_per_mechanism != 4
-        or config.training.calibration_runs_per_mechanism != 5
+        or config.training.support_parent_runs_per_family != 10
+        or config.training.support_checkpoints_per_parent != 3
+        or config.training.support_width_variants != 2
+        or config.training.calibration_runs_per_family != 5
     ):
-        raise ValueError("Per-seed V6 partner resource counts changed.")
+        raise ValueError("Registered DEPI static partner-resource counts changed.")
     if config.training.rollout_length <= 0:
         raise ValueError("Training rollout length must be positive.")
     if config.evaluation.episodes_per_pairing <= 0:
@@ -802,6 +681,17 @@ def validate_config(config: RunConfig) -> None:
         config.evaluation.br_prox_continuation_horizon,
     ) <= 0:
         raise ValueError("Empirical BR-Prox audit budgets must be positive.")
+    if min(
+        config.evaluation.mechanism_anchors_per_pairing,
+        config.evaluation.mechanism_fit_replicas,
+        config.evaluation.mechanism_evaluation_replicas,
+        config.evaluation.mechanism_continuation_horizon,
+    ) <= 0:
+        raise ValueError("Mechanism-control continuation budgets must be positive.")
+    if config.evaluation.recoverable_signal_threshold != OFFICIAL_CORRECT_DELIVERY_REWARD:
+        raise ValueError(
+            "Recoverable-value signal states are preregistered at one delivery (20 points)."
+        )
     if (
         config.evaluation.br_prox_anchors_per_pairing
         > config.environment.episode_steps * config.evaluation.episodes_per_pairing
@@ -812,6 +702,11 @@ def validate_config(config: RunConfig) -> None:
         > config.environment.episode_steps
     ):
         raise ValueError("BR-Prox continuation horizon exceeds the episode.")
+    if (
+        config.evaluation.mechanism_continuation_horizon
+        > config.environment.episode_steps
+    ):
+        raise ValueError("Mechanism continuation horizon exceeds the episode.")
     if not 0.0 < config.evaluation.one_sided_alpha < 1.0:
         raise ValueError("Evaluation one_sided_alpha must lie in (0, 1).")
     if min(
@@ -820,10 +715,21 @@ def validate_config(config: RunConfig) -> None:
         config.evaluation.minimum_mechanisms,
     ) <= 0:
         raise ValueError("Evaluation independent-run minima must be positive.")
+    if config.evaluation.inference_mode not in {"independent_run", "paired_run"}:
+        raise ValueError("Evaluation inference_mode must be independent_run or paired_run.")
+    if config.evaluation.superiority_lcb_threshold != 0.0:
+        raise ValueError("The preregistered superiority LCB threshold is 0.0.")
+    if config.evaluation.minimum_effect != OFFICIAL_CORRECT_DELIVERY_REWARD:
+        raise ValueError("The preregistered material effect is one delivery (20 points).")
+    if config.evaluation.minimum_effect_rule not in {
+        "point_estimate",
+        "lower_confidence_bound",
+    }:
+        raise ValueError("Unknown minimum_effect_rule.")
     if config.run_kind == "formal":
         if not config.evaluation.report_br_prox:
             raise ValueError(
-                "The DELTA-ZSC design requires empirical BR-Prox in the formal "
+                "The DEPI design requires empirical BR-Prox in the formal "
                 "mechanism-disjoint confirmatory evaluation."
             )
         if config.training.rollout_length != OFFICIAL_ROLLOUT_LENGTH:
@@ -846,11 +752,11 @@ def validate_config(config: RunConfig) -> None:
             if getattr(config.ppo, name) != expected:
                 raise ValueError(f"Formal PPO field {name} must equal {expected!r}.")
         if config.environment.num_envs != OFFICIAL_SP_NUM_ENVS:
-            raise ValueError("Official DELTA formal training uses 256 environments.")
+            raise ValueError("Official DEPI formal training uses 256 environments.")
         if config.training.environment_steps != 29_949_952:
-            raise ValueError("Official DELTA formal training executes 29,949,952 steps.")
+            raise ValueError("Official DEPI formal training executes 29,949,952 steps.")
         if config.training.minibatches_per_epoch != OFFICIAL_NUM_MINIBATCHES:
-            raise ValueError("Official DELTA formal training uses 64 minibatches.")
+            raise ValueError("Official DEPI formal training uses 64 minibatches.")
         if config.evaluation.episodes_per_pairing != OFFICIAL_EPISODES_PER_PAIRING:
             raise ValueError("Official evaluation uses 500 episodes per pairing.")
         if config.evaluation.evaluation_seed != OFFICIAL_EVALUATION_ROOT_SEED:
@@ -917,6 +823,8 @@ def load_partner_manifest(
                 "checkpoint_sha256",
                 "parent_training_run_id",
                 "generation_mechanism",
+                "checkpoint_stage",
+                "hyperparameter_family",
                 "seed",
                 "seed_index",
                 "jax_prng_key",
@@ -939,6 +847,8 @@ def load_partner_manifest(
             checkpoint_sha256=str(raw["checkpoint_sha256"]),
             parent_training_run_id=str(raw["parent_training_run_id"]),
             generation_mechanism=str(raw["generation_mechanism"]),
+            checkpoint_stage=float(raw["checkpoint_stage"]),
+            hyperparameter_family=str(raw["hyperparameter_family"]),
             seed=int(raw["seed"]),
             seed_index=(
                 None if raw["seed_index"] is None else int(raw["seed_index"])
@@ -991,8 +901,25 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
             raise ValueError(f"Partner owner_seed_index is outside 0..9: {run.run_id}")
         if run.jax_prng_key is None:
             raise ValueError(
-                f"Every V6 partner run must record its real two-word JAX key: "
+                f"Every DEPI partner run must record its real two-word JAX key: "
                 f"{run.run_id}"
+            )
+        if float(run.checkpoint_stage) not in {0.0, 0.5, 1.0}:
+            raise ValueError(
+                f"Partner checkpoint stage must be one of 0/0.5/1: {run.run_id}"
+            )
+        if run.role != "development_support" and run.checkpoint_stage != 1.0:
+            raise ValueError(
+                f"Only development support may use intermediate stages: {run.run_id}"
+            )
+        if not run.hyperparameter_family.strip():
+            raise ValueError(f"Partner hyperparameter family is empty: {run.run_id}")
+        if (
+            run.role != "development_support"
+            and run.hyperparameter_family != "default"
+        ):
+            raise ValueError(
+                f"Non-support partners must use hyperparameter_family=default: {run.run_id}"
             )
         if run.role == "confirmatory" and run.owner_seed_index is not None:
             raise ValueError(
@@ -1001,7 +928,6 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
         official_parent = (
             run.role in {
                 "owner_source",
-                "generator_init_source",
                 "development_support",
             }
             and run.generation_mechanism in {"rnn-sp", "rnn-op"}
@@ -1018,10 +944,15 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
                     f"Official partner PRNG key differs from split(PRNGKey(42), 10): "
                     f"{run.run_id}"
                 )
-        if run.role in {"calibration", "confirmatory"}:
+        if run.role in {
+            "comparator_fit",
+            "comparator_validation",
+            "calibration",
+            "confirmatory",
+        }:
             if run.seed_index is not None:
                 raise ValueError(
-                    "Fresh calibration/confirmatory partners cannot reuse Official "
+                    "Fresh comparator/calibration/confirmatory partners cannot reuse Official "
                     f"seed indexes: {run.run_id}"
                 )
             official_keys = {
@@ -1030,7 +961,7 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
             }
             if tuple(run.jax_prng_key or ()) in official_keys:
                 raise ValueError(
-                    "Fresh calibration/confirmatory partner reuses a formal "
+                    "Fresh comparator/calibration/confirmatory partner reuses a formal "
                     f"training key: {run.run_id}"
                 )
         if run.jax_prng_key is not None and len(run.jax_prng_key) != 2:
@@ -1041,17 +972,23 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
     evaluation_keys = [
         tuple(run.jax_prng_key or ())
         for run in manifest.runs
-        if run.role in {"calibration", "confirmatory"}
+        if run.role in {
+            "comparator_fit",
+            "comparator_validation",
+            "calibration",
+            "confirmatory",
+        }
     ]
     if len(evaluation_keys) != len(set(evaluation_keys)):
         raise ValueError(
-            "Fresh calibration/confirmatory partners must use distinct JAX keys."
+            "Fresh comparator/calibration/confirmatory partners must use distinct JAX keys."
         )
 
     for role in (
         "owner_source",
-        "generator_init_source",
         "development_support",
+        "comparator_fit",
+        "comparator_validation",
         "calibration",
     ):
         owners_by_parent: dict[str, set[int | None]] = {}
@@ -1066,14 +1003,15 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
         }
         if shared_parents:
             raise ValueError(
-                f"{role} parent runs cannot be shared across DELTA outer runs: "
+                f"{role} parent runs cannot be shared across DEPI outer runs: "
                 f"{shared_parents}"
             )
 
     train_roles = {
         "owner_source",
-        "generator_init_source",
         "development_support",
+        "comparator_fit",
+        "comparator_validation",
     }
     eval_roles = {"calibration", "confirmatory"}
     train_parents = {
@@ -1119,11 +1057,51 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
             f"{sorted(calibration_confirmatory_overlap)}"
         )
 
+    isolated_roles = (
+        "development_support",
+        "comparator_fit",
+        "comparator_validation",
+        "calibration",
+        "confirmatory",
+    )
+    parents_by_role = {
+        role: {
+            run.parent_training_run_id
+            for run in manifest.runs
+            if run.role == role
+        }
+        for role in isolated_roles
+    }
+    groups_by_role = {
+        role: {
+            run.co_training_group_id
+            for run in manifest.runs
+            if run.role == role and run.co_training_group_id is not None
+        }
+        for role in isolated_roles
+    }
+    for left_index, left in enumerate(isolated_roles):
+        for right in isolated_roles[left_index + 1 :]:
+            parent_overlap = parents_by_role[left] & parents_by_role[right]
+            group_overlap = groups_by_role[left] & groups_by_role[right]
+            if parent_overlap or group_overlap:
+                raise ValueError(
+                    "Partner data roles are not lineage-disjoint: "
+                    f"{left}/{right}, parents={sorted(parent_overlap)}, "
+                    f"groups={sorted(group_overlap)}."
+                )
+
     development_support = manifest.by_role("development_support")
+    comparator_fit = manifest.by_role("comparator_fit")
+    comparator_validation = manifest.by_role("comparator_validation")
     calibration = manifest.by_role("calibration")
     confirmatory = manifest.by_role("confirmatory")
     if development_support and len({run.parent_training_run_id for run in development_support}) < 2:
         raise ValueError("Training support requires at least two independent frozen external runs.")
+    if comparator_fit and len({run.parent_training_run_id for run in comparator_fit}) < 2:
+        raise ValueError("Comparator fitting requires at least two independent parent runs.")
+    if comparator_validation and len({run.parent_training_run_id for run in comparator_validation}) < 2:
+        raise ValueError("Comparator validation requires at least two independent parent runs.")
     if calibration and len({run.parent_training_run_id for run in calibration}) < 2:
         raise ValueError("Calibration requires at least two independent parent runs.")
     if confirmatory and len({run.parent_training_run_id for run in confirmatory}) < 2:
@@ -1136,12 +1114,12 @@ def validate_seed_training_manifest(
     owner_seed_index: int,
     formal: bool,
 ) -> None:
-    """Enforce lineage-exclusive V6 initialization and training support."""
+    """Enforce the lineage-disjoint, static DEPI training distribution."""
 
     validate_partner_manifest(manifest)
     owner = int(owner_seed_index)
     if formal and not 0 <= owner < OFFICIAL_TRAINING_RUN_COUNT:
-        raise ValueError("Formal DELTA owner seed must lie in 0..9.")
+        raise ValueError("Formal DEPI owner seed must lie in 0..9.")
     if not formal and owner not in {ENGINEERING_SEED_INDEX, *range(10)}:
         raise ValueError("Mechanical/development owner seed is invalid.")
     manifest_owner = None if owner == ENGINEERING_SEED_INDEX else owner
@@ -1154,11 +1132,11 @@ def validate_seed_training_manifest(
         and run.owner_seed_index != owner
     )
     if foreign:
-        raise ValueError("A per-seed V6 manifest contains another seed's resource.")
+        raise ValueError("A per-seed DEPI manifest contains another seed's resource.")
 
     owners = tuple(run for run in owned if run.role == "owner_source")
     if len(owners) != 1 or owners[0].generation_mechanism not in {"rnn-sp", "sp"}:
-        raise ValueError("Each DELTA seed needs exactly one independent owner-SP source.")
+        raise ValueError("Each DEPI seed needs exactly one independent owner-SP source.")
 
     mechanism_alias = {
         "rnn-sp": "sp",
@@ -1169,68 +1147,131 @@ def validate_seed_training_manifest(
         "sa": "sa",
         "fcp": "fcp",
     }
-
-    def counts(role: str) -> Mapping[str, int]:
-        result = {name: 0 for name in ("sp", "op", "sa", "fcp")}
-        for run in owned:
-            if run.role != role:
-                continue
-            mechanism = mechanism_alias.get(run.generation_mechanism)
-            if mechanism is None:
-                raise ValueError(f"Unknown V6 partner mechanism: {run.generation_mechanism}")
-            result[mechanism] += 1
-        return result
-
-    expected = {
-        "generator_init_source": 1,
-        "development_support": 4,
-    }
-    if formal:
-        for role, per_mechanism in expected.items():
-            observed = counts(role)
-            if any(value != per_mechanism for value in observed.values()):
-                raise ValueError(
-                    f"{role} must contain {per_mechanism} independent runs per mechanism; "
-                    f"observed={dict(observed)}."
-                )
-
-    role_groups = {
-        role: {
-            (run.checkpoint_sha256, run.parent_training_run_id, run.co_training_group_id)
-            for run in owned
-            if run.role == role
-        }
-        for role in (
-            "owner_source",
-            "generator_init_source",
-            "development_support",
+    support = manifest.by_role("development_support")
+    if any(run.owner_seed_index is not None for run in support):
+        raise ValueError(
+            "The registered static support pool is shared and must not be owned by an ego seed."
         )
+    if {mechanism_alias.get(run.generation_mechanism) for run in support} - {
+        "sp",
+        "op",
+    }:
+        raise ValueError("Static training support may contain only SP and OP mechanisms.")
+
+    owner_parent = owners[0].parent_training_run_id
+    support_parents = {run.parent_training_run_id for run in support}
+    if owner_parent in support_parents:
+        raise ValueError("Owner initialization and static support share a parent run.")
+    owner_group = owners[0].co_training_group_id
+    support_groups = {
+        run.co_training_group_id
+        for run in support
+        if run.co_training_group_id is not None
     }
-    roles = tuple(role_groups)
-    for index, first in enumerate(roles):
-        for second in roles[index + 1 :]:
-            first_parents = {row[1] for row in role_groups[first]}
-            second_parents = {row[1] for row in role_groups[second]}
-            if first_parents & second_parents:
-                raise ValueError(f"V6 resource groups {first}/{second} share a parent run.")
-            first_groups = {row[2] for row in role_groups[first] if row[2] is not None}
-            second_groups = {row[2] for row in role_groups[second] if row[2] is not None}
-            if first_groups & second_groups:
-                raise ValueError(f"V6 resource groups {first}/{second} share co-training lineage.")
+    if owner_group is not None and owner_group in support_groups:
+        raise ValueError("Owner initialization and static support share co-training lineage.")
+
+    if formal:
+        comparator_fit = manifest.by_role("comparator_fit")
+        comparator_validation = manifest.by_role("comparator_validation")
+        for role, runs in (
+            ("comparator_fit", comparator_fit),
+            ("comparator_validation", comparator_validation),
+        ):
+            if any(run.owner_seed_index is not None for run in runs):
+                raise ValueError(f"Formal {role} runs must be shared and ego-owner independent.")
+            if len({run.parent_training_run_id for run in runs}) < 2:
+                raise ValueError(
+                    f"Formal {role} needs at least two independent fresh parent runs."
+                )
+            if len(runs) > config.environment.num_envs // 8:
+                raise ValueError(
+                    f"Formal {role} exceeds its deterministic reserved-lane capacity."
+                )
+            if any(
+                mechanism_alias.get(run.generation_mechanism) not in {"sp", "op"}
+                or run.checkpoint_stage != 1.0
+                or run.hyperparameter_family != "default"
+                for run in runs
+            ):
+                raise ValueError(
+                    f"Formal {role} accepts only fresh final-stage default SP/OP runs."
+                )
+        default_support = tuple(
+            run for run in support if run.hyperparameter_family == "default"
+        )
+        width_support = tuple(
+            run for run in support if run.hyperparameter_family != "default"
+        )
+        for mechanism in ("sp", "op"):
+            rows = tuple(
+                run
+                for run in default_support
+                if mechanism_alias[run.generation_mechanism] == mechanism
+            )
+            parents = {run.parent_training_run_id for run in rows}
+            if len(parents) != 10:
+                raise ValueError(
+                    f"Formal static support needs 10 independent {mechanism.upper()} parents."
+                )
+            for parent in parents:
+                stages = {
+                    run.checkpoint_stage
+                    for run in rows
+                    if run.parent_training_run_id == parent
+                }
+                if stages != {0.0, 0.5, 1.0}:
+                    raise ValueError(
+                        f"Static support parent {parent} must provide stages 0/0.5/1."
+                    )
+                if sum(run.parent_training_run_id == parent for run in rows) != 3:
+                    raise ValueError(
+                        f"Static support parent {parent} has duplicate stage entries."
+                    )
+        if (
+            len(width_support) != 2
+            or any(
+                mechanism_alias[run.generation_mechanism] != "op"
+                or run.checkpoint_stage != 1.0
+                for run in width_support
+            )
+            or len({run.parent_training_run_id for run in width_support}) != 2
+        ):
+            raise ValueError(
+                "Formal static support needs exactly two independent final-stage OP width variants."
+            )
+
+        calibration = tuple(
+            run for run in owned if run.role == "calibration"
+        )
+        if calibration:
+            observed = {name: 0 for name in ("sp", "op", "sa", "fcp")}
+            for run in calibration:
+                mechanism = mechanism_alias.get(run.generation_mechanism)
+                if mechanism is None:
+                    raise ValueError(
+                        f"Unknown calibration mechanism: {run.generation_mechanism}"
+                    )
+                observed[mechanism] += 1
+            if any(value != 5 for value in observed.values()):
+                raise ValueError(
+                    "Formal posterior calibration needs five fresh runs per mechanism; "
+                    f"observed={observed}."
+                )
 
 
 __all__ = [
     "AnchorConfig",
     "CONFIG_VERSION",
     "ENGINEERING_SEED_INDEX",
-    "CalibrationConfig",
     "EnvironmentConfig",
     "EvaluationConfig",
     "LAYOUTS",
-    "LossConfig",
     "LossV2Config",
     "MANIFEST_VERSION",
     "METHOD_VERSION",
+    "METHOD_VARIANTS",
+    "CHECKPOINT_SCHEMA_VERSION",
     "OFFICIAL_ACTION_COUNT",
     "OFFICIAL_EPISODE_STEPS",
     "OFFICIAL_CORRECT_DELIVERY_REWARD",
@@ -1252,10 +1293,10 @@ __all__ = [
     "ModelConfig",
     "PARTNER_ROLES",
     "PPOConfig",
-    "PartnerGeneratorConfig",
     "PartnerManifest",
     "PartnerPoolConfig",
     "PartnerRun",
+    "PosteriorCalibrationConfig",
     "RUN_BUDGETS",
     "RUN_KINDS",
     "RunConfig",

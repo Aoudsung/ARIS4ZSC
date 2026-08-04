@@ -1,7 +1,6 @@
 """Three identifiability controls (METHOD_SPEC §4).
 
-All primitives are pure array functions: evaluation apps
-(``signal_audit_app.py`` / ``official_evaluation_app.py``) feed them
+All primitives are pure array functions: ``identifiability_app.py`` feeds them
 precomputed task features, contexts and signatures so that every reading can
 be reproduced offline from recorded checkpoints.
 
@@ -19,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-LEAKAGE_PROBE_ACCURACY_THRESHOLD = 0.55
+LEAKAGE_PROBE_EXCESS_THRESHOLD = 0.05
 PROTOCOL_SWAP_CONSISTENCY_THRESHOLD = 0.65
 BOOTSTRAP_REPLICATION = 9999
 SHUFFLE_EPSILON_QUANTILE = 0.05
@@ -143,6 +142,48 @@ def match_task_state_pairs(
     return np.flatnonzero(valid).astype(np.int64), nearest[valid].astype(np.int64)
 
 
+def match_different_partner_task_states(
+    features: Any,
+    partner_run_ids: Any,
+    *,
+    epsilon_quantile: float = SHUFFLE_EPSILON_QUANTILE,
+) -> tuple[Any, Any, float, Any]:
+    """Nearest task-state matches constrained to different partner runs.
+
+    The epsilon is preregistered as the 5th percentile of the finite nearest
+    different-run distances.  Returned source/donor indexes are therefore
+    task matched without using partner family, latent component, or return
+    labels.  The final array contains the retained source-to-donor distances.
+    """
+
+    import numpy as np
+
+    values = np.asarray(features, dtype=np.float64).reshape((len(features), -1))
+    run_ids = np.asarray(partner_run_ids)
+    if values.shape[0] != run_ids.shape[0] or values.shape[0] < 2:
+        raise ValueError("Task features and partner-run labels must align.")
+    if np.unique(run_ids).size < 2:
+        raise ValueError("Context swaps require at least two partner runs.")
+    if not 0.0 < float(epsilon_quantile) <= 1.0:
+        raise ValueError("Task-match epsilon quantile must lie in (0, 1].")
+    distances = np.linalg.norm(values[:, None, :] - values[None, :, :], axis=-1)
+    admissible = run_ids[:, None] != run_ids[None, :]
+    constrained = np.where(admissible, distances, np.inf)
+    donor = np.argmin(constrained, axis=1)
+    nearest = constrained[np.arange(values.shape[0]), donor]
+    finite = np.isfinite(nearest)
+    if not np.any(finite):
+        raise ValueError("No finite different-partner task-state match exists.")
+    epsilon = float(np.quantile(nearest[finite], float(epsilon_quantile)))
+    valid = finite & (nearest <= epsilon)
+    return (
+        np.flatnonzero(valid).astype(np.int64),
+        donor[valid].astype(np.int64),
+        epsilon,
+        nearest[valid].astype(np.float64),
+    )
+
+
 def protocol_swap_causal_consistency(
     *,
     swapped_logits: Any,
@@ -179,14 +220,50 @@ def protocol_swap_causal_consistency(
     return float(np.mean(sign_logits[informative] == sign_signature[informative]))
 
 
+def continuation_swap_causal_consistency(
+    *,
+    swapped_returns_by_action: Any,
+    original_returns_by_action: Any,
+    source_signature: Any,
+    target_signature: Any,
+) -> float:
+    """CRN continuation control for a real ``u`` or ``c`` intervention.
+
+    At the action where target and source empirical signatures differ most,
+    replacing the source context by the target context should move the real
+    continuation return in the target-signature direction.  Inputs are raw
+    simulator continuations, never policy logits.
+    """
+
+    import numpy as np
+
+    swapped = np.asarray(swapped_returns_by_action, dtype=np.float64)
+    original = np.asarray(original_returns_by_action, dtype=np.float64)
+    source = np.asarray(source_signature, dtype=np.float64)
+    target = np.asarray(target_signature, dtype=np.float64)
+    if not (swapped.shape == original.shape == source.shape == target.shape):
+        raise ValueError("Continuation-swap tensors must share (pair, action) shape.")
+    direction = target - source
+    pivot = np.argmax(np.abs(direction), axis=-1)
+    rows = np.arange(direction.shape[0])
+    expected = np.sign(direction[rows, pivot])
+    observed = np.sign((swapped - original)[rows, pivot])
+    informative = expected != 0.0
+    if not np.any(informative):
+        return 0.5
+    return float(np.mean(observed[informative] == expected[informative]))
+
+
 __all__ = [
     "BOOTSTRAP_REPLICATION",
-    "LEAKAGE_PROBE_ACCURACY_THRESHOLD",
+    "LEAKAGE_PROBE_EXCESS_THRESHOLD",
     "PROTOCOL_SWAP_CONSISTENCY_THRESHOLD",
     "SHUFFLE_EPSILON_QUANTILE",
     "balanced_linear_probe_accuracy",
+    "continuation_swap_causal_consistency",
     "history_shuffle_negative",
     "match_task_state_pairs",
+    "match_different_partner_task_states",
     "paired_bootstrap_drop",
     "protocol_swap_causal_consistency",
     "task_representation_drift_under_shuffle",

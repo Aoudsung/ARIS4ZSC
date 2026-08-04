@@ -18,13 +18,15 @@ from experiments.overcooked_v2.official_adapter import (
     validate_official_runtime,
 )
 from experiments.overcooked_v2.official_policy import (
-    OfficialDeltaPolicy,
+    OfficialDEPIPolicy,
     assert_official_policy_surface,
 )
 from src.path_c.experiment import (
+    METHOD_VERSION,
     OFFICIAL_EPISODE_STEPS,
     OFFICIAL_CORRECT_DELIVERY_REWARD,
     OFFICIAL_EVALUATION_ROOT_SEED,
+    OFFICIAL_PROTOCOL_VERSION,
     OFFICIAL_SOURCE_COMMIT,
     RunConfig,
     load_config,
@@ -38,6 +40,11 @@ from src.path_c.official_statistics import (
     official_two_method_bootstrap,
     rows_to_official_cube,
     registered_bootstrap_seed,
+    registered_superiority_gate,
+)
+from src.path_c.m1_gate import (
+    M1_MINIMUM_ANCHOR_FRACTION,
+    M1_SPEARMAN_THRESHOLD,
 )
 from src.path_c.resources import ResourceLedger, parameter_count
 from src.path_c.storage import (
@@ -52,19 +59,125 @@ from src.path_c.storage import (
 )
 
 
-FORMAL_METHODS = ("sp", "state-augmented", "op", "fcp", "delta")
+FORMAL_METHODS = ("sp", "state-augmented", "op", "fcp", "depi")
 EXTENDED_METHODS = ("ippo-large",)
 
 
-def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
+def _validate_final_m1_payload(
+    payload: Mapping[str, Any],
+    *,
+    layout: str,
+    seed_index: int,
+    model_fingerprint: str,
+) -> bool:
+    """Validate and recompute a final-checkpoint M1 decision."""
+
+    expected_fields = {
+        "version",
+        "artifact_type",
+        "method",
+        "method_variant",
+        "layout",
+        "seed_index",
+        "specification",
+        "history",
+        "latest",
+        "final",
+    }
+    final_fields = {
+        "update",
+        "final_checkpoint_condition",
+        "model_fingerprint",
+        "m1_gate_passed",
+        "m1_path_passing_fractions",
+        "m1_path_mean_spearman",
+        "m1_path_top_action_agreement",
+        "m1_path_mean_value_regret",
+        "m1_spearman_threshold",
+        "m1_minimum_anchor_fraction",
+    }
+    final = payload.get("final")
+    history = payload.get("history")
+    if (
+        set(payload) != expected_fields
+        or payload.get("version") != 1
+        or payload.get("artifact_type") != "depi_final_m1_evaluation"
+        or payload.get("method") != METHOD_VERSION
+        or payload.get("method_variant") != "b2"
+        or payload.get("layout") != layout
+        or int(payload.get("seed_index", -1)) != int(seed_index)
+        or not isinstance(final, Mapping)
+        or set(final) != final_fields
+        or payload.get("latest") != final
+        or not isinstance(history, list)
+        or not history
+        or final.get("final_checkpoint_condition") is not True
+        or final.get("model_fingerprint") != model_fingerprint
+        or not np.isclose(
+            float(final.get("m1_spearman_threshold", -1.0)),
+            M1_SPEARMAN_THRESHOLD,
+            atol=1.0e-6,
+        )
+        or not np.isclose(
+            float(final.get("m1_minimum_anchor_fraction", -1.0)),
+            M1_MINIMUM_ANCHOR_FRACTION,
+            atol=1.0e-6,
+        )
+    ):
+        raise ValueError("Final-checkpoint M1 artifact identity differs.")
+    arrays = {
+        name: final.get(name)
+        for name in (
+            "m1_path_passing_fractions",
+            "m1_path_mean_spearman",
+            "m1_path_top_action_agreement",
+            "m1_path_mean_value_regret",
+        )
+    }
+    if any(
+        not isinstance(values, list)
+        or len(values) != 4
+        or not all(np.isfinite(float(value)) for value in values)
+        for values in arrays.values()
+    ):
+        raise ValueError("Final-checkpoint M1 path metrics are incomplete or non-finite.")
+    fractions = [float(value) for value in arrays["m1_path_passing_fractions"]]
+    agreements = [float(value) for value in arrays["m1_path_top_action_agreement"]]
+    regrets = [float(value) for value in arrays["m1_path_mean_value_regret"]]
+    derived_pass = bool(
+        all(0.0 <= value <= 1.0 for value in fractions)
+        and all(0.0 <= value <= 1.0 for value in agreements)
+        and all(value >= 0.0 for value in regrets)
+        and all(value + 1.0e-6 >= M1_MINIMUM_ANCHOR_FRACTION for value in fractions)
+    )
+    last = history[-1]
+    if (
+        not isinstance(last, Mapping)
+        or int(last.get("update", -1)) != int(final["update"])
+        or last.get("passed") is not derived_pass
+        or last.get("path_passing_fractions")
+        != final["m1_path_passing_fractions"]
+        or last.get("path_mean_spearman") != final["m1_path_mean_spearman"]
+        or last.get("path_top_action_agreement")
+        != final["m1_path_top_action_agreement"]
+        or last.get("path_mean_value_regret")
+        != final["m1_path_mean_value_regret"]
+        or final.get("m1_gate_passed") is not derived_pass
+    ):
+        raise ValueError("Final-checkpoint M1 pass field is not metric-derived.")
+    return derived_pass
+
+
+def run_build_depi_policy_manifest(args: argparse.Namespace) -> None:
     import orbax.checkpoint as ocp
 
     validate_formal_repository_state()
     validate_registered_python_runtime()
     artifacts = tuple(Path(value).resolve() for value in args.deployments)
     if len(artifacts) != 10:
-        raise ValueError("DELTA policy manifest requires exactly ten deployments.")
+        raise ValueError("DEPI policy manifest requires exactly ten deployments.")
     runs = []
+    m1_final_evaluations: list[Mapping[str, Any]] = []
     lineage_rows: list[Mapping[str, Any]] = []
     seed_indexes = set()
     layout = None
@@ -83,13 +196,32 @@ def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
         )
         seed_index = int(training_identity["seed_index"])
         if seed_index in seed_indexes:
-            raise ValueError(f"Duplicate DELTA seed index: {seed_index}")
+            raise ValueError(f"Duplicate DEPI seed index: {seed_index}")
         seed_indexes.add(seed_index)
         current_layout = str(training_identity["layout"])
         layout = current_layout if layout is None else layout
         if current_layout != layout:
-            raise ValueError("DELTA deployments mix layouts.")
+            raise ValueError("DEPI deployments mix layouts.")
         ego_run_id = str(training_identity["ego_run_id"])
+        m1_path = source_run / "m1_gate.json"
+        m1_payload = json.loads(m1_path.read_text(encoding="utf-8"))
+        final_m1 = m1_payload.get("final")
+        derived_m1_pass = _validate_final_m1_payload(
+            m1_payload,
+            layout=current_layout,
+            seed_index=seed_index,
+            model_fingerprint=str(bundle.get("params_fingerprint", "")),
+        )
+        m1_final_evaluations.append(
+            {
+                "run_index": seed_index,
+                "run_id": ego_run_id,
+                "path": str(m1_path),
+                "sha256": sha256_path(m1_path),
+                "model_fingerprint": str(final_m1["model_fingerprint"]),
+                "passed": derived_m1_pass,
+            }
+        )
         runs.append(
             {
                 "run_index": seed_index,
@@ -111,8 +243,9 @@ def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
         for raw in training_identity["partner_manifest"]["runs"]:
             if raw["role"] not in {
                 "owner_source",
-                "generator_init_source",
                 "development_support",
+                "comparator_fit",
+                "comparator_validation",
             }:
                 continue
             lineage_rows.append(
@@ -120,13 +253,13 @@ def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
                     "checkpoint_sha256": str(raw["checkpoint_sha256"]),
                     "parent_training_run_id": str(raw["parent_training_run_id"]),
                     "co_training_group_id": raw["co_training_group_id"],
-                    "role": f"delta_training_{raw['role']}",
+                    "role": f"depi_training_{raw['role']}",
                 }
             )
     if seed_indexes != set(range(10)) or layout is None:
-        raise ValueError("DELTA deployments must cover Official seed indexes 0..9.")
+        raise ValueError("DEPI deployments must cover Official seed indexes 0..9.")
     if len(set(deployment_parameter_counts)) != 1:
-        raise ValueError("DELTA deployments have inconsistent parameter counts.")
+        raise ValueError("DEPI deployments have inconsistent parameter counts.")
     unique_lineage = {
         (
             row["checkpoint_sha256"],
@@ -141,12 +274,15 @@ def run_build_delta_policy_manifest(args: argparse.Namespace) -> None:
         {
             "version": 1,
             "layout": layout,
-            "method": "delta",
-            "policy_kind": "delta_deployment",
+            "method": "depi",
+            "policy_kind": "depi_deployment",
             "official_source_commit": OFFICIAL_SOURCE_COMMIT,
             "runs": sorted(runs, key=lambda row: row["run_index"]),
             "training_lineage": list(unique_lineage.values()),
             "deployment_parameter_count": deployment_parameter_counts[0],
+            "m1_final_evaluations": sorted(
+                m1_final_evaluations, key=lambda row: row["run_index"]
+            ),
         },
     )
 
@@ -166,8 +302,8 @@ def _load_policy_manifest(path: str | Path, *, expected_layout: str) -> Mapping[
     method = str(payload.get("method", "")) if isinstance(payload, Mapping) else ""
     if method in EXTENDED_METHODS:
         expected.add("capacity_match")
-    if method == "delta":
-        expected.add("deployment_parameter_count")
+    if method == "depi":
+        expected.update({"deployment_parameter_count", "m1_final_evaluations"})
     if not isinstance(payload, Mapping) or set(payload) != expected:
         raise ValueError("Policy manifest fields differ from the formal schema.")
     if int(payload["version"]) != 1 or str(payload["layout"]) != expected_layout:
@@ -188,9 +324,9 @@ def _load_policy_manifest(path: str | Path, *, expected_layout: str) -> Mapping[
             match["absolute_mismatch"]
         ):
             raise ValueError("IPPO-Large capacity mismatch metadata is inconsistent.")
-    if method == "delta" and int(payload["deployment_parameter_count"]) <= 0:
-        raise ValueError("DELTA deployment parameter count must be positive.")
-    if str(payload["policy_kind"]) not in {"official_ppo", "delta_deployment"}:
+    if method == "depi" and int(payload["deployment_parameter_count"]) <= 0:
+        raise ValueError("DEPI deployment parameter count must be positive.")
+    if str(payload["policy_kind"]) not in {"official_ppo", "depi_deployment"}:
         raise ValueError("Policy manifest has an unknown policy kind.")
     if str(payload["official_source_commit"]) != OFFICIAL_SOURCE_COMMIT:
         raise ValueError("Policy manifest is not bound to the fixed Official commit.")
@@ -220,6 +356,50 @@ def _load_policy_manifest(path: str | Path, *, expected_layout: str) -> Mapping[
         normalized.append({**dict(raw), "checkpoint": str(artifact)})
     if indexes != set(range(10)):
         raise ValueError("Policy run indexes must be exactly 0..9.")
+    if method == "depi":
+        m1_rows = payload["m1_final_evaluations"]
+        m1_fields = {
+            "run_index",
+            "run_id",
+            "path",
+            "sha256",
+            "model_fingerprint",
+            "passed",
+        }
+        if not isinstance(m1_rows, Sequence) or len(m1_rows) != 10:
+            raise ValueError("DEPI manifest must bind ten final-checkpoint M1 evaluations.")
+        m1_by_index: dict[int, Mapping[str, Any]] = {}
+        run_by_index = {int(row["run_index"]): row for row in normalized}
+        for raw in m1_rows:
+            if not isinstance(raw, Mapping) or set(raw) != m1_fields:
+                raise ValueError("Final-checkpoint M1 manifest fields differ.")
+            index = int(raw["run_index"])
+            if index in m1_by_index or index not in run_by_index:
+                raise ValueError("Final-checkpoint M1 indexes must be exactly 0..9.")
+            m1_path = Path(str(raw["path"])).resolve()
+            if sha256_path(m1_path) != str(raw["sha256"]):
+                raise ValueError(f"Final-checkpoint M1 source hash mismatch: {m1_path}")
+            m1_payload = json.loads(m1_path.read_text(encoding="utf-8"))
+            final_m1 = m1_payload.get("final")
+            bundle = json.loads(
+                (Path(str(run_by_index[index]["checkpoint"])) / "deployment_bundle.json")
+                .read_text(encoding="utf-8")
+            )
+            derived_pass = _validate_final_m1_payload(
+                m1_payload,
+                layout=expected_layout,
+                seed_index=index,
+                model_fingerprint=str(bundle.get("params_fingerprint", "")),
+            )
+            if (
+                str(raw["model_fingerprint"]) != bundle.get("params_fingerprint")
+                or str(raw["run_id"]) != str(run_by_index[index]["run_id"])
+                or raw["passed"] is not derived_pass
+            ):
+                raise ValueError("Final-checkpoint M1 evidence differs from its deployment.")
+            m1_by_index[index] = {**dict(raw), "path": str(m1_path)}
+        if set(m1_by_index) != set(range(10)):
+            raise ValueError("Final-checkpoint M1 indexes must be exactly 0..9.")
     lineage = payload["training_lineage"]
     if not isinstance(lineage, Sequence) or not lineage:
         raise ValueError("Policy manifest must disclose non-empty training lineage.")
@@ -231,7 +411,15 @@ def _load_policy_manifest(path: str | Path, *, expected_layout: str) -> Mapping[
     }
     if any(not isinstance(row, Mapping) or set(row) != lineage_fields for row in lineage):
         raise ValueError("Policy training-lineage rows differ from the formal schema.")
-    return {**dict(payload), "runs": sorted(normalized, key=lambda row: row["run_index"])}
+    normalized_payload = {
+        **dict(payload),
+        "runs": sorted(normalized, key=lambda row: row["run_index"]),
+    }
+    if method == "depi":
+        normalized_payload["m1_final_evaluations"] = [
+            m1_by_index[index] for index in range(10)
+        ]
+    return normalized_payload
 
 
 def _load_policies(manifest: Mapping[str, Any], config: RunConfig) -> tuple[Any, ...]:
@@ -244,7 +432,7 @@ def _load_policies(manifest: Mapping[str, Any], config: RunConfig) -> tuple[Any,
             policy = official_policy(params, official_config)
         else:
             deployment = load_deployment(path, config)
-            policy = OfficialDeltaPolicy(deployment)
+            policy = OfficialDEPIPolicy(deployment)
             assert_official_policy_surface(policy)
         policies.append(policy)
     return tuple(policies)
@@ -416,10 +604,80 @@ def _parse_result(value: str) -> tuple[str, str, Path]:
     return layout, method, Path(raw_path).resolve()
 
 
+def _summary_configs(values: Sequence[str]) -> Mapping[str, tuple[RunConfig, Path]]:
+    parsed: dict[str, tuple[RunConfig, Path]] = {}
+    for value in values:
+        try:
+            layout, raw_path = value.split("=", 1)
+        except ValueError as error:
+            raise ValueError("Summary configs must use LAYOUT=/path syntax.") from error
+        path = Path(raw_path).resolve()
+        config = load_config(path, run_kind="formal")
+        if config.environment.layout != layout:
+            raise ValueError("Summary config label disagrees with its layout.")
+        if layout in parsed:
+            raise ValueError(f"Duplicate summary config for {layout}.")
+        parsed[layout] = (config, path)
+    required = {"test_time_simple", "test_time_wide"}
+    if set(parsed) != required:
+        raise ValueError("Official summary requires one frozen config per layout.")
+    return parsed
+
+
+def _validate_raw_summary_source(
+    directory: Path,
+    *,
+    layout: str,
+    method: str,
+    config: RunConfig,
+) -> Mapping[str, Any]:
+    """Validate raw nodes, lineage, key schedule, and evaluation resources."""
+
+    identity = json.loads(
+        (directory / "run_identity.json").read_text(encoding="utf-8")
+    )
+    if (
+        identity.get("stage") != "official-10x10-evaluate"
+        or identity.get("layout") != layout
+        or identity.get("method") != method
+        or identity.get("official_source_commit") != OFFICIAL_SOURCE_COMMIT
+        or identity.get("evaluation_root_key")
+        != [0, OFFICIAL_EVALUATION_ROOT_SEED]
+        or int(identity.get("episodes_per_cell", -1)) != OFFICIAL_EPISODES
+        or identity.get("config_fingerprint") != config.fingerprint
+    ):
+        raise ValueError("Official evaluation identity disagrees with preregistration.")
+    manifest = identity.get("policy_manifest", {}).get("content")
+    if not isinstance(manifest, Mapping) or manifest.get("method") != method:
+        raise ValueError("Official result has no complete raw policy-node manifest.")
+    if len(manifest.get("runs", ())) != 10:
+        raise ValueError("Official result does not contain ten raw training nodes.")
+    runs = list(manifest["runs"])
+    if {int(row["run_index"]) for row in runs} != set(range(10)):
+        raise ValueError("Official result does not contain run nodes 0..9 exactly once.")
+    if len({str(row["run_id"]) for row in runs}) != 10:
+        raise ValueError("Official policy nodes do not have ten independent run ids.")
+    if len({str(row["parent_training_run_id"]) for row in runs}) != 10:
+        raise ValueError("Official policy nodes reuse a parent training run.")
+    if method != "depi" and manifest.get("policy_kind") != "official_ppo":
+        raise ValueError("A baseline must be raw evaluated runs, not a published point estimate.")
+    lineage = manifest.get("training_lineage")
+    if not isinstance(lineage, Sequence) or not lineage:
+        raise ValueError("Official policy lineage is incomplete.")
+    ledger = ResourceLedger.from_mapping(
+        json.loads((directory / "budget_ledger.json").read_text(encoding="utf-8"))
+    )
+    expected_steps = 100 * OFFICIAL_EPISODES * OFFICIAL_EPISODE_STEPS
+    if ledger.evaluation_steps != expected_steps:
+        raise ValueError("Official evaluation resource ledger is incomplete.")
+    return identity
+
+
 def run_official_summary(args: argparse.Namespace) -> None:
     validate_formal_repository_state()
     validate_registered_python_runtime()
     parsed = [_parse_result(value) for value in args.result]
+    configs = _summary_configs(args.config)
     index = {(layout, method): path for layout, method, path in parsed}
     expected = {
         (layout, method)
@@ -429,15 +687,26 @@ def run_official_summary(args: argparse.Namespace) -> None:
     if set(index) != expected:
         raise ValueError(
             "Formal summary requires Simple and Wide results for SP, SA, OP, FCP, "
-            f"and DELTA; missing={sorted(expected - set(index))}."
+            f"and DEPI; missing={sorted(expected - set(index))}."
         )
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    combined: dict[str, Any] = {"layouts": {}, "source_results": {}}
+    combined: dict[str, Any] = {
+        "version": 2,
+        "artifact_type": "depi_official_scoreboard_summary",
+        "method": METHOD_VERSION,
+        "official_protocol_version": OFFICIAL_PROTOCOL_VERSION,
+        "official_source_commit": OFFICIAL_SOURCE_COMMIT,
+        "layouts": {},
+        "source_results": {},
+        "statistical_preregistration": {},
+    }
     both_pass = True
     for layout in ("test_time_simple", "test_time_wide"):
+        config, config_path = configs[layout]
         cubes = {}
         summaries = {}
+        identities = {}
         for method in FORMAL_METHODS:
             directory = index[(layout, method)]
             rows = read_parquet(directory / "episode_returns.parquet")
@@ -447,32 +716,63 @@ def run_official_summary(args: argparse.Namespace) -> None:
                 raise ValueError("Official result rows disagree with their labels.")
             cubes[method] = rows_to_official_cube(rows)
             summaries[method] = official_scoreboard_summary(cubes[method])
-            identity = json.loads(
-                (directory / "run_identity.json").read_text(encoding="utf-8")
+            identity = _validate_raw_summary_source(
+                directory, layout=layout, method=method, config=config
             )
-            if (
-                identity.get("stage") != "official-10x10-evaluate"
-                or identity.get("layout") != layout
-                or identity.get("method") != method
-            ):
-                raise ValueError("Official evaluation identity disagrees with its label.")
+            identities[method] = identity
             combined["source_results"][f"{layout}:{method}"] = {
                 "path": str(directory),
                 "sha256": sha256_path(directory),
             }
+        lineage_sets = {}
+        for method in FORMAL_METHODS:
+            rows = identities[method]["policy_manifest"]["content"][
+                "training_lineage"
+            ]
+            lineage_sets[method] = {
+                "parent": {str(row["parent_training_run_id"]) for row in rows},
+                "checkpoint": {str(row["checkpoint_sha256"]) for row in rows},
+                "co_training_group": {
+                    str(row["co_training_group_id"])
+                    for row in rows
+                    if row["co_training_group_id"] is not None
+                },
+            }
+        for left_index, left in enumerate(FORMAL_METHODS):
+            for right in FORMAL_METHODS[left_index + 1 :]:
+                collisions = {
+                    name: lineage_sets[left][name] & lineage_sets[right][name]
+                    for name in lineage_sets[left]
+                }
+                collisions = {
+                    name: values for name, values in collisions.items() if values
+                }
+                if collisions:
+                    raise ValueError(
+                        "Formal method lineages are not run/family-disjoint: "
+                        f"{left}/{right}, collisions={sorted(collisions)}."
+                    )
         bootstrap = official_node_bootstrap(
             cubes,
-            delta_method="delta",
+            target_method="depi",
             baseline_methods=("sp", "state-augmented", "op", "fcp"),
             fcp_method="fcp",
             replicates=OFFICIAL_BOOTSTRAP_REPLICATES,
             seed=registered_bootstrap_seed(layout, "official-scoreboard"),
-            alpha=0.05,
+            alpha=float(config.evaluation.one_sided_alpha),
+            inference_mode=config.evaluation.inference_mode,
         )
         delivery_margin = OFFICIAL_CORRECT_DELIVERY_REWARD
-        xp_pass = bootstrap["delta_vs_best_baseline"]["one_sided_lcb"] > 0.0
+        comparison = bootstrap["depi_vs_best_baseline"]
+        superiority = registered_superiority_gate(
+            comparison,
+            lcb_threshold=float(config.evaluation.superiority_lcb_threshold),
+            minimum_effect=float(config.evaluation.minimum_effect),
+            minimum_effect_rule=config.evaluation.minimum_effect_rule,
+        )
+        xp_pass = superiority["passed"]
         competence_pass = (
-            bootstrap["delta_sp_minus_fcp_sp"]["one_sided_lcb"]
+            bootstrap["depi_sp_minus_fcp_sp"]["one_sided_lcb"]
             > -delivery_margin
         )
         both_pass = both_pass and xp_pass and competence_pass
@@ -480,8 +780,20 @@ def run_official_summary(args: argparse.Namespace) -> None:
             "methods": summaries,
             "bootstrap": bootstrap,
             "xp_gate_passed": xp_pass,
+            "superiority_lcb_passed": superiority["superiority_lcb_passed"],
+            "minimum_effect_passed": superiority["minimum_effect_passed"],
             "competence_gate_passed": competence_pass,
             "correct_delivery_margin": delivery_margin,
+        }
+        combined["statistical_preregistration"][layout] = {
+            "config": str(config_path),
+            "config_sha256": sha256_path(config_path),
+            "config_fingerprint": config.fingerprint,
+            "inference_mode": config.evaluation.inference_mode,
+            "one_sided_alpha": config.evaluation.one_sided_alpha,
+            "superiority_lcb_threshold": config.evaluation.superiority_lcb_threshold,
+            "minimum_effect": config.evaluation.minimum_effect,
+            "minimum_effect_rule": config.evaluation.minimum_effect_rule,
         }
     combined["primary_benchmark_gate_passed"] = both_pass
     combined["mechanism_claims_unlocked"] = False
@@ -497,6 +809,9 @@ def run_official_summary(args: argparse.Namespace) -> None:
             "bootstrap_replicates": OFFICIAL_BOOTSTRAP_REPLICATES,
             "one_sided_alpha": 0.05,
             "source_results": combined["source_results"],
+            "statistical_preregistration": combined[
+                "statistical_preregistration"
+            ],
         },
     )
     write_json(output / "official_scoreboard_summary.json", combined)
@@ -514,11 +829,11 @@ def run_official_summary(args: argparse.Namespace) -> None:
                     "xp_mean": summary["xp_mean"],
                     "xp_population_sd": summary["xp_population_sd"],
                     "gap_point": summary["gap_point"],
-                    "delta_vs_best_baseline_one_sided_lcb": (
-                        layout_result["bootstrap"]["delta_vs_best_baseline"][
+                    "depi_vs_best_baseline_one_sided_lcb": (
+                        layout_result["bootstrap"]["depi_vs_best_baseline"][
                             "one_sided_lcb"
                         ]
-                        if method == "delta"
+                        if method == "depi"
                         else ""
                     ),
                 }
@@ -532,11 +847,11 @@ def run_official_summary(args: argparse.Namespace) -> None:
     lines = [
         "# Official Table 2 Scoreboard",
         "",
-        "| Layout | Method | SP | XP | Gap point | DELTA LCB vs best baseline |",
+        "| Layout | Method | SP | XP | Gap point | DEPI LCB vs best baseline |",
         "|---|---|---:|---:|---:|---:|",
     ]
     for row in table_rows:
-        lcb = row["delta_vs_best_baseline_one_sided_lcb"]
+        lcb = row["depi_vs_best_baseline_one_sided_lcb"]
         lines.append(
             f"| {row['layout']} | {row['method']} | "
             f"{row['sp_mean']:.6f} ± {row['sp_population_sd']:.6f} | "
@@ -548,7 +863,7 @@ def run_official_summary(args: argparse.Namespace) -> None:
         (
             "",
             "Gap is a point estimate only; the fixed Official source does not "
-            "register a Gap standard-deviation formula. The DELTA lower bound "
+            "register a Gap standard-deviation formula. The DEPI lower bound "
             "uses 9,999 registered run-node bootstrap replicates.",
         )
     )
@@ -565,7 +880,7 @@ def _parse_capacity_result(value: str) -> tuple[str, str, Path]:
         raise ValueError("Capacity results use LAYOUT:METHOD=/path syntax.") from error
     if layout not in {"test_time_simple", "test_time_wide"}:
         raise ValueError(f"Unknown capacity layout: {layout}")
-    if method not in {"delta", "ippo-large"}:
+    if method not in {"depi", "ippo-large"}:
         raise ValueError(f"Unknown capacity method: {method}")
     return layout, method, Path(raw_path).resolve()
 
@@ -578,16 +893,24 @@ def run_capacity_summary(args: argparse.Namespace) -> None:
     expected = {
         (layout, method)
         for layout in ("test_time_simple", "test_time_wide")
-        for method in ("delta", "ippo-large")
+        for method in ("depi", "ippo-large")
     }
     if set(index) != expected:
-        raise ValueError("Capacity summary requires DELTA and IPPO-Large on both layouts.")
-    result: dict[str, Any] = {"layouts": {}, "source_results": {}}
+        raise ValueError("Capacity summary requires DEPI and IPPO-Large on both layouts.")
+    result: dict[str, Any] = {
+        "version": 2,
+        "artifact_type": "depi_capacity_control_summary",
+        "method": METHOD_VERSION,
+        "official_protocol_version": OFFICIAL_PROTOCOL_VERSION,
+        "official_source_commit": OFFICIAL_SOURCE_COMMIT,
+        "layouts": {},
+        "source_results": {},
+    }
     both_pass = True
     for layout in ("test_time_simple", "test_time_wide"):
         cubes = {}
         manifests = {}
-        for method in ("delta", "ippo-large"):
+        for method in ("depi", "ippo-large"):
             directory = index[(layout, method)]
             rows = read_parquet(directory / "episode_returns.parquet")
             if {str(row["layout"]) for row in rows} != {layout} or {
@@ -609,14 +932,14 @@ def run_capacity_summary(args: argparse.Namespace) -> None:
                 "path": str(directory),
                 "sha256": sha256_path(directory),
             }
-        target = int(manifests["delta"]["deployment_parameter_count"])
+        target = int(manifests["depi"]["deployment_parameter_count"])
         capacity_match = manifests["ippo-large"]["capacity_match"]
         if int(capacity_match["target_parameters"]) != target:
-            raise ValueError("IPPO-Large was not matched to this DELTA deployment size.")
+            raise ValueError("IPPO-Large was not matched to this DEPI deployment size.")
         comparison = official_two_method_bootstrap(
-            cubes["delta"],
+            cubes["depi"],
             cubes["ippo-large"],
-            left_name="delta",
+            left_name="depi",
             right_name="ippo-large",
             replicates=OFFICIAL_BOOTSTRAP_REPLICATES,
             seed=registered_bootstrap_seed(layout, "capacity-control"),
@@ -625,7 +948,7 @@ def run_capacity_summary(args: argparse.Namespace) -> None:
         passed = comparison["one_sided_lcb"] > 0.0
         both_pass = both_pass and passed
         result["layouts"][layout] = {
-            "delta": official_scoreboard_summary(cubes["delta"]),
+            "depi": official_scoreboard_summary(cubes["depi"]),
             "ippo_large": official_scoreboard_summary(cubes["ippo-large"]),
             "capacity_match": capacity_match,
             "bootstrap": comparison,
@@ -651,13 +974,13 @@ def run_capacity_summary(args: argparse.Namespace) -> None:
     lines = [
         "# Parameter-matched capacity control",
         "",
-        "| Layout | DELTA XP | IPPO-Large XP | DELTA−IPPO-Large LCB | Passed |",
+        "| Layout | DEPI XP | IPPO-Large XP | DEPI−IPPO-Large LCB | Passed |",
         "|---|---:|---:|---:|---:|",
     ]
     for layout in ("test_time_simple", "test_time_wide"):
         current = result["layouts"][layout]
         lines.append(
-            f"| {layout} | {current['delta']['xp_mean']:.6f} | "
+            f"| {layout} | {current['depi']['xp_mean']:.6f} | "
             f"{current['ippo_large']['xp_mean']:.6f} | "
             f"{current['bootstrap']['one_sided_lcb']:.6f} | "
             f"{current['capacity_explanation_rejected']} |"
@@ -668,7 +991,7 @@ def run_capacity_summary(args: argparse.Namespace) -> None:
 
 
 __all__ = [
-    "run_build_delta_policy_manifest",
+    "run_build_depi_policy_manifest",
     "run_capacity_summary",
     "run_official_evaluation",
     "run_official_summary",

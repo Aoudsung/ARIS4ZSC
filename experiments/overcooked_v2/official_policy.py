@@ -1,4 +1,4 @@
-"""Official evaluator adapter for the single DELTA-ZSC V6 actor."""
+"""Official evaluator adapter for the single deployable DEPI actor."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from experiments.overcooked_v2.deployment import (
 from src.path_c.counterfactual_anchor import tree_select
 
 
-class OfficialDeltaPolicy:
+class OfficialDEPIPolicy:
     """Duck-typed locked ``AbstractPolicy`` implementation."""
 
     def __init__(self, deployment: Deployment):
@@ -71,4 +71,4 @@ def assert_official_policy_surface(policy: Any) -> None:
         raise TypeError(f"Official policy exposes forbidden test hooks: {present}.")
 
 
-__all__ = ["OfficialDeltaPolicy", "assert_official_policy_surface"]
+__all__ = ["OfficialDEPIPolicy", "assert_official_policy_surface"]

@@ -19,6 +19,7 @@ from .types import LossBundle, RolloutBatch, TrainState, TrainingCoreState, Trai
 
 
 def gather_actions(values: Any, actions: Any, *, action_axis: int = -1) -> Any:
+    import jax
     import jax.numpy as jnp
 
     source = jnp.asarray(values)
@@ -159,32 +160,160 @@ def signature_loss(
     return total, fit, hinge_loss
 
 
+def decision_policy_loss(
+    *,
+    policy_logits: Any,
+    advantage_targets: Any,
+    action_mask: Any,
+    temperature: float,
+    confidence_weight: Any = 1.0,
+) -> Any:
+    """KL from empirical CRN continuation advantages to the actor policy.
+
+    The target distribution and confidence are stopped gradients.  This makes
+    legal all-action supervision alter executed action probabilities directly,
+    closing the former critic-to-actor control break.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    if float(temperature) <= 0.0:
+        raise ValueError("Decision-policy temperature must be positive.")
+    logits = jnp.asarray(policy_logits, dtype=jnp.float32)
+    valid = jnp.asarray(action_mask, dtype=jnp.float32)
+    target_advantage = jax.lax.stop_gradient(centered(advantage_targets))
+    masked_target_logits = target_advantage / float(temperature)
+    masked_target_logits = jnp.where(valid > 0.0, masked_target_logits, -1.0e9)
+    target_probability = jax.lax.stop_gradient(
+        jax.nn.softmax(masked_target_logits, axis=-1)
+    )
+    target_log_probability = jnp.log(jnp.maximum(target_probability, 1.0e-12))
+    policy_log_probability = jax.nn.log_softmax(logits, axis=-1)
+    per_anchor = jnp.sum(
+        target_probability * (target_log_probability - policy_log_probability),
+        axis=-1,
+    )
+    confidence = jax.lax.stop_gradient(
+        jnp.asarray(confidence_weight, dtype=jnp.float32)
+    )
+    confidence = jnp.broadcast_to(confidence, per_anchor.shape)
+    return jnp.sum(confidence * per_anchor) / jnp.maximum(
+        jnp.sum(confidence), 1.0
+    )
+
+
+def capability_consistency_loss(
+    capability_sequence: Any,
+    episode_starts: Any,
+    *,
+    update_period: int = 16,
+) -> Any:
+    """Penalize changes between non-overlapping same-episode ``u`` windows."""
+
+    import jax
+    import jax.numpy as jnp
+
+    values = jnp.asarray(capability_sequence, dtype=jnp.float32)
+    starts = jnp.asarray(episode_starts, dtype=jnp.bool_)
+    period = int(update_period)
+    if period <= 0:
+        raise ValueError("Capability update period must be positive.")
+    if values.shape[0] != starts.shape[0]:
+        raise ValueError("Capability sequence and episode markers must align.")
+    if values.shape[0] <= period:
+        return jnp.asarray(0.0, dtype=jnp.float32)
+    # Publication is aligned to episode-local time rather than the rollout's
+    # global index.  Reconstruct the local counter exactly from start flags so
+    # episodes that begin between global multiples of ``period`` are not
+    # silently omitted.
+    def count_step(previous: Any, start: Any) -> tuple[Any, Any]:
+        current = jnp.where(start, 1, previous + 1)
+        return current, current
+
+    _, local_steps = jax.lax.scan(
+        count_step, jnp.zeros_like(starts[0], dtype=jnp.int32), starts
+    )
+    indexes = jnp.arange(period, values.shape[0], dtype=jnp.int32)
+    previous_indexes = indexes - period
+    episode_ids = jnp.cumsum(starts.astype(jnp.int32), axis=0)
+    same_episode = episode_ids[indexes] == episode_ids[previous_indexes]
+    publication = (local_steps[indexes] % period == 0) & (
+        local_steps[indexes] > period
+    )
+    items = jnp.mean(
+        jnp.square(values[indexes] - values[previous_indexes]), axis=-1
+    )
+    weight = (same_episode & publication).astype(jnp.float32)
+    return jnp.sum(weight * items) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
 def signature_anchor_objective(*, model: Any, params: Any, anchors: Any, loss_v2: Any):
-    """Anchor-batch signature loss; contributes 0 while anchors are disabled."""
+    """Unified legal-anchor decision loss for critic and actor."""
 
     import jax.numpy as jnp
 
+    from .gradient_routing import parameters_for_loss
+
     zero = jnp.asarray(0.0, dtype=jnp.float32)
     if anchors is None:
-        return zero, {"signature_loss": zero, "signature_huber_loss": zero, "signature_hinge_loss": zero}
-    _, output = model.apply(
-        {"params": params},
+        return zero, {
+            "signature_loss": zero,
+            "signature_huber_loss": zero,
+            "signature_hinge_loss": zero,
+            "decision_policy_loss": zero,
+            "decision_supervision_confidence": zero,
+        }
+    _, signature_output = model.apply(
+        {"params": parameters_for_loss(params, loss_name="signature")},
         anchors.policy_states,
         anchors.observations,
         method=model.step,
     )
-    total, fit, hinge_loss = signature_loss(
-        raw_q1=output.raw_q1,
-        raw_q2=output.raw_q2,
+    _, decision_output = model.apply(
+        {"params": parameters_for_loss(params, loss_name="decision")},
+        anchors.policy_states,
+        anchors.observations,
+        method=model.step,
+    )
+    q_total, fit, hinge_loss = signature_loss(
+        raw_q1=signature_output.raw_q1,
+        raw_q2=signature_output.raw_q2,
         advantage_targets=anchors.fit_returns_by_action,
         action_mask=anchors.action_mask,
         hinge_margin=float(loss_v2.rank_hinge_margin),
         hinge_advantage_gap=float(loss_v2.rank_hinge_advantage_gap),
     )
+    replica_count = jnp.maximum(
+        jnp.asarray(anchors.replica_count, dtype=jnp.float32), 1.0
+    )
+    mean = jnp.asarray(anchors.return_sum_by_action, dtype=jnp.float32) / replica_count
+    second = (
+        jnp.asarray(anchors.return_squared_sum_by_action, dtype=jnp.float32)
+        / replica_count
+    )
+    standard_error = jnp.sqrt(
+        jnp.maximum(second - jnp.square(mean), 0.0) / replica_count
+    )
+    anchor_valid = jnp.any(
+        jnp.asarray(anchors.action_mask, dtype=jnp.bool_), axis=-1
+    ).astype(jnp.float32)
+    confidence = jnp.exp(-jnp.mean(standard_error, axis=-1)) * anchor_valid
+    policy_coupling = decision_policy_loss(
+        policy_logits=decision_output.policy_logits,
+        advantage_targets=anchors.fit_returns_by_action,
+        action_mask=anchors.action_mask,
+        temperature=float(getattr(loss_v2, "decision_policy_temperature", 1.0)),
+        confidence_weight=confidence,
+    )
+    policy_weight = float(getattr(loss_v2, "decision_policy_weight", 0.25))
+    total = q_total + policy_weight * policy_coupling
     return total, {
         "signature_loss": total,
         "signature_huber_loss": fit,
         "signature_hinge_loss": hinge_loss,
+        "decision_policy_loss": policy_coupling,
+        "decision_supervision_confidence": jnp.mean(confidence),
     }
 
 
@@ -218,6 +347,43 @@ def separation_loss(
     return jnp.sum(pair_weights * items) / jnp.maximum(jnp.sum(pair_weights), 1.0)
 
 
+def separation_anchor_objective(
+    *, model: Any, params: Any, separation_terms: Any
+) -> Any:
+    """Evaluate matched-pair separation on the current parameters."""
+
+    import jax.numpy as jnp
+
+    from .gradient_routing import parameters_for_loss
+
+    if separation_terms is None:
+        return jnp.asarray(0.0, dtype=jnp.float32)
+    pair_count = jnp.asarray(separation_terms.equivalent_mask).shape[0]
+    dropped = jnp.zeros((pair_count,), dtype=jnp.bool_)
+    owned_params = parameters_for_loss(params, loss_name="separation")
+    _, output_a = model.apply(
+        {"params": owned_params},
+        separation_terms.ego_state_a,
+        separation_terms.probe_observations[0],
+        dropped,
+        method=model.step,
+    )
+    _, output_b = model.apply(
+        {"params": owned_params},
+        separation_terms.ego_state_b,
+        separation_terms.probe_observations[1],
+        dropped,
+        method=model.step,
+    )
+    return separation_loss(
+        context_a=output_a.protocol_embedding,
+        context_b=output_b.protocol_embedding,
+        equivalent_mask=separation_terms.equivalent_mask,
+        margin=separation_terms.margin,
+        weights=separation_terms.weights,
+    )
+
+
 def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
     """Proper mixture NLL L_response over rollout transitions (§2.3)."""
 
@@ -228,9 +394,10 @@ def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
         mixture_response_loss,
         official_partner_observation_planes,
     )
+    from .gradient_routing import parameters_for_loss
 
     _, prediction = model.apply(
-        {"params": params},
+        {"params": parameters_for_loss(params, loss_name="response")},
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
@@ -253,7 +420,16 @@ def response_objective(*, model: Any, params: Any, batch: RolloutBatch):
     }
 
 
-def compute_loss(*, model: Any, params: Mapping[str, Any], batch: RolloutBatch, config: Any, anchors: Any = None, separation_terms: Any = None) -> LossBundle:
+def compute_loss(
+    *,
+    model: Any,
+    params: Mapping[str, Any],
+    batch: RolloutBatch,
+    config: Any,
+    anchors: Any = None,
+    separation_terms: Any = None,
+    auxiliary_active: Any = True,
+) -> LossBundle:
     """Combined four-loss objective at the current parameters (§3.1/§3.3).
 
     ``separation_terms`` is the §3.2 ``SeparationTerms`` payload: its
@@ -262,10 +438,13 @@ def compute_loss(*, model: Any, params: Mapping[str, Any], batch: RolloutBatch, 
     live gradient (§3.4 ownership: capability/protocol encoders).
     """
 
+    import jax
     import jax.numpy as jnp
 
+    from .gradient_routing import parameters_for_loss
+
     _, output = model.apply(
-        {"params": params},
+        {"params": parameters_for_loss(params, loss_name="ppo")},
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
@@ -306,61 +485,92 @@ def compute_loss(*, model: Any, params: Mapping[str, Any], batch: RolloutBatch, 
     response_total, response_metrics = response_objective(
         model=model, params=params, batch=batch
     )
-    signature_total, signature_metrics = signature_anchor_objective(
-        model=model, params=params, anchors=anchors, loss_v2=config.loss_v2
-    )
-    # §3.2/§3.4: L_separation is re-evaluated here on the *current* params so
-    # it joins this same value_and_grad; only the §5.3 classification
-    # (masks/weights/margin) is a precomputed constant carried in the payload.
-    if separation_terms is None:
-        separation_total = jnp.asarray(0.0, dtype=jnp.float32)
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+
+    def active_anchor_terms(_: Any):
+        signature, signature_values = signature_anchor_objective(
+            model=model, params=params, anchors=anchors, loss_v2=config.loss_v2
+        )
+        separation = separation_anchor_objective(
+            model=model, params=params, separation_terms=separation_terms
+        )
+        return signature, separation, signature_values
+
+    def inactive_anchor_terms(_: Any):
+        return zero, zero, {
+            "signature_loss": zero,
+            "signature_huber_loss": zero,
+            "signature_hinge_loss": zero,
+            "decision_policy_loss": zero,
+            "decision_supervision_confidence": zero,
+        }
+
+    if anchors is None and separation_terms is None:
+        signature_total, separation_total, signature_metrics = (
+            inactive_anchor_terms(None)
+        )
     else:
-        pair_count = jnp.asarray(separation_terms.equivalent_mask).shape[0]
-        dropped = jnp.zeros((pair_count,), dtype=jnp.bool_)
-        _, output_a = model.apply(
-            {"params": params},
-            separation_terms.ego_state_a,
-            separation_terms.probe_observations[0],
-            dropped,
-            method=model.step,
-        )
-        _, output_b = model.apply(
-            {"params": params},
-            separation_terms.ego_state_b,
-            separation_terms.probe_observations[1],
-            dropped,
-            method=model.step,
-        )
-        separation_total = separation_loss(
-            context_a=output_a.protocol_embedding,
-            context_b=output_b.protocol_embedding,
-            equivalent_mask=separation_terms.equivalent_mask,
-            margin=separation_terms.margin,
-            weights=separation_terms.weights,
+        signature_total, separation_total, signature_metrics = jax.lax.cond(
+            jnp.asarray(auxiliary_active, dtype=jnp.bool_),
+            active_anchor_terms,
+            inactive_anchor_terms,
+            operand=None,
         )
 
+    variant = str(getattr(config, "method_variant", "b2")).lower()
+    if variant not in {"b0", "b1", "b2"}:
+        raise ValueError("The combined loss supports only implemented B0--B2 variants.")
+    decision_weight = 1.0 if variant == "b2" else 0.0
+    architecture_weight = 1.0 if variant in {"b1", "b2"} else 0.0
+    capability_stability = capability_consistency_loss(
+        output.capability, batch.episode_starts
+    )
     total = (
         ppo_total
-        + float(config.loss_v2.signature_weight) * signature_total
-        + float(config.loss_v2.response_weight) * response_total
-        + float(config.loss_v2.separation_weight) * separation_total
+        + decision_weight * float(config.loss_v2.signature_weight) * signature_total
+        + architecture_weight * float(config.loss_v2.response_weight) * response_total
+        + decision_weight * float(config.loss_v2.separation_weight) * separation_total
+        + architecture_weight
+        * float(getattr(config.loss_v2, "capability_consistency_weight", 0.01))
+        * capability_stability
+    )
+    anchor_valid_count = (
+        zero
+        if anchors is None
+        else jnp.sum(
+            jnp.any(jnp.asarray(anchors.action_mask), axis=-1).astype(jnp.float32)
+        )
+    )
+    auxiliary_indicator = (
+        jnp.asarray(auxiliary_active, dtype=jnp.float32) * decision_weight
     )
     return LossBundle(total, {
         **actor_metrics,
         **response_metrics,
         **signature_metrics,
         "separation_loss": separation_total,
+        "capability_consistency_loss": capability_stability,
+        "anchor_effective_sample_size": auxiliary_indicator * anchor_valid_count,
+        "anchor_use_count_max": auxiliary_indicator,
+        "anchor_auxiliary_actual_total_weight": auxiliary_indicator
+        * (
+            float(config.loss_v2.signature_weight)
+            + float(config.loss_v2.separation_weight)
+        ),
+        "auxiliary_gradient_norm": zero,
         "ppo_total_loss": ppo_total,
         "total_loss": total,
+        "method_variant_code": jnp.asarray({"b0": 0, "b1": 1, "b2": 2}[variant], dtype=jnp.float32),
         "value_loss": value,
         "entropy": entropy,
         "mean_raw_reward": jnp.mean(batch.rewards),
         "mean_shaped_reward": jnp.mean(batch.shaped_rewards),
         "mean_posterior_entropy": jnp.mean(output.posterior_entropy[:-1]),
         "context_dropout_fraction": jnp.mean(batch.context_dropout_masks[:-1].astype(jnp.float32)),
-        # The policy logits already condition on (x, u, c); the k1 estimate
-        # therefore includes every context-pathway parameter effect (§3.4).
-        "combined_policy_kl": actor_metrics["approx_kl"],
+        # This objective is evaluated before the optimizer transaction.  The
+        # registered post-update KL is computed in
+        # ``apply_training_core_update`` after the candidate parameters exist.
+        "combined_policy_kl": jnp.asarray(0.0, dtype=jnp.float32),
     })
 
 
@@ -407,7 +617,49 @@ def merge_training_core(state: TrainState, core: TrainingCoreState) -> TrainStat
     return state._replace(params=core.params, target_params=core.target_params, ppo_optimizer_state=core.ppo_optimizer_state)
 
 
-def apply_training_core_update(*, model: Any, core: TrainingCoreState, optimizer: Any, batch: RolloutBatch, config: Any, anchors: Any = None, separation_terms: Any = None):
+def post_update_combined_policy_kl(*, model: Any, params: Any, batch: RolloutBatch) -> Any:
+    """Behaviour-vs-updated-policy KL over the complete recurrent pathway.
+
+    The forward pass is deliberately performed after the optimizer update and
+    replays ``(x, u, c)`` from the registered rollout batch.  This closes the
+    gap where the pre-update PPO diagnostic was previously relabelled as a
+    post-update combined-policy KL.
+    """
+
+    import jax.numpy as jnp
+
+    _, output = model.apply(
+        {"params": params},
+        batch.initial_policy_state,
+        batch.observations,
+        batch.previous_actions,
+        batch.episode_starts,
+        batch.context_dropout_masks,
+        method=model.sequence,
+    )
+    new_log_probability = categorical_log_probability(
+        output.policy_logits[:-1], batch.actions
+    )
+    old_log_probability = jnp.asarray(
+        batch.old_log_probabilities, dtype=jnp.float32
+    )
+    weight = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    return jnp.sum(
+        weight * (old_log_probability - new_log_probability)
+    ) / jnp.maximum(jnp.sum(weight), 1.0)
+
+
+def apply_training_core_update(
+    *,
+    model: Any,
+    core: TrainingCoreState,
+    optimizer: Any,
+    batch: RolloutBatch,
+    config: Any,
+    anchors: Any = None,
+    separation_terms: Any = None,
+    auxiliary_active: Any = True,
+):
     """One combined gradient step over all four losses (§3.3)."""
 
     import jax
@@ -418,23 +670,60 @@ def apply_training_core_update(*, model: Any, core: TrainingCoreState, optimizer
         loss = compute_loss(
             model=model, params=candidate, batch=batch, config=config,
             anchors=anchors, separation_terms=separation_terms,
+            auxiliary_active=auxiliary_active,
         )
         return loss.total, loss.metrics
 
     (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(core.params)
+    variant = str(getattr(config, "method_variant", "b2")).lower()
+    if variant == "b2" and (anchors is not None or separation_terms is not None):
+        def anchor_objective(candidate_params: Any) -> Any:
+            signature, _ = signature_anchor_objective(
+                model=model,
+                params=candidate_params,
+                anchors=anchors,
+                loss_v2=config.loss_v2,
+            )
+            separation = separation_anchor_objective(
+                model=model,
+                params=candidate_params,
+                separation_terms=separation_terms,
+            )
+            return (
+                float(config.loss_v2.signature_weight) * signature
+                + float(config.loss_v2.separation_weight) * separation
+            )
+
+        auxiliary_gradients = jax.lax.cond(
+            jnp.asarray(auxiliary_active, dtype=jnp.bool_),
+            lambda _: jax.grad(anchor_objective)(core.params),
+            lambda _: jax.tree_util.tree_map(jnp.zeros_like, core.params),
+            operand=None,
+        )
+        auxiliary_gradient_norm = optax.global_norm(auxiliary_gradients)
+    else:
+        auxiliary_gradient_norm = jnp.asarray(0.0, dtype=jnp.float32)
     updates, optimizer_state = optimizer.update(gradients, core.ppo_optimizer_state, core.params)
     params = optax.apply_updates(core.params, updates)
     candidate = TrainingCoreState(params, core.target_params, optimizer_state)
     leaves = jax.tree_util.tree_leaves((candidate.params, candidate.ppo_optimizer_state))
     finite = jnp.isfinite(metrics["total_loss"]) & jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in leaves]))
     committed = jax.lax.cond(finite, lambda _: candidate, lambda _: core, operand=None)
-    kl_stop = metrics["combined_policy_kl"] > float(
-        config.loss_v2.combined_policy_kl_threshold
+    combined_policy_kl = post_update_combined_policy_kl(
+        model=model, params=committed.params, batch=batch
     )
+    finite = finite & jnp.isfinite(combined_policy_kl)
+    committed = jax.lax.cond(finite, lambda _: committed, lambda _: core, operand=None)
+    kl_stop = finite & (combined_policy_kl > float(
+        config.loss_v2.combined_policy_kl_threshold
+    ))
     return committed, {
         **metrics,
+        "auxiliary_gradient_norm": auxiliary_gradient_norm,
+        "combined_policy_kl": combined_policy_kl,
         "optimizer_applied": finite.astype(jnp.float32),
         "nonfinite_update": (~finite).astype(jnp.float32),
+        "nonfinite_failure": (~finite).astype(jnp.float32),
         "kl_early_stop": kl_stop.astype(jnp.float32),
     }
 
@@ -442,11 +731,11 @@ def apply_training_core_update(*, model: Any, core: TrainingCoreState, optimizer
 def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any, batch: RolloutBatch, schedule: Any, config: Any, anchors: Any = None, separation_terms: Any = None):
     """Scan minibatches with the §3.4 early-stop on combined_policy_kl.
 
-    ``anchors`` and ``separation_terms`` are anchor-batch-global payloads
-    (§5 matched-pair separation data path); they are shared by every
-    minibatch step of the scan, never lane-sliced.  The separation payload
-    carries states/observations/masks; the loss forward passes execute on
-    the scan's current params inside ``compute_loss`` (§3.2).
+    ``anchors`` and ``separation_terms`` are anchor-batch-global payloads.
+    They participate in exactly the first optimizer transaction of an outer
+    update, so each anchor is used at most once and its scientific weight is
+    invariant to PPO epoch/minibatch counts.  Later scan steps execute PPO and
+    transition-response losses only.
     """
 
     import jax
@@ -455,19 +744,26 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
     indexes = jnp.asarray(schedule, dtype=jnp.int32)
     flat = indexes.reshape((-1, indexes.shape[-1]))
 
-    def one(carry: tuple[Any, Any], lane_indexes: Any):
+    def one(carry: tuple[Any, Any], values: tuple[Any, Any]):
         current, active = carry
+        lane_indexes, scan_index = values
 
         def apply(value: Any):
             updated, metrics = apply_training_core_update(
                 model=model, core=value, optimizer=optimizer,
                 batch=slice_rollout_lanes(batch, lane_indexes), config=config,
                 anchors=anchors, separation_terms=separation_terms,
+                auxiliary_active=scan_index == 0,
             )
             stop = (metrics["nonfinite_update"] > 0.5) | (metrics["kl_early_stop"] > 0.5)
             return updated, {
                 **metrics,
-                "training_aborted": stop.astype(jnp.float32),
+                # A valid KL stop is a schedule decision, not a numerical
+                # failure.  Keep the legacy field as a strict alias of the
+                # non-finite condition while callers migrate.
+                "nonfinite_failure": metrics["nonfinite_update"],
+                "training_aborted": metrics["nonfinite_update"],
+                "minibatch_skipped": jnp.asarray(0.0, dtype=jnp.float32),
             }
 
         def skip(value: Any):
@@ -478,22 +774,35 @@ def scan_training_updates(*, model: Any, core: TrainingCoreState, optimizer: Any
                 "response_position_loss": zero, "response_direction_loss": zero,
                 "response_inventory_loss": zero, "response_event_loss": zero,
                 "signature_loss": zero, "signature_huber_loss": zero,
-                "signature_hinge_loss": zero, "separation_loss": zero,
+                "signature_hinge_loss": zero, "decision_policy_loss": zero,
+                "decision_supervision_confidence": zero, "separation_loss": zero,
+                "capability_consistency_loss": zero,
+                "anchor_effective_sample_size": zero,
+                "anchor_use_count_max": zero,
+                "anchor_auxiliary_actual_total_weight": zero,
+                "auxiliary_gradient_norm": zero,
                 "ppo_total_loss": zero, "total_loss": zero, "value_loss": zero,
                 "entropy": zero, "mean_raw_reward": zero, "mean_shaped_reward": zero,
                 "mean_posterior_entropy": zero, "context_dropout_fraction": zero,
+                "method_variant_code": zero,
                 "combined_policy_kl": zero, "optimizer_applied": zero,
-                "nonfinite_update": zero, "kl_early_stop": zero,
-                "training_aborted": jnp.asarray(1.0),
+                "nonfinite_update": zero, "nonfinite_failure": zero,
+                "kl_early_stop": zero, "training_aborted": zero,
+                "minibatch_skipped": jnp.asarray(1.0),
             }
 
         updated, metrics = jax.lax.cond(active, apply, skip, current)
         return (
             updated,
-            active & (metrics["training_aborted"] < 0.5),
+            active
+            & (metrics["nonfinite_update"] < 0.5)
+            & (metrics["kl_early_stop"] < 0.5),
         ), metrics
 
-    (final, _), metrics = jax.lax.scan(one, (core, jnp.asarray(True)), flat)
+    scan_indexes = jnp.arange(flat.shape[0], dtype=jnp.int32)
+    (final, _), metrics = jax.lax.scan(
+        one, (core, jnp.asarray(True)), (flat, scan_indexes)
+    )
     return final, metrics
 
 
@@ -521,6 +830,32 @@ def environment_minibatch_schedule(key: Any, *, environment_count: int, minibatc
     return jnp.stack([jax.random.permutation(k, environment_count).reshape((minibatches_per_epoch, lane_count)) for k in keys])
 
 
+def adapt_effective_update_epochs(
+    kl_early_stop: Any,
+    *,
+    current_epochs: int,
+    maximum_epochs: int,
+    minimum_epochs: int = 2,
+) -> tuple[int, float, bool]:
+    """Apply the registered next-update epoch response to any KL stop event."""
+
+    import numpy as np
+
+    current = int(current_epochs)
+    maximum = int(maximum_epochs)
+    minimum = int(minimum_epochs)
+    if not 1 <= minimum <= current <= maximum:
+        raise ValueError("Effective PPO epoch bounds are inconsistent.")
+    events = np.asarray(kl_early_stop, dtype=np.float32).reshape((-1,)) > 0.5
+    if events.size == 0:
+        raise ValueError("KL-stop telemetry cannot be empty.")
+    fraction = float(np.mean(events))
+    occurred = bool(np.any(events))
+    if occurred:
+        return max(minimum, current - 1), fraction, True
+    return min(maximum, current + 1), fraction, False
+
+
 def apply_training_update(*, model: Any, state: TrainState, optimizer: Any, batch: RolloutBatch, config: Any, anchors: Any = None, separation_terms: Any = None) -> TrainingUpdate:
     core, metrics = apply_training_core_update(
         model=model, core=training_core_state(state), optimizer=optimizer,
@@ -530,13 +865,14 @@ def apply_training_update(*, model: Any, state: TrainState, optimizer: Any, batc
 
 
 __all__ = [
-    "apply_training_core_update", "apply_training_update",
-    "categorical_entropy", "categorical_log_probability", "centered",
-    "clipped_value_loss", "compute_loss", "environment_minibatch_schedule",
+    "adapt_effective_update_epochs", "apply_training_core_update", "apply_training_update",
+    "capability_consistency_loss", "categorical_entropy", "categorical_log_probability", "centered",
+    "clipped_value_loss", "compute_loss", "decision_policy_loss", "environment_minibatch_schedule",
     "gather_actions", "generalized_advantage_estimation", "huber",
     "make_optimizer", "merge_training_core", "official_learning_rate_schedule",
     "official_reward_shaping_factor", "polyak_update", "ppo_actor_loss",
-    "response_objective", "scan_training_updates", "separation_loss",
+    "post_update_combined_policy_kl",
+    "response_objective", "scan_training_updates", "separation_anchor_objective", "separation_loss",
     "signature_anchor_objective", "signature_loss", "slice_rollout_lanes",
     "training_core_state",
 ]

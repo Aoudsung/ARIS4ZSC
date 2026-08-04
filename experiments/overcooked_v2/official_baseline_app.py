@@ -301,10 +301,10 @@ def run_official_baseline(args: argparse.Namespace) -> None:
     runtime = validate_official_runtime()
     capacity_match = None
     if method == "ippo-large":
-        if args.delta_deployment is None:
-            raise ValueError("IPPO-Large requires --delta-deployment.")
+        if args.depi_deployment is None:
+            raise ValueError("IPPO-Large requires --depi-deployment.")
         target_count, observation_shape = _deployment_parameter_count(
-            args.delta_deployment
+            args.depi_deployment
         )
         capacity_match = _select_ippo_large_dimension(
             layout=layout,
@@ -316,8 +316,8 @@ def run_official_baseline(args: argparse.Namespace) -> None:
             hidden_dimension=capacity_match["hidden_dimension"],
         )
     else:
-        if args.delta_deployment is not None:
-            raise ValueError("--delta-deployment is only valid for IPPO-Large.")
+        if args.depi_deployment is not None:
+            raise ValueError("--depi-deployment is only valid for IPPO-Large.")
         resolved = compose_official_baseline_config(
             layout=layout, method=method, fcp_population=fcp_population
         )

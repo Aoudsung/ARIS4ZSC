@@ -1,18 +1,19 @@
 """Heuristic partner family for the §7.3 static wide partner pool.
 
-METHOD_SPEC §7.3 registers two scripted partners alongside the 60 trained
-checkpoints: a greedy courier and a stationary helper.  The family is held
-out of training pools and reserved for testing
+METHOD_SPEC §7.3 registers two scripted partners as a checkpoint-free
+family-disjoint test panel: a greedy courier and a stationary helper.  The
+family is held out of training pools and reserved for testing
 (``HEURISTIC_FAMILY_TEST_ONLY``), so evaluation can report zero-shot
 coordination against behaviour never seen during training.
 
 Both partners implement the standard ``PartnerFunctions`` interface with
 ``source == 3`` and run ids ``20_000 + member`` (kept disjoint from the
-static-pool range ``10_000 + member`` and the generator ranges ``-1``/``-2``).
+trained static-pool range ``10_000 + member``).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Mapping, NamedTuple
 
 from .runner import PartnerFunctions
@@ -23,20 +24,69 @@ HEURISTIC_FAMILY_TEST_ONLY = True
 HEURISTIC_COURIER = 0
 HEURISTIC_STATIONARY_HELPER = 1
 
-# Official action layout: 0 noop, 1 north, 2 south, 3 west, 4 east, 5 interact.
-ACTION_NOOP = 0
-ACTION_NORTH = 1
-ACTION_SOUTH = 2
-ACTION_WEST = 3
-ACTION_EAST = 4
+# Pinned Official action layout (``official_adapter.ACTION_ORDER``):
+# right, down, left, up, stay, interact.
+ACTION_EAST = 0
+ACTION_SOUTH = 1
+ACTION_WEST = 2
+ACTION_NORTH = 3
+ACTION_NOOP = 4
 ACTION_INTERACT = 5
 
-# Pinned encoder layout (response_targets.official_partner_observation_planes):
-# each agent block starts with a one-hot position plane; the *self* agent of a
-# partner observation occupies channel 0.
+# Retained public constant for the observing agent's self plane.  Courier
+# targeting uses the pinned *other-agent* plane computed from the full channel
+# contract below.
 EGO_POSITION_CHANNEL = 0
 
 HEURISTIC_RUN_ID_BASE = 20_000
+HEURISTIC_RUN_NAMES = ("heuristic-greedy-courier", "heuristic-stationary-helper")
+
+
+@dataclass(frozen=True, slots=True)
+class HeuristicPanelMember:
+    run_id: str
+    generation_mechanism: str = "heuristic"
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialHeuristicPolicy:
+    """Official-evaluator compatible deterministic heuristic policy."""
+
+    member: int
+
+    def __post_init__(self) -> None:
+        if int(self.member) not in {HEURISTIC_COURIER, HEURISTIC_STATIONARY_HELPER}:
+            raise ValueError("Unknown heuristic panel member.")
+
+    def init_hstate(self, batch_size: int) -> Any:
+        import jax.numpy as jnp
+
+        return jnp.zeros((int(batch_size), 1), dtype=jnp.int32)
+
+    def compute_action(
+        self, observation: Any, done: Any, hstate: Any, key: Any
+    ) -> tuple[Any, Any]:
+        import jax.numpy as jnp
+
+        del done, key
+        action = (
+            _courier_action(observation)
+            if int(self.member) == HEURISTIC_COURIER
+            else jnp.asarray(ACTION_NOOP, dtype=jnp.int32)
+        )
+        return jnp.asarray(action, dtype=jnp.int32), hstate
+
+
+def official_heuristic_panel() -> tuple[tuple[HeuristicPanelMember, OfficialHeuristicPolicy], ...]:
+    """Return the two virtual, checkpoint-free family-disjoint partners."""
+
+    return tuple(
+        (
+            HeuristicPanelMember(run_id=HEURISTIC_RUN_NAMES[member]),
+            OfficialHeuristicPolicy(member=member),
+        )
+        for member in range(HEURISTIC_PARTNER_COUNT)
+    )
 
 
 class HeuristicPartnerState(NamedTuple):
@@ -53,7 +103,13 @@ def _courier_action(observation: Any) -> Any:
 
     import jax.numpy as jnp
 
-    grid = jnp.asarray(observation, dtype=jnp.float32)[..., EGO_POSITION_CHANNEL]
+    from .task_encoder import official_partner_channel_indexes
+
+    observation_array = jnp.asarray(observation, dtype=jnp.float32)
+    other_position_channel = official_partner_channel_indexes(
+        observation_array.shape[-1]
+    )[0]
+    grid = observation_array[..., other_position_channel]
     flat = grid.reshape((-1,))
     target = jnp.argmax(flat)
     rows, cols = grid.shape[-2], grid.shape[-1]
@@ -65,9 +121,10 @@ def _courier_action(observation: Any) -> Any:
     centre_col = jnp.asarray(cols // 2, dtype=jnp.int32)
     delta_row = target_row - centre_row
     delta_col = target_col - centre_col
-    adjacent = (jnp.abs(delta_row) + jnp.abs(delta_col)) <= 1
-    return jnp.where(
-        adjacent,
+    distance = jnp.abs(delta_row) + jnp.abs(delta_col)
+    visible = jnp.any(grid > 0.0)
+    action = jnp.where(
+        distance == 1,
         ACTION_INTERACT,
         jnp.where(
             delta_row < 0,
@@ -78,6 +135,11 @@ def _courier_action(observation: Any) -> Any:
                 jnp.where(delta_col < 0, ACTION_WEST, ACTION_EAST),
             ),
         ),
+    )
+    return jnp.where(
+        visible,
+        action,
+        ACTION_NOOP,
     )
 
 
@@ -103,7 +165,7 @@ def make_heuristic_partner_functions(*, action_count: int = 6) -> PartnerFunctio
         episode_start: Any,
         keys: Any,
     ):
-        del parameters, episode_start, keys
+        del parameters, episode_start
         observation_array = jnp.asarray(observations, dtype=jnp.float32)
         courier = jax.vmap(_courier_action)(observation_array)
         stationary = jnp.full(
@@ -157,9 +219,8 @@ def make_heuristic_partner_functions(*, action_count: int = 6) -> PartnerFunctio
         return {
             "source": jnp.full((count,), 3, dtype=jnp.int32),
             "member": context.member,
-            "code": jnp.asarray(context.member, dtype=jnp.float32)[:, None],
-            "generator_logits": jnp.zeros((count, 6), dtype=jnp.float32),
-            "generator_value": jnp.zeros((count,), dtype=jnp.float32),
+            "family_id": jnp.zeros((count,), dtype=jnp.int32),
+            "checkpoint_stage": jnp.ones((count,), dtype=jnp.float32),
         }
 
     return PartnerFunctions(initial_state, step, observe, run_id, diagnostics)
@@ -176,9 +237,13 @@ __all__ = [
     "HEURISTIC_COURIER",
     "HEURISTIC_FAMILY_TEST_ONLY",
     "HEURISTIC_PARTNER_COUNT",
+    "HEURISTIC_RUN_NAMES",
     "HEURISTIC_RUN_ID_BASE",
     "HEURISTIC_STATIONARY_HELPER",
     "HeuristicPartnerContext",
+    "HeuristicPanelMember",
     "HeuristicPartnerState",
+    "OfficialHeuristicPolicy",
     "make_heuristic_partner_functions",
+    "official_heuristic_panel",
 ]

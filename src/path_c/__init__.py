@@ -1,4 +1,4 @@
-"""Active DELTA-ZSC V6 end-to-end Bayes coordination implementation."""
+"""Active DEPI legal-history protocol-inference implementation."""
 
 from .experiment import (
     CONFIG_VERSION,

@@ -1,146 +1,87 @@
-# ARIS4ZSC — DELTA-ZSC V6
+# ARIS4ZSC — DEPI
 
-This branch contains the implementation candidate for **DELTA-ZSC-E2E**, an
-end-to-end Bayes-coordination agent for OvercookedV2 zero-shot coordination.
+DEPI（Decision-Equivalent Protocol Inference）是面向 OvercookedV2 Test-Time
+Protocol Formation 赛道的零样本协作方法。当前代码身份为：
 
-```text
-METHOD_VERSION = delta_zsc_v6_end_to_end_bayes_coordination
-CONFIG_VERSION = 9
-MANIFEST_VERSION = 2
-OFFICIAL_PROTOCOL_VERSION = overcooked_v2_iclr2025_5ce1707_v1
-```
+- `METHOD_VERSION = depi_exact_filter_decision_supervision_v5`
+- `CONFIG_VERSION = 14`
+- `CHECKPOINT_SCHEMA_VERSION = 5`
+- deployment artifact：`DEPI`
 
-## Status and evidence boundary
+旧方法、checkpoint、优化器和训练产物不兼容；历史设计仅保存在
+[`docs/legacy/`](docs/legacy/README.md)。
 
-V6 is an implementation candidate. Unit tests, mechanical runs and CUDA
-preflights can establish only that the registered computation is executable and
-reproducible. They do not establish ZSC effectiveness. Scientific conclusions
-require the frozen ten-run Simple and Wide Official matrices, the common-partner
-scoreboards and complete resource ledgers.
+## 权威入口
 
-V4.4 remains reproducible on `codex/path-c-simplification`; its reports are in
-[`docs/legacy/v44`](docs/legacy/v44/README.md). V5 r2/r3 remains available in git
-history before the V6 replacement commit. V5 checkpoints, optimizers, replay,
-generator and calibration artifacts are deliberately incompatible with V6.
+实现和实验只能以以下四份文档为准：
 
-## Active method
+1. [`docs/SCIENTIFIC_SPEC.md`](docs/SCIENTIFIC_SPEC.md)：问题、合法信息边界与可证伪主张；
+2. [`docs/METHOD_SPEC.md`](docs/METHOD_SPEC.md)：模型、损失、anchor、状态与 artifact 契约；
+3. [`docs/EVALUATION_SPEC.md`](docs/EVALUATION_SPEC.md)：开发矩阵、正式评估与机制归因；
+4. [`docs/THEORY.md`](docs/THEORY.md)：理论保证和不能声称的内容。
 
-The deployable policy is one fixed-size path:
+固定正式协议见
+[`docs/FORMAL_EXPERIMENT_PROTOCOL.md`](docs/FORMAL_EXPERIMENT_PROTOCOL.md)。
+
+## 当前方法
 
 ```text
-legal observation/action/done history
-    -> Official CNN + task GRU
-    -> diagonal-Gaussian partner belief
-    -> one continuously belief-conditioned actor
-    -> stochastic environment action
+合法 ego 历史
+  ├─ 当前 task-only 观测 ──> task GRU x_t
+  ├─ 观测差 + ego 前一动作 ──> 慢时标 capability u_t
+  └─ 共享 response likelihood + sticky transition ──> 精确离散滤波 pi_t
+                                                      └─> c_t = sum pi_t,k m_k
+
+(x_t, u_t, c_t) ──> 单一 actor / dueling critic
 ```
 
-The deployment bundle additionally retains one shaped-return value head, twin
-raw-return Q heads and the structured partner-response decoder. Training adds a
-live and EMA continuous partner generator, EMA policy/Q targets and a softly
-weighted counterfactual replay. None of those training-only objects is used as a
-partner-ID router.
+B1/B2 在进入 task GRU 前清零全部 other-agent semantic planes，因此伙伴历史不能
+藏入 task carry。协议 carry 就是类别后验 `pi_t`，不存在额外 recognition GRU。
+四个正式 component 是可交换的 value-signature bases，不对应 SP、OP、SA 或 FCP。
 
-The primary method has no base/residual split, hard gate, deployment tier,
-fallback policy, qualification-controlled loss, target-policy epoch or generator
-admission state. C0–C5 labels survive only in the post-training `audit-signals`
-report and cannot affect training, checkpoint selection, deployment or formal
-samples.
+训练目标为 PPO、联合 response NLL、真实 continuation decision supervision 和
+matched-pair separation。反事实标签只使用 128 步 CRN raw-return continuation；不使用
+学习到的端点值。actor 直接拟合由真实 all-action continuation 形成的动作分布。
 
-The confirm-track binding design is
-[`docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md`](docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md).
-The fixed benchmark and claim protocol is
-[`docs/FORMAL_EXPERIMENT_PROTOCOL.md`](docs/FORMAL_EXPERIMENT_PROTOCOL.md).
-The research program entry point is
-[`docs/RESEARCH_PROGRAM.md`](docs/RESEARCH_PROGRAM.md).
-The confirm-track protocol index is
-[`docs/PROTOCOL_INDEX.md`](docs/PROTOCOL_INDEX.md).
+## 开发矩阵
 
-## Runtime
+- B0：容量匹配的 full-observation recurrent PPO；
+- B1：加入 task/protocol 结构隔离、精确滤波和 response likelihood；
+- B2：加入合法 all-action decision supervision 与 matched-pair separation；
+- B3：尚未实现；任何配置或报告都必须 fail closed，不得把它计作完成层级。
 
-Use Python 3.10 and the exact Official source commit
-`5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`. JaxMARL and
-`overcooked_v2_experiments` must both come from that clean source tree.
+开发期同时执行 `K in {2,4,8}` 敏感性；正式配置固定 `K=4`。
+
+## 环境与测试
+
+正式运行要求 Python 3.10、JAX 0.4.38，以及来自 Official commit
+`5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e` 的 JaxMARL 和
+`overcooked_v2_experiments`。仓库自带 `.venv` 时可执行：
 
 ```bash
-git clone https://github.com/overcookedv2/experiments.git /path/to/official
-git -C /path/to/official checkout 5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e
-python -m pip install -e .
-python -m pip install --no-deps \
-  -e /path/to/official/JaxMARL \
-  -e /path/to/official/experiments
+source .venv/bin/activate
 python -m compileall -q src/path_c experiments/overcooked_v2
-pytest -q experiments/overcooked_v2/tests/test_delta_zsc_*.py
+pytest -q experiments/overcooked_v2/tests/test_depi_*.py
+python -m experiments.overcooked_v2.path_c --help
 ```
 
-Formal and registered preflight workers fail closed unless JAX reports a single
-CUDA GPU, `JAX_PLATFORMS=cuda`, healthy dispatcher registration and peak memory
-below 40,000 MiB. CPU tests do not substitute for this CUDA acceptance.
-
-## Commands
-
-The V6 method path is:
-
-```text
-upstream
-build-partner-manifest
-validate-manifest
-train
-evaluate-official
-summarize-official
-evaluate-common
-audit-signals
-```
-
-Engineering and optional commands include `mechanical-e2e`, `cuda-preflight`,
-`calibrate-safety`, `evaluate-common-br-prox`, baseline reproduction and resource
-reporting. `calibrate-safety` creates `DELTA-ZSC-E2E+Safety`; it never replaces or
-modifies the primary `DELTA-ZSC-E2E` artifact.
-
-Example mechanical run:
+最小机械链路：
 
 ```bash
 python -m experiments.overcooked_v2.path_c mechanical-e2e \
-  --config experiments/overcooked_v2/configs/delta_zsc_simple_mechanical_e2e.yaml \
-  --partner-manifest manifests/simple-engineering.json \
+  --config experiments/overcooked_v2/configs/depi_simple_mechanical_e2e.yaml \
+  --partner-manifest /ABSOLUTE/PATH/partner_manifest.json \
   --require-cuda \
-  --output runs/mechanical/v6-e2e
+  --output runs/mechanical/depi
 ```
 
-Formal-shape one-update preflight:
+主要命令依次为：`upstream`、`build-partner-manifest`、`validate-manifest`、
+`train`、`build-depi-policy-manifest`、`calibrate-posterior`、
+`evaluate-official`、`summarize-official`、`evaluate-identifiability`、
+`evaluate-recoverable-value`、`evaluate-common`、`summarize-resources`、
+`build-formal-claim-report`。开发矩阵使用 `run-development-matrix` 与
+`summarize-development-matrix`。
 
-```bash
-python -m experiments.overcooked_v2.path_c cuda-preflight \
-  --config experiments/overcooked_v2/configs/delta_zsc_simple_formal.yaml \
-  --partner-manifest manifests/simple-engineering.json \
-  --seed-index -1 \
-  --output runs/preflight/v6-simple
-```
-
-Index `-1` is reserved for engineering and is never one of Official seed indices
-0–9. After a clean V6 commit is frozen, every formal seed trains and exports the
-same final end-to-end algorithm. A numerical failure is reported; it is not
-restarted under a changed method and is never replaced with an SP checkpoint.
-
-## Registered per-run simulator budget
-
-For a formal 457-update run, excluding upstream partner training:
-
-| Source | Attempted transitions |
-|---|---:|
-| Ego PPO | 29,949,952 |
-| Ego source initialization | 65,536 |
-| Generator training | 5,849,600 |
-| Counterfactual continuation | 5,701,632 |
-| Matched-code legal probes | 14,848 |
-| Generator initialization/holdout | 25,600 |
-| Total | 41,607,168 |
-
-The runtime ledger is authoritative and separately records upstream cost,
-GPU-hours, peak memory, deployable parameters and training-only parameters.
-
-## Security
-
-Never commit credentials, private keys, run artifacts or checkpoints.
-`SSH_Document.md` and `.DS_Store` are explicitly ignored. Server credentials are
-operational material outside this repository.
+正式训练只接受 seed index `0..9`；`-1` 仅供工程运行。正式与 CUDA preflight
+均要求单张 CUDA GPU，并在超过注册显存上限时 fail closed。当前仓库不把测试通过、
+机械运行或机制读数当作 SOTA 结果；只有冻结协议下生成的原始正式矩阵才可进入主张。
