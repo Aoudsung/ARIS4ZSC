@@ -1,14 +1,16 @@
 """Unified DELTA-ZSC model.
 
-The implementation has two estimators with separate parameter trees:
+Two estimators remain deliberately separate:
 
-1. ``BasePolicyModel`` learns task competence by PPO from task-only recurrence
-   and a memoryless current-partner branch.
-2. ``LatentCoordinationModel`` maximizes one joint response-decision likelihood.
+* ``BasePolicyModel`` learns task competence by PPO from task-only recurrence
+  and a memoryless current-partner branch;
+* ``LatentCoordinationModel`` learns one joint response-decision state-space
+  model by maximum likelihood.
 
 ``UnifiedAgent`` combines them only through an analytic KL-constrained mirror
 policy.  No auxiliary actor, comparator, separation geometry, learned
-capability encoder, context dropout, or loss-weighted control path remains.
+capability encoder, context dropout, or loss-weighted control path exists in
+this module.
 """
 
 from __future__ import annotations
@@ -76,25 +78,25 @@ def base_policy_model_class() -> Any:
                 output_dim=self.instant_partner_dim,
                 name="instant_partner_encoder",
             )
-            self.policy_hidden_0 = nn.Dense(
+            self.hidden_0 = nn.Dense(
                 self.task_hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
                 bias_init=zeros,
                 name="policy_hidden_0",
             )
-            self.policy_hidden_1 = nn.Dense(
+            self.hidden_1 = nn.Dense(
                 self.task_hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
                 bias_init=zeros,
                 name="policy_hidden_1",
             )
-            self.policy_logits = nn.Dense(
+            self.logit_head = nn.Dense(
                 self.action_count,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="base_policy_logits",
             )
-            self.state_value = nn.Dense(
+            self.value_head = nn.Dense(
                 1,
                 kernel_init=orthogonal(1.0),
                 bias_init=zeros,
@@ -102,10 +104,10 @@ def base_policy_model_class() -> Any:
             )
 
         def _heads(self, task_features: Any, instant_partner: Any) -> tuple[Any, Any]:
-            combined = jnp.concatenate((task_features, instant_partner), axis=-1)
-            hidden = nn.relu(self.policy_hidden_0(combined))
-            hidden = nn.relu(self.policy_hidden_1(hidden))
-            return self.policy_logits(hidden), self.state_value(hidden)[..., 0]
+            hidden = jnp.concatenate((task_features, instant_partner), axis=-1)
+            hidden = nn.relu(self.hidden_0(hidden))
+            hidden = nn.relu(self.hidden_1(hidden))
+            return self.logit_head(hidden), self.value_head(hidden)[..., 0]
 
         def step(
             self,
@@ -177,66 +179,61 @@ def latent_coordination_model_class() -> Any:
                 inventory_factor_count=self.inventory_factor_count,
                 name="response_emission",
             )
-
-            def transition_initializer(
-                key: Any, shape: tuple[int, ...], dtype: Any
-            ) -> Any:
-                del key
-                return jnp.eye(shape[0], dtype=dtype) * 2.0
-
-            self.transition_logits = self.param(
-                "transition_logits",
-                transition_initializer,
+            # A zero learned residual around a weak identity-biased transition
+            # avoids a custom initializer contract and remains fully trainable.
+            self.transition_residual = self.param(
+                "transition_residual",
+                nn.initializers.zeros_init(),
                 (self.component_count, self.component_count),
             )
-            self.decision_component_embeddings = self.param(
+            self.decision_components = self.param(
                 "decision_component_embeddings",
                 nn.initializers.normal(0.02),
                 (self.component_count, self.latent_hidden_dim),
             )
-            self.decision_base_hidden_0 = nn.Dense(
+            self.base_hidden_0 = nn.Dense(
                 self.latent_hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
                 bias_init=zeros,
                 name="decision_base_hidden_0",
             )
-            self.decision_base_hidden_1 = nn.Dense(
+            self.base_hidden_1 = nn.Dense(
                 self.latent_hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
                 bias_init=zeros,
                 name="decision_base_hidden_1",
             )
-            self.decision_base_mean = nn.Dense(
+            self.base_mean = nn.Dense(
                 self.action_count,
                 kernel_init=orthogonal(0.01),
                 bias_init=zeros,
                 name="decision_base_mean",
             )
-            self.decision_base_log_scale = nn.Dense(
+            self.base_log_scale = nn.Dense(
                 self.action_count,
                 kernel_init=zeros,
                 bias_init=nn.initializers.constant(1.0),
                 name="decision_base_log_scale",
             )
-            self.decision_residual_hidden_0 = nn.Dense(
+            self.residual_hidden_0 = nn.Dense(
                 self.latent_hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
                 bias_init=zeros,
                 name="decision_residual_hidden_0",
             )
-            self.decision_residual_hidden_1 = nn.Dense(
+            self.residual_hidden_1 = nn.Dense(
                 self.latent_hidden_dim,
                 kernel_init=orthogonal(jnp.sqrt(2.0)),
                 bias_init=zeros,
                 name="decision_residual_hidden_1",
             )
-            self.decision_residual_mean = nn.Dense(
+            self.residual_mean = nn.Dense(
                 self.action_count,
                 kernel_init=zeros,
                 bias_init=zeros,
                 name="decision_residual_mean",
             )
-            self.decision_residual_log_scale = nn.Dense(
+            self.residual_log_scale = nn.Dense(
                 self.action_count,
                 kernel_init=zeros,
                 bias_init=zeros,
@@ -244,7 +241,10 @@ def latent_coordination_model_class() -> Any:
             )
 
         def transition(self) -> Any:
-            return transition_matrix(self.transition_logits)
+            identity_bias = 2.0 * jnp.eye(
+                self.component_count, dtype=jnp.float32
+            )
+            return transition_matrix(self.transition_residual + identity_bias)
 
         def response_logits(
             self,
@@ -271,17 +271,17 @@ def latent_coordination_model_class() -> Any:
                 jnp.arange(self.action_count, dtype=jnp.int32),
                 lead + (self.action_count,),
             )
-            frame_actions = jnp.broadcast_to(
+            frames = jnp.broadcast_to(
                 frame_array[..., None, :, :, :],
                 lead + (self.action_count,) + frame_array.shape[-3:],
             )
-            behavior_actions = jnp.broadcast_to(
+            statistics = jnp.broadcast_to(
                 behavior_array[..., None, :],
                 lead + (self.action_count, behavior_array.shape[-1]),
             )
             return self.response_emission(
-                jax.lax.stop_gradient(frame_actions),
-                behavior_actions,
+                jax.lax.stop_gradient(frames),
+                statistics,
                 actions,
                 include_component_residual=True,
             )
@@ -303,16 +303,14 @@ def latent_coordination_model_class() -> Any:
                 raise ValueError("Decision-emission context axes differ.")
             lead = task.shape[:-1]
             common = jnp.concatenate((task, instant, statistics), axis=-1)
-            hidden = nn.tanh(self.decision_base_hidden_0(common))
-            hidden = nn.tanh(self.decision_base_hidden_1(hidden))
-            base_mean = self.decision_base_mean(hidden)
-            base_log_scale = self.decision_base_log_scale(hidden)
+            hidden = nn.tanh(self.base_hidden_0(common))
+            hidden = nn.tanh(self.base_hidden_1(hidden))
+            base_mean = self.base_mean(hidden)
+            base_log_scale = self.base_log_scale(hidden)
 
-            components = self.decision_component_embeddings / jnp.maximum(
+            components = self.decision_components / jnp.maximum(
                 jnp.linalg.norm(
-                    self.decision_component_embeddings,
-                    axis=-1,
-                    keepdims=True,
+                    self.decision_components, axis=-1, keepdims=True
                 ),
                 1.0e-6,
             )
@@ -324,15 +322,11 @@ def latent_coordination_model_class() -> Any:
                 components.reshape((1,) * len(lead) + components.shape),
                 lead + components.shape,
             )
-            residual_input = jnp.concatenate((common_k, components_k), axis=-1)
-            residual_hidden = nn.tanh(
-                self.decision_residual_hidden_0(residual_input)
-            )
-            residual_hidden = nn.tanh(
-                self.decision_residual_hidden_1(residual_hidden)
-            )
-            residual_mean = self.decision_residual_mean(residual_hidden)
-            residual_log_scale = self.decision_residual_log_scale(residual_hidden)
+            residual = jnp.concatenate((common_k, components_k), axis=-1)
+            residual = nn.tanh(self.residual_hidden_0(residual))
+            residual = nn.tanh(self.residual_hidden_1(residual))
+            residual_mean = self.residual_mean(residual)
+            residual_log_scale = self.residual_log_scale(residual)
             if not include_component_residual:
                 residual_mean = jnp.zeros_like(residual_mean)
                 residual_log_scale = jnp.zeros_like(residual_log_scale)
@@ -388,8 +382,8 @@ class UnifiedAgent:
         import jax
         import jax.numpy as jnp
 
-        normalized_variant = str(variant).lower()
-        if normalized_variant not in METHOD_VARIANTS:
+        normalized = str(variant).lower()
+        if normalized not in METHOD_VARIANTS:
             raise ValueError(f"Unknown unified DELTA variant: {variant}")
         next_task_carry, base = self.base_model.apply(
             {"params": base_params},
@@ -441,38 +435,34 @@ class UnifiedAgent:
             episode_start=state.episode_start,
         )
 
-        include_decision_residual = normalized_variant in {
-            JOINT_VARIANT,
-            FULL_VARIANT,
-        }
         decision_mean, decision_log_scale = self.latent_model.apply(
             {"params": latent_params},
             jax.lax.stop_gradient(base.task_features),
             jax.lax.stop_gradient(base.instant_partner),
             current_statistics,
-            include_component_residual=include_decision_residual,
+            include_component_residual=normalized in {JOINT_VARIANT, FULL_VARIANT},
             method=self.latent_model.decision_emission,
         )
         expected_values = expected_action_values(filtered.posterior, decision_mean)
         voi = jnp.zeros_like(expected_values)
-        if normalized_variant == FULL_VARIANT:
-            all_response = self.latent_model.apply(
+        if normalized == FULL_VARIANT:
+            response_by_action = self.latent_model.apply(
                 {"params": latent_params},
                 observation,
                 current_statistics,
                 method=self.latent_model.response_all_actions,
             )
-            outcome_probability = coarse_response_probability(
-                all_response.visibility, all_response.inventory_change
-            )
             voi = myopic_value_of_information(
                 belief=filtered.posterior,
                 transition=transition,
                 component_action_values=decision_mean,
-                response_outcome_probability=outcome_probability,
+                response_outcome_probability=coarse_response_probability(
+                    response_by_action.visibility,
+                    response_by_action.inventory_change,
+                ),
             ).value
 
-        if normalized_variant in {BASE_VARIANT, RESPONSE_ONLY_VARIANT}:
+        if normalized in {BASE_VARIANT, RESPONSE_ONLY_VARIANT}:
             adapted_logits = base.base_logits
             adaptation_temperature = jnp.full(
                 base.base_logits.shape[:-1], jnp.inf, dtype=jnp.float32
