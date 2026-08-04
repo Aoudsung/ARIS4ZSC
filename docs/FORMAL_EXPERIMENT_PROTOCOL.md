@@ -1,148 +1,378 @@
-# FORMAL_EXPERIMENT_PROTOCOL：冻结正式实验合同
+# FORMAL_EXPERIMENT_PROTOCOL：Unified DELTA-ZSC 正式执行合同
 
 `authoritative: true`
 
-本文件固定 confirmatory execution。与
-[`SCIENTIFIC_SPEC.md`](SCIENTIFIC_SPEC.md)、[`METHOD_SPEC.md`](METHOD_SPEC.md) 或
-[`EVALUATION_SPEC.md`](EVALUATION_SPEC.md) 冲突时不得运行；必须先在未观察正式结果的状态下
-同步修订合同、代码、配置和测试，并在证据账本记录原因。
+本协议只适用于 `delta_joint_response_decision_bayes_v1`。旧DEPI checkpoint、comparator、development matrix、claim report和CUDA artifact均不可复用。
 
-## 1. 固定软件与硬件边界
+## 1. 冻结身份
 
-- Python 3.10；JAX 0.4.38；
-- JaxMARL 与 `overcooked_v2_experiments` 必须从 Official commit
-  `5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e` 以 `--no-deps -e` 安装；
-- 正式入口只接受 clean、已提交、可解析为完整 40 位 Git SHA 的 checkout；
-- `JAX_PLATFORMS=cuda`、`JAX_DEFAULT_MATMUL_PRECISION=highest`；
-- 每个 worker 的 `CUDA_VISIBLE_DEVICES` 必须只指向一个已登记 physical GPU；JAX 必须实测
-  只暴露一个 GPU device；
-- worker 起始显存占用不超过 1,024 MiB、起始利用率不超过 10%、无 volatile uncorrectable
-  ECC error；
-- CUDA preflight 的峰值显存必须严格小于 40,000 MiB。
+正式运行前必须固定：
 
-CPU 单元测试、伪造设备元数据、可见 GPU 但实际 CPU backend，均不能代替正式 acceptance。
+- clean committed Git SHA；
+- `src/delta_zsc` active implementation；
+- unified config schema 1；
+- checkpoint/deployment schema 1；
+- Official source commit `5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`；
+- Python 3.10、JAX 0.4.38、Flax 0.10.3、Optax 0.2.5；
+-两个layout配置；
+-训练、calibration、confirmatory partner manifests；
+-三项假设与统计规则；
+-所有RNG domain和seed indexes。
 
-## 2. 固定随机化与失败政策
+任何方法公式、信息边界、K/H/delta、伙伴划分或统计单位变化均要求新commit、新method或schema版本，并重新开始development evidence。
 
-正式训练 seed 是 index 0–9。每个 key 精确等于 `split(PRNGKey(42), 10)[index]`，并由代码
-分出 rollout、partner、anchor-fit、anchor-evaluation、comparator、M1、calibration 等互不
-别名的 named domains。index `-1` 只属于 engineering，正式 manifest、run identity、summary
-和替代运行中均禁止出现。
+## 2. 运行环境
 
-Official evaluation root seed 固定为 0。相同 paired contrast 必须共享 episode-key schedule，
-fit/evaluation continuation 必须使用不同 key 域。
+### 2.1 CPU工程链
 
-正式数值失败按原样保留并报告。不得以改变参数、缩小预算、重新抽 seed、从 checkpoint
-重试、换用 SP checkpoint 或挑选较好 restart 的方式替换失败节点。
+每个冻结commit必须通过：
 
-## 3. 固定环境、模型与预算
-
-两个正式配置为：
-
-- `experiments/overcooked_v2/configs/depi_simple_formal.yaml`；
-- `experiments/overcooked_v2/configs/depi_wide_formal.yaml`。
-
-环境固定 400 steps、local view size 2、successful-delivery indicator、negative rewards、随机
-agent positions 和 delivery 后重新采 recipe。主方法 B2 固定 K=4。
-
-每个 DEPI seed 使用 256 environments、29,949,952 simulator steps、256-step recurrent
-rollout、4 epochs、64 minibatches。PPO 固定 learning rate 2.5e-4、gradient clip 0.25、
-gamma 0.99、GAE lambda 0.95、policy/value clip 0.2、entropy 0.01、value weight 0.5、5%
-warmup、线性 annealing 和 Adam epsilon 1e-5。完整损失、anchor 和 calibration 参数以正式
-配置及其加载时 fail-closed 校验为准。
-
-Official upstream SP 每 run 30,000,000 steps、OP 每 run 50,000,000 steps；训练池使用注册
-checkpoint stages 0.0、0.5、1.0。所有 DEPI、upstream、baseline、comparator、continuation、
-final M1、component diagnostic、mechanism 与 evaluation simulator transitions 都进入资源
-账本，并同时报告 marginal、amortized 和 fully-loaded cost。
-
-## 4. partner lineage 与隔离
-
-正式 manifest schema 为 4。每个资源必须包含 layout、role、mechanism、hyperparameter
-family、stage、seed/run lineage、checkpoint path 与 SHA-256。每个 DEPI owner seed 恰有一个
-独立 owner-SP source；support、comparator fit、comparator validation、posterior calibration
-和 confirmatory runs 按 manifest 规则互斥。
-
-schema 4 的角色名固定为 `owner_source`、`development_support`、`comparator_fit`、
-`comparator_validation`、`calibration`、`confirmatory`。正式 comparator fit 与 validation
-各至少使用八个 fresh、独立、final-stage partner parents；不得复用 Official seed index。
-comparator 必须在 ego development/formal training 前由固定 Official reference ego 与独立
-fit/validation partners 通过 `collect-pair-comparator-source` 采集，再由该 source artifact 拟合并冻结；
-正式 B2 入口没有冻结 artifact 时 fail closed，禁止在 update 0 临时拟合。calibration panel
-由所有 ego seeds 共享，每种机制五个独立 parents，且 `owner_seed_index=None`。
-
-正式训练池由 SP/OP 各 10 个独立 parent runs 的三个阶段，以及两个独立 final-stage OP
-width variants 构成。heuristic family 只进入 Common-Partner 测试。任何 hash 缺失、文件变化、
-role 重叠、另一 owner seed 的资源混入或 fresh run 回用均 fail closed；正式运行禁止
-`--skip-manifest-hash-check`。
-
-## 5. 冻结前执行门
-
-在创建正式结果前必须依次完成：
-
-1. Python 3.10 环境安装与依赖一致性检查；
-2. active source compile、全部 `test_depi_*.py`、CLI smoke 和 legacy-token CI gate；
-3. mechanical end-to-end；
-4. 单 CUDA `cuda-preflight` 必须接收真实冻结 comparator 与 reference ego checkpoint，覆盖
-   comparator contract、真实 rollout、anchor collection/prediction/separation、PPO、auxiliary
-   transaction、checkpoint save/restore、deployment export、fresh-final M1 和峰值显存门；
-5. 冻结 K/方法无关 comparator；K=4、seed indexes 0--9 执行 R0/B0/B1/B2、三项 extra controls
-   与七项注册机制消融，K=2/8 只执行 B1/B2 sensitivity；完成 raw evaluator、共享-panel
-   component diagnostics 和 paired summary；
-6. 完成 development-only decision coverage bank、`p_stay={0.90,0.97,0.99}` sensitivity，以及
-   三个同 pool/budget/capacity 的诚实仓内 contemporary proxies；这些 proxy 不作为已发表方法复现；
-7. 只在未观察正式结果时完成方法/合同 freeze，并提交 clean commit。
-
-任一门失败则不得开始正式 confirmatory runs。B3 保持 `not_implemented`，不构成冻结条件。
-
-## 6. 正式执行顺序
-
-对两个布局和所有注册 seeds/panels，产物链为：
-
-```text
-upstream
-  -> build-partner-manifest / validate-manifest
-  -> collect-pair-comparator-source -> fit-pair-comparator
-  -> cuda-preflight (real comparator branch)
-  -> train
-  -> build-depi-policy-manifest
-  -> calibrate-posterior
-  -> evaluate-official / summarize-official
-  -> evaluate-common-br-prox / evaluate-common
-  -> evaluate-identifiability
-  -> evaluate-recoverable-value
-  -> summarize-capacity-control
-  -> summarize-resources
-  -> build-formal-claim-report
+```bash
+python -m compileall -q src/delta_zsc experiments/overcooked_v2
+pytest -q experiments/overcooked_v2/tests/test_unified_delta_*.py
+python -m experiments.overcooked_v2.delta_zsc --help
 ```
 
-`audit-signals` 是审计读数，不得改写训练结果。每个 stage 写独立目录、完整 stdout/stderr、
-run identity、输入 hash 和 resource ledger；后续 stage 只读取已冻结 artifact，不重新训练或
-静默补齐字段。
+CI还必须拒绝active path中的retired token：
 
-## 7. 评估矩阵与统计
+```text
+pair comparator
+separation margin
+context dropout
+learned capability loss
+decision/pseudo-posterior weight
+gradient routing
+partner generator
+decision regret shaping
+```
 
-Official 每个 ego/partner/layout/role pairing 固定 500 episodes。正式主比较、Common-Partner
-panel、capacity control、BR-Prox、posterior calibration、identifiability、recoverable-value
-和嵌套 development 增量必须满足 [`EVALUATION_SPEC.md`](EVALUATION_SPEC.md)。正式 scoreboard
-固定 9,999 次 node bootstrap、单侧 95% LCB、独立 run 推断，并同时检查 20-point point-estimate
-物质效应。
+### 2.2 CUDA acceptance
 
-每个 DEPI formal ego run 还必须在最终 policy update 后用 deployment params 重新采集 fresh
-anchors、重新初始化 bootstrap members，并以不重叠 fit/evaluation replica domains 执行 M1；
-collection、continuation 和 model fingerprints 必须与 deployment bundle 一致。DEPI policy
-manifest 必须绑定两个布局各 10 个
-M1 artifact 的路径和 SHA-256，formal claim report 必须从 Official raw identity 回溯并
-重新校验。任一 seed 未通过只使 final-M1/decision-supervision 对应证据失败，不得中止或
-替换训练结果。
+正式训练只接受：
 
-不得只发布均值。原始 per-episode returns、run-level nodes、置信界、失败节点、资源和 lineage
-均须保留。formal claim report 输出独立主张向量；局部机制失败只影响对应主张。兼容的全局
-conjunction 仅作 aggregate diagnostic，不能锁住其他已独立成立的 benchmark/机制结果。
+- 单张显式注册物理GPU；
+- `JAX_PLATFORMS=cuda`；
+- `JAX_DEFAULT_MATMUL_PRECISION=highest`；
+- 启动时显存≤1 GiB；
+- 启动利用率≤10%；
+- volatile uncorrectable ECC=0；
+- bundled CUDA-12 `ptxas`；
+- 完整parameter/optimizer/runner checkpoint roundtrip；
+- deployment export/load/action forward；
+- real Official environment与real frozen partner checkpoint。
 
-## 8. 合同变更与结果有效性
+CUDA preflight必须使用mechanical config执行至少一个完整outer update，包括：
 
-冻结后，本文、正式配置、权威 method/science/evaluation spec、源代码和依赖 commit 构成一个
-不可拆分合同。任何改变都创建新方法版本和新实验系列，不得与旧节点拼接。contract-doc 修改
-必须与描述的代码/配置处于同一 commit，并把原因追加到
-[`status/EVIDENCE_LEDGER.md`](status/EVIDENCE_LEDGER.md)。
+1. base-policy rollout；
+2. joint response-decision latent likelihood；
+3. CRN decision anchor；
+4. base PPO；
+5. checkpoint save/restore；
+6. deployment bundle；
+7. joint与full action forward；
+8.有限性、KL上界与资源读数。
+
+通过CPU测试但未通过CUDA acceptance，不得启动development训练。
+
+## 3. Partner lineage
+
+manifest沿用固定Official checkpoint provenance，但active method只消费：
+
+- `development_support`；
+- `calibration`；
+- `confirmatory`。
+
+旧 `comparator_fit` 与 `comparator_validation` role不进入unified训练。
+
+### 3.1 Training support
+
+采样概率：
+
+```text
+mechanism uniform
+ -> hyperparameter family uniform
+ -> checkpoint stage uniform
+ -> parent/run uniform
+```
+
+每个checkpoint必须保存：
+
+- SHA-256；
+- parent training run ID；
+- generation mechanism；
+- seed/index与真实JAX key；
+- checkpoint stage；
+- hyperparameter family；
+- upstream resource ledger。
+
+### 3.2 Lineage隔离
+
+training、calibration与confirmatory在以下任一层面不得重叠：
+
+- checkpoint hash；
+- parent training run；
+- co-training group；
+- seed/checkpoint复制链；
+- ego owner source。
+
+同一算法族允许出现在不同split，但必须由独立parent runs生成。
+
+## 4. RNG合同
+
+正式ego seed indexes固定0–9。每个seed的root key必须由repository registration产生，不能手工替换。
+
+每个outer update从checkpointed root key确定性派生：
+
+- rollout；
+- partner action；
+- environment transition；
+- anchor state selection；
+- anchor CRN replica；
+- latent update；
+- PPO lane permutation。
+
+anchor各action branch在同一个anchor/replica下共享partner/environment randomness。fit与evaluation replicas使用不重叠domain。
+
+resume后后续所有keys必须与uninterrupted run一致。
+
+## 5. Mechanical run
+
+机械运行使用：
+
+```text
+experiments/overcooked_v2/configs/delta_unified_simple_mechanical.yaml
+seed_index = -1
+variant = joint
+```
+
+它只验证：
+
+-环境/partner适配；
+-参数初始化；
+- response/decision likelihood；
+- anchor collector；
+- PPO和latent optimizer；
+- checkpoint/deployment；
+- evaluation policy interface。
+
+机械结果不得进入科学统计。
+
+## 6. Development设计
+
+### 6.1 主矩阵
+
+每个layout先执行paired seeds 0–4：
+
+```text
+base
+response_only
+joint
+```
+
+full不训练，直接用joint deployment执行variant override。
+
+要求同seed三条run的base-policy trajectory与base parameter fingerprint一致。不同只允许出现在latent parameters与anchor resource cost。
+
+### 6.2 K诊断
+
+只在一个预注册layout、joint variant、seeds 0–4执行：
+
+```text
+K = 2, 4, 8
+```
+
+K选择在读取confirmatory结果前冻结。若K=4没有明显问题且性能相当，保持K=4作为主设置，避免post-hoc选择最优K。
+
+### 6.3 Development扩展
+
+根据base/joint paired difference的run-level pilot variance，用一次正确交付20分作为最小关注效果计算seed需求。若5 seeds不足，统一扩展base、response-only、joint至10 seeds；不得只扩展表现较好的variant。
+
+### 6.4 Development判定
+
+Development用于：
+
+- 检查joint likelihood是否有限；
+- 检查base fingerprints是否匹配；
+- 检查decision anchor independent evaluation；
+- 估计方差与算力；
+- 冻结K与最终config。
+
+Development不要求所有诊断通过才能“允许继续”。是否进入正式实验由负责人根据性能、机制和资源整体裁决，但所有development结果必须保留。
+
+## 7. 正式训练
+
+每个layout正式训练：
+
+```text
+base          seeds 0..9
+response_only seeds 0..9
+joint         seeds 0..9
+```
+
+总计每layout30个ego runs，两个layout60个。full由20个joint deployments解析评估，不产生新训练run。
+
+训练数据始终由base policy生成。正式run不可：
+
+- 恢复旧DEPI checkpoint；
+- 加载comparator；
+- 使用confirmatory伙伴；
+- 替换失败seed；
+- 跳过nonfinite update；
+- 修改anchor interval或replica数；
+- 因中间训练曲线提前终止；
+- 在训练后选择非final checkpoint。
+
+正式deployment固定final checkpoint。
+
+## 8. Checkpoint与resume
+
+每个checkpoint必须原子保存：
+
+- base/latent parameters；
+- base/latent optimizer states；
+-完整environment state；
+- partner state与当前member；
+- ego task carry、Beta statistics、belief、previous observation/action；
+- role allocation；
+- process RNG；
+- environment steps与update count；
+- resource ledger。
+
+恢复时验证schema、method、config、partner manifest、parameter tree与run identity。缺少任何字段或hash不一致均fail closed。
+
+测试必须验证：
+
+```text
+N uninterrupted updates
+==
+K updates + checkpoint + restore + (N-K) updates
+```
+
+比较parameters、optimizers、runner、RNG、actions、metrics与resource counters。
+
+## 9. 正式评估顺序
+
+对每个layout：
+
+1. 冻结全部deployment manifests；
+2. 评估base；
+3. 评估response-only；
+4. 评估joint；
+5. 对同一joint bundle以`variant_override=full`评估full；
+6. 评估Official与外部baselines；
+7. 运行held-out calibration；
+8. 运行belief causal evaluation；
+9. 从raw artifacts生成layout summary；
+10. 两layout均完成后生成论文级conjunction report。
+
+所有方法共享confirmatory partner panel、roles、episode keys与raw return定义。
+
+不得在读取某个方法结果后更换伙伴panel或episodes。
+
+## 10. Raw evaluation完整性
+
+每个evaluation目录必须验证：
+
+- 10个ego seeds；
+- 所有confirmatory partner parents；
+- 两种roles；
+- 每pairing 500 episodes；
+- 每episode 400 steps上限；
+- 不重复/不缺失episode key；
+- deployment/config/manifest SHA；
+- raw return finite；
+- resource ledger。
+
+summary只能读取这些目录并重算，不接受手写score。
+
+## 11. Calibration与因果评估
+
+### 11.1 Calibration
+
+每个layout使用同一共享、lineage-disjoint calibration panel。报告nested response base、full component response和uniform mixture的run-block intervals。它是诊断，不决定raw XP是否可报告。
+
+### 11.2 Causal belief
+
+使用fresh source anchors与独立evaluation replicas。donor来自不同partner parent并按task features最近邻匹配。干预只替换belief，不拼接recurrent hidden。
+
+H3 artifact保存per-anchor：
+
+- source/donor partner parent；
+- task distance；
+- belief TV；
+- policy TV；
+- source-world value difference；
+- continuation contract和keys。
+
+## 12. 三假设summary
+
+每layoutsummary只生成：
+
+- H1 full vs strongest external baseline；
+- H2 joint vs response-only；
+- H3 correct vs shuffled belief；
+- 描述性full-joint VOI contrast；
+- 所有diagnostics与resources。
+
+使用 `EVALUATION_SPEC.md` 的ordered hierarchy。不得追加第四项confirmatory claim。
+
+## 13. 资源账本
+
+每run分列：
+
+- base PPO steps；
+- anchor continuation steps；
+- upstream partner steps；
+- calibration steps；
+- causal/mechanism steps；
+- formal evaluation steps；
+- GPU hours；
+- wall-clock；
+- peak memory；
+- deployable parameters；
+- inference latency。
+
+报告：
+
+- marginal ego cost；
+- shared upstream cost；
+- amortized cost；
+- fully loaded reproduction cost。
+
+full相对joint只增加evaluation inference，不增加training cost或parameters。
+
+## 14. 失败处理
+
+- nonfinite：保存失败artifact并终止该run；
+- OOM：保存编译/显存证据，不能静默减小科学batch；
+- checkpoint损坏：终止，不从其他seed复制；
+-伙伴checkpoint缺失：manifest失败；
+- evaluation缺节点：summary失败；
+- H1/H2/H3失败：原样报告，不追加方法补丁后继续使用同一正式数据。
+
+若正式结果揭示方法缺陷，下一版本必须新建method identity、重新development并使用新的confirmatory experiment，而不是在当前正式矩阵上迭代。
+
+## 15. 产物目录
+
+推荐结构：
+
+```text
+artifacts/
+  unified-delta/
+    <commit>/
+      manifests/
+      cuda-acceptance/
+      development/
+      formal/
+        test_time_simple/
+          training/{base,response_only,joint}/seed-*/
+          evaluation/{base,response_only,joint,full,baselines}/
+          calibration/
+          causal/
+          summary/
+        test_time_wide/
+          ...
+      paper-summary/
+```
+
+每层保存run identity和source hashes，使任何summary都能追溯到原始checkpoint、config、伙伴和episode rows。
