@@ -20,7 +20,7 @@ on:
         default: "experiments/overcooked_v2/configs/delta_unified_simple_mechanical.yaml"
         type: string
       partner_manifest:
-        description: "Absolute hash-bound partner manifest on the self-hosted runner"
+        description: "Absolute lineage-bound partner manifest on the self-hosted runner"
         required: false
         type: string
       output_root:

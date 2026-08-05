@@ -18,7 +18,7 @@ from src.delta_zsc.response_model import response_joint_log_probability, respons
 from src.delta_zsc.transition import predict_belief
 from src.delta_zsc.resources import ResourceLedger
 from src.delta_zsc.runner import collect_rollout, initialize_runner
-from src.delta_zsc.storage import ensure_run_identity, sha256_path, write_json
+from src.delta_zsc.storage import ensure_run_identity, write_json
 
 from .deployment import load_deployment
 
@@ -43,7 +43,7 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
     manifest = load_partner_manifest(
         manifest_path,
         expected_layout=config.environment.layout,
-        verify_files=not bool(args.skip_manifest_hash_check),
+        verify_files=not bool(args.skip_manifest_file_check),
     )
     runs = manifest.by_role("calibration")
     if not runs:
@@ -205,15 +205,8 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
         output_dir,
         {
             "stage": "posterior-predictive-diagnostics",
-            "deployment": {
-                "path": str(Path(args.deployment).resolve()),
-                "sha256": sha256_path(args.deployment),
-            },
-            "partner_manifest": {
-                "path": str(manifest_path),
-                "sha256": sha256_path(manifest_path),
-            },
-            "config_fingerprint": config.fingerprint,
+            "deployment": {"path": str(Path(args.deployment).resolve())},
+            "partner_manifest": {"path": str(manifest_path)},
         },
     )
     model_values = np.asarray([row["model_nll"] for row in per_run], dtype=np.float64)

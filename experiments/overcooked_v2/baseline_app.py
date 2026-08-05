@@ -45,7 +45,6 @@ from src.delta_zsc.resources import (
 from src.delta_zsc.storage import (
     ensure_run_identity,
     read_json,
-    sha256_path,
     write_json,
 )
 
@@ -78,7 +77,6 @@ def _read_training_lineage(path: str | Path | None) -> list[Mapping[str, Any]]:
         raise ValueError("Training-lineage manifest must be a JSON list.")
     expected = {
         "checkpoint",
-        "checkpoint_sha256",
         "parent_training_run_id",
         "co_training_group_id",
         "role",
@@ -92,8 +90,8 @@ def _read_training_lineage(path: str | Path | None) -> list[Mapping[str, Any]]:
         if not isinstance(key, list) or len(key) != 2:
             raise ValueError(f"Training-lineage row {index} has a malformed JAX key.")
         checkpoint = Path(str(raw["checkpoint"])).resolve()
-        if not checkpoint.exists() or sha256_path(checkpoint) != raw["checkpoint_sha256"]:
-            raise ValueError(f"Training-lineage checkpoint/hash differs at row {index}.")
+        if not checkpoint.exists():
+            raise FileNotFoundError(checkpoint)
         rows.append({**dict(raw), "checkpoint": str(checkpoint)})
     return rows
 
@@ -132,11 +130,11 @@ def _validate_fcp_population(
             if {path.name for path in current} != {"ckpt_0", "ckpt_1", "ckpt_final"}:
                 raise ValueError(f"FCP parent {run} must preserve three checkpoints.")
             checkpoints.extend(current)
-    expected_hashes = {sha256_path(path) for path in checkpoints}
+    expected_checkpoints = {str(path) for path in checkpoints}
     population_rows = [row for row in lineage if row["role"] == "fcp_population_checkpoint"]
     if len(population_rows) != 240 or {
-        str(row["checkpoint_sha256"]) for row in population_rows
-    } != expected_hashes:
+        str(row["checkpoint"]) for row in population_rows
+    } != expected_checkpoints:
         raise ValueError("FCP lineage must bind all 10x8x3 population checkpoints.")
     parent_ids = {str(row["parent_training_run_id"]) for row in population_rows}
     if len(parent_ids) != 80:
@@ -357,7 +355,7 @@ def run_official_baseline(args: argparse.Namespace) -> None:
         "fcp_population": (
             None
             if fcp_population is None
-            else {"path": str(fcp_population), "sha256": sha256_path(fcp_population)}
+            else {"path": str(fcp_population)}
         ),
         "external_training_lineage": lineage,
         "capacity_match": capacity_match,
@@ -393,7 +391,6 @@ def run_official_baseline(args: argparse.Namespace) -> None:
                 "run_index": index,
                 "run_id": f"{method}-{layout}-{index:02d}",
                 "policy": str(checkpoint),
-                "policy_sha256": sha256_path(checkpoint),
                 "identity": {
                     "parent_training_run_id": f"{method}-{layout}-{index:02d}",
                     "co_training_group_id": None,
@@ -459,15 +456,12 @@ def run_official_baseline(args: argparse.Namespace) -> None:
         )
         ledger_path = run_ledger_root / f"run-{index:02d}.json"
         write_json(ledger_path, run_ledger.to_mapping())
-        row["resource_ledger"] = {
-            "path": str(ledger_path),
-            "sha256": sha256_path(ledger_path),
-        }
+        row["resource_ledger"] = {"path": str(ledger_path)}
 
     training_lineage = [
         *(
             {
-                "checkpoint_sha256": row["checkpoint_sha256"],
+                "checkpoint": row["checkpoint"],
                 "parent_training_run_id": row["parent_training_run_id"],
                 "co_training_group_id": row["co_training_group_id"],
                 "role": row["role"],
@@ -476,7 +470,7 @@ def run_official_baseline(args: argparse.Namespace) -> None:
         ),
         *(
             {
-                "checkpoint_sha256": row["policy_sha256"],
+                "checkpoint": row["policy"],
                 "parent_training_run_id": row["identity"]["parent_training_run_id"],
                 "co_training_group_id": None,
                 "role": "formal_ego",

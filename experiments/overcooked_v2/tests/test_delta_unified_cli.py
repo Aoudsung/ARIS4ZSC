@@ -5,7 +5,7 @@ from pathlib import Path
 
 from experiments.overcooked_v2.delta_zsc import _parser
 from src.delta_zsc.config import FORMAL_METHOD_LABEL, OFFICIAL_BASELINE_METHODS
-from src.delta_zsc.storage import read_json, sha256_path, write_json
+from src.delta_zsc.storage import read_json, write_json
 
 
 def _evaluation_fixture(root: Path, method: str, value: float) -> Path:
@@ -42,7 +42,7 @@ def _evaluation_fixture(root: Path, method: str, value: float) -> Path:
             "method": method,
             "mean_return": float(value),
             "episode_count": len(rows),
-            "raw": {"path": str(raw), "sha256": sha256_path(raw)},
+            "raw": {"path": str(raw)},
             "resource_ledger": {},
         },
     )

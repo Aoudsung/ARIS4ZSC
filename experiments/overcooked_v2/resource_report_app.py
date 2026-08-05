@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.delta_zsc.resources import ResourceLedger
-from src.delta_zsc.storage import ensure_run_identity, read_json, sha256_path, write_json
+from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
 
 
 def _read(path: Path) -> ResourceLedger:
@@ -90,9 +90,7 @@ def run_resource_report(args: argparse.Namespace) -> None:
         if not path.is_file():
             raise FileNotFoundError(path)
         grouped.setdefault(method, []).append(path)
-        sources.setdefault(method, []).append(
-            {"path": str(path), "sha256": sha256_path(path)}
-        )
+        sources.setdefault(method, []).append({"path": str(path)})
     if not grouped:
         raise ValueError("At least one resource method is required.")
     rows = [_method_row(method, grouped[method]) for method in sorted(grouped)]

@@ -115,6 +115,6 @@ be promoted into substitute performance claims.
 
 The package contains implementation and CPU-side acceptance evidence, not
 formal benchmark results. It therefore makes no SOTA claim. Formal conclusions
-require the pinned Python 3.10/Official/CUDA environment, real hash-bound partner
-checkpoints, ten ego runs, both roles, 500 episodes per pairing, and the frozen
+require the pinned Python 3.10/Official/CUDA environment, real lineage-bound
+partner checkpoints, ten ego runs, both roles, 500 episodes per pairing, and the frozen
 Simple/Wide statistical protocol.

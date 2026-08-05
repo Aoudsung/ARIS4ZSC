@@ -1,9 +1,8 @@
-"""Hash-bound partner manifests and lineage validation."""
+"""Lineage-bound partner manifests and their validation."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,7 +15,6 @@ class PartnerRun:
     run_id: str
     role: str
     checkpoint: Path
-    checkpoint_sha256: str
     parent_training_run_id: str
     generation_mechanism: str
     checkpoint_stage: float
@@ -45,31 +43,6 @@ class PartnerManifest:
                 {**asdict(row), "checkpoint": str(row.checkpoint)} for row in self.runs
             ],
         }
-
-    @property
-    def fingerprint(self) -> str:
-        payload = json.dumps(
-            self.to_mapping(), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()
-
-
-def _sha256_path(path: Path) -> str:
-    digest = hashlib.sha256()
-    source = path.resolve()
-    if source.is_file():
-        with source.open("rb") as handle:
-            while block := handle.read(1024 * 1024):
-                digest.update(block)
-        return digest.hexdigest()
-    if not source.is_dir():
-        raise FileNotFoundError(source)
-    for child in sorted(item for item in source.rglob("*") if item.is_file()):
-        digest.update(str(child.relative_to(source)).encode("utf-8"))
-        with child.open("rb") as handle:
-            while block := handle.read(1024 * 1024):
-                digest.update(block)
-    return digest.hexdigest()
 
 
 def normalized_mechanism(value: str) -> str:
@@ -160,7 +133,6 @@ def load_partner_manifest(
             run_id=str(raw["run_id"]),
             role=str(raw["role"]),
             checkpoint=checkpoint,
-            checkpoint_sha256=str(raw["checkpoint_sha256"]),
             parent_training_run_id=str(raw["parent_training_run_id"]),
             generation_mechanism=str(raw["generation_mechanism"]),
             checkpoint_stage=float(raw["checkpoint_stage"]),
@@ -186,11 +158,8 @@ def load_partner_manifest(
                 None if raw["partner_type_id"] is None else str(raw["partner_type_id"])
             ),
         )
-        if verify_files:
-            if not checkpoint.exists():
-                raise FileNotFoundError(checkpoint)
-            if _sha256_path(checkpoint) != row.checkpoint_sha256:
-                raise ValueError(f"Partner checkpoint hash differs for {row.run_id}.")
+        if verify_files and not checkpoint.exists():
+            raise FileNotFoundError(checkpoint)
         runs.append(row)
     manifest = PartnerManifest(layout=str(payload["layout"]), runs=tuple(runs))
     if expected_layout is not None and manifest.layout != str(expected_layout):

@@ -25,7 +25,7 @@ def _common_run(parser: argparse.ArgumentParser) -> None:
         "--run-kind", choices=("mechanical", "development", "formal"), required=True
     )
     parser.add_argument("--partner-manifest", required=True)
-    parser.add_argument("--skip-manifest-hash-check", action="store_true")
+    parser.add_argument("--skip-manifest-file-check", action="store_true")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -47,7 +47,7 @@ def _parser() -> argparse.ArgumentParser:
     validate_manifest = commands.add_parser("validate-partner-manifest")
     validate_manifest.add_argument("--partner-manifest", required=True)
     validate_manifest.add_argument("--expected-layout")
-    validate_manifest.add_argument("--skip-manifest-hash-check", action="store_true")
+    validate_manifest.add_argument("--skip-manifest-file-check", action="store_true")
     validate_manifest.set_defaults(function=validate_partner_manifest_command)
 
     train = commands.add_parser("train")
@@ -118,7 +118,7 @@ def _parser() -> argparse.ArgumentParser:
     matrix_eval.add_argument("--partner-manifest", required=True)
     matrix_eval.add_argument("--layout", required=True)
     matrix_eval.add_argument("--output", required=True)
-    matrix_eval.add_argument("--skip-manifest-hash-check", action="store_true")
+    matrix_eval.add_argument("--skip-manifest-file-check", action="store_true")
     matrix_eval.set_defaults(function=evaluate_development_matrix)
 
     matrix_summary = commands.add_parser("summarize-development-matrix")

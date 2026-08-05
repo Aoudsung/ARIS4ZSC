@@ -184,6 +184,19 @@ def test_mock_end_to_end_rollout_and_anchor_use_base_policy() -> None:
     assert bool(jnp.all(jnp.isfinite(anchors.measurement_covariances)))
 
 
+def _same_tree(left, right) -> bool:
+    import jax
+
+    left_leaves = jax.tree_util.tree_leaves(left)
+    right_leaves = jax.tree_util.tree_leaves(right)
+    if len(left_leaves) != len(right_leaves):
+        return False
+    return all(
+        np.array_equal(np.asarray(jax.device_get(one)), np.asarray(jax.device_get(other)))
+        for one, other in zip(left_leaves, right_leaves)
+    )
+
+
 def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
     import jax
 
@@ -192,11 +205,7 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         load_deployment,
     )
     from src.delta_zsc.optimizer import init_adam
-    from src.delta_zsc.storage import (
-        load_latest_checkpoint,
-        pytree_fingerprint,
-        save_checkpoint,
-    )
+    from src.delta_zsc.storage import load_latest_checkpoint, save_checkpoint
     from src.delta_zsc.types import TrainState
     from src.delta_zsc.runner import initialize_runner
 
@@ -223,7 +232,7 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         tmp_path / "checkpoints", expected_identity=identity
     )
     assert step == 1024
-    assert pytree_fingerprint(restored.base_params) == pytree_fingerprint(base)
+    assert _same_tree(restored.base_params, base)
 
     bundle = export_deployment_bundle(
         tmp_path / "deployment",
@@ -236,4 +245,4 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
     )
     loaded = load_deployment(bundle)
     assert loaded.ego_run_id == "ego-0"
-    assert pytree_fingerprint(loaded.latent_params) == pytree_fingerprint(latent)
+    assert _same_tree(loaded.latent_params, latent)

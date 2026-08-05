@@ -70,7 +70,7 @@ hyperparameter family, stage, and run. Formal support requires at least ten
 independent parents per mechanism.
 
 Calibration and confirmatory panels are parent- and co-training-lineage disjoint
-from support and from each other. The manifest is hash-bound and owner-free.
+from support and from each other. The manifest is lineage-bound and owner-free.
 Heuristics remain test-only.
 
 ## 6. Runs and evaluation
@@ -91,10 +91,10 @@ Simple and Wide are tested separately and combined only by intersection.
 
 Every formal run must preserve:
 
-- resolved config and fingerprint;
+- resolved config;
 - method/source identity;
-- hash-bound partner manifest;
-- complete checkpoint descriptor and parameter fingerprints;
+- lineage-bound partner manifest;
+- complete checkpoint descriptor;
 - per-update metrics and resource ledger;
 - final deployment bundle;
 - raw evaluation rows;

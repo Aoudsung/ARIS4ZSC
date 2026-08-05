@@ -41,7 +41,7 @@ satisfaction, all method variants, belief independence from decision-only
 parameters, separate finite base/latent updates, latent-before-PPO transaction
 ordering, response-only exclusion of decision anchors, legal rollout and CRN
 anchor collection, base-only training behavior, checkpoint/deployment round
-trip, manifest hashing/lineage, and active/legacy repository boundaries.
+trip, manifest lineage, and active/legacy repository boundaries.
 
 ## Synthetic VOI acceptance values
 
@@ -73,16 +73,18 @@ consequence for action choice, not through partner identifiability itself.
 - The complete old package, applications, configs, tests, workflow, analysis,
   and status ledgers remain available only under explicit legacy paths.
 
-## Configuration fingerprints
+## Configuration identity
 
-| Configuration | SHA-256 fingerprint |
-|---|---|
-| Simple development | `7df8546e90ede4ea99a3816f88f5912064d02b20aff768d8cada8605d493ef52` |
-| Simple formal | `80464cbbc35f3192b579316377673d0bc4c505c76261312fa0417cd5979558da` |
-| Simple mechanical | `5f3fb4d108732819c2e7aca57de16f08ed58c1091f9413cac6f1a4a031bc2294` |
-| Wide development | `7e3678b2fd00470534e6804139567c3d7daf543fd09f69222a99832023b77ec6` |
-| Wide formal | `73a436d6dab1ef91ec1e800f92af98012b8241212c8d9ac3acd0111907ffd2c8` |
-| Wide mechanical | `948619d86346f433b10733135dbb7bdccf5d65a94f4f06db8cb738ba8bb5bb6d` |
+The six registered configurations are
+
+`experiments/overcooked_v2/configs/delta_unified_{simple,wide}_{development,formal,mechanical}.yaml`.
+
+Configuration identity is the resolved configuration itself, not a digest of it.
+Every run writes its complete resolved config into `run_identity.json`, into the
+checkpoint descriptor identity, and into `deployment_bundle.json`; `ensure_run_identity`
+refuses to reuse an output directory whose recorded config differs. Changing a
+configuration therefore still changes the experiment identity, and the difference is
+readable rather than opaque.
 
 ## Not executed in this container
 
@@ -100,9 +102,8 @@ The repository provides executable commands and a fail-closed workflow for
 these operations. Their absence prevents a performance or SOTA claim, but does
 not invalidate the CPU-side implementation acceptance described above.
 
-## Integrity
+## Source identity
 
-`SOURCE_MANIFEST_SHA256.txt` hashes every included source file except the
-manifest itself. The distributable ZIP has a separate SHA-256 sidecar and was
-re-extracted before delivery; the extracted files were checked against the
-embedded source manifest.
+The source of record is the git history of this repository: a revision is named
+by its commit, not by a checksum manifest. `SOURCE_MANIFEST_SHA256.txt` and the
+ZIP checksum sidecar were removed together with every other digest in the tree.

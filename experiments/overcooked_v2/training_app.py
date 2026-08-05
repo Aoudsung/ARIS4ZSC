@@ -26,9 +26,7 @@ from src.delta_zsc.runner import collect_rollout, initialize_runner
 from src.delta_zsc.storage import (
     ensure_run_identity,
     load_latest_checkpoint,
-    pytree_fingerprint,
     save_checkpoint,
-    sha256_path,
     write_json,
 )
 from src.delta_zsc.training import environment_minibatch_schedule, training_update
@@ -63,6 +61,19 @@ def _host(value: Any) -> Any:
     return jax.tree_util.tree_map(convert, value)
 
 
+def _same_parameters(left: Any, right: Any) -> bool:
+    """Compare two parameter trees leaf by leaf."""
+
+    import jax
+
+    left_leaves = jax.tree_util.tree_leaves(left)
+    right_leaves = jax.tree_util.tree_leaves(right)
+    if len(left_leaves) != len(right_leaves):
+        return False
+    return all(
+        np.array_equal(np.asarray(jax.device_get(one)), np.asarray(jax.device_get(other)))
+        for one, other in zip(left_leaves, right_leaves)
+    )
 
 
 def _upstream_partner_cost(
@@ -139,7 +150,6 @@ def _upstream_partner_cost(
                 "gpu_hours": parent_gpu,
                 "wall_clock_hours": parent_wall,
                 "source": str(source),
-                "source_sha256": sha256_path(source),
             }
         )
     if formal and any(row["status"] != "counted" for row in records):
@@ -148,6 +158,7 @@ def _upstream_partner_cost(
             "training-support parent."
         )
     return total, gpu_hours, wall_clock_hours, records
+
 
 def _anchor_functions(
     *, model: DeltaModel, partner_functions: Any, partner_parameters: Any, environment: Any
@@ -334,7 +345,7 @@ def run_training(args: argparse.Namespace) -> None:
     manifest = load_partner_manifest(
         manifest_path,
         expected_layout=config.environment.layout,
-        verify_files=not bool(getattr(args, "skip_manifest_hash_check", False)),
+        verify_files=not bool(getattr(args, "skip_manifest_file_check", False)),
     )
     members = build_training_partner_pool(config, manifest)
     (
@@ -379,11 +390,9 @@ def run_training(args: argparse.Namespace) -> None:
         "layout": config.environment.layout,
         "method_variant": config.method_variant,
         "config": config.to_mapping(),
-        "config_fingerprint": config.fingerprint,
         "partner_manifest": {
             "path": str(manifest_path),
-            "sha256": sha256_path(manifest_path),
-            "fingerprint": manifest.fingerprint,
+            "run_ids": [row.run_id for row in manifest.runs],
         },
         "official_runtime": official_runtime,
         "observation_shape": list(environment.observation_shape),
@@ -425,8 +434,8 @@ def run_training(args: argparse.Namespace) -> None:
     )
     checkpoint_identity = {
         "method": METHOD_VERSION,
-        "config_fingerprint": config.fingerprint,
-        "manifest_fingerprint": manifest.fingerprint,
+        "config": config.to_mapping(),
+        "partner_manifest_run_ids": [row.run_id for row in manifest.runs],
         "seed_index": int(args.seed_index),
     }
     if bool(getattr(args, "resume", False)):
@@ -592,12 +601,9 @@ def run_training(args: argparse.Namespace) -> None:
         from .deployment import load_deployment
 
         existing = load_deployment(deployment_directory)
-        if (
-            pytree_fingerprint(existing.base_params)
-            != pytree_fingerprint(state.base_params)
-            or pytree_fingerprint(existing.latent_params)
-            != pytree_fingerprint(state.latent_params)
-        ):
+        if not _same_parameters(
+            existing.base_params, state.base_params
+        ) or not _same_parameters(existing.latent_params, state.latent_params):
             raise RuntimeError("Existing final deployment differs from the final checkpoint.")
     else:
         export_deployment_bundle(
@@ -613,14 +619,12 @@ def run_training(args: argparse.Namespace) -> None:
     # Fresh report-only decision audit.  It never alters learned parameters and
     # is idempotent across resume of a completed run.
     audit_path = output / "final_decision_audit.json"
-    base_fingerprint = pytree_fingerprint(state.base_params)
-    latent_fingerprint = pytree_fingerprint(state.latent_params)
+    final_environment_steps = int(np.asarray(state.effective_environment_steps))
     audit_complete = False
     if audit_path.is_file():
         existing_audit = json.loads(audit_path.read_text(encoding="utf-8"))
         audit_complete = (
-            existing_audit.get("base_params_fingerprint") == base_fingerprint
-            and existing_audit.get("latent_params_fingerprint") == latent_fingerprint
+            int(existing_audit.get("environment_steps", -1)) == final_environment_steps
         )
     if (
         config.method_variant in {"delta_passive", "delta_active"}
@@ -681,8 +685,7 @@ def run_training(args: argparse.Namespace) -> None:
                     batch=audit_batch,
                     anchors=audit_anchors,
                 ),
-                "base_params_fingerprint": base_fingerprint,
-                "latent_params_fingerprint": latent_fingerprint,
+                "environment_steps": final_environment_steps,
             },
         )
 
@@ -738,10 +741,10 @@ def run_cuda_preflight(args: argparse.Namespace) -> None:
             "method": METHOD_VERSION,
             "config": str(Path(args.config).resolve()),
             "partner_manifest": str(Path(args.partner_manifest).resolve()),
-            "deployment_sha256": sha256_path(deployment),
-            "checkpoint_descriptor_sha256": sha256_path(checkpoint),
-            "final_decision_audit_sha256": sha256_path(audit),
-            "resource_ledger_sha256": sha256_path(ledger),
+            "deployment": str(deployment),
+            "checkpoint_descriptor": str(checkpoint),
+            "final_decision_audit": str(audit),
+            "resource_ledger": str(ledger),
         },
     )
 

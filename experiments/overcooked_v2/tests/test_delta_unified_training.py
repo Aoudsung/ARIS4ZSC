@@ -98,11 +98,23 @@ def _anchors():
     )
 
 
+def _same_tree(left, right) -> bool:
+    import jax
+
+    left_leaves = jax.tree_util.tree_leaves(left)
+    right_leaves = jax.tree_util.tree_leaves(right)
+    if len(left_leaves) != len(right_leaves):
+        return False
+    return all(
+        np.array_equal(np.asarray(jax.device_get(one)), np.asarray(jax.device_get(other)))
+        for one, other in zip(left_leaves, right_leaves)
+    )
+
+
 def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
     import jax
 
     from src.delta_zsc.optimizer import init_adam
-    from src.delta_zsc.storage import pytree_fingerprint
     from src.delta_zsc.training import environment_minibatch_schedule, training_update
 
     _, model, base, latent = _setup()
@@ -124,8 +136,8 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
         schedule=schedule,
         total_optimizer_steps=10,
     )
-    assert pytree_fingerprint(updated_base) != pytree_fingerprint(base)
-    assert pytree_fingerprint(updated_latent) != pytree_fingerprint(latent)
+    assert not _same_tree(updated_base, base)
+    assert not _same_tree(updated_latent, latent)
     assert float(metrics["ppo"]["base_update_applied"]) == 1.0
     assert float(metrics["latent"]["latent_update_applied"]) == 1.0
     assert np.isfinite(float(metrics["latent"]["latent_composite_nll"]))

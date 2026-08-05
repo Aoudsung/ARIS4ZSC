@@ -280,4 +280,4 @@ from entering PPO and ensure all training behavior remains the base policy.
 `history_rnn`, `base`, `response_only`, `delta_passive`, and `delta_active` are
 nested comparisons. Only `K`, `H`, and `delta` are scientific method fields.
 All artifacts bind the resolved configuration, source identity, partner
-manifest hashes, parameter fingerprints, and resource ledger.
+manifest lineage, and resource ledger.
