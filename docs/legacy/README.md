@@ -1,9 +1,15 @@
-# 历史归档
+# Historical method and research archive
 
-本目录只保存已废止的方法与研究计划，供追溯使用。其内容不约束当前 DEPI
-实现，不得用于创建配置、加载 checkpoint、解释 artifact 或撰写当前方法主张。
+This directory contains superseded method specifications, research plans,
+status ledgers, and analysis utilities. None of these files define the active
+DELTA-ZSC method, configuration, checkpoint schema, evaluation protocol, or
+paper claim.
 
-- `v6/`：上一代端到端信念、粒子价值、遗憾塑形和连续伙伴生成方案；
-- `v6/research/`：与该方案绑定的旧实验阶梯、论文计划、评审和理论旁路。
+- `v6/`: the retired continuous-posterior / generator-centered design and its
+  research program;
+- `v8/status/`: append-only DEPI v8 decision and evidence ledgers retained for
+  provenance.
 
-当前权威入口始终是仓库根目录 README 所列四份规格。
+The only authoritative active documents are listed by
+`docs/PROTOCOL_INDEX.md`. The complete retired DEPI v8 implementation and its
+analysis utilities are stored under `legacy/implementation_v8/`.

@@ -1,2252 +1,748 @@
-"""DEPI exact-filter decision-supervision training lifecycle.
-
-Every outer update executes the same learning system.  Signal audits never
-control losses, partner sampling, checkpoint selection, or deployment.
-"""
+"""End-to-end Official OvercookedV2 training for unified DELTA-ZSC."""
 
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
-import hashlib
 import json
-import os
 from pathlib import Path
-import subprocess
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
-from experiments.overcooked_v2.deployment import (
-    Deployment,
-    deployment_action,
-    deployable_parameters,
-    export_deployment_bundle,
-    load_deployment,
-)
-from experiments.overcooked_v2.comparator_app import (
-    load_component_diagnostic_panel,
-    load_frozen_pair_comparator,
-)
-from src.path_c.comparator_contract import (
-    comparator_contract_for_run,
-    comparator_reference_policy_set_hash,
-)
-from src.path_c.continuation import ContinuationContract
-from experiments.overcooked_v2.official_adapter import (
-    FrozenPartnerPool,
-    VectorEnvironment,
-    validate_official_runtime,
-)
-from experiments.overcooked_v2.official_policy import OfficialDEPIPolicy
-from src.path_c.anchor_sampling import (
-    COMPARATOR_RUN_ID_CAPACITY,
-    FrozenPairComparator,
-    collect_anchor_batch,
-    make_anchor_functions,
-    preflight_anchor_microbatch_from_records,
-    separation_terms_from_matched_pairs,
-)
-from src.path_c.base_distillation import collect_owner_behavior, distill_owner_actor
-from src.path_c.compiled_kernels import (
-    build_anchor_chunk_kernel,
-    build_training_kernels,
-    configure_persistent_compilation_cache,
-)
-from src.path_c.component_diagnostics import component_intervention_summary
-from src.path_c.experiment import (
-    CONFIG_VERSION,
+from src.delta_zsc.anchors import AnchorFunctions, collect_anchor_batch
+from src.delta_zsc.config import (
     CHECKPOINT_SCHEMA_VERSION,
-    ENGINEERING_SEED_INDEX,
     METHOD_VERSION,
-    OFFICIAL_SOURCE_COMMIT,
-    engineering_training_key,
+    OFFICIAL_ACTION_COUNT,
     load_config,
-    load_partner_manifest,
-    official_training_domain_keys,
-    official_training_key,
-    validate_seed_training_manifest,
 )
-from src.path_c.m1_gate import (
-    evaluate_m1_gate_on_anchor_batch,
-    initialize_bootstrap_value_ensemble,
-    m1_gate_report,
-    train_bootstrap_value_ensemble,
-)
-from src.path_c.model import (
-    build_model,
-    initial_policy_state,
-    initialize_model_parameters,
-)
-from src.path_c.partner_sources import (
-    build_partner_pool,
-    make_static_pool_partner_functions,
-)
-from src.path_c.resources import (
-    ResourceLedger,
-    configure_bundled_cuda_toolchain,
-    gpu_hours_for_wall_seconds,
-    measure_policy_inference_latency_ms,
-    parameter_count,
-    peak_device_memory_bytes,
-    require_single_cuda_worker,
-)
-from src.path_c.runner import (
-    context_dropout_probability,
-    initialize_runner,
-)
-from src.path_c.storage import (
+from src.delta_zsc.manifest import load_partner_manifest
+from src.delta_zsc.model import DeltaModel, observe_after_transition
+from src.delta_zsc.optimizer import init_adam
+from src.delta_zsc.partners import build_training_partner_pool, make_static_partner_functions
+from src.delta_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
+from src.delta_zsc.runner import collect_rollout, initialize_runner
+from src.delta_zsc.storage import (
     ensure_run_identity,
-    orbax_manager,
+    load_latest_checkpoint,
     pytree_fingerprint,
-    restore_latest_checkpoint,
     save_checkpoint,
     sha256_path,
-    training_identity,
-    validate_formal_repository_state,
-    validate_registered_python_runtime,
     write_json,
-    write_json_atomic,
-    write_jsonl,
 )
-from src.path_c.training import (
-    ANCHOR_VARIANTS,
-    SEPARATION_VARIANTS,
-    adapt_effective_update_epochs,
-    environment_minibatch_schedule,
-    make_optimizer,
-    official_reward_shaping_factor,
-    polyak_update,
-)
-from src.path_c.types import CounterfactualAnchorBatch, SeparationTerms, TrainState
+from src.delta_zsc.training import environment_minibatch_schedule, training_update
+from src.delta_zsc.types import TrainState
+
+from .deployment import export_deployment_bundle
 
 
-FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 2**20
-CUDA_PREFLIGHT_SCOPE = "depi_formal_cuda_single_update_preflight"
+def _training_key(seed_index: int) -> Any:
+    import jax
+
+    if int(seed_index) < 0:
+        return jax.random.PRNGKey(0)
+    return jax.random.split(jax.random.PRNGKey(42), 10)[int(seed_index)]
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
 def _host(value: Any) -> Any:
-    """Convert device values to lossless JSON-compatible records."""
-
-    if isinstance(value, Mapping):
-        return {str(key): _host(item) for key, item in value.items()}
-    if isinstance(value, tuple) and hasattr(value, "_fields"):
-        return {name: _host(getattr(value, name)) for name in value._fields}
-    if isinstance(value, (tuple, list)):
-        return [_host(item) for item in value]
-    try:
-        array = np.asarray(value)
-    except Exception:
-        return value
-    if array.ndim == 0:
-        return array.item()
-    return array.tolist()
-
-
-def _gpu_snapshot() -> Mapping[str, Any]:
-    try:
-        completed = subprocess.run(
-            (
-                "nvidia-smi",
-                "--query-gpu=index,uuid,memory.total,memory.used,utilization.gpu,ecc.errors.uncorrected.volatile.total",
-                "--format=csv,noheader,nounits",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        rows = []
-        for line in completed.stdout.splitlines():
-            values = [value.strip() for value in line.split(",")]
-            if len(values) == 6:
-                rows.append(
-                    {
-                        "physical_index": int(values[0]),
-                        "uuid": values[1],
-                        "memory_total_mib": int(values[2]),
-                        "memory_used_mib": int(values[3]),
-                        "utilization_percent": int(values[4]),
-                        "volatile_uncorrected_ecc": values[5],
-                    }
-                )
-        return {"gpus": rows, "captured_at": _utc_now()}
-    except Exception as error:
-        return {"error": f"{type(error).__name__}: {error}", "captured_at": _utc_now()}
-
-
-def _synchronize(value: Any) -> None:
     import jax
 
-    for leaf in jax.tree_util.tree_leaves(value):
-        block = getattr(leaf, "block_until_ready", None)
-        if callable(block):
-            block()
+    def convert(item: Any) -> Any:
+        array = np.asarray(jax.device_get(item))
+        if array.ndim == 0:
+            return array.item()
+        return array.tolist()
+
+    return jax.tree_util.tree_map(convert, value)
 
 
-def _phase(
-    output: Path,
-    *,
-    name: str,
-    update: int,
-    function: Callable[[], Any],
-) -> tuple[Any, float]:
-    started = time.perf_counter()
-    write_json_atomic(
-        output / "phase_status.json",
-        {
-            "status": "running",
-            "phase": name,
-            "update": int(update),
-            "started_at": _utc_now(),
-            "gpu": _gpu_snapshot(),
-        },
-    )
-    try:
-        value = function()
-        _synchronize(value)
-    except Exception as error:
-        write_json_atomic(
-            output / "phase_status.json",
-            {
-                "status": "failed",
-                "phase": name,
-                "update": int(update),
-                "failed_at": _utc_now(),
-                "error": f"{type(error).__name__}: {error}",
-                "gpu": _gpu_snapshot(),
-            },
-        )
-        raise
-    elapsed = time.perf_counter() - started
-    write_json_atomic(
-        output / "phase_status.json",
-        {
-            "status": "complete",
-            "phase": name,
-            "update": int(update),
-            "completed_at": _utc_now(),
-            "wall_seconds": elapsed,
-            "gpu": _gpu_snapshot(),
-        },
-    )
-    return value, elapsed
-
-
-def _owned_runs(manifest: Any, role: str, seed_index: int) -> tuple[Any, ...]:
-    owner = None if int(seed_index) == ENGINEERING_SEED_INDEX else int(seed_index)
-    return tuple(
-        run
-        for run in manifest.runs
-        if run.role == role and run.owner_seed_index == owner
-    )
-
-
-def _pool(runs: tuple[Any, ...]) -> FrozenPartnerPool:
-    if not runs:
-        raise ValueError("A required DEPI frozen-partner pool is empty.")
-    return FrozenPartnerPool.from_checkpoints(
-        [run.checkpoint for run in runs],
-        parent_training_run_ids=[run.parent_training_run_id for run in runs],
-    )
-
-
-def _model_structure_fingerprint(config: Any, observation_shape: tuple[int, ...]) -> str:
-    payload = {
-        "method": METHOD_VERSION,
-        "model": config.to_mapping()["model"],
-        "observation_shape": list(observation_shape),
-        "action_count": 6,
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-
-def _fingerprint_words(tree: Any) -> np.ndarray:
-    digest = bytes.fromhex(pytree_fingerprint(tree))[:8]
-    return np.frombuffer(digest, dtype=">u4").astype(np.uint32)
-
-
-def _empty_supervision_payload(
-    *, config: Any, observation_shape: tuple[int, ...]
-) -> tuple[Any, Any, FrozenPairComparator]:
-    """Fixed-shape inactive values used by checkpoint schema 8."""
-
-    import jax.numpy as jnp
-
-    anchor_count = int(config.anchors.ordinary_states) + 2 * int(
-        config.anchors.matched_history_pairs
-    )
-    pair_count = int(config.anchors.matched_history_pairs)
-    policy = initial_policy_state(
-        batch_size=anchor_count,
-        observation_shape=observation_shape,
-        action_count=6,
-        task_hidden_dim=config.model.task_hidden_dim,
-        capability_hidden_dim=config.model.capability_hidden_dim,
-        capability_dim=config.model.capability_dim,
-        component_embedding_dim=config.model.component_embedding_dim,
-        protocol_components=config.model.protocol_components,
-    )
-    zeros_action = jnp.zeros((anchor_count, 6), dtype=jnp.float32)
-    anchors = CounterfactualAnchorBatch(
-        anchor_ids=jnp.full((anchor_count,), -1, dtype=jnp.int32),
-        rollout_flat_indexes=jnp.zeros((anchor_count,), dtype=jnp.int32),
-        policy_states=policy,
-        observations=jnp.zeros((anchor_count,) + observation_shape, dtype=jnp.float32),
-        partner_sources=jnp.zeros((anchor_count,), dtype=jnp.int32),
-        partner_members=jnp.zeros((anchor_count,), dtype=jnp.int32),
-        partner_family_ids=jnp.zeros((anchor_count,), dtype=jnp.int32),
-        partner_checkpoint_stages=jnp.ones(
-            (anchor_count,), dtype=jnp.float32
-        ),
-        partner_run_ids=jnp.zeros((anchor_count,), dtype=jnp.int32),
-        fit_returns_by_action=zeros_action,
-        return_sum_by_action=zeros_action,
-        return_squared_sum_by_action=zeros_action,
-        replica_count=jnp.zeros((anchor_count, 6), dtype=jnp.int32),
-        collection_policy_logits=zeros_action,
-        collection_update=jnp.zeros((anchor_count,), dtype=jnp.int32),
-        collection_target_fingerprint=jnp.zeros((anchor_count, 2), dtype=jnp.uint32),
-        matched_pair_ids=jnp.full((anchor_count,), -1, dtype=jnp.int32),
-        action_mask=jnp.zeros((anchor_count, 6), dtype=jnp.bool_),
-        evaluation_returns_by_action=jnp.zeros_like(zeros_action),
-        evaluation_replica_count=jnp.zeros((anchor_count, 6), dtype=jnp.int32),
-        fit_replica_returns_by_action=jnp.zeros(
-            (anchor_count, 6, int(config.anchors.fit_replicas)),
-            dtype=jnp.float32,
-        ),
-        collection_policy_fingerprint=jnp.zeros(
-            (anchor_count, 2), dtype=jnp.uint32
-        ),
-        collection_context_fingerprint=jnp.zeros(
-            (anchor_count, 2), dtype=jnp.uint32
-        ),
-    )
-    pair_policy = jax_tree_take(policy, pair_count)
-    separation = SeparationTerms(
-        ego_state_a=pair_policy,
-        ego_state_b=pair_policy,
-        probe_observations=jnp.zeros(
-            (2, pair_count) + observation_shape, dtype=jnp.float32
-        ),
-        equivalent_mask=jnp.zeros((pair_count,), dtype=jnp.bool_),
-        weights=jnp.zeros((pair_count,), dtype=jnp.float32),
-        margin=jnp.asarray(0.0, dtype=jnp.float32),
-        pair_valid=jnp.zeros((pair_count,), dtype=jnp.bool_),
-    )
-    ingredient_count = (int(observation_shape[-1]) - 27) // 4
-    history_dim = int(config.anchors.probe_steps) * (38 + ingredient_count + 2)
-    comparator = FrozenPairComparator(
-        weights=jnp.zeros((2 * history_dim,), dtype=jnp.float32),
-        bias=jnp.asarray(0.0, dtype=jnp.float32),
-        train_accuracy=jnp.asarray(jnp.nan, dtype=jnp.float32),
-        validation_accuracy=jnp.asarray(jnp.nan, dtype=jnp.float32),
-        validation_accuracy_interval=(float("nan"), float("nan")),
-        history_feature_dim=history_dim,
-        pair_feature_dim=2 * history_dim,
-        development_row_count=0,
-        validation_row_count=0,
-        validation_partner_run_count=0,
-        development_partner_run_ids=jnp.full(
-            (COMPARATOR_RUN_ID_CAPACITY,), -1, dtype=jnp.int32
-        ),
-        development_partner_run_count=0,
-    )
-    return anchors, separation, comparator
-
-
-def _empty_m1_history(capacity: int) -> Mapping[str, Any]:
-    """Fixed-shape M1 ledger stored atomically inside ``TrainState``."""
-
-    import jax.numpy as jnp
-
-    count = max(int(capacity), 1)
-    nan = jnp.full
-    return {
-        "updates": jnp.full((count,), -1, dtype=jnp.int32),
-        "passed": jnp.zeros((count,), dtype=jnp.bool_),
-        "path_passing_fractions": nan((count, 4), jnp.nan, dtype=jnp.float32),
-        "path_mean_spearman": nan((count, 4), jnp.nan, dtype=jnp.float32),
-        "path_top_action_agreement": nan((count, 4), jnp.nan, dtype=jnp.float32),
-        "path_mean_value_regret": nan((count, 4), jnp.nan, dtype=jnp.float32),
-        "bootstrap_training_loss": nan((count, 3), jnp.nan, dtype=jnp.float32),
-        "pair_class_fractions": nan((count, 3), jnp.nan, dtype=jnp.float32),
-        "irreducible_ambiguity_fraction": nan(
-            (count,), jnp.nan, dtype=jnp.float32
-        ),
-        "separation_margin": nan((count,), jnp.nan, dtype=jnp.float32),
-        "valid_pair_fraction": nan((count,), jnp.nan, dtype=jnp.float32),
-    }
-
-
-def _append_m1_history(
-    history: Mapping[str, Any],
-    *,
-    index: int,
-    update: int,
-    result: Any,
-    bootstrap_training_metrics: Mapping[str, Any],
-    supervision_readings: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    """Return a fixed-shape ledger with one deterministic slot replaced."""
-
-    import jax.numpy as jnp
-
-    if not 0 <= int(index) < int(np.asarray(history["updates"]).shape[0]):
-        raise RuntimeError("M1 checkpoint history capacity is exhausted.")
-    values = dict(history)
-    values["updates"] = values["updates"].at[index].set(int(update))
-    values["passed"] = values["passed"].at[index].set(result.passed)
-    for name in (
-        "path_passing_fractions",
-        "path_mean_spearman",
-        "path_top_action_agreement",
-        "path_mean_value_regret",
-    ):
-        values[name] = values[name].at[index].set(getattr(result, name))
-    values["bootstrap_training_loss"] = values["bootstrap_training_loss"].at[
-        index
-    ].set(bootstrap_training_metrics["bootstrap_training_loss"])
-    for name in (
-        "pair_class_fractions",
-        "irreducible_ambiguity_fraction",
-        "separation_margin",
-        "valid_pair_fraction",
-    ):
-        values[name] = values[name].at[index].set(
-            jnp.asarray(supervision_readings[name])
-        )
-    return values
-
-
-def _m1_history_records(
-    history: Mapping[str, Any], *, count: int
-) -> list[dict[str, Any]]:
-    """Materialize the checkpoint ledger as the human-readable JSON report."""
-
-    host = _host(history)
-    records: list[dict[str, Any]] = []
-    for index in range(int(count)):
-        records.append(
-            {
-                "update": int(host["updates"][index]),
-                "passed": bool(host["passed"][index]),
-                "path_passing_fractions": host["path_passing_fractions"][index],
-                "path_mean_spearman": host["path_mean_spearman"][index],
-                "path_top_action_agreement": host[
-                    "path_top_action_agreement"
-                ][index],
-                "path_mean_value_regret": host["path_mean_value_regret"][index],
-                "bootstrap_training_loss": host["bootstrap_training_loss"][index],
-                "separation_readings": {
-                    "pair_class_fractions": host["pair_class_fractions"][index],
-                    "irreducible_ambiguity_fraction": host[
-                        "irreducible_ambiguity_fraction"
-                    ][index],
-                    "separation_margin": host["separation_margin"][index],
-                    "valid_pair_fraction": host["valid_pair_fraction"][index],
-                },
-            }
-        )
-    return records
-
-
-def jax_tree_take(tree: Any, count: int) -> Any:
-    import jax
-    import jax.numpy as jnp
-
-    return jax.tree_util.tree_map(lambda value: jnp.asarray(value)[: int(count)], tree)
-
-
-def _checkpoint_identity(state: TrainState) -> Mapping[str, Any]:
-    """Fingerprint every value whose restoration can change the next update.
-
-    The sidecar is intentionally stricter than Orbax's structural restore.  In
-    particular it binds recurrent/random state, supervision state, and every
-    optimizer.  A checkpoint from a previous method cannot be adopted merely
-    because a subset of parameter leaves happens to match.
-    """
-
-    return {
-        "method": METHOD_VERSION,
-        "config_version": CONFIG_VERSION,
-        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
-        "update_count": int(np.asarray(state.update_count)),
-        "effective_environment_steps": int(
-            np.asarray(state.effective_environment_steps)
-        ),
-        "params": pytree_fingerprint(state.params),
-        "target_params": pytree_fingerprint(state.target_params),
-        "ppo_optimizer_state": pytree_fingerprint(state.ppo_optimizer_state),
-        "supervision_anchor_batch": pytree_fingerprint(
-            state.supervision_anchor_batch
-        ),
-        "current_separation_terms": pytree_fingerprint(
-            state.current_separation_terms
-        ),
-        "current_pair_comparator": pytree_fingerprint(
-            state.current_pair_comparator
-        ),
-        "supervision_readings": pytree_fingerprint(state.supervision_readings),
-        "anchor_sampling_counter": int(np.asarray(state.anchor_sampling_counter)),
-        "anchor_microbatch_size": int(np.asarray(state.anchor_microbatch_size)),
-        "effective_update_epochs": int(np.asarray(state.effective_update_epochs)),
-        "bootstrap_encoder_params": pytree_fingerprint(
-            state.bootstrap_encoder_params
-        ),
-        "bootstrap_optimizer_states": pytree_fingerprint(
-            state.bootstrap_optimizer_states
-        ),
-        "bootstrap_sampling_counters": pytree_fingerprint(
-            state.bootstrap_sampling_counters
-        ),
-        "m1_summary_state": pytree_fingerprint(state.m1_summary_state),
-        "m1_history": pytree_fingerprint(state.m1_history),
-        "runner_state": pytree_fingerprint(state.runner_state),
-        "optimizer_steps": {
-            "ppo": int(np.asarray(state.ppo_optimizer_step)),
-        },
-        "random_domains": _host(state.random_domains),
-        "resource_ledger": dict(state.resource_ledger),
-    }
-
-
-def _save_depi_checkpoint(manager: Any, output: Path, state: TrainState) -> None:
-    step = int(np.asarray(state.effective_environment_steps))
-    save_checkpoint(manager, step=step, state=state)
-    write_json(
-        output / "checkpoint_identities" / f"{step:012d}.json",
-        _checkpoint_identity(state),
-    )
-
-
-def _restore_depi_checkpoint(
-    manager: Any, output: Path, template: TrainState
-) -> TrainState | None:
-    restored = restore_latest_checkpoint(manager, item=template)
-    if restored is None:
-        return None
-    step, state = restored
-    if not isinstance(state, TrainState):
-        state = TrainState(*state) if isinstance(state, tuple) else TrainState(**state)
-    path = output / "checkpoint_identities" / f"{step:012d}.json"
-    if not path.is_file():
-        raise RuntimeError("DEPI checkpoint has no atomic resume identity.")
-    expected = json.loads(path.read_text(encoding="utf-8"))
-    observed = json.loads(json.dumps(_checkpoint_identity(state), sort_keys=True))
-    if expected != observed:
-        raise RuntimeError(
-            "Checkpoint parameters, supervision state, RNG, or optimizer identity differs."
-        )
-    if int(np.asarray(state.effective_environment_steps)) != int(step):
-        raise RuntimeError("Checkpoint step disagrees with DEPI TrainState.")
-    return state
-
-
-def _validate_preflight_roundtrips(
-    *,
-    manager: Any,
-    output: Path,
-    state: TrainState,
-    deployment_directory: Path,
-    config: Any,
-) -> Mapping[str, Any]:
-    """Fail closed on both §5 preflight persistence round-trips.
-
-    The checkpoint validator fingerprints every continuation-relevant state
-    field.  The deployment validator restores only the registered whitelist,
-    checks its fingerprint, and executes one real policy forward from the
-    checkpointed runner carry and observation.
-    """
-
-    import jax
-    import jax.numpy as jnp
-
-    restored = _restore_depi_checkpoint(manager, output, state)
-    if restored is None:
-        raise RuntimeError("CUDA preflight checkpoint round-trip produced no state.")
-    expected_checkpoint = _checkpoint_identity(state)
-    observed_checkpoint = _checkpoint_identity(restored)
-    if expected_checkpoint != observed_checkpoint:
-        raise RuntimeError("CUDA preflight checkpoint round-trip is not exact.")
-
-    loaded = load_deployment(deployment_directory, config)
-    expected_deployment_fingerprint = pytree_fingerprint(
-        deployable_parameters(state.params)
-    )
-    observed_deployment_fingerprint = pytree_fingerprint(loaded.params)
-    if observed_deployment_fingerprint != expected_deployment_fingerprint:
-        raise RuntimeError("CUDA preflight deployment round-trip is not exact.")
-
-    runner = restored.runner_state
-    lane_count = int(jnp.asarray(runner.ego_roles).shape[0])
-    lanes = jnp.arange(lane_count, dtype=jnp.int32)
-    observations = runner.observations[lanes, runner.ego_roles]
-    keys = jax.random.split(jax.random.PRNGKey(0), lane_count)
-    stepped, actions, output_values, log_probability = deployment_action(
-        deployment=loaded,
-        state=runner.ego_policy,
-        observation=observations,
-        keys=keys,
-    )
-    forward_values = {
-        "stepped_state": stepped,
-        "actions": actions,
-        "policy_logits": output_values.policy_logits,
-        "state_value": output_values.state_value,
-        "protocol_probabilities": output_values.protocol_probabilities,
-        "log_probability": log_probability,
-    }
-    if not _all_finite(forward_values):
-        raise RuntimeError("CUDA preflight deployment forward is non-finite.")
-    return {
-        "checkpoint_roundtrip_passed": True,
-        "checkpoint_state_fingerprint": pytree_fingerprint(restored),
-        "deployment_roundtrip_passed": True,
-        "deployment_params_fingerprint": observed_deployment_fingerprint,
-        "deployment_forward_passed": True,
-        "deployment_forward_lane_count": lane_count,
-    }
 
 
 def _upstream_partner_cost(
-    runs: tuple[Any, ...], *, formal: bool
-) -> tuple[int, float, float, Any]:
-    """Read explicit upstream ledgers; never invent hidden population cost."""
+    members: tuple[Any, ...], *, formal: bool
+) -> tuple[int, float, float, list[Mapping[str, Any]]]:
+    """Resolve each unique parent policy's explicit simulator cost.
+
+    New DELTA upstream runs expose ``ResourceLedger``.  Existing Official
+    checkpoints may carry an older ledger/summary, so a positive explicit step
+    total is accepted, but formal runs never invent a missing cost.
+    """
 
     total = 0
     gpu_hours = 0.0
     wall_clock_hours = 0.0
-    records = []
+    records: list[Mapping[str, Any]] = []
     seen: set[str] = set()
-    for run in runs:
-        parent = str(run.parent_training_run_id)
+    for member in members:
+        parent = str(member.parent_training_run_id)
         if parent in seen:
             continue
         seen.add(parent)
-        checkpoint = Path(run.checkpoint).resolve()
-        candidates = []
-        for directory in (checkpoint, *checkpoint.parents[:5]):
+        checkpoint = Path(member.checkpoint).resolve()
+        candidates: list[Path] = []
+        for directory in (checkpoint, *checkpoint.parents[:6]):
             candidates.extend(
                 (directory / "resource_ledger.json", directory / "upstream_summary.json")
             )
-        ledger_path = next((path for path in candidates if path.is_file()), None)
-        if ledger_path is None:
-            records.append({"parent": parent, "status": "missing_explicit_ledger"})
+        source = next((value for value in candidates if value.is_file()), None)
+        steps = None
+        parent_gpu = 0.0
+        parent_wall = 0.0
+        if source is not None:
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if isinstance(payload, Mapping):
+                try:
+                    registered = ResourceLedger.from_mapping(payload)
+                except (TypeError, ValueError):
+                    registered = None
+                if registered is not None:
+                    steps = int(registered.total_training_simulator_steps)
+                    parent_gpu = float(registered.gpu_hours)
+                    parent_wall = float(registered.wall_clock_hours)
+                else:
+                    for name in (
+                        "total_training_simulator_steps",
+                        "upstream_partner_steps",
+                        "effective_environment_steps",
+                        "actual_timesteps",
+                    ):
+                        if payload.get(name) is not None and int(payload[name]) > 0:
+                            steps = int(payload[name])
+                            break
+                    parent_gpu = float(
+                        payload.get("gpu_hours", payload.get("training_gpu_hours", 0.0))
+                    )
+                    parent_wall = float(
+                        payload.get(
+                            "wall_clock_hours",
+                            payload.get("training_wall_clock_hours", 0.0),
+                        )
+                    )
+        if steps is None:
+            records.append({"parent_training_run_id": parent, "status": "missing"})
             continue
-        payload = json.loads(ledger_path.read_text(encoding="utf-8"))
-        try:
-            registered_ledger = ResourceLedger.from_mapping(payload)
-        except (TypeError, ValueError):
-            registered_ledger = None
-        value = (
-            registered_ledger.total_training_simulator_steps
-            if registered_ledger is not None
-            else payload.get(
-                "effective_environment_steps", payload.get("actual_timesteps")
-            )
-        )
-        if value is None:
-            records.append({"parent": parent, "status": "ledger_has_no_step_total"})
-            continue
-        total += int(value)
-        if registered_ledger is not None:
-            gpu_hours += float(registered_ledger.gpu_hours)
-            wall_clock_hours += float(registered_ledger.wall_clock_hours)
+        total += steps
+        gpu_hours += parent_gpu
+        wall_clock_hours += parent_wall
         records.append(
             {
-                "parent": parent,
-                "status": (
-                    "counted" if registered_ledger is not None else "legacy_ledger"
-                ),
-                "steps": int(value),
-                "path": str(ledger_path),
+                "parent_training_run_id": parent,
+                "status": "counted",
+                "steps": steps,
+                "gpu_hours": parent_gpu,
+                "wall_clock_hours": parent_wall,
+                "source": str(source),
+                "source_sha256": sha256_path(source),
             }
         )
-    if formal and any(record["status"] != "counted" for record in records):
+    if formal and any(row["status"] != "counted" for row in records):
         raise RuntimeError(
-            "Formal DEPI resource accounting requires explicit upstream partner ledgers."
+            "Formal DELTA requires an explicit upstream resource ledger for every "
+            "training-support parent."
         )
     return total, gpu_hours, wall_clock_hours, records
 
-
-def _comparator_shared_resources(path: str | Path) -> ResourceLedger:
-    """Read the validated shared-cost ledger embedded in a frozen comparator."""
-
-    payload = json.loads(Path(path).resolve().read_text(encoding="utf-8"))
-    registration = payload.get("source_registration")
-    if not isinstance(registration, Mapping):
-        raise ValueError("Frozen comparator has no shared-resource registration.")
-    ledger = ResourceLedger.from_mapping(registration.get("resource_ledger"))
-    if (
-        ledger.comparator_history_collection_steps <= 0
-        or ledger.comparator_continuation_steps <= 0
-        or ledger.reference_ego_upstream_steps <= 0
-        or ledger.shared_pretraining_cost <= 0
-    ):
-        raise ValueError("Frozen comparator shared-resource ledger is incomplete.")
-    return ledger
-
-
-def _all_finite(tree: Any) -> bool:
+def _anchor_functions(
+    *, model: DeltaModel, partner_functions: Any, partner_parameters: Any, environment: Any
+) -> AnchorFunctions:
     import jax
 
-    for leaf in jax.tree_util.tree_leaves(tree):
-        values = np.asarray(jax.device_get(leaf))
-        if values.size and not bool(np.all(np.isfinite(values))):
-            return False
-    return True
-
-
-def _mean_metrics(metrics: Any) -> Any:
-    import jax
-    import jax.numpy as jnp
-
-    return jax.tree_util.tree_map(lambda value: jnp.mean(value), metrics)
-
-
-def _account_runtime_resources(
-    state: TrainState, *, elapsed_wall_seconds: float
-) -> TrainState:
-    """Add one non-overlapping process interval to the checkpointed ledger."""
-
-    ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
-        gpu_hours=gpu_hours_for_wall_seconds(float(elapsed_wall_seconds)),
-        wall_clock_hours=float(elapsed_wall_seconds) / 3_600.0,
-    )
-    ledger = ResourceLedger(
-        **{
-            **{
-                name: getattr(ledger, name)
-                for name in ResourceLedger.__dataclass_fields__
-            },
-            "peak_memory_bytes": max(
-                ledger.peak_memory_bytes, peak_device_memory_bytes()
-            ),
-        }
-    )
-    return state._replace(resource_ledger=ledger.to_mapping())
-
-
-def _anchor_policy_logits(model: Any, params: Any, anchors: Any) -> Any:
-    import jax.numpy as jnp
-
-    unused_state, output = model.apply(
-        {"params": params},
-        anchors.policy_states,
-        anchors.observations,
-        jnp.zeros(anchors.anchor_ids.shape, dtype=jnp.bool_),
-        method=model.step,
-    )
-    del unused_state
-    return output.policy_logits
-
-
-def _write_training_support_latents(
-    output: Path, *, model: Any, params: Any, anchors: Any, config: Any
-) -> None:
-    """Persist final-model support without adding simulator interaction.
-
-    Posterior calibration must use the primary model's actual training
-    support. Re-encoding the fixed anchor set under final parameters avoids mixing
-    latent coordinates from earlier checkpoints.
-    """
-
-    import jax
-    import jax.numpy as jnp
-
-    if anchors is None:
-        write_json(
-            output / "records" / "training_support_latents.json",
-            {
-                "method": METHOD_VERSION,
-                "config_fingerprint": config.fingerprint,
-                "model_fingerprint": pytree_fingerprint(deployable_parameters(params)),
-                "row_count": 0,
-                "status": "skipped_no_supervision_anchors",
-            },
+    def ego_step(base: Any, latent: Any, state: Any, observation: Any, keys: Any):
+        next_state, output = model.step(
+            base,
+            latent,
+            state,
+            observation,
+            compute_latent=True,
+            execute_adaptation=False,
         )
-        return
-    count = int(np.asarray(anchors.anchor_ids).shape[0])
-    batch = anchors
-    unused_state, output_values = model.apply(
-        {"params": params},
-        batch.policy_states,
+        action = jax.vmap(lambda key, logits: jax.random.categorical(key, logits))(
+            keys, output.base_policy_logits
+        )
+        return next_state, action
+
+    def ego_observe(state: Any, action: Any, done: Any):
+        return observe_after_transition(state, action=action, done=done)
+
+    def partner_step_fixed(
+        state: Any, observation: Any, episode_start: Any, keys: Any
+    ):
+        # The anchor world stores the actual snapshot episode-start flag.  This
+        # is essential for states sampled at an episode boundary: partner
+        # recurrent policies must reset exactly as they did in the legal
+        # rollout, rather than being silently forced to continue an old carry.
+        action, next_state, context, unused_value = partner_functions.step(
+            partner_parameters, state, observation, episode_start, keys
+        )
+        del unused_value
+        return action, next_state, context
+
+    def partner_observe(
+        state: Any,
+        context: Any,
+        observation: Any,
+        action: Any,
+        reward: Any,
+        done: Any,
+        next_observation: Any,
+    ):
+        return partner_functions.observe(
+            partner_parameters,
+            state,
+            context,
+            observation,
+            action,
+            reward,
+            done,
+            next_observation,
+        )
+
+    return AnchorFunctions(
+        ego_step=ego_step,
+        ego_observe=ego_observe,
+        partner_step=partner_step_fixed,
+        partner_observe=partner_observe,
+        environment_step=environment.step_with_keys,
+    )
+
+
+def _measure_inference_latency_ms(
+    *, model: DeltaModel, base_params: Any, latent_params: Any
+) -> float:
+    """Median synchronized batch-one deployment-step latency."""
+
+    import jax
+    import jax.numpy as jnp
+
+    state = model.initial_state(1)
+    observation = jnp.zeros((1,) + tuple(model.observation_shape), dtype=jnp.float32)
+    step = jax.jit(lambda current, frame: model.step(
+        base_params, latent_params, current, frame
+    ))
+    for _ in range(20):
+        state, output = step(state, observation)
+        jax.block_until_ready(output.policy_logits)
+    values = []
+    for _ in range(100):
+        started = time.perf_counter()
+        state, output = step(state, observation)
+        jax.block_until_ready(output.policy_logits)
+        values.append((time.perf_counter() - started) * 1_000.0)
+    return float(np.median(np.asarray(values, dtype=np.float64)))
+
+
+def _final_decision_audit(
+    *,
+    model: DeltaModel,
+    base_params: Any,
+    latent_params: Any,
+    batch: Any,
+    anchors: Any,
+) -> Mapping[str, Any]:
+    import jax.numpy as jnp
+
+    _, output = model.sequence(
+        base_params,
+        latent_params,
+        batch.initial_policy_state,
         batch.observations,
-        jnp.zeros((count,), dtype=jnp.bool_),
-        method=model.step,
+        batch.previous_actions,
+        batch.episode_starts,
     )
-    del unused_state
-    write_json(
-        output / "records" / "training_support_latents.json",
-        {
-            "method": METHOD_VERSION,
-            "config_fingerprint": config.fingerprint,
-            "model_fingerprint": pytree_fingerprint(deployable_parameters(params)),
-            "row_count": count,
-            "capability": _host(output_values.capability),
-            "protocol_probabilities": _host(output_values.protocol_probabilities),
-        },
+    predicted = output.expected_decision_values[
+        anchors.time_indexes, anchors.lane_indexes
+    ]
+    target = anchors.evaluation_returns_by_action
+    predicted_order = jnp.argsort(jnp.argsort(predicted, axis=-1), axis=-1)
+    target_order = jnp.argsort(jnp.argsort(target, axis=-1), axis=-1)
+    centered_p = predicted_order - jnp.mean(predicted_order, axis=-1, keepdims=True)
+    centered_t = target_order - jnp.mean(target_order, axis=-1, keepdims=True)
+    spearman = jnp.sum(centered_p * centered_t, axis=-1) / jnp.sqrt(
+        jnp.sum(jnp.square(centered_p), axis=-1)
+        * jnp.sum(jnp.square(centered_t), axis=-1)
+        + 1.0e-8
     )
+    chosen = jnp.argmax(predicted, axis=-1)
+    oracle = jnp.argmax(target, axis=-1)
+    rows = jnp.arange(chosen.shape[0])
+    regret = target[rows, oracle] - target[rows, chosen]
+    anchor_voi = output.active_voi[anchors.time_indexes, anchors.lane_indexes]
+    anchor_voi_raw = output.active_voi_raw[
+        anchors.time_indexes, anchors.lane_indexes
+    ]
+    anchor_information_gain = output.active_information_gain[
+        anchors.time_indexes, anchors.lane_indexes
+    ]
+    anchor_quadrature_error = output.active_voi_quadrature_error[
+        anchors.time_indexes, anchors.lane_indexes
+    ]
+    anchor_adaptation_kl = output.adaptation_kl[
+        anchors.time_indexes, anchors.lane_indexes
+    ]
+    base_greedy = jnp.argmax(
+        output.base_policy_logits[anchors.time_indexes, anchors.lane_indexes],
+        axis=-1,
+    )
+    deployment_greedy = jnp.argmax(
+        output.policy_logits[anchors.time_indexes, anchors.lane_indexes],
+        axis=-1,
+    )
+    return {
+        "mean_spearman": float(jnp.mean(spearman)),
+        "top_action_agreement": float(jnp.mean((chosen == oracle).astype(jnp.float32))),
+        "mean_empirical_action_regret": float(jnp.mean(regret)),
+        "mean_action_voi": float(jnp.mean(anchor_voi)),
+        "mean_max_action_voi": float(jnp.mean(jnp.max(anchor_voi, axis=-1))),
+        "raw_voi_negative_fraction": float(
+            jnp.mean((anchor_voi_raw < 0.0).astype(jnp.float32))
+        ),
+        "mean_information_gain": float(jnp.mean(anchor_information_gain)),
+        "mean_voi_quadrature_error": float(jnp.mean(anchor_quadrature_error)),
+        "max_voi_quadrature_error": float(jnp.max(anchor_quadrature_error)),
+        "mean_adaptation_kl": float(jnp.mean(anchor_adaptation_kl)),
+        "greedy_action_disagreement": float(
+            jnp.mean((base_greedy != deployment_greedy).astype(jnp.float32))
+        ),
+        "anchor_count": int(chosen.shape[0]),
+        "report_only": True,
+    }
 
 
 def run_training(args: argparse.Namespace) -> None:
-    scope = str(getattr(args, "_execution_scope", "training"))
-    preflight = scope == CUDA_PREFLIGHT_SCOPE
-    config = load_config(args.config, run_kind=args.run_kind)
-    anchor_supervision_enabled = config.method_variant in ANCHOR_VARIANTS
-    separation_supervision_enabled = config.method_variant in SEPARATION_VARIANTS
-    # Counterfactual continuations are collected only by B2 and the registered
-    # decision-mechanism ablations. R0/B0/B1 never collect and discard them.
-    anchor_enabled = bool(config.anchors.enabled) and anchor_supervision_enabled
-    pair_comparator_path = getattr(args, "pair_comparator", None)
-    comparator_reference_checkpoint = getattr(
-        args, "comparator_reference_ego_checkpoint", None
-    )
-    if (
-        anchor_supervision_enabled
-        and config.run_kind in {"development", "formal"}
-        and not pair_comparator_path
-    ):
-        raise ValueError(
-            "Registered anchor-supervised development/formal training requires a frozen "
-            "--pair-comparator artifact fitted before ego training."
-        )
-    if pair_comparator_path and not comparator_reference_checkpoint:
-        raise ValueError(
-            "A frozen comparator requires --comparator-reference-ego-checkpoint "
-            "to bind its reference-policy lineage."
-        )
-    pretrained_comparator = bool(pair_comparator_path)
-    cuda_toolchain = None
-    if config.run_kind == "formal" or os.environ.get("DEPI_REQUIRE_CUDA") == "1":
-        cuda_toolchain = configure_bundled_cuda_toolchain()
-
     import jax
     import jax.numpy as jnp
 
-    if config.run_kind == "formal":
-        validate_formal_repository_state()
-        validate_registered_python_runtime()
-    cuda = None
-    if config.run_kind == "formal" or os.environ.get("DEPI_REQUIRE_CUDA") == "1":
-        cuda = require_single_cuda_worker()
-    official_runtime = validate_official_runtime() if config.run_kind == "formal" else None
+    started = time.perf_counter()
+    config = load_config(args.config, run_kind=args.run_kind)
+    if config.run_kind == "formal" or bool(getattr(args, "require_cuda", False)):
+        devices = [device for device in jax.devices() if device.platform == "gpu"]
+        if len(devices) != 1:
+            raise RuntimeError("Formal DELTA requires exactly one visible CUDA device.")
+    from .official_adapter import FrozenPartnerPool, VectorEnvironment, validate_official_runtime
 
+    official_runtime = (
+        validate_official_runtime() if config.run_kind == "formal" else None
+    )
+    manifest_path = Path(args.partner_manifest).resolve()
     manifest = load_partner_manifest(
-        args.partner_manifest,
+        manifest_path,
         expected_layout=config.environment.layout,
-        verify_files=not bool(args.skip_manifest_hash_check),
+        verify_files=not bool(getattr(args, "skip_manifest_hash_check", False)),
     )
-    validate_seed_training_manifest(
-        manifest,
-        config=config,
-        owner_seed_index=int(args.seed_index),
-        formal=(config.run_kind == "formal" and not preflight),
-    )
-    comparator_contract = None
-    if pair_comparator_path:
-        reference_checkpoint_sha = sha256_path(
-            Path(str(comparator_reference_checkpoint)).resolve()
-        )
-        comparator_contract = comparator_contract_for_run(
-            config=config,
-            manifest=manifest,
-            reference_policy_set_hash=comparator_reference_policy_set_hash(
-                reference_checkpoint_sha256=reference_checkpoint_sha,
-                manifest=manifest,
-            ),
-        )
-    output = Path(args.output).resolve()
-    environment = VectorEnvironment.create(config)
-    observation_shape = environment.observation_shape
-    outer_key = (
-        engineering_training_key()
-        if int(args.seed_index) == ENGINEERING_SEED_INDEX
-        else official_training_key(int(args.seed_index))
-    )
-    domains = official_training_domain_keys(int(args.seed_index))
-    identity = dict(
-        training_identity(
-            config=config,
-            seed_index=int(args.seed_index),
-            jax_prng_key=outer_key,
-            partner_manifest=manifest,
-        )
-    )
-    structure_fingerprint = _model_structure_fingerprint(config, observation_shape)
-    cache = configure_persistent_compilation_cache(
-        repository_commit=str(identity["runtime"]["repository_commit"]),
-        official_commit=OFFICIAL_SOURCE_COMMIT,
-        config_fingerprint=config.fingerprint,
-        model_structure_fingerprint=structure_fingerprint,
-        cache_root=os.environ.get("DEPI_JAX_COMPILATION_CACHE"),
-    )
-    identity.update(
-        {
-            "ego_run_id": str(args.ego_run_id),
-            "observation_shape": list(observation_shape),
-            "action_count": 6,
-            "official_runtime": official_runtime,
-            "cuda_worker": cuda,
-            "cuda_toolchain": cuda_toolchain,
-            "execution_scope": scope,
-            "model_structure_fingerprint": structure_fingerprint,
-            "compilation_cache": cache,
-            "scientific_readout_allowed": False,
-            "frozen_pair_comparator": (
-                None
-                if not pair_comparator_path
-                else {
-                    "path": str(Path(pair_comparator_path).resolve()),
-                    "sha256": sha256_path(Path(pair_comparator_path).resolve()),
-                    "contract": comparator_contract.to_mapping(),
-                    "contract_fingerprint": comparator_contract.fingerprint,
-                    "reference_ego_checkpoint": {
-                        "path": str(
-                            Path(str(comparator_reference_checkpoint)).resolve()
-                        ),
-                        "sha256": reference_checkpoint_sha,
-                    },
-                }
-            ),
-        }
-    )
-    ensure_run_identity(output, identity)
-    write_json(output / "resolved_config.json", config.to_mapping())
-    write_json(output / "resolved_partner_manifest.json", manifest.to_mapping())
-    write_json(output / "runtime_gpu.json", cuda or _gpu_snapshot())
-
-    owner_runs = _owned_runs(manifest, "owner_source", int(args.seed_index))
-    support_runs = tuple(
-        run
-        for run in manifest.runs
-        if run.role == "development_support"
-        and run.owner_seed_index in (None, int(args.seed_index))
-    )
-    owner_pool = _pool(owner_runs)
-    support_manifest = type(manifest)(manifest.layout, support_runs)
-    support_members = build_partner_pool(config, support_manifest, "train")
-    comparator_fit_runs = (
-        tuple(manifest.by_role("comparator_fit"))
-        if anchor_supervision_enabled and not pretrained_comparator
-        else ()
-    )
-    comparator_validation_runs = (
-        tuple(manifest.by_role("comparator_validation"))
-        if anchor_supervision_enabled and not pretrained_comparator
-        else ()
-    )
-    comparator_fit_members = (
-        build_partner_pool(config, manifest, "comparator_fit")
-        if comparator_fit_runs
-        else ()
-    )
-    comparator_validation_members = (
-        build_partner_pool(config, manifest, "comparator_validation")
-        if comparator_validation_runs
-        else ()
-    )
-    if bool(comparator_fit_members) != bool(comparator_validation_members):
-        raise RuntimeError("Comparator fit and validation pools must either both exist or both be absent.")
-    if config.run_kind == "formal" and comparator_fit_members:
-        reserved_lane_count = config.environment.num_envs // 8
-        for label, members in (
-            ("comparator_fit", comparator_fit_members),
-            ("comparator_validation", comparator_validation_members),
-        ):
-            if min(member.probability for member in members) < 1.0 / reserved_lane_count:
-                raise RuntimeError(
-                    f"Formal {label} stratification cannot guarantee every run in its reserved lanes."
-                )
-    static_members = (
-        *support_members,
-        *comparator_fit_members,
-        *comparator_validation_members,
-    )
-    if any(member.checkpoint is None for member in static_members):
-        raise RuntimeError("A training partner-pool member has no frozen checkpoint.")
-    support_external_pool = FrozenPartnerPool.from_checkpoints(
-        [member.checkpoint for member in support_members],
-        parent_training_run_ids=[
-            member.parent_training_run_id for member in support_members
-        ],
-    )
-    external_pool = FrozenPartnerPool.from_checkpoints(
-        [member.checkpoint for member in static_members],
-        parent_training_run_ids=[
-            member.parent_training_run_id for member in static_members
-        ],
-    )
-    static_member_probabilities = np.asarray(
-        [member.probability for member in static_members], dtype=np.float32
-    )
-    static_member_sampling_groups = np.asarray(
-        [
-            0 if index < len(support_members) else (
-                1
-                if index < len(support_members) + len(comparator_fit_members)
-                else 2
-            )
-            for index in range(len(static_members))
-        ],
-        dtype=np.int32,
-    )
-    family_index = {
-        family: index
-        for index, family in enumerate(
-            sorted({member.family_id for member in static_members})
-        )
-    }
-    static_member_family_ids = np.asarray(
-        [family_index[member.family_id] for member in static_members], dtype=np.int32
-    )
-    static_member_stages = np.asarray(
-        [member.checkpoint_stage for member in static_members], dtype=np.float32
-    )
-    write_json(
-        output / "partner_pool.json",
-        {
-            "split": "train",
-            "sampling": "mechanism_then_family_then_stage_then_run_uniform",
-            "comparator_lane_allocation_before_freeze": (
-                {"support": "6/8", "comparator_fit": "1/8", "comparator_validation": "1/8"}
-                if comparator_fit_members
-                else {"support": "8/8"}
-            ),
-            "members": [
-                {
-                    "run_id": member.run_id,
-                    "family_id": member.family_id,
-                    "hyperparameter_family": getattr(
-                        member, "hyperparameter_family", "default"
-                    ),
-                    "mechanism": member.mechanism,
-                    "checkpoint_stage": member.checkpoint_stage,
-                    "seed": member.seed,
-                    "probability": member.probability,
-                    "partition": (
-                        "support"
-                        if static_member_sampling_groups[index] == 0
-                        else (
-                            "comparator_fit"
-                            if static_member_sampling_groups[index] == 1
-                            else "comparator_validation"
-                        )
-                    ),
-                }
-                for index, member in enumerate(static_members)
-            ],
-        },
-    )
+    members = build_training_partner_pool(config, manifest)
     (
         upstream_steps,
         upstream_gpu_hours,
         upstream_wall_clock_hours,
         upstream_records,
     ) = _upstream_partner_cost(
-        tuple(
-            {
-                run.run_id: run
-                for run in (
-                    *owner_runs,
-                    *support_runs,
-                    *(() if pair_comparator_path else comparator_fit_runs),
-                    *(() if pair_comparator_path else comparator_validation_runs),
-                )
-            }.values()
-        ),
-        formal=(config.run_kind == "formal" and not preflight),
+        members, formal=(config.run_kind == "formal")
     )
-    write_json(output / "upstream_cost_manifest.json", {"runs": upstream_records})
-
-    model = build_model(
-        observation_shape=observation_shape,
-        action_count=6,
-        task_hidden_dim=config.model.task_hidden_dim,
-        instant_partner_dim=config.model.instant_partner_dim,
-        capability_hidden_dim=config.model.capability_hidden_dim,
-        capability_dim=config.model.capability_dim,
-        protocol_components=config.model.protocol_components,
-        component_embedding_dim=config.model.component_embedding_dim,
-        actor_hidden_dim=config.model.actor_hidden_dim,
-        critic_hidden_dim=config.model.critic_hidden_dim,
-        response_hidden_dim=config.model.response_hidden_dim,
-        modulation_rank=config.model.modulation_rank,
-        action_embedding_dim=config.model.action_embedding_dim,
-        protocol_stay_probability=config.model.protocol_stay_probability,
-        method_variant=config.method_variant,
+    frozen_pool = FrozenPartnerPool.from_checkpoints(
+        [member.checkpoint for member in members],
+        parent_training_run_ids=[member.parent_training_run_id for member in members],
     )
-    ego_root = jnp.asarray(domains["ego"], dtype=jnp.uint32)
-    reset_key, model_key, runner_key = jax.random.split(ego_root, 3)
-    unused_state, initial_observations = environment.reset(reset_key)
-    del unused_state
-    example_policy = initial_policy_state(
-        batch_size=environment.num_envs,
-        observation_shape=observation_shape,
-        action_count=6,
-        task_hidden_dim=config.model.task_hidden_dim,
-        capability_hidden_dim=config.model.capability_hidden_dim,
-        capability_dim=config.model.capability_dim,
-        component_embedding_dim=config.model.component_embedding_dim,
-        protocol_components=config.model.protocol_components,
+    partner_functions = make_static_partner_functions(
+        pool=frozen_pool,
+        probabilities=np.asarray([member.probability for member in members], dtype=np.float32),
+        run_ids=np.arange(len(members), dtype=np.int32),
     )
-    initial_params = initialize_model_parameters(
-        model,
-        key=model_key,
-        example_state=example_policy,
-        example_observation=initial_observations[:, 0],
-    )
-    bootstrap_models: Any = ()
-    bootstrap_params: Any = ()
-    bootstrap_optimizer_states: Any = ()
-    bootstrap_sampling_counters = jnp.zeros((0,), dtype=jnp.int32)
-    if anchor_enabled and anchor_supervision_enabled:
-        (
-            bootstrap_models,
-            bootstrap_params,
-            bootstrap_optimizer_states,
-            bootstrap_sampling_counters,
-        ) = initialize_bootstrap_value_ensemble(
-            key=jax.random.fold_in(model_key, 60),
-            example_policy_state=example_policy,
-            example_observation=initial_observations[:, 0],
-            action_count=6,
-        )
-    rollout_transition_count = (
-        config.environment.num_envs * config.training.rollout_length
-    )
-    total_updates = (
-        config.training.environment_steps + rollout_transition_count - 1
-    ) // rollout_transition_count
-
-    new_run = not bool(args.resume)
-    if new_run:
-        if (output / "checkpoints").exists() and any((output / "checkpoints").iterdir()):
-            raise RuntimeError("Existing checkpoints require explicit --resume.")
-        owner_batch, unused = _phase(
-            output,
-            name="owner_initialization_collection",
-            update=0,
-            function=lambda: collect_owner_behavior(
-                environment=environment,
-                owner_pool=owner_pool,
-                partner_pool=support_external_pool,
-                length=config.training.rollout_length,
-                key=jax.random.fold_in(ego_root, 1),
-                partner_members=jax.random.categorical(
-                    jax.random.fold_in(ego_root, 101),
-                    jnp.log(
-                        jnp.maximum(
-                            jnp.asarray(
-                                [member.probability for member in support_members],
-                                dtype=jnp.float32,
-                            ),
-                            1.0e-12,
-                        )
-                    ),
-                    shape=(environment.num_envs,),
-                ).astype(jnp.int32),
-            ),
-        )
-        del unused
-        owner_optimizer, owner_optimizer_state = make_optimizer(
-            initial_params,
-            learning_rate=config.ppo.learning_rate,
-            gradient_clip_norm=config.ppo.gradient_clip_norm,
-            adam_epsilon=config.ppo.adam_epsilon,
-        )
-        owner_schedule = environment_minibatch_schedule(
-            jax.random.fold_in(ego_root, 2),
-            environment_count=environment.num_envs,
-            minibatches_per_epoch=config.training.minibatches_per_epoch,
-            update_epochs=config.ppo.update_epochs,
-        )
-        (params, unused_owner_state, owner_metrics), unused = _phase(
-            output,
-            name="owner_actor_distillation",
-            update=0,
-            function=lambda: distill_owner_actor(
-                model=model,
-                params=initial_params,
-                batch=owner_batch,
-                initial_state_factory=lambda count: initial_policy_state(
-                    batch_size=count,
-                    observation_shape=observation_shape,
-                    action_count=6,
-                    task_hidden_dim=config.model.task_hidden_dim,
-                    capability_hidden_dim=config.model.capability_hidden_dim,
-                    capability_dim=config.model.capability_dim,
-                    component_embedding_dim=config.model.component_embedding_dim,
-                    protocol_components=config.model.protocol_components,
-                ),
-                optimizer=owner_optimizer,
-                optimizer_state=owner_optimizer_state,
-                schedule=owner_schedule,
-            ),
-        )
-        del unused_owner_state, unused
-    else:
-        params = initial_params
-        owner_metrics = {"owner_distillation_kl": jnp.asarray(np.nan)}
-
-    ppo_optimizer, ppo_state = make_optimizer(
-        params,
-        learning_rate=config.ppo.learning_rate,
-        gradient_clip_norm=config.ppo.gradient_clip_norm,
-        adam_epsilon=config.ppo.adam_epsilon,
-        anneal_learning_rate=config.ppo.anneal_learning_rate,
-        warmup_fraction=config.ppo.lr_warmup_fraction,
-        update_count=total_updates,
-        minibatches_per_epoch=config.training.minibatches_per_epoch,
-        update_epochs=config.ppo.update_epochs,
-    )
-    partner_functions = make_static_pool_partner_functions(
-        external_pool=external_pool,
-        member_probabilities=static_member_probabilities,
-        member_family_ids=static_member_family_ids,
-        member_checkpoint_stages=static_member_stages,
-        member_sampling_groups=(
-            static_member_sampling_groups if comparator_fit_members else None
-        ),
-    )
+    partner_parameters = None
+    environment = VectorEnvironment.create(config)
+    model = DeltaModel(config, environment.observation_shape, OFFICIAL_ACTION_COUNT)
+    root = _training_key(int(args.seed_index))
+    init_key, runner_key, loop_key = jax.random.split(root, 3)
+    base_params, latent_params = model.init_parameters(init_key)
+    base_optimizer_state = init_adam(base_params)
+    latent_optimizer_state = init_adam(latent_params)
     runner = initialize_runner(
         environment=environment,
-        model_config=config.model,
+        model=model,
         partner_functions=partner_functions,
         random_key=runner_key,
     )
-    comparator_shared = (
-        ResourceLedger()
-        if not pair_comparator_path
-        else _comparator_shared_resources(pair_comparator_path)
+    output = Path(args.output).resolve()
+    identity = {
+        "stage": "train",
+        "method": METHOD_VERSION,
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "ego_run_id": str(args.ego_run_id),
+        "seed_index": int(args.seed_index),
+        "run_kind": config.run_kind,
+        "layout": config.environment.layout,
+        "method_variant": config.method_variant,
+        "config": config.to_mapping(),
+        "config_fingerprint": config.fingerprint,
+        "partner_manifest": {
+            "path": str(manifest_path),
+            "sha256": sha256_path(manifest_path),
+            "fingerprint": manifest.fingerprint,
+        },
+        "official_runtime": official_runtime,
+        "observation_shape": list(environment.observation_shape),
+        "action_count": OFFICIAL_ACTION_COUNT,
+    }
+    ensure_run_identity(output, identity)
+    write_json(
+        output / "partner_pool.json",
+        {
+            "sampling": "mechanism_then_family_then_stage_then_run_uniform",
+            "members": [
+                {
+                    "run_id": member.run_id,
+                    "mechanism": member.mechanism,
+                    "hyperparameter_family": member.hyperparameter_family,
+                    "checkpoint_stage": member.checkpoint_stage,
+                    "probability": member.probability,
+                }
+                for member in members
+            ],
+        },
     )
-    initial_ledger = ResourceLedger(
-        ego_initialization_steps=(
-            0 if not new_run else environment.num_envs * config.training.rollout_length
-        ),
+    write_json(output / "upstream_cost_manifest.json", {"parents": upstream_records})
+    ledger = ResourceLedger(
         upstream_partner_steps=upstream_steps,
-        comparator_history_collection_steps=(
-            comparator_shared.comparator_history_collection_steps
-        ),
-        comparator_continuation_steps=(
-            comparator_shared.comparator_continuation_steps
-        ),
-        reference_ego_upstream_steps=(
-            comparator_shared.reference_ego_upstream_steps
-        ),
-        shared_pretraining_cost=comparator_shared.shared_pretraining_cost,
-        gpu_hours=upstream_gpu_hours + comparator_shared.gpu_hours,
-        comparator_gpu_hours=comparator_shared.comparator_gpu_hours,
-        wall_clock_hours=(
-            upstream_wall_clock_hours + comparator_shared.wall_clock_hours
-        ),
+        shared_gpu_hours=upstream_gpu_hours,
+        shared_wall_clock_hours=upstream_wall_clock_hours,
+        deployable_parameters=parameter_count(base_params) + parameter_count(latent_params),
     )
-    (
-        empty_supervision_anchors,
-        empty_separation_terms,
-        empty_pair_comparator,
-    ) = _empty_supervision_payload(
-        config=config, observation_shape=observation_shape
-    )
-    if pair_comparator_path:
-        if comparator_contract is None:
-            raise RuntimeError("Comparator contract was not constructed.")
-        empty_pair_comparator = load_frozen_pair_comparator(
-            pair_comparator_path,
-            expected_contract=comparator_contract,
-            expected_history_feature_dim=int(empty_pair_comparator.history_feature_dim),
-        )
-    template = TrainState(
-        params=params,
-        target_params=jax.tree_util.tree_map(jnp.copy, params),
-        ppo_optimizer_state=ppo_state,
-        supervision_anchor_batch=empty_supervision_anchors,
-        current_separation_terms=empty_separation_terms,
-        current_pair_comparator=empty_pair_comparator,
-        supervision_readings={
-            "pair_class_fractions": jnp.zeros((3,), dtype=jnp.float32),
-            "irreducible_ambiguity_fraction": jnp.asarray(0.0, dtype=jnp.float32),
-            "separation_margin": jnp.asarray(0.0, dtype=jnp.float32),
-            "valid_pair_fraction": jnp.asarray(0.0, dtype=jnp.float32),
-        },
-        anchor_sampling_counter=jnp.asarray(0, dtype=jnp.int32),
-        anchor_microbatch_size=jnp.asarray(0, dtype=jnp.int32),
-        effective_update_epochs=jnp.asarray(
-            config.ppo.update_epochs, dtype=jnp.int32
-        ),
-        bootstrap_encoder_params=bootstrap_params,
-        bootstrap_optimizer_states=bootstrap_optimizer_states,
-        bootstrap_sampling_counters=bootstrap_sampling_counters,
-        m1_summary_state={
-            "evaluations": jnp.asarray(0, dtype=jnp.int32),
-            "latest_passed": jnp.asarray(False),
-        },
-        m1_history=_empty_m1_history(
-            (total_updates + int(config.anchors.interval_updates) - 1)
-            // int(config.anchors.interval_updates)
-            + 1
-        ),
-        ppo_optimizer_step=jnp.asarray(0, dtype=jnp.int32),
+    state = TrainState(
+        base_params=base_params,
+        latent_params=latent_params,
+        base_optimizer_state=base_optimizer_state,
+        latent_optimizer_state=latent_optimizer_state,
         runner_state=runner,
-        random_domains={name: jnp.asarray(value, dtype=jnp.uint32) for name, value in domains.items()},
         update_count=jnp.asarray(0, dtype=jnp.int32),
         effective_environment_steps=jnp.asarray(0, dtype=jnp.int32),
-        resource_ledger=initial_ledger.to_mapping(),
+        resource_ledger=ledger.to_mapping(),
     )
-    manager = orbax_manager(output / "checkpoints")
-    if args.resume:
-        restored = _restore_depi_checkpoint(manager, output, template)
+    checkpoint_identity = {
+        "method": METHOD_VERSION,
+        "config_fingerprint": config.fingerprint,
+        "manifest_fingerprint": manifest.fingerprint,
+        "seed_index": int(args.seed_index),
+    }
+    if bool(getattr(args, "resume", False)):
+        restored = load_latest_checkpoint(
+            output / "checkpoints", expected_identity=checkpoint_identity
+        )
         if restored is None:
-            raise FileNotFoundError("--resume requested but no DEPI checkpoint exists.")
-        state = restored
-    else:
-        state = template
-
-    kernels = build_training_kernels(
-        environment=environment,
+            raise FileNotFoundError("--resume requested but no checkpoint exists.")
+        _, state = restored
+    rollout_steps = config.environment.num_envs * config.training.rollout_length
+    total_updates = config.training.environment_steps // rollout_steps
+    maximum_updates = getattr(args, "maximum_updates", None)
+    if maximum_updates is not None:
+        total_updates = min(total_updates, int(maximum_updates))
+    anchor_functions = _anchor_functions(
         model=model,
-        model_config=config.model,
         partner_functions=partner_functions,
-        config=config,
-        ppo_optimizer=ppo_optimizer,
+        partner_parameters=partner_parameters,
+        environment=environment,
     )
-    anchor_functions = None
-    anchor_kernel = None
-    if anchor_enabled:
-        anchor_functions = make_anchor_functions(
-            model=model,
-            model_config=config.model,
-            partner_functions=partner_functions,
+    for update in range(int(np.asarray(state.update_count)), total_updates):
+        shaping_horizon = max(int(config.upstream.reward_shaping_horizon), 1)
+        shaping = max(
+            1.0
+            - int(np.asarray(state.effective_environment_steps)) / float(shaping_horizon),
+            0.0,
+        )
+        next_steps = int(np.asarray(state.effective_environment_steps)) + rollout_steps
+        anchor_trigger = bool(
+            config.anchors.enabled
+            and config.method_variant in {"delta_passive", "delta_active"}
+            and (
+                next_steps % int(config.anchors.interval_environment_steps) == 0
+                or (bool(getattr(args, "force_anchor", False)) and update == 0)
+            )
+        )
+        runner, batch, records = collect_rollout(
+            state=state.runner_state,
+            length=config.training.rollout_length,
             environment=environment,
+            model=model,
+            base_params=state.base_params,
+            latent_params=state.latent_params,
+            partner_functions=partner_functions,
+            partner_parameters=partner_parameters,
+            official_shaping_factor=shaping,
+            record_anchors=anchor_trigger,
         )
-        anchor_kernel = build_anchor_chunk_kernel(
-            functions=anchor_functions,
-            config=config,
-            memory_limit_bytes=FORMAL_PEAK_MEMORY_LIMIT_BYTES,
-        )
-
-    # §3.3/§5: the most recent anchor batch and its matched-pair separation
-    # terms supervise every combined-loss update until the next anchor trigger
-    # refreshes them; both stay None while anchors are disabled.
-    supervision_active = (
-        anchor_supervision_enabled
-        and int(np.asarray(state.anchor_sampling_counter)) > 0
-    )
-    supervision_anchors = (
-        state.supervision_anchor_batch if supervision_active else None
-    )
-    supervision_separation = (
-        state.current_separation_terms if supervision_active else None
-    )
-    supervision_readings: dict[str, Any] = dict(state.supervision_readings)
-    m1_history_path = output / "m1_gate.json"
-    m1_history = _m1_history_records(
-        state.m1_history,
-        count=int(np.asarray(state.m1_summary_state["evaluations"])),
-    )
-    stored_microbatch = int(np.asarray(state.anchor_microbatch_size))
-    anchor_microbatch = stored_microbatch if stored_microbatch > 0 else None
-    start_update = int(np.asarray(state.update_count))
-    last_update = min(total_updates, start_update + 1) if preflight else total_updates
-    wall_started = time.perf_counter()
-    wall_accounted_at = wall_started
-    # §3.4: when the combined-policy-KL gate fires inside the scan, shrink the
-    # next update's epoch count (floor 2) and recover one epoch per clean update.
-    effective_update_epochs = int(np.asarray(state.effective_update_epochs))
-    bootstrap_params = state.bootstrap_encoder_params
-    bootstrap_optimizer_states = state.bootstrap_optimizer_states
-    bootstrap_sampling_counters = state.bootstrap_sampling_counters
-
-    for update in range(start_update, last_update):
-        phase_times: dict[str, float] = {}
-        snapshot_params = state.params
-        snapshot_target = state.target_params
-        partner_parameters = jnp.asarray(
-            int(state.current_pair_comparator.development_row_count) > 0,
-            dtype=jnp.bool_,
-        )
-        dropout = context_dropout_probability(
-            state.effective_environment_steps,
-            total_steps=config.training.environment_steps,
-            initial=config.training.context_dropout_initial,
-            final=config.training.context_dropout_final,
-        )
-        shaping_factor = official_reward_shaping_factor(
-            state.effective_environment_steps,
-            horizon=config.upstream.reward_shaping_horizon,
-        )
-        remaining_environment_steps = config.training.environment_steps - int(
-            np.asarray(state.effective_environment_steps)
-        )
-        if remaining_environment_steps <= 0:
-            raise RuntimeError("Training loop exceeded the configured PPO transition budget.")
-        rollout_step_count = min(
-            rollout_transition_count, remaining_environment_steps
-        )
-        if rollout_step_count % config.environment.num_envs:
-            raise RuntimeError("PPO transition budget does not contain whole vector steps.")
-        tail_rollout = rollout_step_count != rollout_transition_count
-        anchor_trigger = (
-            anchor_enabled
-            and not tail_rollout
-            and update % config.anchors.interval_updates == 0
-        )
-        rollout_kernel = (
-            kernels.rollout_tail
-            if tail_rollout
-            else (
-                kernels.rollout_anchor_full
-                if anchor_trigger
-                else kernels.rollout_minimal
-            )
-        )
-        (rollout_result, elapsed) = _phase(
-            output,
-            name="rollout",
-            update=update,
-            function=lambda: rollout_kernel(
-                state.runner_state,
-                snapshot_params,
-                snapshot_target,
-                partner_parameters,
-                dropout,
-                jax.random.fold_in(
-                    jnp.asarray(domains["context_dropout"], dtype=jnp.uint32),
-                    update,
-                ),
-                shaping_factor,
-            ),
-        )
-        phase_times["rollout"] = elapsed
-        runner, batch, records = rollout_result
-        if batch is None:
-            raise RuntimeError("Training rollout did not return the DEPI PPO batch.")
-
-        next_pair_comparator = state.current_pair_comparator
-        next_m1_summary = state.m1_summary_state
-        next_m1_history = state.m1_history
-        anchor_budget = {
-            "counterfactual_continuation_steps": 0,
-            "matched_pair_probe_steps": 0,
-        }
+        anchors = None
         if anchor_trigger:
-            if anchor_microbatch is None:
-                anchor_microbatch = preflight_anchor_microbatch_from_records(
-                    records=records,
-                    target_params=snapshot_target,
-                    partner_parameters=partner_parameters,
-                    config=config,
-                    chunk_kernel=anchor_kernel,
-                    key=jax.random.fold_in(
-                        jnp.asarray(domains["training_anchor"], dtype=jnp.uint32),
-                        300_000 + update,
-                    ),
-                )
-            (anchor_result, elapsed) = _phase(
-                output,
-                name="counterfactual_anchor",
-                update=update,
-                function=lambda: collect_anchor_batch(
-                    anchor_domain=update + 1,
-                    key=jax.random.fold_in(
-                        jnp.asarray(domains["training_anchor"], dtype=jnp.uint32), update
-                    ),
-                    records=records,
-                    environment=environment,
-                    model=model,
-                    target_params=snapshot_target,
-                    config=config,
-                    partner_functions=partner_functions,
-                    partner_parameters=partner_parameters,
-                    collection_update=update,
-                    target_fingerprint=jnp.asarray(
-                        _fingerprint_words(snapshot_target), dtype=jnp.uint32
-                    ),
-                    microbatch_size=anchor_microbatch,
-                    anchor_functions=anchor_functions,
-                    chunk_kernel=anchor_kernel,
-                    frozen_comparator=(
-                        state.current_pair_comparator
-                        if int(state.current_pair_comparator.development_row_count) > 0
-                        else None
-                    ),
-                ),
+            anchors = collect_anchor_batch(
+                key=jax.random.fold_in(loop_key, 100_000 + update),
+                records=records,
+                functions=anchor_functions,
+                base_params=state.base_params,
+                latent_params=state.latent_params,
+                states_per_trigger=config.anchors.states_per_trigger,
+                action_count=OFFICIAL_ACTION_COUNT,
+                fit_replicas=config.anchors.fit_replicas,
+                evaluation_replicas=config.anchors.evaluation_replicas,
+                horizon=config.method.continuation_horizon,
+                gamma=config.ppo.gamma,
             )
-            phase_times["counterfactual_anchor"] = elapsed
-            anchors, quotient_pairs, anchor_budget, next_pair_comparator = anchor_result
-            supervision_anchors = anchors if anchor_supervision_enabled else None
-            supervision_separation = None
-            supervision_readings = dict(state.supervision_readings)
-            if (
-                separation_supervision_enabled
-                and quotient_pairs.comparator_distinct_probability is not None
-            ):
-                # §5.3 -> §3.2: matched-pair classification feeds L_separation.
-                # Only the classification (masks/weights/margin) is built here;
-                # the loss forward passes run inside the jit-compiled scan on
-                # the current params so the gradient is live (§3.2/§3.4).
-                (
-                    supervision_separation,
-                    supervision_readings,
-                ) = separation_terms_from_matched_pairs(
-                    quotient=quotient_pairs,
-                    equivalent_probability_max=float(
-                        config.anchors.observable_equivalent_probability_max
-                    ),
-                    distinct_probability_min=float(
-                        config.anchors.decision_distinct_probability_min
-                    ),
-                    signature_threshold=float(
-                        config.anchors.signature_distance_threshold
-                    ),
-                    margin=float(config.loss_v2.separation_margin),
-                )
-            if anchor_supervision_enabled:
-                (
-                    bootstrap_params,
-                    bootstrap_optimizer_states,
-                    bootstrap_sampling_counters,
-                    bootstrap_training_metrics,
-                ) = train_bootstrap_value_ensemble(
-                    models=bootstrap_models,
-                    params=bootstrap_params,
-                    optimizer_states=bootstrap_optimizer_states,
-                    sampling_counters=bootstrap_sampling_counters,
-                    anchors=anchors,
-                    key=jax.random.fold_in(
-                        jnp.asarray(domains["training_anchor"], dtype=jnp.uint32),
-                        900_000 + update,
-                    ),
-                )
-                # §6 M1 uses independent evaluation replicas and is report-only.
-                (gate_result, elapsed) = _phase(
-                    output,
-                    name="m1_gate",
-                    update=update,
-                    function=lambda: evaluate_m1_gate_on_anchor_batch(
-                        model=model,
-                        params=snapshot_params,
-                        bootstrap_models=bootstrap_models,
-                        bootstrap_params=bootstrap_params,
-                        anchors=anchors,
-                        spearman_threshold=float(config.anchors.m1_spearman_threshold),
-                        minimum_anchor_fraction=float(
-                            config.anchors.m1_minimum_anchor_fraction
-                        ),
-                    ),
-                )
-                phase_times["m1_gate"] = elapsed
-                gate_payload = {
-                    "update": update + 1,
-                    **m1_gate_report(gate_result),
-                    **_host(bootstrap_training_metrics),
-                    "separation_readings": _host(supervision_readings),
-                }
-                next_m1_summary = {
-                    "evaluations": state.m1_summary_state["evaluations"] + 1,
-                    "latest_passed": gate_result.passed,
-                }
-                next_m1_history = _append_m1_history(
-                    state.m1_history,
-                    index=int(np.asarray(state.m1_summary_state["evaluations"])),
-                    update=update + 1,
-                    result=gate_result,
-                    bootstrap_training_metrics=bootstrap_training_metrics,
-                    supervision_readings=supervision_readings,
-                )
-                m1_history = _m1_history_records(
-                    next_m1_history,
-                    count=int(np.asarray(next_m1_summary["evaluations"])),
-                )
-                write_json(
-                    m1_history_path,
-                    {
-                        "specification": "METHOD_SPEC §7 extended M1 gate",
-                        "history": m1_history,
-                        "latest": gate_payload,
-                    },
-                )
-            # M1 is a report-only model-quality diagnostic. A failed value
-            # mechanism is recorded but never changes the training path.
-        anchor_age_updates = 0
-        if supervision_anchors is not None:
-            anchor_age_updates = update - int(
-                np.max(np.asarray(supervision_anchors.collection_update))
-            )
-            if anchor_age_updates > int(config.anchors.maximum_age_updates):
-                supervision_anchors = None
-                supervision_separation = None
-                supervision_readings = {
-                    **supervision_readings,
-                    "expired_anchor_batch": True,
-                    "anchor_age_updates": anchor_age_updates,
-                }
         schedule = environment_minibatch_schedule(
-            jax.random.fold_in(
-                jnp.asarray(domains["ego"], dtype=jnp.uint32), 400_000 + update
-            ),
+            jax.random.fold_in(loop_key, update),
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
-            update_epochs=effective_update_epochs,
+            update_epochs=config.ppo.update_epochs,
         )
-        from src.path_c.types import TrainingCoreState
-
-        (ppo_result, elapsed) = _phase(
-            output,
-            name="ppo",
-            update=update,
-            function=lambda: kernels.ppo_scan(
-                TrainingCoreState(
-                    state.params, state.target_params, state.ppo_optimizer_state
-                ),
-                batch,
-                schedule,
-                supervision_anchors,
-                supervision_separation,
+        (
+            base_params,
+            latent_params,
+            base_optimizer_state,
+            latent_optimizer_state,
+            metrics,
+        ) = training_update(
+            model=model,
+            base_params=state.base_params,
+            latent_params=state.latent_params,
+            base_optimizer_state=state.base_optimizer_state,
+            latent_optimizer_state=state.latent_optimizer_state,
+            batch=batch,
+            anchors=anchors,
+            schedule=schedule,
+            total_optimizer_steps=(
+                (config.training.environment_steps // rollout_steps)
+                * config.training.minibatches_per_epoch
+                * config.ppo.update_epochs
             ),
         )
-        phase_times["ppo"] = elapsed
-        ppo_core, ppo_metrics = ppo_result
-        if bool(
-            np.any(np.asarray(ppo_metrics["training_aborted"]) > 0.5)
+        if (
+            float(np.asarray(metrics["ppo"]["base_update_applied"])) < 1.0
+            or float(np.asarray(metrics["ppo"]["base_nonfinite_update"])) > 0.0
+            or float(np.asarray(metrics["latent"]["latent_nonfinite_update"])) > 0.0
         ):
             raise FloatingPointError(
-                "NaN or Inf occurred during the DEPI combined-loss minibatch scan."
+                "A DELTA optimizer transaction produced NaN/Inf and was rolled back."
             )
-        # §3.4 combined-policy-KL gate: adapt the next update's epoch count
-        # (shrink towards the floor of two, recover one epoch per clean update).
-        (
-            effective_update_epochs,
-            kl_stop_fraction,
-            kl_stop_occurred,
-        ) = adapt_effective_update_epochs(
-            ppo_metrics["kl_early_stop"],
-            current_epochs=effective_update_epochs,
-            maximum_epochs=int(config.ppo.update_epochs),
-        )
-        # The single combined objective has one optimizer state.
-        next_params = ppo_core.params
 
-        next_target_params = polyak_update(
-            state.target_params, next_params, config.ppo.polyak_coefficient
-        )
-        if next_pair_comparator is None:
-            next_pair_comparator = state.current_pair_comparator
-
-        completed_steps = int(np.asarray(runner.effective_environment_steps))
-        if completed_steps != int(np.asarray(state.effective_environment_steps)) + rollout_step_count:
-            raise RuntimeError("Rollout accounting differs from the configured vector-step budget.")
+        anchor_steps = 0
+        if anchors is not None:
+            anchor_steps = (
+                config.anchors.states_per_trigger
+                * OFFICIAL_ACTION_COUNT
+                * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
+                * config.method.continuation_horizon
+            )
         ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
-            ego_policy_steps=rollout_step_count,
-            counterfactual_continuation_steps=int(
-                anchor_budget["counterfactual_continuation_steps"]
-            ),
-            matched_pair_probe_steps=int(anchor_budget["matched_pair_probe_steps"]),
+            ego_policy_steps=rollout_steps,
+            anchor_continuation_steps=anchor_steps,
         )
-        ppo_applied = int(
-            np.asarray(jnp.sum(ppo_metrics["optimizer_applied"], dtype=jnp.int32))
-        )
-        state = state._replace(
-            params=next_params,
-            target_params=next_target_params,
-            ppo_optimizer_state=ppo_core.ppo_optimizer_state,
-            supervision_anchor_batch=(
-                supervision_anchors
-                if supervision_anchors is not None
-                else state.supervision_anchor_batch
-            ),
-            current_separation_terms=(
-                supervision_separation
-                if supervision_separation is not None
-                else state.current_separation_terms
-            ),
-            current_pair_comparator=next_pair_comparator,
-            supervision_readings=supervision_readings,
-            anchor_sampling_counter=(
-                state.anchor_sampling_counter + int(anchor_trigger)
-            ),
-            anchor_microbatch_size=jnp.asarray(
-                0 if anchor_microbatch is None else anchor_microbatch,
-                dtype=jnp.int32,
-            ),
-            effective_update_epochs=jnp.asarray(
-                effective_update_epochs, dtype=jnp.int32
-            ),
-            bootstrap_encoder_params=bootstrap_params,
-            bootstrap_optimizer_states=bootstrap_optimizer_states,
-            bootstrap_sampling_counters=bootstrap_sampling_counters,
-            m1_summary_state=next_m1_summary,
-            m1_history=next_m1_history,
-            ppo_optimizer_step=state.ppo_optimizer_step + ppo_applied,
+        state = TrainState(
+            base_params=base_params,
+            latent_params=latent_params,
+            base_optimizer_state=base_optimizer_state,
+            latent_optimizer_state=latent_optimizer_state,
             runner_state=runner,
             update_count=jnp.asarray(update + 1, dtype=jnp.int32),
-            effective_environment_steps=jnp.asarray(completed_steps, dtype=jnp.int32),
+            effective_environment_steps=jnp.asarray(next_steps, dtype=jnp.int32),
             resource_ledger=ledger.to_mapping(),
         )
-        if not _all_finite((state.params, state.target_params)):
-            raise FloatingPointError("NaN or Inf entered the DEPI training state.")
-
-        metrics = {
-            "method": METHOD_VERSION,
-            "update_count": update + 1,
-            "effective_environment_steps": completed_steps,
-            "partner_source": "registered_static_pool",
-            "context_dropout_probability": float(np.asarray(dropout)),
-            "official_shaping_factor": float(np.asarray(shaping_factor)),
-            # Four-loss combined objective metrics (§3): PPO, signature,
-            # response, separation plus combined_policy_kl and posterior
-            # entropy, all recorded per minibatch inside the scan.
-            "ppo": _host(_mean_metrics(ppo_metrics)),
-            "combined_policy_kl_stop_fraction": kl_stop_fraction,
-            "combined_policy_kl_stop_occurred": kl_stop_occurred,
-            "effective_update_epochs": int(effective_update_epochs),
-            # §5 anchor supervision readouts (per-anchor-trigger refresh; the
-            # carried supervision payload trains every combined-loss update).
-            "anchor_supervision": {
-                "active": supervision_anchors is not None,
+        _write_jsonl(
+            output / "records" / "metrics.jsonl",
+            {
+                "update": update + 1,
+                "environment_steps": next_steps,
                 "anchor_trigger": anchor_trigger,
-                "separation_terms": (
-                    {
-                        "margin": float(np.asarray(supervision_separation.margin)),
-                        "pair_count": int(
-                            np.asarray(supervision_separation.equivalent_mask).shape[0]
-                        ),
-                        "equivalent_pair_count": int(
-                            np.sum(np.asarray(supervision_separation.equivalent_mask))
-                        ),
-                    }
-                    if supervision_separation is not None
-                    else None
-                ),
-                "readings": _host(supervision_readings),
+                "official_shaping_factor": shaping,
+                "metrics": _host(metrics),
             },
-            "m1_gate": m1_history[-1] if m1_history else {"evaluated": False},
-            "anchor_usage": {
-                "anchor_trigger": anchor_trigger,
-                "stored_anchor_count": (
-                    int(np.asarray(state.supervision_anchor_batch.anchor_ids).shape[0])
-                    if state.supervision_anchor_batch is not None
-                    else 0
-                ),
-                "invalid_matched_probe_states": int(
-                    anchor_budget.get("invalid_matched_probe_states", 0)
-                ),
-            },
-            "phase_wall_seconds": phase_times,
-            "gpu": _gpu_snapshot(),
-            "scientific_readout": False,
-        }
-        write_jsonl(
-            output / "records" / "metrics" / f"update_{update + 1:08d}.jsonl",
-            (metrics,),
         )
         if (
-            completed_steps
-            % config.training.checkpoint_interval_environment_steps
-            == 0
-            and completed_steps < config.training.environment_steps
-            and not preflight
+            next_steps % config.training.checkpoint_interval_environment_steps == 0
+            and next_steps < config.training.environment_steps
         ):
-            now = time.perf_counter()
-            state = _account_runtime_resources(
-                state, elapsed_wall_seconds=now - wall_accounted_at
+            save_checkpoint(
+                output / "checkpoints",
+                step=next_steps,
+                state=state,
+                identity=checkpoint_identity,
             )
-            wall_accounted_at = now
-            _save_depi_checkpoint(manager, output, state)
-
-    final_m1_payload: Mapping[str, Any] | None = None
-    final_model_fingerprint = pytree_fingerprint(
-        deployable_parameters(state.params)
+    elapsed = time.perf_counter() - started
+    ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
+        training_wall_clock_hours=elapsed / 3600.0,
+        training_gpu_hours=(
+            elapsed / 3600.0
+            if any(device.platform == "gpu" for device in jax.devices())
+            else 0.0
+        ),
     )
-    evaluation_count = int(np.asarray(state.m1_summary_state["evaluations"]))
-    if m1_history_path.is_file():
-        existing_m1 = json.loads(m1_history_path.read_text(encoding="utf-8"))
-        existing_final = existing_m1.get("final")
-        if (
-            existing_m1.get("version") == 1
-            and existing_m1.get("artifact_type") == "depi_final_m1_evaluation"
-            and isinstance(existing_final, Mapping)
-            and existing_final.get("final_checkpoint_condition") is True
-            and existing_final.get("model_fingerprint") == final_model_fingerprint
-            and isinstance(existing_m1.get("history"), list)
-            and len(existing_m1["history"]) == evaluation_count
-        ):
-            # A completed run resumed after the final checkpoint must not append
-            # a second final evaluation or exhaust the fixed checkpoint ledger.
-            final_m1_payload = existing_final
-    if (
-        anchor_supervision_enabled
-        and int(np.asarray(state.anchor_sampling_counter)) > 0
-        and final_m1_payload is None
-    ):
-        # Final M1 is a fresh, final-policy measurement.  It never reuses the
-        # last training anchor, target-policy continuation, or trained
-        # bootstrap members.
-        final_anchor_root = jax.random.fold_in(
-            jnp.asarray(domains["audit_anchor"], dtype=jnp.uint32),
-            int(np.asarray(state.update_count)),
-        )
-        final_partner_parameters = jnp.asarray(
-            int(state.current_pair_comparator.development_row_count) > 0,
-            dtype=jnp.bool_,
-        )
-        final_rollout_runner, final_rollout_batch, final_records = (
-            kernels.rollout_anchor_full(
-                state.runner_state,
-                state.params,
-                state.params,
-                final_partner_parameters,
-                jnp.asarray(0.0, dtype=jnp.float32),
-                jax.random.fold_in(final_anchor_root, 1),
-                jnp.asarray(0.0, dtype=jnp.float32),
-            )
-        )
-        del final_rollout_runner, final_rollout_batch
-        if anchor_microbatch is None:
-            anchor_microbatch = preflight_anchor_microbatch_from_records(
-                records=final_records,
-                target_params=state.params,
-                partner_parameters=final_partner_parameters,
-                config=config,
-                chunk_kernel=anchor_kernel,
-                key=jax.random.fold_in(final_anchor_root, 2),
-            )
-        (
-            final_anchors,
-            unused_final_pairs,
-            final_anchor_budget,
-            unused_final_comparator,
-        ) = collect_anchor_batch(
-            anchor_domain=int(np.asarray(state.update_count)) + 1,
-            key=jax.random.fold_in(final_anchor_root, 3),
-            records=final_records,
-            environment=environment,
-            model=model,
-            target_params=state.params,
-            config=config,
-            partner_functions=partner_functions,
-            partner_parameters=final_partner_parameters,
-            collection_update=int(np.asarray(state.update_count)),
-            target_fingerprint=jnp.asarray(
-                _fingerprint_words(state.params), dtype=jnp.uint32
-            ),
-            microbatch_size=anchor_microbatch,
-            anchor_functions=anchor_functions,
-            chunk_kernel=anchor_kernel,
-            frozen_comparator=state.current_pair_comparator,
-        )
-        del unused_final_pairs, unused_final_comparator
-        if pair_comparator_path:
-            diagnostic_panel = load_component_diagnostic_panel(
-                pair_comparator_path
-            )
-            panel_history_observations = jnp.asarray(
-                diagnostic_panel["history_observations"], dtype=jnp.float32
-            )
-            panel_history_actions = jnp.asarray(
-                diagnostic_panel["history_actions"], dtype=jnp.int32
-            )
-            panel_observations = jnp.asarray(
-                diagnostic_panel["current_observations"], dtype=jnp.float32
-            )
-            panel_count, panel_steps = panel_history_actions.shape
-            panel_state = initial_policy_state(
-                batch_size=panel_count,
-                observation_shape=observation_shape,
-                action_count=6,
-                task_hidden_dim=config.model.task_hidden_dim,
-                capability_hidden_dim=config.model.capability_hidden_dim,
-                capability_dim=config.model.capability_dim,
-                component_embedding_dim=config.model.component_embedding_dim,
-                protocol_components=config.model.protocol_components,
-            )
-            panel_previous_actions = jnp.concatenate(
-                (
-                    jnp.zeros((panel_count, 1), dtype=jnp.int32),
-                    panel_history_actions[:, :-1],
-                ),
-                axis=1,
-            )
-            panel_starts = jnp.zeros(
-                (panel_count, panel_steps), dtype=jnp.bool_
-            ).at[:, 0].set(True)
-            panel_state, unused_panel_context = model.apply(
-                {"params": state.params},
-                panel_state,
-                jnp.swapaxes(panel_history_observations, 0, 1),
-                jnp.swapaxes(panel_previous_actions, 0, 1),
-                jnp.swapaxes(panel_starts, 0, 1),
-                method=model.context_sequence,
-            )
-            del unused_panel_context
-            panel_state = panel_state._replace(
-                previous_action=panel_history_actions[:, -1],
-                episode_start=jnp.zeros((panel_count,), dtype=jnp.bool_),
-            )
-        else:
-            # Mechanical execution has no frozen comparator by construction.
-            # Its fresh final anchors still exercise the complete intervention
-            # path, but are explicitly non-shared and non-scientific.
-            panel_state = final_anchors.policy_states
-            panel_observations = jnp.asarray(
-                final_anchors.observations, dtype=jnp.float32
-            )
-            panel_ids = [
-                f"mechanical-anchor-{int(value)}"
-                for value in np.asarray(final_anchors.anchor_ids).reshape((-1,))
-            ]
-            context_fingerprints = np.asarray(
-                final_anchors.collection_context_fingerprint,
-                dtype=np.uint32,
-            ).reshape((-1, 2))
-            diagnostic_panel = {
-                "panel_ids": panel_ids,
-                "state_hashes": [
-                    f"{int(words[0]):08x}{int(words[1]):08x}"
-                    for words in context_fingerprints
-                ],
-                "source": {
-                    "artifact_type": "mechanical_final_anchor_batch",
-                    "shared_across_runs": False,
-                    "scientific_readout_allowed": False,
-                },
-            }
-        _, final_component_output = model.apply(
-            {"params": state.params},
-            panel_state,
-            panel_observations,
-            method=model.component_intervention_step,
-        )
-        component_summary = component_intervention_summary(
-            action_signatures=final_component_output.action_signatures,
-            policy_logits=final_component_output.policy_logits,
-            protocol_probabilities=(
-                final_component_output.protocol_probabilities
-            ),
-            diagnostic_panel_ids=diagnostic_panel["panel_ids"],
-            diagnostic_panel_state_hashes=diagnostic_panel["state_hashes"],
-            component_embeddings=model.apply(
-                {"params": state.params}, method=model.component_embedding_matrix
-            ),
-        )
-        from src.path_c.response_targets import (
-            pairwise_component_response_divergence,
-        )
-
-        response_divergences = []
-        for action in range(6):
-            _, response_intervention = model.apply(
-                {"params": state.params},
-                panel_state,
-                panel_observations,
-                jnp.full(
-                    panel_observations.shape[0],
-                    action,
-                    dtype=jnp.int32,
-                ),
-                method=model.response_intervention_step,
-            )
-            response_divergences.append(
-                pairwise_component_response_divergence(response_intervention)
-            )
-        component_summary = {
-            **component_summary,
-            "mean_pairwise_response_divergence_all_actions": float(
-                np.asarray(jnp.mean(jnp.stack(response_divergences)))
-            ),
-        }
-        write_json(
-            output / "records" / "final_component_diagnostics.json",
-            {
-                "version": 2,
-                "artifact_type": "depi_exchangeable_response_regime_diagnostics",
-                "method": METHOD_VERSION,
-                "method_variant": config.method_variant,
-                "seed_index": int(args.seed_index),
-                "protocol_components": int(config.model.protocol_components),
-                "model_fingerprint": final_model_fingerprint,
-                "shared_final_diagnostic_panel": True,
-                "diagnostic_panel_source": diagnostic_panel["source"],
-                "one_hot_component_intervention": True,
-                "component_indexes_are_exchangeable": True,
-                **component_summary,
-            },
-        )
-        (
-            final_bootstrap_models,
-            final_bootstrap_params,
-            final_bootstrap_states,
-            final_bootstrap_counters,
-        ) = initialize_bootstrap_value_ensemble(
-            key=jax.random.fold_in(final_anchor_root, 4),
-            example_policy_state=final_anchors.policy_states,
-            example_observation=final_anchors.observations,
-            action_count=6,
-        )
-        (
-            final_bootstrap_params,
-            unused_final_bootstrap_states,
-            unused_final_bootstrap_counters,
-            final_bootstrap_metrics,
-        ) = train_bootstrap_value_ensemble(
-            models=final_bootstrap_models,
-            params=final_bootstrap_params,
-            optimizer_states=final_bootstrap_states,
-            sampling_counters=final_bootstrap_counters,
-            anchors=final_anchors,
-            key=jax.random.fold_in(final_anchor_root, 5),
-        )
-        del unused_final_bootstrap_states, unused_final_bootstrap_counters
-        final_gate = evaluate_m1_gate_on_anchor_batch(
-            model=model,
-            params=state.params,
-            bootstrap_models=final_bootstrap_models,
-            bootstrap_params=final_bootstrap_params,
-            anchors=final_anchors,
-            spearman_threshold=float(config.anchors.m1_spearman_threshold),
-            minimum_anchor_fraction=float(config.anchors.m1_minimum_anchor_fraction),
-        )
-        final_m1_payload = {
-            "update": int(np.asarray(state.update_count)),
-            "final_checkpoint_condition": True,
-            "model_fingerprint": final_model_fingerprint,
-            "deployment_params_fingerprint": final_model_fingerprint,
-            "anchor_collection_policy_fingerprint": final_model_fingerprint,
-            "continuation_policy_fingerprint": final_model_fingerprint,
-            "continuation_contract": ContinuationContract(
-                gamma=float(config.ppo.gamma),
-                horizon=int(config.anchors.continuation_horizon),
-                continuation_policy_fingerprint=final_model_fingerprint,
-            ).to_mapping(),
-            "partner_panel_fingerprint": sha256_path(
-                Path(args.partner_manifest).resolve()
-            ),
-            "fit_key_domain": {
-                "name": "audit_anchor/final_fit",
-                "root": [int(value) for value in np.asarray(final_anchor_root)],
-                "lane_key_derivation": "fold_in(root,100003),fold_in(replica_index)",
-                "replica_index_range": [0, int(config.anchors.fit_replicas)],
-            },
-            "evaluation_key_domain": {
-                "name": "audit_anchor/final_evaluation",
-                "root": [int(value) for value in np.asarray(final_anchor_root)],
-                "lane_key_derivation": "fold_in(root,100003),fold_in(replica_index)",
-                "replica_index_range": [
-                    int(config.anchors.fit_replicas),
-                    int(config.anchors.fit_replicas)
-                    + int(config.anchors.evaluation_replicas),
-                ],
-            },
-            "fresh_final_anchor": True,
-            "bootstrap_reinitialized_after_deployment_freeze": True,
-            "bootstrap_training": _host(final_bootstrap_metrics),
-            **m1_gate_report(final_gate),
-        }
-        final_history_index = int(np.asarray(state.m1_summary_state["evaluations"]))
-        final_history = _append_m1_history(
-            state.m1_history,
-            index=final_history_index,
-            update=int(np.asarray(state.update_count)),
-            result=final_gate,
-            bootstrap_training_metrics=final_bootstrap_metrics,
-            supervision_readings=state.supervision_readings,
-        )
-        state = state._replace(
-            m1_summary_state={
-                "evaluations": state.m1_summary_state["evaluations"] + 1,
-                "latest_passed": final_gate.passed,
-            },
-            m1_history=final_history,
-            resource_ledger=ResourceLedger.from_mapping(state.resource_ledger)
-            .plus(
-                final_m1_steps=(
-                    config.environment.num_envs * config.training.rollout_length
-                    + int(final_anchor_budget["counterfactual_continuation_steps"])
-                    + int(final_anchor_budget["matched_pair_probe_steps"])
-                ),
-                component_diagnostic_steps=0,
-            )
-            .to_mapping(),
-        )
-        m1_history = _m1_history_records(
-            final_history,
-            count=int(np.asarray(state.m1_summary_state["evaluations"])),
-        )
-        write_json(
-            m1_history_path,
-            {
-                "version": 1,
-                "artifact_type": "depi_final_m1_evaluation",
-                "method": METHOD_VERSION,
-                "method_variant": config.method_variant,
-                "layout": config.environment.layout,
-                "seed_index": int(args.seed_index),
-                "specification": "METHOD_SPEC §7 final-checkpoint M1 gate",
-                "history": m1_history,
-                "latest": final_m1_payload,
-                "final": final_m1_payload,
-            },
-        )
-
-    final_step = int(np.asarray(state.effective_environment_steps))
-    deployable_count = parameter_count(deployable_parameters(state.params))
-    training_only_count = parameter_count(state.target_params) + parameter_count(
-        state.bootstrap_encoder_params
-    )
-    final_deployment = Deployment(
-        ego_run_id=str(args.ego_run_id),
-        config=config,
-        model=model,
-        params=state.params,
-    )
-    inference_latency_ms = measure_policy_inference_latency_ms(
-        OfficialDEPIPolicy(final_deployment),
-        np.zeros(observation_shape, dtype=np.float32),
-    )
-    now = time.perf_counter()
-    state = _account_runtime_resources(
-        state, elapsed_wall_seconds=now - wall_accounted_at
-    )
-    ledger = ResourceLedger.from_mapping(state.resource_ledger)
     ledger = ResourceLedger(
         **{
-            **{
-                name: getattr(ledger, name)
-                for name in ResourceLedger.__dataclass_fields__
-            },
-            "deployable_parameters": deployable_count,
-            "training_only_parameters": training_only_count,
-            "inference_latency_ms": inference_latency_ms,
+            **{name: getattr(ledger, name) for name in ResourceLedger.__dataclass_fields__},
+            "peak_memory_bytes": max(
+                int(ledger.peak_memory_bytes), peak_device_memory_bytes()
+            ),
         }
     )
     state = state._replace(resource_ledger=ledger.to_mapping())
-    if manager.latest_step() != final_step:
-        _save_depi_checkpoint(manager, output, state)
-    write_json(output / "resource_ledger.json", ledger.to_mapping())
-    _write_training_support_latents(
-        output,
-        model=model,
-        params=state.params,
-        anchors=(
-            state.supervision_anchor_batch
-            if anchor_supervision_enabled
-            and int(np.asarray(state.anchor_sampling_counter)) > 0
-            else None
-        ),
-        config=config,
-    )
-    metadata = {
-        "method": METHOD_VERSION,
-        "config_version": CONFIG_VERSION,
-        "artifact_name": "DEPI",
-        "method_variant": config.method_variant,
-        "seed_index": int(args.seed_index),
-        "jax_prng_key": list(outer_key),
-        "effective_environment_steps": final_step,
-        "update_count": int(np.asarray(state.update_count)),
-        "context_dropout_at_deployment": 0.0,
-        "anchor_microbatch": anchor_microbatch,
-        "compiled_kernels": kernels.metadata(),
-        "anchor_kernel": (
-            list(anchor_kernel.metadata()) if anchor_kernel is not None else []
-        ),
-        "owner_initialization": _host(owner_metrics),
-        "partner_training_source": "registered_static_pool_only",
-        "gpu": _gpu_snapshot(),
-        "scientific_readout": False,
-        "resume_allowed": not preflight,
-        "note": "Mechanical execution and signal metrics are not ZSC performance evidence.",
-    }
-    write_json(output / "run_metadata.json", metadata)
+
     deployment_directory = output / "final_deployment"
-    if not deployment_directory.exists() or not any(deployment_directory.iterdir()):
+    if deployment_directory.exists() and any(deployment_directory.iterdir()):
+        from .deployment import load_deployment
+
+        existing = load_deployment(deployment_directory)
+        if (
+            pytree_fingerprint(existing.base_params)
+            != pytree_fingerprint(state.base_params)
+            or pytree_fingerprint(existing.latent_params)
+            != pytree_fingerprint(state.latent_params)
+        ):
+            raise RuntimeError("Existing final deployment differs from the final checkpoint.")
+    else:
         export_deployment_bundle(
             deployment_directory,
-            source_training_run=output,
-            deployment=final_deployment,
-        )
-    if preflight:
-        if peak_device_memory_bytes() >= FORMAL_PEAK_MEMORY_LIMIT_BYTES:
-            raise RuntimeError("Formal DEPI CUDA preflight exceeded 40,000 MiB.")
-        roundtrip_report = _validate_preflight_roundtrips(
-            manager=manager,
-            output=output,
-            state=state,
-            deployment_directory=deployment_directory,
+            ego_run_id=str(args.ego_run_id),
             config=config,
+            observation_shape=environment.observation_shape,
+            base_params=state.base_params,
+            latent_params=state.latent_params,
+            source_training_run=output,
         )
-        required_acceptance_artifacts = {
-            "run_identity": output / "run_identity.json",
-            "resolved_config": output / "resolved_config.json",
-            "resolved_partner_manifest": output / "resolved_partner_manifest.json",
-            "resource_ledger": output / "resource_ledger.json",
-            "fresh_final_m1": output / "m1_gate.json",
-            "component_diagnostics": (
-                output / "records" / "final_component_diagnostics.json"
+
+    # Fresh report-only decision audit.  It never alters learned parameters and
+    # is idempotent across resume of a completed run.
+    audit_path = output / "final_decision_audit.json"
+    base_fingerprint = pytree_fingerprint(state.base_params)
+    latent_fingerprint = pytree_fingerprint(state.latent_params)
+    audit_complete = False
+    if audit_path.is_file():
+        existing_audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit_complete = (
+            existing_audit.get("base_params_fingerprint") == base_fingerprint
+            and existing_audit.get("latent_params_fingerprint") == latent_fingerprint
+        )
+    if (
+        config.method_variant in {"delta_passive", "delta_active"}
+        and not audit_complete
+    ):
+        audit_started = time.perf_counter()
+        audit_runner, audit_batch, audit_records = collect_rollout(
+            state=state.runner_state,
+            length=config.training.rollout_length,
+            environment=environment,
+            model=model,
+            base_params=state.base_params,
+            latent_params=state.latent_params,
+            partner_functions=partner_functions,
+            partner_parameters=partner_parameters,
+            official_shaping_factor=0.0,
+            record_anchors=True,
+        )
+        del audit_runner
+        audit_anchors = collect_anchor_batch(
+            key=jax.random.fold_in(loop_key, 999_999),
+            records=audit_records,
+            functions=anchor_functions,
+            base_params=state.base_params,
+            latent_params=state.latent_params,
+            states_per_trigger=config.anchors.states_per_trigger,
+            action_count=OFFICIAL_ACTION_COUNT,
+            fit_replicas=config.anchors.fit_replicas,
+            evaluation_replicas=config.anchors.evaluation_replicas,
+            horizon=config.method.continuation_horizon,
+            gamma=config.ppo.gamma,
+        )
+        audit_steps = (
+            config.environment.num_envs * config.training.rollout_length
+            + config.anchors.states_per_trigger
+            * OFFICIAL_ACTION_COUNT
+            * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
+            * config.method.continuation_horizon
+        )
+        audit_elapsed = time.perf_counter() - audit_started
+        ledger = ledger.plus(
+            final_decision_audit_steps=audit_steps,
+            measurement_wall_clock_hours=audit_elapsed / 3600.0,
+            measurement_gpu_hours=(
+                audit_elapsed / 3600.0
+                if any(device.platform == "gpu" for device in jax.devices())
+                else 0.0
             ),
-            "deployment_bundle": (
-                deployment_directory / "deployment_bundle.json"
-            ),
-        }
-        missing_acceptance = [
-            name for name, path in required_acceptance_artifacts.items()
-            if not path.is_file()
-        ]
-        if missing_acceptance:
-            raise RuntimeError(
-                "CUDA comparator preflight did not complete all registered stages: "
-                f"{missing_acceptance}."
-            )
+        )
+        state = state._replace(resource_ledger=ledger.to_mapping())
         write_json(
-            output / "cuda_preflight_report.json",
+            audit_path,
             {
-                **metadata,
-                **roundtrip_report,
-                "repository_commit": identity["runtime"]["repository_commit"],
-                "config_fingerprint": config.fingerprint,
-                "partner_manifest_sha256": identity["partner_manifest"]["sha256"],
-                "pair_comparator_sha256": identity["frozen_pair_comparator"]["sha256"],
-                "pair_comparator_contract_fingerprint": identity[
-                    "frozen_pair_comparator"
-                ]["contract_fingerprint"],
-                "compiled_rollout_update_count": 1,
-                "real_anchor_collection_passed": True,
-                "comparator_prediction_and_separation_passed": True,
-                "ppo_and_auxiliary_transactions_passed": True,
-                "fresh_final_m1_passed": True,
-                "acceptance_artifacts": {
-                    name: {"path": str(path), "sha256": sha256_path(path)}
-                    for name, path in required_acceptance_artifacts.items()
-                },
-                "peak_memory_gate_passed": True,
-                "peak_memory_limit_bytes": FORMAL_PEAK_MEMORY_LIMIT_BYTES,
-                "observed_peak_memory_bytes": peak_device_memory_bytes(),
+                **_final_decision_audit(
+                    model=model,
+                    base_params=state.base_params,
+                    latent_params=state.latent_params,
+                    batch=audit_batch,
+                    anchors=audit_anchors,
+                ),
+                "base_params_fingerprint": base_fingerprint,
+                "latent_params_fingerprint": latent_fingerprint,
             },
         )
-    write_json_atomic(
-        output / "phase_status.json",
-        {
-            "status": "complete",
-            "phase": "finished",
-            "update": int(np.asarray(state.update_count)),
-            "completed_at": _utc_now(),
-            "gpu": _gpu_snapshot(),
-        },
+
+    measured_latency = _measure_inference_latency_ms(
+        model=model,
+        base_params=state.base_params,
+        latent_params=state.latent_params,
     )
-    print(f"Complete DEPI training run: {output}")
+    current_ledger = ResourceLedger.from_mapping(state.resource_ledger)
+    if current_ledger.inference_latency_ms == 0.0:
+        current_ledger = ResourceLedger(
+            **{
+                **{
+                    name: getattr(current_ledger, name)
+                    for name in ResourceLedger.__dataclass_fields__
+                },
+                "inference_latency_ms": measured_latency,
+            }
+        )
+        state = state._replace(resource_ledger=current_ledger.to_mapping())
 
-
-def run_cuda_preflight(args: argparse.Namespace) -> None:
-    args._execution_scope = CUDA_PREFLIGHT_SCOPE
-    args.run_kind = "formal"
-    args.resume = False
-    run_training(args)
+    save_checkpoint(
+        output / "checkpoints",
+        step=int(np.asarray(state.effective_environment_steps)),
+        state=state,
+        identity=checkpoint_identity,
+    )
+    write_json(output / "resource_ledger.json", ResourceLedger.from_mapping(state.resource_ledger).to_mapping())
 
 
 __all__ = ["run_cuda_preflight", "run_training"]
+
+
+def run_cuda_preflight(args: argparse.Namespace) -> None:
+    """Execute one registered real-partner mechanical update and persistence round trip."""
+    args.maximum_updates = 1
+    args.force_anchor = True
+    args.require_cuda = True
+    args.resume = False
+    run_training(args)
+    output = Path(args.output).resolve()
+    deployment = output / "final_deployment"
+    checkpoint = output / "checkpoints" / "latest.json"
+    audit = output / "final_decision_audit.json"
+    ledger = output / "resource_ledger.json"
+    for path in (deployment / "deployment_bundle.json", checkpoint, audit, ledger):
+        if not path.is_file():
+            raise RuntimeError(f"CUDA preflight artifact is missing: {path}")
+    write_json(
+        output / "cuda_preflight_report.json",
+        {
+            "passed": True,
+            "method": METHOD_VERSION,
+            "config": str(Path(args.config).resolve()),
+            "partner_manifest": str(Path(args.partner_manifest).resolve()),
+            "deployment_sha256": sha256_path(deployment),
+            "checkpoint_descriptor_sha256": sha256_path(checkpoint),
+            "final_decision_audit_sha256": sha256_path(audit),
+            "resource_ledger_sha256": sha256_path(ledger),
+        },
+    )
+
+

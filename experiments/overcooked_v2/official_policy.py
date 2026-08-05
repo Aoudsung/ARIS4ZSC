@@ -1,59 +1,63 @@
-"""Official evaluator adapter for the single deployable DEPI actor."""
+"""Official evaluator adapter exposing only legal local history."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from experiments.overcooked_v2.deployment import (
-    Deployment,
-    deployment_action,
-    reset_deployment_state,
-)
-from src.path_c.counterfactual_anchor import tree_select
+from .deployment import Deployment, deployment_action, reset_deployment_state
 
 
-class OfficialDEPIPolicy:
-    """Duck-typed locked ``AbstractPolicy`` implementation."""
+def _tree_select(mask: Any, selected: Any, alternative: Any) -> Any:
+    import jax
+    import jax.numpy as jnp
+
+    def one(left: Any, right: Any):
+        value = jnp.asarray(mask, dtype=jnp.bool_)
+        expanded = value.reshape(value.shape + (1,) * (jnp.ndim(left) - value.ndim))
+        return jnp.where(expanded, left, right)
+
+    return jax.tree_util.tree_map(one, selected, alternative)
+
+
+class OfficialDELTAPolicy:
+    """Duck-typed OvercookedV2 ``AbstractPolicy`` implementation."""
 
     def __init__(self, deployment: Deployment):
         self.deployment = deployment
 
     def init_hstate(self, batch_size: int, key: Any | None = None) -> Any:
         del key
-        return reset_deployment_state(
-            self.deployment,
-            batch_size=int(batch_size),
-            observation_shape=tuple(self.deployment.model.observation_shape),
-        )
+        return reset_deployment_state(self.deployment, batch_size=int(batch_size))
 
     def compute_action(
         self, obs: Any, done: Any, hstate: Any, key: Any
     ) -> tuple[Any, Any]:
         import jax.numpy as jnp
 
-        observation = jnp.asarray(obs)
-        done_value = jnp.asarray(done, dtype=jnp.bool_)
+        observation = jnp.asarray(obs, dtype=jnp.float32)
         batched = observation.ndim == len(self.deployment.model.observation_shape) + 1
         if not batched:
-            observation = observation[None, ...]
-            done_value = done_value.reshape((1,))
-            key = jnp.asarray(key)[None, ...]
+            observation = observation[None]
+        done_value = jnp.asarray(done, dtype=jnp.bool_)
+        if done_value.ndim == 0:
+            done_value = done_value[None]
+        keys = jnp.asarray(key)
+        if keys.ndim == 1:
+            keys = keys[None]
         fresh = self.init_hstate(int(observation.shape[0]))
-        state = tree_select(done_value, fresh, hstate)
-        stepped, action, unused_output, unused_log_probability = deployment_action(
+        current = _tree_select(done_value, fresh, hstate)
+        stepped, action, unused_output, unused_logp = deployment_action(
             deployment=self.deployment,
-            state=state,
+            state=current,
             observation=observation,
-            keys=key,
+            keys=keys,
         )
-        del unused_output, unused_log_probability
+        del unused_output, unused_logp
         next_state = stepped._replace(
             previous_action=jnp.asarray(action, dtype=jnp.int32),
             episode_start=jnp.zeros_like(done_value, dtype=jnp.bool_),
         )
-        if batched:
-            return action, next_state
-        return action[0], next_state
+        return (action, next_state) if batched else (action[0], next_state)
 
 
 def assert_official_policy_surface(policy: Any) -> None:
@@ -71,4 +75,4 @@ def assert_official_policy_surface(policy: Any) -> None:
         raise TypeError(f"Official policy exposes forbidden test hooks: {present}.")
 
 
-__all__ = ["OfficialDEPIPolicy", "assert_official_policy_surface"]
+__all__ = ["OfficialDELTAPolicy", "assert_official_policy_surface"]

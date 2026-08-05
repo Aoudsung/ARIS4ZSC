@@ -1,1 +1,7 @@
-docs/theory/DELTA_ZSC_COMPLETE_THEORY_AND_DESIGN.md whitespace=-trailing-space
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf whitespace=-trailing-space
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.txt text eol=lf

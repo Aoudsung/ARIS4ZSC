@@ -1,5 +1,7 @@
 # 决策日志（Decision Log）
 
+> **Active-method note (2026-08-05):** entries below are historical and append-only. The current method identity and executable contract are defined only by `docs/PROTOCOL_INDEX.md` and `src/delta_zsc/config.py`; superseded DEPI entries do not override unified DELTA-ZSC.
+
 本日志仅记录项目的**资源与方向决策**（投入、停机、复活、基线口径、治理修订等人类裁决），按时间顺序追加。
 
 **重要边界：本日志中的任何条目都不作为科学论点的证据。** 科学证据只以 `EVIDENCE_LEDGER.md`（证据台账）中登记的实验、审计与统计读数为准。人类裁决可以决定资源投向，但不能证明任何科学主张成立。

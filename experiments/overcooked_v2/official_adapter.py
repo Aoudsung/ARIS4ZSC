@@ -25,16 +25,13 @@ import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
-from src.path_c.experiment import (
+from src.delta_zsc.config import (
     OFFICIAL_CORRECT_DELIVERY_REWARD,
-    OFFICIAL_SOURCE_COMMIT,
-    RunConfig,
-)
-from src.path_c.experiment import (
     OFFICIAL_NUM_MINIBATCHES,
     OFFICIAL_OP_NUM_ENVS,
     OFFICIAL_OP_TOTAL_TIMESTEPS,
     OFFICIAL_ROLLOUT_LENGTH,
+    OFFICIAL_SOURCE_COMMIT,
     OFFICIAL_SP_NUM_ENVS,
     OFFICIAL_SP_TOTAL_TIMESTEPS,
     OFFICIAL_TRAINING_ROOT_SEED,
@@ -244,7 +241,7 @@ def _official_symbol(module: str, name: str) -> Any:
 
 
 def compose_official_config(
-    config: RunConfig,
+    config: Any,
     *,
     algorithm: str,
     seed_index: int,
@@ -480,7 +477,7 @@ def _validate_official_baseline_config(
 def _validate_official_config(
     resolved: Mapping[str, Any],
     *,
-    config: RunConfig,
+    config: Any,
     algorithm: str,
     seed_index: int,
 ) -> None:
@@ -593,7 +590,7 @@ def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
 def validate_official_partner_checkpoint(
     checkpoint_path: str | Path,
     *,
-    config: RunConfig,
+    config: Any,
     algorithm: str,
     seed_index: int,
 ) -> None:
@@ -870,7 +867,7 @@ class VectorEnvironment:
     episode_steps: int
 
     @classmethod
-    def create(cls, config: RunConfig) -> "VectorEnvironment":
+    def create(cls, config: Any) -> "VectorEnvironment":
         import jaxmarl
         from jaxmarl.environments.overcooked_v2.overcooked import ObservationType
 

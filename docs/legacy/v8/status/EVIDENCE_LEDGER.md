@@ -1,5 +1,7 @@
 # 证据台账（只追加）
 
+> **Active-method note (2026-08-05):** entries below are historical and append-only. The current method identity and executable contract are defined only by `docs/PROTOCOL_INDEX.md` and `src/delta_zsc/config.py`; superseded DEPI entries do not override unified DELTA-ZSC.
+
 每条：日期、结论、证据指针。结论被推翻时追加新条目，不改旧条目。
 首批条目摘录自 legacy 源出台账 [legacy/v44/status/FINDINGS_LEDGER.md](../legacy/v44/status/FINDINGS_LEDGER.md)，原始证据细节以源出台账为准，摘录不改原文。
 

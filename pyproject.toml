@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aris4zsc"
-version = "0.3.0"
-description = "DEPI exact-filter decision-supervision coordination experiments"
+version = "0.5.0"
+description = "Unified DELTA-ZSC response-decision Bayesian coordination experiments"
 requires-python = ">=3.10,<3.11"
 dependencies = [
   "numpy>=1.24,<2",
@@ -34,5 +34,5 @@ dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src.path_c*", "experiments.overcooked_v2*"]
+include = ["src.delta_zsc*", "experiments.overcooked_v2*"]
 namespaces = true
