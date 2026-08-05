@@ -1,31 +1,38 @@
+# Python/runtime caches
 __pycache__/
 *.py[cod]
-.DS_Store
-/.claude/settings.local.json
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv
+*.egg-info/
+build/
+dist/
+
+# Local environments and editor state
 .venv/
-venv
 venv/
+.DS_Store
+._*
+.vscode/
+.idea/
+.claude/
+.agents/
+.aris/
+
+# Private local instructions or credentials
+CUSTOMER.md
+AGENTS.md
+CLAUDE.md
+SSH_Document.md
+
+# Generated experiment artifacts
 artifacts/
 reports/
 runs/
 results/
-*.egg-info/
 *.pt
 *.pth
 *.ckpt
 *.tar
 *.tar.gz
 *.zip
-._*
-CUSTOMER.md
-AGENTS.md
-CLAUDE.md
-.agents/
-.aris/
-.claude/
-literature/
-idea-stage/

@@ -1,0 +1,35 @@
+{
+  "artifact_schema_version": 1,
+  "artifact_name": "DELTA-ZSC unified VOI v2 final source package",
+  "created_date": "2026-08-05",
+  "source_reconstruction_base_commit": "149f588d733be48722eea3bff844922f1ed885cc",
+  "active_method_version": "delta_joint_response_decision_mirror_voi_v2",
+  "config_version": 1,
+  "checkpoint_schema_version": 1,
+  "manifest_version": 1,
+  "official_source_commit": "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e",
+  "active_namespace": "src.delta_zsc",
+  "active_cli": "python -m experiments.overcooked_v2.delta_zsc",
+  "local_validation": {
+    "python": "3.13.5",
+    "jax": "0.9.0.1",
+    "numpy": "2.3.5",
+    "backend": "cpu",
+    "test_files": 6,
+    "tests_passed": 26,
+    "compile": "passed",
+    "registered_configs_loaded": 6,
+    "cli_subcommands_smoked": 15,
+    "workflow_yaml": "passed",
+    "namespace_audit": "passed",
+    "credential_pattern_scan": "passed"
+  },
+  "formal_execution_status": {
+    "registered_python_3_10_install": "not_run_in_local_container",
+    "real_official_partner_checkpoint_execution": "not_run_in_local_container",
+    "real_cuda_mechanical_preflight": "not_run_in_local_container",
+    "development_matrix": "not_generated",
+    "formal_hypothesis_results": "not_generated",
+    "sota_claim": false
+  }
+}

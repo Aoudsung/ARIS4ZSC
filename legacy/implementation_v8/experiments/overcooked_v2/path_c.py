@@ -1,0 +1,559 @@
+"""Single command entry for DEPI."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+from experiments.overcooked_v2.calibration_app import run_posterior_calibration
+from experiments.overcooked_v2.comparator_app import (
+    collect_pair_comparator_source,
+    fit_frozen_pair_comparator,
+)
+from experiments.overcooked_v2.common_partner_app import run_common_partner_evaluation
+from experiments.overcooked_v2.manifest_app import add_manifest_command
+from experiments.overcooked_v2.mechanical_e2e_app import run_mechanical_e2e
+from experiments.overcooked_v2.scientific_dry_run_app import run_scientific_dry_run
+from experiments.overcooked_v2.official_baseline_app import run_official_baseline
+from experiments.overcooked_v2.official_br_prox_app import run_common_br_prox
+from experiments.overcooked_v2.official_evaluation_app import (
+    run_build_depi_policy_manifest,
+    run_capacity_summary,
+    run_official_evaluation,
+    run_official_summary,
+)
+from experiments.overcooked_v2.training_app import run_cuda_preflight, run_training
+from experiments.overcooked_v2.signal_audit_app import run_signal_audit
+from experiments.overcooked_v2.upstream_app import run_upstream
+from experiments.overcooked_v2.resource_report_app import run_resource_report
+from experiments.overcooked_v2.formal_claim_app import run_formal_claim_report
+from experiments.overcooked_v2.identifiability_app import (
+    run_identifiability_evaluation,
+    run_recoverable_value_evaluation,
+)
+from experiments.overcooked_v2.development_matrix_app import (
+    evaluate_development_matrix,
+    run_development_matrix,
+    summarize_development_matrix,
+)
+from experiments.overcooked_v2.decision_coverage_app import (
+    build_decision_coverage_source,
+    summarize_decision_coverage,
+)
+from experiments.overcooked_v2.protocol_sensitivity_app import (
+    collect_protocol_sensitivity_sequences,
+    run_protocol_sensitivity_matrix,
+    summarize_protocol_sensitivity,
+)
+from experiments.overcooked_v2.contemporary_baseline_app import (
+    CONTEMPORARY_PROXY_METHODS,
+    run_build_contemporary_proxy_manifest,
+    run_common_proxy_evaluation,
+)
+from src.path_c.experiment import (
+    ENGINEERING_SEED_INDEX,
+    RUN_KINDS,
+    load_config,
+    load_partner_manifest,
+    validate_seed_training_manifest,
+)
+from src.path_c.storage import CompleteConsoleLog
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m experiments.overcooked_v2.path_c"
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    add_manifest_command(commands)
+
+    mechanical = commands.add_parser("mechanical-e2e")
+    mechanical.add_argument(
+        "--config",
+        default=(
+            "experiments/overcooked_v2/configs/"
+            "depi_simple_mechanical_e2e.yaml"
+        ),
+    )
+    mechanical.add_argument("--partner-manifest", required=True)
+    mechanical.add_argument("--ego-run-id", default="depi-engineering")
+    mechanical.add_argument("--require-cuda", action="store_true", default=False)
+    mechanical.add_argument("--resume", action="store_true", default=False)
+    mechanical.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    mechanical.add_argument("--output", required=True)
+    mechanical.set_defaults(function=run_mechanical_e2e, manages_output=True)
+
+    scientific_dry_run = commands.add_parser("scientific-dry-run")
+    scientific_dry_run.add_argument(
+        "--config",
+        default=(
+            "experiments/overcooked_v2/configs/"
+            "depi_simple_mechanical_e2e.yaml"
+        ),
+    )
+    scientific_dry_run.add_argument("--partner-manifest", required=True)
+    scientific_dry_run.add_argument("--pair-comparator", required=True)
+    scientific_dry_run.add_argument(
+        "--comparator-reference-ego-checkpoint", required=True
+    )
+    scientific_dry_run.add_argument("--resume", action="store_true", default=False)
+    scientific_dry_run.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    scientific_dry_run.add_argument("--output", required=True)
+    scientific_dry_run.set_defaults(
+        function=run_scientific_dry_run, manages_output=True
+    )
+
+    upstream = commands.add_parser("upstream")
+    upstream.add_argument("--config", required=True)
+    upstream.add_argument("--algorithm", choices=("rnn-sp", "rnn-op"), required=True)
+    upstream.add_argument("--seed-index", type=int, choices=range(10), required=True)
+    upstream.add_argument("--run-kind", choices=RUN_KINDS, required=True)
+    upstream.add_argument(
+        "--jax-prng-key",
+        type=int,
+        nargs=2,
+        metavar=("WORD0", "WORD1"),
+        help=(
+            "Explicit two-word key for mechanical lineage fixtures only; "
+            "formal and development runs always use split(PRNGKey(42), 10)."
+        ),
+    )
+    upstream.add_argument("--output", required=True)
+    upstream.set_defaults(function=run_upstream, manages_output=True)
+
+    baseline = commands.add_parser("train-official-baseline")
+    baseline.add_argument(
+        "--method",
+        choices=("sp", "state-augmented", "op", "fcp", "ippo-large"),
+        required=True,
+    )
+    baseline.add_argument(
+        "--layout", choices=("test_time_simple", "test_time_wide"), required=True
+    )
+    baseline.add_argument("--fcp-population")
+    baseline.add_argument("--fcp-population-ledger")
+    baseline.add_argument("--training-lineage-manifest")
+    baseline.add_argument("--depi-deployment")
+    baseline.add_argument("--output", required=True)
+    baseline.set_defaults(function=run_official_baseline, manages_output=True)
+
+    proxy_manifest = commands.add_parser("build-contemporary-proxy-manifest")
+    proxy_manifest.add_argument(
+        "--method", choices=CONTEMPORARY_PROXY_METHODS, required=True
+    )
+    proxy_manifest.add_argument("--config", required=True)
+    proxy_manifest.add_argument("--depi-reference-manifest", required=True)
+    proxy_manifest.add_argument("--deployments", nargs=10, required=True)
+    proxy_manifest.add_argument("--output", required=True)
+    proxy_manifest.set_defaults(
+        function=run_build_contemporary_proxy_manifest, manages_output=False
+    )
+
+    proxy_common = commands.add_parser("evaluate-common-proxies")
+    proxy_common.add_argument("--config", required=True)
+    proxy_common.add_argument("--partner-manifest", required=True)
+    proxy_common.add_argument(
+        "--policy-manifest",
+        action="append",
+        required=True,
+        help="METHOD=/policy_manifest.json; provide all three proxy methods",
+    )
+    proxy_common.add_argument("--output", required=True)
+    proxy_common.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    proxy_common.set_defaults(
+        function=run_common_proxy_evaluation, manages_output=True
+    )
+
+    validate = commands.add_parser("validate-manifest")
+    validate.add_argument("--config", required=True)
+    validate.add_argument("--partner-manifest", required=True)
+    validate.add_argument("--run-kind", choices=RUN_KINDS, required=True)
+    validate.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX, *range(10)),
+        help="Required for per-seed DEPI initialization and training manifests.",
+    )
+    validate.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+
+    def validate_manifest(args: argparse.Namespace) -> None:
+        config = load_config(args.config, run_kind=args.run_kind)
+        manifest = load_partner_manifest(
+            args.partner_manifest,
+            expected_layout=config.environment.layout,
+            verify_files=not bool(args.skip_manifest_hash_check),
+        )
+        if args.run_kind == "formal" and args.seed_index is None:
+            raise ValueError("Formal DEPI manifest validation requires --seed-index.")
+        if args.seed_index is not None:
+            validate_seed_training_manifest(
+                manifest,
+                config=config,
+                owner_seed_index=int(args.seed_index),
+                formal=(args.run_kind == "formal"),
+            )
+        print(f"Valid DEPI manifest: {len(manifest.runs)} runs")
+
+    validate.set_defaults(function=validate_manifest, manages_output=False)
+
+    comparator_source = commands.add_parser("collect-pair-comparator-source")
+    comparator_source.add_argument("--config", required=True)
+    comparator_source.add_argument("--partner-manifest", required=True)
+    comparator_source.add_argument("--reference-ego-checkpoint", required=True)
+    comparator_source.add_argument("--output", required=True)
+    comparator_source.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    comparator_source.set_defaults(
+        function=collect_pair_comparator_source, manages_output=True
+    )
+
+    comparator = commands.add_parser("fit-pair-comparator")
+    comparator.add_argument("--source", required=True)
+    comparator.add_argument("--output", required=True)
+    comparator.set_defaults(function=fit_frozen_pair_comparator, manages_output=True)
+
+    coverage_source = commands.add_parser("build-decision-coverage-source")
+    coverage_source.add_argument("--source", required=True)
+    coverage_source.add_argument(
+        "--partition", choices=("fit", "validation"), required=True
+    )
+    coverage_source.add_argument(
+        "--role",
+        choices=("training_support", "development_coverage"),
+        required=True,
+    )
+    coverage_source.add_argument("--output", required=True)
+    coverage_source.set_defaults(
+        function=build_decision_coverage_source, manages_output=False
+    )
+
+    coverage_report = commands.add_parser("summarize-decision-coverage")
+    coverage_report.add_argument("--training-source", required=True)
+    coverage_report.add_argument("--coverage-source", required=True)
+    coverage_report.add_argument("--task-epsilon", type=float, default=4.0)
+    coverage_report.add_argument("--signature-threshold", type=float, default=1.0)
+    coverage_report.add_argument("--output", required=True)
+    coverage_report.set_defaults(
+        function=summarize_decision_coverage, manages_output=True
+    )
+
+    protocol_sequences = commands.add_parser(
+        "collect-protocol-sensitivity-sequences"
+    )
+    protocol_sequences.add_argument("--config", required=True)
+    protocol_sequences.add_argument("--training-run", required=True)
+    protocol_sequences.add_argument("--panel-comparator", required=True)
+    protocol_sequences.add_argument("--output", required=True)
+    protocol_sequences.set_defaults(
+        function=collect_protocol_sensitivity_sequences, manages_output=False
+    )
+
+    protocol_sensitivity = commands.add_parser("summarize-protocol-sensitivity")
+    protocol_sensitivity.add_argument(
+        "--input",
+        action="append",
+        required=True,
+        help="P_STAY=/path/to/sequence-artifact.json; provide 0.90, 0.97, 0.99",
+    )
+    protocol_sensitivity.add_argument("--output", required=True)
+    protocol_sensitivity.set_defaults(
+        function=summarize_protocol_sensitivity, manages_output=True
+    )
+
+    protocol_matrix = commands.add_parser("run-protocol-sensitivity-matrix")
+    protocol_matrix.add_argument("--config", required=True)
+    protocol_matrix.add_argument("--partner-manifest", required=True)
+    protocol_matrix.add_argument("--pair-comparator", required=True)
+    protocol_matrix.add_argument(
+        "--comparator-reference-ego-checkpoint", required=True
+    )
+    protocol_matrix.add_argument(
+        "--seed-index", action="append", type=int, choices=range(10), required=True
+    )
+    protocol_matrix.add_argument("--resume", action="store_true", default=False)
+    protocol_matrix.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    protocol_matrix.add_argument("--output", required=True)
+    protocol_matrix.set_defaults(
+        function=run_protocol_sensitivity_matrix, manages_output=True
+    )
+
+    train = commands.add_parser("train")
+    train.add_argument("--config", required=True)
+    train.add_argument("--partner-manifest", required=True)
+    train.add_argument("--ego-run-id", required=True)
+    train.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX, *range(10)),
+        required=True,
+    )
+    train.add_argument("--run-kind", choices=RUN_KINDS, required=True)
+    train.add_argument("--output", required=True)
+    train.add_argument("--pair-comparator")
+    train.add_argument("--comparator-reference-ego-checkpoint")
+    train.add_argument("--resume", action="store_true")
+    train.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    train.set_defaults(function=run_training, manages_output=True)
+
+    matrix = commands.add_parser("run-development-matrix")
+    matrix.add_argument("--config", required=True)
+    matrix.add_argument("--partner-manifest", required=True)
+    matrix.add_argument(
+        "--seed-index", type=int, action="append", required=True, choices=range(10)
+    )
+    matrix.add_argument(
+        "--protocol-components",
+        type=int,
+        action="append",
+        choices=(2, 4, 8),
+        default=None,
+        help="Repeat exactly for K=2,4,8; omitted runs the full sensitivity set.",
+    )
+    matrix.add_argument("--output", required=True)
+    matrix.add_argument("--pair-comparator", required=True)
+    matrix.add_argument("--comparator-reference-ego-checkpoint", required=True)
+    matrix.add_argument("--resume", action="store_true")
+    matrix.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    matrix.set_defaults(function=run_development_matrix, manages_output=True)
+
+    matrix_evaluate = commands.add_parser("evaluate-development-matrix")
+    matrix_evaluate.add_argument("--matrix", required=True)
+    matrix_evaluate.add_argument(
+        "--variant",
+        choices=(
+            "r0",
+            "b0",
+            "b1",
+            "b2",
+            "r0_extra",
+            "b0_extra",
+            "b1_extra",
+            "deterministic_context",
+            "decision_only",
+            "q_only",
+            "actor_only",
+            "no_separation",
+            "no_capability",
+            "response_only_posterior",
+        ),
+        required=True,
+    )
+    matrix_evaluate.add_argument(
+        "--protocol-components", type=int, choices=(2, 4, 8), required=True
+    )
+    matrix_evaluate.add_argument("--output", required=True)
+    matrix_evaluate.set_defaults(
+        function=evaluate_development_matrix, manages_output=True
+    )
+
+    matrix_summary = commands.add_parser("summarize-development-matrix")
+    matrix_summary.add_argument("--matrix", required=True)
+    matrix_summary.add_argument("--evaluation", action="append", required=True)
+    matrix_summary.add_argument("--output", required=True)
+    matrix_summary.set_defaults(
+        function=summarize_development_matrix, manages_output=True
+    )
+
+    cuda_preflight = commands.add_parser("cuda-preflight")
+    cuda_preflight.add_argument("--config", required=True)
+    cuda_preflight.add_argument("--partner-manifest", required=True)
+    cuda_preflight.add_argument("--pair-comparator", required=True)
+    cuda_preflight.add_argument(
+        "--comparator-reference-ego-checkpoint", required=True
+    )
+    cuda_preflight.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX,),
+        default=ENGINEERING_SEED_INDEX,
+    )
+    cuda_preflight.add_argument(
+        "--ego-run-id", default="depi-formal-cuda-preflight"
+    )
+    cuda_preflight.add_argument("--output", required=True)
+    cuda_preflight.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    cuda_preflight.set_defaults(
+        function=run_cuda_preflight,
+        manages_output=True,
+        run_kind="formal",
+        resume=False,
+    )
+
+    calibrate = commands.add_parser("calibrate-posterior")
+    calibrate.add_argument("--config", required=True)
+    calibrate.add_argument("--partner-manifest", required=True)
+    calibrate.add_argument("--training-run", required=True)
+    calibrate.add_argument(
+        "--seed-index",
+        type=int,
+        choices=(ENGINEERING_SEED_INDEX, *range(10)),
+        required=True,
+    )
+    calibrate.add_argument("--run-kind", choices=RUN_KINDS, required=True)
+    calibrate.add_argument("--output", required=True)
+    calibrate.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    calibrate.set_defaults(function=run_posterior_calibration, manages_output=True)
+
+    audit = commands.add_parser("audit-signals")
+    audit.add_argument("--training-run", required=True)
+    audit.add_argument("--output", required=True)
+    audit.set_defaults(function=run_signal_audit, manages_output=True)
+
+    identifiability = commands.add_parser("evaluate-identifiability")
+    identifiability.add_argument("--raw-input")
+    identifiability.add_argument("--config")
+    identifiability.add_argument("--policy-manifest")
+    identifiability.add_argument("--partner-manifest")
+    identifiability.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    identifiability.add_argument("--output", required=True)
+    identifiability.set_defaults(
+        function=run_identifiability_evaluation, manages_output=True
+    )
+
+    recoverable = commands.add_parser("evaluate-recoverable-value")
+    recoverable.add_argument("--raw-input")
+    recoverable.add_argument("--config")
+    recoverable.add_argument("--policy-manifest")
+    recoverable.add_argument("--partner-manifest")
+    recoverable.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    recoverable.add_argument("--output", required=True)
+    recoverable.set_defaults(
+        function=run_recoverable_value_evaluation, manages_output=True
+    )
+
+    depi_manifest = commands.add_parser("build-depi-policy-manifest")
+    depi_manifest.add_argument("--deployments", nargs=10, required=True)
+    depi_manifest.add_argument("--output", required=True)
+    depi_manifest.set_defaults(
+        function=run_build_depi_policy_manifest, manages_output=False
+    )
+
+    official = commands.add_parser("evaluate-official")
+    official.add_argument("--config", required=True)
+    official.add_argument("--policy-manifest", required=True)
+    official.add_argument("--output", required=True)
+    official.set_defaults(function=run_official_evaluation, manages_output=True)
+
+    official_summary = commands.add_parser("summarize-official")
+    official_summary.add_argument(
+        "--result",
+        action="append",
+        required=True,
+        help="LAYOUT:METHOD=/official/evaluation/directory; provide all ten",
+    )
+    official_summary.add_argument(
+        "--config",
+        action="append",
+        required=True,
+        help="LAYOUT=/formal/config.yaml; provide Simple and Wide preregistrations",
+    )
+    official_summary.add_argument("--output", required=True)
+    official_summary.set_defaults(function=run_official_summary, manages_output=True)
+
+    capacity_summary = commands.add_parser("summarize-capacity-control")
+    capacity_summary.add_argument(
+        "--result",
+        action="append",
+        required=True,
+        help="LAYOUT:METHOD=/official/evaluation/directory; DEPI and IPPO-Large on both layouts",
+    )
+    capacity_summary.add_argument("--output", required=True)
+    capacity_summary.set_defaults(function=run_capacity_summary, manages_output=True)
+
+    common = commands.add_parser("evaluate-common")
+    common.add_argument("--config", required=True)
+    common.add_argument("--partner-manifest", required=True)
+    common.add_argument(
+        "--policy-manifest",
+        action="append",
+        required=True,
+        help="METHOD=/policy_manifest.json; provide all five methods",
+    )
+    common.add_argument("--br-prox-result", required=True)
+    common.add_argument("--output", required=True)
+    common.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    common.set_defaults(function=run_common_partner_evaluation, manages_output=True)
+
+    common_br = commands.add_parser("evaluate-common-br-prox")
+    common_br.add_argument("--config", required=True)
+    common_br.add_argument("--partner-manifest", required=True)
+    common_br.add_argument(
+        "--policy-manifest",
+        action="append",
+        required=True,
+        help="METHOD=/policy_manifest.json; provide all five methods",
+    )
+    common_br.add_argument("--output", required=True)
+    common_br.add_argument(
+        "--skip-manifest-hash-check", action="store_true", default=False
+    )
+    common_br.set_defaults(function=run_common_br_prox, manages_output=True)
+
+    resources = commands.add_parser("summarize-resources")
+    resources.add_argument(
+        "--ledger",
+        action="append",
+        required=True,
+        help="METHOD=/path/resource_ledger.json; repeat for every independent artifact",
+    )
+    resources.add_argument("--output", required=True)
+    resources.set_defaults(function=run_resource_report, manages_output=True)
+
+    claims = commands.add_parser("build-formal-claim-report")
+    claims.add_argument("--official-summary", required=True)
+    claims.add_argument("--common-simple", required=True)
+    claims.add_argument("--common-wide", required=True)
+    claims.add_argument("--capacity-summary", required=True)
+    claims.add_argument("--resource-report", required=True)
+    claims.add_argument("--development-matrix", required=True)
+    claims.add_argument("--posterior-calibration-simple", required=True)
+    claims.add_argument("--posterior-calibration-wide", required=True)
+    claims.add_argument("--identifiability-simple", required=True)
+    claims.add_argument("--identifiability-wide", required=True)
+    claims.add_argument("--recoverable-value-simple", required=True)
+    claims.add_argument("--recoverable-value-wide", required=True)
+    claims.add_argument("--output", required=True)
+    claims.set_defaults(function=run_formal_claim_report, manages_output=True)
+
+    return parser
+
+
+def main() -> None:
+    args = _parser().parse_args()
+    if not args.manages_output:
+        args.function(args)
+        return
+    output = Path(args.output).resolve()
+    with CompleteConsoleLog(output / "logs") as log:
+        print(f"Complete stdout: {log.stdout_path}")
+        print(f"Complete stderr: {log.stderr_path}")
+        args.function(args)
+
+
+if __name__ == "__main__":
+    main()
