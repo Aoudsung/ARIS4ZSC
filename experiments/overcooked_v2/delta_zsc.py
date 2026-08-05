@@ -88,6 +88,7 @@ def _parser() -> argparse.ArgumentParser:
     summarize = commands.add_parser("summarize-evaluations")
     summarize.add_argument("--evaluation", action="append", required=True)
     summarize.add_argument("--bootstrap-replicates", type=int, default=9_999)
+    summarize.add_argument("--seed", type=int, default=0)
     summarize.add_argument("--output", required=True)
     summarize.set_defaults(function=summarize_evaluations)
 

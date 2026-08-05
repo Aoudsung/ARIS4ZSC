@@ -16,6 +16,7 @@ ACTIVE_APPS = {
     "intervention_app.py",
     "official_adapter.py",
     "official_policy.py",
+    "official_training.py",
     "resource_report_app.py",
     "training_app.py",
 }

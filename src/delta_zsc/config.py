@@ -26,6 +26,14 @@ CONFIG_VERSION = 1
 METHOD_VERSION = "delta_joint_response_decision_mirror_voi_v2"
 CHECKPOINT_SCHEMA_VERSION = 1
 MANIFEST_VERSION = 1
+FORMAL_METHOD_LABEL = "delta-active"
+OFFICIAL_BASELINE_METHODS = (
+    "sp",
+    "state-augmented",
+    "op",
+    "fcp",
+    "ippo-large",
+)
 OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
 OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
 OFFICIAL_CORRECT_DELIVERY_REWARD = 20.0

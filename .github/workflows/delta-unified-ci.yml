@@ -57,6 +57,7 @@ jobs:
           pytest -q experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py
           pytest -q experiments/overcooked_v2/tests/test_delta_unified_manifest.py
           pytest -q experiments/overcooked_v2/tests/test_delta_unified_repository.py
+          pytest -q experiments/overcooked_v2/tests/test_delta_unified_cli.py
       - name: Validate all registered configurations
         run: |
           python - <<'PY'

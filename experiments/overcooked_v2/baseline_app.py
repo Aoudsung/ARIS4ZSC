@@ -28,6 +28,7 @@ from .official_adapter import (
     validate_official_runtime,
 )
 from src.delta_zsc.config import (
+    OFFICIAL_BASELINE_METHODS,
     OFFICIAL_OP_TOTAL_TIMESTEPS,
     OFFICIAL_SOURCE_COMMIT,
     OFFICIAL_SP_TOTAL_TIMESTEPS,
@@ -49,7 +50,7 @@ from src.delta_zsc.storage import (
 )
 
 
-BASELINE_METHODS = ("sp", "state-augmented", "op", "fcp", "ippo-large")
+BASELINE_METHODS = OFFICIAL_BASELINE_METHODS
 
 def _runtime_identity() -> Mapping[str, Any]:
     return {
@@ -162,7 +163,7 @@ def _official_command(
     command = [
         sys.executable,
         "-m",
-        "overcooked_v2_experiments.ppo.main",
+        "experiments.overcooked_v2.official_training",
         f"+experiment={experiment}",
         f"+env={layout}",
         "SEED=42",
@@ -192,12 +193,14 @@ def _official_command(
 
 
 def _deployment_parameter_count(path: str | Path) -> tuple[int, tuple[int, ...]]:
-    import pickle
+    from .deployment import load_deployment
 
-    root = Path(path).resolve()
-    bundle = read_json(root / "deployment_bundle.json")
-    params = pickle.loads((root / "parameters.pkl").read_bytes())
-    return parameter_count(params), tuple(int(value) for value in bundle["observation_shape"])
+    deployment = load_deployment(path)
+    params = {
+        "base_params": deployment.base_params,
+        "latent_params": deployment.latent_params,
+    }
+    return parameter_count(params), tuple(deployment.model.observation_shape)
 
 
 def _select_ippo_large_dimension(

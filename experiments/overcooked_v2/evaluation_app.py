@@ -10,7 +10,12 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from src.delta_zsc.config import METHOD_VERSION, load_config
+from src.delta_zsc.config import (
+    FORMAL_METHOD_LABEL,
+    METHOD_VERSION,
+    OFFICIAL_BASELINE_METHODS,
+    load_config,
+)
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.resources import ResourceLedger
 from src.delta_zsc.storage import ensure_run_identity, read_json, sha256_path, write_json
@@ -321,9 +326,13 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
             )
         matrices[method] = matrix
         sources[method] = {"path": str(directory), "sha256": sha256_path(directory)}
-    if "delta-active" not in matrices:
-        raise ValueError("Summary requires delta-active.")
-    baseline_methods = sorted(name for name in matrices if name != "delta-active")
+    if FORMAL_METHOD_LABEL not in matrices:
+        raise ValueError(f"Summary requires {FORMAL_METHOD_LABEL}.")
+    observed_baselines = {name for name in matrices if name != FORMAL_METHOD_LABEL}
+    baseline_methods = [
+        name for name in OFFICIAL_BASELINE_METHODS if name in observed_baselines
+    ]
+    baseline_methods.extend(sorted(observed_baselines - set(baseline_methods)))
     if not baseline_methods:
         raise ValueError("Official summary requires at least one same-protocol baseline.")
     strongest = max(
@@ -331,7 +340,7 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
     )
     contrasts = {
         name: _bootstrap_difference(
-            matrices["delta-active"],
+            matrices[FORMAL_METHOD_LABEL],
             matrices[name],
             replicates=int(args.bootstrap_replicates),
             seed=int(args.seed) + index,
@@ -360,6 +369,7 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
                 "intersection_union: every registered baseline contrast must have "
                 "one-sided LCB>0 and estimate>=20"
             ),
+            "bootstrap_seed": int(args.seed),
             "sources": sources,
         },
     )
