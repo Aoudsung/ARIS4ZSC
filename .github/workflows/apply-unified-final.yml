@@ -1,0 +1,93 @@
+name: apply-unified-final
+
+on:
+  push:
+    branches: ["agent/delta-zsc-unified"]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      JAX_PLATFORM_NAME: cpu
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/delta-zsc-unified
+          fetch-depth: 0
+
+      - name: Reconstruct and verify deterministic final tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/delta-final
+          tar \
+            --sort=name \
+            --mtime='UTC 2026-08-05' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --exclude='.git' \
+            --exclude='./.github/payloads' \
+            --exclude='./.github/workflows/apply-unified-final.yml' \
+            -cf /tmp/delta-final/base.det.tar .
+          echo "b7c8469fd97ba23910d4f24bb497ce4405d665794bec870223893fef4d976c29  /tmp/delta-final/base.det.tar" | sha256sum -c -
+          cat .github/payloads/final.patch.zst.b64.part-* \
+            | base64 --decode > /tmp/delta-final/final.patch.zst
+          echo "771140b985b4f65a19a7a4b8f9d81affd7a42787c7ab6c3d7b338c970ead94a4  /tmp/delta-final/final.patch.zst" | sha256sum -c -
+          zstd -d \
+            --patch-from=/tmp/delta-final/base.det.tar \
+            /tmp/delta-final/final.patch.zst \
+            -o /tmp/delta-final/final.det.tar
+          echo "e3c6a23635333dadbbd4abc9e02d4a2bad9c8bdad5561cadbff065dfd4d40486  /tmp/delta-final/final.det.tar" | sha256sum -c -
+          mkdir -p /tmp/delta-final/tree
+          tar -xf /tmp/delta-final/final.det.tar -C /tmp/delta-final/tree
+          rsync -a --delete \
+            --exclude='.git/' \
+            --filter='protect .git/' \
+            /tmp/delta-final/tree/ "${GITHUB_WORKSPACE}/"
+          chmod +x \
+            validation/generate_voi_diagnostics.py \
+            validation/run_contract_validation.sh \
+            validation/run_isolated_test.sh
+
+      - name: Verify source manifest and compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum -c SOURCE_MANIFEST_SHA256.txt
+          python -m compileall -q src/delta_zsc experiments/overcooked_v2
+
+      - name: Install registered project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip check
+
+      - name: Run final contracts and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash validation/run_contract_validation.sh
+          pytest -q experiments/overcooked_v2/tests/test_delta_unified_*.py
+
+      - name: Commit exact final repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Aoudsung"
+          git config user.email "50046955+Aoudsung@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Final repository is already present."
+            exit 0
+          fi
+          git commit -m "Unify DELTA-ZSC with response-decision Bayesian VOI"
+          git push origin HEAD:agent/delta-zsc-unified
