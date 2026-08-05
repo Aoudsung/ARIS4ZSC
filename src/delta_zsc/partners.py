@@ -184,9 +184,16 @@ def make_static_partner_functions(
     ):
         del parameters, observations, actions, rewards, next_observations
         done = jnp.asarray(dones, dtype=jnp.bool_)
-        fresh_member = jax.vmap(lambda key: sample(key, 1)[0])(context.reset_keys)
-        fresh = StaticPartnerState(
-            carry=pool.initial_carry(int(done.shape[0])), member=fresh_member
+        # Partner resampling and fresh recurrent carries are only observable on
+        # real episode boundaries.  Avoid constructing both for every step.
+        def reset_members(reset_keys: Any) -> StaticPartnerState:
+            fresh_member = jax.vmap(lambda key: sample(key, 1)[0])(reset_keys)
+            return StaticPartnerState(
+                carry=pool.initial_carry(int(done.shape[0])), member=fresh_member
+            )
+
+        fresh = jax.lax.cond(
+            jnp.any(done), reset_members, lambda unused: state, context.reset_keys
         )
         return _tree_select(done, fresh, state)
 

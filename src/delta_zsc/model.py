@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .base_policy import base_policy_step, init_base_params
+from .base_policy import base_policy_sequence, base_policy_step, init_base_params
 from .bayes_voi import myopic_value_of_information_details
 from .behavior_statistics import (
     BEHAVIOR_FEATURE_DIM,
@@ -91,20 +91,25 @@ class DeltaModel:
         observation: Any,
         *,
         compute_latent: bool = True,
+        compute_decision: bool = True,
         execute_adaptation: bool = True,
+        precomputed_base: tuple[Any, Any, Any, Any, Any] | None = None,
     ) -> tuple[PolicyState, ModelOutput]:
         """Advance one legal observation and form the deployment policy."""
 
         import jax.numpy as jnp
 
         start = jnp.asarray(state.episode_start, dtype=jnp.bool_)
-        next_task, task, instant, base_logits, value = base_policy_step(
-            base_params,
-            state.task_carry,
-            observation,
-            start,
-            mask_partner_history=(self.config.method_variant != "history_rnn"),
-        )
+        if precomputed_base is None:
+            next_task, task, instant, base_logits, value = base_policy_step(
+                base_params,
+                state.task_carry,
+                observation,
+                start,
+                mask_partner_history=(self.config.method_variant != "history_rnn"),
+            )
+        else:
+            next_task, task, instant, base_logits, value = precomputed_base
         if not bool(compute_latent):
             lead = tuple(base_logits.shape[:-1])
             components = int(self.config.method.latent_components)
@@ -181,12 +186,29 @@ class DeltaModel:
         )
         del unused_response_target
         statistics = behavior_features(next_behavior)
-        decision = predict_decision(
-            latent_params, task, instant, next_behavior
-        )
-        expected_values = jnp.sum(
-            next_belief[..., :, None] * decision.means, axis=-2
-        )
+        if bool(execute_adaptation) and not bool(compute_decision):
+            raise ValueError("Deployment adaptation requires the decision emission.")
+        if bool(compute_decision):
+            decision = predict_decision(
+                latent_params, task, instant, next_behavior
+            )
+            expected_values = jnp.sum(
+                next_belief[..., :, None] * decision.means, axis=-2
+            )
+        else:
+            from .types import DecisionPrediction
+
+            lead = tuple(base_logits.shape[:-1])
+            components = int(self.config.method.latent_components)
+            decision = DecisionPrediction(
+                means=jnp.zeros(
+                    lead + (components, self.action_count), dtype=jnp.float32
+                ),
+                variances=jnp.ones(
+                    lead + (components, self.action_count), dtype=jnp.float32
+                ),
+            )
+            expected_values = jnp.zeros_like(base_logits, dtype=jnp.float32)
 
         zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
         active_voi = zero_action
@@ -284,14 +306,96 @@ class DeltaModel:
         episode_starts: Any,
         *,
         compute_latent: bool = True,
+        compute_decision: bool = True,
         execute_adaptation: bool = True,
     ) -> tuple[PolicyState, ModelOutput]:
         """Replay a time-major legal history under current parameters."""
 
         import jax
+        import jax.numpy as jnp
 
-        def one(state: PolicyState, values: tuple[Any, Any, Any]):
-            observation, previous_action, start = values
+        (
+            final_task_carry,
+            task_carries,
+            task_features,
+            instant,
+            base_logits,
+            value,
+        ) = base_policy_sequence(
+            base_params,
+            initial_state.task_carry,
+            observations,
+            episode_starts,
+            mask_partner_history=(self.config.method_variant != "history_rnn"),
+        )
+        if not bool(compute_latent):
+            lead = tuple(base_logits.shape[:-1])
+            components = int(self.config.method.latent_components)
+            ingredients = (int(self.observation_shape[-1]) - 27) // 4
+            factors = ingredients + 2
+            zero_component = jnp.zeros(lead + (components,), dtype=jnp.float32)
+            zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
+            response = ResponsePrediction(
+                visibility_logit=zero_component,
+                relative_position_logits=jnp.zeros(
+                    lead + (components, 25), dtype=jnp.float32
+                ),
+                direction_logits=jnp.zeros(
+                    lead + (components, 4), dtype=jnp.float32
+                ),
+                inventory_logits=jnp.zeros(
+                    lead + (components, factors, 2), dtype=jnp.float32
+                ),
+                inventory_change_logit=zero_component,
+            )
+            belief = jnp.broadcast_to(initial_state.belief, lead + (components,))
+            statistics = behavior_features(initial_state.behavior)
+            statistics = jnp.broadcast_to(
+                statistics, lead + (statistics.shape[-1],)
+            )
+            final_state = initial_state._replace(
+                task_carry=final_task_carry,
+                previous_observation=jnp.asarray(observations[-1], dtype=jnp.float32),
+                previous_action=jnp.asarray(previous_actions[-1], dtype=jnp.int32),
+                episode_start=jnp.asarray(episode_starts[-1], dtype=jnp.bool_),
+            )
+            return final_state, ModelOutput(
+                task_features=task_features,
+                instant_partner=instant,
+                base_policy_logits=base_logits,
+                policy_logits=base_logits,
+                value=value,
+                predictive_belief=belief,
+                belief=belief,
+                behavior_features=statistics,
+                response_prediction=response,
+                response_negative_log_likelihood=jnp.zeros(lead, dtype=jnp.float32),
+                component_decision_means=jnp.zeros(
+                    lead + (components, self.action_count), dtype=jnp.float32
+                ),
+                component_decision_variances=jnp.ones(
+                    lead + (components, self.action_count), dtype=jnp.float32
+                ),
+                expected_decision_values=zero_action,
+                active_voi=zero_action,
+                active_voi_raw=zero_action,
+                active_information_gain=zero_action,
+                active_voi_quadrature_error=zero_action,
+                adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
+                adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
+            )
+
+        def one(state: PolicyState, values: tuple[Any, ...]):
+            (
+                observation,
+                previous_action,
+                start,
+                next_task,
+                task,
+                current_instant,
+                current_logits,
+                current_value,
+            ) = values
             current = state._replace(
                 previous_action=previous_action,
                 episode_start=start,
@@ -302,13 +406,30 @@ class DeltaModel:
                 current,
                 observation,
                 compute_latent=compute_latent,
+                compute_decision=compute_decision,
                 execute_adaptation=execute_adaptation,
+                precomputed_base=(
+                    next_task,
+                    task,
+                    current_instant,
+                    current_logits,
+                    current_value,
+                ),
             )
 
         return jax.lax.scan(
             one,
             initial_state,
-            (observations, previous_actions, episode_starts),
+            (
+                observations,
+                previous_actions,
+                episode_starts,
+                task_carries,
+                task_features,
+                instant,
+                base_logits,
+                value,
+            ),
         )
 
 

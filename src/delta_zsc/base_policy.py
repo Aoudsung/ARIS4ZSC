@@ -53,7 +53,7 @@ def base_policy_step(
     episode_start: Any,
     *,
     mask_partner_history: bool,
-) -> tuple[Any, Any, Any, Any, Any]:
+) -> tuple[Any, Any, Any, Any, Any, Any]:
     import jax.numpy as jnp
 
     frame = (
@@ -85,4 +85,64 @@ def base_policy_step(
     return next_carry, task_features, instant, logits, value
 
 
-__all__ = ["base_policy_step", "init_base_params"]
+def base_policy_sequence(
+    params: dict[str, Any],
+    initial_task_carry: Any,
+    observations: Any,
+    episode_starts: Any,
+    *,
+    mask_partner_history: bool,
+) -> tuple[Any, Any, Any, Any, Any]:
+    """Evaluate a time-major base policy with only the GRU left in a scan.
+
+    The observation encoders and policy/value heads are stateless.  Evaluating
+    them over the complete ``time x lane`` array is mathematically identical
+    to calling :func:`base_policy_step` at every time, but turns hundreds of
+    tiny matrix multiplications into a handful of large ones.  Only the task
+    GRU has a genuine temporal dependency and therefore remains sequential.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    observation = jnp.asarray(observations, dtype=jnp.float32)
+    frame = (
+        task_only_observation(observation)
+        if bool(mask_partner_history)
+        else observation
+    )
+    task_flat = frame.reshape(frame.shape[:-3] + (-1,))
+    task_embeddings = layer_normalize(
+        mlp(params["task_encoder"], task_flat, final_activation=True)
+    )
+
+    partner = instantaneous_partner_observation(observation)
+    partner_flat = partner.reshape(partner.shape[:-3] + (-1,))
+    instant = layer_normalize(
+        mlp(params["instant_encoder"], partner_flat, final_activation=True)
+    )
+
+    def recurrent_step(carry: Any, values: tuple[Any, Any]):
+        embedding, episode_start = values
+        start = jnp.asarray(episode_start, dtype=jnp.bool_)
+        reset_carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
+        next_carry = gru_step(params["task_gru"], reset_carry, embedding)
+        return next_carry, next_carry
+
+    final_carry, task_carries = jax.lax.scan(
+        recurrent_step,
+        initial_task_carry,
+        (task_embeddings, episode_starts),
+    )
+    task_features = layer_normalize(task_carries)
+    hidden = mlp(
+        params["actor_trunk"],
+        jnp.concatenate((task_features, instant), axis=-1),
+        final_activation=True,
+    )
+    logits = linear(params["actor"], hidden)
+    value = linear(params["value"], hidden)[..., 0]
+    return final_carry, task_carries, task_features, instant, logits, value
+
+
+__all__ = ["base_policy_sequence", "base_policy_step", "init_base_params"]

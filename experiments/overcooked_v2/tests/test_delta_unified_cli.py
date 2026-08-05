@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from experiments.overcooked_v2.delta_zsc import _parser
 from src.delta_zsc.config import FORMAL_METHOD_LABEL, OFFICIAL_BASELINE_METHODS
@@ -97,3 +98,46 @@ def test_summarize_evaluations_cli_seed_defaults_to_zero() -> None:
         ]
     )
     assert args.seed == 0
+
+
+def test_development_matrix_launches_every_cell_in_a_fresh_process(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import experiments.overcooked_v2.development_matrix_app as matrix_app
+
+    commands: list[list[str]] = []
+
+    def fake_config(source, target, *, variant, component_count):
+        del source, variant, component_count
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fixture: true\n", encoding="utf-8")
+
+    def fake_subprocess(command, *, check):
+        assert check is True
+        commands.append(list(command))
+
+    monkeypatch.setattr(matrix_app, "_write_variant_config", fake_config)
+    monkeypatch.setattr(matrix_app.subprocess, "run", fake_subprocess)
+    monkeypatch.setattr(
+        matrix_app,
+        "read_json",
+        lambda unused: {"deployable_parameters": 1},
+    )
+    monkeypatch.setattr(matrix_app, "_validate_training_entries", lambda rows: None)
+    monkeypatch.setattr(matrix_app, "ensure_run_identity", lambda *args, **kwargs: None)
+    monkeypatch.setattr(matrix_app, "write_json", lambda *args, **kwargs: None)
+    matrix_app.run_development_matrix(
+        SimpleNamespace(
+            config=str(tmp_path / "source.yaml"),
+            partner_manifest=str(tmp_path / "manifest.json"),
+            output=str(tmp_path / "matrix"),
+            seed_index=list(range(5)),
+            resume=True,
+            require_cuda=True,
+            skip_manifest_file_check=True,
+        )
+    )
+    assert len(commands) == 55
+    assert all(command[1:4] == ["-m", "experiments.overcooked_v2.delta_zsc", "train"] for command in commands)
+    assert all("--resume" in command for command in commands)
+    assert all("--require-cuda" in command for command in commands)

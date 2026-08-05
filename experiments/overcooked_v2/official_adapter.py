@@ -1018,6 +1018,101 @@ class VectorEnvironment:
             },
         )
 
+    def step_training_fast_with_keys(
+        self, state: Any, joint_actions: Any, keys: Any
+    ) -> tuple[Any, Any, Any, Any, Mapping[str, Any]]:
+        """Training step without evaluation events or unconditional resets.
+
+        The transition keys and terminal transition are identical to
+        :meth:`step_with_keys`.  A batched reset is evaluated only when at
+        least one lane is done; per-lane selection still preserves exact
+        behavior if lanes ever terminate asynchronously.
+        """
+
+        import jax
+        import jax.numpy as jnp
+
+        split = jax.vmap(lambda item: jax.random.split(item, 2))(keys)
+        action_mapping = {
+            "agent_0": joint_actions[:, 0],
+            "agent_1": joint_actions[:, 1],
+        }
+        terminal_observations, terminal_state, rewards, dones, environment_info = (
+            jax.vmap(self.environment.step_env)(split[:, 0], state, action_mapping)
+        )
+        done = jnp.asarray(dones["__all__"], dtype=jnp.bool_)
+
+        def reset_if_needed(reset_keys: Any):
+            reset_observations, reset_state = jax.vmap(self.environment.reset)(
+                reset_keys
+            )
+            return (
+                _select_done(done, reset_observations, terminal_observations),
+                _select_done(done, reset_state, terminal_state),
+            )
+
+        def keep_terminal(unused_reset_keys: Any):
+            del unused_reset_keys
+            return terminal_observations, terminal_state
+
+        observations, next_state = jax.lax.cond(
+            jnp.any(done), reset_if_needed, keep_terminal, split[:, 1]
+        )
+        raw_by_agent = jnp.stack(
+            (rewards["agent_0"], rewards["agent_1"]), axis=-1
+        ).astype(jnp.float32)
+        shaped = environment_info.get("shaped_reward")
+        if not isinstance(shaped, Mapping):
+            raise RuntimeError(
+                "Locked OvercookedV2 environment did not return shaped_reward."
+            )
+        official_shaped_by_agent = jnp.stack(
+            (shaped["agent_0"], shaped["agent_1"]), axis=-1
+        ).astype(jnp.float32)
+        return (
+            next_state,
+            _stack_observations(observations),
+            jnp.asarray(rewards["agent_0"], dtype=jnp.float32),
+            done,
+            {
+                "terminal_observations": _stack_observations(
+                    terminal_observations
+                ),
+                "raw_rewards_by_agent": raw_by_agent,
+                "official_shaped_rewards_by_agent": official_shaped_by_agent,
+            },
+        )
+
+    def step_anchor_terminal_with_keys(
+        self, state: Any, joint_actions: Any, keys: Any
+    ) -> tuple[Any, Any, Any, Any, Mapping[str, Any]]:
+        """Terminal continuation step with no reset or evaluation diagnostics."""
+
+        import jax
+        import jax.numpy as jnp
+
+        # Preserve the registered CRN transition key: the legacy full step
+        # uses the first half of this split for ``step_env``.
+        split = jax.vmap(lambda item: jax.random.split(item, 2))(keys)
+        action_mapping = {
+            "agent_0": joint_actions[:, 0],
+            "agent_1": joint_actions[:, 1],
+        }
+        observations, next_state, rewards, dones, unused_info = jax.vmap(
+            self.environment.step_env
+        )(split[:, 0], state, action_mapping)
+        del unused_info
+        raw_by_agent = jnp.stack(
+            (rewards["agent_0"], rewards["agent_1"]), axis=-1
+        ).astype(jnp.float32)
+        return (
+            next_state,
+            _stack_observations(observations),
+            jnp.asarray(rewards["agent_0"], dtype=jnp.float32),
+            jnp.asarray(dones["__all__"], dtype=jnp.bool_),
+            {"raw_rewards_by_agent": raw_by_agent},
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class FrozenPartnerPool:

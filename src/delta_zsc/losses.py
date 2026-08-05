@@ -188,6 +188,7 @@ def latent_composite_loss(
         batch.previous_actions,
         batch.episode_starts,
         compute_latent=True,
+        compute_decision=False,
         execute_adaptation=False,
     )
     from .observation import extract_response_target

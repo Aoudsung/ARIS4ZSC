@@ -154,17 +154,21 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
     events: list[str] = []
 
     def fake_latent(**kwargs):
-        assert kwargs["base_params"] == "base-collection"
-        assert kwargs["latent_params"] == "latent-0"
+        assert float(kwargs["base_params"]) == 0.0
+        assert float(kwargs["latent_params"]) == 0.0
         events.append("latent")
-        return "latent-1", "latent-state-1", {"latent_update_applied": 1.0}
+        return jnp.asarray(1.0), jnp.asarray(1.0), {
+            "latent_update_applied": jnp.asarray(1.0)
+        }
 
     def fake_base(**kwargs):
         assert events == ["latent"]
-        assert kwargs["base_params"] == "base-collection"
-        assert kwargs["latent_params"] == "latent-1"
         events.append("ppo")
-        return "base-1", "base-state-1", {"base_update_applied": 1.0}
+        return (
+            kwargs["base_params"] + 1.0,
+            kwargs["optimizer_state"] + 1.0,
+            {"base_update_applied": jnp.asarray(1.0)},
+        )
 
     monkeypatch.setattr(training, "update_latent_model", fake_latent)
     monkeypatch.setattr(training, "update_base_policy", fake_base)
@@ -172,22 +176,17 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
 
     result = training.training_update(
         model=object(),
-        base_params="base-collection",
-        latent_params="latent-0",
-        base_optimizer_state="base-state-0",
-        latent_optimizer_state="latent-state-0",
+        base_params=jnp.asarray(0.0),
+        latent_params=jnp.asarray(0.0),
+        base_optimizer_state=jnp.asarray(0.0),
+        latent_optimizer_state=jnp.asarray(0.0),
         batch=object(),
         anchors=object(),
         schedule=jnp.zeros((1, 1, 1), dtype=jnp.int32),
         total_optimizer_steps=1,
     )
     assert events == ["latent", "ppo"]
-    assert result[:4] == (
-        "base-1",
-        "latent-1",
-        "base-state-1",
-        "latent-state-1",
-    )
+    assert tuple(float(value) for value in result[:4]) == (1.0, 1.0, 1.0, 1.0)
 
 def test_response_only_variant_never_uses_decision_anchor_channel() -> None:
     from src.delta_zsc.losses import latent_composite_loss
@@ -197,6 +196,139 @@ def test_response_only_variant_never_uses_decision_anchor_channel() -> None:
         model, latent, base, _batch(model, base, latent), _anchors()
     )
     assert float(result.metrics["latent_decision_observations"]) == 0.0
+
+
+def test_batched_base_policy_sequence_matches_step_replay() -> None:
+    """P1 batching leaves the registered recurrent policy calculation intact."""
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.base_policy import base_policy_sequence, base_policy_step
+    _, model, base, _ = _setup("base")
+    observations = jax.random.normal(
+        jax.random.PRNGKey(31), (7, 3, 5, 5, 39), dtype=jnp.float32
+    )
+    starts = jnp.asarray(
+        [
+            [True, True, True],
+            [False, False, False],
+            [False, True, False],
+            [False, False, False],
+            [True, False, False],
+            [False, False, True],
+            [False, False, False],
+        ],
+        dtype=jnp.bool_,
+    )
+    initial = model.initial_state(3).task_carry
+
+    def one(carry, values):
+        observation, episode_start = values
+        next_carry, task, instant, logits, value = base_policy_step(
+            base,
+            carry,
+            observation,
+            episode_start,
+            mask_partner_history=True,
+        )
+        return next_carry, (task, instant, logits, value)
+
+    reference_carry, reference = jax.lax.scan(
+        one, initial, (observations, starts)
+    )
+    actual = base_policy_sequence(
+        base,
+        initial,
+        observations,
+        starts,
+        mask_partner_history=True,
+    )
+    (
+        actual_carry,
+        unused_task_carries,
+        actual_task,
+        actual_instant,
+        actual_logits,
+        actual_value,
+    ) = actual
+    del unused_task_carries
+    for left, right in zip(
+        (actual_carry, actual_task, actual_instant, actual_logits, actual_value),
+        (reference_carry, *reference),
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(left), np.asarray(right), rtol=2.0e-5, atol=2.0e-5
+        )
+
+
+def test_batched_filter_sequence_matches_online_steps() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    _, model, base, latent = _setup("delta_active")
+    observations = jax.random.normal(
+        jax.random.PRNGKey(32), (5, 3, 5, 5, 39), dtype=jnp.float32
+    )
+    previous_actions = jax.random.randint(
+        jax.random.PRNGKey(33), (5, 3), 0, 6
+    )
+    starts = jnp.zeros((5, 3), dtype=jnp.bool_).at[0].set(True)
+    initial = model.initial_state(3)
+
+    def one(state, values):
+        observation, action, start = values
+        return model.step(
+            base,
+            latent,
+            state._replace(previous_action=action, episode_start=start),
+            observation,
+            compute_latent=True,
+            compute_decision=False,
+            execute_adaptation=False,
+        )
+
+    reference_state, reference = jax.lax.scan(
+        one, initial, (observations, previous_actions, starts)
+    )
+    actual_state, actual = model.sequence(
+        base,
+        latent,
+        initial,
+        observations,
+        previous_actions,
+        starts,
+        compute_latent=True,
+        compute_decision=False,
+        execute_adaptation=False,
+    )
+    for reference_leaf, actual_leaf in zip(
+        jax.tree_util.tree_leaves(reference_state),
+        jax.tree_util.tree_leaves(actual_state),
+        strict=True,
+    ):
+        np.testing.assert_allclose(
+            np.asarray(actual_leaf),
+            np.asarray(reference_leaf),
+            rtol=2.0e-5,
+            atol=2.0e-5,
+        )
+    for name in (
+        "task_features",
+        "instant_partner",
+        "base_policy_logits",
+        "value",
+        "belief",
+        "behavior_features",
+        "response_negative_log_likelihood",
+    ):
+        np.testing.assert_allclose(
+            np.asarray(getattr(actual, name)),
+            np.asarray(getattr(reference, name)),
+            rtol=2.0e-5,
+            atol=2.0e-5,
+        )
 
 
 def test_anchor_schema_contains_no_stale_posterior_or_comparator() -> None:

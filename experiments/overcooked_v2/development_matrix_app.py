@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -15,7 +17,6 @@ from src.delta_zsc.config import CONFIG_VERSION, METHOD_VERSION, RUN_BUDGETS
 from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
 
 from .evaluation_app import build_policy_manifest, run_evaluation
-from .training_app import run_training
 
 
 MAIN_VARIANTS = (
@@ -139,19 +140,33 @@ def run_development_matrix(args: argparse.Namespace) -> None:
             )
             for seed in seeds:
                 run = output / "runs" / f"k-{component_count}" / variant / f"seed-{seed}"
-                run_training(
-                    SimpleNamespace(
-                        config=str(config_path),
-                        partner_manifest=str(manifest),
-                        ego_run_id=f"delta-k{component_count}-{variant}-seed-{seed}",
-                        seed_index=seed,
-                        run_kind="development",
-                        output=str(run),
-                        resume=bool(args.resume),
-                        require_cuda=bool(args.require_cuda),
-                        skip_manifest_file_check=bool(args.skip_manifest_file_check),
-                    )
-                )
+                command = [
+                    sys.executable,
+                    "-m",
+                    "experiments.overcooked_v2.delta_zsc",
+                    "train",
+                    "--config",
+                    str(config_path),
+                    "--partner-manifest",
+                    str(manifest),
+                    "--ego-run-id",
+                    f"delta-k{component_count}-{variant}-seed-{seed}",
+                    "--seed-index",
+                    str(seed),
+                    "--run-kind",
+                    "development",
+                    "--output",
+                    str(run),
+                ]
+                if bool(args.resume):
+                    command.append("--resume")
+                if bool(args.require_cuda):
+                    command.append("--require-cuda")
+                if bool(args.skip_manifest_file_check):
+                    command.append("--skip-manifest-file-check")
+                # Each matrix cell owns one process so JAX executables, the GPU
+                # allocator, and compilation caches are released between runs.
+                subprocess.run(command, check=True)
                 ledger = read_json(run / "resource_ledger.json")
                 entries.append(
                     {

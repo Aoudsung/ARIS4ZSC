@@ -184,6 +184,103 @@ def test_mock_end_to_end_rollout_and_anchor_use_base_policy() -> None:
     assert bool(jnp.all(jnp.isfinite(anchors.measurement_covariances)))
 
 
+def test_sparse_anchor_rollout_matches_full_recording() -> None:
+    """P0 sparse capture preserves rollout data and the CRN anchor sample."""
+
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.overcooked_v2.training_app import _anchor_functions
+    from src.delta_zsc.anchors import collect_anchor_batch, make_anchor_batch_kernel
+    from src.delta_zsc.runner import (
+        collect_rollout,
+        initialize_runner,
+        make_anchor_snapshot_rollout_kernel,
+        make_compact_training_rollout_kernel,
+    )
+
+    config, model, base, latent = _model()
+    environment = MockEnvironment()
+    partner = _partner_functions()
+    runner = initialize_runner(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        random_key=jax.random.PRNGKey(40),
+    )
+    legacy_runner, legacy_batch, records = collect_rollout(
+        state=runner,
+        length=4,
+        environment=environment,
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        partner_functions=partner,
+        partner_parameters=None,
+        official_shaping_factor=0.25,
+        record_anchors=True,
+    )
+    compact = make_compact_training_rollout_kernel(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        partner_parameters=None,
+        length=4,
+    )
+    compact_runner, compact_batch, no_snapshots = compact(
+        runner, base, latent, jnp.asarray(0.25), jax.random.PRNGKey(0)
+    )
+    assert no_snapshots is None
+    assert _same_tree(legacy_runner, compact_runner)
+    assert _same_tree(legacy_batch, compact_batch)
+
+    anchor_key = jax.random.PRNGKey(41)
+    index_key, root_key = jax.random.split(anchor_key)
+    sparse = make_anchor_snapshot_rollout_kernel(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        partner_parameters=None,
+        length=4,
+        states_per_trigger=2,
+    )
+    sparse_runner, sparse_batch, snapshots = sparse(
+        runner, base, latent, jnp.asarray(0.25), index_key
+    )
+    assert _same_tree(legacy_runner, sparse_runner)
+    assert _same_tree(legacy_batch, sparse_batch)
+    functions = _anchor_functions(
+        model=model,
+        partner_functions=partner,
+        partner_parameters=None,
+        environment=environment,
+    )
+    legacy_anchors = collect_anchor_batch(
+        key=anchor_key,
+        records=records,
+        functions=functions,
+        base_params=base,
+        latent_params=latent,
+        states_per_trigger=2,
+        action_count=6,
+        fit_replicas=2,
+        evaluation_replicas=2,
+        horizon=2,
+        gamma=0.99,
+    )
+    sparse_anchor_kernel = make_anchor_batch_kernel(
+        functions=functions,
+        action_count=6,
+        fit_replicas=2,
+        evaluation_replicas=2,
+        horizon=2,
+    )
+    sparse_anchors = sparse_anchor_kernel(
+        root_key, snapshots, base, latent, jnp.asarray(0.99)
+    )
+    assert _same_tree(legacy_anchors, sparse_anchors)
+
+
 def _same_tree(left, right) -> bool:
     import jax
 

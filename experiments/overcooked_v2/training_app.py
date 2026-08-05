@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
 import time
@@ -10,7 +11,10 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from src.delta_zsc.anchors import AnchorFunctions, collect_anchor_batch
+from src.delta_zsc.anchors import (
+    AnchorFunctions,
+    make_anchor_batch_kernel,
+)
 from src.delta_zsc.config import (
     CHECKPOINT_SCHEMA_VERSION,
     METHOD_VERSION,
@@ -22,14 +26,21 @@ from src.delta_zsc.model import DeltaModel, observe_after_transition
 from src.delta_zsc.optimizer import init_adam
 from src.delta_zsc.partners import build_training_partner_pool, make_static_partner_functions
 from src.delta_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
-from src.delta_zsc.runner import collect_rollout, initialize_runner
+from src.delta_zsc.runner import (
+    initialize_runner,
+    make_anchor_snapshot_rollout_kernel,
+    make_compact_training_rollout_kernel,
+)
 from src.delta_zsc.storage import (
     ensure_run_identity,
     load_latest_checkpoint,
     save_checkpoint,
     write_json,
 )
-from src.delta_zsc.training import environment_minibatch_schedule, training_update
+from src.delta_zsc.training import (
+    environment_minibatch_schedule,
+    make_training_update_kernel,
+)
 from src.delta_zsc.types import TrainState
 
 from .deployment import export_deployment_bundle
@@ -43,17 +54,20 @@ def _training_key(seed_index: int) -> Any:
     return jax.random.split(jax.random.PRNGKey(42), 10)[int(seed_index)]
 
 
-def _write_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
+def _write_jsonl_batch(path: Path, payloads: list[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        for payload in payloads:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def _host(value: Any) -> Any:
+def _host_converted(value: Any) -> Any:
+    """Convert an already transferred JAX/NumPy tree to JSON values."""
+
     import jax
 
     def convert(item: Any) -> Any:
-        array = np.asarray(jax.device_get(item))
+        array = np.asarray(item)
         if array.ndim == 0:
             return array.item()
         return array.tolist()
@@ -171,7 +185,8 @@ def _anchor_functions(
             latent,
             state,
             observation,
-            compute_latent=True,
+            compute_latent=False,
+            compute_decision=False,
             execute_adaptation=False,
         )
         action = jax.vmap(lambda key, logits: jax.random.categorical(key, logits))(
@@ -204,23 +219,22 @@ def _anchor_functions(
         done: Any,
         next_observation: Any,
     ):
-        return partner_functions.observe(
-            partner_parameters,
-            state,
-            context,
-            observation,
-            action,
-            reward,
-            done,
-            next_observation,
-        )
+        # The frozen Official recurrent partner is already advanced by
+        # ``partner_step``.  Its observe hook only prepares the next episode's
+        # member/carry, which is unobservable after a terminal anchor branch.
+        del context, observation, action, reward, done, next_observation
+        return state
 
     return AnchorFunctions(
         ego_step=ego_step,
         ego_observe=ego_observe,
         partner_step=partner_step_fixed,
         partner_observe=partner_observe,
-        environment_step=environment.step_with_keys,
+        environment_step=getattr(
+            environment,
+            "step_anchor_terminal_with_keys",
+            environment.step_with_keys,
+        ),
     )
 
 
@@ -324,6 +338,185 @@ def _final_decision_audit(
         "anchor_count": int(chosen.shape[0]),
         "report_only": True,
     }
+
+
+def _make_non_anchor_block_kernel(
+    *,
+    rollout_kernel: Any,
+    update_kernel: Any,
+    loop_key: Any,
+    block_length: int,
+    rollout_steps: int,
+    shaping_horizon: int,
+    environment_count: int,
+    minibatches_per_epoch: int,
+    update_epochs: int,
+) -> Any:
+    """Compile consecutive ordinary updates into one device transaction."""
+
+    import jax
+    import jax.numpy as jnp
+
+    length = int(block_length)
+    if length <= 0:
+        raise ValueError("Training block length must be positive.")
+
+    @jax.jit
+    def kernel(
+        runner_state: Any,
+        base_params: Any,
+        latent_params: Any,
+        base_optimizer_state: Any,
+        latent_optimizer_state: Any,
+        start_update: Any,
+        start_environment_steps: Any,
+    ):
+        initial = (
+            runner_state,
+            base_params,
+            latent_params,
+            base_optimizer_state,
+            latent_optimizer_state,
+        )
+
+        def one(carry: Any, offset: Any):
+            runner, base, latent, base_optimizer, latent_optimizer = carry
+            update_index = jnp.asarray(start_update, dtype=jnp.int32) + offset
+            environment_steps = (
+                jnp.asarray(start_environment_steps, dtype=jnp.int32)
+                + offset * int(rollout_steps)
+            )
+            shaping = jnp.maximum(
+                1.0
+                - environment_steps.astype(jnp.float32)
+                / jnp.asarray(shaping_horizon, dtype=jnp.float32),
+                0.0,
+            )
+            runner, batch, unused_snapshots = rollout_kernel(
+                runner,
+                base,
+                latent,
+                shaping,
+                loop_key,
+            )
+            del unused_snapshots
+            schedule = environment_minibatch_schedule(
+                jax.random.fold_in(loop_key, update_index),
+                environment_count=environment_count,
+                minibatches_per_epoch=minibatches_per_epoch,
+                update_epochs=update_epochs,
+            )
+            (
+                base,
+                latent,
+                base_optimizer,
+                latent_optimizer,
+                metrics,
+            ) = update_kernel(
+                base,
+                latent,
+                base_optimizer,
+                latent_optimizer,
+                batch,
+                schedule,
+            )
+            return (
+                runner,
+                base,
+                latent,
+                base_optimizer,
+                latent_optimizer,
+            ), metrics
+
+        return jax.lax.scan(
+            one, initial, jnp.arange(length, dtype=jnp.int32)
+        )
+
+    return kernel
+
+
+def _make_anchor_update_kernel(
+    *,
+    rollout_kernel: Any,
+    anchor_kernel: Any,
+    update_kernel: Any,
+    loop_key: Any,
+    rollout_steps: int,
+    shaping_horizon: int,
+    environment_count: int,
+    minibatches_per_epoch: int,
+    update_epochs: int,
+    gamma: float,
+) -> Any:
+    """Compile snapshot rollout, CRN continuations, and update as one kernel."""
+
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def kernel(
+        runner_state: Any,
+        base_params: Any,
+        latent_params: Any,
+        base_optimizer_state: Any,
+        latent_optimizer_state: Any,
+        update_index: Any,
+        environment_steps: Any,
+    ):
+        shaping = jnp.maximum(
+            1.0
+            - jnp.asarray(environment_steps, dtype=jnp.float32)
+            / jnp.asarray(shaping_horizon, dtype=jnp.float32),
+            0.0,
+        )
+        anchor_key = jax.random.fold_in(
+            loop_key, 100_000 + jnp.asarray(update_index, dtype=jnp.int32)
+        )
+        index_key, root_key = jax.random.split(anchor_key)
+        runner, batch, snapshots = rollout_kernel(
+            runner_state,
+            base_params,
+            latent_params,
+            shaping,
+            index_key,
+        )
+        anchors = anchor_kernel(
+            root_key,
+            snapshots,
+            base_params,
+            latent_params,
+            jnp.asarray(gamma, dtype=jnp.float32),
+        )
+        schedule = environment_minibatch_schedule(
+            jax.random.fold_in(loop_key, update_index),
+            environment_count=environment_count,
+            minibatches_per_epoch=minibatches_per_epoch,
+            update_epochs=update_epochs,
+        )
+        (
+            base_params,
+            latent_params,
+            base_optimizer_state,
+            latent_optimizer_state,
+            metrics,
+        ) = update_kernel(
+            base_params,
+            latent_params,
+            base_optimizer_state,
+            latent_optimizer_state,
+            batch,
+            anchors,
+            schedule,
+        )
+        return (
+            runner,
+            base_params,
+            latent_params,
+            base_optimizer_state,
+            latent_optimizer_state,
+        ), metrics
+
+    return kernel
 
 
 def run_training(args: argparse.Namespace) -> None:
@@ -456,96 +649,263 @@ def run_training(args: argparse.Namespace) -> None:
         partner_parameters=partner_parameters,
         environment=environment,
     )
-    for update in range(int(np.asarray(state.update_count)), total_updates):
-        shaping_horizon = max(int(config.upstream.reward_shaping_horizon), 1)
-        shaping = max(
-            1.0
-            - int(np.asarray(state.effective_environment_steps)) / float(shaping_horizon),
-            0.0,
-        )
-        next_steps = int(np.asarray(state.effective_environment_steps)) + rollout_steps
-        anchor_trigger = bool(
-            config.anchors.enabled
-            and config.method_variant in {"delta_passive", "delta_active"}
-            and (
-                next_steps % int(config.anchors.interval_environment_steps) == 0
-                or (bool(getattr(args, "force_anchor", False)) and update == 0)
-            )
-        )
-        runner, batch, records = collect_rollout(
-            state=state.runner_state,
-            length=config.training.rollout_length,
+    compact_rollout_kernel = make_compact_training_rollout_kernel(
+        environment=environment,
+        model=model,
+        partner_functions=partner_functions,
+        partner_parameters=partner_parameters,
+        length=config.training.rollout_length,
+    )
+    host_update_count = int(np.asarray(state.update_count))
+    host_environment_steps = int(np.asarray(state.effective_environment_steps))
+    shaping_horizon = max(int(config.upstream.reward_shaping_horizon), 1)
+    checkpoint_updates = max(
+        int(config.training.checkpoint_interval_environment_steps) // rollout_steps,
+        1,
+    )
+    anchor_enabled = bool(
+        config.anchors.enabled
+        and config.method_variant in {"delta_passive", "delta_active"}
+    )
+    anchor_updates = (
+        int(config.anchors.interval_environment_steps) // rollout_steps
+        if anchor_enabled
+        else None
+    )
+    force_first_anchor = bool(getattr(args, "force_anchor", False))
+    total_optimizer_steps = (
+        (config.training.environment_steps // rollout_steps)
+        * config.training.minibatches_per_epoch
+        * config.ppo.update_epochs
+    )
+    no_anchor_update_kernel = make_training_update_kernel(
+        model=model,
+        total_optimizer_steps=total_optimizer_steps,
+        with_anchors=False,
+    )
+    anchor_update_kernel = None
+    anchor_steps_per_trigger = 0
+    if anchor_enabled:
+        anchor_rollout_kernel = make_anchor_snapshot_rollout_kernel(
             environment=environment,
             model=model,
-            base_params=state.base_params,
-            latent_params=state.latent_params,
             partner_functions=partner_functions,
             partner_parameters=partner_parameters,
-            official_shaping_factor=shaping,
-            record_anchors=anchor_trigger,
+            length=config.training.rollout_length,
+            states_per_trigger=config.anchors.states_per_trigger,
         )
-        anchors = None
-        if anchor_trigger:
-            anchors = collect_anchor_batch(
-                key=jax.random.fold_in(loop_key, 100_000 + update),
-                records=records,
-                functions=anchor_functions,
-                base_params=state.base_params,
-                latent_params=state.latent_params,
-                states_per_trigger=config.anchors.states_per_trigger,
-                action_count=OFFICIAL_ACTION_COUNT,
-                fit_replicas=config.anchors.fit_replicas,
-                evaluation_replicas=config.anchors.evaluation_replicas,
-                horizon=config.method.continuation_horizon,
-                gamma=config.ppo.gamma,
+        compiled_anchor_batch = make_anchor_batch_kernel(
+            functions=anchor_functions,
+            action_count=OFFICIAL_ACTION_COUNT,
+            fit_replicas=config.anchors.fit_replicas,
+            evaluation_replicas=config.anchors.evaluation_replicas,
+            horizon=config.method.continuation_horizon,
+        )
+        with_anchor_update_kernel = make_training_update_kernel(
+            model=model,
+            total_optimizer_steps=total_optimizer_steps,
+            with_anchors=True,
+        )
+        anchor_update_kernel = _make_anchor_update_kernel(
+            rollout_kernel=anchor_rollout_kernel,
+            anchor_kernel=compiled_anchor_batch,
+            update_kernel=with_anchor_update_kernel,
+            loop_key=loop_key,
+            rollout_steps=rollout_steps,
+            shaping_horizon=shaping_horizon,
+            environment_count=config.environment.num_envs,
+            minibatches_per_epoch=config.training.minibatches_per_epoch,
+            update_epochs=config.ppo.update_epochs,
+            gamma=config.ppo.gamma,
+        )
+        anchor_steps_per_trigger = (
+            config.anchors.states_per_trigger
+            * OFFICIAL_ACTION_COUNT
+            * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
+            * config.method.continuation_horizon
+        )
+
+    def is_anchor_update(update_index: int) -> bool:
+        return bool(
+            anchor_enabled
+            and (
+                (update_index + 1) % int(anchor_updates) == 0
+                or (force_first_anchor and update_index == 0)
             )
-        schedule = environment_minibatch_schedule(
-            jax.random.fold_in(loop_key, update),
+        )
+
+    # Plan every executable shape before the first training dispatch.  Normal
+    # development/formal runs need one cadence shape and at most one shorter
+    # final block.
+    planned_lengths: set[int] = set()
+    planned_cursor = host_update_count
+    while planned_cursor < total_updates:
+        if is_anchor_update(planned_cursor):
+            planned_cursor += 1
+            continue
+        next_checkpoint = (
+            (planned_cursor // checkpoint_updates) + 1
+        ) * checkpoint_updates
+        next_anchor = total_updates
+        if anchor_enabled:
+            candidate = planned_cursor
+            while candidate < total_updates and not is_anchor_update(candidate):
+                candidate += 1
+            next_anchor = candidate
+        planned_end = min(total_updates, next_checkpoint, next_anchor)
+        if planned_end <= planned_cursor:
+            raise AssertionError("Training block planner made no progress.")
+        planned_lengths.add(planned_end - planned_cursor)
+        planned_cursor = planned_end
+    block_kernels = {
+        length: _make_non_anchor_block_kernel(
+            rollout_kernel=compact_rollout_kernel,
+            update_kernel=no_anchor_update_kernel,
+            loop_key=loop_key,
+            block_length=length,
+            rollout_steps=rollout_steps,
+            shaping_horizon=shaping_horizon,
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
         )
-        (
-            base_params,
-            latent_params,
-            base_optimizer_state,
-            latent_optimizer_state,
-            metrics,
-        ) = training_update(
-            model=model,
-            base_params=state.base_params,
-            latent_params=state.latent_params,
-            base_optimizer_state=state.base_optimizer_state,
-            latent_optimizer_state=state.latent_optimizer_state,
-            batch=batch,
-            anchors=anchors,
-            schedule=schedule,
-            total_optimizer_steps=(
-                (config.training.environment_steps // rollout_steps)
-                * config.training.minibatches_per_epoch
-                * config.ppo.update_epochs
-            ),
-        )
-        if (
-            float(np.asarray(metrics["ppo"]["base_update_applied"])) < 1.0
-            or float(np.asarray(metrics["ppo"]["base_nonfinite_update"])) > 0.0
-            or float(np.asarray(metrics["latent"]["latent_nonfinite_update"])) > 0.0
+        for length in sorted(planned_lengths)
+    }
+
+    # Pending entries hold whole device blocks.  They are transferred together
+    # only at an anchor/checkpoint/log boundary.
+    pending_metrics: list[tuple[int, int, bool, Any]] = []
+    io_futures: list[Future[Any]] = []
+    io_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="delta-io")
+
+    def reap_io() -> None:
+        for future in tuple(io_futures):
+            if future.done():
+                future.result()
+                io_futures.remove(future)
+
+    def flush_boundary(*, checkpoint_step: int | None = None) -> None:
+        nonlocal pending_metrics
+        if not pending_metrics and checkpoint_step is None:
+            return
+        reap_io()
+        metric_trees = [entry[3] for entry in pending_metrics]
+        if checkpoint_step is None:
+            hosted_metrics = jax.device_get(metric_trees)
+            hosted_state = None
+        else:
+            hosted_metrics, hosted_state = jax.device_get((metric_trees, state))
+        payloads: list[Mapping[str, Any]] = []
+        failed = False
+        for (start, count, anchor_trigger, _), segment in zip(
+            pending_metrics, hosted_metrics, strict=True
         ):
+            for offset in range(count):
+                metrics = jax.tree_util.tree_map(
+                    lambda value: np.asarray(value)[offset], segment
+                )
+                converted = _host_converted(metrics)
+                update_number = start + offset + 1
+                environment_steps = update_number * rollout_steps
+                shaping = max(
+                    1.0
+                    - (environment_steps - rollout_steps) / float(shaping_horizon),
+                    0.0,
+                )
+                payloads.append(
+                    {
+                        "update": update_number,
+                        "environment_steps": environment_steps,
+                        "anchor_trigger": anchor_trigger,
+                        "official_shaping_factor": shaping,
+                        "metrics": converted,
+                    }
+                )
+                failed = failed or (
+                    float(converted["ppo"]["base_update_applied"]) < 1.0
+                    or float(converted["ppo"]["base_nonfinite_update"]) > 0.0
+                    or float(converted["latent"]["latent_nonfinite_update"]) > 0.0
+                )
+        pending_metrics = []
+        if payloads:
+            io_futures.append(
+                io_executor.submit(
+                    _write_jsonl_batch,
+                    output / "records" / "metrics.jsonl",
+                    payloads,
+                )
+            )
+        if checkpoint_step is not None:
+            io_futures.append(
+                io_executor.submit(
+                    save_checkpoint,
+                    output / "checkpoints",
+                    step=checkpoint_step,
+                    state=hosted_state,
+                    identity=checkpoint_identity,
+                )
+            )
+        if failed:
+            for future in io_futures:
+                future.result()
             raise FloatingPointError(
                 "A DELTA optimizer transaction produced NaN/Inf and was rolled back."
             )
 
-        anchor_steps = 0
-        if anchors is not None:
-            anchor_steps = (
-                config.anchors.states_per_trigger
-                * OFFICIAL_ACTION_COUNT
-                * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
-                * config.method.continuation_horizon
+    update = host_update_count
+    while update < total_updates:
+        if is_anchor_update(update):
+            assert anchor_update_kernel is not None
+            core, metrics = anchor_update_kernel(
+                state.runner_state,
+                state.base_params,
+                state.latent_params,
+                state.base_optimizer_state,
+                state.latent_optimizer_state,
+                update,
+                host_environment_steps,
             )
+            count = 1
+            anchor_trigger = True
+            anchor_cost = anchor_steps_per_trigger
+            metrics = jax.tree_util.tree_map(lambda value: value[None], metrics)
+        else:
+            next_checkpoint = (
+                (update // checkpoint_updates) + 1
+            ) * checkpoint_updates
+            next_anchor = total_updates
+            if anchor_enabled:
+                candidate = update
+                while candidate < total_updates and not is_anchor_update(candidate):
+                    candidate += 1
+                next_anchor = candidate
+            block_end = min(total_updates, next_checkpoint, next_anchor)
+            count = block_end - update
+            if count <= 0:
+                raise AssertionError("Training block execution made no progress.")
+            core, metrics = block_kernels[count](
+                state.runner_state,
+                state.base_params,
+                state.latent_params,
+                state.base_optimizer_state,
+                state.latent_optimizer_state,
+                update,
+                host_environment_steps,
+            )
+            anchor_trigger = False
+            anchor_cost = 0
+        (
+            runner,
+            base_params,
+            latent_params,
+            base_optimizer_state,
+            latent_optimizer_state,
+        ) = core
+        next_update = update + count
+        next_steps = host_environment_steps + count * rollout_steps
         ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
-            ego_policy_steps=rollout_steps,
-            anchor_continuation_steps=anchor_steps,
+            ego_policy_steps=count * rollout_steps,
+            anchor_continuation_steps=anchor_cost,
         )
         state = TrainState(
             base_params=base_params,
@@ -553,30 +913,25 @@ def run_training(args: argparse.Namespace) -> None:
             base_optimizer_state=base_optimizer_state,
             latent_optimizer_state=latent_optimizer_state,
             runner_state=runner,
-            update_count=jnp.asarray(update + 1, dtype=jnp.int32),
-            effective_environment_steps=jnp.asarray(next_steps, dtype=jnp.int32),
+            update_count=next_update,
+            effective_environment_steps=next_steps,
             resource_ledger=ledger.to_mapping(),
         )
-        _write_jsonl(
-            output / "records" / "metrics.jsonl",
-            {
-                "update": update + 1,
-                "environment_steps": next_steps,
-                "anchor_trigger": anchor_trigger,
-                "official_shaping_factor": shaping,
-                "metrics": _host(metrics),
-            },
-        )
-        if (
-            next_steps % config.training.checkpoint_interval_environment_steps == 0
+        pending_metrics.append((update, count, anchor_trigger, metrics))
+        update = next_update
+        host_environment_steps = next_steps
+        checkpoint_due = (
+            update % checkpoint_updates == 0
             and next_steps < config.training.environment_steps
-        ):
-            save_checkpoint(
-                output / "checkpoints",
-                step=next_steps,
-                state=state,
-                identity=checkpoint_identity,
+        )
+        if anchor_trigger or checkpoint_due:
+            flush_boundary(
+                checkpoint_step=next_steps if checkpoint_due else None
             )
+    flush_boundary()
+    for future in io_futures:
+        future.result()
+    io_executor.shutdown(wait=True)
     elapsed = time.perf_counter() - started
     ledger = ResourceLedger.from_mapping(state.resource_ledger).plus(
         training_wall_clock_hours=elapsed / 3600.0,
@@ -626,36 +981,24 @@ def run_training(args: argparse.Namespace) -> None:
         audit_complete = (
             int(existing_audit.get("environment_steps", -1)) == final_environment_steps
         )
-    if (
-        config.method_variant in {"delta_passive", "delta_active"}
-        and not audit_complete
-    ):
+    if anchor_enabled and not audit_complete:
         audit_started = time.perf_counter()
-        audit_runner, audit_batch, audit_records = collect_rollout(
-            state=state.runner_state,
-            length=config.training.rollout_length,
-            environment=environment,
-            model=model,
-            base_params=state.base_params,
-            latent_params=state.latent_params,
-            partner_functions=partner_functions,
-            partner_parameters=partner_parameters,
-            official_shaping_factor=0.0,
-            record_anchors=True,
+        audit_key = jax.random.fold_in(loop_key, 999_999)
+        audit_index_key, audit_root_key = jax.random.split(audit_key)
+        audit_runner, audit_batch, audit_snapshots = anchor_rollout_kernel(
+            state.runner_state,
+            state.base_params,
+            state.latent_params,
+            jnp.asarray(0.0, dtype=jnp.float32),
+            audit_index_key,
         )
         del audit_runner
-        audit_anchors = collect_anchor_batch(
-            key=jax.random.fold_in(loop_key, 999_999),
-            records=audit_records,
-            functions=anchor_functions,
-            base_params=state.base_params,
-            latent_params=state.latent_params,
-            states_per_trigger=config.anchors.states_per_trigger,
-            action_count=OFFICIAL_ACTION_COUNT,
-            fit_replicas=config.anchors.fit_replicas,
-            evaluation_replicas=config.anchors.evaluation_replicas,
-            horizon=config.method.continuation_horizon,
-            gamma=config.ppo.gamma,
+        audit_anchors = compiled_anchor_batch(
+            audit_root_key,
+            audit_snapshots,
+            state.base_params,
+            state.latent_params,
+            jnp.asarray(config.ppo.gamma, dtype=jnp.float32),
         )
         audit_steps = (
             config.environment.num_envs * config.training.rollout_length
@@ -747,5 +1090,3 @@ def run_cuda_preflight(args: argparse.Namespace) -> None:
             "resource_ledger": str(ledger),
         },
     )
-
-

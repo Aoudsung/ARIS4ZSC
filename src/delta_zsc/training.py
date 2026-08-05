@@ -213,24 +213,31 @@ def training_update(
         anchors=anchors,
     )
 
-    current_base = base_params
-    current_base_state = base_optimizer_state
-    ppo_metrics = []
     flat = jnp.asarray(schedule).reshape((-1, schedule.shape[-1]))
-    for index in range(int(flat.shape[0])):
-        current_base, current_base_state, metrics = update_base_policy(
+
+    def ppo_minibatch(carry: tuple[Any, Any], indexes: Any):
+        current_base, current_base_state = carry
+        next_base, next_base_state, metrics = update_base_policy(
             model=model,
             base_params=current_base,
             latent_params=current_latent,
             optimizer_state=current_base_state,
-            batch=slice_rollout_lanes(batch, flat[index]),
+            batch=slice_rollout_lanes(batch, indexes),
             total_optimizer_steps=total_optimizer_steps,
         )
-        ppo_metrics.append(metrics)
-    mean_ppo = {
-        name: jnp.mean(jnp.stack([jnp.asarray(row[name]) for row in ppo_metrics]))
-        for name in ppo_metrics[0]
-    }
+        return (next_base, next_base_state), metrics
+
+    # Keep the registered epoch/minibatch order exactly unchanged while
+    # lowering the whole sequence as one device program.  The previous Python
+    # loop dispatched one tiny four-lane GRU update per minibatch.
+    (current_base, current_base_state), ppo_metrics = jax.lax.scan(
+        ppo_minibatch,
+        (base_params, base_optimizer_state),
+        flat,
+    )
+    mean_ppo = jax.tree_util.tree_map(
+        lambda value: jnp.mean(jnp.asarray(value), axis=0), ppo_metrics
+    )
     return (
         current_base,
         current_latent,
@@ -240,8 +247,71 @@ def training_update(
     )
 
 
+def make_training_update_kernel(
+    *, model: Any, total_optimizer_steps: int, with_anchors: bool
+) -> Any:
+    """Create one stable compiled outer update for an anchor signature.
+
+    The PPO lane gathers and the complete optimizer-step sequence stay inside
+    this executable.  Separate no-anchor and with-anchor kernels avoid changing
+    PyTree signatures at runtime.
+    """
+
+    import jax
+
+    if bool(with_anchors):
+
+        @jax.jit
+        def kernel(
+            base_params: Any,
+            latent_params: Any,
+            base_optimizer_state: Any,
+            latent_optimizer_state: Any,
+            batch: RolloutBatch,
+            anchors: AnchorBatch,
+            schedule: Any,
+        ):
+            return training_update(
+                model=model,
+                base_params=base_params,
+                latent_params=latent_params,
+                base_optimizer_state=base_optimizer_state,
+                latent_optimizer_state=latent_optimizer_state,
+                batch=batch,
+                anchors=anchors,
+                schedule=schedule,
+                total_optimizer_steps=total_optimizer_steps,
+            )
+
+    else:
+
+        @jax.jit
+        def kernel(
+            base_params: Any,
+            latent_params: Any,
+            base_optimizer_state: Any,
+            latent_optimizer_state: Any,
+            batch: RolloutBatch,
+            schedule: Any,
+        ):
+            return training_update(
+                model=model,
+                base_params=base_params,
+                latent_params=latent_params,
+                base_optimizer_state=base_optimizer_state,
+                latent_optimizer_state=latent_optimizer_state,
+                batch=batch,
+                anchors=None,
+                schedule=schedule,
+                total_optimizer_steps=total_optimizer_steps,
+            )
+
+    return kernel
+
+
 __all__ = [
     "environment_minibatch_schedule",
+    "make_training_update_kernel",
     "ppo_learning_rate",
     "slice_rollout_lanes",
     "training_update",

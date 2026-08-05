@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple
 
-from .types import AnchorBatch
+from .types import AnchorBatch, AnchorSnapshots
 
 
 class AnchorWorld(NamedTuple):
@@ -159,7 +159,11 @@ def collect_all_action_continuations(
         )
         increment = jnp.where(
             active,
-            (float(gamma) ** jnp.asarray(step, dtype=jnp.float32)) * ego_reward,
+            (
+                jnp.asarray(gamma, dtype=jnp.float32)
+                ** jnp.asarray(step, dtype=jnp.float32)
+            )
+            * ego_reward,
             0.0,
         )
         return _select_active(active, candidate, branch), returns + increment
@@ -276,11 +280,118 @@ def collect_anchor_batch(
     )
 
 
+def collect_anchor_batch_from_snapshots(
+    *,
+    root_key: Any,
+    snapshots: AnchorSnapshots,
+    functions: AnchorFunctions,
+    base_params: Any,
+    latent_params: Any,
+    action_count: int,
+    fit_replicas: int,
+    evaluation_replicas: int,
+    horizon: int,
+    gamma: Any,
+) -> AnchorBatch:
+    """Collect CRN targets from already selected sparse rollout worlds."""
+
+    import jax
+    import jax.numpy as jnp
+
+    state_count = int(snapshots.time_indexes.shape[0])
+    world = AnchorWorld(
+        environment_state=snapshots.environment_state,
+        observations=snapshots.observations,
+        ego_state=snapshots.ego_state,
+        partner_state=snapshots.partner_state,
+        partner_episode_start=snapshots.partner_episode_start,
+        ego_roles=snapshots.ego_roles,
+        done=jnp.zeros((state_count,), dtype=jnp.bool_),
+    )
+    roots = jax.random.split(root_key, state_count)
+    fit, evaluation, fit_replica, evaluation_replica = (
+        collect_all_action_continuations(
+            world=world,
+            root_keys=roots,
+            functions=functions,
+            base_params=base_params,
+            latent_params=latent_params,
+            action_count=action_count,
+            fit_replicas=fit_replicas,
+            evaluation_replicas=evaluation_replicas,
+            horizon=horizon,
+            gamma=gamma,
+        )
+    )
+    from .decision_model import action_contrast_matrix
+
+    basis = action_contrast_matrix(action_count)
+    contrast_samples = jnp.einsum("nar,ad->nrd", fit_replica, basis)
+    centered_samples = contrast_samples - jnp.mean(
+        contrast_samples, axis=1, keepdims=True
+    )
+    sample_covariance = jnp.einsum(
+        "nrd,nre->nde", centered_samples, centered_samples
+    ) / float(fit_replicas - 1)
+    measurement_covariance = sample_covariance / float(fit_replicas)
+    return AnchorBatch(
+        time_indexes=snapshots.time_indexes,
+        lane_indexes=snapshots.lane_indexes,
+        fit_returns_by_action=fit,
+        evaluation_returns_by_action=evaluation,
+        measurement_covariances=(
+            measurement_covariance
+            + 1.0e-6 * jnp.eye(action_count - 1, dtype=jnp.float32)
+        ),
+        action_mask=jnp.ones_like(fit, dtype=jnp.bool_),
+        fit_replica_returns_by_action=fit_replica,
+        evaluation_replica_returns_by_action=evaluation_replica,
+    )
+
+
+def make_anchor_batch_kernel(
+    *,
+    functions: AnchorFunctions,
+    action_count: int,
+    fit_replicas: int,
+    evaluation_replicas: int,
+    horizon: int,
+) -> Callable[..., AnchorBatch]:
+    """Create the single fixed compiled anchor-continuation executable."""
+
+    import jax
+
+    @jax.jit
+    def kernel(
+        root_key: Any,
+        snapshots: AnchorSnapshots,
+        base_params: Any,
+        latent_params: Any,
+        gamma: Any,
+    ) -> AnchorBatch:
+        return collect_anchor_batch_from_snapshots(
+            root_key=root_key,
+            snapshots=snapshots,
+            functions=functions,
+            base_params=base_params,
+            latent_params=latent_params,
+            action_count=action_count,
+            fit_replicas=fit_replicas,
+            evaluation_replicas=evaluation_replicas,
+            horizon=horizon,
+            gamma=gamma,
+        )
+
+    return kernel
+
+
 __all__ = [
     "AnchorFunctions",
     "AnchorWorld",
     "collect_all_action_continuations",
     "collect_anchor_batch",
+    "collect_anchor_batch_from_snapshots",
     "gather_time_lane",
+    "make_anchor_batch_kernel",
     "select_anchor_indexes",
 ]

@@ -117,6 +117,19 @@ class AnchorBatch(NamedTuple):
     evaluation_replica_returns_by_action: Any
 
 
+class AnchorSnapshots(NamedTuple):
+    """The sparse pre-action worlds selected from an anchor rollout."""
+
+    time_indexes: Any
+    lane_indexes: Any
+    environment_state: Any
+    observations: Any
+    ego_state: Any
+    partner_state: Any
+    partner_episode_start: Any
+    ego_roles: Any
+
+
 class AdamState(NamedTuple):
     count: Any
     first_moment: Any
@@ -153,6 +166,7 @@ class LossResult(NamedTuple):
 __all__ = [
     "AdamState",
     "AnchorBatch",
+    "AnchorSnapshots",
     "BehaviorStatistics",
     "DecisionPrediction",
     "LossResult",
