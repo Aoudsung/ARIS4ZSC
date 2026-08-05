@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -36,6 +37,7 @@ def build_partner_manifest(args: Any) -> None:
     """Resolve checkpoint paths from a human-editable manifest plan."""
 
     plan = Path(args.plan).resolve()
+    target = Path(args.output).resolve()
     payload = read_json(plan)
     if not isinstance(payload, Mapping) or set(payload) != {"version", "layout", "runs"}:
         raise ValueError("Partner manifest plan top-level schema differs.")
@@ -51,9 +53,12 @@ def build_partner_manifest(args: Any) -> None:
         checkpoint = _resolve_checkpoint(raw["checkpoint"], plan=plan)
         if not checkpoint.exists():
             raise FileNotFoundError(checkpoint)
-        rows.append({**dict(raw), "checkpoint": str(checkpoint)})
+        # Store paths relative to the manifest.  A complete experiment tree can
+        # then be renamed or moved without leaving every checkpoint reference
+        # pointing at its former absolute location.
+        stored_checkpoint = os.path.relpath(checkpoint, start=target.parent)
+        rows.append({**dict(raw), "checkpoint": stored_checkpoint})
 
-    target = Path(args.output).resolve()
     write_json(
         target,
         {

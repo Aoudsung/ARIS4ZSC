@@ -10,6 +10,7 @@ import time
 from typing import Any, Mapping
 
 import numpy as np
+import yaml
 
 from src.delta_zsc.anchors import (
     AnchorFunctions,
@@ -90,6 +91,161 @@ def _same_parameters(left: Any, right: Any) -> bool:
     )
 
 
+def _parse_official_throughput(source: Path) -> Mapping[str, Any]:
+    """Load a completed single-GPU Official parent training record.
+
+    The pilot parent jobs predate ``ResourceLedger`` but saved their measured
+    wall time next to Hydra's frozen training config.  Treat that pair as one
+    auditable source: neither the configured budget nor an incomplete job is
+    allowed to masquerade as measured upstream cost.
+    """
+
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(
+        source.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "=" not in line:
+            raise ValueError(
+                f"Malformed Official throughput line {line_number}: {source}"
+            )
+        name, value = (part.strip() for part in line.split("=", 1))
+        if not name or not value or name in values:
+            raise ValueError(
+                f"Invalid Official throughput field on line {line_number}: {source}"
+            )
+        values[name] = value
+
+    required = {"status", "environment_steps", "wall_seconds"}
+    missing = required - set(values)
+    if missing:
+        raise ValueError(
+            f"Official throughput record lacks {sorted(missing)}: {source}"
+        )
+    if int(values["status"]) != 0:
+        raise ValueError(
+            f"Official parent training did not complete successfully: {source}"
+        )
+    steps = int(values["environment_steps"])
+    wall_seconds = float(values["wall_seconds"])
+    if steps <= 0 or wall_seconds <= 0.0 or not np.isfinite(wall_seconds):
+        raise ValueError(f"Official parent cost must be positive: {source}")
+
+    config_source = source.parent / "official_hydra" / ".hydra" / "config.yaml"
+    if not config_source.is_file():
+        raise FileNotFoundError(
+            f"Official throughput record has no matching Hydra config: {config_source}"
+        )
+    config_payload = yaml.safe_load(config_source.read_text(encoding="utf-8"))
+    if not isinstance(config_payload, Mapping):
+        raise ValueError(f"Official Hydra config is not a mapping: {config_source}")
+    model_payload = config_payload.get("model")
+    if (
+        not isinstance(model_payload, Mapping)
+        or model_payload.get("TOTAL_TIMESTEPS") is None
+    ):
+        raise ValueError(
+            f"Official Hydra config lacks model.TOTAL_TIMESTEPS: {config_source}"
+        )
+    configured_steps = int(round(float(model_payload["TOTAL_TIMESTEPS"])))
+    if configured_steps != steps:
+        raise ValueError(
+            "Official throughput/config step mismatch: "
+            f"measured={steps}, configured={configured_steps}, source={source}"
+        )
+    if int(config_payload.get("NUM_SEEDS", 0)) != 1:
+        raise ValueError(
+            f"Official parent cost record must describe one seed: {config_source}"
+        )
+    if config_payload.get("SEED") is None:
+        raise ValueError(f"Official Hydra config lacks SEED: {config_source}")
+
+    # Registered parent jobs are one-GPU jobs.  New launch scripts may record
+    # ``gpu_device_count`` explicitly; the legacy pilot format omitted it.
+    device_count = int(values.get("gpu_device_count", "1"))
+    if device_count != 1:
+        raise ValueError(f"Official parent cost must describe one GPU: {source}")
+    return {
+        "steps": steps,
+        "gpu_hours": wall_seconds / 3600.0,
+        "wall_clock_hours": wall_seconds / 3600.0,
+        "source": str(source),
+        "source_kind": "official_throughput",
+        "configured_seed": int(config_payload["SEED"]),
+        "gpu_device_count": device_count,
+    }
+
+
+def _resolve_upstream_parent_cost(checkpoint: Path) -> Mapping[str, Any] | None:
+    """Resolve explicit or legacy-Official cost evidence for one checkpoint."""
+
+    checkpoint = checkpoint.resolve()
+    directories = (checkpoint, *checkpoint.parents[:6])
+    for directory in directories:
+        for source in (
+            directory / "resource_ledger.json",
+            directory / "upstream_summary.json",
+        ):
+            if not source.is_file():
+                continue
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(payload, Mapping):
+                raise ValueError(f"Upstream resource source is not a mapping: {source}")
+            try:
+                registered = ResourceLedger.from_mapping(payload)
+            except (TypeError, ValueError):
+                registered = None
+            if registered is not None:
+                steps = int(registered.total_training_simulator_steps)
+                gpu_hours = float(registered.gpu_hours)
+                wall_clock_hours = float(registered.wall_clock_hours)
+                source_kind = "resource_ledger"
+            else:
+                steps = 0
+                for name in (
+                    "total_training_simulator_steps",
+                    "upstream_partner_steps",
+                    "effective_environment_steps",
+                    "actual_timesteps",
+                ):
+                    if payload.get(name) is not None and int(payload[name]) > 0:
+                        steps = int(payload[name])
+                        break
+                gpu_hours = float(
+                    payload.get("gpu_hours", payload.get("training_gpu_hours", 0.0))
+                )
+                wall_clock_hours = float(
+                    payload.get(
+                        "wall_clock_hours",
+                        payload.get("training_wall_clock_hours", 0.0),
+                    )
+                )
+                source_kind = "legacy_upstream_summary"
+            if steps <= 0:
+                raise ValueError(
+                    f"Upstream resource source has no positive step total: {source}"
+                )
+            return {
+                "steps": steps,
+                "gpu_hours": gpu_hours,
+                "wall_clock_hours": wall_clock_hours,
+                "source": str(source),
+                "source_kind": source_kind,
+            }
+
+    throughput = next(
+        (
+            directory / "throughput.txt"
+            for directory in directories
+            if (directory / "throughput.txt").is_file()
+        ),
+        None,
+    )
+    return None if throughput is None else _parse_official_throughput(throughput)
+
+
 def _upstream_partner_cost(
     members: tuple[Any, ...], *, formal: bool
 ) -> tuple[int, float, float, list[Mapping[str, Any]]]:
@@ -111,48 +267,19 @@ def _upstream_partner_cost(
             continue
         seen.add(parent)
         checkpoint = Path(member.checkpoint).resolve()
-        candidates: list[Path] = []
-        for directory in (checkpoint, *checkpoint.parents[:6]):
-            candidates.extend(
-                (directory / "resource_ledger.json", directory / "upstream_summary.json")
+        resolved = _resolve_upstream_parent_cost(checkpoint)
+        if resolved is None:
+            records.append(
+                {
+                    "parent_training_run_id": parent,
+                    "status": "missing",
+                    "checkpoint": str(checkpoint),
+                }
             )
-        source = next((value for value in candidates if value.is_file()), None)
-        steps = None
-        parent_gpu = 0.0
-        parent_wall = 0.0
-        if source is not None:
-            payload = json.loads(source.read_text(encoding="utf-8"))
-            if isinstance(payload, Mapping):
-                try:
-                    registered = ResourceLedger.from_mapping(payload)
-                except (TypeError, ValueError):
-                    registered = None
-                if registered is not None:
-                    steps = int(registered.total_training_simulator_steps)
-                    parent_gpu = float(registered.gpu_hours)
-                    parent_wall = float(registered.wall_clock_hours)
-                else:
-                    for name in (
-                        "total_training_simulator_steps",
-                        "upstream_partner_steps",
-                        "effective_environment_steps",
-                        "actual_timesteps",
-                    ):
-                        if payload.get(name) is not None and int(payload[name]) > 0:
-                            steps = int(payload[name])
-                            break
-                    parent_gpu = float(
-                        payload.get("gpu_hours", payload.get("training_gpu_hours", 0.0))
-                    )
-                    parent_wall = float(
-                        payload.get(
-                            "wall_clock_hours",
-                            payload.get("training_wall_clock_hours", 0.0),
-                        )
-                    )
-        if steps is None:
-            records.append({"parent_training_run_id": parent, "status": "missing"})
             continue
+        steps = int(resolved["steps"])
+        parent_gpu = float(resolved["gpu_hours"])
+        parent_wall = float(resolved["wall_clock_hours"])
         total += steps
         gpu_hours += parent_gpu
         wall_clock_hours += parent_wall
@@ -163,7 +290,7 @@ def _upstream_partner_cost(
                 "steps": steps,
                 "gpu_hours": parent_gpu,
                 "wall_clock_hours": parent_wall,
-                "source": str(source),
+                **dict(resolved),
             }
         )
     if formal and any(row["status"] != "counted" for row in records):
@@ -172,6 +299,25 @@ def _upstream_partner_cost(
             "training-support parent."
         )
     return total, gpu_hours, wall_clock_hours, records
+
+
+def _reconcile_upstream_resource_cost(
+    payload: Mapping[str, Any],
+    *,
+    steps: int,
+    gpu_hours: float,
+    wall_clock_hours: float,
+) -> Mapping[str, Any]:
+    """Replace shared parent cost after loading a legacy/resumed state."""
+
+    ledger = ResourceLedger.from_mapping(payload)
+    values = dict(ledger.to_mapping())
+    values.update(
+        upstream_partner_steps=int(steps),
+        shared_gpu_hours=float(gpu_hours),
+        shared_wall_clock_hours=float(wall_clock_hours),
+    )
+    return ResourceLedger.from_mapping(values).to_mapping()
 
 
 def _anchor_functions(
@@ -638,6 +784,14 @@ def run_training(args: argparse.Namespace) -> None:
         if restored is None:
             raise FileNotFoundError("--resume requested but no checkpoint exists.")
         _, state = restored
+        state = state._replace(
+            resource_ledger=_reconcile_upstream_resource_cost(
+                state.resource_ledger,
+                steps=upstream_steps,
+                gpu_hours=upstream_gpu_hours,
+                wall_clock_hours=upstream_wall_clock_hours,
+            )
+        )
     rollout_steps = config.environment.num_envs * config.training.rollout_length
     total_updates = config.training.environment_steps // rollout_steps
     maximum_updates = getattr(args, "maximum_updates", None)
