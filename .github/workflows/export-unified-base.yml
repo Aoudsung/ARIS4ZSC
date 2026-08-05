@@ -1,0 +1,32 @@
+name: export-unified-base
+
+on:
+  push:
+    branches: ["agent/delta-zsc-unified-import"]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/delta-zsc-unified
+          fetch-depth: 1
+      - name: Archive current target branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar --exclude=.git -cJf /tmp/delta-zsc-unified-base.tar.xz .
+          sha256sum /tmp/delta-zsc-unified-base.tar.xz > /tmp/delta-zsc-unified-base.tar.xz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: delta-zsc-unified-base-${{ github.run_id }}
+          path: |
+            /tmp/delta-zsc-unified-base.tar.xz
+            /tmp/delta-zsc-unified-base.tar.xz.sha256
+          if-no-files-found: error
+          retention-days: 1
