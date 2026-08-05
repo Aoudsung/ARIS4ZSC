@@ -59,6 +59,6 @@ promoted into a new primary claim after results are observed.
 
 A failed or missing run is not replaced by another seed. Root-cause reruns must
 use the same immutable identity. Exclusions require a pre-existing mechanical
-invalidity such as corrupted checkpoint, manifest-hash mismatch, non-finite
-state, or incomplete raw artifact; poor performance is never an exclusion
+invalidity such as an unreadable checkpoint, a manifest/lineage mismatch,
+non-finite state, or an incomplete raw artifact; poor performance is never an exclusion
 criterion.

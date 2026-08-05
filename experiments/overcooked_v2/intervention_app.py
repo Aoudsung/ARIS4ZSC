@@ -16,7 +16,7 @@ from src.delta_zsc.mirror_policy import mirror_policy_logits
 from src.delta_zsc.partners import make_static_partner_functions
 from src.delta_zsc.resources import ResourceLedger
 from src.delta_zsc.runner import collect_rollout, initialize_runner
-from src.delta_zsc.storage import ensure_run_identity, sha256_path, write_json
+from src.delta_zsc.storage import ensure_run_identity, write_json
 
 from .deployment import load_deployment
 
@@ -67,7 +67,7 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
     manifest = load_partner_manifest(
         manifest_path,
         expected_layout=config.environment.layout,
-        verify_files=not bool(args.skip_manifest_hash_check),
+        verify_files=not bool(args.skip_manifest_file_check),
     )
     runs = manifest.by_role("development_coverage") or manifest.by_role("confirmatory")
     if len(runs) < 2:
@@ -187,21 +187,14 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
 
     boot = _crossed_bootstrap(effects)
     output_dir = Path(args.output).resolve()
-    deployment_sources = [
-        {"path": str(path), "sha256": sha256_path(path)}
-        for path in deployment_paths
-    ]
+    deployment_sources = [{"path": str(path)} for path in deployment_paths]
     ensure_run_identity(
         output_dir,
         {
             "stage": "belief-value-intervention",
             "layout": config.environment.layout,
             "deployments": deployment_sources,
-            "partner_manifest": {
-                "path": str(manifest_path),
-                "sha256": sha256_path(manifest_path),
-            },
-            "config_fingerprint": config.fingerprint,
+            "partner_manifest": {"path": str(manifest_path)},
         },
     )
     elapsed = time.perf_counter() - started

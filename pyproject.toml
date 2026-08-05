@@ -21,7 +21,10 @@ dependencies = [
   "chex>=0.1.86",
   "flax==0.10.3",
   "optax==0.2.5",
-  "orbax-checkpoint>=0.5",
+  # Official commit 5ce1707 stores its config with the legacy
+  # flax.training.orbax_utils API.  Orbax 0.11 rejects the embedded PosixPath
+  # before writing any checkpoint, after training has already completed.
+  "orbax-checkpoint==0.5.20",
   "distrax>=0.1",
   "hydra-core>=1.3",
   "omegaconf>=2.3",

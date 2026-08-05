@@ -3,8 +3,8 @@
 `partner_manifest_plan.template.json` is a human-editable input to
 `build-partner-manifest`; it is not itself a scientific manifest. Replace every
 checkpoint placeholder with a real file or directory. The builder resolves
-paths, computes deterministic SHA-256 hashes, writes manifest schema v1, and
-immediately reloads it through the active lineage validator.
+paths, writes manifest schema v2, and immediately reloads it through the active
+lineage validator.
 
 ```bash
 python -m experiments.overcooked_v2.delta_zsc build-partner-manifest \

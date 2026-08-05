@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.delta_zsc.config import LAYOUTS, METHOD_VERSION
-from src.delta_zsc.storage import read_json, sha256_path, write_json
+from src.delta_zsc.storage import read_json, write_json
 
 
 def _layout_sources(values: list[str], *, label: str) -> dict[str, Path]:
@@ -26,7 +26,7 @@ def _layout_sources(values: list[str], *, label: str) -> dict[str, Path]:
 
 
 def _source(path: Path) -> Mapping[str, str]:
-    return {"path": str(path), "sha256": sha256_path(path)}
+    return {"path": str(path)}
 
 
 def build_formal_claim_report(args: argparse.Namespace) -> None:

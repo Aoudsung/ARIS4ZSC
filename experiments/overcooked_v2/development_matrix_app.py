@@ -12,7 +12,7 @@ import numpy as np
 import yaml
 
 from src.delta_zsc.config import CONFIG_VERSION, METHOD_VERSION, RUN_BUDGETS
-from src.delta_zsc.storage import ensure_run_identity, read_json, sha256_path, write_json
+from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
 
 from .evaluation_app import build_policy_manifest, run_evaluation
 from .training_app import run_training
@@ -149,10 +149,9 @@ def run_development_matrix(args: argparse.Namespace) -> None:
                         output=str(run),
                         resume=bool(args.resume),
                         require_cuda=bool(args.require_cuda),
-                        skip_manifest_hash_check=bool(args.skip_manifest_hash_check),
+                        skip_manifest_file_check=bool(args.skip_manifest_file_check),
                     )
                 )
-                identity = read_json(run / "run_identity.json")
                 ledger = read_json(run / "resource_ledger.json")
                 entries.append(
                     {
@@ -161,8 +160,7 @@ def run_development_matrix(args: argparse.Namespace) -> None:
                         "seed_index": seed,
                         "run": str(run),
                         "deployment": str(run / "final_deployment"),
-                        "config": {"path": str(config_path), "sha256": sha256_path(config_path)},
-                        "config_fingerprint": identity["config_fingerprint"],
+                        "config": {"path": str(config_path)},
                         "resource_ledger": ledger,
                     }
                 )
@@ -171,8 +169,8 @@ def run_development_matrix(args: argparse.Namespace) -> None:
         "version": 1,
         "artifact_type": "delta_development_matrix",
         "method": METHOD_VERSION,
-        "source_config": {"path": str(source), "sha256": sha256_path(source)},
-        "partner_manifest": {"path": str(manifest), "sha256": sha256_path(manifest)},
+        "source_config": {"path": str(source)},
+        "partner_manifest": {"path": str(manifest)},
         "seeds": list(seeds),
         "main_k4_variants": list(MAIN_VARIANTS),
         "k_sensitivity_variants": list(K_SENSITIVITY_VARIANTS),
@@ -230,7 +228,7 @@ def evaluate_development_matrix(args: argparse.Namespace) -> None:
                 policy_manifest=str(manifest_path),
                 partner_manifest=args.partner_manifest,
                 partner_role="development_coverage",
-                skip_manifest_hash_check=bool(args.skip_manifest_hash_check),
+                skip_manifest_file_check=bool(args.skip_manifest_file_check),
                 output=str(evaluation_dir),
             )
         )
@@ -239,7 +237,6 @@ def evaluate_development_matrix(args: argparse.Namespace) -> None:
                 "component_count": component_count,
                 "variant": variant,
                 "directory": str(evaluation_dir),
-                "sha256": sha256_path(evaluation_dir),
             }
         )
     write_json(
@@ -247,7 +244,7 @@ def evaluate_development_matrix(args: argparse.Namespace) -> None:
         {
             "version": 1,
             "artifact_type": "delta_development_evaluations",
-            "matrix": {"path": str(matrix_path), "sha256": sha256_path(matrix_path)},
+            "matrix": {"path": str(matrix_path)},
             "evaluations": evaluations,
         },
     )
@@ -256,8 +253,6 @@ def evaluate_development_matrix(args: argparse.Namespace) -> None:
 def _rows(path: Path) -> list[Mapping[str, Any]]:
     summary = read_json(path / "evaluation_summary.json")
     raw = Path(summary["raw"]["path"])
-    if sha256_path(raw) != summary["raw"]["sha256"]:
-        raise ValueError("Development raw evaluation hash differs.")
     return [json.loads(line) for line in raw.read_text(encoding="utf-8").splitlines() if line]
 
 
@@ -326,10 +321,7 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
                 for k in (2, 4, 8)
             },
             "sources": {
-                "evaluations": {
-                    "path": str(Path(args.evaluations).resolve()),
-                    "sha256": sha256_path(args.evaluations),
-                }
+                "evaluations": {"path": str(Path(args.evaluations).resolve())}
             },
         },
     )

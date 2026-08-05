@@ -28,4 +28,4 @@ registered cases distinguish decision value from mere identifiability:
 
 These are implementation acceptance artifacts, not benchmark results. The real
 Official/CUDA preflight requires the pinned Python 3.10 environment, a
-hash-bound partner manifest, real checkpoints, and a self-hosted GPU.
+lineage-bound partner manifest, real checkpoints, and a self-hosted GPU.

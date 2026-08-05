@@ -7,8 +7,8 @@ they are not additional scientific gates or reasons to delay end-to-end runs.
 ## 1. Final implementation acceptance
 
 Run the active compilation, six isolated test files, all six configuration
-loads, CLI smoke tests, hash-bound manifest validation, and one real CUDA
-mechanical update. Archive the validation report with the exact source hash.
+loads, CLI smoke tests, lineage-bound manifest validation, and one real CUDA
+mechanical update. Archive the validation report with the exact commit.
 
 ## 2. Paired development execution
 

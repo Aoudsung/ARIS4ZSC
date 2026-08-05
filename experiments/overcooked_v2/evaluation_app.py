@@ -10,16 +10,21 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from src.delta_zsc.config import METHOD_VERSION, load_config
+from src.delta_zsc.config import (
+    FORMAL_METHOD_LABEL,
+    METHOD_VERSION,
+    OFFICIAL_BASELINE_METHODS,
+    load_config,
+)
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.resources import ResourceLedger
-from src.delta_zsc.storage import ensure_run_identity, read_json, sha256_path, write_json
+from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
 
 from .deployment import load_deployment
 from .official_policy import OfficialDELTAPolicy
 
 
-POLICY_MANIFEST_VERSION = 1
+POLICY_MANIFEST_VERSION = 2
 EVALUATION_SCHEMA_VERSION = 1
 
 
@@ -57,7 +62,6 @@ def build_policy_manifest(args: argparse.Namespace) -> None:
                 "run_index": index,
                 "run_id": run_id,
                 "policy": str(path),
-                "policy_sha256": sha256_path(path),
                 "identity": identity,
             }
         )
@@ -111,10 +115,6 @@ def run_evaluation(args: argparse.Namespace) -> None:
         range(len(manifest_runs))
     ):
         raise ValueError("Policy manifest run indexes must be contiguous from zero.")
-    for row in manifest_runs:
-        policy_path = Path(str(row["policy"])).resolve()
-        if sha256_path(policy_path) != str(row["policy_sha256"]):
-            raise ValueError("Policy manifest checkpoint/deployment hash differs.")
     if config.run_kind == "formal" and len(manifest_runs) != config.evaluation.minimum_ego_runs:
         raise ValueError("Formal evaluation requires ten independent ego runs.")
 
@@ -122,7 +122,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
     partner_manifest = load_partner_manifest(
         partner_manifest_path,
         expected_layout=config.environment.layout,
-        verify_files=not bool(args.skip_manifest_hash_check),
+        verify_files=not bool(args.skip_manifest_file_check),
     )
     partners = partner_manifest.by_role(str(args.partner_role))
     if not partners:
@@ -192,12 +192,8 @@ def run_evaluation(args: argparse.Namespace) -> None:
         "stage": "official-evaluation",
         "layout": config.environment.layout,
         "method": policy_manifest["method"],
-        "config_fingerprint": config.fingerprint,
-        "policy_manifest": {"path": str(manifest_path), "sha256": sha256_path(manifest_path)},
-        "partner_manifest": {
-            "path": str(partner_manifest_path),
-            "sha256": sha256_path(partner_manifest_path),
-        },
+        "policy_manifest": {"path": str(manifest_path)},
+        "partner_manifest": {"path": str(partner_manifest_path)},
         "partner_role": str(args.partner_role),
     }
     ensure_run_identity(output, identity)
@@ -222,7 +218,7 @@ def run_evaluation(args: argparse.Namespace) -> None:
             "method": policy_manifest["method"],
             "mean_return": float(np.mean([row["raw_return"] for row in rows])),
             "episode_count": len(rows),
-            "raw": {"path": str(raw), "sha256": sha256_path(raw)},
+            "raw": {"path": str(raw)},
             "resource_ledger": ledger.to_mapping(),
         },
     )
@@ -294,8 +290,6 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
         ):
             raise ValueError("Evaluation summary label differs from its registered method.")
         raw = Path(summary["raw"]["path"])
-        if sha256_path(raw) != summary["raw"]["sha256"]:
-            raise ValueError("Raw evaluation hash differs.")
         rows = _read_jsonl(raw)
         if not rows or any(
             str(row.get("method")) != method
@@ -320,10 +314,14 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
                 "Evaluation run-index, partner, or layout nodes differ across methods."
             )
         matrices[method] = matrix
-        sources[method] = {"path": str(directory), "sha256": sha256_path(directory)}
-    if "delta-active" not in matrices:
-        raise ValueError("Summary requires delta-active.")
-    baseline_methods = sorted(name for name in matrices if name != "delta-active")
+        sources[method] = {"path": str(directory)}
+    if FORMAL_METHOD_LABEL not in matrices:
+        raise ValueError(f"Summary requires {FORMAL_METHOD_LABEL}.")
+    observed_baselines = {name for name in matrices if name != FORMAL_METHOD_LABEL}
+    baseline_methods = [
+        name for name in OFFICIAL_BASELINE_METHODS if name in observed_baselines
+    ]
+    baseline_methods.extend(sorted(observed_baselines - set(baseline_methods)))
     if not baseline_methods:
         raise ValueError("Official summary requires at least one same-protocol baseline.")
     strongest = max(
@@ -331,7 +329,7 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
     )
     contrasts = {
         name: _bootstrap_difference(
-            matrices["delta-active"],
+            matrices[FORMAL_METHOD_LABEL],
             matrices[name],
             replicates=int(args.bootstrap_replicates),
             seed=int(args.seed) + index,
@@ -360,6 +358,7 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
                 "intersection_union: every registered baseline contrast must have "
                 "one-sided LCB>0 and estimate>=20"
             ),
+            "bootstrap_seed": int(args.seed),
             "sources": sources,
         },
     )

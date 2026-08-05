@@ -15,10 +15,10 @@ from src.delta_zsc.config import (
 )
 from src.delta_zsc.losses import categorical_log_probability
 from src.delta_zsc.model import DeltaModel, observe_after_transition
-from src.delta_zsc.storage import pytree_fingerprint, sha256_path, write_json
+from src.delta_zsc.storage import write_json
 
 
-DEPLOYMENT_BUNDLE_VERSION = 1
+DEPLOYMENT_BUNDLE_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,11 +57,9 @@ def export_deployment_bundle(
             "ego_run_id": str(ego_run_id),
             "method_variant": config.method_variant,
             "config": config.to_mapping(),
-            "config_fingerprint": config.fingerprint,
             "observation_shape": [int(value) for value in observation_shape],
             "action_count": int(6),
-            "parameter_fingerprint": pytree_fingerprint(parameters),
-            "params_sha256": sha256_path(params_path),
+            "params": params_path.name,
             "source_training_run": str(Path(source_training_run).resolve()),
         },
     )
@@ -81,11 +79,9 @@ def load_deployment(directory: str | Path) -> Deployment:
         "ego_run_id",
         "method_variant",
         "config",
-        "config_fingerprint",
         "observation_shape",
         "action_count",
-        "parameter_fingerprint",
-        "params_sha256",
+        "params",
         "source_training_run",
     }
     if not isinstance(payload, dict) or set(payload) != required:
@@ -97,19 +93,13 @@ def load_deployment(directory: str | Path) -> Deployment:
     ):
         raise ValueError("Deployment method/schema identity differs.")
     config = run_config_from_mapping(payload["config"])
-    if config.fingerprint != payload["config_fingerprint"]:
-        raise ValueError("Deployment config fingerprint differs.")
     if config.method_variant != payload["method_variant"]:
         raise ValueError("Deployment method variant differs.")
-    params_path = root / "params.pkl"
-    if sha256_path(params_path) != payload["params_sha256"]:
-        raise ValueError("Deployment parameter file hash differs.")
+    params_path = root / str(payload["params"])
     with params_path.open("rb") as handle:
         parameters = pickle.load(handle)
     if set(parameters) != {"base_params", "latent_params"}:
         raise ValueError("Deployment parameter tree differs.")
-    if pytree_fingerprint(parameters) != payload["parameter_fingerprint"]:
-        raise ValueError("Deployment parameter fingerprint differs.")
     shape = tuple(int(value) for value in payload["observation_shape"])
     action_count = int(payload["action_count"])
     return Deployment(

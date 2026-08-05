@@ -1,12 +1,13 @@
-"""Deterministic identities, hashes, and dependency-light checkpoints."""
+"""Deterministic run identities and dependency-light checkpoints."""
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import pickle
 from typing import Any, Mapping
+
+from .config import CHECKPOINT_SCHEMA_VERSION
 
 
 def write_json(path: str | Path, payload: Any) -> Path:
@@ -21,37 +22,6 @@ def write_json(path: str | Path, payload: Any) -> Path:
 
 def read_json(path: str | Path) -> Any:
     return json.loads(Path(path).resolve().read_text(encoding="utf-8"))
-
-
-def sha256_path(path: str | Path) -> str:
-    source = Path(path).resolve()
-    digest = hashlib.sha256()
-    if source.is_file():
-        with source.open("rb") as handle:
-            while block := handle.read(1024 * 1024):
-                digest.update(block)
-        return digest.hexdigest()
-    if not source.is_dir():
-        raise FileNotFoundError(source)
-    for child in sorted(item for item in source.rglob("*") if item.is_file()):
-        digest.update(str(child.relative_to(source)).encode("utf-8"))
-        with child.open("rb") as handle:
-            while block := handle.read(1024 * 1024):
-                digest.update(block)
-    return digest.hexdigest()
-
-
-def pytree_fingerprint(tree: Any) -> str:
-    import jax
-    import numpy as np
-
-    digest = hashlib.sha256()
-    for leaf in jax.tree_util.tree_leaves(tree):
-        value = np.asarray(jax.device_get(leaf))
-        digest.update(str(value.dtype).encode("utf-8"))
-        digest.update(str(value.shape).encode("utf-8"))
-        digest.update(value.tobytes(order="C"))
-    return digest.hexdigest()
 
 
 def ensure_run_identity(directory: str | Path, identity: Mapping[str, Any]) -> Path:
@@ -82,10 +52,9 @@ def save_checkpoint(
         pickle.dump(state, handle, protocol=pickle.HIGHEST_PROTOCOL)
     temporary.replace(target)
     descriptor = {
-        "version": 1,
+        "version": CHECKPOINT_SCHEMA_VERSION,
         "step": int(step),
         "checkpoint": target.name,
-        "checkpoint_sha256": sha256_path(target),
         "identity": json.loads(json.dumps(identity, sort_keys=True, default=str)),
     }
     write_json(root / "latest.json", descriptor)
@@ -102,15 +71,17 @@ def load_latest_checkpoint(
     if not latest.is_file():
         return None
     descriptor = read_json(latest)
-    required = {"version", "step", "checkpoint", "checkpoint_sha256", "identity"}
+    required = {"version", "step", "checkpoint", "identity"}
     if not isinstance(descriptor, Mapping) or set(descriptor) != required:
         raise ValueError("Checkpoint descriptor schema differs.")
+    if int(descriptor["version"]) != CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Checkpoint descriptor version must be {CHECKPOINT_SCHEMA_VERSION}."
+        )
     expected = json.loads(json.dumps(expected_identity, sort_keys=True, default=str))
     if descriptor["identity"] != expected:
         raise ValueError("Checkpoint identity differs from the requested run.")
     checkpoint = root / str(descriptor["checkpoint"])
-    if sha256_path(checkpoint) != descriptor["checkpoint_sha256"]:
-        raise ValueError("Checkpoint hash differs from its descriptor.")
     with checkpoint.open("rb") as handle:
         state = pickle.load(handle)
     return int(descriptor["step"]), state
@@ -119,9 +90,7 @@ def load_latest_checkpoint(
 __all__ = [
     "ensure_run_identity",
     "load_latest_checkpoint",
-    "pytree_fingerprint",
     "read_json",
     "save_checkpoint",
-    "sha256_path",
     "write_json",
 ]

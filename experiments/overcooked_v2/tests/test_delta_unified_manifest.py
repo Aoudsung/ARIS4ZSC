@@ -23,10 +23,9 @@ def _row(checkpoint: str, *, run_id: str, role: str, parent: str, mechanism: str
     }
 
 
-def test_manifest_builder_hashes_and_reloads_lineage(tmp_path: Path) -> None:
+def test_manifest_builder_resolves_and_reloads_lineage(tmp_path: Path) -> None:
     from experiments.overcooked_v2.delta_manifest_app import build_partner_manifest
     from src.delta_zsc.manifest import load_partner_manifest
-    from src.delta_zsc.storage import sha256_path
 
     support = tmp_path / "support.ckpt"
     calibration = tmp_path / "calibration.ckpt"
@@ -38,7 +37,7 @@ def test_manifest_builder_hashes_and_reloads_lineage(tmp_path: Path) -> None:
     plan.write_text(
         json.dumps(
             {
-                "version": 1,
+                "version": 2,
                 "layout": "test_time_simple",
                 "runs": [
                     _row(
@@ -79,4 +78,4 @@ def test_manifest_builder_hashes_and_reloads_lineage(tmp_path: Path) -> None:
         output, expected_layout="test_time_simple", verify_files=True
     )
     assert len(manifest.runs) == 3
-    assert manifest.runs[0].checkpoint_sha256 == sha256_path(support)
+    assert manifest.runs[0].checkpoint == support.resolve()
