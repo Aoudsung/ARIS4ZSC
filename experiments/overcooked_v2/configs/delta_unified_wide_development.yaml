@@ -1,0 +1,56 @@
+version: 1
+
+environment:
+  layout: test_time_wide
+  agent_view_size: 2
+  episode_steps: 400
+  indicate_successful_delivery: true
+  negative_rewards: true
+  random_agent_positions: true
+  sample_recipe_on_delivery: true
+
+method:
+  latent_components: 4
+  continuation_horizon: 128
+  adaptation_kl_budget: 0.04
+
+architecture:
+  task_hidden_dim: 128
+  instant_partner_dim: 32
+  latent_hidden_dim: 64
+  response_hidden_dim: 128
+  action_embedding_dim: 16
+
+ppo:
+  learning_rate: 0.00025
+  update_epochs: 4
+  minibatches: 8
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  value_weight: 0.5
+  entropy_weight: 0.01
+  gradient_clip_norm: 0.25
+  adam_epsilon: 0.00001
+  normalize_advantages: true
+
+latent_optimizer:
+  learning_rate: 0.00025
+  gradient_clip_norm: 0.25
+  adam_epsilon: 0.00001
+  updates_per_rollout: 1
+
+data:
+  num_envs: 32
+  rollout_length: 128
+  total_environment_steps: 1048576
+  anchor_interval_updates: 16
+  anchor_states: 8
+  fit_replicas: 4
+  evaluation_replicas: 4
+
+evaluation:
+  episodes_per_pairing: 100
+  evaluate_both_roles: true
+  bootstrap_replicates: 4999
+  minimum_effect: 20.0

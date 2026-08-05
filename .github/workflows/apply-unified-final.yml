@@ -1,0 +1,79 @@
+name: apply-unified-final
+
+on:
+  push:
+    branches: ["agent/delta-zsc-unified"]
+    paths:
+      - ".github/payloads/DELTA_UNIFIED_READY"
+
+permissions:
+  contents: write
+
+jobs:
+  reconstruct-validate-and-publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      JAX_PLATFORM_NAME: cpu
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/delta-zsc-unified
+          fetch-depth: 0
+
+      - name: Reconstruct exact release tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/delta-unified/tree
+          cat .github/payloads/release.tar.gz.b64.part-* \
+            | base64 --decode > /tmp/delta-unified/release.tar.gz
+          echo "1032ce25d0858fb123e18998f0f669de497352eedb436f70683818c849d50a2a  /tmp/delta-unified/release.tar.gz" \
+            | sha256sum -c -
+          tar -xzf /tmp/delta-unified/release.tar.gz \
+            -C /tmp/delta-unified/tree
+          cd /tmp/delta-unified/tree
+          sha256sum -c MANIFEST.sha256
+          cd "${GITHUB_WORKSPACE}"
+          rsync -a --delete \
+            --exclude='.git/' \
+            --filter='protect .git/' \
+            /tmp/delta-unified/tree/ "${GITHUB_WORKSPACE}/"
+
+      - name: Install and validate final source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+          python -m compileall -q src experiments tests scripts
+          python scripts/validate_static.py
+          pytest -q
+          DELTA_ZSC_REPO_ROOT="$PWD" python tests/helpers/model_variant_smoke.py
+          DELTA_ZSC_REPO_ROOT="$PWD" python tests/helpers/training_anchor_smoke.py
+          python -m experiments.overcooked_v2.delta_zsc \
+            audit-voi --output /tmp/delta-unified/voi-audit.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          evidence = json.loads(Path('/tmp/delta-unified/voi-audit.json').read_text())
+          if evidence.get('version') != 2 or not evidence.get('passed'):
+              raise SystemExit('VOI audit did not pass the release-v2 contract.')
+          PY
+
+      - name: Commit exact final repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Aoudsung"
+          git config user.email "50046955+Aoudsung@users.noreply.github.com"
+          git add -A
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Exact final repository already present."
+            exit 0
+          fi
+          git commit -m "Finalize unified DELTA-ZSC Bayesian VOI repository"
+          git push origin HEAD:agent/delta-zsc-unified

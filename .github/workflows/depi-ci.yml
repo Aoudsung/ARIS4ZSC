@@ -1,0 +1,22 @@
+name: depi-ci
+
+on:
+  # The original DEPI branch retains its historical workflow in its own ref.
+  # On the unified branch this compatibility check exists only to make the
+  # retirement explicit and to keep any legacy required-check name resolved.
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm DEPI is retired from the active method
+        run: |
+          test -d src/delta_zsc
+          test -f docs/MIGRATION_TO_UNIFIED_DELTA.md
+          test -f .github/workflows/delta-unified-ci.yml
+          echo "Legacy DEPI tests are intentionally non-authoritative on agent/delta-zsc-unified."
+          echo "The active scientific and engineering checks are provided by delta-unified-ci."

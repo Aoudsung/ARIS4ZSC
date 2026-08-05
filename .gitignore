@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+/SSH_Document.md
 /.claude/settings.local.json
 .pytest_cache/
 .mypy_cache/
@@ -14,6 +15,8 @@ reports/
 runs/
 results/
 *.egg-info/
+/build/
+/dist/
 *.pt
 *.pth
 *.ckpt
@@ -28,4 +31,15 @@ CLAUDE.md
 .aris/
 .claude/
 literature/
-idea-stage/
+/idea-stage/*
+!/idea-stage/refine-logs/
+/idea-stage/refine-logs/*
+!/idea-stage/refine-logs/PATH_C_PROPOSAL.md
+!/idea-stage/refine-logs/PATH_C_THEORY.md
+!/idea-stage/refine-logs/PATH_C_MODULE_DESIGN.md
+!/idea-stage/refine-logs/PATH_C_EXECUTION_PLAN.md
+!/idea-stage/refine-logs/PATH_C_PREREGISTRATION.md
+!/idea-stage/refine-logs/PATH_C_OPPORTUNITY_AUDIT_SPEC.md
+!/idea-stage/refine-logs/R015_RETURN_BOUND_DERIVATION.md
+!/idea-stage/refine-logs/EXPERIMENT_PLAN.md
+!/idea-stage/refine-logs/EXPERIMENT_TRACKER.md
