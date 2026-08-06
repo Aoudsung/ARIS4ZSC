@@ -1,121 +1,122 @@
-# Final DELTA-ZSC revision summary
+# DELTA-ZSC v4 revision summary
 
-## Artifact identity
+## Active identity
 
-- Source reconstruction base: `149f588d733be48722eea3bff844922f1ed885cc`
-- Active method: `delta_joint_geometry_interface_decision_exact_voi_v3`
-- Active namespace: `src/delta_zsc/`
-- Active CLI: `python -m experiments.overcooked_v2.delta_zsc`
-- Official benchmark source: `5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`
+- Upstream source: `Aoudsung/ARIS4ZSC`, branch `zsc_v8`, commit
+  `15e90b1be0d50ef99df0fa5837312d70fa913643`.
+- Local source-archive baseline: `018dd8202abd06e2a685872406c8d4a6e1804e69`.
+- Active method:
+  `delta_episode_static_centered_residual_delayed_exact_voi_v4`.
+- Configuration schema: 3.
+- Checkpoint/deployment schema: 4.
+- Partner-manifest schema: 2.
+- Package version: `0.6.0`.
+- Active namespace: `src/delta_zsc/`.
+- Active CLI: `python -m experiments.overcooked_v2.delta_zsc`.
+- Official benchmark source: `5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`.
 
-Configuration schema 2 and checkpoint schema 3 make every earlier DELTA
-checkpoint, optimizer and replay artifact incompatible. Partner manifest
-schema 2 is unchanged, so existing Official SP/OP parent assets remain usable.
+v4 DELTA checkpoints, optimizer state, semantic-initializer artifacts and
+deployment bundles are incompatible with v3. Existing Official SP/OP parent
+checkpoints and manifest-v2 lineage records remain usable.
 
-This revision replaces the active DEPI v8 patch chain rather than adding another
-layer to it. The complete retired implementation remains available under
-`legacy/implementation_v8/`, but cannot be imported by package discovery or the
-active experiment applications.
+## Root cause closed by the implementation
 
-## Root-cause closure
+The v3 failure was not an observation-index failure. The aligned interface
+target contained convention information, but the model learned a pooled
+response instead of partner-semantic components. A physical-time transition
+then either erased sparse evidence or, when made sticky, accumulated a
+partner-independent likelihood bias. Immediate one-step response also lacked a
+causal teammate reaction to the current probe.
 
-| Previously observed root cause | Final correction |
-|---|---|
-| Eight slots behaved as eight value estimators, not eight coordination modes | A single exchangeable categorical latent state jointly parameterizes one response emission and one decision emission. Components have no separate actors or critics. |
-| Value targets were derived from the model's own target-network Q values | Sparse labels are real simulator returns from all-action common-random-number continuations. |
-| Response prediction could change a posterior without changing useful action ordering | Response and CRN action-return contrasts are two measurement channels of the same latent component. The latent score is decision-relevant by construction. |
-| PPO, response, critic, comparator, and actor objectives shared parameters and Adam moments | `base_params` and `latent_params` have disjoint trees, optimizers, objectives, and static replay paths. |
-| Auxiliary adaptation actor and entropy dynamics could collapse the executed policy | Task competence is learned only by base PPO. Adaptation is the analytic solution of a KL-constrained mirror-improvement problem. |
-| Training labels and replay features could refer to different continuation policies | Each outer update commits the latent transaction against the exact collection-time base tree before any PPO minibatch changes that tree. |
-| Fixed scripts did not pressure a general partner-conditional function | Training support is a manifest-bound, mechanism/family/stage/run-stratified population of independent SP/OP parents and progress checkpoints; calibration and confirmatory lineages are disjoint. |
-| Earlier "active" terms were entropy or cross-likelihood proxies | Active DELTA integrates complete learned response outcomes, performs an all-component likelihood calculation and exact Bayes update for every outcome, and values the posterior through latent-conditioned task returns. |
-| Old proposal, implementation, evaluation and documentation described different methods | One versioned configuration authority, one active namespace, one CLI, one deployment schema, and one authoritative document index now define the method. |
+v4 changes the estimand and parameterization rather than adding an anti-collapse
+penalty:
 
-## Exact compact VOI v3
+1. the latent is constant inside an episode and resets only at a true boundary;
+2. high-frequency occurrence factors are shared and cannot alter component
+   responsibilities;
+3. only conditional semantic factors produce Bayes likelihood ratios;
+4. response and decision emissions are pooled baselines plus K-centered
+   residuals with direct embedding skips and standard fan-in residual
+   initialization;
+5. the event residual is initialized by an unlabeled, lineage-bound
+   spectral-simplex artifact;
+6. shared response, semantic response and decision channels are separately
+   mean-normalized with fixed coefficient one;
+7. active information is delayed until the teammate has had one reaction step;
+8. successor decision values are conditioned on the probe and evaluated at
+   t+2 after one base-policy bridge;
+9. the active controller uses an exact 66-outcome finite Bayesian value and a
+   two-step discount.
 
-For current response posterior `b_t` and candidate probe action `a`, the
-implementation:
+No partner identity, SP/OP label, component-separation loss, entropy gate,
+component-specific actor, or component-specific critic is introduced.
 
-1. predicts the next component prior `b_bar = b_t T`;
-2. sums source components exactly;
-3. retains complete direct geometry and aligned interface/recipe evidence for
-   passive filtering;
-4. exactly enumerates the 66 outcomes of the compact active response marginal;
-5. scores every compact outcome under every latent component;
-7. performs a normalized categorical Bayes update;
-8. evaluates the posterior-optimal latent-conditioned action value;
-9. subtracts the prior-optimal value;
-10. reports exact VOI, expected information gain, minimum VOI, and the negative
-    floating-point fraction.
-
-The control path adds `gamma * VOI` without a clamp and then solves the
-registered KL-constrained mirror update. Information gain is diagnostic only.
-
-The public VOI API accepts either a shared `[..., K, A]` decision matrix or a
-probe-conditioned `[..., P, K, A]` matrix. The registered OvercookedV2 model
-uses the shared matrix as an explicitly bounded one-response local-stationarity
-surrogate; it does not claim exact long-horizon Bayes-adaptive planning.
-
-## Training boundary
-
-One outer update is an alternating estimator transaction:
+## Final method path
 
 ```text
-collect D_n and CRN anchors C_n with base parameters omega_n
-    -> update latent parameters Theta_n using stopgrad(omega_n), D_n, C_n
-    -> update omega_n with on-policy PPO minibatches from D_n
+legal immediate response
+    -> shared occurrence score (prediction only)
+    -> component-semantic likelihood
+    -> episode-static posterior
+    -> current shared decision baseline + centered component residual
+    -> passive KL mirror update
+
+candidate probe at t
+    -> collection-time base bridge at t+1
+    -> delayed response o[t+1] -> o[t+2]
+    -> exact 66-outcome Bayes update
+    -> probe-conditioned t+2 all-action value
+    -> gamma^2 VOI
+    -> active KL mirror update
 ```
 
-PPO replay uses `compute_latent=False, execute_adaptation=False`. Latent replay
-and anchor continuation use `compute_latent=True,
-execute_adaptation=False`. Frozen deployment uses both flags. These are static
-code paths, not learned gates or research-stage blockers.
+The active probe commits exactly one base bridge before a new posterior-dependent
+action can be taken. The CRN estimator uses the same timing and excludes probe
+and bridge rewards from the successor target.
 
-## Final active code boundary
+## Optimization contract
+
+One outer transaction is:
 
 ```text
-src/delta_zsc/
-  base_policy.py             task-only recurrent competence
-  behavior_statistics.py     analytic Beta posteriors
-  transition.py              learned row-stochastic mode dynamics
-  response_model.py          complete factorized teammate response
-  decision_model.py          CRN return contrasts and covariance score
-  belief_filter.py           response-only categorical Bayes filter
-  latent_model.py            shared response/decision latent semantics
-  bayes_voi.py               exact compact VOI v3
-  mirror_policy.py           analytic KL adaptation
-  losses.py                  PPO and latent proper scores
-  training.py                separate alternating transactions
-  anchors.py                 sparse real all-action continuations
-  runner.py                  legal-history rollout
-  manifest.py / partners.py  lineage and sampling
-  storage.py / resources.py  identity and accounting
+collect D_n and sparse CRN anchors C_n with base omega_n
+    -> update latent Theta_n using D_n, C_n and stopgrad(omega_n)
+    -> update base omega_n with PPO minibatches from D_n
 ```
 
-The active experiment layer contains only manifest construction, training,
-deployment, Official baselines/evaluation, posterior diagnostics, belief
-intervention, development matrices, resource reporting, and the closed formal
-claim synthesis.
+`base_params` and `latent_params` have separate parameter trees, optimizers and
+Adam moments. PPO replay is statically base-only. The latent objective is:
 
-## Paper-level claim structure
+\[
+L_{latent}=L_{shared}+L_{semantic}+L_{decision},
+\]
 
-The repository pre-registers only three ordered confirmatory claims:
+where each present channel is divided by its own observation count.
 
-1. `H1`: frozen active DELTA exceeds every registered same-protocol baseline on
-   both Simple and Wide, with a positive one-sided run-level lower bound and at
-   least 20 raw-return points of material effect;
-2. `H2`: passive DELTA exceeds response-only under paired seeds on both layouts;
-3. `H3`: in a same-world intervention, the correct legal-history belief has
-   positive empirical decision value over a task-matched shuffled belief.
+## Calibration and provenance
 
-The active-versus-passive VOI increment is a pre-registered secondary result.
-Posterior entropy, information gain, response NLL, and VOI numerical diagnostics cannot
-be promoted into substitute performance claims.
+Development and formal semantic variants require a fitted initializer. The
+initializer:
 
-## Evidence boundary
+- uses legal response contexts collected by a completed base policy;
+- fits a cross-fitted pooled event predictor;
+- forms normalized episode residuals;
+- uses SVD plus a centered regular simplex;
+- records layout, protocol, source commit, component count and lineages;
+- rejects SP/OP-label-derived construction and calibration/training parent
+  overlap.
 
-The package contains implementation and CPU-side acceptance evidence, not
-formal benchmark results. It therefore makes no SOTA claim. Formal conclusions
-require the pinned Python 3.10/Official/CUDA environment, real lineage-bound
-partner checkpoints, ten ego runs, both roles, 500 episodes per pairing, and the frozen
-Simple/Wide statistical protocol.
+K=2, K=4 and K=8 artifacts can be generated from the same calibration panel.
+
+## Validation status
+
+The source package passes the complete isolated local CPU contract suite,
+configuration/CLI validation, namespace checks and exact-VOI synthetic
+acceptance. The exact counts and environment are recorded in
+`VALIDATION_REPORT.md` and `validation/ISOLATED_TEST_RESULTS.json`.
+
+This package does not contain a completed v4 CUDA run, paired development
+matrix, formal H1/H2/H3 result, or SOTA claim. The prior v3 CUDA results are
+historical failure diagnostics only.
+
+Detailed traceability is in `IMPLEMENTATION_MATRIX.md`.

@@ -1,4 +1,4 @@
-version: 2
+version: 3
 method_variant: delta_active
 method:
   latent_components: 4
@@ -41,7 +41,7 @@ anchors:
   enabled: true
   interval_environment_steps: 1024
   states_per_trigger: 2
-  fit_replicas: 2
+  fit_replicas: 6
   evaluation_replicas: 2
 training:
   rollout_length: 256

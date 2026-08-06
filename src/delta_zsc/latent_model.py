@@ -1,9 +1,9 @@
-"""Unified latent coordination model.
+"""Episode-static shared-latent coordination model for DELTA v4.
 
-One exchangeable latent state jointly emits the observable teammate response
-and the counterfactual action-value signature. Training minimizes one
-shared-latent composite predictive likelihood under the response-only belief; there is no comparator, separation loss, pseudo-label
-critic, capability encoder, or auxiliary actor target.
+Immediate semantic responses update the legal posterior. Shared occurrence
+factors are predicted but cannot change component responsibilities. Delayed
+probe responses and sparse current/successor decision observations train the
+same component semantics without entering the online filter state.
 """
 
 from __future__ import annotations
@@ -11,12 +11,22 @@ from __future__ import annotations
 from typing import Any
 
 from .behavior_statistics import behavior_features, update_behavior_statistics
-from .belief_filter import filter_update, uniform_belief
-from .decision_model import decision_predict, init_decision_params
+from .belief_filter import episode_static_prior, filter_update
+from .decision_model import (
+    decision_predict,
+    init_decision_params,
+    successor_decision_predict,
+)
 from .nn import tree_stop_gradient
 from .observation import extract_response_target
-from .response_model import init_response_params, response_joint_log_probability, response_predict
-from .transition import init_transition_logits, predict_belief
+from .response_model import (
+    init_probe_response_params,
+    init_response_params,
+    probe_response_predict,
+    response_predict,
+    response_semantic_component_log_probability,
+    response_shared_log_probability,
+)
 
 
 def init_latent_params(
@@ -31,6 +41,7 @@ def init_latent_params(
     action_count: int,
     action_embedding_dim: int,
     hidden_dim: int,
+    semantic_event_bias: Any | None = None,
 ) -> dict[str, Any]:
     import jax
     import jax.numpy as jnp
@@ -42,16 +53,28 @@ def init_latent_params(
         "component_embeddings": jax.random.normal(
             keys[0], (component_count, component_embedding_dim), dtype=jnp.float32
         ) / max(component_embedding_dim, 1) ** 0.5,
-        "transition_logits": init_transition_logits(keys[1], component_count),
         "response": init_response_params(
-            keys[2],
+            keys[1],
             observation_shape=observation_shape,
             behavior_dim=behavior_dim,
+            component_count=component_count,
             component_embedding_dim=component_embedding_dim,
             action_count=action_count,
             action_embedding_dim=action_embedding_dim,
             hidden_dim=hidden_dim,
             inventory_factor_count=inventory_factor_count,
+            semantic_event_bias=semantic_event_bias,
+        ),
+        "probe_response": init_probe_response_params(
+            keys[2],
+            observation_shape=observation_shape,
+            behavior_dim=behavior_dim,
+            component_count=component_count,
+            component_embedding_dim=component_embedding_dim,
+            action_count=action_count,
+            action_embedding_dim=action_embedding_dim,
+            hidden_dim=hidden_dim,
+            semantic_event_bias=semantic_event_bias,
         ),
         "decision": init_decision_params(
             keys[3],
@@ -59,6 +82,7 @@ def init_latent_params(
             instant_dim=instant_dim,
             behavior_dim=behavior_dim,
             component_embedding_dim=component_embedding_dim,
+            action_embedding_dim=action_embedding_dim,
             hidden_dim=hidden_dim,
             action_count=action_count,
         ),
@@ -73,17 +97,16 @@ def observe_response(
     observation: Any,
     previous_action: Any,
     episode_start: Any,
-) -> tuple[Any, Any, Any, Any, Any]:
-    """Perform one response likelihood update and sufficient-statistic update."""
+) -> tuple[Any, Any, Any, Any, Any, Any]:
+    """Apply one immediate semantic Bayes update and update legal statistics."""
 
-    import jax.scipy as jsp
     import jax.numpy as jnp
+    import jax.scipy as jsp
 
     start = jnp.asarray(episode_start, dtype=jnp.bool_)
     component_count = int(params["component_embeddings"].shape[0])
-    prior = uniform_belief(start.shape, component_count)
-    previous_belief = jnp.where(start[..., None], prior, belief)
-    response_target = extract_response_target(
+    prior = episode_static_prior(belief, start, component_count)
+    target = extract_response_target(
         previous_observation, observation, previous_action, start
     )
     before_features = behavior_features(statistics)
@@ -94,26 +117,26 @@ def observe_response(
         before_features,
         previous_action,
     )
-    component_logp = response_joint_log_probability(prediction, response_target)
-    predictive = predict_belief(previous_belief, params["transition_logits"])
-    marginal_logp = jsp.special.logsumexp(
-        jnp.log(jnp.maximum(predictive, 1.0e-30)) + component_logp,
-        axis=-1,
+    shared_logp = response_shared_log_probability(prediction, target)
+    semantic_logp = response_semantic_component_log_probability(prediction, target)
+    marginal_semantic_logp = jsp.special.logsumexp(
+        jnp.log(jnp.maximum(prior, 1.0e-30)) + semantic_logp, axis=-1
     )
-    filtered = filter_update(
-        previous_belief, params["transition_logits"], component_logp
-    )
+    filtered = filter_update(prior, semantic_logp)
     next_belief = jnp.where(start[..., None], prior, filtered)
     next_statistics = update_behavior_statistics(
-        statistics, response_target, episode_start=start
+        statistics, target, episode_start=start
     )
-    negative_log_likelihood = jnp.where(start, 0.0, -marginal_logp)
+    negative_log_likelihood = jnp.where(
+        start, 0.0, -(shared_logp + marginal_semantic_logp)
+    )
     return (
         next_belief,
         next_statistics,
         negative_log_likelihood,
         prediction,
-        response_target,
+        target,
+        prior,
     )
 
 
@@ -132,4 +155,42 @@ def predict_decision(
     )
 
 
-__all__ = ["init_latent_params", "observe_response", "predict_decision"]
+def predict_successor_decision(
+    params: dict[str, Any],
+    task_features: Any,
+    instant_partner: Any,
+    statistics: Any,
+    probe_actions: Any,
+) -> Any:
+    return successor_decision_predict(
+        params["decision"],
+        params["component_embeddings"],
+        tree_stop_gradient(task_features),
+        tree_stop_gradient(instant_partner),
+        behavior_features(statistics),
+        probe_actions,
+    )
+
+
+def predict_probe_response(
+    params: dict[str, Any],
+    frame: Any,
+    statistics: Any,
+    probe_actions: Any,
+) -> Any:
+    return probe_response_predict(
+        params["probe_response"],
+        params["component_embeddings"],
+        frame,
+        behavior_features(statistics),
+        probe_actions,
+    )
+
+
+__all__ = [
+    "init_latent_params",
+    "observe_response",
+    "predict_decision",
+    "predict_probe_response",
+    "predict_successor_decision",
+]

@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.delta_zsc.anchors import collect_anchor_batch
-from src.delta_zsc.config import load_config
+from src.delta_zsc.config import OFFICIAL_ACTION_COUNT, load_config
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.mirror_policy import mirror_policy_logits
 from src.delta_zsc.partners import make_static_partner_functions
@@ -69,7 +69,11 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
         expected_layout=config.environment.layout,
         verify_files=not bool(args.skip_manifest_file_check),
     )
-    runs = manifest.by_role("development_coverage") or manifest.by_role("confirmatory")
+    runs = (
+        manifest.by_role("confirmatory")
+        if config.run_kind == "formal"
+        else (manifest.by_role("development_coverage") or manifest.by_role("confirmatory"))
+    )
     if len(runs) < 2:
         raise ValueError("Belief intervention needs at least two held-out partner runs.")
 
@@ -124,11 +128,12 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
                 base_params=deployment.base_params,
                 latent_params=deployment.latent_params,
                 states_per_trigger=config.anchors.states_per_trigger,
-                action_count=6,
+                action_count=OFFICIAL_ACTION_COUNT,
                 fit_replicas=config.anchors.fit_replicas,
                 evaluation_replicas=config.anchors.evaluation_replicas,
                 horizon=config.method.continuation_horizon,
                 gamma=config.ppo.gamma,
+                collect_successor=False,
             )
             _, output = deployment.model.sequence(
                 deployment.base_params,

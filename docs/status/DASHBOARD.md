@@ -1,21 +1,58 @@
-# Unified DELTA-ZSC status dashboard
+# DELTA-ZSC v4 status dashboard
 
-Updated: 2026-08-06. This page reports implementation status only; it does not
-turn engineering validation into scientific evidence.
+Date: 2026-08-06
 
-| Track | Status | Meaning |
+## Active source status
+
+| Item | Status | Evidence |
 |---|---|---|
-| Unified method | implemented | one response-decision latent model, response-only filter, separate base/latent optimizers, analytic KL adaptation, and deterministic Bayesian VOI |
-| VOI | implemented and exercised on CUDA | exact 66-outcome compact marginal completed three development runs and final audits; values remain near zero in the current pilot |
-| Active code boundary | implemented | only `src/delta_zsc/` and the unified CLI remain in the active tree; the full DEPI v8 source/apps/configs/workflow/tests and historical analysis are archived under `legacy/implementation_v8/`; old decision/evidence ledgers are under `docs/legacy/v8/` |
-| Local CPU regression | pending for v3 | the prior v2 result is superseded; no Python or tests were run while applying this revision |
-| End-to-end path | passed for the three-seed pilot | revised response extraction, exact VOI, training, checkpoint/deployment export and Official-environment evaluation all completed on one A10 |
-| Registered Python 3.10 install | executed remotely | Python 3.10.19, JAX 0.4.38 and one CUDA device were verified on `ali_ZSC` |
-| Real Official/CUDA execution | three-seed development pilot completed | real SP/OP pilot checkpoints and Official reset/step were used; no numerical update failed |
-| Development evidence | pilot generated; registered matrix absent | Simple development-support mean raw return is 6.6778 over 3,600 episodes; a non-independent one-seed SP comparator is 5.6167; posterior separation and decision quality remain poor |
-| Formal evidence | not generated | no H1/H2/H3 or SOTA claim is made by the repository alone |
+| Method identity | complete | config 3, checkpoint schema 4, package 0.6.0 |
+| Episode-static latent | implemented and locally tested | `belief_filter.py`; core filter test |
+| Shared occurrence / component semantic split | implemented and locally tested | `response_model.py`; posterior-isolation tests |
+| Centered response and decision residuals | implemented and locally tested | response/decision centering test |
+| Spectral-simplex initializer | implemented and locally tested | initializer/provenance tests |
+| Three separately normalized proper-score channels | implemented and locally tested | v4 objective test |
+| Delayed causal probe response | implemented and locally tested | delayed-window tests |
+| Probe-conditioned t+2 CRN decision target | implemented and locally tested | successor-anchor tests |
+| Exact 66-outcome delayed VOI | implemented and locally tested | VOI tests and synthetic artifact |
+| One committed base bridge after an active probe | implemented and locally tested | active bridge test |
+| Final action-selectivity audit | implemented and locally tested | final-audit broadcasting regression |
+| Versioned deployment/checkpoint round trip | implemented and locally tested | storage/deployment test |
 
-The empirical priority is to explain and correct the near-uniform posterior,
-weak decision agreement, OP-partner failure and role asymmetry before spending
-compute on the paired development matrix. The pilot artifacts are under
-`/mnt/workspace/ARIS4ZSC_v5/runs/engineering/SP_OP_results/delta_interface_v3_3seed_20260806`.
+## Validation status
+
+- Active source compilation: passed.
+- Six registered configurations: passed.
+- Root CLI plus 16 subcommand help paths: passed.
+- Namespace/workflow/credential contracts: passed.
+- Isolated local CPU pytest suite: `50/50` passed, zero failures, zero
+  timeouts; per-test evidence is recorded in
+  `validation/ISOLATED_TEST_RESULTS.json`.
+- Exact delayed-VOI synthetic acceptance: passed.
+
+## Empirical status
+
+| Stage | Status |
+|---|---|
+| Real fitted initializer from calibration lineages | not generated in this source package |
+| Real Official-checkpoint v4 mechanical run | not executed |
+| CUDA memory/throughput acceptance | not executed |
+| Paired five-seed development matrix | not executed |
+| Formal ten-run Simple/Wide matrix | not executed |
+| H1/H2/H3 evidence | not generated |
+| SOTA claim | closed |
+
+The three-seed v3 CUDA pilot remains historical failure evidence. Its return,
+posterior and VOI measurements cannot be reported as v4 results.
+
+## Next executable scientific path
+
+1. Build lineage-disjoint fitted semantic initializers for Simple and Wide at
+   K=2/4/8.
+2. Run the one-update CUDA mechanical path and archive its resource ledger.
+3. Execute the bounded paired development matrix.
+4. Inspect partner separation, filter KL, component event JS, successor action
+   ordering, VOI action spread and active/passive policy TV together with raw
+   return.
+5. Proceed to formal training only under the registered protocol; no local
+   source test acts as a performance gate or substitute result.

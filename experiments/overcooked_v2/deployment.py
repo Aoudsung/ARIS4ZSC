@@ -6,19 +6,21 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import pickle
-from typing import Any
+from typing import Any, Mapping
 
 from src.delta_zsc.config import (
     CHECKPOINT_SCHEMA_VERSION,
     METHOD_VERSION,
+    OFFICIAL_ACTION_COUNT,
     run_config_from_mapping,
 )
 from src.delta_zsc.losses import categorical_log_probability
 from src.delta_zsc.model import DeltaModel, observe_after_transition
 from src.delta_zsc.storage import write_json
+from src.delta_zsc.semantic_initializer import SEMANTIC_INITIALIZER_SCHEMA_VERSION
 
 
-DEPLOYMENT_BUNDLE_VERSION = 2
+DEPLOYMENT_BUNDLE_VERSION = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +30,7 @@ class Deployment:
     model: DeltaModel
     base_params: Any
     latent_params: Any
+    semantic_initializer: Mapping[str, Any]
 
 
 def export_deployment_bundle(
@@ -39,6 +42,7 @@ def export_deployment_bundle(
     base_params: Any,
     latent_params: Any,
     source_training_run: str | Path,
+    semantic_initializer: Mapping[str, Any],
 ) -> Path:
     root = Path(directory).resolve()
     if root.exists() and any(root.iterdir()):
@@ -58,9 +62,10 @@ def export_deployment_bundle(
             "method_variant": config.method_variant,
             "config": config.to_mapping(),
             "observation_shape": [int(value) for value in observation_shape],
-            "action_count": int(6),
+            "action_count": int(OFFICIAL_ACTION_COUNT),
             "params": params_path.name,
             "source_training_run": str(Path(source_training_run).resolve()),
+            "semantic_initializer": dict(semantic_initializer),
         },
     )
     return root
@@ -83,6 +88,7 @@ def load_deployment(directory: str | Path) -> Deployment:
         "action_count",
         "params",
         "source_training_run",
+        "semantic_initializer",
     }
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("Deployment bundle schema differs.")
@@ -92,6 +98,15 @@ def load_deployment(directory: str | Path) -> Deployment:
         or payload["method"] != METHOD_VERSION
     ):
         raise ValueError("Deployment method/schema identity differs.")
+    initializer = payload["semantic_initializer"]
+    if (
+        not isinstance(initializer, dict)
+        or initializer.get("artifact_type")
+        != "delta_semantic_component_initializer"
+        or int(initializer.get("version", -1)) != SEMANTIC_INITIALIZER_SCHEMA_VERSION
+        or initializer.get("uses_partner_labels") is not False
+    ):
+        raise ValueError("Deployment semantic-initializer identity differs.")
     config = run_config_from_mapping(payload["config"])
     if config.method_variant != payload["method_variant"]:
         raise ValueError("Deployment method variant differs.")
@@ -108,6 +123,7 @@ def load_deployment(directory: str | Path) -> Deployment:
         model=DeltaModel(config, shape, action_count),
         base_params=parameters["base_params"],
         latent_params=parameters["latent_params"],
+        semantic_initializer=dict(initializer),
     )
 
 
@@ -131,6 +147,7 @@ def deployment_action(
         deployment.latent_params,
         state,
         observation,
+        execute_adaptation=not bool(force_base),
     )
     logits = output.base_policy_logits if bool(force_base) else output.policy_logits
     key_array = jnp.asarray(keys)

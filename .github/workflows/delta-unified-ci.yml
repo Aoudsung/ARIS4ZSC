@@ -6,6 +6,7 @@ on:
       - main
       - agent/delta-zsc-v5
       - agent/delta-zsc-unified
+      - zsc_v8
   pull_request:
   workflow_dispatch:
     inputs:
@@ -21,6 +22,10 @@ on:
         type: string
       partner_manifest:
         description: "Absolute lineage-bound partner manifest on the self-hosted runner"
+        required: false
+        type: string
+      semantic_initializer:
+        description: "Absolute DELTA v4 semantic-initializer directory or NPZ path"
         required: false
         type: string
       output_root:
@@ -49,15 +54,9 @@ jobs:
       - name: Compile active implementation
         run: |
           python -m compileall -q src/delta_zsc experiments/overcooked_v2
-      - name: Run unified core tests in isolated JAX processes
+      - name: Run every DELTA test in isolated JAX processes
         run: |
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_voi.py
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_core.py
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_training.py
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_manifest.py
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_repository.py
-          pytest -q experiments/overcooked_v2/tests/test_delta_unified_cli.py
+          python validation/run_all_isolated_tests.py
       - name: Validate all registered configurations
         run: |
           python - <<'PY'
@@ -74,7 +73,7 @@ jobs:
           for command in \
             build-partner-manifest validate-partner-manifest train cuda-preflight \
             build-policy-manifest evaluate summarize-evaluations \
-            posterior-diagnostics belief-intervention run-development-matrix \
+            build-semantic-initializer posterior-diagnostics belief-intervention run-development-matrix \
             evaluate-development-matrix summarize-development-matrix \
             train-baseline resource-report formal-claim; do
             python -m experiments.overcooked_v2.delta_zsc "${command}" --help
@@ -82,6 +81,7 @@ jobs:
       - name: Enforce one active scientific namespace
         run: |
           test ! -d src/path_c
+          test ! -f src/delta_zsc/transition.py
           ! grep -R -n -E 'pair_comparator|separation_margin|context_dropout|capability_consistency_weight|posterior_decision_weight|decision_policy_weight|gradient_routing|decision_regret|response_cross_log_likelihood' src/delta_zsc
           ! grep -R -n -E 'src\.path_c\.(model|training)' \
             experiments/overcooked_v2/training_app.py \
@@ -111,7 +111,9 @@ jobs:
         run: |
           test -n "${{ inputs.partner_manifest }}"
           test -n "${{ inputs.output_root }}"
+          test -n "${{ inputs.semantic_initializer }}"
           test -f "${{ inputs.partner_manifest }}"
+          test -e "${{ inputs.semantic_initializer }}"
       - name: Register one idle physical GPU
         shell: bash
         run: |
@@ -157,6 +159,7 @@ jobs:
             --partner-manifest "${{ inputs.partner_manifest }}" \
             --ego-run-id delta-cuda-preflight \
             --seed-index -1 \
+            --semantic-initializer "${{ inputs.semantic_initializer }}" \
             --output "${{ inputs.output_root }}/delta-cuda-${{ github.run_id }}-${{ github.run_attempt }}"
       - name: Upload acceptance evidence
         uses: actions/upload-artifact@v4

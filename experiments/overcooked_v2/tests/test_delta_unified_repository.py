@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import ast
+import re
 
 
 ACTIVE_APPS = {
@@ -70,13 +72,26 @@ def test_pyproject_packages_only_active_namespace() -> None:
     assert "src.path_c*" not in text
 
 
-def test_only_unified_workflow_is_active_and_method_identity_is_v3() -> None:
+
+def test_requirements_match_pyproject_runtime_dependencies_exactly() -> None:
+    source = Path("pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r"(?ms)^dependencies\s*=\s*(\[.*?^\])", source)
+    assert match is not None
+    project_dependencies = set(ast.literal_eval(match.group(1)))
+    requirements = {
+        line.strip()
+        for line in Path("requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    assert requirements == project_dependencies
+
+def test_only_unified_workflow_is_active_and_method_identity_is_v4() -> None:
     workflows = {path.name for path in Path(".github/workflows").glob("*.yml")}
     assert workflows == {"delta-unified-ci.yml"}
     assert Path("legacy/implementation_v8/.github/workflows/depi-ci.yml").is_file()
     from src.delta_zsc.config import METHOD_VERSION
 
-    assert METHOD_VERSION == "delta_joint_geometry_interface_decision_exact_voi_v3"
+    assert METHOD_VERSION == "delta_episode_static_centered_residual_delayed_exact_voi_v4"
 
 
 def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
@@ -95,3 +110,6 @@ def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
     assert "halton" not in text
     assert "66" in text
     assert "exact" in text
+    assert "episode-static" in text
+    assert "centered residual" in text
+    assert "delayed" in text

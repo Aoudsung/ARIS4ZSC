@@ -1,21 +1,62 @@
-SUPERSEDED BY UNVALIDATED EXACT-VOI V3 REVISION — historical v2 result follows
-DELTA-ZSC VOI v2 local acceptance — 2026-08-05
-Environment: Python 3.13.5 / JAX 0.9.0.1 CPU / NumPy 2.3.5
+DELTA v4 isolated local CPU regression
+python=3.13.5
+jax=0.9.0.1
+numpy=2.3.5
+platform=cpu
+complete=true
+discovered=50
+executed=50
+passed=50
+failed=0
+timed_out=0
 
-PASS  test_delta_unified_voi.py             7 tests
-PASS  test_delta_unified_core.py            6 tests
-PASS  test_delta_unified_training.py        4 tests
-PASS  test_delta_unified_runner_storage.py  2 tests
-PASS  test_delta_unified_manifest.py        1 test
-PASS  test_delta_unified_repository.py      6 tests
-TOTAL                                        26 tests passed
-
-PASS  compileall active source/apps
-PASS  six registered configuration loads
-PASS  top-level CLI and 15 subcommand help paths
-PASS  workflow YAML parse
-PASS  active/legacy namespace and retired-token audit
-PASS  credential-pattern scan
-
-NOT RUN: exact Python 3.10 installation, real Official checkpoints, real CUDA
-preflight, development matrix, or formal benchmark evaluation.
+[passed] experiments/overcooked_v2/tests/test_delta_unified_cli.py::test_summarize_evaluations_cli_wires_seed_and_writes_h1_summary (1.413s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_cli.py::test_summarize_evaluations_cli_seed_defaults_to_zero (1.275s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_cli.py::test_development_matrix_launches_every_cell_in_a_fresh_process (1.267s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_all_registered_configs_load_and_method_has_three_fields (0.811s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_action_contrast_basis_is_orthonormal_and_offset_invariant (1.945s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_episode_static_filter_persists_and_resets_only_at_episode_start (1.775s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_interface_alignment_and_interact_exclusion_contract (4.446s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_mirror_policy_satisfies_kl_constraint (2.195s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_model_executes_all_variants_with_one_shared_interface (16.926s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_decision_parameters_cannot_change_online_belief (18.389s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_v4_response_and_decision_residuals_are_component_centered (12.811s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_shared_occurrence_heads_cannot_change_online_belief (17.809s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_spectral_simplex_initializer_is_centered_and_round_trips (0.932s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_core.py::test_delayed_probe_target_uses_second_action_and_masks_terminal_windows (4.728s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_manifest_builder_resolves_and_reloads_lineage (0.785s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_official_parent_throughput_is_counted_once_per_lineage (1.470s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_official_parent_throughput_must_match_frozen_config (1.569s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_resumed_resource_ledger_reconciles_parent_cost (1.522s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_active_namespace_contains_no_retired_patch_chain (0.909s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_active_tree_contains_only_unified_method_and_registered_apps (0.913s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_active_experiment_apps_import_only_unified_method_namespace (0.935s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_pyproject_packages_only_active_namespace (0.977s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_requirements_match_pyproject_runtime_dependencies_exactly (0.967s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_only_unified_workflow_is_active_and_method_identity_is_v4 (0.961s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_authoritative_docs_describe_only_exact_bayes_voi (0.903s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_mock_end_to_end_rollout_and_anchor_use_base_policy (22.886s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_sparse_anchor_rollout_matches_full_recording (25.384s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_checkpoint_and_deployment_round_trip (9.473s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_final_v4_audit_reduces_probe_axis_before_anchor_mask (29.156s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_training.py::test_base_and_latent_updates_are_separate_finite_transactions (31.270s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_training.py::test_outer_transaction_commits_latent_before_ppo (8.995s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_training.py::test_response_only_variant_never_uses_decision_anchor_channel (16.441s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_training.py::test_batched_base_policy_sequence_matches_step_replay (11.894s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_training.py::test_batched_filter_sequence_matches_online_steps (12.823s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_training.py::test_anchor_schema_contains_no_stale_posterior_or_comparator (0.797s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_compact_delayed_distribution_has_exactly_66_normalized_outcomes (2.172s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_uninformative_delayed_response_has_zero_exact_voi_and_information_gain (3.377s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_information_without_successor_decision_relevance_has_zero_voi (2.879s)
+[passed] experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_probe_conditioned_successor_utility_is_required_and_jittable (1.836s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_deterministic_and_spectral_initializers_are_centered_and_round_trip (0.783s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_fitted_initializer_provenance_is_layout_and_lineage_bound (0.783s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_delayed_probe_target_uses_second_action_window_and_masks_boundaries (5.285s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_three_channel_objective_is_exact_sum_of_normalized_channels (19.162s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_active_probe_commits_exactly_one_base_continuation (19.207s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_probe_anchor_forces_decision_only_after_base_bridge (2.092s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_successor_anchor_waits_for_delayed_response_and_excludes_bridge_rewards (2.281s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_passive_anchor_batch_has_no_successor_observation (22.099s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_development_budget_distinguishes_passive_and_active_anchor_cost (0.794s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_development_matrix_resolves_k_specific_initializer_root (0.820s)
+[passed] experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_final_audit_component_event_js_reduces_probe_axis_before_anchor_mask (2.417s)

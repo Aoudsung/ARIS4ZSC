@@ -1,4 +1,4 @@
-version: 2
+version: 3
 method_variant: delta_active
 method:
   latent_components: 4
@@ -39,9 +39,9 @@ latent_optimizer:
   adam_epsilon: 1.0e-05
 anchors:
   enabled: true
-  interval_environment_steps: 98304
+  interval_environment_steps: 147456
   states_per_trigger: 16
-  fit_replicas: 4
+  fit_replicas: 8
   evaluation_replicas: 8
 training:
   rollout_length: 256

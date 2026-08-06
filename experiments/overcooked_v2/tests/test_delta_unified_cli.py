@@ -117,6 +117,11 @@ def test_development_matrix_launches_every_cell_in_a_fresh_process(
         commands.append(list(command))
 
     monkeypatch.setattr(matrix_app, "_write_variant_config", fake_config)
+    monkeypatch.setattr(
+        matrix_app,
+        "_initializer_for_component_count",
+        lambda source, component_count: Path(source) / f"k-{component_count}",
+    )
     monkeypatch.setattr(matrix_app.subprocess, "run", fake_subprocess)
     monkeypatch.setattr(
         matrix_app,
@@ -124,6 +129,11 @@ def test_development_matrix_launches_every_cell_in_a_fresh_process(
         lambda unused: {"deployable_parameters": 1},
     )
     monkeypatch.setattr(matrix_app, "_validate_training_entries", lambda rows: None)
+    monkeypatch.setattr(
+        matrix_app,
+        "_initializer_for_component_count",
+        lambda root, count: Path(root) / f"k-{count}",
+    )
     monkeypatch.setattr(matrix_app, "ensure_run_identity", lambda *args, **kwargs: None)
     monkeypatch.setattr(matrix_app, "write_json", lambda *args, **kwargs: None)
     matrix_app.run_development_matrix(
@@ -135,9 +145,11 @@ def test_development_matrix_launches_every_cell_in_a_fresh_process(
             resume=True,
             require_cuda=True,
             skip_manifest_file_check=True,
+            semantic_initializer=str(tmp_path / "initializers"),
         )
     )
     assert len(commands) == 55
     assert all(command[1:4] == ["-m", "experiments.overcooked_v2.delta_zsc", "train"] for command in commands)
     assert all("--resume" in command for command in commands)
     assert all("--require-cuda" in command for command in commands)
+    assert all("--semantic-initializer" in command for command in commands)

@@ -12,6 +12,16 @@ from .optimizer import adam_update
 from .types import AnchorBatch, RolloutBatch
 
 
+def _tree_norm(tree: Any) -> Any:
+    import jax
+    import jax.numpy as jnp
+
+    leaves = jax.tree_util.tree_leaves(tree)
+    if not leaves:
+        return jnp.asarray(0.0, dtype=jnp.float32)
+    return jnp.sqrt(jnp.sum(jnp.stack([jnp.sum(jnp.square(x)) for x in leaves])))
+
+
 def slice_rollout_lanes(batch: RolloutBatch, indexes: Any) -> RolloutBatch:
     import jax
 
@@ -22,7 +32,6 @@ def slice_rollout_lanes(batch: RolloutBatch, indexes: Any) -> RolloutBatch:
         else:
             values[name] = value[:, indexes]
     return RolloutBatch(**values)
-
 
 
 def ppo_learning_rate(
@@ -138,22 +147,73 @@ def update_latent_model(
         return latent_params, optimizer_state, {
             "latent_composite_nll": 0.0,
             "latent_response_nll": 0.0,
+            "latent_shared_response_nll": 0.0,
+            "latent_semantic_response_nll": 0.0,
+            "latent_probe_shared_nll": 0.0,
+            "latent_probe_semantic_nll": 0.0,
+            "latent_shared_total_nll": 0.0,
+            "latent_semantic_total_nll": 0.0,
             "latent_decision_nll": 0.0,
-            "latent_response_observations": 0.0,
+            "latent_successor_decision_nll": 0.0,
+            "latent_decision_total_nll": 0.0,
+            "latent_shared_response_observations": 0.0,
+            "latent_semantic_response_observations": 0.0,
+            "latent_probe_observations": 0.0,
+            "latent_probe_semantic_observations": 0.0,
             "latent_decision_observations": 0.0,
+            "latent_successor_decision_observations": 0.0,
+            "latent_shared_total_observations": 0.0,
+            "latent_semantic_total_observations": 0.0,
+            "latent_decision_total_observations": 0.0,
             "latent_mean_posterior_entropy": 0.0,
+            "latent_mean_filter_kl": 0.0,
+            "latent_component_event_js": 0.0,
+            "latent_probe_component_event_js": 0.0,
             "latent_decision_top_action_agreement": 0.0,
             "latent_decision_empirical_regret": 0.0,
+            "latent_decision_component_disagreement": 0.0,
+            "latent_successor_top_action_agreement": 0.0,
+            "latent_successor_empirical_regret": 0.0,
+            "latent_interface_coverage_rate": 0.0,
+            "latent_interface_change_rate": 0.0,
+            "latent_interface_other_multi_rate": 0.0,
+            "latent_recipe_coverage_rate": 0.0,
+            "latent_visibility_positive_rate": 0.0,
+            "latent_inventory_change_positive_rate": 0.0,
+            "latent_recipe_change_positive_rate": 0.0,
             "latent_gradient_norm": 0.0,
+            "latent_shared_gradient_norm": 0.0,
+            "latent_semantic_gradient_norm": 0.0,
+            "latent_decision_gradient_norm": 0.0,
+            "latent_semantic_decision_gradient_cosine": 0.0,
+            "latent_gradient_alignment_available": 0.0,
+            "latent_response_parameter_gradient_norm": 0.0,
+            "latent_component_embedding_gradient_norm": 0.0,
             "latent_update_applied": 0.0,
             "latent_nonfinite_update": 0.0,
         }
+
+    import jax.numpy as jnp
 
     def objective(candidate: Any):
         loss = latent_composite_loss(model, candidate, base_params, batch, anchors)
         return loss.total, loss.metrics
 
-    (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(latent_params)
+    # The optimizer uses exactly one reverse pass through the registered
+    # composite proper score.  Full-tree per-channel pullbacks would replicate
+    # every latent gradient three times and make the formal JIT graph
+    # needlessly large.  Exact semantic/decision channel alignment is instead
+    # evaluated, report-only, on the shared component embeddings in the final
+    # anchor audit via ``component_embedding_channel_gradient_diagnostics``.
+    (total, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(
+        latent_params
+    )
+    metrics = {**metrics, "latent_composite_nll": total}
+    response_gradient_norm = _tree_norm(
+        (gradients["response"], gradients["probe_response"])
+    )
+    embedding_gradient_norm = _tree_norm(gradients["component_embeddings"])
+
     updated, next_state, gradient_norm = adam_update(
         latent_params,
         gradients,
@@ -162,21 +222,76 @@ def update_latent_model(
         maximum_gradient_norm=float(model.config.latent_optimizer.gradient_clip_norm),
         epsilon=float(model.config.latent_optimizer.adam_epsilon),
     )
-    import jax.numpy as jnp
-
     leaves = jax.tree_util.tree_leaves((updated, next_state))
     finite = (
         jnp.isfinite(metrics["latent_composite_nll"])
         & jnp.isfinite(gradient_norm)
         & jnp.all(jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in leaves]))
     )
-    committed_params = jax.lax.cond(finite, lambda _: updated, lambda _: latent_params, None)
-    committed_state = jax.lax.cond(finite, lambda _: next_state, lambda _: optimizer_state, None)
+    committed_params = jax.lax.cond(
+        finite, lambda _: updated, lambda _: latent_params, None
+    )
+    committed_state = jax.lax.cond(
+        finite, lambda _: next_state, lambda _: optimizer_state, None
+    )
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
     return committed_params, committed_state, {
         **metrics,
         "latent_gradient_norm": gradient_norm,
+        # Per-channel full-tree gradient diagnostics are deliberately not part
+        # of the training transaction; zero plus availability=0 is an explicit
+        # schema value, not an estimated gradient.
+        "latent_shared_gradient_norm": zero,
+        "latent_semantic_gradient_norm": zero,
+        "latent_decision_gradient_norm": zero,
+        "latent_semantic_decision_gradient_cosine": zero,
+        "latent_gradient_alignment_available": zero,
+        "latent_response_parameter_gradient_norm": response_gradient_norm,
+        "latent_component_embedding_gradient_norm": embedding_gradient_norm,
         "latent_update_applied": finite.astype(jnp.float32),
         "latent_nonfinite_update": (~finite).astype(jnp.float32),
+    }
+
+
+def component_embedding_channel_gradient_diagnostics(
+    *,
+    model: Any,
+    latent_params: Any,
+    base_params: Any,
+    batch: RolloutBatch,
+    anchors: AnchorBatch,
+) -> Mapping[str, Any]:
+    """Exact response/decision alignment on the shared [K,D] embeddings."""
+
+    import jax.numpy as jnp
+
+    embeddings = latent_params["component_embeddings"]
+
+    def channel_values(candidate_embeddings: Any) -> Any:
+        candidate = {**latent_params, "component_embeddings": candidate_embeddings}
+        metrics = latent_composite_loss(
+            model, candidate, base_params, batch, anchors
+        ).metrics
+        return jnp.stack(
+            (
+                metrics["latent_semantic_total_nll"],
+                metrics["latent_decision_total_nll"],
+            )
+        )
+
+    jacobian = jax.jacrev(channel_values)(embeddings)
+    semantic_gradient = jacobian[0]
+    decision_gradient = jacobian[1]
+    semantic_norm = jnp.sqrt(jnp.sum(jnp.square(semantic_gradient)))
+    decision_norm = jnp.sqrt(jnp.sum(jnp.square(decision_gradient)))
+    cosine = jnp.sum(semantic_gradient * decision_gradient) / jnp.maximum(
+        semantic_norm * decision_norm, 1.0e-12
+    )
+    return {
+        "semantic_component_embedding_gradient_norm": semantic_norm,
+        "decision_component_embedding_gradient_norm": decision_norm,
+        "semantic_decision_component_embedding_gradient_cosine": cosine,
+        "gradient_alignment_available": jnp.asarray(1.0, dtype=jnp.float32),
     }
 
 
@@ -310,6 +425,7 @@ def make_training_update_kernel(
 
 
 __all__ = [
+    "component_embedding_channel_gradient_diagnostics",
     "environment_minibatch_schedule",
     "make_training_update_kernel",
     "ppo_learning_rate",

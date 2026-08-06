@@ -1,16 +1,26 @@
-"""Proper objectives for the two DELTA-ZSC parameter owners."""
+"""Proper objectives for DELTA v4's two parameter owners."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from .decision_model import decision_component_log_probability, decision_predict
-from .response_model import (
-    response_factor_log_probabilities,
-    response_joint_log_probability,
-    response_predict,
+from .decision_model import (
+    decision_component_log_probability,
+    decision_predict,
+    successor_decision_predict,
 )
-from .transition import predict_belief
+from .observation import extract_probe_response_target, extract_response_target
+from .response_model import (
+    probe_response_predict,
+    probe_response_semantic_component_log_probability,
+    probe_response_shared_factor_log_probabilities,
+    probe_response_shared_log_probability,
+    response_predict,
+    response_semantic_component_log_probability,
+    response_semantic_factor_log_probabilities,
+    response_shared_factor_log_probabilities,
+    response_shared_log_probability,
+)
 from .types import AnchorBatch, LossResult, RolloutBatch
 
 
@@ -70,6 +80,30 @@ def _masked_mean(value: Any, mask: Any) -> Any:
     weight = jnp.asarray(mask, dtype=jnp.float32)
     return jnp.sum(weight * jnp.asarray(value, dtype=jnp.float32)) / jnp.maximum(
         jnp.sum(weight), 1.0
+    )
+
+
+def _masked_nll(log_probability: Any, mask: Any) -> tuple[Any, Any, Any]:
+    import jax.numpy as jnp
+
+    weight = jnp.asarray(mask, dtype=jnp.float32)
+    count = jnp.sum(weight)
+    total = -jnp.sum(weight * jnp.asarray(log_probability, dtype=jnp.float32))
+    return total / jnp.maximum(count, 1.0), total, count
+
+
+def _mixture_log_probability(belief: Any, component_logp: Any) -> Any:
+    import jax.numpy as jnp
+    import jax.scipy as jsp
+
+    probability = jnp.asarray(belief, dtype=jnp.float32)
+    probability = probability / jnp.maximum(
+        jnp.sum(probability, axis=-1, keepdims=True), 1.0e-30
+    )
+    return jsp.special.logsumexp(
+        jnp.log(jnp.maximum(probability, 1.0e-30))
+        + jnp.asarray(component_logp, dtype=jnp.float32),
+        axis=-1,
     )
 
 
@@ -135,15 +169,9 @@ def ppo_loss(
     )
     value_loss = 0.5 * _masked_mean(value_error, mask)
     entropy = _masked_mean(categorical_entropy(logits), mask)
-    old_logp_all = jnn.log_softmax(
-        # The old scalar log probability cannot reconstruct the full old
-        # distribution.  This diagnostic therefore reports the exact sampled
-        # action log-ratio, while clipping remains the actual trust region.
-        logits,
-        axis=-1,
+    approximate_kl = 0.5 * _masked_mean(
+        jnp.square(new_logp - batch.old_log_probabilities), mask
     )
-    del old_logp_all
-    approximate_kl = 0.5 * _masked_mean(jnp.square(new_logp - batch.old_log_probabilities), mask)
     total = (
         actor
         + float(model.config.ppo.value_weight) * value_loss
@@ -170,18 +198,17 @@ def latent_composite_loss(
     batch: RolloutBatch,
     anchors: AnchorBatch | None,
 ) -> LossResult:
-    """Shared-latent proper predictive score with no auxiliary loss weights.
+    """Channel-normalized proper score for the unified v4 latent model.
 
-    Response observations and sparse CRN decision observations are independent
-    measurement channels conditional on the same latent component.  Their
-    negative log probabilities are summed and normalized by the number of
-    actual observations.  Decision evidence is never inserted into the online
-    filter state, preserving the legal deployment recursion.
+    Each independently sampled measurement channel contributes its own mean
+    negative log probability with a fixed coefficient of one.  Consequently
+    the method is invariant to rollout length and anchor instrumentation rate;
+    no tunable auxiliary-loss weight is introduced.
     """
 
     import jax
+    import jax.nn as jnn
     import jax.numpy as jnp
-    import jax.scipy as jsp
 
     stopped_base = jax.lax.stop_gradient(base_params)
     _, output = model.sequence(
@@ -195,71 +222,115 @@ def latent_composite_loss(
         compute_decision=False,
         execute_adaptation=False,
     )
-    from .observation import extract_response_target
-
-    response_target = extract_response_target(
+    response_mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    target = extract_response_target(
         batch.observations[:-1],
         batch.response_next_observations,
         batch.actions,
         jnp.zeros_like(batch.dones, dtype=jnp.bool_),
     )
-    response_prediction = response_predict(
+    prediction = response_predict(
         latent_params["response"],
         latent_params["component_embeddings"],
         batch.observations[:-1],
         output.behavior_features[:-1],
         batch.actions,
     )
-    component_response_logp = response_joint_log_probability(
-        response_prediction, response_target
+    shared_logp = response_shared_log_probability(prediction, target)
+    semantic_component_logp = response_semantic_component_log_probability(
+        prediction, target
     )
-    predictive = predict_belief(
-        output.belief[:-1], latent_params["transition_logits"]
+    semantic_logp = _mixture_log_probability(
+        output.belief[:-1], semantic_component_logp
     )
-    response_logp = jsp.special.logsumexp(
-        jnp.log(jnp.maximum(predictive, 1.0e-30)) + component_response_logp,
-        axis=-1,
+    shared_nll, shared_sum, shared_count = _masked_nll(shared_logp, response_mask)
+    semantic_mask = response_mask * jnp.maximum(
+        jnp.asarray(target.direct.visible_mask, dtype=jnp.float32),
+        jnp.asarray(target.interface_available, dtype=jnp.float32)
+        * jnp.asarray(target.interface_changed, dtype=jnp.float32),
     )
-    response_mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
-    response_sum = -jnp.sum(response_mask * response_logp)
-    response_count = jnp.sum(response_mask)
-    response_nll = response_sum / jnp.maximum(response_count, 1.0)
-    factor_logp = response_factor_log_probabilities(response_prediction, response_target)
-    direct = response_target.direct
-    factor_masks = {
-        "visibility": jnp.ones_like(response_mask),
-        "position": direct.visible_mask,
-        "direction": direct.visible_mask,
-        "inventory": direct.visible_mask,
-        "inventory_change": direct.event_mask,
-        "interface_availability": jnp.ones_like(response_mask),
-        "interface_change": response_target.interface_available,
-        "interface_event": (
-            response_target.interface_available * response_target.interface_changed
-        ),
-        "recipe_change": response_target.recipe_mask,
-    }
-    factor_metrics = {}
-    for name, component_factor_logp in factor_logp.items():
-        marginal_factor_logp = jsp.special.logsumexp(
-            jnp.log(jnp.maximum(predictive, 1.0e-30)) + component_factor_logp,
-            axis=-1,
+    semantic_nll, semantic_sum, semantic_count = _masked_nll(semantic_logp, semantic_mask)
+
+    # Delayed probe-response channel: t's probe is supervised by the legal
+    # transition o[t+1] -> o[t+2] under the second ego action.
+    probe_shared_nll = jnp.asarray(0.0, dtype=jnp.float32)
+    probe_semantic_nll = jnp.asarray(0.0, dtype=jnp.float32)
+    probe_count = jnp.asarray(0.0, dtype=jnp.float32)
+    probe_shared_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    probe_semantic_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    probe_semantic_count = jnp.asarray(0.0, dtype=jnp.float32)
+    probe_event_js = jnp.asarray(0.0, dtype=jnp.float32)
+    uses_probe_channel = (
+        model.config.method_variant == "delta_active" and batch.actions.shape[0] >= 2
+    )
+    if uses_probe_channel:
+        invalid = jnp.asarray(batch.dones[:-1], dtype=jnp.bool_) | jnp.asarray(
+            batch.dones[1:], dtype=jnp.bool_
         )
-        factor_mask = response_mask * jnp.asarray(factor_masks[name], dtype=jnp.float32)
-        factor_count = jnp.sum(factor_mask)
-        factor_metrics[f"latent_response_{name}_nll"] = -jnp.sum(
-            factor_mask * marginal_factor_logp
-        ) / jnp.maximum(factor_count, 1.0)
-        factor_metrics[f"latent_response_{name}_count"] = factor_count
-        factor_metrics[f"latent_response_{name}_rate"] = factor_count / jnp.maximum(
-            response_count, 1.0
+        probe_target = extract_probe_response_target(
+            batch.response_next_observations[:-1],
+            batch.response_next_observations[1:],
+            batch.actions[1:],
+            invalid,
+        )
+        probe_prediction = probe_response_predict(
+            latent_params["probe_response"],
+            latent_params["component_embeddings"],
+            batch.observations[:-2],
+            output.behavior_features[:-2],
+            batch.actions[:-1],
+        )
+        probe_valid = (
+            response_mask[:-1]
+            * response_mask[1:]
+            * jnp.asarray(probe_target.valid_mask, dtype=jnp.float32)
+        )
+        probe_shared_logp = probe_response_shared_log_probability(
+            probe_prediction, probe_target
+        )
+        probe_shared_nll, probe_shared_sum, probe_count = _masked_nll(
+            probe_shared_logp, probe_valid
+        )
+        probe_semantic_component = (
+            probe_response_semantic_component_log_probability(
+                probe_prediction, probe_target
+            )
+        )
+        probe_semantic_logp = _mixture_log_probability(
+            output.belief[:-2], probe_semantic_component
+        )
+        probe_semantic_mask = (
+            probe_valid
+            * jnp.asarray(probe_target.interface_available, dtype=jnp.float32)
+            * jnp.asarray(probe_target.interface_changed, dtype=jnp.float32)
+        )
+        probe_semantic_nll, probe_semantic_sum, probe_semantic_count = _masked_nll(
+            probe_semantic_logp, probe_semantic_mask
+        )
+        probability = jnn.softmax(probe_prediction.interface_event_logits, axis=-1)
+        mean_probability = jnp.mean(probability, axis=-2, keepdims=True)
+        probe_event_js = jnp.mean(
+            jnp.sum(
+                probability
+                * (
+                    jnp.log(jnp.maximum(probability, 1.0e-30))
+                    - jnp.log(jnp.maximum(mean_probability, 1.0e-30))
+                ),
+                axis=-1,
+            )
         )
 
+    decision_nll = jnp.asarray(0.0, dtype=jnp.float32)
     decision_sum = jnp.asarray(0.0, dtype=jnp.float32)
     decision_count = jnp.asarray(0.0, dtype=jnp.float32)
-    decision_nll = jnp.asarray(0.0, dtype=jnp.float32)
     decision_top_action_agreement = jnp.asarray(0.0, dtype=jnp.float32)
     decision_empirical_regret = jnp.asarray(0.0, dtype=jnp.float32)
+    decision_component_disagreement = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_decision_nll = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_decision_sum = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_decision_count = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_top_action_agreement = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_empirical_regret = jnp.asarray(0.0, dtype=jnp.float32)
     uses_decision_channel = (
         anchors is not None
         and model.config.method_variant in {"delta_passive", "delta_active"}
@@ -267,90 +338,236 @@ def latent_composite_loss(
     if uses_decision_channel:
         time = anchors.time_indexes
         lane = anchors.lane_indexes
-        prediction = decision_predict(
+        current_prediction = decision_predict(
             latent_params["decision"],
             latent_params["component_embeddings"],
             jax.lax.stop_gradient(output.task_features[time, lane]),
             jax.lax.stop_gradient(output.instant_partner[time, lane]),
             output.behavior_features[time, lane],
         )
-        component_decision_logp = decision_component_log_probability(
-            prediction,
+        current_component_logp = decision_component_log_probability(
+            current_prediction,
             anchors.fit_returns_by_action,
             anchors.measurement_covariances,
             anchors.action_mask,
         )
-        response_only_belief = output.belief[time, lane]
-        decision_logp = jsp.special.logsumexp(
-            jnp.log(jnp.maximum(response_only_belief, 1.0e-30))
-            + component_decision_logp,
-            axis=-1,
+        anchor_belief = output.belief[time, lane]
+        current_logp = _mixture_log_probability(anchor_belief, current_component_logp)
+        current_valid = jnp.all(anchors.action_mask, axis=-1).astype(jnp.float32)
+        decision_nll, decision_sum, decision_count = _masked_nll(
+            current_logp, current_valid
         )
-        valid = jnp.all(anchors.action_mask, axis=-1).astype(jnp.float32)
-        decision_sum = -jnp.sum(valid * decision_logp)
-        decision_count = jnp.sum(valid)
-        decision_nll = decision_sum / jnp.maximum(decision_count, 1.0)
         expected = jnp.sum(
-            response_only_belief[..., :, None] * prediction.means, axis=-2
+            anchor_belief[..., :, None] * current_prediction.means, axis=-2
         )
         selected = jnp.argmax(expected, axis=-1)
         oracle = jnp.argmax(anchors.evaluation_returns_by_action, axis=-1)
         rows = jnp.arange(selected.shape[0])
-        decision_top_action_agreement = jnp.sum(valid * (selected == oracle)) / jnp.maximum(
-            decision_count, 1.0
+        decision_top_action_agreement = _masked_mean(selected == oracle, current_valid)
+        decision_empirical_regret = _masked_mean(
+            anchors.evaluation_returns_by_action[rows, oracle]
+            - anchors.evaluation_returns_by_action[rows, selected],
+            current_valid,
         )
-        decision_empirical_regret = jnp.sum(
-            valid
-            * (
-                anchors.evaluation_returns_by_action[rows, oracle]
-                - anchors.evaluation_returns_by_action[rows, selected]
+        component_top = jnp.argmax(current_prediction.means, axis=-1)
+        decision_component_disagreement = jnp.mean(
+            (component_top[..., :, None] != component_top[..., None, :]).astype(
+                jnp.float32
             )
-        ) / jnp.maximum(decision_count, 1.0)
+        )
 
-    total_count = response_count + decision_count
-    total = (response_sum + decision_sum) / jnp.maximum(total_count, 1.0)
+        if model.config.method_variant == "delta_active":
+            action_count = int(anchors.probe_fit_returns_by_action.shape[-2])
+            probe_actions = jnp.broadcast_to(
+                jnp.arange(action_count, dtype=jnp.int32),
+                (time.shape[0], action_count),
+            )
+            successor_prediction = successor_decision_predict(
+                latent_params["decision"],
+                latent_params["component_embeddings"],
+                jax.lax.stop_gradient(output.task_features[time, lane]),
+                jax.lax.stop_gradient(output.instant_partner[time, lane]),
+                output.behavior_features[time, lane],
+                probe_actions,
+            )
+            successor_component_logp = decision_component_log_probability(
+                successor_prediction,
+                anchors.probe_fit_returns_by_action,
+                anchors.probe_measurement_covariances,
+                anchors.probe_action_mask,
+            )
+            successor_belief = jnp.broadcast_to(
+                anchor_belief[:, None, :], successor_component_logp.shape
+            )
+            successor_logp = _mixture_log_probability(
+                successor_belief, successor_component_logp
+            )
+            successor_valid = jnp.all(
+                anchors.probe_action_mask, axis=-1
+            ).astype(jnp.float32)
+            (
+                successor_decision_nll,
+                successor_decision_sum,
+                successor_decision_count,
+            ) = _masked_nll(successor_logp, successor_valid)
+            successor_expected = jnp.sum(
+                anchor_belief[:, None, :, None] * successor_prediction.means,
+                axis=-2,
+            )
+            successor_selected = jnp.argmax(successor_expected, axis=-1)
+            successor_oracle = jnp.argmax(
+                anchors.probe_evaluation_returns_by_action, axis=-1
+            )
+            probe_rows = jnp.arange(successor_selected.shape[0])[:, None]
+            probe_indexes = jnp.arange(action_count)[None, :]
+            successor_top_action_agreement = _masked_mean(
+                successor_selected == successor_oracle, successor_valid
+            )
+            successor_empirical_regret = _masked_mean(
+                anchors.probe_evaluation_returns_by_action[
+                    probe_rows, probe_indexes, successor_oracle
+                ]
+                - anchors.probe_evaluation_returns_by_action[
+                    probe_rows, probe_indexes, successor_selected
+                ],
+                successor_valid,
+            )
+
+    # Three channel-normalized proper scores. Immediate and delayed response
+    # measurements share their channel denominator; current and successor CRN
+    # observations share the decision denominator. Instrumentation frequency
+    # therefore cannot become an implicit method weight.
+    shared_total_sum = shared_sum + probe_shared_sum
+    shared_total_count = shared_count + probe_count
+    shared_channel_nll = shared_total_sum / jnp.maximum(shared_total_count, 1.0)
+    semantic_total_sum = semantic_sum + probe_semantic_sum
+    semantic_total_count = semantic_count + probe_semantic_count
+    semantic_channel_nll = semantic_total_sum / jnp.maximum(
+        semantic_total_count, 1.0
+    )
+    decision_total_sum = decision_sum + successor_decision_sum
+    decision_total_count = decision_count + successor_decision_count
+    decision_channel_nll = decision_total_sum / jnp.maximum(
+        decision_total_count, 1.0
+    )
+    total = shared_channel_nll + semantic_channel_nll
+    if uses_decision_channel:
+        total = total + decision_channel_nll
+
+    posterior = jnp.asarray(output.belief, dtype=jnp.float32)
+    prior = jnp.asarray(output.predictive_belief, dtype=jnp.float32)
     posterior_entropy = -jnp.sum(
-        output.belief
-        * jnp.log(jnp.maximum(output.belief, 1.0e-30)),
+        posterior * jnp.log(jnp.maximum(posterior, 1.0e-30)), axis=-1
+    )
+    filter_kl = jnp.sum(
+        posterior
+        * (
+            jnp.log(jnp.maximum(posterior, 1.0e-30))
+            - jnp.log(jnp.maximum(prior, 1.0e-30))
+        ),
         axis=-1,
     )
+    event_probability = jnn.softmax(prediction.interface_event_logits, axis=-1)
+    mean_event_probability = jnp.mean(event_probability, axis=-2, keepdims=True)
+    event_component_js = jnp.mean(
+        jnp.sum(
+            event_probability
+            * (
+                jnp.log(jnp.maximum(event_probability, 1.0e-30))
+                - jnp.log(jnp.maximum(mean_event_probability, 1.0e-30))
+            ),
+            axis=-1,
+        )
+    )
+
+    factor_metrics: dict[str, Any] = {}
+    shared_masks = {
+        "visibility": jnp.ones_like(response_mask),
+        "inventory_change": target.direct.event_mask,
+        "interface_availability": jnp.ones_like(response_mask),
+        "interface_change": target.interface_available,
+        "recipe_change": target.recipe_mask,
+    }
+    for name, logp in response_shared_factor_log_probabilities(
+        prediction, target
+    ).items():
+        mask = response_mask * jnp.asarray(shared_masks[name], dtype=jnp.float32)
+        nll, _, count = _masked_nll(logp, mask)
+        factor_metrics[f"latent_shared_{name}_nll"] = nll
+        factor_metrics[f"latent_shared_{name}_count"] = count
+    semantic_masks = {
+        "position": target.direct.visible_mask,
+        "direction": target.direct.visible_mask,
+        "inventory": target.direct.visible_mask,
+        "interface_event": target.interface_available * target.interface_changed,
+    }
+    for name, component_logp in response_semantic_factor_log_probabilities(
+        prediction, target
+    ).items():
+        mask = response_mask * jnp.asarray(semantic_masks[name], dtype=jnp.float32)
+        nll, _, count = _masked_nll(
+            _mixture_log_probability(output.belief[:-1], component_logp), mask
+        )
+        factor_metrics[f"latent_semantic_{name}_nll"] = nll
+        factor_metrics[f"latent_semantic_{name}_count"] = count
+
     return LossResult(
         total=total,
         metrics={
             "latent_composite_nll": total,
-            "latent_response_nll": response_nll,
+            "latent_shared_response_nll": shared_nll,
+            "latent_semantic_response_nll": semantic_nll,
+            "latent_probe_shared_nll": probe_shared_nll,
+            "latent_probe_semantic_nll": probe_semantic_nll,
+            "latent_shared_total_nll": shared_channel_nll,
+            "latent_semantic_total_nll": semantic_channel_nll,
+            "latent_response_nll": shared_nll + semantic_nll,
             "latent_decision_nll": decision_nll,
-            "latent_response_observations": response_count,
+            "latent_successor_decision_nll": successor_decision_nll,
+            "latent_decision_total_nll": decision_channel_nll,
+            "latent_shared_response_observations": shared_count,
+            "latent_semantic_response_observations": semantic_count,
+            "latent_probe_observations": probe_count,
+            "latent_probe_semantic_observations": probe_semantic_count,
             "latent_decision_observations": decision_count,
+            "latent_successor_decision_observations": successor_decision_count,
+            "latent_shared_total_observations": shared_total_count,
+            "latent_semantic_total_observations": semantic_total_count,
+            "latent_decision_total_observations": decision_total_count,
             "latent_mean_posterior_entropy": jnp.mean(posterior_entropy),
+            "latent_mean_filter_kl": jnp.mean(filter_kl),
+            "latent_component_event_js": event_component_js,
+            "latent_probe_component_event_js": probe_event_js,
             "latent_decision_top_action_agreement": decision_top_action_agreement,
             "latent_decision_empirical_regret": decision_empirical_regret,
+            "latent_decision_component_disagreement": decision_component_disagreement,
+            "latent_successor_top_action_agreement": successor_top_action_agreement,
+            "latent_successor_empirical_regret": successor_empirical_regret,
             "latent_interface_coverage_rate": _masked_mean(
-                response_target.interface_available, response_mask
+                target.interface_available, response_mask
             ),
             "latent_interface_change_rate": _masked_mean(
-                response_target.interface_changed,
-                response_mask * response_target.interface_available,
+                target.interface_changed,
+                response_mask * target.interface_available,
             ),
             "latent_interface_other_multi_rate": _masked_mean(
-                (response_target.interface_event == 30).astype(jnp.float32),
+                (target.interface_event == 30).astype(jnp.float32),
                 response_mask
-                * response_target.interface_available
-                * response_target.interface_changed,
+                * target.interface_available
+                * target.interface_changed,
             ),
             "latent_recipe_coverage_rate": _masked_mean(
-                response_target.recipe_mask, response_mask
+                target.recipe_mask, response_mask
             ),
             "latent_visibility_positive_rate": _masked_mean(
-                response_target.direct.visibility, response_mask
+                target.direct.visibility, response_mask
             ),
             "latent_inventory_change_positive_rate": _masked_mean(
-                response_target.direct.inventory_change,
-                response_mask * response_target.direct.event_mask,
+                target.direct.inventory_change,
+                response_mask * target.direct.event_mask,
             ),
             "latent_recipe_change_positive_rate": _masked_mean(
-                response_target.recipe_changed,
-                response_mask * response_target.recipe_mask,
+                target.recipe_changed, response_mask * target.recipe_mask
             ),
             **factor_metrics,
         },

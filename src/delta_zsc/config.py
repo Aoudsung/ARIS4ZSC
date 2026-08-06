@@ -21,11 +21,11 @@ from typing import Any, Mapping
 import yaml
 
 
-CONFIG_VERSION = 2
-METHOD_VERSION = "delta_joint_geometry_interface_decision_exact_voi_v3"
+CONFIG_VERSION = 3
+METHOD_VERSION = "delta_episode_static_centered_residual_delayed_exact_voi_v4"
 # Schema version 2 dropped every checksum/fingerprint field: artifacts are
 # identified by run id and path, never by a digest.
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
 MANIFEST_VERSION = 2
 FORMAL_METHOD_LABEL = "delta-active"
 OFFICIAL_BASELINE_METHODS = (
@@ -428,9 +428,10 @@ def validate_config(config: RunConfig) -> None:
             config.anchors.evaluation_replicas,
         ) <= 0:
             raise ValueError("Anchor sampling values must be positive.")
-        if config.anchors.fit_replicas < 2:
+        if config.anchors.fit_replicas < OFFICIAL_ACTION_COUNT:
             raise ValueError(
-                "At least two fit replicas are required to estimate decision-emission variance."
+                "Full-rank five-dimensional CRN covariance requires at least "
+                f"{OFFICIAL_ACTION_COUNT} fit replicas."
             )
         if config.anchors.interval_environment_steps % rollout_steps:
             raise ValueError("Anchor interval must align with rollouts.")
@@ -492,7 +493,7 @@ def validate_config(config: RunConfig) -> None:
             not config.anchors.enabled
             or config.anchors.interval_environment_steps != 1_048_576
             or config.anchors.states_per_trigger != 16
-            or config.anchors.fit_replicas != 4
+            or config.anchors.fit_replicas != 8
             or config.anchors.evaluation_replicas != 8
         ):
             raise ValueError("Formal sparse decision-observation budget differs.")

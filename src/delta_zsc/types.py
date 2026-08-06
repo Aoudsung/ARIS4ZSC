@@ -1,8 +1,8 @@
-"""Immutable PyTree-compatible records for unified DELTA-ZSC.
+"""Immutable PyTree-compatible records for DELTA-ZSC v4.
 
-The active state contains only legal deployment history.  Privileged
-counterfactual observations appear exclusively in :class:`AnchorBatch` and are
-never copied into :class:`PolicyState`.
+The deployable state contains only legal interaction history.  Privileged
+counterfactual observations appear exclusively in :class:`AnchorBatch`; they
+are never copied into :class:`PolicyState` or the response-only posterior.
 """
 
 from __future__ import annotations
@@ -11,14 +11,20 @@ from typing import Any, Mapping, NamedTuple
 
 
 class BehaviorStatistics(NamedTuple):
-    """Independent Beta posteriors for six observable behaviour rates."""
+    """Independent Beta posteriors for six legal observable behaviour rates."""
 
     alpha: Any
     beta: Any
 
 
 class PolicyState(NamedTuple):
-    """Complete deployable recurrent state."""
+    """Complete deployable recurrent state for one episode-static latent.
+
+    ``probe_continuation_pending`` is true only for the single intervening
+    action after an active probe.  That action is executed by the collection-
+    time base policy, matching the delayed response and post-response decision
+    estimands.  It is reset at every episode boundary.
+    """
 
     task_carry: Any
     belief: Any
@@ -26,10 +32,11 @@ class PolicyState(NamedTuple):
     previous_observation: Any
     previous_action: Any
     episode_start: Any
+    probe_continuation_pending: Any
 
 
 class DirectResponseTarget(NamedTuple):
-    """Directly observed teammate geometry retained for passive filtering."""
+    """Immediate teammate geometry retained for passive semantic filtering."""
 
     visibility: Any
     relative_position: Any
@@ -43,7 +50,7 @@ class DirectResponseTarget(NamedTuple):
 
 
 class ResponseTarget(NamedTuple):
-    """Complete direct and aligned-interface response observation."""
+    """Complete immediate direct/interface response observation."""
 
     direct: DirectResponseTarget
     interface_available: Any
@@ -53,8 +60,28 @@ class ResponseTarget(NamedTuple):
     recipe_changed: Any
 
 
+class ProbeResponseTarget(NamedTuple):
+    """Two-step delayed response to an ego probe.
+
+    The target is extracted from ``o[t+1] -> o[t+2]`` and removes the direct
+    physical effect of the second ego action. ``valid_mask`` is zero whenever
+    either intervening transition crosses an episode boundary.
+    """
+
+    visibility: Any
+    interface_available: Any
+    interface_changed: Any
+    interface_event: Any
+    valid_mask: Any
+
+
 class DirectResponsePrediction(NamedTuple):
-    """Latent-conditioned direct teammate response distribution."""
+    """Immediate response distribution.
+
+    Occurrence heads have no component axis.  Conditional geometry heads have
+    a component axis and are the only direct-response factors allowed to alter
+    the episode-static posterior.
+    """
 
     visibility_logit: Any
     relative_position_logits: Any
@@ -64,7 +91,7 @@ class DirectResponsePrediction(NamedTuple):
 
 
 class ResponsePrediction(NamedTuple):
-    """Complete response emission; availability is shared across components."""
+    """Immediate response emission with shared occurrence and semantic factors."""
 
     direct: DirectResponsePrediction
     interface_availability_logit: Any
@@ -73,15 +100,26 @@ class ResponsePrediction(NamedTuple):
     recipe_change_logit: Any
 
 
+class ProbeResponsePrediction(NamedTuple):
+    """Compact delayed response used by exact active VOI."""
+
+    visibility_logit: Any
+    interface_availability_logit: Any
+    interface_change_logit: Any
+    interface_event_logits: Any
+
+
 class DecisionPrediction(NamedTuple):
-    """Per-component action-return mean and positive model variance."""
+    """Shared action-value baseline plus centered component residual."""
 
     means: Any
     variances: Any
+    shared_means: Any
+    component_residuals: Any
 
 
 class VOIResult(NamedTuple):
-    """Exact myopic value under the compact active-response marginal."""
+    """Exact value under the 66-outcome delayed probe-response marginal."""
 
     value: Any
     expected_posterior_value: Any
@@ -103,12 +141,16 @@ class ModelOutput(NamedTuple):
     belief: Any
     behavior_features: Any
     response_prediction: ResponsePrediction
+    probe_response_prediction: ProbeResponsePrediction
     response_negative_log_likelihood: Any
     component_decision_means: Any
     component_decision_variances: Any
+    component_successor_decision_means: Any
+    component_successor_decision_variances: Any
     expected_decision_values: Any
     active_voi: Any
     active_information_gain: Any
+    active_probe_eligible: Any
     adaptation_kl: Any
     adaptation_temperature: Any
 
@@ -116,9 +158,14 @@ class ModelOutput(NamedTuple):
 class RolloutBatch(NamedTuple):
     """A time-major on-policy rollout.
 
-    State-like arrays contain ``T+1`` rows.  Transition arrays contain ``T``
-    rows.  ``response_next_observations`` stores the terminal frame on a done
+    State-like arrays contain ``T+1`` rows. Transition arrays contain ``T``
+    rows. ``response_next_observations`` stores the terminal frame on a done
     transition even though ``observations[t+1]`` contains the reset frame.
+
+    Consecutive rows encode the registered delayed probe window without an
+    additional observation copy: for ``t < T-1``, the target transition is
+    ``response_next_observations[t] -> response_next_observations[t+1]`` under
+    ``actions[t+1]`` and is valid iff neither ``dones[t]`` nor ``dones[t+1]``.
     """
 
     observations: Any
@@ -136,7 +183,13 @@ class RolloutBatch(NamedTuple):
 
 
 class AnchorBatch(NamedTuple):
-    """Sparse CRN all-action decision observations."""
+    """Sparse CRN current and delayed post-response all-action observations.
+
+    For each probe, the probe transition and one sampled base-continuation
+    transition are executed before the all-action matrix is forced.  Their
+    rewards are excluded because the delayed response is not usable until the
+    resulting ``t+2`` observation.
+    """
 
     time_indexes: Any
     lane_indexes: Any
@@ -146,10 +199,16 @@ class AnchorBatch(NamedTuple):
     action_mask: Any
     fit_replica_returns_by_action: Any
     evaluation_replica_returns_by_action: Any
+    probe_fit_returns_by_action: Any
+    probe_evaluation_returns_by_action: Any
+    probe_measurement_covariances: Any
+    probe_action_mask: Any
+    probe_fit_replica_returns_by_action: Any
+    probe_evaluation_replica_returns_by_action: Any
 
 
 class AnchorSnapshots(NamedTuple):
-    """The sparse pre-action worlds selected from an anchor rollout."""
+    """Sparse pre-action worlds selected from an anchor rollout."""
 
     time_indexes: Any
     lane_indexes: Any
@@ -205,6 +264,8 @@ __all__ = [
     "LossResult",
     "ModelOutput",
     "PolicyState",
+    "ProbeResponsePrediction",
+    "ProbeResponseTarget",
     "ResponsePrediction",
     "ResponseTarget",
     "RolloutBatch",

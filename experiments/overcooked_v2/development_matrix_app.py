@@ -13,7 +13,12 @@ from typing import Any, Mapping
 import numpy as np
 import yaml
 
-from src.delta_zsc.config import CONFIG_VERSION, METHOD_VERSION, RUN_BUDGETS
+from src.delta_zsc.config import (
+    CONFIG_VERSION,
+    METHOD_VERSION,
+    OFFICIAL_ACTION_COUNT,
+    RUN_BUDGETS,
+)
 from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
 
 from .evaluation_app import build_policy_manifest, run_evaluation
@@ -32,17 +37,78 @@ K_SENSITIVITY_VARIANTS = ("delta_passive", "delta_active")
 DEVELOPMENT_SEEDS = tuple(range(5))
 
 
-def _anchor_budget(payload: Mapping[str, Any]) -> int:
+def _initializer_for_component_count(
+    source: str | Path, component_count: int
+) -> Path:
+    """Resolve one matching initializer or a ``k-K`` matrix subdirectory."""
+
+    root = Path(source).resolve()
+
+    def matches(npz_path: Path, json_path: Path) -> bool:
+        if not npz_path.is_file() or not json_path.is_file():
+            return False
+        metadata = json.loads(json_path.read_text(encoding="utf-8"))
+        shape = metadata.get("event_component_bias_shape")
+        return (
+            isinstance(shape, list)
+            and len(shape) == 2
+            and int(shape[0]) == int(component_count)
+        )
+
+    if root.is_dir():
+        direct_npz = root / "semantic_component_initializer.npz"
+        direct_json = root / "semantic_component_initializer.json"
+        if matches(direct_npz, direct_json):
+            return root
+        candidate = root / f"k-{int(component_count)}"
+        if matches(
+            candidate / "semantic_component_initializer.npz",
+            candidate / "semantic_component_initializer.json",
+        ):
+            return candidate
+    elif root.is_file():
+        npz_path = (
+            root.with_name("semantic_component_initializer.npz")
+            if root.suffix == ".json"
+            else root
+        )
+        json_path = (
+            root
+            if root.suffix == ".json"
+            else root.with_name("semantic_component_initializer.json")
+        )
+        if matches(npz_path, json_path):
+            return root
+    raise FileNotFoundError(
+        "Development matrix requires either one matching initializer artifact "
+        f"or a root containing k-{int(component_count)}/."
+    )
+
+
+def _anchor_budget(
+    payload: Mapping[str, Any], *, method_variant: str | None = None
+) -> int:
+    """Return the exact privileged continuation cost for one DELTA variant."""
+
+    variant = str(
+        payload["method_variant"] if method_variant is None else method_variant
+    )
+    if variant not in {"delta_passive", "delta_active"}:
+        return 0
     base = RUN_BUDGETS["development"].environment_steps
     anchors = payload["anchors"]
     method = payload["method"]
     triggers = base // int(anchors["interval_environment_steps"])
-    return triggers * (
-        int(anchors["states_per_trigger"])
-        * 6
-        * (int(anchors["fit_replicas"]) + int(anchors["evaluation_replicas"]))
-        * int(method["continuation_horizon"])
-    )
+    states = int(anchors["states_per_trigger"])
+    actions = OFFICIAL_ACTION_COUNT
+    replicas = int(anchors["fit_replicas"]) + int(anchors["evaluation_replicas"])
+    horizon = int(method["continuation_horizon"])
+    current = states * actions * replicas * horizon
+    successor = 0
+    if variant == "delta_active":
+        successor = states * actions * replicas * (2 + actions * horizon)
+    per_trigger = current + successor
+    return triggers * per_trigger
 
 
 def _write_variant_config(
@@ -57,7 +123,9 @@ def _write_variant_config(
     payload["method_variant"] = variant.removesuffix("_extra")
     payload["method"]["latent_components"] = int(component_count)
     payload["training"]["extra_ppo_environment_steps"] = (
-        _anchor_budget(payload) if variant.endswith("_extra") else 0
+        _anchor_budget(payload, method_variant="delta_active")
+        if variant.endswith("_extra")
+        else 0
     )
     # Controls without a decision emission never collect anchors.
     if payload["method_variant"] in {"history_rnn", "base", "response_only"}:
@@ -91,10 +159,14 @@ def _validate_training_entries(entries: list[Mapping[str, Any]]) -> None:
                 active = index[(component_count, "delta_active", seed)]["resource_ledger"]
                 if (
                     int(passive["ego_policy_steps"]) != int(active["ego_policy_steps"])
-                    or int(passive["anchor_continuation_steps"])
-                    != int(active["anchor_continuation_steps"])
+                    or int(passive["anchor_continuation_steps"]) <= 0
+                    or int(active["anchor_continuation_steps"])
+                    <= int(passive["anchor_continuation_steps"])
                 ):
-                    raise ValueError("K-sensitivity passive/active budgets differ.")
+                    raise ValueError(
+                        "K-sensitivity must use equal PPO budgets, current-only "
+                        "passive anchors, and larger active successor anchors."
+                    )
                 continue
             by_variant = {variant: index[(4, variant, seed)]["resource_ledger"] for variant in variants}
             base_ppo = {
@@ -105,18 +177,29 @@ def _validate_training_entries(entries: list[Mapping[str, Any]]) -> None:
             }
             if len(base_ppo) != 1:
                 raise ValueError("Core development variants have different PPO budgets.")
-            anchor_cost = int(by_variant["delta_active"]["anchor_continuation_steps"] )
+            passive_anchor_cost = int(
+                by_variant["delta_passive"]["anchor_continuation_steps"]
+            )
+            active_anchor_cost = int(
+                by_variant["delta_active"]["anchor_continuation_steps"]
+            )
             if (
-                anchor_cost <= 0
-                or int(by_variant["delta_passive"]["anchor_continuation_steps"]) != anchor_cost
+                passive_anchor_cost <= 0
+                or active_anchor_cost <= passive_anchor_cost
             ):
-                raise ValueError("Passive and active DELTA must share one sparse-anchor budget.")
+                raise ValueError(
+                    "DELTA-passive must collect current-only anchors and "
+                    "DELTA-active must additionally collect successor anchors."
+                )
             for name in ("history_rnn", "base", "response_only", "history_rnn_extra", "base_extra"):
                 if int(by_variant[name]["anchor_continuation_steps"]) != 0:
                     raise ValueError(f"{name} must not collect privileged decision anchors.")
             ordinary = next(iter(base_ppo))
             for name in ("history_rnn_extra", "base_extra"):
-                if int(by_variant[name]["ego_policy_steps"]) != ordinary + anchor_cost:
+                if (
+                    int(by_variant[name]["ego_policy_steps"])
+                    != ordinary + active_anchor_cost
+                ):
                     raise ValueError(f"{name} does not reallocate the exact anchor cost to PPO.")
                 if int(by_variant[name]["marginal_training_simulator_steps"]) != int(
                     by_variant["delta_active"]["marginal_training_simulator_steps"]
@@ -127,6 +210,12 @@ def run_development_matrix(args: argparse.Namespace) -> None:
     source = Path(args.config).resolve()
     manifest = Path(args.partner_manifest).resolve()
     output = Path(args.output).resolve()
+    initializer_root = getattr(args, "semantic_initializer", None)
+    if not initializer_root:
+        raise ValueError(
+            "Development matrix requires the fitted K=2/4/8 semantic "
+            "initializer root."
+        )
     seeds = tuple(int(value) for value in args.seed_index)
     if tuple(sorted(seeds)) != DEVELOPMENT_SEEDS:
         raise ValueError("Development matrix uses seed indexes 0..4 exactly once.")
@@ -162,6 +251,17 @@ def run_development_matrix(args: argparse.Namespace) -> None:
                     command.append("--resume")
                 if bool(args.require_cuda):
                     command.append("--require-cuda")
+                if initializer_root:
+                    command.extend(
+                        (
+                            "--semantic-initializer",
+                            str(
+                                _initializer_for_component_count(
+                                    initializer_root, component_count
+                                )
+                            ),
+                        )
+                    )
                 if bool(args.skip_manifest_file_check):
                     command.append("--skip-manifest-file-check")
                 # Each matrix cell owns one process so JAX executables, the GPU
@@ -186,6 +286,11 @@ def run_development_matrix(args: argparse.Namespace) -> None:
         "method": METHOD_VERSION,
         "source_config": {"path": str(source)},
         "partner_manifest": {"path": str(manifest)},
+        "semantic_initializer_root": (
+            None
+            if initializer_root is None
+            else str(Path(initializer_root).resolve())
+        ),
         "seeds": list(seeds),
         "main_k4_variants": list(MAIN_VARIANTS),
         "k_sensitivity_variants": list(K_SENSITIVITY_VARIANTS),
@@ -199,6 +304,7 @@ def run_development_matrix(args: argparse.Namespace) -> None:
             "method": METHOD_VERSION,
             "source_config": result["source_config"],
             "partner_manifest": result["partner_manifest"],
+            "semantic_initializer_root": result["semantic_initializer_root"],
         },
     )
     write_json(output / "development_matrix.json", result)

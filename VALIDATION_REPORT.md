@@ -1,131 +1,140 @@
-# DELTA-ZSC validation report
+# DELTA-ZSC v4 validation report
 
 Date: 2026-08-06
 
 ## Scope
 
-The local regression results below cover the superseded VOI v2 package. The
-exact-VOI v3 revision has not been executed locally, but it has compiled and
-completed three fresh development-budget runs plus a real Official-environment
-evaluation on the registered remote CUDA stack. This is development-support
-pilot evidence, not confirmatory OvercookedV2 evidence or a SOTA claim.
+This report validates the source contracts of
+`delta_episode_static_centered_residual_delayed_exact_voi_v4`. It does not
+claim benchmark performance. The v3 CUDA pilot is not v4 evidence and is not
+included in any v4 result.
 
-## Remote CUDA v3 execution
+## Artifact identity
 
-- Runtime: Python 3.10.19, JAX 0.4.38, one NVIDIA A10 CUDA device.
-- Method identity: `delta_active`,
-  `delta_joint_geometry_interface_decision_exact_voi_v3`, config schema 2,
-  checkpoint schema 3.
-- Training: seeds 0, 1 and 2 each completed all 1,228,800 registered
-  development ego-policy steps, 150 updates, 12 anchor triggers and final
-  deployment export; no base or latent non-finite update was recorded.
-- Evaluation: 3,600 real Official-environment episodes against the available
-  `development_support` SP/OP pilot panel; mean raw return `6.6777777778`.
-- Artifact root:
-  `/mnt/workspace/ARIS4ZSC_v5/runs/engineering/SP_OP_results/delta_interface_v3_3seed_20260806`.
+- Upstream source commit:
+  `15e90b1be0d50ef99df0fa5837312d70fa913643`.
+- Local source-archive baseline:
+  `018dd8202abd06e2a685872406c8d4a6e1804e69`.
+- Config schema: 3.
+- Checkpoint/deployment schema: 4.
+- Manifest schema: 2.
+- Package: `aris4zsc==0.6.0`.
+- Official source commit: `5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`.
 
-The pilot exposes a substantive scientific failure rather than an execution
-failure: mean posterior entropy remains within roughly `3e-4` of `log(4)`, final
-top-action agreement is only `0.0625`--`0.125`, and exact VOI/information gain
-remain near zero. The SP-partner subset averages `17.6778`, while the OP-partner
-subset averages `-4.3222`; role 0 averages `13.8778` and role 1 `-0.5222`.
-A descriptive one-seed SP comparator on the same panel averages `5.6167`, versus
-`6.6778` for the three DELTA seeds. This is not an inferential comparison: the
-SP ego is seed 201, shares lineage with the panel's SP parent, and is evaluated
-against its own staged checkpoints.
+## Local environment
 
-## Local validation environment
+The recorded regression was executed on CPU. Exact Python, JAX, NumPy,
+duration and per-test records are machine-readable in
+`validation/ISOLATED_TEST_RESULTS.json` and mirrored in
+`validation/LOCAL_TEST_RESULTS.txt`.
 
-- Python: 3.13.5
-- JAX: 0.9.0.1, CPU backend
-- NumPy: 2.3.5
-- Formal registered environment: Python 3.10, JAX/JAXLIB 0.4.38 and pinned
-  Official OvercookedV2 dependencies in `pyproject.toml`
+The installable project remains pinned to Python 3.10, JAX/JAXLIB 0.4.38 and
+NumPy below 2 through `pyproject.toml`. The local container used to edit the
+source has a newer CPU-only Python/JAX stack; the isolated subprocess runner
+prevents cross-test JAX executable retention.
 
-The local environment differs from the formal environment. Tests were therefore
-run as isolated CPU processes. The GitHub workflow installs and checks the
-registered Python 3.10 dependency set; the optional self-hosted job performs a
-real CUDA mechanical preflight.
+## Executed acceptance paths
 
-## Regression results
+### Static and command contracts
 
-| Test file | Result | Tests |
-|---|---:|---:|
-| `test_delta_unified_voi.py` | passed | 7 |
-| `test_delta_unified_core.py` | passed | 6 |
-| `test_delta_unified_training.py` | passed | 4 |
-| `test_delta_unified_runner_storage.py` | passed | 2 |
-| `test_delta_unified_manifest.py` | passed | 1 |
-| `test_delta_unified_repository.py` | passed | 6 |
-| **Total** | **passed** | **26** |
+`validation/run_contract_validation.sh` verifies:
 
-The listed v2 tests covered the prior numerical integration and
-uninformative/revealing/decision-irrelevant response cases, binary
-marginalization, probe-conditioned JIT execution, exact filtering, KL
-satisfaction, all method variants, belief independence from decision-only
-parameters, separate finite base/latent updates, latent-before-PPO transaction
-ordering, response-only exclusion of decision anchors, legal rollout and CRN
-anchor collection, base-only training behavior, checkpoint/deployment round
-trip, manifest lineage, and active/legacy repository boundaries.
+- compilation of active source, experiment applications and validation tools;
+- Python 3.10 grammar compatibility for every active Python source;
+- loading all six Simple/Wide mechanical/development/formal configs;
+- the root CLI and 16 subcommand help paths;
+- workflow YAML parsing;
+- one active scientific namespace;
+- absence of active `transition.py`;
+- no retired DEPI objective symbols in the active namespace;
+- no committed credential patterns or local absolute paths;
+- exact dependency equality between `pyproject.toml` and `requirements.txt`;
+- regenerated exact delayed-VOI synthetic diagnostics.
 
-## Synthetic VOI acceptance values
+### Isolated pytest regression
+
+`validation/run_all_isolated_tests.py` discovers each top-level
+`test_delta_*.py` function and runs it in a fresh bounded subprocess. The suite
+covers:
+
+| Area | Contract coverage |
+|---|---|
+| CLI and matrix orchestration | argument wiring, seed defaults, fresh-process matrix cells, K-specific initializer roots |
+| Repository identity | active namespace, package discovery, workflow, v4 identity, authoritative exact-VOI documents |
+| Observation semantics | frame alignment, interact exclusion, recipe/interface masks, delayed two-step target and terminal masking |
+| Episode-static Bayes filter | persistence, reset, decision isolation, shared-occurrence isolation |
+| Centered emissions | response residuals, current decision residuals, successor decision residuals, shared variance |
+| Semantic initializer | simplex centering, SVD artifact round trip, label rejection, layout/protocol/lineage provenance |
+| Proper scores and optimization | exact three-channel sum, response-only anchor exclusion, parameter ownership, latent-before-PPO ordering |
+| CRN anchors | base-policy rollout, sparse capture equivalence, delayed base bridge, successor reward exclusion, passive/active schemas |
+| Exact active value | 66 normalized outcomes, uninformative zero value, decision-irrelevant information, mandatory probe-conditioned utility |
+| Deployment/storage | checkpoint round trip, initializer provenance in deployment, one-step active base bridge |
+| Final audit | probe-axis reduction before anchor masking, finite action-selectivity and component diagnostics |
+
+The final frozen-worktree regression discovered and executed **50** tests:
+**50/50 passed**, with **0 failures** and
+**0 timeouts**, in **354.538 seconds**.
+
+Per-file distribution:
+
+| Test file | Count |
+|---|---:|
+| `test_delta_unified_cli.py` | 3 |
+| `test_delta_unified_core.py` | 11 |
+| `test_delta_unified_manifest.py` | 4 |
+| `test_delta_unified_repository.py` | 7 |
+| `test_delta_unified_runner_storage.py` | 4 |
+| `test_delta_unified_training.py` | 6 |
+| `test_delta_unified_voi.py` | 4 |
+| `test_delta_v4_semantics.py` | 11 |
+| **Total** | **50** |
+
+The authoritative per-test evidence is in the generated result files rather
+than being inferred from this prose.
+
+## Exact-VOI synthetic acceptance
 
 `validation/voi_synthetic_diagnostics.json` records:
 
-- uninformative response: VOI `0.0`, information gain `0.0`;
-- decision-revealing response: VOI approximately `0.999329`, information gain
-  approximately `0.690129`;
-- component-identifying but decision-irrelevant response: information gain
-  approximately `0.690129`, VOI `0.0`.
+- exactly 66 outcomes;
+- maximum component outcome-mass error below `1e-7`;
+- uninformative delayed response: VOI and information gain at float32 zero;
+- decision-revealing response: positive VOI and positive information gain;
+- component-identifying but successor-decision-irrelevant response: positive
+  information gain and float32-zero VOI.
 
-This directly checks that active DELTA values information only through its
-consequence for action choice, not through partner identifiability itself.
+The implementation contains no Halton sequence, quadrature sample count,
+quadrature convergence gate, VOI clamp, or information-gain reward.
 
-## Superseded v2 contract validation
+## What this validation establishes
 
-- Active source and experiment applications compile successfully.
-- All six registered Simple/Wide mechanical/development/formal configurations
-  load and pass exact-field validation.
-- All 15 CLI subcommands and the top-level CLI parse their help paths.
-- `.github/workflows/delta-unified-ci.yml` parses as YAML and contains the CPU
-  acceptance and optional self-hosted CUDA jobs.
-- `src/path_c/` and the old root analysis track are absent from the active tree.
-- Active applications contain no `src.path_c` import.
-- Retired comparator/separation/context-dropout/capability/gradient-routing/
-  decision-regret/cross-log-likelihood tokens are absent from `src/delta_zsc`.
-- No credential-like private-key, GitHub-token, or AWS-key pattern was found.
-- The complete old package, applications, configs, tests, workflow, analysis,
-  and status ledgers remain available only under explicit legacy paths.
+The executed checks establish that the implementation can represent and run:
 
-## Configuration identity
+- an episode-static response posterior;
+- shared occurrence and component-semantic likelihoods;
+- centered response/current-decision/successor-decision residuals;
+- an unlabeled spectral-simplex initializer with strict provenance;
+- separately normalized shared, semantic and decision proper scores;
+- causal delayed probe-response timing;
+- probe-conditioned t+2 CRN action values;
+- exact 66-outcome active VOI with `gamma^2` temporal placement;
+- one committed base bridge after an active probe;
+- versioned checkpoint and deployment artifacts.
 
-The six registered configurations are
+## Not executed in this package
 
-`experiments/overcooked_v2/configs/delta_unified_{simple,wide}_{development,formal,mechanical}.yaml`.
+The following remain empirical work and are not represented as passed:
 
-Configuration identity is the resolved configuration itself, not a digest of it.
-Every run writes its complete resolved config into `run_identity.json`, into the
-checkpoint descriptor identity, and into `deployment_bundle.json`; `ensure_run_identity`
-refuses to reuse an output directory whose recorded config differs. Changing a
-configuration therefore still changes the experiment identity, and the difference is
-readable rather than opaque.
+1. construction of fitted K=2/4/8 semantic initializers from the registered
+   real calibration lineages;
+2. restoration and execution of real Official SP/OP parent checkpoints under
+   v4;
+3. one-update CUDA mechanical acceptance on the registered Python 3.10/JAX
+   0.4.38 stack;
+4. paired five-seed Simple/Wide development matrices;
+5. ten-run formal training/evaluation and preregistered H1/H2/H3 inference;
+6. any comparison with SOTA.
 
-## Not executed
-
-The following require resources not present in the local runtime and are not
-represented as passed:
-
-1. v3 local CPU regression and synthetic diagnostics regeneration;
-2. a lineage-disjoint multi-parent calibration/confirmatory panel;
-3. paired five-seed Simple/Wide development matrices;
-4. ten-run formal training/evaluation and H1/H2/H3 inference.
-
-Their absence prevents a performance or SOTA claim. The remote pilot establishes
-that the revised implementation executes end to end; it does not establish that
-the current learned posterior or active policy is scientifically effective.
-
-## Source identity
-
-The source of record is the git history of this repository: a revision is named
-by its commit, not by a checksum manifest. `SOURCE_MANIFEST_SHA256.txt` and the
-ZIP checksum sidecar were removed together with every other digest in the tree.
+A successful source regression is necessary but not evidence that latent
+components become partner-semantic or that return improves. Those questions
+must be answered by the registered development and formal protocols.

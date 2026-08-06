@@ -1,51 +1,59 @@
-# DEVELOPMENT_MATRIX — Registered feasible matrix
+# DEVELOPMENT_MATRIX — Registered DELTA-ZSC v4 matrix
 
 `authoritative: true`
 
 ## Main K=4 block
 
-Five paired seeds (`0..4`) are used for every row and each layout.
+Five paired seeds (`0..4`) are used for every row and layout. Each DELTA row is
+bound to the same layout-specific residual-panel initializer root; the runner
+selects the K-specific `k-2`, `k-4`, or `k-8` artifact for that row. Thus K
+sensitivity changes only the simplex cardinality, not the calibration data.
+The matrix command therefore requires `--semantic-initializer`; latent-bearing
+development cells do not silently fall back to an unfitted simplex.
 
-| Variant | Response latent | Decision channel | KL adaptation | Active VOI | Anchor cost |
+| Variant | Episode-static response latent | Current decision | Delayed response + successor decision | KL adaptation | Anchor cost |
 |---|---:|---:|---:|---:|---:|
 | history_rnn | no | no | no | no | 0 |
 | base | no | no | no | no | 0 |
 | response_only | yes | no | no | no | 0 |
-| delta_passive | yes | yes | yes | no | registered |
-| delta_active | yes | yes | yes | yes | registered |
+| delta_passive | yes | yes | no | yes | current anchors |
+| delta_active | yes | yes | yes | yes | current + successor anchors |
 | history_rnn_extra | no | no | no | no | reallocated to PPO |
 | base_extra | no | no | no | no | reallocated to PPO |
 
-The first five rows have equal ordinary PPO interaction. Passive and active use
-identical anchor observations. The two extra controls add exactly the anchor
-continuation transition count to PPO and collect no privileged labels.
-Deployable parameter capacity is checked within each paired block.
+The core rows have equal ordinary PPO interaction. Extra controls add the exact
+charged current/successor continuation transition count to PPO and receive no
+counterfactual labels.
 
 ## K sensitivity
 
-Only passive and active DELTA are run for `K=2` and `K=8`. The main `K=4` runs
-are reused, giving 10 additional training runs per layout rather than another
-full matrix.
+Only passive and active DELTA are run for `K=2` and `K=8`; the main `K=4` runs
+are reused. Initializer construction uses the same residual data but projects a
+simplex with the registered K.
 
 ## Pre-specified contrasts
 
 1. `delta_passive - response_only` — decision-emission contribution.
-2. `delta_active - delta_passive` — active response VOI.
+2. `delta_active - delta_passive` — delayed active-response contribution.
 3. `delta_active - base`.
 4. `delta_active - history_rnn`.
 5. `delta_active - base_extra`.
 6. `delta_active - history_rnn_extra`.
 
-The matrix application mechanically validates interaction, anchor and capacity
-alignment before writing its artifact.
+## Required paired diagnostics
 
-## Diagnostic interpretation
+- base action/reward and partner-stream identity where variants should share
+  collection behavior;
+- initializer identity and singular values;
+- component event JS and partner-separation L1;
+- response-induced filter KL and phase drift;
+- current/successor agreement, regret, and component disagreement;
+- VOI and information-gain action spread;
+- active/passive policy TV;
+- report-only semantic/decision gradient norms and cosine on the shared
+  component embeddings.
 
-- High information gain with zero VOI means identifiable but decision-irrelevant
-  response structure.
-- A negative exact VOI beyond floating-point noise indicates a numerical or
-  normalization defect; values are reported, not silently clamped.
-- Low decision NLL but no XP gain points to policy conversion or distribution
-  mismatch.
-- Response improvement without decision improvement falsifies the claim that
-  generic teammate prediction is sufficient.
+High posterior sharpness with low partner separation is a failed global winner,
+not successful inference. Positive information gain with zero VOI spread is not
+active probing. Low decision loss without held-out return gain localizes failure
+to policy conversion or distribution shift.

@@ -1,137 +1,202 @@
-# THEORY — Finite guarantees and explicit limits
+# THEORY — DELTA-ZSC v4 guarantees, identifiability, and limits
 
 `authoritative: true`
 
-## 1. Exact filter relative to the learned model
+## 1. Exact episode-static filtering
 
-Given a normalized previous belief, row-stochastic transition `T`, and finite
-component response likelihoods, the update in `belief_filter.py` is exactly the
-categorical Chapman-Kolmogorov prediction followed by Bayes correction. The
-result is normalized and non-negative. This is an implementation theorem about
-the registered latent model, not a claim that its components are true human
-protocols.
-
-## 2. Proper composite latent score
-
-The response and CRN decision channels are conditionally independent given the
-same component. Their summed negative log likelihood is a proper composite
-predictive score for the registered factorization. Normalization by `N_y+N_A`
-changes estimator scale, not its optimum. No arbitrary auxiliary-loss weights
-are required.
-
-## 3. Mirror-policy solution
-
-For fixed base policy `pi_0`, finite action values `Q`, and KL radius
-`delta>0`, the constrained objective
+Given a normalized prior `b`, finite semantic log likelihoods `ell_k`, and no
+episode boundary, `belief_filter.py` returns
 
 \[
-\max_\pi \langle\pi,Q\rangle
-\quad\text{s.t.}\quad D_{KL}(\pi\Vert\pi_0)\le\delta
+\operatorname{softmax}(\log b+\ell).
 \]
 
-has the exponential-tilting solution
+At an episode boundary it replaces `b` by the uniform prior before correction
+and suppresses the fictitious cross-episode response. The implementation is an
+exact categorical Bayes update for the registered episode-static model. It is
+not a claim that a component equals a unique human protocol.
+
+## 2. Shared factors cannot alter posterior odds
+
+Suppose the complete response likelihood factorizes as
 
 \[
-\pi_\eta(a)\propto\pi_0(a)e^{Q(a)/\eta}.
+p(y\mid k)=p_{sh}(y^{occ})p_{sem}(y^{sem}\mid k).
 \]
 
-KL decreases monotonically with `eta`; bisection therefore returns the unique
-boundary solution when the constraint is active. The code tests the achieved KL
-numerically.
-
-This guarantees improvement only for the supplied model-based objective. A
-real-return guarantee additionally requires accurate action values.
-
-## 4. Non-negativity of exact decision VOI
-
-Let
+Then
 
 \[
-V(b)=\max_a\sum_kb_k\mu_k(a).
+\frac{b'(i)}{b'(j)}=
+\frac{b(i)p_{sem}(y\mid i)}{b(j)p_{sem}(y\mid j)},
 \]
 
-`V` is the maximum of linear functions and is therefore convex. A Bayes
-posterior is a martingale, so
+because `p_sh` cancels. v4 enforces this cancellation structurally by removing
+the component axis from occurrence heads and by passing only semantic log
+probabilities to `filter_update`. Therefore high-frequency partner-independent
+no-change events cannot create a component winner.
+
+## 3. Centered residual decomposition
+
+For component logits `L_k=L_0+Delta_k` with `sum_k Delta_k=0`, the component
+mean is exactly `L_0`. Shared prediction and specialization are identifiable as
+separate parameter roles: changing all components equally cannot be represented
+by the residual branch, and changing only the pooled baseline cannot create a
+posterior likelihood ratio.
+
+Centering does not guarantee useful specialization by itself. It removes the
+specific pooled-offset degeneracy and supplies first-order component paths. The
+semantic predictive score still decides whether residual differences persist.
+
+## 4. Spectral-simplex initializer properties
+
+The initializer is centered because both the regular simplex vertices and the
+final bias are zero mean over components. It is label-free because its inputs
+are only episode-grouped event residuals after cross-fitted pooled prediction.
+Every frame coordinate participates through a fixed Rademacher projection whose
+dimension and seed are stored in the artifact; behavior and action features are
+uncompressed. Partner IDs and SP/OP labels are absent from the construction
+function and artifact contract.
+
+SVD chooses directions of greatest unexplained episode-level event variation;
+it does not assert that those directions are true partner identities. The
+simplex gives all components equal norm and pairwise symmetric starting
+geometry, avoiding a privileged random winner.
+
+## 5. Three proper predictive channels
+
+Each channel term is a mean negative log probability of observations generated
+under the registered conditional model. A fixed sum of proper scores remains a
+proper composite score for those marginals. Separate normalization changes
+channel scale but not the optimum of an individual channel and prevents sample
+frequency from becoming an implicit coefficient.
+
+Because the three marginals share parameters and a latent variable, their
+optima can conflict. The final anchor audit computes exact semantic and
+decision gradient norms and their cosine on the shared component embeddings.
+These diagnostics reveal conflict without gating training or tripling the full
+optimizer backward pass.
+
+## 6. Decision contrast likelihood
+
+Centered six-action returns lie in the five-dimensional subspace orthogonal to
+the all-ones vector. The Helmert basis is orthonormal on that subspace, so
+projecting targets, means, and covariance loses only the unidentifiable common
+offset. With at least six fit replicas, the sample covariance can be full rank
+five before numerical jitter. The shared model variance keeps component
+likelihood differences tied to predicted means rather than component-specific
+uncertainty.
+
+## 7. CRN successor estimand
+
+For a probe `a` and post-response action `a'`, the registered target is the
+discounted return beginning at `t+2`, where `a'` is forced after one unforced
+collection-time-base bridge. Rewards on both the probe and bridge transitions
+are excluded. Matched roots and step IDs make noise common across probe and
+decision alternatives. Sequential `lax.map` changes only execution memory,
+not the random variables or estimator.
+
+The successor predictor conditions on the pre-probe legal state and probe. It
+therefore models an expectation over the stochastic probe successor, the
+unforced bridge action, the teammate reaction, and environment transition; it
+is not a deterministic simulator-state value oracle.
+
+## 8. Delayed response causal timing
+
+In the simultaneous-action environment, the partner action at time `t` cannot
+condition on ego action `a_t`. The earliest policy reaction is the partner
+action selected at `t+1`. Therefore the delayed target compares the
+intermediate and delayed observations. Removing the second ego action's direct
+physical effect leaves a legal observable response attributable to the joint
+successor dynamics under the registered continuation distribution.
+
+This target is causal with respect to probe timing but remains observational:
+other state changes and partner stochasticity are integrated by the learned
+conditional distribution.
+
+## 9. Exact 66-outcome normalization
+
+The delayed compact outcome distribution contains:
+
+- two `availability=0` outcomes;
+- two `availability=1, change=0` outcomes;
+- sixty-two `availability=1, change=1` event outcomes.
+
+Shared Bernoulli factors are broadcast across components; the 31-class event is
+normalized per component. Summing the 66 exponentiated log probabilities equals
+one for every probe and component up to floating-point error.
+
+## 10. Non-negativity of exact decision VOI
+
+For fixed probe-conditioned successor matrix `mu^a`,
 
 \[
-\mathbb E_y[b^{y}]=\bar b.
+V^a(b)=\max_{a'}\sum_k b(k)\mu^a_k(a')
 \]
 
-Jensen's inequality gives
+is convex in `b`. A Bayes posterior is a martingale under the predictive outcome
+distribution, so Jensen's inequality gives
 
 \[
-\mathbb E_y[V(b^y)]-V(\bar b)\ge0.
+\mathbb E_y[V^a(b^{a,y})]-V^a(b)\ge0.
 \]
 
-The implementation exactly sums its finite 66-outcome active-response marginal
-and uses the resulting value directly. It records small negative values and
-their frequency as floating-point diagnostics rather than changing them.
+The code sums all 66 outcomes exactly. Negative values can therefore only be
+floating-point artifacts or malformed inputs; they are reported, not modified.
 
-## 5. Decision relevance, not identity information
+## 11. Information is not decision value
 
-If all components induce the same action-value vector, then `V(b)` is independent
-of `b`; hence VOI is exactly zero even when the response perfectly identifies
-the component. More generally, information that only separates components with
-identical optimal decision value has zero decision VOI. This property is covered
-by a synthetic test where information gain is positive but VOI is zero.
+If every component has the same successor action-value vector, `V^a` is
+independent of belief and VOI is zero even if the response identifies the
+component perfectly. Conversely, action-independent response information can
+produce the same positive VOI for every probe and therefore no active policy
+change. v4 consequently reports action-wise VOI spread, information-gain
+spread, and active/passive policy total variation in addition to their means.
 
-## 6. Exact compact-marginal scope
+## 12. Mirror-policy guarantee
 
-Passive filtering scores the complete response. Active probing exactly sums the
-compact marginal `(visibility,M,C,E)`: two unavailable, two available/no-change,
-and sixty-two available/change-event outcomes. Conditional geometry,
-inventory-change, and recipe are analytically marginalized by omission from
-this marginal, not numerically sampled. Thus exactness refers to this registered
-compact marginal, not to enumeration of every full geometric response tuple.
+For finite action values and `delta>0`, maximizing expected supplied value under
+`D_KL(pi||pi0)<=delta` has the exponential-tilt solution. Bisection finds the
+active boundary when required. This guarantees optimality only for the supplied
+model-based values. Real-return improvement requires accurate response and
+decision models.
 
-## 7. Scope of the local-stationarity surrogate
+## 13. Identifiability boundary
 
-The true one-step Bayes-adaptive value may use a response- and probe-dependent
-future utility matrix `mu^{a,y}`. The standard model uses a shared local matrix
-`mu`. Suppose
+Finite mixtures are permutation-invariant. Centering and simplex initialization
+remove a harmful symmetric fixed point but do not establish unique semantic
+labels. Scientific usefulness requires all of the following empirical links:
 
-\[
-\sup_{a,y,k,a'}|\mu^{a,y}_k(a')-\mu_k(a')|\le\epsilon_{drift}.
-\]
+1. semantic component distributions differ;
+2. legal histories select different mixtures for different partners;
+3. component decision residuals induce different action orderings;
+4. the correct belief has higher same-world continuation value than a shuffled
+   belief.
 
-For any belief, the corresponding optimal values differ by at most
-`epsilon_drift`; applying this to both posterior and prior terms yields
+Posterior sharpness alone is insufficient; a partner-independent global winner
+fails conditions 2 and 4.
 
-\[
-|\mathrm{VOI}_{true}(a)-\mathrm{VOI}_{local}(a)|
-\le 2\epsilon_{drift}.
-\]
+## 14. Approximation boundary
 
-Thus the active term is well-founded when decision-equivalent action ordering
-changes slowly over the one-response horizon. The repository does not claim
-exact long-horizon planning. The public VOI API already accepts
-probe-conditioned future utilities for a future extension that supplies them
-with valid training observations.
+v4 is not a full Bayes-adaptive POMDP solver. The delayed head predicts one
+reaction window, and successor decision values integrate one registered base
+bridge plus the horizon-`H` continuation. VOI values only the first decision at
+`t+2` after that response, and its incremental control contribution is
+discounted by `gamma^2`. It does not recursively price all future information.
 
-## 8. Error decomposition for adapted performance
+The method also assumes the episode-static latent is an adequate summary of
+partner-relevant convention uncertainty. Continuous within-partner adaptation
+that cannot be represented by legal history features and `K` exchangeable
+residual modes remains model error.
 
-The difference between the ideal and implemented adapted objective can be
-decomposed into:
+## 15. Explicit non-claims
 
-1. response-model error;
-2. posterior filtering error inherited from that model;
-3. decision-emission error;
-4. local-stationarity error;
-5. compact-active-marginal approximation error;
-6. KL projection restriction.
+The implementation does not prove:
 
-The architecture exposes diagnostics for response NLL, held-out decision
-ordering, posterior entropy, exact VOI minimum/negative fraction, information
-gain, aligned-event coverage/calibration, and achieved KL. These measurements diagnose failure but do not
-become additional training gates.
-
-## 9. What is not proved
-
-No theorem in this repository establishes:
-
-- universal ZSC generalization to arbitrary partners;
-- global return improvement under misspecified emissions;
-- semantic identifiability of latent components beyond permutation;
-- exact recovery of teammate intent;
-- exact solution of the full partially observable stochastic game;
-- SOTA performance without confirmatory raw results.
+- recovery of partner identity or training algorithm;
+- unique latent semantics;
+- calibrated posterior from entropy alone;
+- real-return improvement from mirror adaptation without accurate values;
+- SOTA performance without formal frozen matrices;
+- exact long-horizon active planning;
+- independence of behavior statistics from partner history.

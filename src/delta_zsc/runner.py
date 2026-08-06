@@ -228,6 +228,7 @@ def collect_rollout(
             "belief": output.belief,
             "active_voi": output.active_voi,
             "active_information_gain": output.active_information_gain,
+            "active_probe_eligible": output.active_probe_eligible,
             "adaptation_kl": output.adaptation_kl,
         }
         return next_state, row

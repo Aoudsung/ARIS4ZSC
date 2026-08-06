@@ -1,10 +1,8 @@
-"""Exact filtering under the learned physical-time latent model."""
+"""Exact response-only filtering for an episode-static coordination latent."""
 
 from __future__ import annotations
 
 from typing import Any
-
-from .transition import predict_belief
 
 
 def uniform_belief(batch_shape: tuple[int, ...], component_count: int) -> Any:
@@ -17,24 +15,38 @@ def uniform_belief(batch_shape: tuple[int, ...], component_count: int) -> Any:
     )
 
 
-def filter_update(
+def episode_static_prior(
     previous_belief: Any,
-    transition_logits: Any,
-    component_log_likelihood: Any,
+    episode_start: Any,
+    component_count: int | None = None,
 ) -> Any:
-    """Apply one Chapman-Kolmogorov prediction and Bayes correction.
+    """Return identity persistence inside an episode and uniform reset at its start."""
 
-    Missing response factors are represented inside the component likelihood by
-    multiplicative ones (zero log contribution).  The physical-time transition
-    is never silently replaced by identity.
-    """
-
-    import jax.nn
     import jax.numpy as jnp
 
-    predictive = predict_belief(previous_belief, transition_logits)
-    return jax.nn.softmax(
-        jnp.log(jnp.maximum(predictive, 1.0e-30))
+    belief = jnp.asarray(previous_belief, dtype=jnp.float32)
+    count = int(belief.shape[-1] if component_count is None else component_count)
+    start = jnp.asarray(episode_start, dtype=jnp.bool_)
+    uniform = uniform_belief(start.shape, count)
+    normalized = belief / jnp.maximum(jnp.sum(belief, axis=-1, keepdims=True), 1.0e-30)
+    return jnp.where(start[..., None], uniform, normalized)
+
+
+def filter_update(previous_belief: Any, component_log_likelihood: Any) -> Any:
+    """Apply one Bayes correction without a physical-time transition.
+
+    Only component-semantic likelihoods may be passed here. Shared occurrence
+    factors are deliberately absent, so a component cannot win merely by
+    predicting partner-independent no-change/visibility frequencies.
+    """
+
+    import jax.nn as jnn
+    import jax.numpy as jnp
+
+    prior = jnp.asarray(previous_belief, dtype=jnp.float32)
+    prior = prior / jnp.maximum(jnp.sum(prior, axis=-1, keepdims=True), 1.0e-30)
+    return jnn.softmax(
+        jnp.log(jnp.maximum(prior, 1.0e-30))
         + jnp.asarray(component_log_likelihood, dtype=jnp.float32),
         axis=-1,
     )
@@ -49,4 +61,9 @@ def belief_entropy(belief: Any) -> Any:
     )
 
 
-__all__ = ["belief_entropy", "filter_update", "uniform_belief"]
+__all__ = [
+    "belief_entropy",
+    "episode_static_prior",
+    "filter_update",
+    "uniform_belief",
+]

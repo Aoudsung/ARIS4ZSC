@@ -59,24 +59,25 @@ def test_action_contrast_basis_is_orthonormal_and_offset_invariant() -> None:
     )
 
 
-def test_filter_uses_physical_transition_and_exact_response_correction() -> None:
+def test_episode_static_filter_persists_and_resets_only_at_episode_start() -> None:
     import jax.numpy as jnp
 
-    from src.delta_zsc.belief_filter import filter_update
+    from src.delta_zsc.belief_filter import episode_static_prior, filter_update
 
-    belief = jnp.asarray([[0.9, 0.1]], dtype=jnp.float32)
-    transition_logits = jnp.log(
-        jnp.asarray([[0.8, 0.2], [0.3, 0.7]], dtype=jnp.float32)
+    belief = jnp.asarray([[0.9, 0.1], [0.2, 0.8]], dtype=jnp.float32)
+    prior = episode_static_prior(
+        belief, jnp.asarray([False, True]), component_count=2
     )
-    neutral = jnp.zeros_like(belief)
-    predicted = belief @ jnp.exp(transition_logits)
+    np.testing.assert_allclose(np.asarray(prior[0]), np.asarray(belief[0]), atol=1e-6)
+    np.testing.assert_allclose(np.asarray(prior[1]), [0.5, 0.5], atol=1e-6)
+    neutral = jnp.zeros_like(prior)
     np.testing.assert_allclose(
-        np.asarray(filter_update(belief, transition_logits, neutral)),
-        np.asarray(predicted),
-        atol=1e-6,
+        np.asarray(filter_update(prior, neutral)), np.asarray(prior), atol=1e-6
     )
-    evidence = jnp.asarray([[0.0, -10.0]], dtype=jnp.float32)
-    assert float(filter_update(belief, transition_logits, evidence)[0, 0]) > 0.99
+    evidence = jnp.asarray([[0.0, -10.0], [-10.0, 0.0]], dtype=jnp.float32)
+    corrected = filter_update(prior, evidence)
+    assert float(corrected[0, 0]) > 0.99
+    assert float(corrected[1, 1]) > 0.99
 
 
 def test_interface_alignment_and_interact_exclusion_contract() -> None:
@@ -144,6 +145,10 @@ def test_model_executes_all_variants_with_one_shared_interface() -> None:
         assert next_state.belief.shape == (3, 4)
         assert output.policy_logits.shape == (3, 6)
         assert output.component_decision_means.shape == (3, 4, 6)
+        assert output.component_successor_decision_means.shape == (3, 6, 4, 6)
+        assert output.probe_response_prediction.interface_event_logits.shape == (
+            3, 6, 4, 31
+        )
         assert output.active_voi.shape == (3, 6)
         assert bool(jnp.all(jnp.isfinite(output.policy_logits)))
         if variant in {"delta_passive", "delta_active"}:
@@ -180,3 +185,171 @@ def test_decision_parameters_cannot_change_online_belief() -> None:
     np.testing.assert_allclose(
         np.asarray(original.belief), np.asarray(modified.belief), atol=1e-6
     )
+
+
+def test_v4_response_and_decision_residuals_are_component_centered() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.decision_model import decision_predict, successor_decision_predict
+    from src.delta_zsc.response_model import response_predict
+
+    config = _small_config("delta_active")
+    from src.delta_zsc.model import DeltaModel
+
+    model = DeltaModel(config, (5, 5, 39), 6)
+    _, latent = model.init_parameters(jax.random.PRNGKey(81))
+    frame = jnp.zeros((2, 5, 5, 39), dtype=jnp.float32)
+    behavior = jnp.zeros((2, 12), dtype=jnp.float32)
+    actions = jnp.asarray([0, 1], dtype=jnp.int32)
+    response = response_predict(
+        latent["response"], latent["component_embeddings"], frame, behavior, actions
+    )
+    event_residual = response.interface_event_logits - jnp.mean(
+        response.interface_event_logits, axis=-2, keepdims=True
+    )
+    np.testing.assert_allclose(
+        np.asarray(jnp.sum(event_residual, axis=-2)), 0.0, atol=2.0e-6
+    )
+    decision = decision_predict(
+        latent["decision"],
+        latent["component_embeddings"],
+        jnp.zeros((2, 16), dtype=jnp.float32),
+        jnp.zeros((2, 8), dtype=jnp.float32),
+        behavior,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jnp.sum(decision.component_residuals, axis=-2)),
+        0.0,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(jnp.sum(decision.component_residuals, axis=-1)),
+        0.0,
+        atol=2.0e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(decision.variances),
+        np.asarray(jnp.broadcast_to(decision.variances[..., :1, :], decision.variances.shape)),
+        atol=1.0e-6,
+    )
+    probes = jnp.broadcast_to(jnp.arange(6, dtype=jnp.int32), (2, 6))
+    successor = successor_decision_predict(
+        latent["decision"],
+        latent["component_embeddings"],
+        jnp.zeros((2, 16), dtype=jnp.float32),
+        jnp.zeros((2, 8), dtype=jnp.float32),
+        behavior,
+        probes,
+    )
+    assert successor.means.shape == (2, 6, 4, 6)
+    np.testing.assert_allclose(
+        np.asarray(jnp.sum(successor.component_residuals, axis=-2)),
+        0.0,
+        atol=2.0e-6,
+    )
+
+
+def test_shared_occurrence_heads_cannot_change_online_belief() -> None:
+    import copy
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.model import DeltaModel, observe_after_transition
+
+    config = _small_config("delta_passive")
+    model = DeltaModel(config, (5, 5, 39), 6)
+    base, latent = model.init_parameters(jax.random.PRNGKey(82))
+    state = model.initial_state(1)
+    first = jnp.zeros((1, 5, 5, 39), dtype=jnp.float32)
+    state, _ = model.step(base, latent, state, first)
+    state = observe_after_transition(
+        state, action=jnp.asarray([4]), done=jnp.asarray([False])
+    )
+    second = first.at[0, 2, 2, 13].set(1.0)
+    changed = copy.deepcopy(latent)
+    for name in (
+        "visibility",
+        "inventory_change",
+        "availability",
+        "interface_change",
+        "recipe_change",
+    ):
+        changed["response"][name]["bias"] = (
+            changed["response"][name]["bias"] + 50.0
+        )
+    _, original = model.step(base, latent, state, second)
+    _, modified = model.step(base, changed, state, second)
+    np.testing.assert_allclose(
+        np.asarray(original.belief), np.asarray(modified.belief), atol=1.0e-6
+    )
+
+
+def test_spectral_simplex_initializer_is_centered_and_round_trips(tmp_path: Path) -> None:
+    import numpy as np
+
+    from src.delta_zsc.semantic_initializer import (
+        fit_spectral_simplex_initializer,
+        load_semantic_initializer,
+        save_semantic_initializer,
+    )
+
+    residuals = np.zeros((8, 31), dtype=np.float32)
+    residuals[:4, 12] = 1.0
+    residuals[:4, 13] = -1.0
+    residuals[4:, 12] = -1.0
+    residuals[4:, 13] = 1.0
+    initializer = fit_spectral_simplex_initializer(
+        residuals,
+        component_count=4,
+        source={"fixture": True, "uses_partner_labels": False},
+    )
+    assert initializer.event_component_bias.shape == (4, 31)
+    np.testing.assert_allclose(
+        np.mean(initializer.event_component_bias, axis=0), 0.0, atol=1.0e-6
+    )
+    npz, metadata = save_semantic_initializer(tmp_path, initializer)
+    assert npz.is_file() and metadata.is_file()
+    restored = load_semantic_initializer(
+        tmp_path, component_count=4, event_count=31
+    )
+    np.testing.assert_allclose(
+        restored.event_component_bias, initializer.event_component_bias, atol=0.0
+    )
+    assert restored.source["uses_partner_labels"] is False
+
+
+def test_delayed_probe_target_uses_second_action_and_masks_terminal_windows() -> None:
+    import jax.numpy as jnp
+
+    from src.delta_zsc.observation import extract_probe_response_target
+
+    intermediate = jnp.zeros((5, 5, 39), dtype=jnp.float32)
+    intermediate = intermediate.at[1, 2, 20].set(1.0)  # front counter
+    intermediate = intermediate.at[4, 4, 20].set(1.0)  # retained facility
+    intermediate = intermediate.at[2, 2, 1].set(1.0)  # ego faces up
+    delayed = intermediate.at[1, 2, 29].set(1.0)
+    interact = extract_probe_response_target(
+        intermediate,
+        delayed,
+        jnp.asarray(5),
+        jnp.asarray(False),
+    )
+    stay = extract_probe_response_target(
+        intermediate,
+        delayed,
+        jnp.asarray(4),
+        jnp.asarray(False),
+    )
+    assert float(interact.valid_mask) == 1.0
+    assert not bool(interact.interface_changed)
+    assert bool(stay.interface_changed)
+    invalid = extract_probe_response_target(
+        intermediate,
+        delayed,
+        jnp.asarray(4),
+        jnp.asarray(True),
+    )
+    assert float(invalid.valid_mask) == 0.0
+    assert float(invalid.interface_available) == 0.0
+    assert float(invalid.interface_changed) == 0.0

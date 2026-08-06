@@ -83,6 +83,8 @@ def _anchors():
         dtype=jnp.float32,
     )
     replicas = jnp.stack((fit - 0.1, fit + 0.1), axis=-1)
+    probe = jnp.broadcast_to(fit[:, None, :], (2, 6, 6))
+    probe_replicas = jnp.stack((probe - 0.1, probe + 0.1), axis=-1)
     return AnchorBatch(
         time_indexes=jnp.asarray([1, 2], dtype=jnp.int32),
         lane_indexes=jnp.asarray([0, 1], dtype=jnp.int32),
@@ -94,6 +96,15 @@ def _anchors():
         action_mask=jnp.ones_like(fit, dtype=jnp.bool_),
         fit_replica_returns_by_action=replicas,
         evaluation_replica_returns_by_action=replicas,
+        probe_fit_returns_by_action=probe,
+        probe_evaluation_returns_by_action=probe,
+        probe_measurement_covariances=jnp.broadcast_to(
+            jnp.eye(5, dtype=jnp.float32)[None, None] * 0.01,
+            (2, 6, 5, 5),
+        ),
+        probe_action_mask=jnp.ones_like(probe, dtype=jnp.bool_),
+        probe_fit_replica_returns_by_action=probe_replicas,
+        probe_evaluation_replica_returns_by_action=probe_replicas,
     )
 
 
@@ -141,6 +152,13 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
     assert float(metrics["latent"]["latent_update_applied"]) == 1.0
     assert np.isfinite(float(metrics["latent"]["latent_composite_nll"]))
     assert float(metrics["latent"]["latent_decision_observations"]) == 2.0
+    assert float(
+        metrics["latent"]["latent_successor_decision_observations"]
+    ) == 12.0
+    # Full-tree channel pullbacks are intentionally excluded from the training
+    # transaction.  Exact semantic/decision alignment is computed report-only
+    # on the shared component embeddings in the final anchor audit.
+    assert float(metrics["latent"]["latent_gradient_alignment_available"]) == 0.0
 
 
 
@@ -188,13 +206,20 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
     assert tuple(float(value) for value in result[:4]) == (1.0, 1.0, 1.0, 1.0)
 
 def test_response_only_variant_never_uses_decision_anchor_channel() -> None:
+    import jax
+
     from src.delta_zsc.losses import latent_composite_loss
 
     _, model, base, latent = _setup("response_only")
-    result = latent_composite_loss(
-        model, latent, base, _batch(model, base, latent), _anchors()
-    )
+    batch = _batch(model, base, latent)
+    anchors = _anchors()
+    result = jax.jit(
+        lambda candidate: latent_composite_loss(
+            model, candidate, base, batch, anchors
+        )
+    )(latent)
     assert float(result.metrics["latent_decision_observations"]) == 0.0
+    assert float(result.metrics["latent_successor_decision_observations"]) == 0.0
 
 
 def test_batched_base_policy_sequence_matches_step_replay() -> None:
@@ -342,4 +367,10 @@ def test_anchor_schema_contains_no_stale_posterior_or_comparator() -> None:
         "action_mask",
         "fit_replica_returns_by_action",
         "evaluation_replica_returns_by_action",
+        "probe_fit_returns_by_action",
+        "probe_evaluation_returns_by_action",
+        "probe_measurement_covariances",
+        "probe_action_mask",
+        "probe_fit_replica_returns_by_action",
+        "probe_evaluation_replica_returns_by_action",
     }

@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 
 from .baseline_app import BASELINE_METHODS, run_official_baseline
-from .calibration_app import run_posterior_predictive_diagnostics
+from .calibration_app import (
+    build_semantic_initializer,
+    run_posterior_predictive_diagnostics,
+)
 from .development_matrix_app import (
     evaluate_development_matrix,
     run_development_matrix,
@@ -57,6 +60,7 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--output", required=True)
     train.add_argument("--resume", action="store_true")
     train.add_argument("--require-cuda", action="store_true")
+    train.add_argument("--semantic-initializer")
     train.set_defaults(function=run_training)
 
     preflight = commands.add_parser("cuda-preflight")
@@ -64,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--ego-run-id", default="delta-cuda-preflight")
     preflight.add_argument("--seed-index", type=int, default=-1)
     preflight.add_argument("--output", required=True)
+    preflight.add_argument("--semantic-initializer")
     preflight.set_defaults(function=run_cuda_preflight)
 
     policy_manifest = commands.add_parser("build-policy-manifest")
@@ -92,6 +97,25 @@ def _parser() -> argparse.ArgumentParser:
     summarize.add_argument("--output", required=True)
     summarize.set_defaults(function=summarize_evaluations)
 
+    initializer = commands.add_parser("build-semantic-initializer")
+    _common_run(initializer)
+    initializer.add_argument("--deployment", required=True)
+    initializer.add_argument(
+        "--partner-role", choices=("calibration",), default="calibration"
+    )
+    initializer.add_argument(
+        "--component-count",
+        action="append",
+        type=int,
+        choices=(2, 4, 8),
+        help=(
+            "Build one or more K-specific simplex artifacts from the same "
+            "unlabeled residual panel. Defaults to K from --config."
+        ),
+    )
+    initializer.add_argument("--output", required=True)
+    initializer.set_defaults(function=build_semantic_initializer)
+
     diagnostics = commands.add_parser("posterior-diagnostics")
     _common_run(diagnostics)
     diagnostics.add_argument("--deployment", required=True)
@@ -110,6 +134,7 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--output", required=True)
     matrix.add_argument("--resume", action="store_true")
     matrix.add_argument("--require-cuda", action="store_true")
+    matrix.add_argument("--semantic-initializer", required=True)
     matrix.set_defaults(function=run_development_matrix)
 
     matrix_eval = commands.add_parser("evaluate-development-matrix")

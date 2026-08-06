@@ -1,4 +1,4 @@
-# FORMAL_EXPERIMENT_PROTOCOL — Frozen confirmatory contract
+# FORMAL_EXPERIMENT_PROTOCOL — Frozen DELTA-ZSC v4 contract
 
 `authoritative: true`
 
@@ -14,9 +14,10 @@
 - successful-delivery indicator: enabled;
 - Official source identity: fixed in `src/delta_zsc/config.py`.
 
-## 2. Confirmatory DELTA
+## 2. Confirmatory method
 
 ```yaml
+version: 3
 method_variant: delta_active
 method:
   latent_components: 4
@@ -24,9 +25,9 @@ method:
   adaptation_kl_budget: 0.04
 ```
 
-Active VOI exactly enumerates the registered 66-outcome compact response
-marginal. There is no VOI sample-count setting, quadrature diagnostic, or
-non-negative control clamp.
+The latent is episode-static. Formal training requires a layout-specific,
+lineage-bound spectral-simplex initializer artifact. The initializer uses no
+partner labels and is part of run identity.
 
 ## 3. Base PPO
 
@@ -41,39 +42,58 @@ non-negative control clamp.
 - gradient norm: 0.25;
 - gamma: 0.99;
 - GAE lambda: 0.95;
-- clip/value-clip: 0.2;
+- policy/value clip: 0.2;
 - entropy coefficient: 0.01;
 - value coefficient: 0.5;
 - Adam epsilon: 1e-5.
 
-## 4. Sparse decision observations
+## 4. Sparse current and successor decision observations
 
 - anchor interval: 1,048,576 ordinary environment steps;
 - states per trigger: 16;
-- fit replicas: 4;
+- fit replicas: 8;
 - evaluation replicas: 8;
 - continuation horizon: 128;
-- six forced ego actions;
-- base policy for first-action branches and all continuation actions;
-- matched CRN across action branches;
-- fit/evaluation replica split fixed before model scoring;
-- no replay across outer updates.
+- current forced actions: 6;
+- active probe actions: 6;
+- forced post-response actions per probe: 6;
+- one unforced collection-time-base bridge per probe replica;
+- probe- and bridge-transition rewards excluded from the successor target;
+- matched CRN across action alternatives;
+- base policy for unforced continuation actions;
+- fit/evaluation split fixed before scoring;
+- no replay across outer updates;
+- full five-dimensional measurement covariance;
+- nested `lax.map` bounded-memory execution.
 
-## 5. Partner distributions
+Eight fit replicas satisfy the minimum six needed for a potentially full-rank
+five-dimensional sample covariance.
 
-Training support contains independent SP and OP parent runs, each with progress
-checkpoints 0, 0.5, and 1.0. Sampling is uniform over mechanism, then
-hyperparameter family, stage, and run. Formal support requires at least ten
-independent parents per mechanism.
+## 5. Delayed response and exact active value
 
-Calibration and confirmatory panels are parent- and co-training-lineage disjoint
-from support and from each other. The manifest is lineage-bound and owner-free.
-Heuristics remain test-only.
+The active target is the legal two-transition window
+`o[t+1] -> o[t+2]`, conditioned on probe `a[t]`; `a[t+1]` is used only to remove
+its direct ego effect. Either terminal transition invalidates the window.
 
-## 6. Runs and evaluation
+VOI exactly enumerates the 66 delayed compact outcomes and uses the
+probe-conditioned `t+2` decision matrix. Its incremental value is discounted
+by `gamma^2`. There is no sample-count field, quadrature estimate, non-negative
+clamp, or information-gain reward.
 
-- training runs: seed indexes 0..9;
-- engineering seed: -1, excluded from scientific summaries;
+## 6. Partner distributions
+
+Training support contains independent SP and OP parents with checkpoints at
+0.0, 0.5, and 1.0. Sampling is uniform over mechanism, family, stage, and run.
+Formal support requires at least ten independent parents per mechanism.
+
+Initializer calibration, posterior calibration, and confirmatory panels are
+parent- and co-training-lineage disjoint from support and from each other.
+Partner manifests are owner-free. Heuristics remain test-only.
+
+## 7. Runs and evaluation
+
+- DELTA training seed indexes: 0..9;
+- engineering seed: -1, excluded from science;
 - episodes per ego/partner/role pairing: 500;
 - both ego roles: required;
 - bootstrap replicates: 9,999;
@@ -82,23 +102,35 @@ Heuristics remain test-only.
 - minimum independent partner runs per mechanism: 4;
 - material effect: 20 raw-return points.
 
-Simple and Wide are tested separately and combined only by intersection.
+Simple and Wide are inferred separately and combined only by intersection.
 
-## 7. Acceptance artifacts
+## 8. Required artifacts
 
-Every formal run must preserve:
+Every formal run preserves:
 
-- resolved config;
-- method/source identity;
+- resolved config and method/source identity;
+- semantic initializer NPZ/JSON and source metadata;
 - lineage-bound partner manifest;
 - complete checkpoint descriptor;
-- per-update metrics and resource ledger;
+- per-update shared/semantic/decision metrics and resource ledger;
 - final deployment bundle;
+- final current/successor decision and active-policy audit;
 - raw evaluation rows;
 - posterior diagnostic artifact;
 - belief-intervention artifact;
 - final three-claim report.
 
-A CUDA preflight is an execution acceptance test, not a scientific result. It
-must exercise one real update, an anchor trigger, separate base/latent updates,
-checkpoint restore, deployment export, and finite VOI/KL diagnostics.
+## 9. Execution acceptance
+
+A CUDA preflight is engineering evidence only. It must exercise:
+
+- real Official reset/step and frozen partner checkpoints;
+- semantic initializer loading;
+- one legal delayed response window;
+- one current and successor anchor trigger;
+- separate finite latent and PPO updates;
+- checkpoint save/restore and deployment export;
+- finite exact VOI, action-wise VOI spread, mirror KL, and posterior metrics.
+
+No formal claim is eligible until the ten-run frozen matrices and all lineage
+checks are complete.

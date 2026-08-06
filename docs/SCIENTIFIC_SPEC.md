@@ -1,142 +1,155 @@
-# SCIENTIFIC_SPEC — Decision-relevant adaptation in zero-shot coordination
+# SCIENTIFIC_SPEC — Decision-relevant episode-static adaptation
 
 `authoritative: true`
 
-## 1. Substrate
+## 1. Registered substrate
 
-The registered substrate is OvercookedV2 Test-Time Protocol Formation with
-400-step episodes, six ego actions, view radius two, random initial positions,
-negative rewards, recipe resampling after delivery, and successful-delivery
-indication. Simple and Wide are distinct confirmatory layouts and must both be
-reported.
+The substrate is OvercookedV2 Test-Time Protocol Formation with 400-step
+episodes, six ego actions, view radius two, negative rewards, random initial
+positions, recipe resampling after delivery, and successful-delivery indication.
+`test_time_simple` and `test_time_wide` are separate layouts; neither may hide
+failure on the other.
 
 ## 2. Scientific problem
 
-A previously unseen teammate may produce legal local histories that imply a
-different action ordering for the ego agent. The problem is not to classify the
-teammate's training algorithm. It is to estimate, from legal history alone, the
-smallest uncertainty state needed to improve decisions without sacrificing
-base task competence.
+A previously unseen teammate may express a convention that changes the ego's
+best action. The problem is not to identify the teammate's training algorithm.
+It is to learn, from legal interaction history alone, an uncertainty state that
+supports better decisions while retaining one shared task policy.
 
-Formally, let `H_t` be legal local history and `z_t` an exchangeable latent
-coordination mode. DELTA asks whether a response-only posterior
-
-\[
-b_t(z)=p(z_t=z\mid H_t)
-\]
-
-can support a decision-relevant action-return estimate
+Because the frozen partner is constant within an episode, DELTA v4 represents
+an exchangeable episode-level latent `z_e`. The legal posterior is
 
 \[
-\bar Q_t(a)=\sum_z b_t(z)Q_z(x_t,r_t,u_t,a)
+b_t(z)=p(z_e=z\mid H_t),
 \]
 
-that improves zero-shot cross-play through a single shared policy.
+and its current decision value is
+
+\[
+\bar Q_t(a)=\sum_zb_t(z)\mu_z(x_t,a).
+\]
+
+For active DELTA, candidate probes also receive the value of a delayed partner
+response under a probe-conditioned successor decision matrix.
 
 ## 3. Legal deployment information
 
-The deployed policy may use only:
+Deployment may use only:
 
-- the ego's local observation history;
-- the ego's previous executed actions;
+- local observation history;
+- previously executed ego actions;
 - episode boundaries;
-- analytic statistics computed from observable teammate events;
-- the learned response likelihood and its categorical posterior.
+- deterministic behavior statistics computed from observable responses;
+- learned shared/semantic response models;
+- the episode-static categorical posterior;
+- learned current and successor decision emissions.
 
-It may not use partner run ID, training algorithm, checkpoint index, family
-label, hidden simulator state, future response, counterfactual return, or any
-training-only lineage metadata.
-
-Counterfactual all-action continuations are privileged training observations.
-They supervise the meaning of latent components but are never inserted into the
-online posterior state.
+Deployment may not use partner run ID, SP/OP label, checkpoint stage, training
+family, hidden simulator state, future observations, counterfactual returns, or
+manifest lineage.
 
 ## 4. Unified latent semantics
 
-A latent component is defined only through two conditional observation
-channels:
+A component is exchangeable and is defined jointly by:
 
-1. the distribution of an observable teammate response;
-2. the distribution of centered CRN action-return contrasts.
+1. a conditional semantic response distribution;
+2. a centered current action-value residual;
+3. for active DELTA, a delayed probe-response distribution and a centered
+   probe-successor action-value residual.
 
-Components are exchangeable. A component is defined by two conditional
-distributions: the teammate response it predicts and the action-return
-contrast it implies; it need not map to a human-interpretable protocol.
-A component is scientifically useful only when legal response evidence
-changes a decision-relevant posterior mixture.
+Shared occurrence heads model pooled visibility/change frequencies but do not
+define component semantics and cannot alter posterior odds.
 
-The observable response retains direct teammate visibility and, when visible,
-position, direction, inventory, and inventory change. It also contains a
-two-candidate aligned world-interface event and independently covered recipe
-change. Alignment availability is component-shared; ambiguous alignment and
-cross-episode transitions add no interface evidence.
+A component is scientifically useful only when legal semantic evidence selects
+it differently across partners and its decision residual changes action
+ordering. Posterior entropy reduction alone is not evidence of adaptation.
 
 ## 5. Primary hypotheses
 
-### H1 — performance
+### H1 — frozen performance
 
-Frozen `delta_active` exceeds every registered same-protocol baseline on both
-Simple and Wide. For each baseline, the one-sided crossed-node bootstrap lower
-bound must be positive and the point estimate must be at least one correct
-delivery, 20 raw-return points.
+On both Simple and Wide, frozen `delta_active` exceeds every registered
+same-protocol baseline. For each contrast, the one-sided crossed-node bootstrap
+lower bound must be positive and the point estimate must be at least one
+correct delivery, 20 raw-return points.
 
 ### H2 — decision-emission contribution
 
-At fixed `K=4`, partner distribution, base PPO budget, network capacity, seed,
-and evaluation panel:
+At fixed `K=4`, partner distribution, base budget, architecture, seed, and
+panel:
 
 \[
-J(\text{delta_passive}) > J(\text{response_only})
+J(\text{delta_passive})>J(\text{response_only})
 \]
 
-on both layouts. This isolates the sparse counterfactual decision observation
-from response prediction alone.
+on both layouts. This isolates current decision supervision and mirror
+adaptation from response prediction alone.
 
-### H3 — causal value of the legal-history belief
+### H3 — causal value of the legal belief
 
-In the same source world and with the same learned action-return matrix, the
-policy formed from the correct belief must select higher empirical continuation
-value than a task-matched shuffled belief:
+Holding source world, base logits, learned decision matrix, and CRN outcomes
+fixed, the correct legal-history belief must produce higher empirical
+continuation value than a task-matched shuffled belief:
 
 \[
-\mathbb E[(\pi_{b}-\pi_{\tilde b})^T G_{\text{source}}] > 0
+\mathbb E[(\pi_b-\pi_{\tilde b})^TG_{source}]>0
 \]
 
 on both layouts.
 
-The claims follow a closed hierarchy H1 -> H2 -> H3. All measurements remain
-visible even when a later claim is not eligible.
+Claims are evaluated in the closed order `H1 -> H2 -> H3`.
 
-## 6. Secondary question: active response value
+## 6. Secondary active question
 
-`delta_active - delta_passive` estimates whether choosing actions partly for the
-decision value of the next teammate response improves cross-play. This contrast
-is pre-registered and fully reported, but it is secondary: the paper does not
-promote a null active increment into a new mechanism after observing results.
+`delta_active - delta_passive` measures whether delayed action-selective
+response value improves zero-shot cross-play. It is pre-registered and reported
+regardless of sign. Mean VOI or information gain cannot establish active
+control; action-wise VOI spread and active/passive policy divergence are
+required mechanism evidence.
 
-## 7. Required negative controls
+## 7. Required controls
 
-- `history_rnn`: tests whether generic recurrent capacity explains performance.
-- `base`: task competence without history-based latent adaptation.
-- `response_only`: response prediction without decision-conditioned action change.
-- `history_rnn_extra` and `base_extra`: spend the exact anchor simulator cost on
-  additional ordinary PPO interaction.
-- `K in {2,4,8}`: bounded capacity sensitivity, not an open sweep.
-- informative-but-decision-irrelevant synthetic VOI test: information gain may
-  be positive while decision VOI must remain zero.
+- `history_rnn`: generic recurrent-history capacity;
+- `base`: task competence without latent adaptation;
+- `response_only`: legal response posterior without decision adaptation;
+- `history_rnn_extra` and `base_extra`: spend anchor simulator cost on ordinary
+  PPO interaction;
+- `K in {2,4,8}`: bounded capacity sensitivity;
+- synthetic uninformative, decision-revealing, and
+  identifiable-but-decision-irrelevant exact-VOI cases;
+- parent-disjoint conditional oracle diagnostic for residual event information;
+- shared-occurrence posterior-independence test;
+- episode-static reset/persistence test.
 
-## 8. Non-claims
+## 8. Required mechanism measurements
 
-The repository does not claim:
+Every v4 study reports:
 
-- recovery of true partner identity or a unique true protocol;
-- exact solution of the full Bayes-adaptive POMDP;
-- global policy improvement from an approximate action-return model;
-- calibration merely because posterior entropy changes;
-- SOTA performance without frozen raw Simple/Wide matrices;
-- independence of the task recurrent state from every indirect teammate effect.
+- immediate and delayed shared/semantic NLL and counts;
+- component event Jensen-Shannon separation;
+- posterior entropy and response-induced filter KL;
+- belief separation by partner run/mechanism and within-episode phase drift;
+- current and successor top-action agreement, regret, and component action
+  disagreement;
+- exact VOI, information gain, their action-wise spread, and negative numerical
+  fraction;
+- active/passive policy total variation and greedy disagreement;
+- report-only semantic/decision component-embedding gradient norms and cosine;
+- semantic initializer singular values, source lineage, and conditional oracle
+  gain.
 
-The active VOI exactly enumerates the 66 outcomes of the compact
-`(visibility, interface availability, change, event)` marginal of that complete
-response. It remains a registered one-response decision-equivalence approximation.
-Its local-stationarity scope and error bound are explicit in `THEORY.md`.
+None is a substitute for raw return.
+
+## 9. Non-claims
+
+The project does not claim:
+
+- recovery of true partner identity or a unique protocol taxonomy;
+- exact long-horizon Bayes-adaptive planning;
+- calibration from a sharp posterior alone;
+- causal partner labels from spectral directions;
+- guaranteed real-return improvement from approximate decision values;
+- SOTA performance before frozen ten-seed Simple/Wide evaluation;
+- that behavior statistics contain no partner information;
+- that v3 development results are evidence for v4.

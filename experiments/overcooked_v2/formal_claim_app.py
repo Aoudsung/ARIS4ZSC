@@ -72,8 +72,8 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
             raise ValueError(f"Belief intervention identity differs on {layout}.")
         if (
             diagnostics[layout].get("artifact_type")
-            != "delta_posterior_predictive_diagnostics"
-            or diagnostics[layout].get("version") != 3
+            != "delta_v4_posterior_predictive_diagnostics"
+            or diagnostics[layout].get("version") != 4
             or diagnostics[layout].get("layout") != layout
             or diagnostics[layout].get("claim_role") != "diagnostic_only"
         ):
@@ -164,7 +164,7 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
     write_json(
         args.output,
         {
-            "version": 2,
+            "version": 3,
             "artifact_type": "delta_formal_claim_report",
             "method": METHOD_VERSION,
             "layouts": list(LAYOUTS),

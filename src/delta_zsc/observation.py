@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-from .types import DirectResponseTarget, ResponseTarget
+from .types import DirectResponseTarget, ProbeResponseTarget, ResponseTarget
 
 
 PARTNER_POSITION_CLASSES = 25
@@ -328,6 +328,41 @@ def extract_response_target(
     return ResponseTarget(direct, *interface)
 
 
+def extract_probe_response_target(
+    intermediate_observation: Any,
+    delayed_observation: Any,
+    second_action: Any,
+    invalid_window: Any,
+) -> ProbeResponseTarget:
+    """Extract the legal two-step response induced by an earlier probe.
+
+    The teammate can first react to the probe when choosing its action in the
+    intermediate state.  Accordingly the observable response is the transition
+    ``intermediate_observation -> delayed_observation``.  Frame alignment and
+    interact exclusion use ``second_action`` so the direct physical effect of
+    the ego continuation action is removed.
+    """
+
+    import jax.numpy as jnp
+
+    invalid = jnp.asarray(invalid_window, dtype=jnp.bool_)
+    immediate = extract_response_target(
+        intermediate_observation, delayed_observation, second_action, invalid
+    )
+    valid = (~invalid).astype(jnp.float32)
+    return ProbeResponseTarget(
+        visibility=jnp.asarray(immediate.direct.visibility, dtype=jnp.float32) * valid,
+        interface_available=(
+            jnp.asarray(immediate.interface_available, dtype=jnp.float32) * valid
+        ),
+        interface_changed=(
+            jnp.asarray(immediate.interface_changed, dtype=jnp.float32) * valid
+        ),
+        interface_event=immediate.interface_event,
+        valid_mask=valid,
+    )
+
+
 __all__ = [
     "FrameAlignment",
     "INTERFACE_EVENT_CLASSES",
@@ -339,6 +374,7 @@ __all__ = [
     "align_egocentric_frames",
     "decode_local_task_state",
     "extract_interface_target",
+    "extract_probe_response_target",
     "extract_response_target",
     "ingredient_count",
     "instantaneous_partner_observation",

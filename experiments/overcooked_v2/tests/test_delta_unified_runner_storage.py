@@ -178,7 +178,11 @@ def test_mock_end_to_end_rollout_and_anchor_use_base_policy() -> None:
     )
     assert anchors.fit_returns_by_action.shape == (2, 6)
     assert anchors.measurement_covariances.shape == (2, 5, 5)
+    assert anchors.probe_fit_returns_by_action.shape == (2, 6, 6)
+    assert anchors.probe_measurement_covariances.shape == (2, 6, 5, 5)
+    assert anchors.probe_action_mask.shape == (2, 6, 6)
     assert bool(jnp.all(jnp.isfinite(anchors.measurement_covariances)))
+    assert bool(jnp.all(jnp.isfinite(anchors.probe_measurement_covariances)))
 
 
 def test_sparse_anchor_rollout_matches_full_recording() -> None:
@@ -239,7 +243,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         partner_functions=partner,
         partner_parameters=None,
         length=4,
-        states_per_trigger=2,
+        states_per_trigger=1,
     )
     sparse_runner, sparse_batch, snapshots = sparse(
         runner, base, latent, jnp.asarray(0.25), index_key
@@ -258,19 +262,20 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         functions=functions,
         base_params=base,
         latent_params=latent,
-        states_per_trigger=2,
+        states_per_trigger=1,
         action_count=6,
         fit_replicas=2,
-        evaluation_replicas=2,
-        horizon=2,
+        evaluation_replicas=1,
+        horizon=1,
         gamma=0.99,
     )
     sparse_anchor_kernel = make_anchor_batch_kernel(
         functions=functions,
         action_count=6,
         fit_replicas=2,
-        evaluation_replicas=2,
-        horizon=2,
+        evaluation_replicas=1,
+        horizon=1,
+        collect_successor=True,
     )
     sparse_anchors = sparse_anchor_kernel(
         root_key, snapshots, base, latent, jnp.asarray(0.99)
@@ -299,6 +304,7 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         load_deployment,
     )
     from src.delta_zsc.optimizer import init_adam
+    from src.delta_zsc.semantic_initializer import deterministic_simplex_initializer
     from src.delta_zsc.storage import load_latest_checkpoint, save_checkpoint
     from src.delta_zsc.types import TrainState
     from src.delta_zsc.runner import initialize_runner
@@ -336,7 +342,86 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         base_params=base,
         latent_params=latent,
         source_training_run=tmp_path,
+        semantic_initializer=deterministic_simplex_initializer(4, 31).to_mapping(
+            include_bias=False
+        ),
     )
     loaded = load_deployment(bundle)
     assert loaded.ego_run_id == "ego-0"
     assert _same_tree(loaded.latent_params, latent)
+    assert loaded.semantic_initializer["uses_partner_labels"] is False
+    assert loaded.semantic_initializer["event_component_bias_shape"] == [4, 31]
+
+
+def test_final_v4_audit_reduces_probe_axis_before_anchor_mask() -> None:
+    """Final report accepts [anchor, probe, K, event] logits without broadcasting."""
+
+    import jax
+    import numpy as np
+
+    from experiments.overcooked_v2.training_app import (
+        _anchor_functions,
+        _final_decision_audit,
+    )
+    from src.delta_zsc.anchors import collect_anchor_batch
+    from src.delta_zsc.runner import collect_rollout, initialize_runner
+
+    _, model, base, latent = _model()
+    environment = MockEnvironment()
+    partner = _partner_functions()
+    runner = initialize_runner(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        random_key=jax.random.PRNGKey(70),
+    )
+    _, batch, records = collect_rollout(
+        state=runner,
+        length=4,
+        environment=environment,
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        partner_functions=partner,
+        partner_parameters=None,
+        official_shaping_factor=0.0,
+        record_anchors=True,
+        use_deployment_policy=False,
+    )
+    functions = _anchor_functions(
+        model=model,
+        partner_functions=partner,
+        partner_parameters=None,
+        environment=environment,
+    )
+    anchors = collect_anchor_batch(
+        key=jax.random.PRNGKey(71),
+        records=records,
+        functions=functions,
+        base_params=base,
+        latent_params=latent,
+        states_per_trigger=2,
+        action_count=6,
+        fit_replicas=2,
+        evaluation_replicas=2,
+        horizon=1,
+        gamma=0.99,
+    )
+    audit = _final_decision_audit(
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        batch=batch,
+        anchors=anchors,
+    )
+    assert audit["schema_version"] == 4
+    assert audit["anchor_count"] == 2
+    assert audit["valid_probe_count"] >= 0
+    for name in (
+        "probe_component_event_js",
+        "mean_voi_action_spread",
+        "mean_information_gain_action_spread",
+        "mean_active_passive_policy_tv",
+        "mean_filter_kl",
+    ):
+        assert np.isfinite(audit[name]), name

@@ -1,14 +1,10 @@
-"""Unified DELTA-ZSC model and deployment state transition.
+"""Unified DELTA-ZSC v4 model and deployment transition.
 
-The model contains exactly two parameter owners:
-
-* ``base_params``: task competence, trained by on-policy PPO only;
-* ``latent_params``: transition, response emission, and decision emission,
-  trained by one shared-latent composite predictive score only.
-
-Deployment combines the two estimates through an analytic KL-constrained
-mirror policy.  DELTA-active adds the deterministic Bayesian VOI computed from
-the same response/decision model; it is not a separately trained actor.
+``base_params`` own task competence and are trained only by on-policy PPO.
+``latent_params`` own the episode-static semantic response, delayed probe
+response, and current/post-response decision emissions.  Deployment uses an
+analytic KL-constrained mirror policy; no additional actor or critic is created
+per latent component.
 """
 
 from __future__ import annotations
@@ -24,31 +20,80 @@ from .behavior_statistics import (
     initial_behavior_statistics,
 )
 from .belief_filter import uniform_belief
+from .decision_model import successor_decision_predict
 from .latent_model import init_latent_params, observe_response, predict_decision
 from .mirror_policy import mirror_policy_logits
-from .response_model import response_predict
-from .transition import predict_belief
-from .types import DirectResponsePrediction, ModelOutput, PolicyState, ResponsePrediction
+from .observation import (
+    INTERFACE_EVENT_CLASSES,
+    PARTNER_DIRECTION_CLASSES,
+    PARTNER_INVENTORY_FACTOR_CLASSES,
+    PARTNER_POSITION_CLASSES,
+)
+from .response_model import probe_response_predict
+from .types import (
+    DecisionPrediction,
+    DirectResponsePrediction,
+    ModelOutput,
+    PolicyState,
+    ProbeResponsePrediction,
+    ResponsePrediction,
+)
 
 
-def _zero_response(lead: tuple[int, ...], components: int, factors: int) -> ResponsePrediction:
+def _zero_response(
+    lead: tuple[int, ...], components: int, factors: int
+) -> ResponsePrediction:
     import jax.numpy as jnp
 
-    zero_component = jnp.zeros(lead + (components,), dtype=jnp.float32)
     return ResponsePrediction(
         direct=DirectResponsePrediction(
-            visibility_logit=zero_component,
-            relative_position_logits=jnp.zeros(lead + (components, 25), dtype=jnp.float32),
-            direction_logits=jnp.zeros(lead + (components, 4), dtype=jnp.float32),
-            inventory_logits=jnp.zeros(
-                lead + (components, factors, 2), dtype=jnp.float32
+            visibility_logit=jnp.zeros(lead, dtype=jnp.float32),
+            relative_position_logits=jnp.zeros(
+                lead + (components, PARTNER_POSITION_CLASSES), dtype=jnp.float32
             ),
-            inventory_change_logit=zero_component,
+            direction_logits=jnp.zeros(lead + (components, PARTNER_DIRECTION_CLASSES), dtype=jnp.float32),
+            inventory_logits=jnp.zeros(
+                lead + (components, factors, PARTNER_INVENTORY_FACTOR_CLASSES), dtype=jnp.float32
+            ),
+            inventory_change_logit=jnp.zeros(lead, dtype=jnp.float32),
         ),
         interface_availability_logit=jnp.zeros(lead, dtype=jnp.float32),
-        interface_change_logit=zero_component,
-        interface_event_logits=jnp.zeros(lead + (components, 31), dtype=jnp.float32),
-        recipe_change_logit=zero_component,
+        interface_change_logit=jnp.zeros(lead, dtype=jnp.float32),
+        interface_event_logits=jnp.zeros(
+            lead + (components, INTERFACE_EVENT_CLASSES), dtype=jnp.float32
+        ),
+        recipe_change_logit=jnp.zeros(lead, dtype=jnp.float32),
+    )
+
+
+def _zero_probe_response(
+    lead: tuple[int, ...], probes: int, components: int
+) -> ProbeResponsePrediction:
+    import jax.numpy as jnp
+
+    shared = lead + (int(probes),)
+    return ProbeResponsePrediction(
+        visibility_logit=jnp.zeros(shared, dtype=jnp.float32),
+        interface_availability_logit=jnp.zeros(shared, dtype=jnp.float32),
+        interface_change_logit=jnp.zeros(shared, dtype=jnp.float32),
+        interface_event_logits=jnp.zeros(
+            shared + (int(components), INTERFACE_EVENT_CLASSES), dtype=jnp.float32
+        ),
+    )
+
+
+def _zero_decision(
+    lead: tuple[int, ...], components: int, actions: int
+) -> DecisionPrediction:
+    import jax.numpy as jnp
+
+    return DecisionPrediction(
+        means=jnp.zeros(lead + (components, actions), dtype=jnp.float32),
+        variances=jnp.ones(lead + (components, actions), dtype=jnp.float32),
+        shared_means=jnp.zeros(lead + (actions,), dtype=jnp.float32),
+        component_residuals=jnp.zeros(
+            lead + (components, actions), dtype=jnp.float32
+        ),
     )
 
 
@@ -60,8 +105,21 @@ class DeltaModel:
     observation_shape: tuple[int, ...]
     action_count: int
 
-    def init_parameters(self, key: Any) -> tuple[Any, Any]:
+    def init_parameters(
+        self,
+        key: Any,
+        *,
+        semantic_initializer: Any | None = None,
+        semantic_event_bias: Any | None = None,
+    ) -> tuple[Any, Any]:
         import jax
+
+        if semantic_initializer is not None and semantic_event_bias is not None:
+            raise ValueError(
+                "Provide either semantic_initializer or semantic_event_bias, not both."
+            )
+        if semantic_initializer is not None:
+            semantic_event_bias = semantic_initializer.event_component_bias
 
         base_key, latent_key = jax.random.split(key)
         base = init_base_params(
@@ -83,6 +141,7 @@ class DeltaModel:
             action_count=self.action_count,
             action_embedding_dim=self.config.model.action_embedding_dim,
             hidden_dim=self.config.model.latent_hidden_dim,
+            semantic_event_bias=semantic_event_bias,
         )
         return base, latent
 
@@ -101,6 +160,58 @@ class DeltaModel:
             ),
             previous_action=jnp.zeros(batch, dtype=jnp.int32),
             episode_start=jnp.ones(batch, dtype=jnp.bool_),
+            probe_continuation_pending=jnp.zeros(batch, dtype=jnp.bool_),
+        )
+
+    def _empty_output(
+        self,
+        *,
+        state: PolicyState,
+        next_task: Any,
+        task: Any,
+        instant: Any,
+        base_logits: Any,
+        value: Any,
+        observation: Any,
+    ) -> tuple[PolicyState, ModelOutput]:
+        import jax.numpy as jnp
+
+        lead = tuple(base_logits.shape[:-1])
+        components = int(self.config.method.latent_components)
+        factors = (int(self.observation_shape[-1]) - 27) // 4 + 2
+        zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
+        response = _zero_response(lead, components, factors)
+        probe = _zero_probe_response(lead, self.action_count, components)
+        decision = _zero_decision(lead, components, self.action_count)
+        successor = _zero_decision(
+            lead + (self.action_count,), components, self.action_count
+        )
+        next_state = state._replace(
+            task_carry=next_task,
+            previous_observation=jnp.asarray(observation, dtype=jnp.float32),
+        )
+        return next_state, ModelOutput(
+            task_features=task,
+            instant_partner=instant,
+            base_policy_logits=base_logits,
+            policy_logits=base_logits,
+            value=value,
+            predictive_belief=state.belief,
+            belief=state.belief,
+            behavior_features=behavior_features(state.behavior),
+            response_prediction=response,
+            probe_response_prediction=probe,
+            response_negative_log_likelihood=jnp.zeros(lead, dtype=jnp.float32),
+            component_decision_means=decision.means,
+            component_decision_variances=decision.variances,
+            component_successor_decision_means=successor.means,
+            component_successor_decision_variances=successor.variances,
+            expected_decision_values=zero_action,
+            active_voi=zero_action,
+            active_information_gain=zero_action,
+            active_probe_eligible=jnp.zeros(lead, dtype=jnp.bool_),
+            adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
+            adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
         )
 
     def step(
@@ -120,6 +231,11 @@ class DeltaModel:
         import jax.numpy as jnp
 
         start = jnp.asarray(state.episode_start, dtype=jnp.bool_)
+        pending_continuation = jnp.where(
+            start,
+            jnp.zeros_like(start, dtype=jnp.bool_),
+            jnp.asarray(state.probe_continuation_pending, dtype=jnp.bool_),
+        )
         if precomputed_base is None:
             next_task, task, instant, base_logits, value = base_policy_step(
                 base_params,
@@ -131,55 +247,23 @@ class DeltaModel:
         else:
             next_task, task, instant, base_logits, value = precomputed_base
         if not bool(compute_latent):
-            lead = tuple(base_logits.shape[:-1])
-            components = int(self.config.method.latent_components)
-            ingredients = (int(self.observation_shape[-1]) - 27) // 4
-            factors = ingredients + 2
-            zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
-            response = _zero_response(lead, components, factors)
-            next_state = state._replace(
-                task_carry=next_task,
-                previous_observation=jnp.asarray(observation, dtype=jnp.float32),
-            )
-            return next_state, ModelOutput(
-                task_features=task,
-                instant_partner=instant,
-                base_policy_logits=base_logits,
-                policy_logits=base_logits,
+            return self._empty_output(
+                state=state,
+                next_task=next_task,
+                task=task,
+                instant=instant,
+                base_logits=base_logits,
                 value=value,
-                predictive_belief=state.belief,
-                belief=state.belief,
-                behavior_features=behavior_features(state.behavior),
-                response_prediction=response,
-                response_negative_log_likelihood=jnp.zeros(lead, dtype=jnp.float32),
-                component_decision_means=jnp.zeros(
-                    lead + (components, self.action_count), dtype=jnp.float32
-                ),
-                component_decision_variances=jnp.ones(
-                    lead + (components, self.action_count), dtype=jnp.float32
-                ),
-                expected_decision_values=zero_action,
-                active_voi=zero_action,
-                active_information_gain=zero_action,
-                adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
-                adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
+                observation=observation,
             )
-        prior = jnp.where(
-            start[..., None],
-            uniform_belief(start.shape, self.config.method.latent_components),
-            state.belief,
-        )
-        predictive = jnp.where(
-            start[..., None],
-            prior,
-            predict_belief(prior, latent_params["transition_logits"]),
-        )
+
         (
             next_belief,
             next_behavior,
             response_nll,
             response_prediction,
-            unused_response_target,
+            unused_target,
+            observed_prior,
         ) = observe_response(
             latent_params,
             state.belief,
@@ -189,39 +273,35 @@ class DeltaModel:
             state.previous_action,
             start,
         )
-        del unused_response_target
+        del unused_target
         statistics = behavior_features(next_behavior)
         if bool(execute_adaptation) and not bool(compute_decision):
             raise ValueError("Deployment adaptation requires the decision emission.")
+
+        lead = tuple(base_logits.shape[:-1])
+        components = int(self.config.method.latent_components)
+        zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
         if bool(compute_decision):
-            decision = predict_decision(
-                latent_params, task, instant, next_behavior
-            )
+            decision = predict_decision(latent_params, task, instant, next_behavior)
             expected_values = jnp.sum(
                 next_belief[..., :, None] * decision.means, axis=-2
             )
         else:
-            from .types import DecisionPrediction
+            decision = _zero_decision(lead, components, self.action_count)
+            expected_values = zero_action
 
-            lead = tuple(base_logits.shape[:-1])
-            components = int(self.config.method.latent_components)
-            decision = DecisionPrediction(
-                means=jnp.zeros(
-                    lead + (components, self.action_count), dtype=jnp.float32
-                ),
-                variances=jnp.ones(
-                    lead + (components, self.action_count), dtype=jnp.float32
-                ),
-            )
-            expected_values = jnp.zeros_like(base_logits, dtype=jnp.float32)
-
-        zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
+        probe_prediction = _zero_probe_response(
+            lead, self.action_count, components
+        )
+        successor = _zero_decision(
+            lead + (self.action_count,), components, self.action_count
+        )
         active_voi = zero_action
         information_gain = zero_action
         action_values = expected_values
         variant = str(self.config.method_variant)
+        next_pending = jnp.zeros_like(pending_continuation, dtype=jnp.bool_)
         if bool(execute_adaptation) and variant == "delta_active":
-            lead = tuple(base_logits.shape[:-1])
             actions = jnp.broadcast_to(
                 jnp.arange(self.action_count, dtype=jnp.int32),
                 lead + (self.action_count,),
@@ -234,24 +314,62 @@ class DeltaModel:
                 statistics[..., None, :],
                 lead + (self.action_count, statistics.shape[-1]),
             )
-            response_by_action = response_predict(
-                latent_params["response"],
+            probe_prediction = probe_response_predict(
+                latent_params["probe_response"],
                 latent_params["component_embeddings"],
                 frame,
                 stats,
                 actions,
             )
-            voi = myopic_value_of_information_details(
-                next_belief,
-                latent_params["transition_logits"],
-                response_by_action,
-                decision.means,
+            successor = successor_decision_predict(
+                latent_params["decision"],
+                latent_params["component_embeddings"],
+                task,
+                instant,
+                statistics,
+                actions,
             )
-            active_voi = voi.value
-            information_gain = voi.expected_information_gain
-            action_values = expected_values + float(self.config.ppo.gamma) * active_voi
-
-        if bool(execute_adaptation) and variant in {"delta_passive", "delta_active"}:
+            voi = myopic_value_of_information_details(
+                next_belief, probe_prediction, successor.means
+            )
+            raw_voi = voi.value
+            raw_information_gain = voi.expected_information_gain
+            # The delayed response is first observable at t+2, after one
+            # collection-time base continuation.  The information value is
+            # therefore discounted by gamma squared.
+            active_values = expected_values + (
+                float(self.config.ppo.gamma) ** 2
+            ) * raw_voi
+            (
+                candidate_logits,
+                candidate_kl,
+                candidate_temperature,
+            ) = mirror_policy_logits(
+                base_logits,
+                active_values,
+                kl_budget=self.config.method.adaptation_kl_budget,
+            )
+            active_lane = ~pending_continuation
+            policy_logits = jnp.where(
+                active_lane[..., None], candidate_logits, base_logits
+            )
+            active_voi = jnp.where(active_lane[..., None], raw_voi, zero_action)
+            information_gain = jnp.where(
+                active_lane[..., None], raw_information_gain, zero_action
+            )
+            adaptation_kl = jnp.where(
+                active_lane, candidate_kl, jnp.zeros_like(candidate_kl)
+            )
+            adaptation_temperature = jnp.where(
+                active_lane,
+                candidate_temperature,
+                jnp.full_like(candidate_temperature, jnp.inf),
+            )
+            # An active probe is followed by exactly one base-policy action.
+            # On a pending lane this step consumes that continuation and does
+            # not immediately launch a second overlapping probe.
+            next_pending = active_lane
+        elif bool(execute_adaptation) and variant == "delta_passive":
             policy_logits, adaptation_kl, adaptation_temperature = mirror_policy_logits(
                 base_logits,
                 action_values,
@@ -259,19 +377,17 @@ class DeltaModel:
             )
         else:
             policy_logits = base_logits
-            adaptation_kl = jnp.zeros(base_logits.shape[:-1], dtype=jnp.float32)
-            adaptation_temperature = jnp.full(
-                base_logits.shape[:-1], jnp.inf, dtype=jnp.float32
-            )
+            adaptation_kl = jnp.zeros(lead, dtype=jnp.float32)
+            adaptation_temperature = jnp.full(lead, jnp.inf, dtype=jnp.float32)
 
         next_state = PolicyState(
             task_carry=next_task,
             belief=next_belief,
             behavior=next_behavior,
             previous_observation=jnp.asarray(observation, dtype=jnp.float32),
-            # The executed action is inserted by ``observe_after_transition``.
             previous_action=state.previous_action,
             episode_start=start,
+            probe_continuation_pending=next_pending,
         )
         return next_state, ModelOutput(
             task_features=task,
@@ -279,16 +395,24 @@ class DeltaModel:
             base_policy_logits=base_logits,
             policy_logits=policy_logits,
             value=value,
-            predictive_belief=predictive,
+            predictive_belief=observed_prior,
             belief=next_belief,
             behavior_features=statistics,
             response_prediction=response_prediction,
+            probe_response_prediction=probe_prediction,
             response_negative_log_likelihood=response_nll,
             component_decision_means=decision.means,
             component_decision_variances=decision.variances,
+            component_successor_decision_means=successor.means,
+            component_successor_decision_variances=successor.variances,
             expected_decision_values=expected_values,
             active_voi=active_voi,
             active_information_gain=information_gain,
+            active_probe_eligible=(
+                (~pending_continuation)
+                if bool(execute_adaptation) and variant == "delta_active"
+                else jnp.zeros(lead, dtype=jnp.bool_)
+            ),
             adaptation_kl=adaptation_kl,
             adaptation_temperature=adaptation_temperature,
         )
@@ -328,10 +452,14 @@ class DeltaModel:
         if not bool(compute_latent):
             lead = tuple(base_logits.shape[:-1])
             components = int(self.config.method.latent_components)
-            ingredients = (int(self.observation_shape[-1]) - 27) // 4
-            factors = ingredients + 2
+            factors = (int(self.observation_shape[-1]) - 27) // 4 + 2
             zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
             response = _zero_response(lead, components, factors)
+            probe = _zero_probe_response(lead, self.action_count, components)
+            decision = _zero_decision(lead, components, self.action_count)
+            successor = _zero_decision(
+                lead + (self.action_count,), components, self.action_count
+            )
             belief = jnp.broadcast_to(initial_state.belief, lead + (components,))
             statistics = behavior_features(initial_state.behavior)
             statistics = jnp.broadcast_to(
@@ -353,16 +481,16 @@ class DeltaModel:
                 belief=belief,
                 behavior_features=statistics,
                 response_prediction=response,
+                probe_response_prediction=probe,
                 response_negative_log_likelihood=jnp.zeros(lead, dtype=jnp.float32),
-                component_decision_means=jnp.zeros(
-                    lead + (components, self.action_count), dtype=jnp.float32
-                ),
-                component_decision_variances=jnp.ones(
-                    lead + (components, self.action_count), dtype=jnp.float32
-                ),
+                component_decision_means=decision.means,
+                component_decision_variances=decision.variances,
+                component_successor_decision_means=successor.means,
+                component_successor_decision_variances=successor.variances,
                 expected_decision_values=zero_action,
                 active_voi=zero_action,
                 active_information_gain=zero_action,
+                active_probe_eligible=jnp.zeros(lead, dtype=jnp.bool_),
                 adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
                 adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
             )
@@ -425,9 +553,15 @@ def observe_after_transition(
 
     import jax.numpy as jnp
 
+    terminal = jnp.asarray(done, dtype=jnp.bool_)
     return state._replace(
         previous_action=jnp.asarray(action, dtype=jnp.int32),
-        episode_start=jnp.asarray(done, dtype=jnp.bool_),
+        episode_start=terminal,
+        probe_continuation_pending=jnp.where(
+            terminal,
+            jnp.zeros_like(terminal, dtype=jnp.bool_),
+            jnp.asarray(state.probe_continuation_pending, dtype=jnp.bool_),
+        ),
     )
 
 

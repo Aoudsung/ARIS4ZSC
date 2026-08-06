@@ -24,9 +24,15 @@ from src.delta_zsc.config import (
 )
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.model import DeltaModel, observe_after_transition
+from src.delta_zsc.observation import INTERFACE_EVENT_CLASSES
 from src.delta_zsc.optimizer import init_adam
 from src.delta_zsc.partners import build_training_partner_pool, make_static_partner_functions
 from src.delta_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
+from src.delta_zsc.semantic_initializer import (
+    deterministic_simplex_initializer,
+    load_semantic_initializer,
+    validate_semantic_initializer_provenance,
+)
 from src.delta_zsc.runner import (
     initialize_runner,
     make_anchor_snapshot_rollout_kernel,
@@ -39,6 +45,7 @@ from src.delta_zsc.storage import (
     write_json,
 )
 from src.delta_zsc.training import (
+    component_embedding_channel_gradient_diagnostics,
     environment_minibatch_schedule,
     make_training_update_kernel,
 )
@@ -409,6 +416,33 @@ def _measure_inference_latency_ms(
     return float(np.median(np.asarray(values, dtype=np.float64)))
 
 
+def _component_event_js_by_anchor(component_event_logits: Any) -> Any:
+    """Reduce ``[anchor, probe, component, event]`` logits to ``[anchor]`` JS.
+
+    The component axis is exchangeable and the probe axis is an experimental
+    action axis.  Final-audit eligibility is anchor-level, so both axes must be
+    reduced in that order before applying an anchor mask.
+    """
+
+    import jax.nn as jnn
+    import jax.numpy as jnp
+
+    probability = jnn.softmax(component_event_logits, axis=-1)
+    component_mean = jnp.mean(probability, axis=-2, keepdims=True)
+    js_by_probe = jnp.mean(
+        jnp.sum(
+            probability
+            * (
+                jnp.log(jnp.maximum(probability, 1.0e-30))
+                - jnp.log(jnp.maximum(component_mean, 1.0e-30))
+            ),
+            axis=-1,
+        ),
+        axis=-1,
+    )
+    return jnp.mean(js_by_probe, axis=-1)
+
+
 def _final_decision_audit(
     *,
     model: DeltaModel,
@@ -417,7 +451,12 @@ def _final_decision_audit(
     batch: Any,
     anchors: Any,
 ) -> Mapping[str, Any]:
+    """Report current and probe-successor decision quality plus active selectivity."""
+
+    import jax.nn as jnn
     import jax.numpy as jnp
+
+    from src.delta_zsc.mirror_policy import mirror_policy_logits
 
     _, output = model.sequence(
         base_params,
@@ -426,10 +465,13 @@ def _final_decision_audit(
         batch.observations,
         batch.previous_actions,
         batch.episode_starts,
+        compute_latent=True,
+        compute_decision=True,
+        execute_adaptation=True,
     )
-    predicted = output.expected_decision_values[
-        anchors.time_indexes, anchors.lane_indexes
-    ]
+    time = anchors.time_indexes
+    lane = anchors.lane_indexes
+    predicted = output.expected_decision_values[time, lane]
     target = anchors.evaluation_returns_by_action
     predicted_order = jnp.argsort(jnp.argsort(predicted, axis=-1), axis=-1)
     target_order = jnp.argsort(jnp.argsort(target, axis=-1), axis=-1)
@@ -444,37 +486,141 @@ def _final_decision_audit(
     oracle = jnp.argmax(target, axis=-1)
     rows = jnp.arange(chosen.shape[0])
     regret = target[rows, oracle] - target[rows, chosen]
-    anchor_voi = output.active_voi[anchors.time_indexes, anchors.lane_indexes]
-    anchor_information_gain = output.active_information_gain[
-        anchors.time_indexes, anchors.lane_indexes
-    ]
-    anchor_adaptation_kl = output.adaptation_kl[
-        anchors.time_indexes, anchors.lane_indexes
-    ]
-    base_greedy = jnp.argmax(
-        output.base_policy_logits[anchors.time_indexes, anchors.lane_indexes],
-        axis=-1,
+
+    component_current = output.component_decision_means[time, lane]
+    component_current_top = jnp.argmax(component_current, axis=-1)
+    component_current_disagreement = jnp.mean(
+        (
+            component_current_top[..., :, None]
+            != component_current_top[..., None, :]
+        ).astype(jnp.float32)
     )
-    deployment_greedy = jnp.argmax(
-        output.policy_logits[anchors.time_indexes, anchors.lane_indexes],
-        axis=-1,
+
+    successor = output.component_successor_decision_means[time, lane]
+    belief = output.belief[time, lane]
+    successor_expected = jnp.sum(belief[:, None, :, None] * successor, axis=-2)
+    successor_selected = jnp.argmax(successor_expected, axis=-1)
+    successor_target = anchors.probe_evaluation_returns_by_action
+    successor_oracle = jnp.argmax(successor_target, axis=-1)
+    successor_valid = jnp.all(anchors.probe_action_mask, axis=-1)
+    probe_rows = jnp.arange(successor_selected.shape[0])[:, None]
+    probe_indexes = jnp.arange(successor_selected.shape[1])[None, :]
+    successor_regret = (
+        successor_target[probe_rows, probe_indexes, successor_oracle]
+        - successor_target[probe_rows, probe_indexes, successor_selected]
     )
+    successor_denominator = jnp.maximum(jnp.sum(successor_valid), 1)
+    successor_agreement = jnp.sum(
+        successor_valid * (successor_selected == successor_oracle)
+    ) / successor_denominator
+    successor_mean_regret = jnp.sum(successor_valid * successor_regret) / (
+        successor_denominator
+    )
+    successor_component_top = jnp.argmax(successor, axis=-1)
+    successor_component_disagreement = jnp.mean(
+        (
+            successor_component_top[..., :, :, None]
+            != successor_component_top[..., :, None, :]
+        ).astype(jnp.float32)
+    )
+
+    anchor_voi = output.active_voi[time, lane]
+    anchor_information_gain = output.active_information_gain[time, lane]
+    anchor_adaptation_kl = output.adaptation_kl[time, lane]
+    active_eligible = output.active_probe_eligible[time, lane].astype(jnp.float32)
+    active_denominator = jnp.maximum(jnp.sum(active_eligible), 1.0)
+
+    def active_mean(value: Any) -> Any:
+        return jnp.sum(active_eligible * jnp.asarray(value, dtype=jnp.float32)) / (
+            active_denominator
+        )
+    base_logits = output.base_policy_logits[time, lane]
+    active_logits = output.policy_logits[time, lane]
+    passive_logits, _, _ = mirror_policy_logits(
+        base_logits,
+        output.expected_decision_values[time, lane],
+        kl_budget=model.config.method.adaptation_kl_budget,
+    )
+    active_probability = jnn.softmax(active_logits, axis=-1)
+    passive_probability = jnn.softmax(passive_logits, axis=-1)
+    active_passive_tv = 0.5 * jnp.sum(
+        jnp.abs(active_probability - passive_probability), axis=-1
+    )
+    base_greedy = jnp.argmax(base_logits, axis=-1)
+    active_greedy = jnp.argmax(active_logits, axis=-1)
+    passive_greedy = jnp.argmax(passive_logits, axis=-1)
+
+    posterior = jnp.maximum(output.belief[time, lane], 1.0e-30)
+    prior = jnp.maximum(output.predictive_belief[time, lane], 1.0e-30)
+    posterior_entropy = -jnp.sum(posterior * jnp.log(posterior), axis=-1)
+    filter_kl = jnp.sum(posterior * (jnp.log(posterior) - jnp.log(prior)), axis=-1)
+
+    probe_component_event_js_by_anchor = _component_event_js_by_anchor(
+        output.probe_response_prediction.interface_event_logits[time, lane]
+    )
+    voi_spread = jnp.max(anchor_voi, axis=-1) - jnp.min(anchor_voi, axis=-1)
+    information_spread = jnp.max(anchor_information_gain, axis=-1) - jnp.min(
+        anchor_information_gain, axis=-1
+    )
+    eligible_voi = jnp.where(active_eligible[:, None] > 0.0, anchor_voi, jnp.inf)
+    eligible_minimum_voi = jnp.where(
+        jnp.sum(active_eligible) > 0.0, jnp.min(eligible_voi), 0.0
+    )
+
     return {
+        "schema_version": 4,
         "mean_spearman": float(jnp.mean(spearman)),
-        "top_action_agreement": float(jnp.mean((chosen == oracle).astype(jnp.float32))),
+        "top_action_agreement": float(
+            jnp.mean((chosen == oracle).astype(jnp.float32))
+        ),
         "mean_empirical_action_regret": float(jnp.mean(regret)),
-        "mean_action_voi": float(jnp.mean(anchor_voi)),
-        "mean_max_action_voi": float(jnp.mean(jnp.max(anchor_voi, axis=-1))),
-        "minimum_exact_voi": float(jnp.min(anchor_voi)),
+        "current_component_top_action_disagreement": float(
+            component_current_disagreement
+        ),
+        "successor_top_action_agreement": float(successor_agreement),
+        "successor_mean_empirical_action_regret": float(successor_mean_regret),
+        "successor_component_top_action_disagreement": float(
+            successor_component_disagreement
+        ),
+        "mean_action_voi": float(
+            jnp.sum(active_eligible[:, None] * anchor_voi)
+            / (active_denominator * anchor_voi.shape[-1])
+        ),
+        "mean_max_action_voi": float(
+            active_mean(jnp.max(anchor_voi, axis=-1))
+        ),
+        "mean_voi_action_spread": float(active_mean(voi_spread)),
+        "minimum_exact_voi": float(eligible_minimum_voi),
         "exact_voi_negative_fraction": float(
-            jnp.mean((anchor_voi < 0.0).astype(jnp.float32))
+            jnp.sum(
+                active_eligible[:, None]
+                * (anchor_voi < 0.0).astype(jnp.float32)
+            )
+            / (active_denominator * anchor_voi.shape[-1])
         ),
-        "mean_information_gain": float(jnp.mean(anchor_information_gain)),
-        "mean_adaptation_kl": float(jnp.mean(anchor_adaptation_kl)),
-        "greedy_action_disagreement": float(
-            jnp.mean((base_greedy != deployment_greedy).astype(jnp.float32))
+        "mean_information_gain": float(
+            jnp.sum(active_eligible[:, None] * anchor_information_gain)
+            / (active_denominator * anchor_information_gain.shape[-1])
         ),
+        "mean_information_gain_action_spread": float(
+            active_mean(information_spread)
+        ),
+        "mean_active_passive_policy_tv": float(active_mean(active_passive_tv)),
+        "active_passive_greedy_disagreement": float(
+            active_mean((active_greedy != passive_greedy).astype(jnp.float32))
+        ),
+        "base_active_greedy_disagreement": float(
+            active_mean((base_greedy != active_greedy).astype(jnp.float32))
+        ),
+        "mean_adaptation_kl": float(active_mean(anchor_adaptation_kl)),
+        "mean_posterior_entropy": float(jnp.mean(posterior_entropy)),
+        "mean_filter_kl": float(jnp.mean(filter_kl)),
+        "probe_component_event_js": float(
+            active_mean(probe_component_event_js_by_anchor)
+        ),
+        "active_probe_eligible_count": int(jnp.sum(active_eligible)),
         "anchor_count": int(chosen.shape[0]),
+        "valid_probe_count": int(jnp.sum(successor_valid)),
         "report_only": True,
     }
 
@@ -700,9 +846,52 @@ def run_training(args: argparse.Namespace) -> None:
     partner_parameters = None
     environment = VectorEnvironment.create(config)
     model = DeltaModel(config, environment.observation_shape, OFFICIAL_ACTION_COUNT)
+    initializer_path_value = getattr(args, "semantic_initializer", None)
+    semantic_variant = config.method_variant in {
+        "response_only",
+        "delta_passive",
+        "delta_active",
+    }
+    require_fitted_initializer = (
+        config.run_kind in {"development", "formal"} and semantic_variant
+    )
+    if initializer_path_value:
+        initializer_path = Path(initializer_path_value).resolve()
+        semantic_initializer = load_semantic_initializer(
+            initializer_path,
+            component_count=config.method.latent_components,
+            event_count=INTERFACE_EVENT_CLASSES,
+        )
+    else:
+        initializer_path = None
+        if require_fitted_initializer:
+            raise RuntimeError(
+                "Development/formal DELTA v4 semantic variants require "
+                "--semantic-initializer built from the lineage-disjoint "
+                "calibration panel."
+            )
+        semantic_initializer = deterministic_simplex_initializer(
+            config.method.latent_components, INTERFACE_EVENT_CLASSES
+        )
+    validate_semantic_initializer_provenance(
+        semantic_initializer,
+        method=METHOD_VERSION,
+        layout=config.environment.layout,
+        component_count=config.method.latent_components,
+        event_classes=INTERFACE_EVENT_CLASSES,
+        protocol_version=config.official_protocol.protocol_version,
+        official_source_commit=config.official_protocol.source_commit,
+        training_parent_ids={member.parent_training_run_id for member in members},
+        expected_calibration_run_ids=(
+            row.run_id for row in manifest.by_role("calibration")
+        ),
+        require_fitted=require_fitted_initializer,
+    )
     root = _training_key(int(args.seed_index))
     init_key, runner_key, loop_key = jax.random.split(root, 3)
-    base_params, latent_params = model.init_parameters(init_key)
+    base_params, latent_params = model.init_parameters(
+        init_key, semantic_initializer=semantic_initializer
+    )
     base_optimizer_state = init_adam(base_params)
     latent_optimizer_state = init_adam(latent_params)
     runner = initialize_runner(
@@ -729,6 +918,10 @@ def run_training(args: argparse.Namespace) -> None:
         "official_runtime": official_runtime,
         "observation_shape": list(environment.observation_shape),
         "action_count": OFFICIAL_ACTION_COUNT,
+        "semantic_initializer": {
+            "path": None if initializer_path is None else str(initializer_path),
+            "artifact": semantic_initializer.to_mapping(),
+        },
     }
     ensure_run_identity(output, identity)
     write_json(
@@ -769,6 +962,7 @@ def run_training(args: argparse.Namespace) -> None:
         "config": config.to_mapping(),
         "partner_manifest_run_ids": [row.run_id for row in manifest.runs],
         "seed_index": int(args.seed_index),
+        "semantic_initializer": semantic_initializer.to_mapping(),
     }
     if bool(getattr(args, "resume", False)):
         restored = load_latest_checkpoint(
@@ -847,6 +1041,7 @@ def run_training(args: argparse.Namespace) -> None:
             fit_replicas=config.anchors.fit_replicas,
             evaluation_replicas=config.anchors.evaluation_replicas,
             horizon=config.method.continuation_horizon,
+            collect_successor=(config.method_variant == "delta_active"),
         )
         with_anchor_update_kernel = make_training_update_kernel(
             model=model,
@@ -865,12 +1060,28 @@ def run_training(args: argparse.Namespace) -> None:
             update_epochs=config.ppo.update_epochs,
             gamma=config.ppo.gamma,
         )
-        anchor_steps_per_trigger = (
+        anchor_replicas = (
+            config.anchors.fit_replicas + config.anchors.evaluation_replicas
+        )
+        current_anchor_steps = (
             config.anchors.states_per_trigger
             * OFFICIAL_ACTION_COUNT
-            * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
+            * anchor_replicas
             * config.method.continuation_horizon
         )
+        successor_anchor_steps = 0
+        if config.method_variant == "delta_active":
+            successor_anchor_steps = (
+                config.anchors.states_per_trigger
+                * OFFICIAL_ACTION_COUNT
+                * anchor_replicas
+                * (
+                    2
+                    + OFFICIAL_ACTION_COUNT
+                    * config.method.continuation_horizon
+                )
+            )
+        anchor_steps_per_trigger = current_anchor_steps + successor_anchor_steps
 
     def is_anchor_update(update_index: int) -> bool:
         return bool(
@@ -1116,6 +1327,7 @@ def run_training(args: argparse.Namespace) -> None:
             base_params=state.base_params,
             latent_params=state.latent_params,
             source_training_run=output,
+            semantic_initializer=semantic_initializer.to_mapping(include_bias=False),
         )
 
     # Fresh report-only decision audit.  It never alters learned parameters and
@@ -1147,12 +1359,43 @@ def run_training(args: argparse.Namespace) -> None:
             state.latent_params,
             jnp.asarray(config.ppo.gamma, dtype=jnp.float32),
         )
+        gradient_alignment = jax.jit(
+            lambda latent, base: component_embedding_channel_gradient_diagnostics(
+                model=model,
+                latent_params=latent,
+                base_params=base,
+                batch=audit_batch,
+                anchors=audit_anchors,
+            )
+        )(state.latent_params, state.base_params)
+        gradient_alignment = jax.tree_util.tree_map(
+            jax.block_until_ready, gradient_alignment
+        )
+        audit_replicas = (
+            config.anchors.fit_replicas + config.anchors.evaluation_replicas
+        )
+        audit_current_steps = (
+            config.anchors.states_per_trigger
+            * OFFICIAL_ACTION_COUNT
+            * audit_replicas
+            * config.method.continuation_horizon
+        )
+        audit_successor_steps = 0
+        if config.method_variant == "delta_active":
+            audit_successor_steps = (
+                config.anchors.states_per_trigger
+                * OFFICIAL_ACTION_COUNT
+                * audit_replicas
+                * (
+                    2
+                    + OFFICIAL_ACTION_COUNT
+                    * config.method.continuation_horizon
+                )
+            )
         audit_steps = (
             config.environment.num_envs * config.training.rollout_length
-            + config.anchors.states_per_trigger
-            * OFFICIAL_ACTION_COUNT
-            * (config.anchors.fit_replicas + config.anchors.evaluation_replicas)
-            * config.method.continuation_horizon
+            + audit_current_steps
+            + audit_successor_steps
         )
         audit_elapsed = time.perf_counter() - audit_started
         ledger = ledger.plus(
@@ -1168,14 +1411,17 @@ def run_training(args: argparse.Namespace) -> None:
         write_json(
             audit_path,
             {
-                "version": 3,
-                "artifact_type": "delta_final_decision_audit",
+                "version": 4,
+                "artifact_type": "delta_v4_final_decision_audit",
                 **_final_decision_audit(
                     model=model,
                     base_params=state.base_params,
                     latent_params=state.latent_params,
                     batch=audit_batch,
                     anchors=audit_anchors,
+                ),
+                "component_embedding_gradient_alignment": _host_converted(
+                    gradient_alignment
                 ),
                 "environment_steps": final_environment_steps,
             },

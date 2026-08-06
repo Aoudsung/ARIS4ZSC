@@ -1,12 +1,13 @@
-# STATISTICAL_PREREGISTRATION
+# STATISTICAL_PREREGISTRATION — DELTA-ZSC v4
 
 `authoritative: true`
 
 ## Frozen before confirmatory evaluation
 
-- method identity and source revision;
-- Simple/Wide configs;
-- training and evaluation partner manifests;
+- v4 method/source identity and schemas;
+- Simple/Wide configs and semantic initializer artifacts;
+- training, initializer-calibration, posterior-calibration, and confirmatory
+  partner manifests;
 - seed indexes 0..9;
 - all registered baseline labels;
 - 500 episodes per pairing and both roles;
@@ -14,51 +15,59 @@
 - crossed ego-run/partner-run bootstrap with 9,999 replicates;
 - one-sided alpha 0.05;
 - material effect 20 points;
-- closed hierarchy H1 -> H2 -> H3;
-- active-VOI increment as secondary;
-- exact 66-outcome compact active-response marginal.
+- closed hierarchy `H1 -> H2 -> H3`;
+- active-minus-passive as secondary;
+- exact delayed 66-outcome active marginal and probe-successor estimand.
 
 ## H1
 
-For each layout and every registered baseline `m`, estimate
+For every layout and baseline `m`, estimate
 
 \[
 \Delta_m=J(\text{delta-active})-J(m).
 \]
 
-H1 passes only if every contrast has one-sided 95% lower bound above zero and
-point estimate at least 20. Requiring all contrasts is an intersection-union
-rule; no baseline is dropped after viewing results.
+H1 passes only when every contrast has one-sided 95% lower bound above zero and
+point estimate at least 20. This is an intersection-union rule; no baseline is
+removed after results.
 
 ## H2
 
-Using paired development seed means, compute
+Using paired development seed means, estimate
 
 \[
 J(\text{delta-passive})-J(\text{response-only}).
 \]
 
 Both layouts require a 95% interval lower endpoint above zero. H2 is
-confirmatory only when H1 passes.
+confirmatory only after H1.
 
 ## H3
 
-At same-world intervention anchors, compute empirical source continuation value
-of correct-belief minus shuffled-belief policies. Bootstrap ego and partner
-nodes. Both layouts require a one-sided lower bound above zero. H3 is
-confirmatory only when H1 and H2 pass.
+At same-world anchors, compare source continuation value of correct-belief and
+task-matched shuffled-belief mirror policies. Bootstrap ego and partner nodes.
+Both layouts require a one-sided lower bound above zero. H3 is confirmatory only
+after H1 and H2.
 
-## Secondary and diagnostic outputs
+## Secondary active result
 
-Always report active-minus-passive, K sensitivity, response and decision log
-scores, posterior entropy, information gain, exact VOI minimum/negative fraction,
-adaptation KL, resource accounting and negative-transfer summaries. None may be
-promoted into a new primary claim after results are observed.
+Always report `delta_active - delta_passive`, exact VOI, information gain,
+action-wise spreads, active/passive policy TV, and successor decision quality.
+No minimum active effect is imposed after results, and a null result is not
+redefined as success.
+
+## Diagnostic outputs
+
+Always report initializer singular values and conditional oracle gain,
+shared/semantic/decision scores and counts, component JS, partner separation,
+filter KL, posterior entropy, phase drift, current/successor regret, gradient
+alignment, exact-VOI numerical diagnostics, K sensitivity, negative transfer,
+and full resources. None may replace the primary endpoint.
 
 ## Missingness and failures
 
-A failed or missing run is not replaced by another seed. Root-cause reruns must
-use the same immutable identity. Exclusions require a pre-existing mechanical
-invalidity such as an unreadable checkpoint, a manifest/lineage mismatch,
-non-finite state, or an incomplete raw artifact; poor performance is never an exclusion
-criterion.
+A missing run is not replaced by another seed. A rerun keeps the immutable
+identity. Exclusion requires pre-existing mechanical invalidity such as an
+unreadable checkpoint, lineage mismatch, non-finite state, malformed initializer,
+or incomplete raw artifact. Poor performance, uniform belief, or zero active
+increment are never exclusion criteria.

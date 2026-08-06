@@ -1,0 +1,369 @@
+{
+  "complete": true,
+  "discovered": 50,
+  "duration_seconds": 354.53757333755493,
+  "executed": 50,
+  "failed": 0,
+  "finished_unix": 1786006765.6020696,
+  "jax_version": "0.9.0.1",
+  "numpy_version": "2.3.5",
+  "passed": 50,
+  "platform": "cpu",
+  "python_version": "3.13.5",
+  "records": [
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_cli.py::test_summarize_evaluations_cli_wires_seed_and_writes_h1_summary",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.413071870803833,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_cli.py::test_summarize_evaluations_cli_seed_defaults_to_zero",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.2748637199401855,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_cli.py::test_development_matrix_launches_every_cell_in_a_fresh_process",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.2671480178833008,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_all_registered_configs_load_and_method_has_three_fields",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.8105106353759766,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_action_contrast_basis_is_orthonormal_and_offset_invariant",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.944706916809082,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_episode_static_filter_persists_and_resets_only_at_episode_start",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.7753634452819824,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_interface_alignment_and_interact_exclusion_contract",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 4.446125030517578,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_mirror_policy_satisfies_kl_constraint",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 2.1952016353607178,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_model_executes_all_variants_with_one_shared_interface",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 16.926241159439087,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_decision_parameters_cannot_change_online_belief",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 18.388740062713623,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_v4_response_and_decision_residuals_are_component_centered",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 12.811115741729736,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_shared_occurrence_heads_cannot_change_online_belief",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 17.808802604675293,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_spectral_simplex_initializer_is_centered_and_round_trips",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9318976402282715,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_core.py::test_delayed_probe_target_uses_second_action_and_masks_terminal_windows",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 4.727545738220215,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_manifest_builder_resolves_and_reloads_lineage",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.7853453159332275,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_official_parent_throughput_is_counted_once_per_lineage",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.4701299667358398,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_official_parent_throughput_must_match_frozen_config",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.5687553882598877,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_manifest.py::test_resumed_resource_ledger_reconciles_parent_cost",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.522423505783081,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_active_namespace_contains_no_retired_patch_chain",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9092354774475098,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_active_tree_contains_only_unified_method_and_registered_apps",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9132366180419922,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_active_experiment_apps_import_only_unified_method_namespace",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9352827072143555,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_pyproject_packages_only_active_namespace",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9768784046173096,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_requirements_match_pyproject_runtime_dependencies_exactly",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9667325019836426,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_only_unified_workflow_is_active_and_method_identity_is_v4",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9607839584350586,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_repository.py::test_authoritative_docs_describe_only_exact_bayes_voi",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.9031436443328857,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_mock_end_to_end_rollout_and_anchor_use_base_policy",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 22.88589835166931,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_sparse_anchor_rollout_matches_full_recording",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 25.38406753540039,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_checkpoint_and_deployment_round_trip",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 9.472925186157227,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py::test_final_v4_audit_reduces_probe_axis_before_anchor_mask",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 29.15644335746765,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_training.py::test_base_and_latent_updates_are_separate_finite_transactions",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 31.270129203796387,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_training.py::test_outer_transaction_commits_latent_before_ppo",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 8.994538068771362,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_training.py::test_response_only_variant_never_uses_decision_anchor_channel",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 16.44088649749756,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_training.py::test_batched_base_policy_sequence_matches_step_replay",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 11.894086599349976,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_training.py::test_batched_filter_sequence_matches_online_steps",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 12.822754621505737,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_training.py::test_anchor_schema_contains_no_stale_posterior_or_comparator",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.7971210479736328,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_compact_delayed_distribution_has_exactly_66_normalized_outcomes",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 2.172374725341797,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_uninformative_delayed_response_has_zero_exact_voi_and_information_gain",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 3.3770928382873535,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_information_without_successor_decision_relevance_has_zero_voi",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 2.8785195350646973,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_unified_voi.py::test_probe_conditioned_successor_utility_is_required_and_jittable",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 1.8359737396240234,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_deterministic_and_spectral_initializers_are_centered_and_round_trip",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.782703161239624,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_fitted_initializer_provenance_is_layout_and_lineage_bound",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.7826173305511475,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_delayed_probe_target_uses_second_action_window_and_masks_boundaries",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 5.284760236740112,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_three_channel_objective_is_exact_sum_of_normalized_channels",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 19.16237735748291,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_active_probe_commits_exactly_one_base_continuation",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 19.207148790359497,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_probe_anchor_forces_decision_only_after_base_bridge",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 2.0920467376708984,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_successor_anchor_waits_for_delayed_response_and_excludes_bridge_rewards",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 2.281487226486206,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_passive_anchor_batch_has_no_successor_observation",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 22.099103689193726,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_development_budget_distinguishes_passive_and_active_anchor_cost",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.7944517135620117,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_development_matrix_resolves_k_specific_initializer_root",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 0.8201382160186768,
+      "status": "passed"
+    },
+    {
+      "nodeid": "experiments/overcooked_v2/tests/test_delta_v4_semantics.py::test_final_audit_component_event_js_reduces_probe_axis_before_anchor_mask",
+      "output": ".                                                                        [100%]\n",
+      "returncode": 0,
+      "seconds": 2.417299747467041,
+      "status": "passed"
+    }
+  ],
+  "runner": "validation/run_all_isolated_tests.py",
+  "schema_version": 1,
+  "started_unix": 1786006411.0644968,
+  "timed_out": 0
+}

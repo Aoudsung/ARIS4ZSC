@@ -1,42 +1,44 @@
 {
-  "artifact_type": "delta_exact_voi_v3_synthetic_acceptance",
+  "artifact_type": "delta_v4_delayed_exact_voi_synthetic_acceptance",
   "decision_revealing_response": {
     "information_gain": [
       [
-        0.6901289820671082
+        0.6860066652297974
       ]
     ],
     "voi": [
       [
-        0.9993290901184082
+        0.9897011518478394
       ]
     ]
   },
   "identity_information_without_decision_relevance": {
     "information_gain": [
       [
-        0.6901289820671082
+        0.6860066652297974
       ]
     ],
     "voi": [
       [
-        0.0
+        2.384185791015625e-07
       ]
     ]
   },
-  "method": "delta_joint_geometry_interface_decision_exact_voi_v3",
-  "validation_status": "pending_v3_regeneration",
+  "maximum_component_outcome_mass_error": 5.960464477539063e-08,
+  "method": "delta_episode_static_centered_residual_delayed_exact_voi_v4",
+  "outcome_count": 66,
   "uninformative_response": {
     "information_gain": [
       [
-        0.0
+        5.960464477539063e-08
       ]
     ],
     "voi": [
       [
-        0.0
+        1.1920928955078125e-07
       ]
     ]
   },
-  "version": 3
+  "validation_status": "generated_locally",
+  "version": 4
 }
