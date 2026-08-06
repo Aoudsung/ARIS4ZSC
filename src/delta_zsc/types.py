@@ -11,7 +11,7 @@ from typing import Any, Mapping, NamedTuple
 
 
 class BehaviorStatistics(NamedTuple):
-    """Independent Beta posteriors for four observable behaviour rates."""
+    """Independent Beta posteriors for six observable behaviour rates."""
 
     alpha: Any
     beta: Any
@@ -28,14 +28,49 @@ class PolicyState(NamedTuple):
     episode_start: Any
 
 
-class ResponsePrediction(NamedTuple):
-    """Factorized response distribution with a latent-component axis."""
+class DirectResponseTarget(NamedTuple):
+    """Directly observed teammate geometry retained for passive filtering."""
+
+    visibility: Any
+    relative_position: Any
+    direction: Any
+    inventory: Any
+    inventory_change: Any
+    visible_mask: Any
+    event_mask: Any
+    movement: Any
+    carrying: Any
+
+
+class ResponseTarget(NamedTuple):
+    """Complete direct and aligned-interface response observation."""
+
+    direct: DirectResponseTarget
+    interface_available: Any
+    interface_changed: Any
+    interface_event: Any
+    recipe_mask: Any
+    recipe_changed: Any
+
+
+class DirectResponsePrediction(NamedTuple):
+    """Latent-conditioned direct teammate response distribution."""
 
     visibility_logit: Any
     relative_position_logits: Any
     direction_logits: Any
     inventory_logits: Any
     inventory_change_logit: Any
+
+
+class ResponsePrediction(NamedTuple):
+    """Complete response emission; availability is shared across components."""
+
+    direct: DirectResponsePrediction
+    interface_availability_logit: Any
+    interface_change_logit: Any
+    interface_event_logits: Any
+    recipe_change_logit: Any
 
 
 class DecisionPrediction(NamedTuple):
@@ -46,16 +81,14 @@ class DecisionPrediction(NamedTuple):
 
 
 class VOIResult(NamedTuple):
-    """Myopic response-value quadrature and report-only diagnostics."""
+    """Exact myopic value under the compact active-response marginal."""
 
     value: Any
-    raw_value: Any
     expected_posterior_value: Any
     prior_value: Any
     expected_posterior_entropy: Any
     predictive_entropy: Any
     expected_information_gain: Any
-    quadrature_error_estimate: Any
 
 
 class ModelOutput(NamedTuple):
@@ -75,9 +108,7 @@ class ModelOutput(NamedTuple):
     component_decision_variances: Any
     expected_decision_values: Any
     active_voi: Any
-    active_voi_raw: Any
     active_information_gain: Any
-    active_voi_quadrature_error: Any
     adaptation_kl: Any
     adaptation_temperature: Any
 
@@ -169,10 +200,13 @@ __all__ = [
     "AnchorSnapshots",
     "BehaviorStatistics",
     "DecisionPrediction",
+    "DirectResponsePrediction",
+    "DirectResponseTarget",
     "LossResult",
     "ModelOutput",
     "PolicyState",
     "ResponsePrediction",
+    "ResponseTarget",
     "RolloutBatch",
     "RunnerState",
     "TrainState",

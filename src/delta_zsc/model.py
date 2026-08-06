@@ -26,10 +26,30 @@ from .behavior_statistics import (
 from .belief_filter import uniform_belief
 from .latent_model import init_latent_params, observe_response, predict_decision
 from .mirror_policy import mirror_policy_logits
-from .observation import partner_visibility
 from .response_model import response_predict
 from .transition import predict_belief
-from .types import ModelOutput, PolicyState, ResponsePrediction
+from .types import DirectResponsePrediction, ModelOutput, PolicyState, ResponsePrediction
+
+
+def _zero_response(lead: tuple[int, ...], components: int, factors: int) -> ResponsePrediction:
+    import jax.numpy as jnp
+
+    zero_component = jnp.zeros(lead + (components,), dtype=jnp.float32)
+    return ResponsePrediction(
+        direct=DirectResponsePrediction(
+            visibility_logit=zero_component,
+            relative_position_logits=jnp.zeros(lead + (components, 25), dtype=jnp.float32),
+            direction_logits=jnp.zeros(lead + (components, 4), dtype=jnp.float32),
+            inventory_logits=jnp.zeros(
+                lead + (components, factors, 2), dtype=jnp.float32
+            ),
+            inventory_change_logit=zero_component,
+        ),
+        interface_availability_logit=jnp.zeros(lead, dtype=jnp.float32),
+        interface_change_logit=zero_component,
+        interface_event_logits=jnp.zeros(lead + (components, 31), dtype=jnp.float32),
+        recipe_change_logit=zero_component,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,21 +135,8 @@ class DeltaModel:
             components = int(self.config.method.latent_components)
             ingredients = (int(self.observation_shape[-1]) - 27) // 4
             factors = ingredients + 2
-            zero_component = jnp.zeros(lead + (components,), dtype=jnp.float32)
             zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
-            response = ResponsePrediction(
-                visibility_logit=zero_component,
-                relative_position_logits=jnp.zeros(
-                    lead + (components, 25), dtype=jnp.float32
-                ),
-                direction_logits=jnp.zeros(
-                    lead + (components, 4), dtype=jnp.float32
-                ),
-                inventory_logits=jnp.zeros(
-                    lead + (components, factors, 2), dtype=jnp.float32
-                ),
-                inventory_change_logit=zero_component,
-            )
+            response = _zero_response(lead, components, factors)
             next_state = state._replace(
                 task_carry=next_task,
                 previous_observation=jnp.asarray(observation, dtype=jnp.float32),
@@ -153,9 +160,7 @@ class DeltaModel:
                 ),
                 expected_decision_values=zero_action,
                 active_voi=zero_action,
-                active_voi_raw=zero_action,
                 active_information_gain=zero_action,
-                active_voi_quadrature_error=zero_action,
                 adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
                 adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
             )
@@ -212,9 +217,7 @@ class DeltaModel:
 
         zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
         active_voi = zero_action
-        active_voi_raw = zero_action
         information_gain = zero_action
-        quadrature_error = zero_action
         action_values = expected_values
         variant = str(self.config.method_variant)
         if bool(execute_adaptation) and variant == "delta_active":
@@ -243,13 +246,9 @@ class DeltaModel:
                 latent_params["transition_logits"],
                 response_by_action,
                 decision.means,
-                previous_visibility=partner_visibility(observation),
-                sample_count=self.config.model.voi_quadrature_samples,
             )
             active_voi = voi.value
-            active_voi_raw = voi.raw_value
             information_gain = voi.expected_information_gain
-            quadrature_error = voi.quadrature_error_estimate
             action_values = expected_values + float(self.config.ppo.gamma) * active_voi
 
         if bool(execute_adaptation) and variant in {"delta_passive", "delta_active"}:
@@ -289,9 +288,7 @@ class DeltaModel:
             component_decision_variances=decision.variances,
             expected_decision_values=expected_values,
             active_voi=active_voi,
-            active_voi_raw=active_voi_raw,
             active_information_gain=information_gain,
-            active_voi_quadrature_error=quadrature_error,
             adaptation_kl=adaptation_kl,
             adaptation_temperature=adaptation_temperature,
         )
@@ -333,21 +330,8 @@ class DeltaModel:
             components = int(self.config.method.latent_components)
             ingredients = (int(self.observation_shape[-1]) - 27) // 4
             factors = ingredients + 2
-            zero_component = jnp.zeros(lead + (components,), dtype=jnp.float32)
             zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
-            response = ResponsePrediction(
-                visibility_logit=zero_component,
-                relative_position_logits=jnp.zeros(
-                    lead + (components, 25), dtype=jnp.float32
-                ),
-                direction_logits=jnp.zeros(
-                    lead + (components, 4), dtype=jnp.float32
-                ),
-                inventory_logits=jnp.zeros(
-                    lead + (components, factors, 2), dtype=jnp.float32
-                ),
-                inventory_change_logit=zero_component,
-            )
+            response = _zero_response(lead, components, factors)
             belief = jnp.broadcast_to(initial_state.belief, lead + (components,))
             statistics = behavior_features(initial_state.behavior)
             statistics = jnp.broadcast_to(
@@ -378,9 +362,7 @@ class DeltaModel:
                 ),
                 expected_decision_values=zero_action,
                 active_voi=zero_action,
-                active_voi_raw=zero_action,
                 active_information_gain=zero_action,
-                active_voi_quadrature_error=zero_action,
                 adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
                 adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
             )

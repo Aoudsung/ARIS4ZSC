@@ -7,8 +7,8 @@ from typing import Any
 from .types import BehaviorStatistics
 
 
-BEHAVIOR_STREAM_COUNT = 4
-BEHAVIOR_FEATURE_DIM = 8
+BEHAVIOR_STREAM_COUNT = 6
+BEHAVIOR_FEATURE_DIM = 12
 
 
 def initial_behavior_statistics(batch_shape: tuple[int, ...]) -> BehaviorStatistics:
@@ -50,19 +50,23 @@ def update_behavior_statistics(
 
     trials = jnp.stack(
         (
-            jnp.ones_like(response_target.visibility, dtype=jnp.float32),
-            jnp.asarray(response_target.event_mask, dtype=jnp.float32),
-            jnp.asarray(response_target.visible_mask, dtype=jnp.float32),
-            jnp.asarray(response_target.event_mask, dtype=jnp.float32),
+            jnp.ones_like(response_target.direct.visibility, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.event_mask, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.visible_mask, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.event_mask, dtype=jnp.float32),
+            jnp.asarray(response_target.interface_available, dtype=jnp.float32),
+            jnp.asarray(response_target.recipe_mask, dtype=jnp.float32),
         ),
         axis=-1,
     )
     successes = jnp.stack(
         (
-            jnp.asarray(response_target.visibility, dtype=jnp.float32),
-            jnp.asarray(response_target.movement, dtype=jnp.float32),
-            jnp.asarray(response_target.carrying, dtype=jnp.float32),
-            jnp.asarray(response_target.inventory_change, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.visibility, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.movement, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.carrying, dtype=jnp.float32),
+            jnp.asarray(response_target.direct.inventory_change, dtype=jnp.float32),
+            jnp.asarray(response_target.interface_changed, dtype=jnp.float32),
+            jnp.asarray(response_target.recipe_changed, dtype=jnp.float32),
         ),
         axis=-1,
     )

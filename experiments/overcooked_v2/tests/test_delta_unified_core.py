@@ -24,7 +24,6 @@ def _small_config(variant: str = "delta_active"):
             latent_hidden_dim=16,
             latent_embedding_dim=8,
             action_embedding_dim=4,
-            voi_quadrature_samples=8,
         ),
     )
 
@@ -80,6 +79,37 @@ def test_filter_uses_physical_transition_and_exact_response_correction() -> None
     assert float(filter_update(belief, transition_logits, evidence)[0, 0]) > 0.99
 
 
+def test_interface_alignment_and_interact_exclusion_contract() -> None:
+    import jax.numpy as jnp
+
+    from src.delta_zsc.observation import extract_interface_target
+
+    previous = jnp.zeros((5, 5, 39), dtype=jnp.float32)
+    # Asymmetric static counter pattern uniquely selects successful right move.
+    previous = previous.at[0, 1, 20].set(1.0)
+    previous = previous.at[3, 3, 20].set(1.0)
+    current = jnp.zeros_like(previous)
+    current = current.at[:, :4, 20:29].set(previous[:, 1:, 20:29])
+    current = current.at[0, 0, 29].set(1.0)
+    available, changed, event, _, _ = extract_interface_target(
+        previous, current, jnp.asarray(0), jnp.asarray(False)
+    )
+    assert bool(available)
+    assert bool(changed)
+    assert int(event) == 0  # counter, appeared, plate
+
+    stationary = jnp.zeros((5, 5, 39), dtype=jnp.float32)
+    stationary = stationary.at[1, 2, 20].set(1.0)  # ego-facing counter
+    stationary = stationary.at[4, 4, 20].set(1.0)  # unaffected target facility
+    stationary = stationary.at[2, 2, 1].set(1.0)   # ego faces up
+    after_interact = stationary.at[1, 2, 29].set(1.0)
+    available, changed, _, _, _ = extract_interface_target(
+        stationary, after_interact, jnp.asarray(5), jnp.asarray(False)
+    )
+    assert bool(available)
+    assert not bool(changed)
+
+
 def test_mirror_policy_satisfies_kl_constraint() -> None:
     import jax.numpy as jnp
 
@@ -114,7 +144,7 @@ def test_model_executes_all_variants_with_one_shared_interface() -> None:
         assert next_state.belief.shape == (3, 4)
         assert output.policy_logits.shape == (3, 6)
         assert output.component_decision_means.shape == (3, 4, 6)
-        assert output.active_voi_quadrature_error.shape == (3, 6)
+        assert output.active_voi.shape == (3, 6)
         assert bool(jnp.all(jnp.isfinite(output.policy_logits)))
         if variant in {"delta_passive", "delta_active"}:
             assert float(jnp.max(output.adaptation_kl)) <= 0.04001

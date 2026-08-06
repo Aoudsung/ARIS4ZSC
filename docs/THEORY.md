@@ -63,9 +63,9 @@ Jensen's inequality gives
 \mathbb E_y[V(b^y)]-V(\bar b)\ge0.
 \]
 
-The implementation records the raw deterministic quadrature estimate and uses
-its non-negative part for control because finite quadrature can violate the
-inequality slightly.
+The implementation exactly sums its finite 66-outcome active-response marginal
+and uses the resulting value directly. It records small negative values and
+their frequency as floating-point diagnostics rather than changing them.
 
 ## 5. Decision relevance, not identity information
 
@@ -75,16 +75,14 @@ the component. More generally, information that only separates components with
 identical optimal decision value has zero decision VOI. This property is covered
 by a synthetic test where information gain is positive but VOI is zero.
 
-## 6. Deterministic quadrature consistency
+## 6. Exact compact-marginal scope
 
-For the finite discrete response model, inverse-CDF integration with a
-low-discrepancy sequence converges to the response expectation as sample count
-increases. DELTA Rao-Blackwellizes both binary factors: visibility is summed
-exactly, and inventory-change is summed exactly whenever it is legally
-observable. Source components are also summed exactly. Only the remaining
-position/direction/inventory integral is approximated. The `S/2` versus `S`
-prefix difference is a convergence diagnostic, not a probabilistic confidence
-interval or a formal error bound.
+Passive filtering scores the complete response. Active probing exactly sums the
+compact marginal `(visibility,M,C,E)`: two unavailable, two available/no-change,
+and sixty-two available/change-event outcomes. Conditional geometry,
+inventory-change, and recipe are analytically marginalized by omission from
+this marginal, not numerically sampled. Thus exactness refers to this registered
+compact marginal, not to enumeration of every full geometric response tuple.
 
 ## 7. Scope of the local-stationarity surrogate
 
@@ -105,10 +103,10 @@ For any belief, the corresponding optimal values differ by at most
 \]
 
 Thus the active term is well-founded when decision-equivalent action ordering
-changes slowly over the one-response horizon. The repository does not infer
-that condition from entropy and does not claim exact long-horizon planning.
-The public VOI API already accepts probe-conditioned future utilities for a
-future extension that supplies them with valid training observations.
+changes slowly over the one-response horizon. The repository does not claim
+exact long-horizon planning. The public VOI API already accepts
+probe-conditioned future utilities for a future extension that supplies them
+with valid training observations.
 
 ## 8. Error decomposition for adapted performance
 
@@ -119,12 +117,12 @@ decomposed into:
 2. posterior filtering error inherited from that model;
 3. decision-emission error;
 4. local-stationarity error;
-5. deterministic quadrature error;
+5. compact-active-marginal approximation error;
 6. KL projection restriction.
 
 The architecture exposes diagnostics for response NLL, held-out decision
-ordering, posterior entropy, raw/clamped VOI, information gain, quadrature
-prefix error, and achieved KL. These measurements diagnose failure but do not
+ordering, posterior entropy, exact VOI minimum/negative fraction, information
+gain, aligned-event coverage/calibration, and achieved KL. These measurements diagnose failure but do not
 become additional training gates.
 
 ## 9. What is not proved

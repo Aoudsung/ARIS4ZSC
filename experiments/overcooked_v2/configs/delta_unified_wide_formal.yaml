@@ -1,4 +1,4 @@
-version: 1
+version: 2
 method_variant: delta_active
 method:
   latent_components: 4
@@ -19,7 +19,6 @@ model:
   latent_hidden_dim: 128
   latent_embedding_dim: 32
   action_embedding_dim: 16
-  voi_quadrature_samples: 16
 ppo:
   update_epochs: 4
   learning_rate: 0.00025

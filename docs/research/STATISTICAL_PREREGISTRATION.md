@@ -16,7 +16,7 @@
 - material effect 20 points;
 - closed hierarchy H1 -> H2 -> H3;
 - active-VOI increment as secondary;
-- Halton sample count 16 and nested 8/16 error diagnostic.
+- exact 66-outcome compact active-response marginal.
 
 ## H1
 
@@ -51,7 +51,7 @@ confirmatory only when H1 and H2 pass.
 ## Secondary and diagnostic outputs
 
 Always report active-minus-passive, K sensitivity, response and decision log
-scores, posterior entropy, information gain, raw/clamped VOI, quadrature error,
+scores, posterior entropy, information gain, exact VOI minimum/negative fraction,
 adaptation KL, resource accounting and negative-transfer summaries. None may be
 promoted into a new primary claim after results are observed.
 

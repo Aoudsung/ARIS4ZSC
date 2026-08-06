@@ -83,7 +83,9 @@ def observe_response(
     component_count = int(params["component_embeddings"].shape[0])
     prior = uniform_belief(start.shape, component_count)
     previous_belief = jnp.where(start[..., None], prior, belief)
-    response_target = extract_response_target(previous_observation, observation)
+    response_target = extract_response_target(
+        previous_observation, observation, previous_action, start
+    )
     before_features = behavior_features(statistics)
     prediction = response_predict(
         params["response"],

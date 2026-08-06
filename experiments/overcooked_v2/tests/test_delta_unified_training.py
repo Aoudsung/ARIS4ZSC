@@ -26,7 +26,6 @@ def _setup(variant: str = "delta_active"):
             latent_hidden_dim=16,
             latent_embedding_dim=8,
             action_embedding_dim=4,
-            voi_quadrature_samples=4,
         ),
         ppo=replace(config.ppo, update_epochs=1),
     )

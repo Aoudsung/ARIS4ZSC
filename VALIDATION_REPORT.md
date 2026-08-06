@@ -1,13 +1,38 @@
-# DELTA-ZSC VOI v2 validation report
+# DELTA-ZSC validation report
 
-Date: 2026-08-05
+Date: 2026-08-06
 
 ## Scope
 
-This report covers the final source package, completed VOI v2, estimator
-boundaries, mocked end-to-end mechanics, configuration/CLI contracts, active
-namespace isolation, and artifact integrity. It does not contain or imply
-formal OvercookedV2 performance evidence.
+The local regression results below cover the superseded VOI v2 package. The
+exact-VOI v3 revision has not been executed locally, but it has compiled and
+completed three fresh development-budget runs plus a real Official-environment
+evaluation on the registered remote CUDA stack. This is development-support
+pilot evidence, not confirmatory OvercookedV2 evidence or a SOTA claim.
+
+## Remote CUDA v3 execution
+
+- Runtime: Python 3.10.19, JAX 0.4.38, one NVIDIA A10 CUDA device.
+- Method identity: `delta_active`,
+  `delta_joint_geometry_interface_decision_exact_voi_v3`, config schema 2,
+  checkpoint schema 3.
+- Training: seeds 0, 1 and 2 each completed all 1,228,800 registered
+  development ego-policy steps, 150 updates, 12 anchor triggers and final
+  deployment export; no base or latent non-finite update was recorded.
+- Evaluation: 3,600 real Official-environment episodes against the available
+  `development_support` SP/OP pilot panel; mean raw return `6.6777777778`.
+- Artifact root:
+  `/mnt/workspace/ARIS4ZSC_v5/runs/engineering/SP_OP_results/delta_interface_v3_3seed_20260806`.
+
+The pilot exposes a substantive scientific failure rather than an execution
+failure: mean posterior entropy remains within roughly `3e-4` of `log(4)`, final
+top-action agreement is only `0.0625`--`0.125`, and exact VOI/information gain
+remain near zero. The SP-partner subset averages `17.6778`, while the OP-partner
+subset averages `-4.3222`; role 0 averages `13.8778` and role 1 `-0.5222`.
+A descriptive one-seed SP comparator on the same panel averages `5.6167`, versus
+`6.6778` for the three DELTA seeds. This is not an inferential comparison: the
+SP ego is seed 201, shares lineage with the panel's SP parent, and is evaluated
+against its own staged checkpoints.
 
 ## Local validation environment
 
@@ -34,8 +59,8 @@ real CUDA mechanical preflight.
 | `test_delta_unified_repository.py` | passed | 6 |
 | **Total** | **passed** | **26** |
 
-The tests cover deterministic multidimensional Halton construction,
-uninformative/revealing/decision-irrelevant response cases, exact binary
+The listed v2 tests covered the prior numerical integration and
+uninformative/revealing/decision-irrelevant response cases, binary
 marginalization, probe-conditioned JIT execution, exact filtering, KL
 satisfaction, all method variants, belief independence from decision-only
 parameters, separate finite base/latent updates, latent-before-PPO transaction
@@ -47,8 +72,7 @@ trip, manifest lineage, and active/legacy repository boundaries.
 
 `validation/voi_synthetic_diagnostics.json` records:
 
-- uninformative response: VOI `0.0`, information gain `0.0`, quadrature error
-  `0.0`;
+- uninformative response: VOI `0.0`, information gain `0.0`;
 - decision-revealing response: VOI approximately `0.999329`, information gain
   approximately `0.690129`;
 - component-identifying but decision-irrelevant response: information gain
@@ -57,7 +81,7 @@ trip, manifest lineage, and active/legacy repository boundaries.
 This directly checks that active DELTA values information only through its
 consequence for action choice, not through partner identifiability itself.
 
-## Contract validation
+## Superseded v2 contract validation
 
 - Active source and experiment applications compile successfully.
 - All six registered Simple/Wide mechanical/development/formal configurations
@@ -86,21 +110,19 @@ refuses to reuse an output directory whose recorded config differs. Changing a
 configuration therefore still changes the experiment identity, and the difference is
 readable rather than opaque.
 
-## Not executed in this container
+## Not executed
 
 The following require resources not present in the local runtime and are not
 represented as passed:
 
-1. editable installation under the exact registered Python 3.10 dependency
-   environment;
-2. restoration and execution of real Official partner checkpoints;
-3. the self-hosted single-GPU CUDA mechanical preflight;
-4. paired five-seed Simple/Wide development matrices;
-5. ten-run formal training/evaluation and H1/H2/H3 inference.
+1. v3 local CPU regression and synthetic diagnostics regeneration;
+2. a lineage-disjoint multi-parent calibration/confirmatory panel;
+3. paired five-seed Simple/Wide development matrices;
+4. ten-run formal training/evaluation and H1/H2/H3 inference.
 
-The repository provides executable commands and a fail-closed workflow for
-these operations. Their absence prevents a performance or SOTA claim, but does
-not invalidate the CPU-side implementation acceptance described above.
+Their absence prevents a performance or SOTA claim. The remote pilot establishes
+that the revised implementation executes end to end; it does not establish that
+the current learned posterior or active policy is scientifically effective.
 
 ## Source identity
 

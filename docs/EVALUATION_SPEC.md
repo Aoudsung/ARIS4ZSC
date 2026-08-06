@@ -66,9 +66,9 @@ Claims are evaluated in the closed order H1 -> H2 -> H3.
 The active increment is reported on both layouts regardless of sign. It remains
 a pre-registered secondary result. Mechanism diagnostics include:
 
-- raw and non-negative VOI;
+- exact compact-marginal VOI;
 - expected information gain;
-- nested Halton quadrature error;
+- exact-VOI minimum and negative floating-point fraction;
 - action-wise VOI dispersion;
 - achieved adaptation KL;
 - active/passive action disagreement;
@@ -78,10 +78,14 @@ Information gain cannot substitute for task VOI.
 
 ## 6. Posterior-predictive diagnostics
 
-The calibration application is diagnostic only. It reports response NLL,
-component-mixture gain, posterior entropy, and held-out structure by independent
-partner run. It does not tune a conformal gate or decide whether training may
-continue.
+The calibration application is diagnostic only. It reports factor NLL/counts,
+aligned-interface coverage, change Brier score, conditional event NLL,
+`OTHER/MULTI` rate, event-component Jensen-Shannon separation, posterior
+entropy, and the measured SP/OP target-distribution difference by independent
+partner run. No target-distribution threshold gates performance. Its outputs
+are read-only diagnostics for localizing the error
+terms enumerated in THEORY §8; training progression follows the registered
+development procedure.
 
 ## 7. Resource accounting
 

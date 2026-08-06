@@ -227,9 +227,7 @@ def collect_rollout(
             "deployment_policy_logits": output.policy_logits,
             "belief": output.belief,
             "active_voi": output.active_voi,
-            "active_voi_raw": output.active_voi_raw,
             "active_information_gain": output.active_information_gain,
-            "active_voi_quadrature_error": output.active_voi_quadrature_error,
             "adaptation_kl": output.adaptation_kl,
         }
         return next_state, row
@@ -295,9 +293,7 @@ def collect_rollout(
             "base_policy_logits": rows["base_policy_logits"],
             "deployment_policy_logits": rows["deployment_policy_logits"],
             "active_voi": rows["active_voi"],
-            "active_voi_raw": rows["active_voi_raw"],
             "active_information_gain": rows["active_information_gain"],
-            "active_voi_quadrature_error": rows["active_voi_quadrature_error"],
             "adaptation_kl": rows["adaptation_kl"],
         }
     )

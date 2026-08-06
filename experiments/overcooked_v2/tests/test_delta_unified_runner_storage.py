@@ -102,7 +102,6 @@ def _model():
             latent_hidden_dim=16,
             latent_embedding_dim=8,
             action_embedding_dim=4,
-            voi_quadrature_samples=4,
         ),
     )
     model = DeltaModel(config, (5, 5, 39), 6)
@@ -142,11 +141,9 @@ def test_mock_end_to_end_rollout_and_anchor_use_base_policy() -> None:
     )
     assert batch.observations.shape == (5, 4, 5, 5, 39)
     assert batch.response_next_observations.shape == (4, 4, 5, 5, 39)
-    assert records["active_voi_raw"].shape == (4, 4, 6)
-    assert records["active_voi_quadrature_error"].shape == (4, 4, 6)
     # Training is exactly base-policy collection: no active value is computed
     # and no analytic deployment adjustment enters the behavior distribution.
-    np.testing.assert_allclose(np.asarray(records["active_voi_raw"]), 0.0, atol=0.0)
+    np.testing.assert_allclose(np.asarray(records["active_voi"]), 0.0, atol=0.0)
     np.testing.assert_allclose(
         np.asarray(records["deployment_policy_logits"]),
         np.asarray(records["base_policy_logits"]),

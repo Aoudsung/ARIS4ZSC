@@ -73,7 +73,7 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
         if (
             diagnostics[layout].get("artifact_type")
             != "delta_posterior_predictive_diagnostics"
-            or diagnostics[layout].get("version") != 2
+            or diagnostics[layout].get("version") != 3
             or diagnostics[layout].get("layout") != layout
             or diagnostics[layout].get("claim_role") != "diagnostic_only"
         ):

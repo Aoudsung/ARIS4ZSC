@@ -5,12 +5,18 @@ OvercookedV2 Test-Time Protocol Formation benchmark.
 
 Active identity:
 
-- `METHOD_VERSION = delta_joint_response_decision_mirror_voi_v2`
-- `CONFIG_VERSION = 1`
-- `CHECKPOINT_SCHEMA_VERSION = 1`
-- `MANIFEST_VERSION = 1`
+- `METHOD_VERSION = delta_joint_geometry_interface_decision_exact_voi_v3`
+- `CONFIG_VERSION = 2`
+- `CHECKPOINT_SCHEMA_VERSION = 3`
+- `MANIFEST_VERSION = 2`
 - active Python namespace: `src/delta_zsc/`
 - active CLI: `python -m experiments.overcooked_v2.delta_zsc`
+
+The v3 checkpoint schema is deliberately incompatible with earlier DELTA
+checkpoints and optimizer/replay state. Official SP/OP parent checkpoints and
+partner manifests remain valid because `MANIFEST_VERSION` is unchanged. Any
+earlier DELTA seed-0 run is failure-diagnostic evidence only: it cannot be
+resumed or included in v3 scientific summaries.
 
 The complete previous DEPI v8 source package, experiment applications,
 configurations, workflow, and tests are preserved under
@@ -57,30 +63,27 @@ separation loss, or gradient-routing table remains.
 
 ## Completed active VOI
 
-For each candidate probe action, DELTA constructs its full factorized teammate
-response distribution. Visibility is summed exactly; position, direction and
-inventory are integrated by a deterministic multidimensional Halton rule; and
-observable inventory-change is summed exactly. Every resulting outcome is
+Passive filtering uses the full factorized response: direct teammate geometry,
+aligned structured interface events, and independently covered recipe change.
+For each candidate probe action, active DELTA exactly enumerates the 66 outcomes
+of the compact `(visibility, availability, change, event)` marginal. Every outcome is
 scored under every latent component, followed by an exact categorical Bayes
 update. DELTA then evaluates how much the updated belief improves the best
 latent-conditioned decision:
 
 \[
-\widehat{\mathrm{VOI}}_S(a)
+\mathrm{VOI}(a)
 =
-\mathcal Q^{\rm RB}_S\!\left[
+\mathbb E_{Y^{active}}\!\left[
 V\!\left(b^{a,Y};\mu^a\right)
 \right]
 -
 V\!\left(\bar b;\mu^a\right),
 \]
-Here `Q_S^RB` denotes exact summation over source components, visibility, and
-legal inventory-change outcomes, with Halton integration only over the
-remaining categorical product. This is not an entropy bonus or an expected-cross-log-likelihood proxy. Expected
-information gain is reported separately and never added to reward. The active
-policy uses `max(VOI_raw, 0)` only to suppress finite-quadrature negative noise.
-The nested `S/2` versus `S` Halton-prefix difference is emitted as a numerical
-convergence diagnostic and never gates the policy.
+This is exact for the compact active-response marginal, not an entropy bonus or
+an enumeration of the full geometry tuple. Expected information gain is
+reported separately and never added to reward. VOI is used without a clamp;
+its minimum and negative-value fraction are floating-point diagnostics.
 
 The registered implementation is a one-response, decision-equivalence VOI. It
 supports probe-conditioned future utility matrices, while the standard
@@ -101,7 +104,7 @@ method:
 
 `K` is latent capacity, `H` defines the CRN decision-return estimand, and
 `delta` bounds deployment deviation from the base policy. Network widths,
-optimizer values, quadrature samples, rollout counts, and bootstrap replicates
+optimizer values, rollout counts, and bootstrap replicates
 are engineering or measurement settings, not additional mechanisms.
 
 ## Registered variants

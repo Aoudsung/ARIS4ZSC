@@ -26,6 +26,9 @@ registered cases distinguish decision value from mere identifiability:
 - response reveals component identity but all components have the same action
   ordering/value: information gain > 0 while VOI = 0.
 
+The checked-in JSON is marked pending until the v3 generator is executed in the
+registered environment; the historical v2 local result is not v3 acceptance.
+
 These are implementation acceptance artifacts, not benchmark results. The real
 Official/CUDA preflight requires the pinned Python 3.10 environment, a
 lineage-bound partner manifest, real checkpoints, and a self-hosted GPU.

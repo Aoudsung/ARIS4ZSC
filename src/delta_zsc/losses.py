@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from .decision_model import decision_component_log_probability, decision_predict
-from .response_model import response_joint_log_probability, response_predict
+from .response_model import (
+    response_factor_log_probabilities,
+    response_joint_log_probability,
+    response_predict,
+)
 from .transition import predict_belief
 from .types import AnchorBatch, LossResult, RolloutBatch
 
@@ -194,7 +198,10 @@ def latent_composite_loss(
     from .observation import extract_response_target
 
     response_target = extract_response_target(
-        batch.observations[:-1], batch.response_next_observations
+        batch.observations[:-1],
+        batch.response_next_observations,
+        batch.actions,
+        jnp.zeros_like(batch.dones, dtype=jnp.bool_),
     )
     response_prediction = response_predict(
         latent_params["response"],
@@ -217,6 +224,36 @@ def latent_composite_loss(
     response_sum = -jnp.sum(response_mask * response_logp)
     response_count = jnp.sum(response_mask)
     response_nll = response_sum / jnp.maximum(response_count, 1.0)
+    factor_logp = response_factor_log_probabilities(response_prediction, response_target)
+    direct = response_target.direct
+    factor_masks = {
+        "visibility": jnp.ones_like(response_mask),
+        "position": direct.visible_mask,
+        "direction": direct.visible_mask,
+        "inventory": direct.visible_mask,
+        "inventory_change": direct.event_mask,
+        "interface_availability": jnp.ones_like(response_mask),
+        "interface_change": response_target.interface_available,
+        "interface_event": (
+            response_target.interface_available * response_target.interface_changed
+        ),
+        "recipe_change": response_target.recipe_mask,
+    }
+    factor_metrics = {}
+    for name, component_factor_logp in factor_logp.items():
+        marginal_factor_logp = jsp.special.logsumexp(
+            jnp.log(jnp.maximum(predictive, 1.0e-30)) + component_factor_logp,
+            axis=-1,
+        )
+        factor_mask = response_mask * jnp.asarray(factor_masks[name], dtype=jnp.float32)
+        factor_count = jnp.sum(factor_mask)
+        factor_metrics[f"latent_response_{name}_nll"] = -jnp.sum(
+            factor_mask * marginal_factor_logp
+        ) / jnp.maximum(factor_count, 1.0)
+        factor_metrics[f"latent_response_{name}_count"] = factor_count
+        factor_metrics[f"latent_response_{name}_rate"] = factor_count / jnp.maximum(
+            response_count, 1.0
+        )
 
     decision_sum = jnp.asarray(0.0, dtype=jnp.float32)
     decision_count = jnp.asarray(0.0, dtype=jnp.float32)
@@ -288,6 +325,34 @@ def latent_composite_loss(
             "latent_mean_posterior_entropy": jnp.mean(posterior_entropy),
             "latent_decision_top_action_agreement": decision_top_action_agreement,
             "latent_decision_empirical_regret": decision_empirical_regret,
+            "latent_interface_coverage_rate": _masked_mean(
+                response_target.interface_available, response_mask
+            ),
+            "latent_interface_change_rate": _masked_mean(
+                response_target.interface_changed,
+                response_mask * response_target.interface_available,
+            ),
+            "latent_interface_other_multi_rate": _masked_mean(
+                (response_target.interface_event == 30).astype(jnp.float32),
+                response_mask
+                * response_target.interface_available
+                * response_target.interface_changed,
+            ),
+            "latent_recipe_coverage_rate": _masked_mean(
+                response_target.recipe_mask, response_mask
+            ),
+            "latent_visibility_positive_rate": _masked_mean(
+                response_target.direct.visibility, response_mask
+            ),
+            "latent_inventory_change_positive_rate": _masked_mean(
+                response_target.direct.inventory_change,
+                response_mask * response_target.direct.event_mask,
+            ),
+            "latent_recipe_change_positive_rate": _masked_mean(
+                response_target.recipe_changed,
+                response_mask * response_target.recipe_mask,
+            ),
+            **factor_metrics,
         },
     )
 

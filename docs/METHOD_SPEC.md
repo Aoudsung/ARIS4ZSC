@@ -14,8 +14,8 @@ p(z_{1:T},y_{1:T},A_{\mathcal S}\mid x_{1:T},r_{1:T},u_{1:T},a_{1:T})
 
 `y_t` is the legal observable teammate response. `A_t` is the sparse CRN
 all-action return observation. Both channels share the same latent component;
-there is no comparator, separation objective, pseudo-responsibility target,
-capability encoder, context dropout, auxiliary actor, or loss-weight table.
+the training objective is the marginal likelihood of the factorization above:
+latent prior and transition, response emission, and decision emission.
 
 ## 2. Base task policy
 
@@ -33,10 +33,12 @@ not part of DELTA.
 
 ## 3. Analytic behavior statistics
 
-DELTA maintains four independent Beta(1,1) posteriors over observable rates:
+DELTA maintains six independent Beta(1,1) posteriors over observable rates:
 visibility, visible movement, visible inventory occupancy, and visible
-inventory change. The model reads posterior means and log precision. These are
-exact legal-history functions and require no learned capability loss.
+inventory change, aligned interface change, and recipe change. The model reads
+posterior means and log precision. These are
+exact legal-history functions with closed-form Beta updates; their posterior
+parameters are accumulated event counts.
 
 ## 4. Latent dynamics and response emission
 
@@ -54,6 +56,27 @@ each component:
 - direction conditional on visibility;
 - factorized inventory conditional on visibility;
 - inventory change conditional on visibility at both ends.
+
+Visibility is scored every step, including in Simple where the conditional
+geometry masks may be zero; factor-level NLL/count/rate diagnostics keep that
+evidence separate from masked geometry.
+
+It additionally aligns consecutive ego-centric frames using exactly the
+successful-move and stationary candidates. Static channels 20:29 determine a
+unique overlap; failed or ambiguous alignment is unavailable. For `interact`,
+the ego-facing cell is excluded. Dynamic channels 29:34 then yield an aligned
+interface hurdle: shared availability, component-conditioned change, and a
+31-class event (`3 facilities x 2 appeared/disappeared x 5 objects`, plus
+`OTHER/MULTI`). `NO_CHANGE` is a scored response. Recipe change has an
+independent coverage mask requiring the same recipe/button cell in both frames.
+Availability has no component axis and therefore cannot create latent evidence.
+Goal events require an actual dynamic-plane change; no delivery-indicator event
+is synthesized.
+
+Thus the conditional interface support has 32 outcomes: `NO_CHANGE` plus 31
+change outcomes. Event logits are normalized jointly after adding factorized
+facility, appeared/disappeared, and object logits and appending the
+`OTHER/MULTI` logit.
 
 A complete response is scored under one component before the mixture is
 marginalized. Missing conditional factors contribute zero log likelihood; they
@@ -113,8 +136,9 @@ L_{\rm latent}
 {N_y+N_A}.
 \]
 
-There is no tunable relative loss coefficient. `response_only` omits the sparse
-decision channel by construction.
+The composite loss combines the two channels with equal per-observation
+weighting, normalized by the observation count `N_y+N_A`; `response_only`
+omits the sparse decision channel by construction.
 
 ### 7.1 Alternating estimator transaction
 
@@ -156,12 +180,13 @@ The solution family is
 \pi_\eta(a)\propto\pi_0(a)\exp(\bar Q_t(a)/\eta),
 \]
 
-with `eta` found by deterministic one-dimensional dual search. There is no
-learned adaptation actor or policy-temperature hyperparameter.
+with `eta` found by deterministic one-dimensional dual search against the KL
+budget `delta`. The adapted policy is the closed-form tilt of `pi_0` by
+`\bar Q_t`, fully determined by the current mixture and the registered budget.
 
-## 9. Completed active VOI
+## 9. Exact compact active VOI
 
-### 9.1 Predictive response
+### 9.1 Predictive response marginal
 
 For probe action `a`, first propagate the current posterior:
 
@@ -169,27 +194,22 @@ For probe action `a`, first propagate the current posterior:
 \bar b=b_tT.
 \]
 
-The response model defines `p_theta(y | z=k,H_t,a)`. DELTA first sums the
-binary visibility outcome exactly. In the visible branch, let `u_s` be a fixed
-multidimensional Halton point for relative position, direction and inventory:
-
-\[
-\tilde y_{a,k,s}=F^{-1}_{\theta,k,a}(u_s).
-\]
-
-When inventory-change is legally observable it is also summed exactly. Thus the
-only numerical approximation is the remaining finite multi-categorical
-response integral; masked factors are never sampled as if they were evidence.
+Passive filtering uses the complete response above. Active probing uses its
+compact marginal `Y_active=(visibility,M,C,E)`: direct conditional geometry,
+inventory-change, and recipe are marginalized out. For each visibility value,
+the interface has one unavailable outcome, one available/no-change outcome,
+and 31 available/change event outcomes. DELTA therefore enumerates exactly
+`2 + 2 + 2*31 = 66` outcomes per probe action.
 
 ### 9.2 Exact Bayes update for each outcome
 
 The same outcome is scored under every model component:
 
 \[
-b^{a,k,s}_j
+b^{a,y}_j
 =
-\frac{\bar b_jp_\theta(y_{a,k,s}\mid z=j,H_t,a)}
-{\sum_\ell\bar b_\ell p_\theta(y_{a,k,s}\mid z=\ell,H_t,a)}.
+\frac{\bar b_jp_\theta(y\mid z=j,H_t,a)}
+{\sum_\ell\bar b_\ell p_\theta(y\mid z=\ell,H_t,a)}.
 \]
 
 ### 9.3 Decision value
@@ -200,34 +220,13 @@ For a belief `q`, define
 V(q;\mu)=\max_{a'}\sum_jq_j\mu_j(a').
 \]
 
-Write `v in {0,1}` for visibility, `m_t` for whether the teammate was
-visible before the probe, `e in {0,1}` for inventory-change when `v*m_t=1`, and
-`c_s` for the Halton-integrated categorical factors. Define
+The exact compact-marginal value is
 
 \[
-\Phi(a,k,v,c_s)=
-\begin{cases}
-V(b^{a,k,v,c_s};\mu^a), & vm_t=0,\\
-\sum_{e\in\{0,1\}}p(e\mid k,a,v,c_s)
-V(b^{a,k,v,c_s,e};\mu^a), & vm_t=1.
-\end{cases}
-\]
-
-The Rao-Blackwellized deterministic estimate is
-
-\[
-\widehat{\mathrm{VOI}}_S(a)=
-\left[
-\sum_k\bar b_k\sum_{v\in\{0,1\}}p(v\mid k,a)
-\frac1S\sum_{s=1}^S\Phi(a,k,v,c_s)
-\right]
+\mathrm{VOI}(a)=
+\left[\sum_{y\in\mathcal Y_{66}}p(y\mid a)V(b^{a,y};\mu^a)\right]
 -V(\bar b;\mu^a).
 \]
-
-Thus source components, visibility, and every legally observed
-inventory-change outcome are integrated exactly; only the
-position/direction/inventory categorical product uses `S` Halton points.
-Masked factors contribute no likelihood and are never sampled as evidence.
 
 `mu^a` may be probe-conditioned. The registered OvercookedV2 model uses the
 shared current decision matrix as a local-stationarity surrogate. Consequently
@@ -237,25 +236,17 @@ Bayes-adaptive value.
 The policy uses
 
 \[
-Q^{\rm active}(a)=\bar Q_t(a)+\gamma\max(\widehat{\mathrm{VOI}}_S(a),0).
+Q^{\rm active}(a)=\bar Q_t(a)+\gamma\mathrm{VOI}(a).
 \]
 
-The maximum only removes finite-quadrature negative noise; the unclamped value
-is recorded. Expected information gain is recorded separately and is never
-added to task value.
+No clamp changes this exact value. Expected information gain, minimum VOI, and
+the negative-value fraction are numerical diagnostics only.
 
 ### 9.4 Numerical diagnostic
 
-Because the first `S/2` Halton points are a nested prefix of the `S`-point rule,
-DELTA reports
-
-\[
-e_{\rm quad}(a)=|\widehat{\mathrm{VOI}}_S(a)-
-\widehat{\mathrm{VOI}}_{S/2}(a)|.
-\]
-
-This value is diagnostic only. It does not gate, shrink, or rescale adaptation.
-Formal execution fixes `S=16` as a numerical setting.
+Exact enumeration has no sample count or quadrature-error field. Small negative
+values can only arise from floating-point arithmetic; they are reported rather
+than clipped, gated, shrunk, or rescaled.
 
 ## 10. Sparse CRN anchors
 
@@ -272,8 +263,8 @@ update and never replayed.
   `execute_adaptation=False`.
 - Deployment/evaluation: `compute_latent=True`, `execute_adaptation=True`.
 
-These are static code paths, not learned gates. They prevent latent/VOI graphs
-from entering PPO and ensure all training behavior remains the base policy.
+These flags are fixed constants per code path; they keep latent/VOI graphs out
+of PPO and ensure all training behavior remains the base policy.
 
 ## 12. Method variants and configuration
 

@@ -21,11 +21,11 @@ from typing import Any, Mapping
 import yaml
 
 
-CONFIG_VERSION = 1
-METHOD_VERSION = "delta_joint_response_decision_mirror_voi_v2"
+CONFIG_VERSION = 2
+METHOD_VERSION = "delta_joint_geometry_interface_decision_exact_voi_v3"
 # Schema version 2 dropped every checksum/fingerprint field: artifacts are
 # identified by run id and path, never by a digest.
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 MANIFEST_VERSION = 2
 FORMAL_METHOD_LABEL = "delta-active"
 OFFICIAL_BASELINE_METHODS = (
@@ -104,7 +104,6 @@ class ModelConfig:
     latent_hidden_dim: int
     latent_embedding_dim: int
     action_embedding_dim: int
-    voi_quadrature_samples: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,16 +387,9 @@ def validate_config(config: RunConfig) -> None:
         "latent_hidden_dim",
         "latent_embedding_dim",
         "action_embedding_dim",
-        "voi_quadrature_samples",
     ):
         if int(getattr(config.model, name)) <= 0:
             raise ValueError(f"Model field {name} must be positive.")
-    quadrature_samples = int(config.model.voi_quadrature_samples)
-    if quadrature_samples < 2 or quadrature_samples & (quadrature_samples - 1):
-        raise ValueError(
-            "VOI quadrature samples must be a power of two of at least two "
-            "so the nested half-prefix diagnostic is well-defined."
-        )
     if config.ppo.update_epochs <= 0:
         raise ValueError("PPO update epochs must be positive.")
     if not 0.0 < config.ppo.gamma <= 1.0:
@@ -489,8 +481,6 @@ def validate_config(config: RunConfig) -> None:
         for name, expected in formal_ppo.items():
             if getattr(config.ppo, name) != expected:
                 raise ValueError(f"Formal PPO field {name} must equal {expected!r}.")
-        if config.model.voi_quadrature_samples != 16:
-            raise ValueError("Formal active VOI uses 16 deterministic quadrature samples.")
         if (
             config.environment.num_envs != 256
             or config.training.rollout_length != OFFICIAL_ROLLOUT_LENGTH

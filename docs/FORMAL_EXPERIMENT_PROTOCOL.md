@@ -22,14 +22,11 @@ method:
   latent_components: 4
   continuation_horizon: 128
   adaptation_kl_budget: 0.04
-model:
-  voi_quadrature_samples: 16
 ```
 
-The Halton sample count is a deterministic numerical-accuracy setting. It is
-not a reward coefficient and is not selected from confirmatory performance.
-Each action records the absolute difference between the 16-point and nested
-8-point estimates.
+Active VOI exactly enumerates the registered 66-outcome compact response
+marginal. There is no VOI sample-count setting, quadrature diagnostic, or
+non-negative control clamp.
 
 ## 3. Base PPO
 

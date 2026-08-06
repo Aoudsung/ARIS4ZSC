@@ -43,8 +43,8 @@ alignment before writing its artifact.
 
 - High information gain with zero VOI means identifiable but decision-irrelevant
   response structure.
-- High VOI with large nested quadrature error means numerical resolution is
-  insufficient; this is reported, not silently gated.
+- A negative exact VOI beyond floating-point noise indicates a numerical or
+  normalization defect; values are reported, not silently clamped.
 - Low decision NLL but no XP gain points to policy conversion or distribution
   mismatch.
 - Response improvement without decision improvement falsifies the claim that

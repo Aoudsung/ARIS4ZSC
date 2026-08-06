@@ -59,9 +59,17 @@ channels:
 1. the distribution of an observable teammate response;
 2. the distribution of centered CRN action-return contrasts.
 
-Components are exchangeable. They are not SP/OP/SA/FCP labels and need not map
-to a human-interpretable protocol. A component is scientifically useful only
-when legal response evidence changes a decision-relevant posterior mixture.
+Components are exchangeable. A component is defined by two conditional
+distributions: the teammate response it predicts and the action-return
+contrast it implies; it need not map to a human-interpretable protocol.
+A component is scientifically useful only when legal response evidence
+changes a decision-relevant posterior mixture.
+
+The observable response retains direct teammate visibility and, when visible,
+position, direction, inventory, and inventory change. It also contains a
+two-candidate aligned world-interface event and independently covered recipe
+change. Alignment availability is component-shared; ambiguous alignment and
+cross-episode transitions add no interface evidence.
 
 ## 5. Primary hypotheses
 
@@ -128,5 +136,7 @@ The repository does not claim:
 - SOTA performance without frozen raw Simple/Wide matrices;
 - independence of the task recurrent state from every indirect teammate effect.
 
-The active VOI is a registered one-response decision-equivalence approximation.
+The active VOI exactly enumerates the 66 outcomes of the compact
+`(visibility, interface availability, change, event)` marginal of that complete
+response. It remains a registered one-response decision-equivalence approximation.
 Its local-stationarity scope and error bound are explicit in `THEORY.md`.

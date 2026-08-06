@@ -445,13 +445,7 @@ def _final_decision_audit(
     rows = jnp.arange(chosen.shape[0])
     regret = target[rows, oracle] - target[rows, chosen]
     anchor_voi = output.active_voi[anchors.time_indexes, anchors.lane_indexes]
-    anchor_voi_raw = output.active_voi_raw[
-        anchors.time_indexes, anchors.lane_indexes
-    ]
     anchor_information_gain = output.active_information_gain[
-        anchors.time_indexes, anchors.lane_indexes
-    ]
-    anchor_quadrature_error = output.active_voi_quadrature_error[
         anchors.time_indexes, anchors.lane_indexes
     ]
     anchor_adaptation_kl = output.adaptation_kl[
@@ -471,12 +465,11 @@ def _final_decision_audit(
         "mean_empirical_action_regret": float(jnp.mean(regret)),
         "mean_action_voi": float(jnp.mean(anchor_voi)),
         "mean_max_action_voi": float(jnp.mean(jnp.max(anchor_voi, axis=-1))),
-        "raw_voi_negative_fraction": float(
-            jnp.mean((anchor_voi_raw < 0.0).astype(jnp.float32))
+        "minimum_exact_voi": float(jnp.min(anchor_voi)),
+        "exact_voi_negative_fraction": float(
+            jnp.mean((anchor_voi < 0.0).astype(jnp.float32))
         ),
         "mean_information_gain": float(jnp.mean(anchor_information_gain)),
-        "mean_voi_quadrature_error": float(jnp.mean(anchor_quadrature_error)),
-        "max_voi_quadrature_error": float(jnp.max(anchor_quadrature_error)),
         "mean_adaptation_kl": float(jnp.mean(anchor_adaptation_kl)),
         "greedy_action_disagreement": float(
             jnp.mean((base_greedy != deployment_greedy).astype(jnp.float32))
@@ -1175,6 +1168,8 @@ def run_training(args: argparse.Namespace) -> None:
         write_json(
             audit_path,
             {
+                "version": 3,
+                "artifact_type": "delta_final_decision_audit",
                 **_final_decision_audit(
                     model=model,
                     base_params=state.base_params,

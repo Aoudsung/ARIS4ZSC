@@ -6,12 +6,12 @@ from typing import Any
 
 from .nn import init_linear, init_mlp, linear, mlp
 from .observation import (
-    ResponseTarget,
+    INTERFACE_EVENT_CLASSES,
     PARTNER_DIRECTION_CLASSES,
     PARTNER_INVENTORY_FACTOR_CLASSES,
     PARTNER_POSITION_CLASSES,
 )
-from .types import ResponsePrediction
+from .types import DirectResponsePrediction, ResponsePrediction, ResponseTarget
 
 
 def init_response_params(
@@ -27,7 +27,7 @@ def init_response_params(
 ) -> dict[str, Any]:
     import jax
 
-    keys = jax.random.split(key, 8)
+    keys = jax.random.split(key, 16)
     frame_dim = int(observation_shape[0] * observation_shape[1] * observation_shape[2])
     trunk_input = hidden_dim + behavior_dim + component_embedding_dim + action_embedding_dim
     return {
@@ -36,6 +36,11 @@ def init_response_params(
             keys[1], (int(action_count), int(action_embedding_dim))
         ) / max(action_embedding_dim, 1) ** 0.5,
         "trunk": init_mlp(keys[2], (trunk_input, hidden_dim, hidden_dim)),
+        "availability_trunk": init_mlp(
+            keys[8],
+            (hidden_dim + behavior_dim + action_embedding_dim, hidden_dim, hidden_dim),
+        ),
+        "availability": init_linear(keys[9], hidden_dim, 1, scale=0.01),
         "visibility": init_linear(keys[3], hidden_dim, 1, scale=0.01),
         "position": init_linear(
             keys[4], hidden_dim, PARTNER_POSITION_CLASSES, scale=0.01
@@ -50,6 +55,12 @@ def init_response_params(
             scale=0.01,
         ),
         "event": init_linear(keys[7], hidden_dim, 1, scale=0.01),
+        "interface_change": init_linear(keys[10], hidden_dim, 1, scale=0.01),
+        "interface_facility": init_linear(keys[11], hidden_dim, 3, scale=0.01),
+        "interface_direction": init_linear(keys[12], hidden_dim, 2, scale=0.01),
+        "interface_object": init_linear(keys[13], hidden_dim, 5, scale=0.01),
+        "interface_other": init_linear(keys[14], hidden_dim, 1, scale=0.01),
+        "recipe_change": init_linear(keys[15], hidden_dim, 1, scale=0.01),
     }
 
 
@@ -108,12 +119,35 @@ def response_predict(
             PARTNER_INVENTORY_FACTOR_CLASSES,
         )
     )
+    facility = linear(params["interface_facility"], hidden)
+    change_direction = linear(params["interface_direction"], hidden)
+    object_kind = linear(params["interface_object"], hidden)
+    structured = (
+        facility[..., :, None, None]
+        + change_direction[..., None, :, None]
+        + object_kind[..., None, None, :]
+    )
+    structured = structured.reshape(lead + (count, INTERFACE_EVENT_CLASSES - 1))
+    interface_event = jnp.concatenate(
+        (structured, linear(params["interface_other"], hidden)), axis=-1
+    )
+    shared_hidden = mlp(
+        params["availability_trunk"],
+        jnp.concatenate((frame_encoded, behavior_features, action_emb), axis=-1),
+        final_activation=True,
+    )
     return ResponsePrediction(
-        visibility_logit=linear(params["visibility"], hidden)[..., 0],
-        relative_position_logits=linear(params["position"], hidden),
-        direction_logits=linear(params["direction"], hidden),
-        inventory_logits=inventory,
-        inventory_change_logit=linear(params["event"], hidden)[..., 0],
+        direct=DirectResponsePrediction(
+            visibility_logit=linear(params["visibility"], hidden)[..., 0],
+            relative_position_logits=linear(params["position"], hidden),
+            direction_logits=linear(params["direction"], hidden),
+            inventory_logits=inventory,
+            inventory_change_logit=linear(params["event"], hidden)[..., 0],
+        ),
+        interface_availability_logit=linear(params["availability"], shared_hidden)[..., 0],
+        interface_change_logit=linear(params["interface_change"], hidden)[..., 0],
+        interface_event_logits=interface_event,
+        recipe_change_logit=linear(params["recipe_change"], hidden)[..., 0],
     )
 
 
@@ -150,33 +184,74 @@ def response_joint_log_probability(
 ) -> Any:
     """Compute log p(y | z=k,H,a) with one shared component per response."""
 
+    factors = response_factor_log_probabilities(prediction, target)
+    return sum(factors.values())
+
+
+def response_factor_log_probabilities(
+    prediction: ResponsePrediction, target: ResponseTarget
+) -> dict[str, Any]:
+    """Return additive complete-response factors for diagnostic decomposition."""
+
     import jax.numpy as jnp
 
-    visible = jnp.asarray(target.visible_mask, dtype=jnp.float32)[..., None]
-    event_mask = jnp.asarray(target.event_mask, dtype=jnp.float32)[..., None]
-    logp = _bernoulli_log_probability(
-        prediction.visibility_logit, jnp.asarray(target.visibility)[..., None]
+    direct = target.direct
+    predicted_direct = prediction.direct
+    visible = jnp.asarray(direct.visible_mask, dtype=jnp.float32)[..., None]
+    event_mask = jnp.asarray(direct.event_mask, dtype=jnp.float32)[..., None]
+    visibility = _bernoulli_log_probability(
+        predicted_direct.visibility_logit, jnp.asarray(direct.visibility)[..., None]
     )
-    logp = logp + visible * _categorical_log_probability(
-        prediction.relative_position_logits, target.relative_position
+    position = visible * _categorical_log_probability(
+        predicted_direct.relative_position_logits, direct.relative_position
     )
-    logp = logp + visible * _categorical_log_probability(
-        prediction.direction_logits, target.direction
+    direction = visible * _categorical_log_probability(
+        predicted_direct.direction_logits, direct.direction
     )
-    logp = logp + visible * jnp.sum(
-        _factor_categorical_log_probability(prediction.inventory_logits, target.inventory),
+    inventory = visible * jnp.sum(
+        _factor_categorical_log_probability(predicted_direct.inventory_logits, direct.inventory),
         axis=-1,
     )
-    logp = logp + event_mask * _bernoulli_log_probability(
-        prediction.inventory_change_logit,
-        jnp.asarray(target.inventory_change)[..., None],
+    inventory_change = event_mask * _bernoulli_log_probability(
+        predicted_direct.inventory_change_logit,
+        jnp.asarray(direct.inventory_change)[..., None],
     )
-    return logp
+    available = jnp.asarray(target.interface_available, dtype=jnp.float32)[..., None]
+    changed = jnp.asarray(target.interface_changed, dtype=jnp.float32)[..., None]
+    # Availability is deliberately shared (no K axis), hence cannot alter the
+    # normalized component posterior even though it remains part of the score.
+    availability = _bernoulli_log_probability(
+        prediction.interface_availability_logit,
+        target.interface_available,
+    )[..., None]
+    interface_change = available * _bernoulli_log_probability(
+        prediction.interface_change_logit, changed
+    )
+    interface_event = available * changed * _categorical_log_probability(
+        prediction.interface_event_logits, target.interface_event
+    )
+    recipe_mask = jnp.asarray(target.recipe_mask, dtype=jnp.float32)[..., None]
+    recipe = recipe_mask * _bernoulli_log_probability(
+        prediction.recipe_change_logit,
+        jnp.asarray(target.recipe_changed)[..., None],
+    )
+    return {
+        "visibility": visibility,
+        "position": position,
+        "direction": direction,
+        "inventory": inventory,
+        "inventory_change": inventory_change,
+        "interface_availability": availability,
+        "interface_change": interface_change,
+        "interface_event": interface_event,
+        "recipe_change": recipe,
+    }
 
 
 
 __all__ = [
     "init_response_params",
     "response_joint_log_probability",
+    "response_factor_log_probabilities",
     "response_predict",
 ]

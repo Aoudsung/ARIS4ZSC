@@ -1,3 +1,4 @@
+SUPERSEDED BY UNVALIDATED EXACT-VOI V3 REVISION — historical v2 result follows
 DELTA-ZSC VOI v2 local acceptance — 2026-08-05
 Environment: Python 3.13.5 / JAX 0.9.0.1 CPU / NumPy 2.3.5
 

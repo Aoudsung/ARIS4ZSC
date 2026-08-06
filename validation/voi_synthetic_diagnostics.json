@@ -1,14 +1,9 @@
 {
-  "artifact_type": "delta_voi_v2_synthetic_acceptance",
+  "artifact_type": "delta_exact_voi_v3_synthetic_acceptance",
   "decision_revealing_response": {
     "information_gain": [
       [
         0.6901289820671082
-      ]
-    ],
-    "raw_voi": [
-      [
-        0.9993290901184082
       ]
     ],
     "voi": [
@@ -29,14 +24,10 @@
       ]
     ]
   },
-  "method": "delta_joint_response_decision_mirror_voi_v2",
+  "method": "delta_joint_geometry_interface_decision_exact_voi_v3",
+  "validation_status": "pending_v3_regeneration",
   "uninformative_response": {
     "information_gain": [
-      [
-        0.0
-      ]
-    ],
-    "quadrature_error": [
       [
         0.0
       ]
@@ -46,5 +37,6 @@
         0.0
       ]
     ]
-  }
+  },
+  "version": 3
 }

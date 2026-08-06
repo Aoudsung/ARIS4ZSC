@@ -14,7 +14,11 @@ from src.delta_zsc.config import load_config
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.observation import extract_response_target
 from src.delta_zsc.partners import make_static_partner_functions
-from src.delta_zsc.response_model import response_joint_log_probability, response_predict
+from src.delta_zsc.response_model import (
+    response_factor_log_probabilities,
+    response_joint_log_probability,
+    response_predict,
+)
 from src.delta_zsc.transition import predict_belief
 from src.delta_zsc.resources import ResourceLedger
 from src.delta_zsc.runner import collect_rollout, initialize_runner
@@ -88,79 +92,133 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
             batch.previous_actions,
             batch.episode_starts,
         )
-        valid_transition = ~np.asarray(batch.episode_starts[1:], dtype=bool)
-        model_nll_all = np.asarray(output.response_negative_log_likelihood[1:])
-        model_nll = model_nll_all[valid_transition]
+        model_rows = []
         uniform_rows = []
         no_history_rows = []
         event_probabilities = []
         event_labels = []
         event_masks = []
+        event_conditional_nll = []
+        event_other = []
+        event_classes = []
+        component_js = []
+        factor_rows: dict[str, list[np.ndarray]] = {}
         component_count = config.method.latent_components
         uniform = jnp.full((config.environment.num_envs, component_count), 1.0 / component_count)
-        for time in range(1, batch.observations.shape[0]):
+        for time in range(batch.actions.shape[0]):
             target = extract_response_target(
-                batch.observations[time - 1], batch.observations[time]
+                batch.observations[time],
+                batch.response_next_observations[time],
+                batch.actions[time],
+                jnp.zeros_like(batch.dones[time], dtype=jnp.bool_),
             )
-            prediction = output.response_prediction[time]
+            prediction = response_predict(
+                deployment.latent_params["response"],
+                deployment.latent_params["component_embeddings"],
+                batch.observations[time],
+                output.behavior_features[time],
+                batch.actions[time],
+            )
             component_logp = response_joint_log_probability(prediction, target)
+            predictive_belief = predict_belief(
+                output.belief[time], deployment.latent_params["transition_logits"]
+            )
+            model_logp = jsp.special.logsumexp(
+                jnp.log(jnp.maximum(predictive_belief, 1.0e-30)) + component_logp,
+                axis=-1,
+            )
+            model_rows.append(np.asarray(-model_logp))
             uniform_logp = jsp.special.logsumexp(
                 jnp.log(uniform) + component_logp, axis=-1
             )
-            transition_valid = ~np.asarray(batch.episode_starts[time], dtype=bool)
-            uniform_rows.append(
-                np.asarray(-uniform_logp)[transition_valid]
-            )
-            zero_behavior = jnp.zeros_like(output.behavior_features[time - 1])
+            uniform_rows.append(np.asarray(-uniform_logp))
+            zero_behavior = jnp.zeros_like(output.behavior_features[time])
             no_history_prediction = response_predict(
                 deployment.latent_params["response"],
                 deployment.latent_params["component_embeddings"],
-                batch.observations[time - 1],
+                batch.observations[time],
                 zero_behavior,
-                batch.previous_actions[time],
+                batch.actions[time],
             )
             no_history_component = response_joint_log_probability(
                 no_history_prediction, target
             )
-            no_history_rows.append(
-                np.asarray(
-                    -jsp.special.logsumexp(
-                        jnp.log(uniform) + no_history_component, axis=-1
-                    )
-                )[transition_valid]
-            )
-            event_component = jax.nn.sigmoid(prediction.inventory_change_logit)
-            predictive_belief = predict_belief(
-                output.belief[time - 1],
-                deployment.latent_params["transition_logits"],
-            )
-            predictive_belief = jnp.where(
-                batch.episode_starts[time][..., None],
-                uniform,
-                predictive_belief,
-            )
+            no_history_rows.append(np.asarray(-jsp.special.logsumexp(
+                jnp.log(uniform) + no_history_component, axis=-1
+            )))
+            event_component = jax.nn.sigmoid(prediction.interface_change_logit)
             event_probabilities.append(
-                np.asarray(jnp.sum(predictive_belief * event_component, axis=-1))[
-                    transition_valid
+                np.asarray(jnp.sum(predictive_belief * event_component, axis=-1))
+            )
+            event_labels.append(np.asarray(target.interface_changed))
+            event_masks.append(np.asarray(target.interface_available))
+            event_logp = jax.nn.log_softmax(prediction.interface_event_logits, axis=-1)
+            # This is p(E | C=1,H), so the component mixture must first be
+            # updated by the observed change event.  Using the predictive
+            # belief directly would report a different, unregistered score.
+            changed_component_logp = (
+                jnp.log(jnp.maximum(predictive_belief, 1.0e-30))
+                + jax.nn.log_sigmoid(prediction.interface_change_logit)
+            )
+            mixture_event = jsp.special.logsumexp(
+                changed_component_logp[..., :, None] + event_logp,
+                axis=-2,
+            ) - jsp.special.logsumexp(changed_component_logp, axis=-1)[..., None]
+            selected_event_logp = jnp.take_along_axis(
+                mixture_event, target.interface_event[..., None], axis=-1
+            )[..., 0]
+            changed_mask = target.interface_available * target.interface_changed
+            event_conditional_nll.append(np.asarray(-selected_event_logp)[np.asarray(changed_mask) > 0.5])
+            event_other.append(np.asarray(target.interface_event)[np.asarray(changed_mask) > 0.5] == 30)
+            event_classes.append(
+                np.asarray(target.interface_event)[np.asarray(changed_mask) > 0.5]
+            )
+            component_probability = np.asarray(jax.nn.softmax(prediction.interface_event_logits, axis=-1))
+            mean_probability = np.mean(component_probability, axis=-2, keepdims=True)
+            component_js.append(np.mean(np.sum(
+                component_probability * (
+                    np.log(np.maximum(component_probability, 1.0e-12))
+                    - np.log(np.maximum(mean_probability, 1.0e-12))
+                ), axis=-1
+            ), axis=-1))
+            for name, component_factor in response_factor_log_probabilities(prediction, target).items():
+                factor_mixture = jsp.special.logsumexp(
+                    jnp.log(jnp.maximum(predictive_belief, 1.0e-30)) + component_factor,
+                    axis=-1,
+                )
+                direct = target.direct
+                factor_mask = {
+                    "visibility": jnp.ones_like(target.interface_available),
+                    "position": direct.visible_mask,
+                    "direction": direct.visible_mask,
+                    "inventory": direct.visible_mask,
+                    "inventory_change": direct.event_mask,
+                    "interface_availability": jnp.ones_like(target.interface_available),
+                    "interface_change": target.interface_available,
+                    "interface_event": changed_mask,
+                    "recipe_change": target.recipe_mask,
+                }[name]
+                selected_factor = np.asarray(-factor_mixture)[
+                    np.asarray(factor_mask) > 0.5
                 ]
-            )
-            event_labels.append(
-                np.asarray(target.inventory_change)[transition_valid]
-            )
-            event_masks.append(np.asarray(target.event_mask)[transition_valid])
+                factor_rows.setdefault(name, []).append(selected_factor)
+        model_nll = np.concatenate(model_rows, axis=0)
         uniform_nll = np.concatenate(uniform_rows, axis=0)
         no_history_nll = np.concatenate(no_history_rows, axis=0)
         event_p = np.concatenate(event_probabilities, axis=0)
         event_y = np.concatenate(event_labels, axis=0)
         event_m = np.concatenate(event_masks, axis=0) > 0.5
+        observed_event_classes = (
+            np.concatenate(event_classes)
+            if any(row.size for row in event_classes)
+            else np.asarray([], dtype=np.int32)
+        )
+        event_histogram = np.bincount(observed_event_classes, minlength=31).astype(np.float64)
+        event_distribution = event_histogram / max(float(np.sum(event_histogram)), 1.0)
         brier = float(np.mean((event_p[event_m] - event_y[event_m]) ** 2)) if np.any(event_m) else None
         voi = np.asarray(output.active_voi[:-1], dtype=np.float64)
-        voi_raw = np.asarray(output.active_voi_raw[:-1], dtype=np.float64)
         information_gain = np.asarray(
             output.active_information_gain[:-1], dtype=np.float64
-        )
-        quadrature_error = np.asarray(
-            output.active_voi_quadrature_error[:-1], dtype=np.float64
         )
         adaptation_kl = np.asarray(output.adaptation_kl[:-1], dtype=np.float64)
         base_action = np.argmax(np.asarray(output.base_policy_logits[:-1]), axis=-1)
@@ -176,6 +234,29 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
                 "event_prevalence": (
                     None if not np.any(event_m) else float(np.mean(event_y[event_m]))
                 ),
+                "interface_coverage_rate": float(np.mean(event_m)),
+                "event_conditional_nll": (
+                    None if not any(row.size for row in event_conditional_nll)
+                    else float(np.mean(np.concatenate(event_conditional_nll)))
+                ),
+                "event_other_multi_rate": (
+                    None if not any(row.size for row in event_other)
+                    else float(np.mean(np.concatenate(event_other)))
+                ),
+                "interface_event_count": int(observed_event_classes.size),
+                "interface_event_distribution": event_distribution.tolist(),
+                "mean_component_event_js": float(np.mean(np.concatenate(component_js))),
+                "factor_nll": {
+                    name: (
+                        None if not any(row.size for row in rows)
+                        else float(np.mean(np.concatenate(rows)))
+                    )
+                    for name, rows in factor_rows.items()
+                },
+                "factor_count": {
+                    name: int(sum(row.size for row in rows))
+                    for name, rows in factor_rows.items()
+                },
                 "valid_transition_count": int(model_nll.size),
                 "mean_belief_entropy": float(
                     np.mean(
@@ -188,11 +269,9 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
                 ),
                 "mean_action_voi": float(np.mean(voi)),
                 "mean_max_action_voi": float(np.mean(np.max(voi, axis=-1))),
-                "raw_voi_negative_fraction": float(np.mean(voi_raw < -1.0e-7)),
+                "minimum_exact_voi": float(np.min(voi)),
+                "exact_voi_negative_fraction": float(np.mean(voi < 0.0)),
                 "mean_information_gain": float(np.mean(information_gain)),
-                "mean_voi_quadrature_error": float(np.mean(quadrature_error)),
-                "p95_voi_quadrature_error": float(np.quantile(quadrature_error, 0.95)),
-                "maximum_voi_quadrature_error": float(np.max(quadrature_error)),
                 "mean_adaptation_kl": float(np.mean(adaptation_kl)),
                 "greedy_action_disagreement_rate": float(
                     np.mean(base_action != deployed_action)
@@ -238,13 +317,37 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
     information_values = np.asarray(
         [row["mean_information_gain"] for row in per_run], dtype=np.float64
     )
-    quadrature_values = np.asarray(
-        [row["mean_voi_quadrature_error"] for row in per_run], dtype=np.float64
-    )
     disagreement_values = np.asarray(
         [row["greedy_action_disagreement_rate"] for row in per_run],
         dtype=np.float64,
     )
+    target_distribution_by_mechanism = {}
+    for mechanism in sorted({row["partner_mechanism"] for row in per_run}):
+        mechanism_rows = [
+            row for row in per_run if row["partner_mechanism"] == mechanism
+        ]
+        weights = np.asarray(
+            [row["interface_event_count"] for row in mechanism_rows], dtype=np.float64
+        )
+        distributions = np.asarray(
+            [row["interface_event_distribution"] for row in mechanism_rows],
+            dtype=np.float64,
+        )
+        target_distribution_by_mechanism[mechanism] = (
+            np.sum(distributions * weights[:, None], axis=0)
+            / max(float(np.sum(weights)), 1.0)
+        ).tolist()
+    sp_op_total_variation = None
+    if "sp" in target_distribution_by_mechanism and "op" in target_distribution_by_mechanism:
+        sp_op_total_variation = float(
+            0.5
+            * np.sum(
+                np.abs(
+                    np.asarray(target_distribution_by_mechanism["sp"])
+                    - np.asarray(target_distribution_by_mechanism["op"])
+                )
+            )
+        )
     elapsed = time.perf_counter() - started
     import jax
 
@@ -260,7 +363,7 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
     write_json(
         output_dir / "posterior_predictive_diagnostics.json",
         {
-            "version": 2,
+            "version": 3,
             "artifact_type": "delta_posterior_predictive_diagnostics",
             "layout": config.environment.layout,
             "claim_role": "diagnostic_only",
@@ -277,7 +380,9 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
             "mean_action_voi": float(np.mean(voi_values)),
             "mean_max_action_voi": float(np.mean(max_voi_values)),
             "mean_information_gain": float(np.mean(information_values)),
-            "mean_voi_quadrature_error": float(np.mean(quadrature_values)),
+            "interface_event_distribution_by_mechanism": target_distribution_by_mechanism,
+            "sp_op_interface_event_total_variation": sp_op_total_variation,
+            "sp_op_measurement_has_no_performance_gate": True,
             "mean_greedy_action_disagreement_rate": float(
                 np.mean(disagreement_values)
             ),

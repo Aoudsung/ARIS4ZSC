@@ -70,13 +70,13 @@ def test_pyproject_packages_only_active_namespace() -> None:
     assert "src.path_c*" not in text
 
 
-def test_only_unified_workflow_is_active_and_method_identity_is_v2() -> None:
+def test_only_unified_workflow_is_active_and_method_identity_is_v3() -> None:
     workflows = {path.name for path in Path(".github/workflows").glob("*.yml")}
     assert workflows == {"delta-unified-ci.yml"}
     assert Path("legacy/implementation_v8/.github/workflows/depi-ci.yml").is_file()
     from src.delta_zsc.config import METHOD_VERSION
 
-    assert METHOD_VERSION == "delta_joint_response_decision_mirror_voi_v2"
+    assert METHOD_VERSION == "delta_joint_geometry_interface_decision_exact_voi_v3"
 
 
 def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
@@ -92,6 +92,6 @@ def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
     text = "\n".join(path.read_text(encoding="utf-8") for path in active).lower()
     assert "expected cross log likelihood" not in text
     assert "voi_component" not in text
-    assert "halton" in text
-    assert "exact bayes" in text
-    assert "visibility is summed exactly" in text
+    assert "halton" not in text
+    assert "66" in text
+    assert "exact" in text

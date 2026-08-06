@@ -3,10 +3,14 @@
 ## Artifact identity
 
 - Source reconstruction base: `149f588d733be48722eea3bff844922f1ed885cc`
-- Active method: `delta_joint_response_decision_mirror_voi_v2`
+- Active method: `delta_joint_geometry_interface_decision_exact_voi_v3`
 - Active namespace: `src/delta_zsc/`
 - Active CLI: `python -m experiments.overcooked_v2.delta_zsc`
 - Official benchmark source: `5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e`
+
+Configuration schema 2 and checkpoint schema 3 make every earlier DELTA
+checkpoint, optimizer and replay artifact incompatible. Partner manifest
+schema 2 is unchanged, so existing Official SP/OP parent assets remain usable.
 
 This revision replaces the active DEPI v8 patch chain rather than adding another
 layer to it. The complete retired implementation remains available under
@@ -27,28 +31,25 @@ active experiment applications.
 | Earlier "active" terms were entropy or cross-likelihood proxies | Active DELTA integrates complete learned response outcomes, performs an all-component likelihood calculation and exact Bayes update for every outcome, and values the posterior through latent-conditioned task returns. |
 | Old proposal, implementation, evaluation and documentation described different methods | One versioned configuration authority, one active namespace, one CLI, one deployment schema, and one authoritative document index now define the method. |
 
-## Completed VOI v2
+## Exact compact VOI v3
 
 For current response posterior `b_t` and candidate probe action `a`, the
 implementation:
 
 1. predicts the next component prior `b_bar = b_t T`;
 2. sums source components exactly;
-3. sums binary visibility exactly;
-4. integrates visible relative position, direction, and factorized inventory
-   with a deterministic multidimensional Halton rule;
-5. sums inventory-change exactly whenever it is legally observable;
-6. scores every generated complete response under every latent component;
+3. retains complete direct geometry and aligned interface/recipe evidence for
+   passive filtering;
+4. exactly enumerates the 66 outcomes of the compact active response marginal;
+5. scores every compact outcome under every latent component;
 7. performs a normalized categorical Bayes update;
 8. evaluates the posterior-optimal latent-conditioned action value;
 9. subtracts the prior-optimal value;
-10. reports raw VOI, non-negative control VOI, expected information gain, and
-    the nested `S/2` versus `S` quadrature difference.
+10. reports exact VOI, expected information gain, minimum VOI, and the negative
+    floating-point fraction.
 
-The control path adds `gamma * max(raw_voi, 0)` to posterior expected action
-returns and then solves the registered KL-constrained mirror update. Information
-gain and quadrature difference are diagnostics only; neither gates nor rescales
-the policy.
+The control path adds `gamma * VOI` without a clamp and then solves the
+registered KL-constrained mirror update. Information gain is diagnostic only.
 
 The public VOI API accepts either a shared `[..., K, A]` decision matrix or a
 probe-conditioned `[..., P, K, A]` matrix. The registered OvercookedV2 model
@@ -81,7 +82,7 @@ src/delta_zsc/
   decision_model.py          CRN return contrasts and covariance score
   belief_filter.py           response-only categorical Bayes filter
   latent_model.py            shared response/decision latent semantics
-  bayes_voi.py               completed VOI v2
+  bayes_voi.py               exact compact VOI v3
   mirror_policy.py           analytic KL adaptation
   losses.py                  PPO and latent proper scores
   training.py                separate alternating transactions
@@ -108,7 +109,7 @@ The repository pre-registers only three ordered confirmatory claims:
    positive empirical decision value over a task-matched shuffled belief.
 
 The active-versus-passive VOI increment is a pre-registered secondary result.
-Posterior entropy, information gain, response NLL, and quadrature error cannot
+Posterior entropy, information gain, response NLL, and VOI numerical diagnostics cannot
 be promoted into substitute performance claims.
 
 ## Evidence boundary

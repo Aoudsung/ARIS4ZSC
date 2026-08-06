@@ -1,8 +1,9 @@
 # RESEARCH_PROGRAM — Direct route to a publishable DELTA-ZSC result
 
 The objective is benchmark superiority supported by a small, falsifiable
-mechanism story. Engineering checks exist only to make the experiment valid;
-they are not additional scientific gates or reasons to delay end-to-end runs.
+mechanism story. Engineering checks exist only to certify that the experiment
+is valid; end-to-end runs proceed once the §1 checks are archived with the
+exact commit.
 
 ## 1. Final implementation acceptance
 
@@ -20,11 +21,11 @@ losses or variants. Read the results in this order:
 3. passive versus active DELTA;
 4. total-interaction controls;
 5. bounded K sensitivity;
-6. posterior, KL and quadrature diagnostics.
+6. posterior, KL and exact-VOI numerical diagnostics.
 
 A weak result triggers diagnosis of the corresponding estimator or data
-distribution, not another stack of gates. The next revision must preserve the
-single latent factorization.
+distribution; the next revision repairs that defect and preserves the single
+latent factorization.
 
 ## 3. Formal benchmark execution
 
@@ -43,7 +44,8 @@ The paper is strongest when all three claims close:
 
 The active-VOI increment is a pre-registered secondary contribution. A null
 increment is reported as such; it does not invalidate passive decision-relevant
-adaptation, and it does not justify inventing an entropy bonus after the fact.
+adaptation, and post-hoc additions to the registered method remain excluded:
+any revision must pass the three-link test in §5.
 
 ## 5. Revision discipline
 
