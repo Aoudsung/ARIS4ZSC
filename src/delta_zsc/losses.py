@@ -128,6 +128,10 @@ def ppo_loss(
         batch.episode_starts,
         compute_latent=False,
         execute_adaptation=False,
+        # Replay the posteriors the behaviour policy was conditioned on.  The
+        # latent update commits before this one, so recomputing them here would
+        # evaluate the ratio against a policy that never generated the data.
+        beliefs=batch.beliefs,
     )
     logits = output.base_policy_logits[:-1]
     value = output.value

@@ -229,7 +229,8 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         length=4,
     )
     compact_runner, compact_batch, no_snapshots = compact(
-        runner, base, latent, jnp.asarray(0.25), jax.random.PRNGKey(0)
+        runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0),
+        jax.random.PRNGKey(0)
     )
     assert no_snapshots is None
     assert _same_tree(legacy_runner, compact_runner)
@@ -246,7 +247,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         states_per_trigger=1,
     )
     sparse_runner, sparse_batch, snapshots = sparse(
-        runner, base, latent, jnp.asarray(0.25), index_key
+        runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0), index_key
     )
     assert _same_tree(legacy_runner, sparse_runner)
     assert _same_tree(legacy_batch, sparse_batch)
@@ -284,16 +285,34 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
 
 
 def _same_tree(left, right) -> bool:
+    """Compare two trees leaf by leaf.
+
+    Integer and boolean leaves must match exactly: those carry indexes, masks
+    and identities where any difference is a real disagreement.  Floating-point
+    leaves are compared to a tight tolerance instead of bit-for-bit, because the
+    sparse and full-recording paths evaluate the same arithmetic inside two
+    differently shaped jit graphs.  Since the anchor continuation began
+    bootstrapping its truncation with the value network, XLA fuses those graphs
+    differently and the float32 results agree to ~1e-7 rather than exactly.
+    """
+
     import jax
 
     left_leaves = jax.tree_util.tree_leaves(left)
     right_leaves = jax.tree_util.tree_leaves(right)
     if len(left_leaves) != len(right_leaves):
         return False
-    return all(
-        np.array_equal(np.asarray(jax.device_get(one)), np.asarray(jax.device_get(other)))
-        for one, other in zip(left_leaves, right_leaves)
-    )
+    for one, other in zip(left_leaves, right_leaves):
+        a = np.asarray(jax.device_get(one))
+        b = np.asarray(jax.device_get(other))
+        if a.shape != b.shape:
+            return False
+        if np.issubdtype(a.dtype, np.floating):
+            if not np.allclose(a, b, rtol=1.0e-5, atol=1.0e-6):
+                return False
+        elif not np.array_equal(a, b):
+            return False
+    return True
 
 
 def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:

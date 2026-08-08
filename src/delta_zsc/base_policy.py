@@ -16,6 +16,7 @@ def init_base_params(
     task_embedding_dim: int,
     instant_partner_dim: int,
     action_count: int,
+    component_count: int,
 ) -> dict[str, Any]:
     import jax
 
@@ -29,7 +30,10 @@ def init_base_params(
         * observation_shape[1]
         * len(partner_channel_indexes(observation_shape[-1]))
     )
-    combined = int(task_hidden_dim) + int(instant_partner_dim)
+    # The actor reads the response-only posterior alongside the task features.
+    # Without it PPO optimises a single policy against the *marginal* over
+    # partners, and protocol-dependent actions cancel in the averaged advantage.
+    combined = int(task_hidden_dim) + int(instant_partner_dim) + int(component_count)
     return {
         "task_encoder": init_mlp(
             keys[0], (frame_dim, int(task_embedding_dim), int(task_embedding_dim))
@@ -51,9 +55,17 @@ def base_policy_step(
     task_carry: Any,
     observation: Any,
     episode_start: Any,
+    belief: Any,
     *,
     mask_partner_history: bool,
-) -> tuple[Any, Any, Any, Any, Any, Any]:
+) -> tuple[Any, Any, Any, Any, Any]:
+    """Advance the actor one step conditioned on the current partner posterior.
+
+    ``belief`` is the response-only posterior ``b_t = P(z | h_t)``.  It arrives
+    already detached: PPO trains only ``base_params`` through it, so the
+    two-estimator boundary is unchanged.
+    """
+
     import jax.numpy as jnp
 
     frame = (
@@ -75,9 +87,10 @@ def base_policy_step(
     instant = layer_normalize(
         mlp(params["instant_encoder"], partner_flat, final_activation=True)
     )
+    posterior = jnp.asarray(belief, dtype=jnp.float32)
     hidden = mlp(
         params["actor_trunk"],
-        jnp.concatenate((task_features, instant), axis=-1),
+        jnp.concatenate((task_features, instant, posterior), axis=-1),
         final_activation=True,
     )
     logits = linear(params["actor"], hidden)
@@ -90,9 +103,10 @@ def base_policy_sequence(
     initial_task_carry: Any,
     observations: Any,
     episode_starts: Any,
+    beliefs: Any,
     *,
     mask_partner_history: bool,
-) -> tuple[Any, Any, Any, Any, Any]:
+) -> tuple[Any, Any, Any, Any, Any, Any]:
     """Evaluate a time-major base policy with only the GRU left in a scan.
 
     The observation encoders and policy/value heads are stateless.  Evaluating
@@ -135,9 +149,10 @@ def base_policy_sequence(
         (task_embeddings, episode_starts),
     )
     task_features = layer_normalize(task_carries)
+    posterior = jnp.asarray(beliefs, dtype=jnp.float32)
     hidden = mlp(
         params["actor_trunk"],
-        jnp.concatenate((task_features, instant), axis=-1),
+        jnp.concatenate((task_features, instant, posterior), axis=-1),
         final_activation=True,
     )
     logits = linear(params["actor"], hidden)

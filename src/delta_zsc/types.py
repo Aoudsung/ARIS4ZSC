@@ -166,6 +166,11 @@ class RolloutBatch(NamedTuple):
     additional observation copy: for ``t < T-1``, the target transition is
     ``response_next_observations[t] -> response_next_observations[t+1]`` under
     ``actions[t+1]`` and is valid iff neither ``dones[t]`` nor ``dones[t+1]``.
+
+    ``beliefs`` holds the posterior the actor was conditioned on at collection
+    time.  PPO replays these rather than recomputing them, because the latent
+    parameters commit before the PPO update and a recomputed posterior would
+    make the replay off-policy with respect to the behaviour policy.
     """
 
     observations: Any
@@ -179,6 +184,7 @@ class RolloutBatch(NamedTuple):
     old_log_probabilities: Any
     old_values: Any
     ppo_mask: Any
+    beliefs: Any
     initial_policy_state: PolicyState
 
 

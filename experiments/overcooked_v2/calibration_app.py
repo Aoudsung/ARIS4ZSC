@@ -357,6 +357,11 @@ def build_semantic_initializer(args: argparse.Namespace) -> None:
             pool=pool,
             probabilities=jnp.asarray([1.0]),
             run_ids=jnp.asarray([0]),
+            # One member: the stage curriculum renormalises within its single
+            # group and is therefore the identity here.
+            checkpoint_stages=jnp.asarray([1.0]),
+            group_indexes=jnp.asarray([0]),
+            group_count=1,
         )
         environment = VectorEnvironment.create(config)
         runner = initialize_runner(
@@ -604,6 +609,11 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
             pool=pool,
             probabilities=jnp.asarray([1.0]),
             run_ids=jnp.asarray([0]),
+            # One member: the stage curriculum renormalises within its single
+            # group and is therefore the identity here.
+            checkpoint_stages=jnp.asarray([1.0]),
+            group_indexes=jnp.asarray([0]),
+            group_count=1,
         )
         environment = VectorEnvironment.create(config)
         runner = initialize_runner(

@@ -330,12 +330,17 @@ def _anchor_functions(
     import jax
 
     def ego_step(base: Any, latent: Any, state: Any, observation: Any, keys: Any):
+        # The CRN continuation must run the same belief-conditioned actor the
+        # anchor is meant to score.  Continuing under a posterior-blind policy
+        # makes Q_z(s,a) the value of "take a, then abandon whatever protocol a
+        # committed to", which is nearly identical across actions and carries
+        # no ranking signal.
         next_state, output = model.step(
             base,
             latent,
             state,
             observation,
-            compute_latent=False,
+            compute_latent=True,
             compute_decision=False,
             execute_adaptation=False,
         )
@@ -343,6 +348,18 @@ def _anchor_functions(
             keys, output.base_policy_logits
         )
         return next_state, action
+
+    def ego_value(base: Any, latent: Any, state: Any, observation: Any):
+        _, output = model.step(
+            base,
+            latent,
+            state,
+            observation,
+            compute_latent=True,
+            compute_decision=False,
+            execute_adaptation=False,
+        )
+        return output.value
 
     def ego_observe(state: Any, action: Any, done: Any):
         return observe_after_transition(state, action=action, done=done)
@@ -377,6 +394,7 @@ def _anchor_functions(
 
     return AnchorFunctions(
         ego_step=ego_step,
+        ego_value=ego_value,
         ego_observe=ego_observe,
         partner_step=partner_step_fixed,
         partner_observe=partner_observe,
@@ -630,6 +648,7 @@ def _make_non_anchor_block_kernel(
     block_length: int,
     rollout_steps: int,
     shaping_horizon: int,
+    curriculum_horizon: int,
     environment_count: int,
     minibatches_per_epoch: int,
     update_epochs: int,
@@ -674,11 +693,18 @@ def _make_non_anchor_block_kernel(
                 / jnp.asarray(shaping_horizon, dtype=jnp.float32),
                 0.0,
             )
+            curriculum = jnp.clip(
+                environment_steps.astype(jnp.float32)
+                / jnp.asarray(curriculum_horizon, dtype=jnp.float32),
+                0.0,
+                1.0,
+            )
             runner, batch, unused_snapshots = rollout_kernel(
                 runner,
                 base,
                 latent,
                 shaping,
+                curriculum,
                 loop_key,
             )
             del unused_snapshots
@@ -725,6 +751,7 @@ def _make_anchor_update_kernel(
     loop_key: Any,
     rollout_steps: int,
     shaping_horizon: int,
+    curriculum_horizon: int,
     environment_count: int,
     minibatches_per_epoch: int,
     update_epochs: int,
@@ -755,11 +782,18 @@ def _make_anchor_update_kernel(
             loop_key, 100_000 + jnp.asarray(update_index, dtype=jnp.int32)
         )
         index_key, root_key = jax.random.split(anchor_key)
+        curriculum = jnp.clip(
+            jnp.asarray(environment_steps, dtype=jnp.float32)
+            / jnp.asarray(curriculum_horizon, dtype=jnp.float32),
+            0.0,
+            1.0,
+        )
         runner, batch, snapshots = rollout_kernel(
             runner_state,
             base_params,
             latent_params,
             shaping,
+            curriculum,
             index_key,
         )
         anchors = anchor_kernel(
@@ -833,10 +867,26 @@ def run_training(args: argparse.Namespace) -> None:
         [member.checkpoint for member in members],
         parent_training_run_ids=[member.parent_training_run_id for member in members],
     )
+    # Group by (mechanism, hyperparameter family) so the stage curriculum can
+    # renormalise inside a group and leave the registered mechanism balance
+    # untouched.
+    group_keys = sorted({(m.mechanism, m.hyperparameter_family) for m in members})
+    group_lookup = {key: index for index, key in enumerate(group_keys)}
     partner_functions = make_static_partner_functions(
         pool=frozen_pool,
         probabilities=np.asarray([member.probability for member in members], dtype=np.float32),
         run_ids=np.arange(len(members), dtype=np.int32),
+        checkpoint_stages=np.asarray(
+            [member.checkpoint_stage for member in members], dtype=np.float32
+        ),
+        group_indexes=np.asarray(
+            [
+                group_lookup[(member.mechanism, member.hyperparameter_family)]
+                for member in members
+            ],
+            dtype=np.int32,
+        ),
+        group_count=len(group_keys),
     )
     partner_parameters = None
     environment = VectorEnvironment.create(config)
@@ -995,6 +1045,10 @@ def run_training(args: argparse.Namespace) -> None:
     host_update_count = int(np.asarray(state.update_count))
     host_environment_steps = int(np.asarray(state.effective_environment_steps))
     shaping_horizon = max(int(config.upstream.reward_shaping_horizon), 1)
+    # The partner curriculum reaches the registered uniform mixture at the same
+    # point the Official shaping schedule reaches zero, so the run has one
+    # "training wheels are off" boundary rather than two.
+    curriculum_horizon = shaping_horizon
     checkpoint_updates = max(
         int(config.training.checkpoint_interval_environment_steps) // rollout_steps,
         1,
@@ -1050,6 +1104,7 @@ def run_training(args: argparse.Namespace) -> None:
             loop_key=loop_key,
             rollout_steps=rollout_steps,
             shaping_horizon=shaping_horizon,
+            curriculum_horizon=curriculum_horizon,
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
@@ -1118,6 +1173,7 @@ def run_training(args: argparse.Namespace) -> None:
             block_length=length,
             rollout_steps=rollout_steps,
             shaping_horizon=shaping_horizon,
+            curriculum_horizon=curriculum_horizon,
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
@@ -1344,6 +1400,9 @@ def run_training(args: argparse.Namespace) -> None:
             state.base_params,
             state.latent_params,
             jnp.asarray(0.0, dtype=jnp.float32),
+            # The audit measures the finished policy against the registered
+            # partner mixture, so the curriculum is at its end point.
+            jnp.asarray(1.0, dtype=jnp.float32),
             audit_index_key,
         )
         del audit_runner

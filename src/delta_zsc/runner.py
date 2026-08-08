@@ -272,6 +272,9 @@ def collect_rollout(
         axis=0,
     )
     values = jnp.concatenate((rows["old_value"], final_output.value[None]), axis=0)
+    # The posterior the actor actually saw, kept alongside the observations so
+    # PPO replays the behaviour policy rather than a re-derived one.
+    beliefs = jnp.concatenate((rows["belief"], final_output.belief[None]), axis=0)
     batch = RolloutBatch(
         observations=observations,
         response_next_observations=rows["response_next_observation"],
@@ -284,6 +287,7 @@ def collect_rollout(
         old_log_probabilities=rows["old_log_probability"],
         old_values=values[:-1],
         ppo_mask=jnp.ones((steps, count), dtype=jnp.float32),
+        beliefs=beliefs,
         initial_policy_state=initial_policy_state,
     )
     records = (
@@ -328,6 +332,11 @@ def _make_training_rollout_kernel(
         raise ValueError("Rollout length must be positive.")
     if snapshot_count < 0 or snapshot_count > steps * count:
         raise ValueError("Anchor snapshot count is outside the rollout.")
+    # Oversample candidates so the post-rollout stratification has something to
+    # choose between.  Four is enough to reach the rarer task stages without
+    # making the snapshot arrays a meaningful fraction of the full recording
+    # this path exists to avoid.
+    candidate_count = min(snapshot_count * 4, steps * count)
     environment_step = getattr(
         environment, "step_training_fast_with_keys", environment.step_with_keys
     )
@@ -376,18 +385,26 @@ def _make_training_rollout_kernel(
         base_params: Any,
         latent_params: Any,
         shaping_factor: Any,
+        partner_curriculum: Any,
         snapshot_key: Any,
     ) -> tuple[RunnerState, RolloutBatch, AnchorSnapshots | None]:
         shaping = jnp.asarray(shaping_factor, dtype=jnp.float32)
+        # Forwarded into the partner functions' otherwise unused parameter slot,
+        # where the static pool reads it as its stage-curriculum progress.
+        curriculum = jnp.asarray(partner_curriculum, dtype=jnp.float32)
         initial_policy_state = state.ego_policy_state
         if snapshot_count:
             from .anchors import select_anchor_indexes
 
+            # Positions have to be chosen before the rollout runs, so the task
+            # stage at each one is not known yet.  Capture a wider uniform
+            # candidate set and keep the stratified subset afterwards, once the
+            # rewards that label the stages exist.
             time_indexes, lane_indexes = select_anchor_indexes(
                 snapshot_key,
                 time_count=steps,
                 environment_count=count,
-                requested=snapshot_count,
+                requested=candidate_count,
             )
             snapshots = AnchorSnapshots(
                 time_indexes=time_indexes,
@@ -508,7 +525,7 @@ def _make_training_rollout_kernel(
                 stepped_ego, action=ego_action, done=done
             )
             next_partner_state = partner_functions.observe(
-                partner_parameters,
+                curriculum,
                 stepped_partner,
                 partner_context,
                 partner_observation,
@@ -539,6 +556,7 @@ def _make_training_rollout_kernel(
                 jnp.asarray(done, dtype=jnp.bool_),
                 old_log_probability,
                 output.value,
+                output.belief,
             )
             if snapshot_count:
                 return (next_state, current_snapshots), row
@@ -563,10 +581,43 @@ def _make_training_rollout_kernel(
             dones,
             old_log_probabilities,
             old_values,
+            step_beliefs,
         ) = rows
+        if snapshot_count:
+            from .anchors import anchor_task_strata, select_anchor_indexes
+
+            candidate_raw = raw_rewards[
+                final_snapshots.time_indexes, final_snapshots.lane_indexes
+            ]
+            candidate_shaped = shaped_rewards[
+                final_snapshots.time_indexes, final_snapshots.lane_indexes
+            ]
+            keep, _ = select_anchor_indexes(
+                jax.random.fold_in(snapshot_key, 7717),
+                time_count=candidate_count,
+                environment_count=1,
+                requested=snapshot_count,
+                strata=anchor_task_strata(candidate_raw, candidate_shaped),
+            )
+            final_snapshots = jax.tree_util.tree_map(
+                lambda value: value[keep], final_snapshots
+            )
         final_observation = final_state.joint_observations[
             lanes, final_state.ego_roles
         ]
+        # The T-th posterior is the one formed on the final observation, matching
+        # what collect_rollout stores.  Reusing the carried state's belief would
+        # store the prior for time T instead and make the two rollout paths
+        # disagree on the row PPO bootstraps its value from.
+        _, final_output = model.step(
+            base_params,
+            latent_params,
+            final_state.ego_policy_state,
+            final_observation,
+            compute_latent=compute_latent,
+            compute_decision=False,
+            execute_adaptation=False,
+        )
         batch = RolloutBatch(
             observations=jnp.concatenate(
                 (ego_observations, final_observation[None]), axis=0
@@ -593,6 +644,9 @@ def _make_training_rollout_kernel(
             old_log_probabilities=old_log_probabilities,
             old_values=old_values,
             ppo_mask=jnp.ones((steps, count), dtype=jnp.float32),
+            beliefs=jnp.concatenate(
+                (step_beliefs, final_output.belief[None]), axis=0
+            ),
             initial_policy_state=initial_policy_state,
         )
         return final_state, batch, final_snapshots

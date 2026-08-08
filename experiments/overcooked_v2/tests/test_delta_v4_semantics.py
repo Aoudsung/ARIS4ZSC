@@ -221,6 +221,7 @@ def test_three_channel_objective_is_exact_sum_of_normalized_channels() -> None:
         old_log_probabilities=jnp.zeros((time, lanes)),
         old_values=jnp.zeros((time, lanes)),
         ppo_mask=jnp.ones((time, lanes)),
+        beliefs=jnp.full((time + 1, lanes, 4), 0.25),
         initial_policy_state=model.initial_state(lanes),
     )
     result = latent_composite_loss(model, latent, base, batch, None)
@@ -349,6 +350,9 @@ def test_probe_anchor_forces_decision_only_after_base_bridge() -> None:
 
     functions = AnchorFunctions(
         ego_step=ego_step,
+        ego_value=lambda base, latent, state, observation: jnp.zeros(
+            jnp.asarray(observation).shape[:1], dtype=jnp.float32
+        ),
         ego_observe=ego_observe,
         partner_step=partner_step,
         partner_observe=partner_observe,
@@ -434,6 +438,9 @@ def test_successor_anchor_waits_for_delayed_response_and_excludes_bridge_rewards
     )
     functions = AnchorFunctions(
         ego_step=ego_step,
+        ego_value=lambda base, latent, state, observation: jnp.zeros(
+            jnp.asarray(observation).shape[:1], dtype=jnp.float32
+        ),
         ego_observe=ego_observe,
         partner_step=partner_step,
         partner_observe=partner_observe,

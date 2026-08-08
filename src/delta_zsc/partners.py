@@ -126,11 +126,60 @@ def _tree_select(mask: Any, selected: Any, alternative: Any) -> Any:
     return jax.tree_util.tree_map(one, selected, alternative)
 
 
+CURRICULUM_SHARPNESS = 4.0
+"""Initial log-odds penalty applied per unit of missing partner capability.
+
+At progress zero a stage-0 partner is exp(-4) ~ 1.8% as likely as a fully
+trained one; the penalty decays linearly to zero, so the registered uniform
+mixture is reached at progress one and holds thereafter.
+
+The permanently uniform mixture it replaces gave every episode a one-in-three
+chance of a randomly initialised partner.  A partner that cannot complete a
+dish emits no protocol to infer and completes no joint task, so those episodes
+carry no coordination signal at all -- they only add variance to an advantage
+that is already averaged over conflicting partners.  Late in training the same
+episodes are useful as a robustness perturbation, which is where they now land.
+"""
+
+
+def partner_curriculum_weights(
+    base_probabilities: Any,
+    stages: Any,
+    group_indexes: Any,
+    group_count: int,
+    progress: Any,
+) -> Any:
+    """Re-weight the pool toward capable partners early in training.
+
+    Renormalisation is per (mechanism, family) group so the registered
+    ``mechanism_uniform_sampling`` invariant survives the reweighting: the
+    curriculum moves mass between stages, never between mechanisms.
+    """
+
+    import jax.numpy as jnp
+
+    base = jnp.asarray(base_probabilities, dtype=jnp.float32)
+    stage = jnp.asarray(stages, dtype=jnp.float32)
+    groups = jnp.asarray(group_indexes, dtype=jnp.int32)
+    fraction = jnp.clip(jnp.asarray(progress, dtype=jnp.float32), 0.0, 1.0)
+    sharpness = jnp.asarray(CURRICULUM_SHARPNESS, dtype=jnp.float32) * (1.0 - fraction)
+    unnormalised = base * jnp.exp(sharpness * (stage - 1.0))
+    group_mass = jnp.zeros((int(group_count),), dtype=jnp.float32).at[groups].add(
+        unnormalised
+    )
+    group_base = jnp.zeros((int(group_count),), dtype=jnp.float32).at[groups].add(base)
+    scale = group_base[groups] / jnp.maximum(group_mass[groups], 1.0e-30)
+    return unnormalised * scale
+
+
 def make_static_partner_functions(
     *,
     pool: Any,
     probabilities: Any,
     run_ids: Any,
+    checkpoint_stages: Any,
+    group_indexes: Any,
+    group_count: int,
 ) -> PartnerFunctions:
     import jax
     import jax.numpy as jnp
@@ -142,18 +191,26 @@ def make_static_partner_functions(
     identifiers = jnp.asarray(run_ids, dtype=jnp.int32)
     if identifiers.shape != weights.shape:
         raise ValueError("Static partner run IDs do not match pool members.")
+    stages = jnp.asarray(checkpoint_stages, dtype=jnp.float32)
+    groups = jnp.asarray(group_indexes, dtype=jnp.int32)
+    if stages.shape != weights.shape or groups.shape != weights.shape:
+        raise ValueError("Static partner stage/group arrays do not match pool members.")
 
-    def sample(key: Any, size: int) -> Any:
+    def sample(key: Any, size: int, progress: Any) -> Any:
+        current = partner_curriculum_weights(
+            weights, stages, groups, int(group_count), progress
+        )
         return jax.random.categorical(
             key,
-            jnp.log(jnp.maximum(weights, 1.0e-30)),
+            jnp.log(jnp.maximum(current, 1.0e-30)),
             shape=(int(size),),
         ).astype(jnp.int32)
 
     def initial_state(batch_size: int, key: Any) -> StaticPartnerState:
+        # Training starts at progress zero; the curriculum is at its sharpest.
         return StaticPartnerState(
             carry=pool.initial_carry(int(batch_size)),
-            member=sample(key, int(batch_size)),
+            member=sample(key, int(batch_size), 0.0),
         )
 
     def step(
@@ -182,12 +239,17 @@ def make_static_partner_functions(
         dones: Any,
         next_observations: Any,
     ):
-        del parameters, observations, actions, rewards, next_observations
+        del observations, actions, rewards, next_observations
+        # ``parameters`` carries the curriculum progress for this update.  The
+        # static pool has no learnable parameters, so the slot was unused.
+        progress = 0.0 if parameters is None else parameters
         done = jnp.asarray(dones, dtype=jnp.bool_)
         # Partner resampling and fresh recurrent carries are only observable on
         # real episode boundaries.  Avoid constructing both for every step.
         def reset_members(reset_keys: Any) -> StaticPartnerState:
-            fresh_member = jax.vmap(lambda key: sample(key, 1)[0])(reset_keys)
+            fresh_member = jax.vmap(lambda key: sample(key, 1, progress)[0])(
+                reset_keys
+            )
             return StaticPartnerState(
                 carry=pool.initial_carry(int(done.shape[0])), member=fresh_member
             )

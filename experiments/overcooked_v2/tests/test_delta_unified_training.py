@@ -69,6 +69,7 @@ def _batch(model, base, latent, *, time_count: int = 4, lanes: int = 4):
         ),
         old_values=output.value[:-1],
         ppo_mask=jnp.ones((time_count, lanes)),
+        beliefs=output.belief,
         initial_policy_state=model.initial_state(lanes),
     )
 
@@ -247,25 +248,29 @@ def test_batched_base_policy_sequence_matches_step_replay() -> None:
     )
     initial = model.initial_state(3).task_carry
 
+    beliefs = jnp.full(starts.shape + (4,), 0.25, dtype=jnp.float32)
+
     def one(carry, values):
-        observation, episode_start = values
+        observation, episode_start, belief = values
         next_carry, task, instant, logits, value = base_policy_step(
             base,
             carry,
             observation,
             episode_start,
+            belief,
             mask_partner_history=True,
         )
         return next_carry, (task, instant, logits, value)
 
     reference_carry, reference = jax.lax.scan(
-        one, initial, (observations, starts)
+        one, initial, (observations, starts, beliefs)
     )
     actual = base_policy_sequence(
         base,
         initial,
         observations,
         starts,
+        beliefs,
         mask_partner_history=True,
     )
     (

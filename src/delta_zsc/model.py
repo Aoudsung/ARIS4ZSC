@@ -129,6 +129,7 @@ class DeltaModel:
             task_embedding_dim=self.config.model.task_embedding_dim,
             instant_partner_dim=self.config.model.instant_partner_dim,
             action_count=self.action_count,
+            component_count=self.config.method.latent_components,
         )
         latent = init_latent_params(
             latent_key,
@@ -228,25 +229,38 @@ class DeltaModel:
     ) -> tuple[PolicyState, ModelOutput]:
         """Advance one legal observation and form the deployment policy."""
 
+        import jax
         import jax.numpy as jnp
 
         start = jnp.asarray(state.episode_start, dtype=jnp.bool_)
+        components = int(self.config.method.latent_components)
+        mask_history = self.config.method_variant != "history_rnn"
         pending_continuation = jnp.where(
             start,
             jnp.zeros_like(start, dtype=jnp.bool_),
             jnp.asarray(state.probe_continuation_pending, dtype=jnp.bool_),
         )
-        if precomputed_base is None:
-            next_task, task, instant, base_logits, value = base_policy_step(
-                base_params,
-                state.task_carry,
-                observation,
-                start,
-                mask_partner_history=(self.config.method_variant != "history_rnn"),
-            )
-        else:
-            next_task, task, instant, base_logits, value = precomputed_base
+
+        # The posterior is formed before the actor runs, because the actor now
+        # reads it.  observe_response depends on nothing the base policy
+        # produces, so this ordering is available; predict_decision still runs
+        # after, since it consumes the actor's task and instant features.
         if not bool(compute_latent):
+            # Execution modes without a latent pass (history_rnn, base, PPO
+            # replay of those) have no posterior.  Feed the uninformative prior
+            # so the actor input keeps one fixed shape across every mode.
+            actor_belief = uniform_belief(tuple(start.shape), components)
+            if precomputed_base is None:
+                next_task, task, instant, base_logits, value = base_policy_step(
+                    base_params,
+                    state.task_carry,
+                    observation,
+                    start,
+                    actor_belief,
+                    mask_partner_history=mask_history,
+                )
+            else:
+                next_task, task, instant, base_logits, value = precomputed_base
             return self._empty_output(
                 state=state,
                 next_task=next_task,
@@ -274,12 +288,25 @@ class DeltaModel:
             start,
         )
         del unused_target
+        # Detached: PPO reaches base_params through this input and must not
+        # reach latent_params, which only the predictive score may train.
+        actor_belief = jax.lax.stop_gradient(next_belief)
+        if precomputed_base is None:
+            next_task, task, instant, base_logits, value = base_policy_step(
+                base_params,
+                state.task_carry,
+                observation,
+                start,
+                actor_belief,
+                mask_partner_history=mask_history,
+            )
+        else:
+            next_task, task, instant, base_logits, value = precomputed_base
         statistics = behavior_features(next_behavior)
         if bool(execute_adaptation) and not bool(compute_decision):
             raise ValueError("Deployment adaptation requires the decision emission.")
 
         lead = tuple(base_logits.shape[:-1])
-        components = int(self.config.method.latent_components)
         zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
         if bool(compute_decision):
             decision = predict_decision(latent_params, task, instant, next_behavior)
@@ -368,6 +395,15 @@ class DeltaModel:
             # An active probe is followed by exactly one base-policy action.
             # On a pending lane this step consumes that continuation and does
             # not immediately launch a second overlapping probe.
+            #
+            # The bridge deliberately stays on the base policy: the delayed-VOI
+            # accounting and the successor decision target are both derived
+            # under one intervening base continuation, so replacing it with a
+            # mirror step would leave the executed trajectory and the estimated
+            # quantity describing different policies.  What made this harmful --
+            # the base policy being posterior-blind -- is fixed at the source:
+            # the actor now reads b_t, so the bridge no longer abandons the
+            # protocol, it just declines to re-probe.
             next_pending = active_lane
         elif bool(execute_adaptation) and variant == "delta_passive":
             policy_logits, adaptation_kl, adaptation_temperature = mirror_policy_logits(
@@ -429,12 +465,33 @@ class DeltaModel:
         compute_latent: bool = True,
         compute_decision: bool = True,
         execute_adaptation: bool = True,
+        beliefs: Any | None = None,
     ) -> tuple[PolicyState, ModelOutput]:
-        """Replay a time-major legal history under current parameters."""
+        """Replay a time-major legal history under current parameters.
+
+        ``beliefs`` supplies the posteriors the actor was conditioned on when
+        the data was collected.  PPO replay must pass them: recomputing the
+        posterior under updated latent parameters would silently make the
+        replay off-policy with respect to the behaviour policy.
+
+        When they are omitted and a latent pass is requested, the batched base
+        policy cannot be reused -- the actor now depends on a posterior that
+        only exists once the recursion has run -- so the scan recomputes it per
+        step.  Callers that read actor outputs under a recomputed posterior
+        (belief intervention) need exactly that.
+        """
 
         import jax
         import jax.numpy as jnp
 
+        components = int(self.config.method.latent_components)
+        replay_beliefs = (
+            jnp.asarray(beliefs, dtype=jnp.float32)
+            if beliefs is not None
+            else uniform_belief(
+                tuple(jnp.asarray(episode_starts, dtype=jnp.bool_).shape), components
+            )
+        )
         (
             final_task_carry,
             task_carries,
@@ -447,6 +504,7 @@ class DeltaModel:
             initial_state.task_carry,
             observations,
             episode_starts,
+            replay_beliefs,
             mask_partner_history=(self.config.method_variant != "history_rnn"),
         )
         if not bool(compute_latent):
@@ -510,6 +568,14 @@ class DeltaModel:
                 previous_action=previous_action,
                 episode_start=start,
             )
+            # With replayed posteriors the batched actor outputs are already the
+            # ones the behaviour policy produced, so reuse them.  Without them
+            # the actor must be re-evaluated against the recursive posterior.
+            reuse = (
+                (next_task, task, current_instant, current_logits, current_value)
+                if beliefs is not None
+                else None
+            )
             return self.step(
                 base_params,
                 latent_params,
@@ -518,13 +584,7 @@ class DeltaModel:
                 compute_latent=compute_latent,
                 compute_decision=compute_decision,
                 execute_adaptation=execute_adaptation,
-                precomputed_base=(
-                    next_task,
-                    task,
-                    current_instant,
-                    current_logits,
-                    current_value,
-                ),
+                precomputed_base=reuse,
             )
 
         return jax.lax.scan(

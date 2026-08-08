@@ -26,6 +26,7 @@ class AnchorWorld(NamedTuple):
 
 class AnchorFunctions(NamedTuple):
     ego_step: Callable[..., tuple[Any, Any]]
+    ego_value: Callable[..., Any]
     ego_observe: Callable[..., Any]
     partner_step: Callable[..., tuple[Any, Any, Any]]
     partner_observe: Callable[..., Any]
@@ -151,6 +152,43 @@ def _step_world(
     return _select_active(active, candidate, branch), jnp.where(active, ego_reward, 0.0)
 
 
+def _horizon_bootstrap(
+    *,
+    world: AnchorWorld,
+    functions: AnchorFunctions,
+    base_params: Any,
+    latent_params: Any,
+    horizon: int,
+    gamma: float,
+) -> Any:
+    """Value at the truncation point of a continuation branch.
+
+    Without it a 128-step window scores "the return achievable within 128
+    steps", which is close to zero for every action whenever the task needs a
+    longer commitment than the window -- exactly the regime where the anchor is
+    supposed to separate actions.  Branches that already terminated contribute
+    nothing.
+
+    The value head is trained on raw plus shaped reward while the Official
+    shaping factor is still annealing, so the bootstrap carries that shaping
+    component until it reaches zero.  The alternative is a second value head
+    trained on raw return alone, which is more machinery than the bias warrants.
+    """
+
+    import jax.numpy as jnp
+
+    lanes = jnp.arange(jnp.asarray(world.ego_roles).shape[0], dtype=jnp.int32)
+    ego_observation = world.observations[lanes, world.ego_roles]
+    value = functions.ego_value(
+        base_params, latent_params, world.ego_state, ego_observation
+    )
+    active = ~jnp.asarray(world.done, dtype=jnp.bool_)
+    discount = jnp.asarray(gamma, dtype=jnp.float32) ** jnp.asarray(
+        horizon, dtype=jnp.float32
+    )
+    return jnp.where(active, discount * jnp.asarray(value, dtype=jnp.float32), 0.0)
+
+
 def collect_all_action_continuations(
     *,
     world: AnchorWorld,
@@ -206,7 +244,17 @@ def collect_all_action_continuations(
             jnp.asarray(gamma, dtype=jnp.float32) ** jnp.asarray(step, dtype=jnp.float32)
         ) * reward
 
-    _, values = jax.lax.fori_loop(0, int(horizon), advance, (current, raw_return))
+    final_world, values = jax.lax.fori_loop(
+        0, int(horizon), advance, (current, raw_return)
+    )
+    values = values + _horizon_bootstrap(
+        world=final_world,
+        functions=functions,
+        base_params=base_params,
+        latent_params=latent_params,
+        horizon=int(horizon),
+        gamma=gamma,
+    )
     values = values.reshape((anchor_count, int(action_count), replicas))
     fit_replica = values[..., : int(fit_replicas)]
     evaluation_replica = values[..., int(fit_replicas) :]
@@ -316,8 +364,18 @@ def collect_probe_successor_continuations(
                 )
                 return branch, returns + discount * reward
 
-            _, returns = jax.lax.fori_loop(
+            final_branch, returns = jax.lax.fori_loop(
                 0, int(horizon), advance, (decision_world, initial_return)
+            )
+            # Same truncation correction as the current-state target, so both
+            # decision channels estimate the same quantity.
+            returns = returns + _horizon_bootstrap(
+                world=final_branch,
+                functions=functions,
+                base_params=base_params,
+                latent_params=latent_params,
+                horizon=int(horizon),
+                gamma=gamma,
             )
             return returns.reshape((anchor_count, replicas))
 
@@ -348,19 +406,68 @@ def collect_probe_successor_continuations(
     )
 
 
+ANCHOR_STRATUM_COUNT = 4
+"""No-progress, task-shaping progress, correct delivery, incorrect delivery."""
+
+
+def anchor_task_strata(raw_rewards: Any, shaped_rewards: Any) -> Any:
+    """Label each rollout position by how far the joint task got there.
+
+    The Official shaping signal fires exactly on the intermediate milestones --
+    correct ingredient into the pot, cooking started, plate picked up, correct
+    dish taken out -- and the raw reward separates a correct delivery from an
+    incorrect one.  Together they are a task-stage label that costs nothing to
+    compute, because the rollout already records both.
+    """
+
+    import jax.numpy as jnp
+
+    raw = jnp.asarray(raw_rewards, dtype=jnp.float32)
+    shaped = jnp.asarray(shaped_rewards, dtype=jnp.float32)
+    stratum = jnp.zeros(raw.shape, dtype=jnp.int32)
+    stratum = jnp.where(shaped != 0.0, 1, stratum)
+    stratum = jnp.where(raw > 0.0, 2, stratum)
+    stratum = jnp.where(raw < 0.0, 3, stratum)
+    return stratum
+
+
 def select_anchor_indexes(
     key: Any,
     *,
     time_count: int,
     environment_count: int,
     requested: int,
+    strata: Any | None = None,
 ) -> tuple[Any, Any]:
+    """Choose anchor positions, stratified by task stage when labels are given.
+
+    Uniform selection draws from wherever the policy spends its time, and a
+    policy that has not learned the task spends nearly all of it in states where
+    nothing is happening.  The anchor then supervises only those states, the
+    action values there are flat, and the mirror step has nothing to rank -- the
+    weak policy keeps its own supervision weak.
+
+    Weighting each candidate by the inverse size of its stratum and drawing
+    without replacement (Gumbel top-k, exact for weighted sampling without
+    replacement) gives every stage that actually occurred a comparable share,
+    while costing one extra pass over arrays the rollout already produced.
+    """
+
     import jax
+    import jax.numpy as jnp
 
     total = int(time_count) * int(environment_count)
     if not 0 < int(requested) <= total:
         raise ValueError("Requested anchor count is outside the rollout.")
-    flat = jax.random.choice(key, total, shape=(int(requested),), replace=False)
+    if strata is None:
+        flat = jax.random.choice(key, total, shape=(int(requested),), replace=False)
+        return flat // int(environment_count), flat % int(environment_count)
+
+    labels = jnp.asarray(strata, dtype=jnp.int32).reshape((total,))
+    counts = jnp.zeros((ANCHOR_STRATUM_COUNT,), dtype=jnp.float32).at[labels].add(1.0)
+    log_weight = -jnp.log(jnp.maximum(counts[labels], 1.0))
+    gumbel = jax.random.gumbel(key, shape=(total,), dtype=jnp.float32)
+    flat = jnp.argsort(-(log_weight + gumbel))[: int(requested)]
     return flat // int(environment_count), flat % int(environment_count)
 
 
@@ -503,12 +610,29 @@ def collect_anchor_batch(
 
     time_count, environment_count = records["ego_roles"].shape
     index_key, root_key = jax.random.split(key)
-    time, lane = select_anchor_indexes(
+    # Mirror the sparse path exactly: a uniform candidate draw, then a
+    # stratified subselection.  The sparse kernel cannot see task stages until
+    # the rollout has run, so both paths must use the same two-step procedure
+    # for the two to remain interchangeable.
+    candidate_count = min(int(states_per_trigger) * 4, time_count * environment_count)
+    candidate_time, candidate_lane = select_anchor_indexes(
         index_key,
         time_count=time_count,
         environment_count=environment_count,
-        requested=states_per_trigger,
+        requested=candidate_count,
     )
+    strata = anchor_task_strata(
+        records["raw_reward"][candidate_time, candidate_lane],
+        records["shaped_reward"][candidate_time, candidate_lane],
+    )
+    keep, _ = select_anchor_indexes(
+        jax.random.fold_in(index_key, 7717),
+        time_count=candidate_count,
+        environment_count=1,
+        requested=int(states_per_trigger),
+        strata=strata,
+    )
+    time, lane = candidate_time[keep], candidate_lane[keep]
     world = AnchorWorld(
         environment_state=gather_time_lane(records["environment_state"], time, lane),
         observations=gather_time_lane(records["joint_observations"], time, lane),
@@ -627,5 +751,6 @@ __all__ = [
     "collect_probe_successor_continuations",
     "gather_time_lane",
     "make_anchor_batch_kernel",
+    "anchor_task_strata",
     "select_anchor_indexes",
 ]
