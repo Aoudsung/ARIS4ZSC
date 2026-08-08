@@ -254,13 +254,15 @@ def _resolve_upstream_parent_cost(checkpoint: Path) -> Mapping[str, Any] | None:
 
 
 def _upstream_partner_cost(
-    members: tuple[Any, ...], *, formal: bool
+    members: tuple[Any, ...],
 ) -> tuple[int, float, float, list[Mapping[str, Any]]]:
     """Resolve each unique parent policy's explicit simulator cost.
 
     New DELTA upstream runs expose ``ResourceLedger``.  Existing Official
-    checkpoints may carry an older ledger/summary, so a positive explicit step
-    total is accepted, but formal runs never invent a missing cost.
+    checkpoints may carry an older ledger/summary.  A parent without either is
+    recorded as ``missing`` and contributes nothing to the totals; no cost is
+    ever invented for it.  Upstream accounting is reported, not enforced, so a
+    parent trained outside ``train-baseline`` does not block the run.
     """
 
     total = 0
@@ -299,11 +301,6 @@ def _upstream_partner_cost(
                 "wall_clock_hours": parent_wall,
                 **dict(resolved),
             }
-        )
-    if formal and any(row["status"] != "counted" for row in records):
-        raise RuntimeError(
-            "Formal DELTA requires an explicit upstream resource ledger for every "
-            "training-support parent."
         )
     return total, gpu_hours, wall_clock_hours, records
 
@@ -831,9 +828,7 @@ def run_training(args: argparse.Namespace) -> None:
         upstream_gpu_hours,
         upstream_wall_clock_hours,
         upstream_records,
-    ) = _upstream_partner_cost(
-        members, formal=(config.run_kind == "formal")
-    )
+    ) = _upstream_partner_cost(members)
     frozen_pool = FrozenPartnerPool.from_checkpoints(
         [member.checkpoint for member in members],
         parent_training_run_ids=[member.parent_training_run_id for member in members],

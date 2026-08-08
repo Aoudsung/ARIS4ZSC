@@ -70,10 +70,32 @@ class RunBudget:
     checkpoint_interval_environment_steps: int
 
 
+FORMAL_NUM_ENVS = 128
+"""Formal vector width, reduced from the registered 256.
+
+At 256 the CRN anchor kernel asks CUDA for 131072 bytes of shared memory per
+block and the L40 this runs on offers 101376, so the anchor update fails to
+compile -- reproduced by cuda-preflight and unaffected by
+``--xla_gpu_enable_triton_gemm=false`` or ``--xla_gpu_autotune_level=0``.  A
+bisection over the anchor kernel put the ceiling between 192 and 256.
+
+128 is the largest width that clears both that ceiling and every registered
+divisibility rule: 29_949_952 total steps and the 1_048_576 anchor interval are
+whole multiples of 128*256, and 128 divides the 64 minibatches per epoch.  Every
+other registered number is therefore unchanged; only the width moves.
+
+This is a deviation from the registered protocol, not a neutral engineering
+knob.  Halving the width doubles the update count (457 -> 914) and halves the
+per-update sample, so the optimisation trajectory differs even at identical
+total steps.  Results produced this way must not be reported as the registered
+Official protocol.  Restore 256 on hardware with >=128 KiB of shared memory per
+block (Hopper and later).
+"""
+
 RUN_BUDGETS: Mapping[str, RunBudget] = {
     "mechanical": RunBudget(4, 1_024, 1, 1_024),
     "development": RunBudget(32, 1_228_800, 8, 98_304),
-    "formal": RunBudget(256, 29_949_952, 64, 29_949_952),
+    "formal": RunBudget(FORMAL_NUM_ENVS, 29_949_952, 64, 29_949_952),
 }
 
 
@@ -483,7 +505,7 @@ def validate_config(config: RunConfig) -> None:
             if getattr(config.ppo, name) != expected:
                 raise ValueError(f"Formal PPO field {name} must equal {expected!r}.")
         if (
-            config.environment.num_envs != 256
+            config.environment.num_envs != FORMAL_NUM_ENVS
             or config.training.rollout_length != OFFICIAL_ROLLOUT_LENGTH
             or config.training.environment_steps != 29_949_952
             or config.training.minibatches_per_epoch != OFFICIAL_NUM_MINIBATCHES

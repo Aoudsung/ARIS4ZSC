@@ -5,6 +5,13 @@ the Orbax checkpoint payload.  Supported Orbax releases do not serialize that
 host object.  The training computation and checkpoint parameters remain
 Official; only the copied config metadata is normalized to JSON-like strings
 at the storage boundary.
+
+Two Official modules reach the storage boundary and each holds its own
+module-level reference to ``store_checkpoint``: ``ppo.main`` for the SP/OP/FCP
+path, and ``ppo.state_sample_run`` for the state-augmented path, which
+``ppo.main`` dispatches to whenever ``NUM_ITERATIONS`` is configured.  Both
+references must be rebound -- patching only ``ppo.main`` leaves rnn-sa writing
+through the unpatched function.
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ def main() -> None:
     import orbax.checkpoint as ocp
     from flax.training import orbax_utils
     from overcooked_v2_experiments.ppo import main as official_main
+    from overcooked_v2_experiments.ppo import state_sample_run as official_state_sample
     from overcooked_v2_experiments.ppo.utils.store import _get_checkpoint_dir
 
     config_directory = Path(official_main.__file__).resolve().parent / "config"
@@ -63,6 +71,7 @@ def main() -> None:
         )
 
     official_main.store_checkpoint = store_checkpoint
+    official_state_sample.store_checkpoint = store_checkpoint
     official_main.main()
 
 

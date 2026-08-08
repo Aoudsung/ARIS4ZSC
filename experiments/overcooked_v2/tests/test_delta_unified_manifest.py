@@ -117,9 +117,7 @@ def test_official_parent_throughput_is_counted_once_per_lineage(tmp_path: Path) 
         SimpleNamespace(parent_training_run_id="sp-parent-201", checkpoint=value)
         for value in checkpoints
     )
-    steps, gpu_hours, wall_hours, records = _upstream_partner_cost(
-        members, formal=True
-    )
+    steps, gpu_hours, wall_hours, records = _upstream_partner_cost(members)
     assert steps == 30_000_000
     assert gpu_hours == pytest.approx(0.5)
     assert wall_hours == pytest.approx(0.5)
@@ -150,7 +148,7 @@ def test_official_parent_throughput_must_match_frozen_config(tmp_path: Path) -> 
         parent_training_run_id="op-parent-202", checkpoint=checkpoint
     )
     try:
-        _upstream_partner_cost((member,), formal=False)
+        _upstream_partner_cost((member,))
     except ValueError as error:
         assert "step mismatch" in str(error)
     else:
