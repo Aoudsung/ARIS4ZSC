@@ -139,8 +139,17 @@ its bias, which the previous concatenated form could not express).
 `base_params`. Every Official parameter maps onto exactly one DELTA parameter;
 the only inputs with no counterpart — the instantaneous partner encoding and
 the posterior — enter the actor and value trunks as additional rows
-initialised to **zero**. A transplanted DELTA therefore begins as a
-numerically exact copy of that Official policy.
+initialised to **zero**.
+
+The weights are an exact copy; the *inputs* are not. Every variant except
+`history_rnn` feeds the task encoder a partner-masked frame, because the
+teammate may reach the policy only through the legal response channel, whereas
+the Official checkpoint was trained on the full frame. The transplanted encoder
+therefore runs slightly off its fitted distribution. It still transfers most of
+its competence — shaped return 24.8 at the first update against the partner
+mixture, against -0.7 from random initialisation — but calling it "numerically
+identical to the Official policy", as an earlier draft of this document did, was
+wrong.
 
 ## 8. Audit metrics
 

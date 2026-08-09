@@ -13,9 +13,18 @@ Every Official parameter maps onto exactly one DELTA parameter, because the
 encoder, recurrent cell and heads are now the pinned Official ones.  The only
 DELTA inputs with no Official counterpart are the instantaneous partner
 encoding and the response-only posterior; both enter the actor and value trunks
-as additional input rows, and those rows are initialised to **zero**.  A
-transplanted DELTA therefore starts as a numerically exact copy of the Official
-policy, and every later departure from it is something PPO chose.
+as additional input rows, and those rows are initialised to **zero**.
+
+The *weights* are an exact copy.  The *inputs* are not, and the difference
+matters: every variant except ``history_rnn`` feeds the task encoder a
+partner-masked frame -- ``task_only_observation`` zeroes the teammate's
+channels, because the teammate may reach the policy only through the legal
+response channel -- whereas the Official checkpoint was trained on the full
+frame.  A transplanted encoder therefore runs slightly off the distribution it
+was fitted to.  It still carries most of its competence across (measured on a
+development run: shaped return 24.8 at the first update against the partner
+mixture, against -0.7 from random initialisation), but this is not the identity
+and should not be described as one.
 
 The Official convex combination is ``h' = (1-z) n + z h`` and DELTA's gate is
 written the same way, so the recurrent transplant is a direct copy with no sign
