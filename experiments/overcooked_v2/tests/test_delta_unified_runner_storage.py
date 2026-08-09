@@ -177,12 +177,8 @@ def test_mock_end_to_end_rollout_and_anchor_use_base_policy() -> None:
         gamma=0.99,
     )
     assert anchors.fit_returns_by_action.shape == (2, 6)
-    assert anchors.measurement_covariances.shape == (2, 5, 5)
     assert anchors.probe_fit_returns_by_action.shape == (2, 6, 6)
-    assert anchors.probe_measurement_covariances.shape == (2, 6, 5, 5)
     assert anchors.probe_action_mask.shape == (2, 6, 6)
-    assert bool(jnp.all(jnp.isfinite(anchors.measurement_covariances)))
-    assert bool(jnp.all(jnp.isfinite(anchors.probe_measurement_covariances)))
 
 
 def test_sparse_anchor_rollout_matches_full_recording() -> None:
@@ -244,7 +240,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         partner_functions=partner,
         partner_parameters=None,
         length=4,
-        states_per_trigger=1,
+        states_per_trigger=2,  # pilot candidates, narrowed to 1 below
     )
     sparse_runner, sparse_batch, snapshots = sparse(
         runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0), index_key
@@ -257,6 +253,9 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         partner_parameters=None,
         environment=environment,
     )
+    # Both paths run the production two-tier configuration: a wide pilot,
+    # then the registered measurement on the narrowed set.  Parity at
+    # pilot_replicas=0 alone would leave the shipped path untested.
     legacy_anchors = collect_anchor_batch(
         key=anchor_key,
         records=records,
@@ -269,6 +268,8 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         evaluation_replicas=1,
         horizon=1,
         gamma=0.99,
+        pilot_states=2,
+        pilot_replicas=2,
     )
     sparse_anchor_kernel = make_anchor_batch_kernel(
         functions=functions,
@@ -277,6 +278,8 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         evaluation_replicas=1,
         horizon=1,
         collect_successor=True,
+        states_per_trigger=1,
+        pilot_replicas=2,
     )
     sparse_anchors = sparse_anchor_kernel(
         root_key, snapshots, base, latent, jnp.asarray(0.99)
@@ -335,11 +338,15 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         partner_functions=_partner_functions(),
         random_key=jax.random.PRNGKey(3),
     )
+    from src.delta_zsc.training import init_latent_optimizer
+
     state = TrainState(
         base,
         latent,
+        latent,
         init_adam(base),
-        init_adam(latent),
+        init_latent_optimizer(latent),
+        None,
         runner,
         1,
         1024,
@@ -444,3 +451,71 @@ def test_final_v4_audit_reduces_probe_axis_before_anchor_mask() -> None:
         "mean_filter_kl",
     ):
         assert np.isfinite(audit[name]), name
+
+
+def test_pilot_narrows_the_measured_anchor_set() -> None:
+    """End to end: the batch that reaches the loss is the narrowed one.
+
+    The rollout emits the wide candidate set and the anchor kernel keeps only
+    the states the cheap pass found separable, so the expensive replicas are
+    never spent on a state where every action leads to the same trajectory.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.overcooked_v2.training_app import _anchor_functions
+    from src.delta_zsc.anchors import make_anchor_batch_kernel
+    from src.delta_zsc.runner import (
+        initialize_runner,
+        make_anchor_snapshot_rollout_kernel,
+    )
+
+    config, model, base, latent = _model()
+    environment = MockEnvironment()
+    partner = _partner_functions()
+    runner = initialize_runner(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        random_key=jax.random.PRNGKey(41),
+    )
+    rollout = make_anchor_snapshot_rollout_kernel(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        partner_parameters=None,
+        length=4,
+        states_per_trigger=4,
+    )
+    _, _, snapshots = rollout(
+        runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0),
+        jax.random.PRNGKey(1)
+    )
+    assert snapshots.time_indexes.shape == (4,)
+
+    functions = _anchor_functions(
+        model=model,
+        partner_functions=partner,
+        partner_parameters=None,
+        environment=environment,
+    )
+    kernel = make_anchor_batch_kernel(
+        functions=functions,
+        action_count=6,
+        fit_replicas=2,
+        evaluation_replicas=1,
+        horizon=1,
+        collect_successor=False,
+        states_per_trigger=1,
+        pilot_replicas=2,
+    )
+    batch = kernel(jax.random.PRNGKey(2), snapshots, base, latent, jnp.asarray(0.99))
+    assert batch.time_indexes.shape == (1,)
+    assert batch.contrast_mean.shape == (1, 6, 6)
+    kept = (int(batch.time_indexes[0]), int(batch.lane_indexes[0]))
+    candidates = {
+        (int(t), int(l))
+        for t, l in zip(snapshots.time_indexes, snapshots.lane_indexes)
+    }
+    assert kept in candidates

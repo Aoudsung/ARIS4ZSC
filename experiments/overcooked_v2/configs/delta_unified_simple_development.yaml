@@ -43,6 +43,10 @@ anchors:
   states_per_trigger: 16
   fit_replicas: 8
   evaluation_replicas: 8
+  pilot_states: 64
+  pilot_replicas: 2
+  buffer_triggers: 0
+  replay_states: 0
 training:
   rollout_length: 256
   extra_ppo_environment_steps: 0

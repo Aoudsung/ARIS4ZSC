@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, NamedTuple
 
+from .contrast import pairwise_contrasts_from_replicas
 from .types import AnchorBatch, AnchorSnapshots
 
 
@@ -204,12 +205,56 @@ def collect_all_action_continuations(
 ) -> tuple[Any, Any, Any, Any]:
     """Return current-state all-action fit/evaluation means and replicas."""
 
+    import jax.numpy as jnp
+
+    if min(int(fit_replicas), int(evaluation_replicas)) <= 0:
+        raise ValueError("Anchor continuation dimensions must be positive.")
+    values = _all_action_replica_returns(
+        world=world,
+        root_keys=root_keys,
+        functions=functions,
+        base_params=base_params,
+        latent_params=latent_params,
+        action_count=action_count,
+        replicas=int(fit_replicas) + int(evaluation_replicas),
+        horizon=horizon,
+        gamma=gamma,
+    )
+    fit_replica = values[..., : int(fit_replicas)]
+    evaluation_replica = values[..., int(fit_replicas) :]
+    return (
+        jnp.mean(fit_replica, axis=-1),
+        jnp.mean(evaluation_replica, axis=-1),
+        fit_replica,
+        evaluation_replica,
+    )
+
+
+def _all_action_replica_returns(
+    *,
+    world: AnchorWorld,
+    root_keys: Any,
+    functions: AnchorFunctions,
+    base_params: Any,
+    latent_params: Any,
+    action_count: int,
+    replicas: int,
+    horizon: int,
+    gamma: float,
+) -> Any:
+    """``[state, action, replica]`` CRN continuation returns.
+
+    Replica ``r`` of every action shares one root key, so differencing two
+    actions inside a replica cancels the partner draw, the environment noise and
+    the continuation randomness.
+    """
+
     import jax
     import jax.numpy as jnp
 
     anchor_count = int(jnp.asarray(world.done).shape[0])
-    replicas = int(fit_replicas + evaluation_replicas)
-    if min(anchor_count, action_count, fit_replicas, evaluation_replicas, horizon) <= 0:
+    replicas = int(replicas)
+    if min(anchor_count, int(action_count), replicas, int(horizon)) <= 0:
         raise ValueError("Anchor continuation dimensions must be positive.")
     repeats = int(action_count) * replicas
     forced_actions = jnp.tile(
@@ -255,15 +300,67 @@ def collect_all_action_continuations(
         horizon=int(horizon),
         gamma=gamma,
     )
-    values = values.reshape((anchor_count, int(action_count), replicas))
-    fit_replica = values[..., : int(fit_replicas)]
-    evaluation_replica = values[..., int(fit_replicas) :]
-    return (
-        jnp.mean(fit_replica, axis=-1),
-        jnp.mean(evaluation_replica, axis=-1),
-        fit_replica,
-        evaluation_replica,
+    return values.reshape((anchor_count, int(action_count), replicas))
+
+
+
+def anchor_pilot_scores(
+    *,
+    world: AnchorWorld,
+    root_keys: Any,
+    functions: AnchorFunctions,
+    base_params: Any,
+    latent_params: Any,
+    action_count: int,
+    replicas: int,
+    horizon: int,
+    gamma: Any,
+) -> Any:
+    """Largest pairwise signal-to-noise ratio available at each candidate state.
+
+    A cheap wide pass answers the question the expensive pass cannot: *is there
+    anything here to measure?*  On the pre-refactor anchors the answer was no --
+    not one action pair across the whole batch was separated by two standard
+    errors, and every row contained exact ties, because taking a different first
+    action and then following the same policy re-merges almost immediately in
+    most Overcooked states.  Spending the full replica budget uniformly over
+    such states buys a precise estimate of zero.
+    """
+
+    import jax.numpy as jnp
+
+    returns = _all_action_replica_returns(
+        world=world,
+        root_keys=root_keys,
+        functions=functions,
+        base_params=base_params,
+        latent_params=latent_params,
+        action_count=action_count,
+        replicas=replicas,
+        horizon=horizon,
+        gamma=gamma,
     )
+    contrast = pairwise_contrasts_from_replicas(
+        returns, jnp.ones(returns.shape[:-1], dtype=jnp.bool_)
+    )
+    ratio = jnp.abs(contrast.mean) / jnp.maximum(contrast.standard_error, 1.0e-6)
+    ratio = jnp.where(contrast.valid, ratio, 0.0)
+    return jnp.max(ratio, axis=(-2, -1))
+
+
+def select_by_pilot_score(scores: Any, keep: int) -> Any:
+    """Indexes of the ``keep`` highest-scoring pilot states.
+
+    Selection is on the pilot's own replicas; the retained states are then
+    measured again under fresh keys, so the contrasts that reach the loss are
+    not the ones that won the selection.  What selection biases is *which
+    states* the decision head is trained on -- deliberately, the same way the
+    task-stage stratification does -- not the value measured at them.
+    """
+
+    import jax.numpy as jnp
+
+    return jnp.argsort(-jnp.asarray(scores, dtype=jnp.float32))[: int(keep)]
 
 
 def collect_probe_successor_continuations(
@@ -406,28 +503,60 @@ def collect_probe_successor_continuations(
     )
 
 
-ANCHOR_STRATUM_COUNT = 4
-"""No-progress, task-shaping progress, correct delivery, incorrect delivery."""
+ANCHOR_STRATUM_COUNT = 18
+"""Sixteen local task situations, plus the two delivery outcomes.
+
+The situation label is ``holding x partner_visible x pot_active``, read from the
+ego's own frame: what you are carrying, whether you can see your teammate, and
+whether anything is cooking are what decide whether one action differs from
+another.  A correct and an incorrect delivery are kept as their own strata
+because they are rare and are exactly where the action mattered.
+
+The earlier four-way label was derived from reward alone, so it could not
+distinguish an empty-handed agent from one holding a finished dish -- the two
+states where a decision head most needs contrast.
+
+Adjacency, corridor conflict and role side are deliberately *not* in the label.
+They matter to this method through one question only -- does the action choice
+change the outcome here -- and the pilot pass measures that directly, with the
+environment rather than a hand-written predicate deciding the answer.
+"""
 
 
-def anchor_task_strata(raw_rewards: Any, shaped_rewards: Any) -> Any:
-    """Label each rollout position by how far the joint task got there.
+def anchor_task_strata(
+    raw_rewards: Any, shaped_rewards: Any, observations: Any | None = None
+) -> Any:
+    """Label each rollout position by the local task situation it presents.
 
-    The Official shaping signal fires exactly on the intermediate milestones --
-    correct ingredient into the pot, cooking started, plate picked up, correct
-    dish taken out -- and the raw reward separates a correct delivery from an
-    incorrect one.  Together they are a task-stage label that costs nothing to
-    compute, because the rollout already records both.
+    ``shaped_rewards`` must be the *unscaled* Official signal.  The training
+    reward is multiplied by the annealed shaping factor, which reaches zero at
+    half the run, after which every milestone would look like "no progress".
+
+    ``observations`` is the ego frame at the same positions.  Without it the
+    function falls back to the reward-only label, which keeps the dense and
+    sparse anchor paths interchangeable for callers that do not carry frames.
     """
 
     import jax.numpy as jnp
 
+    from .observation import ego_situation
+
     raw = jnp.asarray(raw_rewards, dtype=jnp.float32)
     shaped = jnp.asarray(shaped_rewards, dtype=jnp.float32)
-    stratum = jnp.zeros(raw.shape, dtype=jnp.int32)
-    stratum = jnp.where(shaped != 0.0, 1, stratum)
-    stratum = jnp.where(raw > 0.0, 2, stratum)
-    stratum = jnp.where(raw < 0.0, 3, stratum)
+    if observations is None:
+        stratum = jnp.zeros(raw.shape, dtype=jnp.int32)
+        stratum = jnp.where(shaped != 0.0, 1, stratum)
+    else:
+        holding, visible, pot_active, _ = ego_situation(observations)
+        stratum = (
+            holding * 4
+            + visible.astype(jnp.int32) * 2
+            + pot_active.astype(jnp.int32)
+        )
+    # Deliveries override the situation label: they are rare, and an anchor
+    # batch that never contains one has never seen the decision that scores.
+    stratum = jnp.where(raw > 0.0, ANCHOR_STRATUM_COUNT - 2, stratum)
+    stratum = jnp.where(raw < 0.0, ANCHOR_STRATUM_COUNT - 1, stratum)
     return stratum
 
 
@@ -479,22 +608,6 @@ def gather_time_lane(tree: Any, time_indexes: Any, lane_indexes: Any) -> Any:
     )
 
 
-def _measurement_covariance(replica_returns: Any, action_count: int, fit_replicas: int) -> Any:
-    import jax.numpy as jnp
-
-    from .decision_model import action_contrast_matrix
-
-    basis = action_contrast_matrix(action_count)
-    contrast_samples = jnp.einsum("...ar,ad->...rd", replica_returns, basis)
-    centered = contrast_samples - jnp.mean(contrast_samples, axis=-2, keepdims=True)
-    sample_covariance = jnp.einsum("...rd,...re->...de", centered, centered) / float(
-        fit_replicas - 1
-    )
-    return sample_covariance / float(fit_replicas) + 1.0e-6 * jnp.eye(
-        action_count - 1, dtype=jnp.float32
-    )
-
-
 def _collect_from_world(
     *,
     world: AnchorWorld,
@@ -510,9 +623,46 @@ def _collect_from_world(
     horizon: int,
     gamma: Any,
     collect_successor: bool,
+    task_phase: Any = None,
+    policy_version: Any = 0,
+    states_per_trigger: int | None = None,
+    pilot_replicas: int = 0,
 ) -> AnchorBatch:
     import jax
     import jax.numpy as jnp
+
+    if task_phase is None:
+        task_phase = jnp.zeros_like(time_indexes, dtype=jnp.int32)
+    if int(pilot_replicas) > 0:
+        # Two-tier measurement.  Every candidate world gets a cheap pass; only
+        # the states where some action pair is actually separable are measured
+        # at the registered replica budget.  Both anchor entry points narrow
+        # here, so the dense and sparse paths stay interchangeable.
+        candidate_count = int(jnp.asarray(world.done).shape[0])
+        keep = (
+            candidate_count
+            if states_per_trigger is None
+            else int(states_per_trigger)
+        )
+        if keep > candidate_count:
+            raise ValueError("Cannot keep more anchor states than were piloted.")
+        pilot_key, root_key = jax.random.split(root_key)
+        scores = anchor_pilot_scores(
+            world=world,
+            root_keys=jax.random.split(pilot_key, candidate_count),
+            functions=functions,
+            base_params=base_params,
+            latent_params=latent_params,
+            action_count=action_count,
+            replicas=int(pilot_replicas),
+            horizon=horizon,
+            gamma=gamma,
+        )
+        chosen = select_by_pilot_score(scores, keep)
+        world = jax.tree_util.tree_map(lambda value: value[chosen], world)
+        time_indexes = time_indexes[chosen]
+        lane_indexes = lane_indexes[chosen]
+        task_phase = task_phase[chosen]
 
     state_count = int(jnp.asarray(world.done).shape[0])
     immediate_key, probe_key = jax.random.split(root_key)
@@ -549,9 +699,6 @@ def _collect_from_world(
             horizon=horizon,
             gamma=gamma,
         )
-        probe_covariance = _measurement_covariance(
-            probe_fit_replica, action_count, fit_replicas
-        )
     else:
         # Preserve one static AnchorBatch signature while avoiding every
         # privileged successor simulation in DELTA-passive.  False masks make
@@ -565,25 +712,33 @@ def _collect_from_world(
         probe_evaluation_replica = jnp.zeros(
             action_shape + (int(evaluation_replicas),), dtype=jnp.float32
         )
-        probe_covariance = jnp.zeros(
-            (state_count, int(action_count), int(action_count) - 1, int(action_count) - 1),
-            dtype=jnp.float32,
-        )
         probe_action_mask = jnp.zeros(action_shape, dtype=jnp.bool_)
+    # Contrast core.  Fit replicas carry the CRN draws used for supervision;
+    # evaluation replicas stay separate so an oracle-vs-oracle reliability
+    # number remains available.
+    action_mask_full = jnp.ones_like(fit, dtype=jnp.bool_)
+    contrast = pairwise_contrasts_from_replicas(fit_replica, action_mask_full)
+    probe_contrast = pairwise_contrasts_from_replicas(
+        probe_fit_replica, probe_action_mask
+    )
     return AnchorBatch(
         time_indexes=time_indexes,
         lane_indexes=lane_indexes,
+        contrast_mean=contrast.mean,
+        contrast_standard_error=contrast.standard_error,
+        contrast_valid=contrast.valid,
+        probe_contrast_mean=probe_contrast.mean,
+        probe_contrast_standard_error=probe_contrast.standard_error,
+        probe_contrast_valid=probe_contrast.valid,
+        task_phase=task_phase,
+        policy_version=jnp.asarray(policy_version, dtype=jnp.int32),
         fit_returns_by_action=fit,
         evaluation_returns_by_action=evaluation,
-        measurement_covariances=_measurement_covariance(
-            fit_replica, action_count, fit_replicas
-        ),
         action_mask=jnp.ones_like(fit, dtype=jnp.bool_),
         fit_replica_returns_by_action=fit_replica,
         evaluation_replica_returns_by_action=evaluation_replica,
         probe_fit_returns_by_action=probe_fit,
         probe_evaluation_returns_by_action=probe_evaluation,
-        probe_measurement_covariances=probe_covariance,
         probe_action_mask=probe_action_mask,
         probe_fit_replica_returns_by_action=probe_fit_replica,
         probe_evaluation_replica_returns_by_action=probe_evaluation_replica,
@@ -604,6 +759,8 @@ def collect_anchor_batch(
     horizon: int,
     gamma: float,
     collect_successor: bool = True,
+    pilot_states: int | None = None,
+    pilot_replicas: int = 0,
 ) -> AnchorBatch:
     import jax
     import jax.numpy as jnp
@@ -614,22 +771,31 @@ def collect_anchor_batch(
     # stratified subselection.  The sparse kernel cannot see task stages until
     # the rollout has run, so both paths must use the same two-step procedure
     # for the two to remain interchangeable.
-    candidate_count = min(int(states_per_trigger) * 4, time_count * environment_count)
+    # The oversample factor must key off the same count the sparse runner
+    # uses, which is the pilot candidate set, not the measured set.
+    piloted = int(states_per_trigger if pilot_states is None else pilot_states)
+    candidate_count = min(piloted * 4, time_count * environment_count)
     candidate_time, candidate_lane = select_anchor_indexes(
         index_key,
         time_count=time_count,
         environment_count=environment_count,
         requested=candidate_count,
     )
+    candidate_frames = records["joint_observations"][
+        candidate_time,
+        candidate_lane,
+        records["ego_roles"][candidate_time, candidate_lane],
+    ]
     strata = anchor_task_strata(
         records["raw_reward"][candidate_time, candidate_lane],
-        records["shaped_reward"][candidate_time, candidate_lane],
+        records["unscaled_shaped_reward"][candidate_time, candidate_lane],
+        candidate_frames,
     )
     keep, _ = select_anchor_indexes(
         jax.random.fold_in(index_key, 7717),
         time_count=candidate_count,
         environment_count=1,
-        requested=int(states_per_trigger),
+        requested=piloted,
         strata=strata,
     )
     time, lane = candidate_time[keep], candidate_lane[keep]
@@ -640,7 +806,7 @@ def collect_anchor_batch(
         partner_state=gather_time_lane(records["partner_state"], time, lane),
         partner_episode_start=records["episode_starts"][time, lane],
         ego_roles=records["ego_roles"][time, lane],
-        done=jnp.zeros((int(states_per_trigger),), dtype=jnp.bool_),
+        done=jnp.zeros(time.shape, dtype=jnp.bool_),
     )
     return _collect_from_world(
         world=world,
@@ -656,6 +822,9 @@ def collect_anchor_batch(
         horizon=horizon,
         gamma=gamma,
         collect_successor=collect_successor,
+        task_phase=strata[keep],
+        states_per_trigger=states_per_trigger,
+        pilot_replicas=pilot_replicas,
     )
 
 
@@ -672,8 +841,10 @@ def collect_anchor_batch_from_snapshots(
     horizon: int,
     gamma: Any,
     collect_successor: bool = True,
+    states_per_trigger: int | None = None,
+    pilot_replicas: int = 0,
 ) -> AnchorBatch:
-    """Collect both v4 CRN target families from sparse rollout worlds."""
+    """Collect both CRN target families from sparse rollout worlds."""
 
     import jax.numpy as jnp
 
@@ -701,6 +872,9 @@ def collect_anchor_batch_from_snapshots(
         horizon=horizon,
         gamma=gamma,
         collect_successor=collect_successor,
+        task_phase=snapshots.task_phase,
+        states_per_trigger=states_per_trigger,
+        pilot_replicas=pilot_replicas,
     )
 
 
@@ -712,6 +886,8 @@ def make_anchor_batch_kernel(
     evaluation_replicas: int,
     horizon: int,
     collect_successor: bool,
+    states_per_trigger: int | None = None,
+    pilot_replicas: int = 0,
 ) -> Callable[..., AnchorBatch]:
     """Create a fixed current-only or current-plus-successor executable."""
 
@@ -737,6 +913,8 @@ def make_anchor_batch_kernel(
             horizon=horizon,
             gamma=gamma,
             collect_successor=collect_successor,
+            states_per_trigger=states_per_trigger,
+            pilot_replicas=pilot_replicas,
         )
 
     return kernel
@@ -747,7 +925,9 @@ __all__ = [
     "AnchorWorld",
     "collect_all_action_continuations",
     "collect_anchor_batch",
+    "anchor_pilot_scores",
     "collect_anchor_batch_from_snapshots",
+    "select_by_pilot_score",
     "collect_probe_successor_continuations",
     "gather_time_lane",
     "make_anchor_batch_kernel",

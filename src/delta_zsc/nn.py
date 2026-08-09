@@ -63,15 +63,114 @@ def mlp(params: Sequence[dict[str, Any]], value: Any, *, final_activation: bool)
     return hidden
 
 
+
+def init_orthogonal(
+    key: Any, input_dim: int, output_dim: int, *, scale: float
+) -> dict[str, Any]:
+    """Orthogonal kernel with zero bias, matching the Official initialiser.
+
+    The pinned OvercookedV2 baselines initialise every layer this way.  Using
+    the same scheme is not cosmetic: it is what makes an untransplanted DELTA
+    and an Official baseline start from the same distribution, so a difference
+    between them is a difference of method rather than of initialisation.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    initializer = jax.nn.initializers.orthogonal(scale=float(scale))
+    return {
+        "kernel": initializer(key, (int(input_dim), int(output_dim)), jnp.float32),
+        "bias": jnp.zeros((int(output_dim),), dtype=jnp.float32),
+    }
+
+
+def init_conv(
+    key: Any,
+    kernel_size: tuple[int, int],
+    input_channels: int,
+    output_channels: int,
+    *,
+    scale: float,
+) -> dict[str, Any]:
+    import jax
+    import jax.numpy as jnp
+
+    height, width = int(kernel_size[0]), int(kernel_size[1])
+    initializer = jax.nn.initializers.orthogonal(scale=float(scale))
+    return {
+        "kernel": initializer(
+            key,
+            (height, width, int(input_channels), int(output_channels)),
+            jnp.float32,
+        ),
+        "bias": jnp.zeros((int(output_channels),), dtype=jnp.float32),
+    }
+
+
+def conv(params: dict[str, Any], value: Any) -> Any:
+    """NHWC convolution, unit stride, SAME padding.
+
+    These are the pinned Official settings; a stride or padding difference
+    would silently change the receptive field and make a transplanted kernel
+    compute something other than what it was trained to compute.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    array = jnp.asarray(value, dtype=jnp.float32)
+    flat = array.reshape((-1,) + array.shape[-3:])
+    output = jax.lax.conv_general_dilated(
+        flat,
+        jnp.asarray(params["kernel"], dtype=jnp.float32),
+        window_strides=(1, 1),
+        padding="SAME",
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+    )
+    output = output + jnp.asarray(params["bias"], dtype=jnp.float32)
+    return output.reshape(array.shape[:-3] + output.shape[-3:])
+
+
+def init_layer_norm(dimension: int) -> dict[str, Any]:
+    import jax.numpy as jnp
+
+    return {
+        "scale": jnp.ones((int(dimension),), dtype=jnp.float32),
+        "bias": jnp.zeros((int(dimension),), dtype=jnp.float32),
+    }
+
+
+def layer_norm(params: dict[str, Any], value: Any, epsilon: float = 1.0e-6) -> Any:
+    import jax.numpy as jnp
+
+    normalized = layer_normalize(value, epsilon=epsilon)
+    return normalized * jnp.asarray(
+        params["scale"], dtype=jnp.float32
+    ) + jnp.asarray(params["bias"], dtype=jnp.float32)
+
+
 def init_gru(key: Any, input_dim: int, hidden_dim: int) -> dict[str, Any]:
+    """A GRU in the exact form the pinned Official baselines use.
+
+    Input and hidden projections are separate, and the candidate applies the
+    reset gate to the *whole* hidden projection including its bias.  The
+    previous formulation here concatenated ``[x, r*h]`` through one matrix,
+    which cannot express the ``r * hn_bias`` term and therefore could not
+    reproduce a trained Official recurrent cell even in principle.
+    """
+
     import jax
 
-    update_key, reset_key, candidate_key = jax.random.split(key, 3)
-    combined = int(input_dim) + int(hidden_dim)
+    keys = jax.random.split(key, 6)
+    inputs, hidden = int(input_dim), int(hidden_dim)
     return {
-        "update": init_linear(update_key, combined, int(hidden_dim)),
-        "reset": init_linear(reset_key, combined, int(hidden_dim)),
-        "candidate": init_linear(candidate_key, combined, int(hidden_dim)),
+        "input_reset": init_orthogonal(keys[0], inputs, hidden, scale=1.0),
+        "input_update": init_orthogonal(keys[1], inputs, hidden, scale=1.0),
+        "input_candidate": init_orthogonal(keys[2], inputs, hidden, scale=1.0),
+        "hidden_reset": init_orthogonal(keys[3], hidden, hidden, scale=1.0),
+        "hidden_update": init_orthogonal(keys[4], hidden, hidden, scale=1.0),
+        "hidden_candidate": init_orthogonal(keys[5], hidden, hidden, scale=1.0),
     }
 
 
@@ -81,12 +180,19 @@ def gru_step(params: dict[str, Any], carry: Any, value: Any) -> Any:
 
     previous = jnp.asarray(carry, dtype=jnp.float32)
     current = jnp.asarray(value, dtype=jnp.float32)
-    combined = jnp.concatenate((current, previous), axis=-1)
-    update = jax.nn.sigmoid(linear(params["update"], combined))
-    reset = jax.nn.sigmoid(linear(params["reset"], combined))
-    candidate_input = jnp.concatenate((current, reset * previous), axis=-1)
-    candidate = jnp.tanh(linear(params["candidate"], candidate_input))
-    return (1.0 - update) * previous + update * candidate
+    reset = jax.nn.sigmoid(
+        linear(params["input_reset"], current)
+        + previous @ params["hidden_reset"]["kernel"]
+    )
+    update = jax.nn.sigmoid(
+        linear(params["input_update"], current)
+        + previous @ params["hidden_update"]["kernel"]
+    )
+    candidate = jnp.tanh(
+        linear(params["input_candidate"], current)
+        + reset * linear(params["hidden_candidate"], previous)
+    )
+    return (1.0 - update) * candidate + update * previous
 
 
 def layer_normalize(value: Any, epsilon: float = 1.0e-5) -> Any:
@@ -105,7 +211,12 @@ def tree_stop_gradient(tree: Any) -> Any:
 
 
 __all__ = [
+    "conv",
     "gru_step",
+    "init_conv",
+    "init_layer_norm",
+    "init_orthogonal",
+    "layer_norm",
     "init_gru",
     "init_linear",
     "init_mlp",

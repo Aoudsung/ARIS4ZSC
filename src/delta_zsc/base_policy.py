@@ -8,6 +8,25 @@ from .nn import gru_step, init_gru, init_linear, init_mlp, layer_normalize, line
 from .observation import instantaneous_partner_observation, task_only_observation
 
 
+OFFICIAL_CONV_STACK = (
+    ((1, 1), 128),
+    ((1, 1), 128),
+    ((1, 1), 8),
+    ((3, 3), 16),
+    ((3, 3), 32),
+    ((3, 3), 32),
+)
+"""The pinned OvercookedV2 observation encoder, layer for layer.
+
+The previous encoder flattened the 5x5x39 frame and ran two dense layers over
+it.  That discards the spatial structure the whole observation is built around,
+and it is not the network the Official baselines use -- so a DELTA run and its
+own baseline differed in feature extractor as well as in method, and no
+Official checkpoint could initialise it.
+
+"""
+
+
 def init_base_params(
     key: Any,
     *,
@@ -20,8 +39,9 @@ def init_base_params(
 ) -> dict[str, Any]:
     import jax
 
-    keys = jax.random.split(key, 6)
-    frame_dim = int(observation_shape[0] * observation_shape[1] * observation_shape[2])
+    from .nn import init_conv, init_layer_norm, init_orthogonal
+
+    keys = jax.random.split(key, 8 + len(OFFICIAL_CONV_STACK))
     # Derive the instantaneous branch size by applying the pinned channel rule.
     from .observation import partner_channel_indexes
 
@@ -30,24 +50,70 @@ def init_base_params(
         * observation_shape[1]
         * len(partner_channel_indexes(observation_shape[-1]))
     )
+    channels = int(observation_shape[-1])
+    convolutions = []
+    for index, (kernel_size, features) in enumerate(OFFICIAL_CONV_STACK):
+        convolutions.append(
+            init_conv(
+                keys[index], kernel_size, channels, features, scale=2.0**0.5
+            )
+        )
+        channels = features
+    spatial = int(observation_shape[0]) * int(observation_shape[1]) * channels
+    offset = len(OFFICIAL_CONV_STACK)
+
     # The actor reads the response-only posterior alongside the task features.
     # Without it PPO optimises a single policy against the *marginal* over
     # partners, and protocol-dependent actions cancel in the averaged advantage.
     combined = int(task_hidden_dim) + int(instant_partner_dim) + int(component_count)
     return {
-        "task_encoder": init_mlp(
-            keys[0], (frame_dim, int(task_embedding_dim), int(task_embedding_dim))
+        "task_conv": tuple(convolutions),
+        "task_dense": init_orthogonal(
+            keys[offset], spatial, int(task_embedding_dim), scale=2.0**0.5
         ),
-        "task_gru": init_gru(keys[1], int(task_embedding_dim), int(task_hidden_dim)),
+        "task_norm": init_layer_norm(int(task_embedding_dim)),
+        "task_gru": init_gru(keys[offset + 1], int(task_embedding_dim), int(task_hidden_dim)),
         "instant_encoder": init_mlp(
-            keys[2], (partner_dim, int(instant_partner_dim), int(instant_partner_dim))
+            keys[offset + 2],
+            (partner_dim, int(instant_partner_dim), int(instant_partner_dim)),
         ),
-        "actor_trunk": init_mlp(
-            keys[3], (combined, int(task_hidden_dim), int(task_hidden_dim))
+        "actor_trunk": init_orthogonal(
+            keys[offset + 3], combined, int(task_hidden_dim), scale=2.0**0.5
         ),
-        "actor": init_linear(keys[4], int(task_hidden_dim), int(action_count), scale=0.01),
-        "value": init_linear(keys[5], int(task_hidden_dim), 1, scale=1.0),
+        "actor": init_orthogonal(
+            keys[offset + 4], int(task_hidden_dim), int(action_count), scale=0.01
+        ),
+        "value_trunk": init_orthogonal(
+            keys[offset + 5], combined, int(task_hidden_dim), scale=2.0**0.5
+        ),
+        "value": init_orthogonal(
+            keys[offset + 6], int(task_hidden_dim), 1, scale=1.0
+        ),
     }
+
+
+def encode_task_frame(params: dict[str, Any], frame: Any) -> Any:
+    """The Official convolutional encoder, ending in the pinned LayerNorm."""
+
+    import jax.nn
+    import jax.numpy as jnp
+
+    from .nn import conv, layer_norm
+
+    hidden = jnp.asarray(frame, dtype=jnp.float32)
+    for layer in params["task_conv"]:
+        hidden = jax.nn.relu(conv(layer, hidden))
+    flat = hidden.reshape(hidden.shape[:-3] + (-1,))
+    embedding = jax.nn.relu(linear(params["task_dense"], flat))
+    return layer_norm(params["task_norm"], embedding)
+
+
+def _heads(params: dict[str, Any], features: Any) -> tuple[Any, Any]:
+    import jax.nn
+
+    actor = jax.nn.relu(linear(params["actor_trunk"], features))
+    critic = jax.nn.relu(linear(params["value_trunk"], features))
+    return linear(params["actor"], actor), linear(params["value"], critic)[..., 0]
 
 
 def base_policy_step(
@@ -75,12 +141,9 @@ def base_policy_step(
     )
     start = jnp.asarray(episode_start, dtype=jnp.bool_)
     carry = jnp.where(start[..., None], jnp.zeros_like(task_carry), task_carry)
-    task_flat = frame.reshape(frame.shape[:-3] + (-1,))
-    task_embedding = layer_normalize(
-        mlp(params["task_encoder"], task_flat, final_activation=True)
-    )
+    task_embedding = encode_task_frame(params, frame)
     next_carry = gru_step(params["task_gru"], carry, task_embedding)
-    task_features = layer_normalize(next_carry)
+    task_features = next_carry
 
     partner = instantaneous_partner_observation(observation)
     partner_flat = partner.reshape(partner.shape[:-3] + (-1,))
@@ -88,13 +151,9 @@ def base_policy_step(
         mlp(params["instant_encoder"], partner_flat, final_activation=True)
     )
     posterior = jnp.asarray(belief, dtype=jnp.float32)
-    hidden = mlp(
-        params["actor_trunk"],
-        jnp.concatenate((task_features, instant, posterior), axis=-1),
-        final_activation=True,
+    logits, value = _heads(
+        params, jnp.concatenate((task_features, instant, posterior), axis=-1)
     )
-    logits = linear(params["actor"], hidden)
-    value = linear(params["value"], hidden)[..., 0]
     return next_carry, task_features, instant, logits, value
 
 
@@ -125,10 +184,7 @@ def base_policy_sequence(
         if bool(mask_partner_history)
         else observation
     )
-    task_flat = frame.reshape(frame.shape[:-3] + (-1,))
-    task_embeddings = layer_normalize(
-        mlp(params["task_encoder"], task_flat, final_activation=True)
-    )
+    task_embeddings = encode_task_frame(params, frame)
 
     partner = instantaneous_partner_observation(observation)
     partner_flat = partner.reshape(partner.shape[:-3] + (-1,))
@@ -148,16 +204,18 @@ def base_policy_sequence(
         initial_task_carry,
         (task_embeddings, episode_starts),
     )
-    task_features = layer_normalize(task_carries)
+    task_features = task_carries
     posterior = jnp.asarray(beliefs, dtype=jnp.float32)
-    hidden = mlp(
-        params["actor_trunk"],
-        jnp.concatenate((task_features, instant, posterior), axis=-1),
-        final_activation=True,
+    logits, value = _heads(
+        params, jnp.concatenate((task_features, instant, posterior), axis=-1)
     )
-    logits = linear(params["actor"], hidden)
-    value = linear(params["value"], hidden)[..., 0]
     return final_carry, task_carries, task_features, instant, logits, value
 
 
-__all__ = ["base_policy_sequence", "base_policy_step", "init_base_params"]
+__all__ = [
+    "OFFICIAL_CONV_STACK",
+    "base_policy_sequence",
+    "base_policy_step",
+    "encode_task_frame",
+    "init_base_params",
+]

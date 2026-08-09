@@ -22,10 +22,13 @@ import yaml
 
 
 CONFIG_VERSION = 3
-METHOD_VERSION = "delta_episode_static_centered_residual_delayed_exact_voi_v4"
+METHOD_VERSION = "delta_belief_conditioned_raw_return_pairwise_crn_v5"
 # Schema version 2 dropped every checksum/fingerprint field: artifacts are
-# identified by run id and path, never by a digest.
-CHECKPOINT_SCHEMA_VERSION = 4
+# identified by run id and path, never by a digest.  Version 5 added the
+# belief-conditioned critic to the latent tree; a v4 checkpoint has no
+# ``belief_value`` subtree and must fail closed rather than deploy a policy
+# whose decision head is missing.
+CHECKPOINT_SCHEMA_VERSION = 5
 MANIFEST_VERSION = 2
 FORMAL_METHOD_LABEL = "delta-active"
 OFFICIAL_BASELINE_METHODS = (
@@ -154,11 +157,38 @@ class LatentOptimizerConfig:
 
 @dataclass(frozen=True, slots=True)
 class AnchorConfig:
+    """Anchor instrumentation, i.e. statistical sample-size design.
+
+    ``pilot_states`` candidate worlds each receive a cheap ``pilot_replicas``
+    pass; the ``states_per_trigger`` with the highest pairwise SNR are then
+    measured at the registered fit/evaluation budget.  Setting
+    ``pilot_replicas`` to zero disables the two-tier pass, in which case
+    ``pilot_states`` must equal ``states_per_trigger``.
+
+    ``buffer_triggers`` slots of past worlds are retained and ``replay_states``
+    of each trigger's measured states are drawn from them instead of from the
+    fresh pilot.  Returns are always re-run under current parameters; only the
+    search for separable states is reused.
+
+    Both are **0** in every registered config.  With replay on, the anchor
+    update did not finish XLA compilation in eighty minutes; with it off and
+    everything else identical, the same run completes in 490 seconds.  The
+    machinery is kept because the measurement that would justify it -- whether
+    re-measuring proven-separable worlds raises the resolvable-pair fraction --
+    is worth making later, but it is off until it pays for itself.  The critic
+    already trains on every update through the TD channel, so replay only
+    changes how often the *contrast* channel fires.
+    """
+
     enabled: bool
     interval_environment_steps: int
     states_per_trigger: int
     fit_replicas: int
     evaluation_replicas: int
+    pilot_states: int
+    pilot_replicas: int
+    buffer_triggers: int
+    replay_states: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,6 +487,26 @@ def validate_config(config: RunConfig) -> None:
             )
         if config.anchors.interval_environment_steps % rollout_steps:
             raise ValueError("Anchor interval must align with rollouts.")
+        if config.anchors.pilot_replicas == 1:
+            raise ValueError("A pilot standard error needs at least two replicas.")
+        if config.anchors.pilot_replicas < 0:
+            raise ValueError("Pilot replicas must be non-negative.")
+        if config.anchors.pilot_states < config.anchors.states_per_trigger:
+            raise ValueError("Fewer piloted states than the batch keeps.")
+        if config.anchors.buffer_triggers < 0 or config.anchors.replay_states < 0:
+            raise ValueError("Anchor replay sizes must be non-negative.")
+        if config.anchors.replay_states >= config.anchors.states_per_trigger:
+            raise ValueError("An anchor trigger must measure some fresh states.")
+        if config.anchors.replay_states and not config.anchors.buffer_triggers:
+            raise ValueError("Replaying anchor states needs a buffer to draw from.")
+        if (
+            config.anchors.pilot_replicas == 0
+            and config.anchors.pilot_states != config.anchors.states_per_trigger
+        ):
+            raise ValueError(
+                "Without a pilot pass every candidate state is measured, so "
+                "pilot_states must equal states_per_trigger."
+            )
     if tuple(config.partner_pool.checkpoint_stages) != (0.0, 0.5, 1.0):
         raise ValueError("Partner checkpoint stages are fixed at 0/0.5/1.")
     if not config.partner_pool.mechanism_uniform_sampling:
@@ -517,6 +567,10 @@ def validate_config(config: RunConfig) -> None:
             or config.anchors.states_per_trigger != 16
             or config.anchors.fit_replicas != 8
             or config.anchors.evaluation_replicas != 8
+            or config.anchors.pilot_states != 64
+            or config.anchors.pilot_replicas != 2
+            or config.anchors.buffer_triggers != 0
+            or config.anchors.replay_states != 0
         ):
             raise ValueError("Formal sparse decision-observation budget differs.")
         if (

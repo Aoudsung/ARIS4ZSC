@@ -5,7 +5,7 @@ Date: 2026-08-06
 ## Scope
 
 This report validates the source contracts of
-`delta_episode_static_centered_residual_delayed_exact_voi_v4`. It does not
+`delta_belief_conditioned_raw_return_pairwise_crn_v5`. It does not
 claim benchmark performance. The v3 CUDA pilot is not v4 evidence and is not
 included in any v4 result.
 

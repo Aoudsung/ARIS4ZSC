@@ -116,6 +116,48 @@ def decode_local_task_state(observation: Any) -> LocalTaskState:
     )
 
 
+
+EGO_HOLDING_CLASSES = 4
+"""nothing, ingredient, plate, cooked dish."""
+
+
+def ego_situation(observation: Any) -> tuple[Any, Any, Any, Any]:
+    """Decode what the ego is holding, plus three legal situation bits.
+
+    Everything here is read from the agent's own local frame, so it is legal
+    deployment information -- it is used only to label anchor positions, but a
+    label computed from privileged state would be a boundary violation waiting
+    to be wired somewhere else.
+
+    Returns ``(holding, partner_visible, pot_active, recipe_visible)``.
+    ``holding`` is the ego inventory collapsed to one of four classes: the
+    ingredient planes come first, then the plate and dish factors that
+    OvercookedV2 appends last.
+    """
+
+    import jax.numpy as jnp
+
+    value = jnp.asarray(observation, dtype=jnp.float32)
+    ingredients = ingredient_count(value.shape[-1])
+    block_size = ingredients + 7
+    inventory = value[..., 5:block_size]
+    mass = jnp.sum(inventory, axis=(-3, -2))
+    ingredient_mass = jnp.sum(mass[..., :ingredients], axis=-1)
+    plate_mass = mass[..., ingredients]
+    dish_mass = mass[..., ingredients + 1]
+
+    holding = jnp.zeros(mass.shape[:-1], dtype=jnp.int32)
+    holding = jnp.where(ingredient_mass > 0.5, 1, holding)
+    holding = jnp.where(plate_mass > 0.5, 2, holding)
+    holding = jnp.where(dish_mass > 0.5, 3, holding)
+
+    dynamic = value[..., DYNAMIC_CHANNEL_START:DYNAMIC_CHANNEL_END]
+    pot_active = jnp.sum(dynamic, axis=(-3, -2, -1)) > 0.5
+    recipe = value[..., RECIPE_CHANNEL_START:RECIPE_CHANNEL_END]
+    recipe_visible = jnp.sum(recipe, axis=(-3, -2, -1)) > 0.5
+    return holding, partner_visibility(value), pot_active, recipe_visible
+
+
 def align_egocentric_frames(
     previous: LocalTaskState, current: LocalTaskState, previous_action: Any
 ) -> FrameAlignment:
@@ -372,7 +414,9 @@ __all__ = [
     "PARTNER_INVENTORY_FACTOR_CLASSES",
     "PARTNER_POSITION_CLASSES",
     "align_egocentric_frames",
+    "EGO_HOLDING_CLASSES",
     "decode_local_task_state",
+    "ego_situation",
     "extract_interface_target",
     "extract_probe_response_target",
     "extract_response_target",

@@ -6,7 +6,7 @@
   `15e90b1be0d50ef99df0fa5837312d70fa913643`.
 - Local source-archive baseline: `018dd8202abd06e2a685872406c8d4a6e1804e69`.
 - Active method:
-  `delta_episode_static_centered_residual_delayed_exact_voi_v4`.
+  `delta_belief_conditioned_raw_return_pairwise_crn_v5`.
 - Configuration schema: 3.
 - Checkpoint/deployment schema: 4.
 - Partner-manifest schema: 2.

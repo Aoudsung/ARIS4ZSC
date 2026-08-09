@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
-from .decision_model import (
-    decision_component_log_probability,
-    decision_predict,
-    successor_decision_predict,
+from .belief_value import belief_value_predict, huber, td_lambda_targets
+from .successor_feature import outcome_encoding, successor_feature_predict
+from .contrast import (
+    PairwiseContrast,
+    contrast_regression_loss,
+    exact_tie_fraction,
+    kendall_tau_b,
+    pairwise_contrasts_from_replicas,
+    pairwise_sign_agreement,
+    resolvable_pair_statistics,
 )
 from .observation import extract_probe_response_target, extract_response_target
 from .response_model import (
@@ -22,6 +28,77 @@ from .response_model import (
     response_shared_log_probability,
 )
 from .types import AnchorBatch, LossResult, RolloutBatch
+
+
+
+RAW_VALUE_METRIC_NAMES = (
+    "raw_value_total",
+    "raw_value_state",
+    "raw_value_action",
+    "raw_value_mean",
+    "raw_value_target_mean",
+    "raw_advantage_dispersion",
+)
+
+CONTRAST_METRIC_NAMES = (
+    "contrast_total",
+    "contrast_weight",
+    "contrast_sign_agreement",
+    "contrast_pairs",
+    "contrast_resolvable_fraction",
+    "contrast_mean_absolute",
+    "contrast_mean_standard_error",
+)
+
+ANCHOR_ORACLE_METRIC_NAMES = (
+    "mirror_same_world_improvement",
+    "mirror_same_world_improvement_standard_error",
+    "mirror_same_world_win_rate",
+    "mirror_realised_kl",
+    "anchor_oracle_repeatability",
+    "anchor_top_action_agreement",
+    "anchor_best_action_regret",
+    "anchor_best_action_regret_standard_error",
+    "anchor_evaluation_sign_agreement",
+    "anchor_evaluation_kendall_tau_b",
+    "anchor_evaluation_exact_tie_fraction",
+    "anchor_evaluation_pairs",
+    "anchor_evaluation_resolvable_fraction",
+    "anchor_evaluation_mean_absolute",
+    "anchor_evaluation_mean_standard_error",
+)
+
+SUCCESSOR_METRIC_NAMES = (
+    "successor_feature_total",
+    "successor_feature_task",
+    "successor_feature_instant",
+    "successor_feature_identity_baseline",
+    "successor_feature_dispersion",
+    "successor_value_total",
+    "successor_value_mean",
+    "successor_value_realised_gap",
+)
+
+DECISION_METRIC_NAMES = (
+    RAW_VALUE_METRIC_NAMES
+    + CONTRAST_METRIC_NAMES
+    + ANCHOR_ORACLE_METRIC_NAMES
+    + SUCCESSOR_METRIC_NAMES
+)
+"""Every decision-side metric key.
+
+The composite must emit all of them on every update, zero-filled when the
+channel did not run: an anchor batch arrives on a minority of updates, and a
+metrics dict whose keys depend on that would either break accumulation or
+silently drop the updates that carry the measurement.
+"""
+
+
+def zero_decision_metrics() -> dict[str, Any]:
+    import jax.numpy as jnp
+
+    zero = jnp.asarray(0.0, dtype=jnp.float32)
+    return {name: zero for name in DECISION_METRIC_NAMES}
 
 
 def categorical_log_probability(logits: Any, actions: Any) -> Any:
@@ -195,12 +272,473 @@ def ppo_loss(
     )
 
 
+
+def raw_task_value_loss(
+    model: Any,
+    latent_params: Any,
+    output: Any,
+    batch: RolloutBatch,
+    *,
+    target_params: Any = None,
+    lambda_: float = 0.95,
+) -> tuple[Any, Mapping[str, Any]]:
+    """TD(lambda) on raw task reward for the belief-conditioned critic.
+
+    This runs on every outer update.  The component decision head it stands in
+    for received a non-zero gradient on 28 of 3656 updates, because its channel
+    only entered the objective when an anchor batch existed; every rollout step
+    carries ``(x_t, b_t, a_t, r_t, x_{t+1}, b_{t+1})`` and can train this one.
+
+    Raw reward only.  The PPO critic keeps the annealed shaping term because it
+    is training task competence; this target must match the anchor contrasts,
+    which accumulate raw reward, or the two decision-side estimands describe
+    different quantities.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    params = latent_params["belief_value"]
+    policy = jax.nn.softmax(
+        jax.lax.stop_gradient(output.base_policy_logits), axis=-1
+    )
+    prediction = belief_value_predict(
+        params,
+        jax.lax.stop_gradient(output.task_features),
+        jax.lax.stop_gradient(output.instant_partner),
+        output.behavior_features,
+        jax.lax.stop_gradient(output.belief),
+        policy,
+    )
+    values = prediction.value_mean
+    # Bootstrap from the slow target copy.  The online critic is also the thing
+    # the mirror step reads, so letting it chase its own bootstrap couples the
+    # deployed policy to its own estimation noise -- and the anchor contrasts
+    # arrive too rarely to correct it.
+    bootstrap = values
+    if target_params is not None:
+        bootstrap = belief_value_predict(
+            target_params["belief_value"],
+            jax.lax.stop_gradient(output.task_features),
+            jax.lax.stop_gradient(output.instant_partner),
+            jax.lax.stop_gradient(output.behavior_features),
+            jax.lax.stop_gradient(output.belief),
+            policy,
+        ).value_mean
+    targets = jax.lax.stop_gradient(
+        td_lambda_targets(
+            jnp.asarray(batch.rewards, dtype=jnp.float32),
+            bootstrap,
+            jnp.asarray(batch.dones, dtype=jnp.float32),
+            gamma=float(model.config.ppo.gamma),
+            lambda_=float(lambda_),
+        )
+    )
+    mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
+    state_loss = _masked_mean(huber(values[:-1] - targets), mask)
+
+    # The advantage head is anchored to the realised action's residual return so
+    # it does not drift freely between anchor batches.
+    actions = jnp.asarray(batch.actions, dtype=jnp.int32)
+    taken = jnp.take_along_axis(
+        prediction.advantage_mean[:-1], actions[..., None], axis=-1
+    )[..., 0]
+    residual = jax.lax.stop_gradient(targets - values[:-1])
+    action_loss = _masked_mean(huber(taken - residual), mask)
+    total = state_loss + action_loss
+    return total, {
+        "raw_value_total": total,
+        "raw_value_state": state_loss,
+        "raw_value_action": action_loss,
+        "raw_value_mean": _masked_mean(values[:-1], mask),
+        "raw_value_target_mean": _masked_mean(targets, mask),
+        "raw_advantage_dispersion": _masked_mean(
+            jnp.mean(prediction.advantage_dispersion()[:-1], axis=-1), mask
+        ),
+    }
+
+
+def pairwise_crn_contrast_loss(
+    latent_params: Any,
+    output: Any,
+    anchors: Any,
+) -> tuple[Any, Mapping[str, Any]]:
+    """Calibrate the critic's action differences against the CRN contrasts.
+
+    Only differences enter, weighted by the inverse measurement variance the
+    anchor reports.  A pair the simulator could not resolve therefore trains
+    "these two actions are close" with a small weight, instead of being handed
+    an ``argmax`` winner decided by index order -- which is what happened on
+    every anchor row of the previous target.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    time = anchors.time_indexes
+    lane = anchors.lane_indexes
+    policy = jax.nn.softmax(
+        jax.lax.stop_gradient(output.base_policy_logits[time, lane]), axis=-1
+    )
+    prediction = belief_value_predict(
+        latent_params["belief_value"],
+        jax.lax.stop_gradient(output.task_features[time, lane]),
+        jax.lax.stop_gradient(output.instant_partner[time, lane]),
+        output.behavior_features[time, lane],
+        jax.lax.stop_gradient(output.belief[time, lane]),
+        policy,
+    )
+    contrast = PairwiseContrast(
+        mean=anchors.contrast_mean,
+        standard_error=anchors.contrast_standard_error,
+        valid=anchors.contrast_valid,
+    )
+    loss, weight = contrast_regression_loss(prediction.advantage_mean, contrast)
+    statistics = resolvable_pair_statistics(contrast)
+    return loss, {
+        "contrast_total": loss,
+        "contrast_weight": weight,
+        "contrast_sign_agreement": pairwise_sign_agreement(
+            prediction.advantage_mean, contrast
+        ),
+        **{f"contrast_{name}": value for name, value in statistics.items()},
+    }
+
+
+
+
+def successor_feature_loss(
+    latent_params: Any,
+    output: Any,
+    batch: RolloutBatch,
+    probe_target: Any,
+    valid: Any,
+) -> tuple[Any, Mapping[str, Any]]:
+    """Fit the two-step landing state the probe actually produces.
+
+    Supervision is free: every consecutive pair of rollout rows already carries
+    the probe action at ``t``, the delayed response observed over
+    ``t+1 -> t+2``, and the encoder features at ``t+2``.  The targets are
+    stop-gradiented -- the encoder belongs to PPO, and a successor model able to
+    reshape it would be making the representation predictable rather than
+    useful.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    prediction = successor_feature_predict(
+        latent_params["successor_feature"],
+        jax.lax.stop_gradient(output.task_features[:-2]),
+        jax.lax.stop_gradient(output.instant_partner[:-2]),
+        output.behavior_features[:-2],
+        jax.lax.stop_gradient(output.belief[:-2]),
+        _probe_action_index(batch),
+        outcome_encoding(
+            probe_target.visibility,
+            probe_target.interface_available,
+            probe_target.interface_changed,
+            probe_target.interface_event,
+        ),
+    )
+    task_target = jax.lax.stop_gradient(output.task_features[2:])
+    instant_target = jax.lax.stop_gradient(output.instant_partner[2:])
+    task_error = _masked_mean(
+        jnp.mean(huber(prediction.task_mean - task_target), axis=-1), valid
+    )
+    instant_error = _masked_mean(
+        jnp.mean(huber(prediction.instant_mean - instant_target), axis=-1), valid
+    )
+    total = task_error + instant_error
+    # The null model is "nothing moves in two steps".  A successor model that
+    # cannot beat it is not contributing anything VOI could use, so the same
+    # error under the identity prediction is reported alongside.
+    identity = _masked_mean(
+        jnp.mean(
+            huber(jax.lax.stop_gradient(output.task_features[:-2]) - task_target),
+            axis=-1,
+        ),
+        valid,
+    ) + _masked_mean(
+        jnp.mean(
+            huber(
+                jax.lax.stop_gradient(output.instant_partner[:-2]) - instant_target
+            ),
+            axis=-1,
+        ),
+        valid,
+    )
+    return total, {
+        "successor_feature_total": total,
+        "successor_feature_task": task_error,
+        "successor_feature_instant": instant_error,
+        "successor_feature_identity_baseline": identity,
+        "successor_feature_dispersion": _masked_mean(
+            prediction.dispersion(), valid
+        ),
+    }
+
+
+def successor_belief_value_loss(
+    model: Any,
+    latent_params: Any,
+    output: Any,
+    batch: RolloutBatch,
+    probe_target: Any,
+    valid: Any,
+    *,
+    lambda_: float = 0.95,
+) -> tuple[Any, Mapping[str, Any]]:
+    """Value the predicted landing state against what actually happened there.
+
+    Active VOI reads ``Q`` at the successor, so the successor's *value* is the
+    quantity that has to be right -- a feature error that changes no action
+    value costs nothing, and one that flips an ordering costs everything.  This
+    regresses the critic at the predicted landing state onto the same TD(lambda)
+    target the critic is fitted to at the real one.
+
+    The critic enters stop-gradiented.  Otherwise the cheapest way to satisfy
+    this loss would be to flatten ``Q`` until every successor looks alike, which
+    is exactly the degeneracy the whole redesign is trying to leave behind.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    critic_params = jax.lax.stop_gradient(latent_params["belief_value"])
+    policy = jax.nn.softmax(
+        jax.lax.stop_gradient(output.base_policy_logits), axis=-1
+    )
+    realised = belief_value_predict(
+        critic_params,
+        jax.lax.stop_gradient(output.task_features),
+        jax.lax.stop_gradient(output.instant_partner),
+        output.behavior_features,
+        jax.lax.stop_gradient(output.belief),
+        policy,
+    )
+    # A successor at ``t`` lands on state ``t+2``, and TD targets exist for
+    # states ``0..T-1`` only -- the final row is the bootstrap state, not an
+    # estimate.  The usable window is therefore ``t <= T-3``.
+    target = jax.lax.stop_gradient(
+        td_lambda_targets(
+            jnp.asarray(batch.rewards, dtype=jnp.float32),
+            realised.value_mean,
+            jnp.asarray(batch.dones, dtype=jnp.float32),
+            gamma=float(model.config.ppo.gamma),
+            lambda_=float(lambda_),
+        )
+    )[2:]
+    steps = int(target.shape[0])
+
+    successor = successor_feature_predict(
+        latent_params["successor_feature"],
+        jax.lax.stop_gradient(output.task_features[:-2]),
+        jax.lax.stop_gradient(output.instant_partner[:-2]),
+        output.behavior_features[:-2],
+        jax.lax.stop_gradient(output.belief[:-2]),
+        _probe_action_index(batch),
+        outcome_encoding(
+            probe_target.visibility,
+            probe_target.interface_available,
+            probe_target.interface_changed,
+            probe_target.interface_event,
+        ),
+    )
+    predicted = belief_value_predict(
+        critic_params,
+        successor.task_mean[:steps],
+        successor.instant_mean[:steps],
+        output.behavior_features[2 : 2 + steps],
+        jax.lax.stop_gradient(output.belief[2 : 2 + steps]),
+        policy[2 : 2 + steps],
+    )
+    window = valid[:steps]
+    loss = _masked_mean(huber(predicted.value_mean - target), window)
+    return loss, {
+        "successor_value_total": loss,
+        "successor_value_mean": _masked_mean(predicted.value_mean, window),
+        "successor_value_realised_gap": _masked_mean(
+            jnp.abs(predicted.value_mean - realised.value_mean[2 : 2 + steps]),
+            window,
+        ),
+    }
+
+
+def _probe_action_index(batch: RolloutBatch) -> Any:
+    """The action played at ``t``, whose delayed response arrives at ``t+2``.
+
+    This must be the action the probe-response target is conditioned on, which
+    is ``actions[:-1]`` -- the same slice ``probe_response_predict`` receives.
+    Deriving it from ``output.active_voi`` instead would have trained the whole
+    successor model on action zero: the latent objective evaluates the sequence
+    with ``compute_decision`` off, so that field is identically zero there and
+    its argmax is constant.
+    """
+
+    import jax.numpy as jnp
+
+    return jnp.asarray(batch.actions[:-1], dtype=jnp.int32)
+
+
+def _anchor_oracle_diagnostics(
+    latent_params: Any, output: Any, anchors: AnchorBatch
+) -> Mapping[str, Any]:
+    """Audit the critic against the held-out anchor replicas.
+
+    Every quantity here is measured on ``evaluation_*``, which no loss reads.
+    ``oracle_repeatability`` is the one that exposed the old target: when the
+    fit and evaluation halves of the same anchor disagree about the best
+    action, no head can score well on it, and agreement measured against the
+    fit half is reporting noise rather than skill.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    time = anchors.time_indexes
+    lane = anchors.lane_indexes
+    policy = jax.nn.softmax(output.base_policy_logits[time, lane], axis=-1)
+    prediction = belief_value_predict(
+        latent_params["belief_value"],
+        output.task_features[time, lane],
+        output.instant_partner[time, lane],
+        output.behavior_features[time, lane],
+        output.belief[time, lane],
+        policy,
+    )
+    advantage = jax.lax.stop_gradient(prediction.advantage_mean)
+    legal = jnp.asarray(anchors.action_mask, dtype=jnp.bool_)
+    evaluation = pairwise_contrasts_from_replicas(
+        anchors.evaluation_replica_returns_by_action, legal
+    )
+    evaluation_returns = jnp.asarray(
+        anchors.evaluation_returns_by_action, dtype=jnp.float32
+    )
+    fit_best = jnp.argmax(
+        jnp.where(legal, anchors.fit_returns_by_action, -jnp.inf), axis=-1
+    )
+    oracle = jnp.argmax(jnp.where(legal, evaluation_returns, -jnp.inf), axis=-1)
+    selected = jnp.argmax(jnp.where(legal, advantage, -jnp.inf), axis=-1)
+    rows = jnp.arange(oracle.shape[0])
+    regret = evaluation_returns[rows, oracle] - evaluation_returns[rows, selected]
+    # Same-world mirror improvement.  The anchor measured every action's
+    # continuation return under one set of random numbers, so the base policy
+    # and the mirror policy can be scored against the *same* worlds: the
+    # difference is what the adaptation step actually bought, not a comparison
+    # of two separate runs.  Everything here uses the evaluation replicas the
+    # loss never sees.
+    from .mirror_policy import MIRROR_UNCERTAINTY_PENALTY, robust_mirror_policy_logits
+
+    base_logits = jax.lax.stop_gradient(output.base_policy_logits[time, lane])
+    mirror_logits, mirror_kl, _ = robust_mirror_policy_logits(
+        base_logits,
+        advantage,
+        jax.lax.stop_gradient(prediction.advantage_dispersion()),
+        kl_budget=0.04,
+        uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
+    )
+    legal_float = legal.astype(jnp.float32)
+
+    def masked_policy(logits: Any) -> Any:
+        weights = jax.nn.softmax(logits, axis=-1) * legal_float
+        return weights / jnp.maximum(jnp.sum(weights, axis=-1, keepdims=True), 1.0e-30)
+
+    base_return = jnp.sum(masked_policy(base_logits) * evaluation_returns, axis=-1)
+    mirror_return = jnp.sum(masked_policy(mirror_logits) * evaluation_returns, axis=-1)
+    improvement = mirror_return - base_return
+    rows_float = jnp.maximum(float(improvement.shape[0]), 1.0)
+    return {
+        "mirror_same_world_improvement": jnp.mean(improvement),
+        "mirror_same_world_improvement_standard_error": jnp.std(improvement)
+        / jnp.sqrt(rows_float),
+        "mirror_same_world_win_rate": jnp.mean(
+            (improvement > 0.0).astype(jnp.float32)
+        ),
+        "mirror_realised_kl": jnp.mean(mirror_kl),
+        "anchor_oracle_repeatability": jnp.mean(
+            (fit_best == oracle).astype(jnp.float32)
+        ),
+        "anchor_top_action_agreement": jnp.mean(
+            (selected == oracle).astype(jnp.float32)
+        ),
+        "anchor_best_action_regret": jnp.mean(regret),
+        "anchor_best_action_regret_standard_error": jnp.std(regret)
+        / jnp.sqrt(jnp.maximum(float(regret.shape[0]), 1.0)),
+        "anchor_evaluation_sign_agreement": pairwise_sign_agreement(
+            advantage, evaluation
+        ),
+        "anchor_evaluation_kendall_tau_b": jnp.mean(
+            kendall_tau_b(advantage, evaluation_returns, legal)
+        ),
+        "anchor_evaluation_exact_tie_fraction": exact_tie_fraction(
+            evaluation_returns, legal
+        ),
+        **{
+            f"anchor_evaluation_{name}": value
+            for name, value in resolvable_pair_statistics(evaluation).items()
+        },
+    }
+
+
+
+def latent_contrast_loss(
+    model: Any,
+    latent_params: Any,
+    base_params: Any,
+    batch: RolloutBatch,
+    anchors: AnchorBatch,
+) -> LossResult:
+    """The anchor calibration alone, evaluated after the TD step has committed.
+
+    Sequencing matters here because both objectives write the same critic: the
+    contrast is what pins the *ordering* of actions, and it should correct a
+    critic that has already absorbed this rollout's returns rather than one
+    that has not.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    # The sequence is evaluated at detached latent parameters.  This is exact,
+    # not an approximation: with ``compute_decision`` off, the recursion reads
+    # the response emissions and the belief filter and never touches
+    # ``belief_value``, which is the only subtree this objective writes.  The
+    # contrast additionally consumes every feature stop-gradiented.  Passing
+    # live parameters here would therefore build a backward pass through a
+    # 256-step scan whose gradient is identically zero -- and that backward
+    # pass is most of the graph.
+    _, output = model.sequence(
+        jax.lax.stop_gradient(base_params),
+        jax.lax.stop_gradient(latent_params),
+        batch.initial_policy_state,
+        batch.observations,
+        batch.previous_actions,
+        batch.episode_starts,
+        compute_latent=True,
+        compute_decision=False,
+        execute_adaptation=False,
+    )
+    loss, metrics = pairwise_crn_contrast_loss(latent_params, output, anchors)
+    # The oracle diagnostics stay out of this objective deliberately.  They
+    # contain a forty-eight-iteration mirror solve and a held-out re-scoring of
+    # every anchor, none of which carries gradient -- but placing them inside
+    # ``value_and_grad`` still put them in the differentiated graph, and the
+    # resulting XLA module did not finish backend compilation in forty minutes
+    # (against 173 seconds for the same kernel without an anchor batch).  They
+    # are computed once, gradient-free, in the final audit.
+    return LossResult(total=loss, metrics=metrics)
+
+
 def latent_composite_loss(
     model: Any,
     latent_params: Any,
     base_params: Any,
     batch: RolloutBatch,
     anchors: AnchorBatch | None,
+    *,
+    target_latent_params: Any = None,
+    include_contrast: bool = True,
 ) -> LossResult:
     """Channel-normalized proper score for the unified v4 latent model.
 
@@ -264,6 +802,8 @@ def latent_composite_loss(
     probe_semantic_sum = jnp.asarray(0.0, dtype=jnp.float32)
     probe_semantic_count = jnp.asarray(0.0, dtype=jnp.float32)
     probe_event_js = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    successor_metrics: dict[str, Any] = {}
     uses_probe_channel = (
         model.config.method_variant == "delta_active" and batch.actions.shape[0] >= 2
     )
@@ -311,6 +851,19 @@ def latent_composite_loss(
         probe_semantic_nll, probe_semantic_sum, probe_semantic_count = _masked_nll(
             probe_semantic_logp, probe_semantic_mask
         )
+        # Successor channel.  The same two-step window that supervises the
+        # delayed response also says where the pair ended up and what it was
+        # worth there, so active VOI reads a landing state the data measured
+        # rather than the current state wearing its name.
+        feature_loss, feature_metrics = successor_feature_loss(
+            latent_params, output, batch, probe_target, probe_valid
+        )
+        value_consistency, value_consistency_metrics = successor_belief_value_loss(
+            model, latent_params, output, batch, probe_target, probe_valid
+        )
+        successor_loss = feature_loss + value_consistency
+        successor_metrics = {**feature_metrics, **value_consistency_metrics}
+
         probability = jnn.softmax(probe_prediction.interface_event_logits, axis=-1)
         mean_probability = jnp.mean(probability, axis=-2, keepdims=True)
         probe_event_js = jnp.mean(
@@ -324,123 +877,42 @@ def latent_composite_loss(
             )
         )
 
-    decision_nll = jnp.asarray(0.0, dtype=jnp.float32)
-    decision_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    decision_count = jnp.asarray(0.0, dtype=jnp.float32)
-    decision_top_action_agreement = jnp.asarray(0.0, dtype=jnp.float32)
-    decision_empirical_regret = jnp.asarray(0.0, dtype=jnp.float32)
-    decision_component_disagreement = jnp.asarray(0.0, dtype=jnp.float32)
-    successor_decision_nll = jnp.asarray(0.0, dtype=jnp.float32)
-    successor_decision_sum = jnp.asarray(0.0, dtype=jnp.float32)
-    successor_decision_count = jnp.asarray(0.0, dtype=jnp.float32)
-    successor_top_action_agreement = jnp.asarray(0.0, dtype=jnp.float32)
-    successor_empirical_regret = jnp.asarray(0.0, dtype=jnp.float32)
-    uses_decision_channel = (
-        anchors is not None
-        and model.config.method_variant in {"delta_passive", "delta_active"}
-    )
-    if uses_decision_channel:
-        time = anchors.time_indexes
-        lane = anchors.lane_indexes
-        current_prediction = decision_predict(
-            latent_params["decision"],
-            latent_params["component_embeddings"],
-            jax.lax.stop_gradient(output.task_features[time, lane]),
-            jax.lax.stop_gradient(output.instant_partner[time, lane]),
-            output.behavior_features[time, lane],
+    # Decision channel.  Two terms replace the component return mixture: a
+    # TD(lambda) fit of the belief-conditioned raw value on every rollout step,
+    # and -- when anchors exist -- a precision-weighted fit of the critic's
+    # action differences to the measured CRN contrasts.
+    #
+    # Both gradients reach only ``latent_params["belief_value"]``.  The task
+    # features, the instant partner encoding, the posterior and the acting
+    # policy all enter stop-gradiented, and the head does not read the component
+    # embeddings.  The response channels above and this one are therefore
+    # disjoint optimisation problems that share an Adam state, which is why the
+    # differing units -- nats against raw return -- need no relative weight and
+    # must not be given one.
+    value_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    contrast_loss = jnp.asarray(0.0, dtype=jnp.float32)
+    decision_metrics = zero_decision_metrics()
+    trains_decision = model.config.method_variant in {"delta_passive", "delta_active"}
+    uses_decision_channel = trains_decision and anchors is not None
+    decision_metrics = {**decision_metrics, **successor_metrics}
+    if trains_decision:
+        value_loss, value_reports = raw_task_value_loss(
+            model, latent_params, output, batch, target_params=target_latent_params
         )
-        current_component_logp = decision_component_log_probability(
-            current_prediction,
-            anchors.fit_returns_by_action,
-            anchors.measurement_covariances,
-            anchors.action_mask,
+        decision_metrics = {**decision_metrics, **value_reports}
+    if uses_decision_channel and include_contrast:
+        contrast_loss, contrast_reports = pairwise_crn_contrast_loss(
+            latent_params, output, anchors
         )
-        anchor_belief = output.belief[time, lane]
-        current_logp = _mixture_log_probability(anchor_belief, current_component_logp)
-        current_valid = jnp.all(anchors.action_mask, axis=-1).astype(jnp.float32)
-        decision_nll, decision_sum, decision_count = _masked_nll(
-            current_logp, current_valid
-        )
-        expected = jnp.sum(
-            anchor_belief[..., :, None] * current_prediction.means, axis=-2
-        )
-        selected = jnp.argmax(expected, axis=-1)
-        oracle = jnp.argmax(anchors.evaluation_returns_by_action, axis=-1)
-        rows = jnp.arange(selected.shape[0])
-        decision_top_action_agreement = _masked_mean(selected == oracle, current_valid)
-        decision_empirical_regret = _masked_mean(
-            anchors.evaluation_returns_by_action[rows, oracle]
-            - anchors.evaluation_returns_by_action[rows, selected],
-            current_valid,
-        )
-        component_top = jnp.argmax(current_prediction.means, axis=-1)
-        decision_component_disagreement = jnp.mean(
-            (component_top[..., :, None] != component_top[..., None, :]).astype(
-                jnp.float32
-            )
-        )
+        decision_metrics = {
+            **decision_metrics,
+            **contrast_reports,
+            **_anchor_oracle_diagnostics(latent_params, output, anchors),
+        }
 
-        if model.config.method_variant == "delta_active":
-            action_count = int(anchors.probe_fit_returns_by_action.shape[-2])
-            probe_actions = jnp.broadcast_to(
-                jnp.arange(action_count, dtype=jnp.int32),
-                (time.shape[0], action_count),
-            )
-            successor_prediction = successor_decision_predict(
-                latent_params["decision"],
-                latent_params["component_embeddings"],
-                jax.lax.stop_gradient(output.task_features[time, lane]),
-                jax.lax.stop_gradient(output.instant_partner[time, lane]),
-                output.behavior_features[time, lane],
-                probe_actions,
-            )
-            successor_component_logp = decision_component_log_probability(
-                successor_prediction,
-                anchors.probe_fit_returns_by_action,
-                anchors.probe_measurement_covariances,
-                anchors.probe_action_mask,
-            )
-            successor_belief = jnp.broadcast_to(
-                anchor_belief[:, None, :], successor_component_logp.shape
-            )
-            successor_logp = _mixture_log_probability(
-                successor_belief, successor_component_logp
-            )
-            successor_valid = jnp.all(
-                anchors.probe_action_mask, axis=-1
-            ).astype(jnp.float32)
-            (
-                successor_decision_nll,
-                successor_decision_sum,
-                successor_decision_count,
-            ) = _masked_nll(successor_logp, successor_valid)
-            successor_expected = jnp.sum(
-                anchor_belief[:, None, :, None] * successor_prediction.means,
-                axis=-2,
-            )
-            successor_selected = jnp.argmax(successor_expected, axis=-1)
-            successor_oracle = jnp.argmax(
-                anchors.probe_evaluation_returns_by_action, axis=-1
-            )
-            probe_rows = jnp.arange(successor_selected.shape[0])[:, None]
-            probe_indexes = jnp.arange(action_count)[None, :]
-            successor_top_action_agreement = _masked_mean(
-                successor_selected == successor_oracle, successor_valid
-            )
-            successor_empirical_regret = _masked_mean(
-                anchors.probe_evaluation_returns_by_action[
-                    probe_rows, probe_indexes, successor_oracle
-                ]
-                - anchors.probe_evaluation_returns_by_action[
-                    probe_rows, probe_indexes, successor_selected
-                ],
-                successor_valid,
-            )
-
-    # Three channel-normalized proper scores. Immediate and delayed response
-    # measurements share their channel denominator; current and successor CRN
-    # observations share the decision denominator. Instrumentation frequency
-    # therefore cannot become an implicit method weight.
+    # Two channel-normalized proper scores for the response measurements.
+    # Immediate and delayed observations share their channel denominator, so
+    # instrumentation frequency cannot become an implicit method weight.
     shared_total_sum = shared_sum + probe_shared_sum
     shared_total_count = shared_count + probe_count
     shared_channel_nll = shared_total_sum / jnp.maximum(shared_total_count, 1.0)
@@ -449,14 +921,13 @@ def latent_composite_loss(
     semantic_channel_nll = semantic_total_sum / jnp.maximum(
         semantic_total_count, 1.0
     )
-    decision_total_sum = decision_sum + successor_decision_sum
-    decision_total_count = decision_count + successor_decision_count
-    decision_channel_nll = decision_total_sum / jnp.maximum(
-        decision_total_count, 1.0
+    total = (
+        shared_channel_nll
+        + semantic_channel_nll
+        + value_loss
+        + contrast_loss
+        + successor_loss
     )
-    total = shared_channel_nll + semantic_channel_nll
-    if uses_decision_channel:
-        total = total + decision_channel_nll
 
     posterior = jnp.asarray(output.belief, dtype=jnp.float32)
     prior = jnp.asarray(output.predictive_belief, dtype=jnp.float32)
@@ -526,27 +997,16 @@ def latent_composite_loss(
             "latent_shared_total_nll": shared_channel_nll,
             "latent_semantic_total_nll": semantic_channel_nll,
             "latent_response_nll": shared_nll + semantic_nll,
-            "latent_decision_nll": decision_nll,
-            "latent_successor_decision_nll": successor_decision_nll,
-            "latent_decision_total_nll": decision_channel_nll,
             "latent_shared_response_observations": shared_count,
             "latent_semantic_response_observations": semantic_count,
             "latent_probe_observations": probe_count,
             "latent_probe_semantic_observations": probe_semantic_count,
-            "latent_decision_observations": decision_count,
-            "latent_successor_decision_observations": successor_decision_count,
             "latent_shared_total_observations": shared_total_count,
             "latent_semantic_total_observations": semantic_total_count,
-            "latent_decision_total_observations": decision_total_count,
             "latent_mean_posterior_entropy": jnp.mean(posterior_entropy),
             "latent_mean_filter_kl": jnp.mean(filter_kl),
             "latent_component_event_js": event_component_js,
             "latent_probe_component_event_js": probe_event_js,
-            "latent_decision_top_action_agreement": decision_top_action_agreement,
-            "latent_decision_empirical_regret": decision_empirical_regret,
-            "latent_decision_component_disagreement": decision_component_disagreement,
-            "latent_successor_top_action_agreement": successor_top_action_agreement,
-            "latent_successor_empirical_regret": successor_empirical_regret,
             "latent_interface_coverage_rate": _masked_mean(
                 target.interface_available, response_mask
             ),
@@ -574,6 +1034,7 @@ def latent_composite_loss(
                 target.recipe_changed, response_mask * target.recipe_mask
             ),
             **factor_metrics,
+            **decision_metrics,
         },
     )
 

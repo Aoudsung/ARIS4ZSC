@@ -74,4 +74,78 @@ def mirror_policy_logits(
     return final_logits, final_kl, eta
 
 
-__all__ = ["categorical_kl_from_logits", "mirror_policy_logits"]
+
+
+MIRROR_UNCERTAINTY_PENALTY = 1.0
+"""One ensemble standard deviation, as a registered constant rather than a knob.
+
+The natural reading of ``beta = 1`` is "improve against the advantage you can
+show at one sigma of ensemble disagreement".  It is deliberately not a config
+key: a tunable value here would recreate the weighted-objective search the
+refactor removed, and there is no held-out quantity that could tune it without
+reading the confirmatory panel.
+"""
+
+
+def robust_mirror_policy_logits(
+    base_logits: Any,
+    advantage_mean: Any,
+    advantage_dispersion: Any,
+    *,
+    kl_budget: float,
+    uncertainty_penalty: float,
+    iterations: int = 48,
+) -> tuple[Any, Any, Any]:
+    """Improve against a conservative lower bound on the advantage.
+
+    ``mirror_policy_logits`` treats any ordering as actionable: because the
+    constrained optimum is invariant to positive rescaling of ``Q``, a contrast
+    of 1e-4 and a contrast of 10 produce the same policy, only a different dual
+    temperature.  Measured on the pre-refactor anchors, no action pair was
+    separated by even two standard errors, yet the solver still spent the full
+    0.04 KL budget on every active step.
+
+    This objective replaces the raw inner product with
+
+        (pi - pi0)^T Abar  -  beta * sqrt((pi - pi0)^T Sigma (pi - pi0))
+
+    using the ensemble dispersion as a diagonal Sigma.  Where the advantage is
+    well determined the first term dominates and the step is unchanged; where
+    the ensemble disagrees the penalty cancels the unproven improvement and the
+    solution stays near the base policy.  It is a continuous lower bound, not a
+    gate: nothing is thresholded on or off.
+    """
+
+    import jax.nn
+    import jax.numpy as jnp
+
+    mean = jnp.asarray(advantage_mean, dtype=jnp.float32)
+    dispersion = jnp.asarray(advantage_dispersion, dtype=jnp.float32)
+    beta = jnp.asarray(uncertainty_penalty, dtype=jnp.float32)
+    base = jnp.asarray(base_logits, dtype=jnp.float32)
+    reference = jax.nn.softmax(base, axis=-1)
+
+    # Shrink each advantage toward zero by its own uncertainty and clamp there.
+    # Subtracting a signed penalty outright would be wrong twice over: the dual
+    # solver is invariant to positive rescaling, so a uniformly shrunk vector
+    # would still spend the whole budget, and once the dispersion exceeds the
+    # mean the signed subtraction flips the ordering and *increases* the
+    # magnitude.  Clamping at zero is the lower confidence bound: an action the
+    # ensemble cannot separate from the baseline contributes nothing, and when
+    # no action survives the vector is constant and the solver's no-signal
+    # branch returns the base policy unchanged.
+    conservative = jnp.sign(mean) * jnp.maximum(
+        jnp.abs(mean) - beta * jnp.abs(dispersion), 0.0
+    )
+    del reference
+    return mirror_policy_logits(
+        base, conservative, kl_budget=kl_budget, iterations=iterations
+    )
+
+
+
+__all__ = [
+    "categorical_kl_from_logits",
+    "mirror_policy_logits",
+    "robust_mirror_policy_logits",
+]

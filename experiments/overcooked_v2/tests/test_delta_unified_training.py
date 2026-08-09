@@ -86,23 +86,31 @@ def _anchors():
     replicas = jnp.stack((fit - 0.1, fit + 0.1), axis=-1)
     probe = jnp.broadcast_to(fit[:, None, :], (2, 6, 6))
     probe_replicas = jnp.stack((probe - 0.1, probe + 0.1), axis=-1)
+    from src.delta_zsc.contrast import pairwise_contrasts_from_replicas
+
+    mask = jnp.ones_like(fit, dtype=jnp.bool_)
+    contrast = pairwise_contrasts_from_replicas(replicas, mask)
+    probe_contrast = pairwise_contrasts_from_replicas(
+        probe_replicas, jnp.ones_like(probe, dtype=jnp.bool_)
+    )
     return AnchorBatch(
         time_indexes=jnp.asarray([1, 2], dtype=jnp.int32),
         lane_indexes=jnp.asarray([0, 1], dtype=jnp.int32),
+        contrast_mean=contrast.mean,
+        contrast_standard_error=contrast.standard_error,
+        contrast_valid=contrast.valid,
+        probe_contrast_mean=probe_contrast.mean,
+        probe_contrast_standard_error=probe_contrast.standard_error,
+        probe_contrast_valid=probe_contrast.valid,
+        task_phase=jnp.zeros((2,), dtype=jnp.int32),
+        policy_version=jnp.asarray(0, dtype=jnp.int32),
         fit_returns_by_action=fit,
         evaluation_returns_by_action=fit,
-        measurement_covariances=jnp.broadcast_to(
-            jnp.eye(5, dtype=jnp.float32)[None] * 0.01, (2, 5, 5)
-        ),
         action_mask=jnp.ones_like(fit, dtype=jnp.bool_),
         fit_replica_returns_by_action=replicas,
         evaluation_replica_returns_by_action=replicas,
         probe_fit_returns_by_action=probe,
         probe_evaluation_returns_by_action=probe,
-        probe_measurement_covariances=jnp.broadcast_to(
-            jnp.eye(5, dtype=jnp.float32)[None, None] * 0.01,
-            (2, 6, 5, 5),
-        ),
         probe_action_mask=jnp.ones_like(probe, dtype=jnp.bool_),
         probe_fit_replica_returns_by_action=probe_replicas,
         probe_evaluation_replica_returns_by_action=probe_replicas,
@@ -126,7 +134,11 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
     import jax
 
     from src.delta_zsc.optimizer import init_adam
-    from src.delta_zsc.training import environment_minibatch_schedule, training_update
+    from src.delta_zsc.training import (
+        environment_minibatch_schedule,
+        init_latent_optimizer,
+        training_update,
+    )
 
     _, model, base, latent = _setup()
     batch = _batch(model, base, latent)
@@ -136,30 +148,71 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
         minibatches_per_epoch=1,
         update_epochs=1,
     )
-    updated_base, updated_latent, _, _, metrics = training_update(
+    (
+        updated_base,
+        updated_latent,
+        updated_target,
+        _,
+        _,
+        metrics,
+    ) = training_update(
         model=model,
         base_params=base,
         latent_params=latent,
+        target_latent_params=latent,
         base_optimizer_state=init_adam(base),
-        latent_optimizer_state=init_adam(latent),
+        latent_optimizer_state=init_latent_optimizer(latent),
         batch=batch,
         anchors=_anchors(),
         schedule=schedule,
         total_optimizer_steps=10,
     )
+    from src.delta_zsc.losses import DECISION_METRIC_NAMES
+
     assert not _same_tree(updated_base, base)
     assert not _same_tree(updated_latent, latent)
+    # The target moves, but by a fraction of the online step: it is a slow copy,
+    # not a second online critic.
+    assert not _same_tree(updated_target, latent)
+    import jax
+    import jax.numpy as jnp
+
+    def _distance(left, right):
+        leaves = jax.tree_util.tree_leaves(
+            jax.tree_util.tree_map(lambda a, b: jnp.sum(jnp.square(a - b)), left, right)
+        )
+        return float(jnp.sqrt(sum(leaves)))
+
+    assert _distance(updated_target, latent) < 0.5 * _distance(updated_latent, latent)
     assert float(metrics["ppo"]["base_update_applied"]) == 1.0
     assert float(metrics["latent"]["latent_update_applied"]) == 1.0
     assert np.isfinite(float(metrics["latent"]["latent_composite_nll"]))
-    assert float(metrics["latent"]["latent_decision_observations"]) == 2.0
-    assert float(
-        metrics["latent"]["latent_successor_decision_observations"]
-    ) == 12.0
-    # Full-tree channel pullbacks are intentionally excluded from the training
-    # transaction.  Exact semantic/decision alignment is computed report-only
-    # on the shared component embeddings in the final anchor audit.
-    assert float(metrics["latent"]["latent_gradient_alignment_available"]) == 0.0
+    # The raw-return critic trains inside this transaction on every step.
+    assert float(metrics["latent"]["raw_value_total"]) > 0.0
+
+    # The anchor contrast is a *separate* executable, applied by the caller
+    # after this one commits.  Keeping it out of this module is what makes the
+    # anchor path compile: fused, the two 256-step recurrent scans produced an
+    # HLO module XLA could not finish.
+    from src.delta_zsc.training import update_contrast_channel
+
+    calibrated, contrast_state, contrast_metrics = update_contrast_channel(
+        model=model,
+        latent_params=updated_latent,
+        base_params=updated_base,
+        optimizer_state=init_latent_optimizer(latent)["contrast"],
+        batch=batch,
+        anchors=_anchors(),
+    )
+    assert float(contrast_metrics["contrast_weight"]) > 0.0
+    assert float(contrast_metrics["latent_contrast_update_applied"]) == 1.0
+    # Only the critic moved; the response channels are untouched by it.
+    assert not _same_tree(calibrated["belief_value"], updated_latent["belief_value"])
+    assert _same_tree(calibrated["response"], updated_latent["response"])
+    # Every decision key is present whether or not the anchor channel fired, so
+    # accumulation across updates cannot silently drop the measured ones.
+    for name in DECISION_METRIC_NAMES:
+        assert name in metrics["latent"]
 
 
 
@@ -175,7 +228,7 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
         assert float(kwargs["base_params"]) == 0.0
         assert float(kwargs["latent_params"]) == 0.0
         events.append("latent")
-        return jnp.asarray(1.0), jnp.asarray(1.0), {
+        return jnp.asarray(1.0), jnp.asarray(1.0), jnp.asarray(1.0), {
             "latent_update_applied": jnp.asarray(1.0)
         }
 
@@ -196,6 +249,7 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
         model=object(),
         base_params=jnp.asarray(0.0),
         latent_params=jnp.asarray(0.0),
+        target_latent_params=jnp.asarray(0.0),
         base_optimizer_state=jnp.asarray(0.0),
         latent_optimizer_state=jnp.asarray(0.0),
         batch=object(),
@@ -204,7 +258,7 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
         total_optimizer_steps=1,
     )
     assert events == ["latent", "ppo"]
-    assert tuple(float(value) for value in result[:4]) == (1.0, 1.0, 1.0, 1.0)
+    assert tuple(float(value) for value in result[:5]) == (1.0, 1.0, 1.0, 1.0, 1.0)
 
 def test_response_only_variant_never_uses_decision_anchor_channel() -> None:
     import jax
@@ -219,8 +273,8 @@ def test_response_only_variant_never_uses_decision_anchor_channel() -> None:
             model, candidate, base, batch, anchors
         )
     )(latent)
-    assert float(result.metrics["latent_decision_observations"]) == 0.0
-    assert float(result.metrics["latent_successor_decision_observations"]) == 0.0
+    assert float(result.metrics["contrast_weight"]) == 0.0
+    assert float(result.metrics["raw_value_total"]) == 0.0
 
 
 def test_batched_base_policy_sequence_matches_step_replay() -> None:
@@ -366,16 +420,135 @@ def test_anchor_schema_contains_no_stale_posterior_or_comparator() -> None:
     assert set(AnchorBatch._fields) == {
         "time_indexes",
         "lane_indexes",
+        "contrast_mean",
+        "contrast_standard_error",
+        "contrast_valid",
+        "probe_contrast_mean",
+        "probe_contrast_standard_error",
+        "probe_contrast_valid",
+        "task_phase",
+        "policy_version",
         "fit_returns_by_action",
         "evaluation_returns_by_action",
-        "measurement_covariances",
         "action_mask",
         "fit_replica_returns_by_action",
         "evaluation_replica_returns_by_action",
         "probe_fit_returns_by_action",
         "probe_evaluation_returns_by_action",
-        "probe_measurement_covariances",
         "probe_action_mask",
         "probe_fit_replica_returns_by_action",
         "probe_evaluation_replica_returns_by_action",
     }
+
+
+def test_response_and_decision_channels_are_parameter_disjoint() -> None:
+    """The two latent channels must not be able to fight over a parameter.
+
+    This replaces the reported semantic/decision gradient cosine.  The decision
+    side is now the belief-conditioned critic, which reads the task features,
+    the instant partner encoding and the posterior stop-gradiented and does not
+    touch the component embeddings; the response side owns the embeddings and
+    the emissions.  Disjointness is therefore a structural fact, and a test is
+    the right place to keep it one -- wiring the critic into the embeddings
+    would silently reintroduce the coupling the audit used to have to measure.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.losses import (
+        latent_composite_loss,
+        pairwise_crn_contrast_loss,
+        raw_task_value_loss,
+    )
+
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
+    anchors = _anchors()
+
+    def decision_only(candidate):
+        _, output = model.sequence(
+            base,
+            candidate,
+            batch.initial_policy_state,
+            batch.observations,
+            batch.previous_actions,
+            batch.episode_starts,
+            compute_latent=True,
+            compute_decision=False,
+            execute_adaptation=False,
+        )
+        value, _ = raw_task_value_loss(model, candidate, output, batch)
+        contrast, _ = pairwise_crn_contrast_loss(candidate, output, anchors)
+        return value + contrast
+
+    gradients = jax.jit(jax.grad(decision_only))(latent)
+    for name in ("component_embeddings", "response", "probe_response"):
+        norm = float(
+            jnp.sqrt(
+                sum(
+                    jnp.sum(jnp.square(leaf))
+                    for leaf in jax.tree_util.tree_leaves(gradients[name])
+                )
+            )
+        )
+        assert norm == 0.0, f"{name} received decision-channel gradient {norm}"
+    critic_norm = float(
+        jnp.sqrt(
+            sum(
+                jnp.sum(jnp.square(leaf))
+                for leaf in jax.tree_util.tree_leaves(gradients["belief_value"])
+            )
+        )
+    )
+    assert critic_norm > 0.0
+
+    # And the converse: the full composite must still reach the critic, so the
+    # channel is genuinely part of the training transaction rather than an
+    # unreferenced head.
+    full = jax.jit(
+        jax.grad(lambda c: latent_composite_loss(model, c, base, batch, anchors).total)
+    )(latent)
+    full_critic = float(
+        jnp.sqrt(
+            sum(
+                jnp.sum(jnp.square(leaf))
+                for leaf in jax.tree_util.tree_leaves(full["belief_value"])
+            )
+        )
+    )
+    assert full_critic > 0.0
+
+
+def test_raw_value_channel_trains_without_any_anchor() -> None:
+    """The failure this replaces: 28 non-zero decision updates out of 3656.
+
+    The component head only entered the objective when an anchor batch existed.
+    The critic must receive gradient on an ordinary update that carries none.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.losses import latent_composite_loss
+
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
+    result = jax.jit(
+        lambda c: latent_composite_loss(model, c, base, batch, None)
+    )(latent)
+    assert float(result.metrics["raw_value_total"]) > 0.0
+    assert float(result.metrics["contrast_weight"]) == 0.0
+
+    gradients = jax.jit(
+        jax.grad(lambda c: latent_composite_loss(model, c, base, batch, None).total)
+    )(latent)
+    norm = float(
+        jnp.sqrt(
+            sum(
+                jnp.sum(jnp.square(leaf))
+                for leaf in jax.tree_util.tree_leaves(gradients["belief_value"])
+            )
+        )
+    )
+    assert norm > 0.0

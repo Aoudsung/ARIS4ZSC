@@ -91,7 +91,7 @@ def test_only_unified_workflow_is_active_and_method_identity_is_v4() -> None:
     assert Path("legacy/implementation_v8/.github/workflows/depi-ci.yml").is_file()
     from src.delta_zsc.config import METHOD_VERSION
 
-    assert METHOD_VERSION == "delta_episode_static_centered_residual_delayed_exact_voi_v4"
+    assert METHOD_VERSION == "delta_belief_conditioned_raw_return_pairwise_crn_v5"
 
 
 def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:

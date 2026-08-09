@@ -5,6 +5,13 @@ interface_event)`` exactly: two unavailable outcomes, two available/no-change
 outcomes, and sixty-two structured-change outcomes.  The posterior is valued
 with a probe-conditioned successor decision matrix, never the current-state
 matrix.
+
+Successor values may be supplied per probe (``[..., P, K, A]``) or per probe
+*and outcome* (``[..., P, 66, K, A]``).  The second form is what the successor
+feature model produces: a probe that reveals the teammate is idle and a probe
+that reveals it is plating do not leave the pair in the same place, and pricing
+both at one state charges the probe for its information while crediting it with
+none of its consequences.
 """
 
 from __future__ import annotations
@@ -32,10 +39,14 @@ def _validate_inputs(
     probes = int(event.shape[-3])
     if int(event.shape[-1]) != INTERFACE_EVENT_CLASSES:
         raise ValueError("Probe-response event support differs from 31 classes.")
-    expected = lead + (probes, components, means.shape[-1])
-    if tuple(means.shape) != expected:
+    outcomes = 4 + 2 * INTERFACE_EVENT_CLASSES
+    actions = int(means.shape[-1])
+    per_probe = lead + (probes, components, actions)
+    per_outcome = lead + (probes, outcomes, components, actions)
+    if tuple(means.shape) not in (per_probe, per_outcome):
         raise ValueError(
-            "DELTA v4 requires probe-conditioned successor decision means."
+            "Successor decision means must be probe-conditioned "
+            f"{per_probe} or probe-and-outcome-conditioned {per_outcome}."
         )
     shared_shape = lead + (probes,)
     for value in (
@@ -45,7 +56,7 @@ def _validate_inputs(
     ):
         if tuple(jnp.asarray(value).shape) != shared_shape:
             raise ValueError("Probe-response shared occurrence axes differ.")
-    return lead, components, probes, int(means.shape[-1])
+    return lead, components, probes, actions
 
 
 def compact_active_outcome_log_probabilities(
@@ -131,10 +142,23 @@ def myopic_value_of_information_details(
     outcome_probability = jnp.exp(outcome_logp)
     posterior = jnn.softmax(joint_logp, axis=-1)
     means = jnp.asarray(successor_decision_means, dtype=jnp.float32)
-    posterior_action_values = jnp.einsum(
-        "...pok,...pka->...poa", posterior, means
-    )
-    prior_action_values = jnp.einsum("...k,...pka->...pa", probability, means)
+    if means.ndim == posterior.ndim + 1:
+        # Per-outcome successor values.  Both terms integrate the same landing
+        # states; the only difference is whether the follow-up action is
+        # allowed to depend on the outcome.  That difference is precisely the
+        # value of the information, with the probe's displacement charged to
+        # both sides and therefore cancelling.
+        posterior_action_values = jnp.einsum(
+            "...pok,...poka->...poa", posterior, means
+        )
+        prior_action_values = jnp.einsum(
+            "...k,...poka,...po->...pa", probability, means, outcome_probability
+        )
+    else:
+        posterior_action_values = jnp.einsum(
+            "...pok,...pka->...poa", posterior, means
+        )
+        prior_action_values = jnp.einsum("...k,...pka->...pa", probability, means)
     prior_value = jnp.max(prior_action_values, axis=-1)
     posterior_value = jnp.max(posterior_action_values, axis=-1)
     expected_posterior_value = jnp.sum(

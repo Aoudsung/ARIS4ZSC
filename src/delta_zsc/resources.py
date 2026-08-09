@@ -94,13 +94,25 @@ def parameter_count(tree: Any) -> int:
 
 
 def peak_device_memory_bytes() -> int:
+    """Highest actual allocation across devices, in bytes.
+
+    ``peak_pool_bytes`` is deliberately not consulted.  It reports the size of
+    the arena XLA preallocated, which is ``XLA_PYTHON_CLIENT_MEM_FRACTION``
+    times the device and has nothing to do with what the run used: measured on
+    an L40, a formal-shaped deployment step reported 34,116 MiB by the pool and
+    1,038 MiB by actual use.  Since 0.75 x 46,068 MiB sits just under the
+    registered 40,000 MiB ceiling, reading the pool made that acceptance gate
+    pass on this hardware no matter what the run did -- and it would fail on a
+    larger card for no reason connected to the experiment.
+    """
+
     try:
         import jax
 
         values = []
         for device in jax.devices():
             stats = device.memory_stats() or {}
-            for key in ("peak_bytes_in_use", "peak_pool_bytes", "bytes_in_use"):
+            for key in ("peak_bytes_in_use", "bytes_in_use"):
                 if key in stats:
                     values.append(int(stats[key]))
         return max(values, default=0)

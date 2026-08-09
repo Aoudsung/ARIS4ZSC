@@ -20,9 +20,13 @@ from .behavior_statistics import (
     initial_behavior_statistics,
 )
 from .belief_filter import uniform_belief
-from .decision_model import successor_decision_predict
-from .latent_model import init_latent_params, observe_response, predict_decision
-from .mirror_policy import mirror_policy_logits
+from .belief_value import belief_value_predict
+from .latent_model import init_latent_params, observe_response
+from .mirror_policy import (
+    MIRROR_UNCERTAINTY_PENALTY,
+    mirror_policy_logits,
+    robust_mirror_policy_logits,
+)
 from .observation import (
     INTERFACE_EVENT_CLASSES,
     PARTNER_DIRECTION_CLASSES,
@@ -95,6 +99,133 @@ def _zero_decision(
             lead + (components, actions), dtype=jnp.float32
         ),
     )
+
+
+
+def component_action_values(
+    latent_params: Any,
+    task_features: Any,
+    instant_partner: Any,
+    behavior_features: Any,
+    policy_probabilities: Any,
+    component_count: int,
+) -> Any:
+    """``[..., K, A]`` action values, one per latent component.
+
+    The same trained critic evaluated at each one-hot posterior.  This is the
+    matrix VOI integrates against: "what would I do if I knew the mode were k?"
+    is a question about the belief-conditioned value, and asking a separately
+    parameterised component head was what left the decomposition unidentified.
+
+    The K rows share every parameter, so they are as distinguishable as the
+    posterior input makes them -- which is the honest amount, and is measurable
+    from the spread of these rows rather than assumed by construction.
+    """
+
+    import jax.numpy as jnp
+
+    from .belief_value import belief_value_predict
+
+    components = int(component_count)
+    lead = tuple(jnp.asarray(task_features).shape[:-1])
+    identity = jnp.broadcast_to(
+        jnp.eye(components, dtype=jnp.float32), lead + (components, components)
+    )
+
+    def spread(value: Any) -> Any:
+        value = jnp.asarray(value, dtype=jnp.float32)
+        return jnp.broadcast_to(
+            value[..., None, :], lead + (components, value.shape[-1])
+        )
+
+    prediction = belief_value_predict(
+        latent_params["belief_value"],
+        spread(task_features),
+        spread(instant_partner),
+        spread(behavior_features),
+        identity,
+        spread(policy_probabilities),
+    )
+    return prediction.advantage_mean, prediction.advantage_dispersion()
+
+
+
+def successor_action_values(
+    latent_params: Any,
+    task_features: Any,
+    instant_partner: Any,
+    behavior_features: Any,
+    belief: Any,
+    policy_probabilities: Any,
+    probe_prediction: Any,
+    component_count: int,
+    action_count: int,
+) -> Any:
+    """``[..., P, K, A]`` action values at the predicted ``t+2`` state.
+
+    For every candidate probe the successor model says where the pair lands and
+    the critic says what the actions are worth there, under each latent
+    component.  Pricing a probe at the *current* state instead charges it two
+    steps of delay and credits it with none of the position those steps buy.
+
+    The landing state is evaluated at the probe's expected delayed response
+    rather than once per enumerated outcome -- see
+    ``expected_outcome_encoding`` for what that approximates and what it does
+    not.  The posterior VOI prices is still integrated over all sixty-six
+    outcomes exactly.
+    """
+
+    import jax.numpy as jnp
+
+    from .belief_value import belief_value_predict
+    from .successor_feature import (
+        expected_outcome_encoding,
+        successor_feature_predict,
+    )
+
+    components = int(component_count)
+    probes = int(action_count)
+    lead = tuple(jnp.asarray(task_features).shape[:-1])
+    outcomes = expected_outcome_encoding(probe_prediction, belief)
+
+    def spread(value: Any) -> Any:
+        value = jnp.asarray(value, dtype=jnp.float32)
+        return jnp.broadcast_to(value[..., None, :], lead + (probes, value.shape[-1]))
+
+    probe_actions = jnp.broadcast_to(
+        jnp.arange(probes, dtype=jnp.int32), lead + (probes,)
+    )
+    successor = successor_feature_predict(
+        latent_params["successor_feature"],
+        spread(task_features),
+        spread(instant_partner),
+        spread(behavior_features),
+        spread(belief),
+        probe_actions,
+        outcomes,
+    )
+
+    identity = jnp.broadcast_to(
+        jnp.eye(components, dtype=jnp.float32),
+        lead + (probes, components, components),
+    )
+
+    def per_component(value: Any) -> Any:
+        value = jnp.asarray(value, dtype=jnp.float32)
+        return jnp.broadcast_to(
+            value[..., None, :], lead + (probes, components, value.shape[-1])
+        )
+
+    prediction = belief_value_predict(
+        latent_params["belief_value"],
+        per_component(successor.task_mean),
+        per_component(successor.instant_mean),
+        per_component(spread(behavior_features)),
+        identity,
+        per_component(spread(policy_probabilities)),
+    )
+    return prediction.advantage_mean
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,8 +374,8 @@ class DeltaModel:
 
         # The posterior is formed before the actor runs, because the actor now
         # reads it.  observe_response depends on nothing the base policy
-        # produces, so this ordering is available; predict_decision still runs
-        # after, since it consumes the actor's task and instant features.
+        # produces, so this ordering is available; the critic still runs after,
+        # since it consumes the actor's task and instant features.
         if not bool(compute_latent):
             # Execution modes without a latent pass (history_rnn, base, PPO
             # replay of those) have no posterior.  Feed the uninformative prior
@@ -309,13 +440,46 @@ class DeltaModel:
         lead = tuple(base_logits.shape[:-1])
         zero_action = jnp.zeros_like(base_logits, dtype=jnp.float32)
         if bool(compute_decision):
-            decision = predict_decision(latent_params, task, instant, next_behavior)
-            expected_values = jnp.sum(
-                next_belief[..., :, None] * decision.means, axis=-2
+            # Deployment improves against the belief-conditioned raw-return
+            # advantage, not the posterior-weighted component mixture.  Holding
+            # the component residuals at zero moved the fitted mixture NLL by
+            # 1.1%, so ``sum_k b_k mu_k`` was reporting a single shared function
+            # dressed as K of them; the advantage below is the quantity the
+            # trajectories and the CRN contrasts jointly identify.
+            critic = belief_value_predict(
+                latent_params["belief_value"],
+                task,
+                instant,
+                statistics,
+                next_belief,
+                jax.nn.softmax(base_logits, axis=-1),
+            )
+            expected_values = critic.advantage_mean
+            expected_dispersion = critic.advantage_dispersion()
+            # Component-conditional values come from the same critic under each
+            # one-hot posterior, so nothing downstream -- VOI, the intervention
+            # app, the audit -- reads a head the objective does not train.
+            component_means, component_spread = component_action_values(
+                latent_params,
+                task,
+                instant,
+                statistics,
+                jax.nn.softmax(base_logits, axis=-1),
+                components,
+            )
+            decision = DecisionPrediction(
+                means=component_means,
+                variances=jnp.square(component_spread),
+                shared_means=expected_values,
+                component_residuals=component_means - expected_values[..., None, :],
             )
         else:
             decision = _zero_decision(lead, components, self.action_count)
             expected_values = zero_action
+            expected_dispersion = zero_action
+            component_means = jnp.zeros(
+                lead + (components, self.action_count), dtype=jnp.float32
+            )
 
         probe_prediction = _zero_probe_response(
             lead, self.action_count, components
@@ -348,16 +512,26 @@ class DeltaModel:
                 stats,
                 actions,
             )
-            successor = successor_decision_predict(
-                latent_params["decision"],
-                latent_params["component_embeddings"],
+            # The successor value is taken not to depend on which probe was
+            # played, only on the posterior that probe's response induces --
+            # the bounded one-response local-stationarity surrogate in
+            # docs/THEORY.md.  VOI still differs across probes, because
+            # different probes induce different response distributions and so
+            # different posteriors.  Broadcasting here rather than relaxing the
+            # VOI shape contract keeps the surrogate visible at its call site.
+            successor_means = successor_action_values(
+                latent_params,
                 task,
                 instant,
                 statistics,
-                actions,
+                next_belief,
+                jax.nn.softmax(base_logits, axis=-1),
+                probe_prediction,
+                components,
+                self.action_count,
             )
             voi = myopic_value_of_information_details(
-                next_belief, probe_prediction, successor.means
+                next_belief, probe_prediction, successor_means
             )
             raw_voi = voi.value
             raw_information_gain = voi.expected_information_gain
@@ -371,10 +545,12 @@ class DeltaModel:
                 candidate_logits,
                 candidate_kl,
                 candidate_temperature,
-            ) = mirror_policy_logits(
+            ) = robust_mirror_policy_logits(
                 base_logits,
                 active_values,
+                expected_dispersion,
                 kl_budget=self.config.method.adaptation_kl_budget,
+                uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
             )
             active_lane = ~pending_continuation
             policy_logits = jnp.where(
@@ -406,10 +582,16 @@ class DeltaModel:
             # protocol, it just declines to re-probe.
             next_pending = active_lane
         elif bool(execute_adaptation) and variant == "delta_passive":
-            policy_logits, adaptation_kl, adaptation_temperature = mirror_policy_logits(
+            (
+                policy_logits,
+                adaptation_kl,
+                adaptation_temperature,
+            ) = robust_mirror_policy_logits(
                 base_logits,
                 action_values,
+                expected_dispersion,
                 kl_budget=self.config.method.adaptation_kl_budget,
+                uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
             )
         else:
             policy_logits = base_logits

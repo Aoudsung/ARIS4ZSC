@@ -1,4 +1,4 @@
-# ARCHITECTURE — DELTA-ZSC v4 equation-to-code map
+# ARCHITECTURE — DELTA-ZSC v5 equation-to-code map
 
 `authoritative: true`
 
@@ -12,7 +12,11 @@
 | episode-static prior and Bayes correction | `src/delta_zsc/belief_filter.py` |
 | shared occurrence / centered semantic emissions | `src/delta_zsc/response_model.py` |
 | unlabeled spectral-simplex artifact | `src/delta_zsc/semantic_initializer.py` |
-| current and successor decision emissions | `src/delta_zsc/decision_model.py` |
+| belief-conditioned raw-return value | `src/delta_zsc/belief_value.py` |
+| pairwise CRN action contrasts | `src/delta_zsc/contrast.py` |
+| two-step successor features | `src/delta_zsc/successor_feature.py` |
+| anchor world buffer | `src/delta_zsc/anchor_buffer.py` |
+| Official SP transplant | `src/delta_zsc/official_initializer.py` |
 | unified legal state transition | `src/delta_zsc/latent_model.py`, `model.py` |
 | exact delayed 66-outcome VOI | `src/delta_zsc/bayes_voi.py` |
 | analytic KL mirror policy | `src/delta_zsc/mirror_policy.py` |
@@ -25,7 +29,13 @@
 | one active CLI | `experiments/overcooked_v2/delta_zsc.py` |
 
 There is deliberately no active `transition.py`: physical-time latent dynamics
-were removed in v4.
+were removed in v4.  There is no active `decision_model.py` either: the
+component-wise Gaussian return mixture was removed in v5.  Holding its component
+residuals at zero moved the fitted training NLL by 1.1%, so the K component
+means were not identified by the data -- one shared function explained
+essentially the whole likelihood, and the ordering metrics it produced sat at
+chance.  What the trajectories do identify is the belief-conditioned marginal
+value, which `belief_value.py` models.
 
 ## 2. Parameter ownership
 
@@ -42,7 +52,7 @@ were removed in v4.
 - shared component embeddings;
 - immediate response model;
 - delayed probe-response model;
-- current and successor decision model.
+- belief-conditioned critic and successor feature model.
 
 The trees are disjoint and have separate Adam states. PPO receives a
 stop-gradient latent tree and executes `compute_latent=False`. The latent loss
@@ -72,8 +82,8 @@ future response, semantic initializer metadata, or decision anchor.
 4. shared and semantic response prediction;
 5. semantic-only Bayes correction;
 6. legal statistics update;
-7. current decision prediction;
-8. optional delayed probe-response and successor decision prediction;
+7. belief-conditioned action values;
+8. optional delayed probe-response and successor-state action values;
 9. exact VOI for `delta_active`;
 10. passive or active mirror policy;
 11. storage of the current observation for the next legal response.
@@ -101,18 +111,28 @@ Delayed semantic prediction contains the event head required by active VOI.
 
 ## 6. Decision topology
 
-Current decision:
+The decision side is one belief-conditioned critic in dueling form:
 
 ```text
-task features + instantaneous partner + behavior
-    -> shared trunk -> shared mean and shared variance
-shared trunk + component embedding
-    -> component trunk -> centered context residual
-component embedding -> direct mean residual skip
+task features + instantaneous partner + behavior + posterior
+    -> shared trunk -> state value
+                    -> E independent advantage heads
+advantage is centered under the acting policy; the ensemble spread is
+reported, never trained
 ```
 
-Successor decision adds a probe-action embedding and a separate shared/component
-trunk. Both return `[...,K,A]` means and shared component-broadcast variance.
+Component-conditional values are the same critic evaluated at each one-hot
+posterior, so `[...,K,A]` is a read-out rather than a separately parameterised
+head. Two channels train it, both on raw task reward so they estimate one
+quantity:
+
+- TD(lambda) on every rollout step, bootstrapping from a Polyak target copy;
+- precision-weighted regression of its action *differences* onto the measured
+  same-replica CRN contrasts, whenever an anchor batch exists.
+
+The successor model predicts the `t+2` features under a probe and its observed
+delayed response, so active VOI evaluates the critic where the decision is
+actually made rather than at the current state.
 
 ## 7. Training data alignment
 
@@ -163,7 +183,7 @@ These are compile-time paths, not learned gates.
 
 ## 10. Artifact and schema boundary
 
-- method: `delta_episode_static_centered_residual_delayed_exact_voi_v4`;
+- method: `delta_belief_conditioned_raw_return_pairwise_crn_v5`;
 - config schema: 3;
 - checkpoint schema: 4;
 - deployment bundle: 3;

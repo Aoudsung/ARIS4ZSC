@@ -175,13 +175,21 @@ def collect_rollout(
             ]
         )
         shaped_by_agent = info.get("official_shaped_rewards_by_agent")
-        shaped_reward = (
+        # Keep the unscaled Official shaping signal alongside the scaled one.
+        # The scaled value is the PPO reward and correctly decays to zero at the
+        # shaping horizon; the unscaled value is the task-stage event indicator
+        # (correct ingredient potted, cooking started, plate taken, correct dish
+        # taken out) and must survive the anneal, or anchor stage labelling goes
+        # blind for the entire second half of training.
+        unscaled_shaped_reward = (
             jnp.zeros_like(raw_reward)
             if shaped_by_agent is None
             else jnp.asarray(shaped_by_agent, dtype=jnp.float32)[
                 lanes, current.ego_roles
             ]
-            * jnp.asarray(official_shaping_factor, dtype=jnp.float32)
+        )
+        shaped_reward = unscaled_shaped_reward * jnp.asarray(
+            official_shaping_factor, dtype=jnp.float32
         )
         next_ego_state = observe_after_transition(
             stepped_ego, action=ego_action, done=done
@@ -220,6 +228,7 @@ def collect_rollout(
             "action": ego_action,
             "raw_reward": raw_reward,
             "shaped_reward": shaped_reward,
+            "unscaled_shaped_reward": unscaled_shaped_reward,
             "done": jnp.asarray(done, dtype=jnp.bool_),
             "old_log_probability": old_log_probability,
             "old_value": output.value,
@@ -417,6 +426,7 @@ def _make_training_rollout_kernel(
                 partner_state=select_lanes(state.partner_state, lane_indexes),
                 partner_episode_start=state.partner_episode_start[lane_indexes],
                 ego_roles=state.ego_roles[lane_indexes],
+                task_phase=jnp.zeros_like(lane_indexes, dtype=jnp.int32),
             )
             initial_carry: Any = (state, snapshots)
         else:
@@ -513,14 +523,16 @@ def _make_training_rollout_kernel(
                 ]
             )
             shaped_by_agent = info.get("official_shaped_rewards_by_agent")
-            shaped_reward = (
+            # See collect_rollout: the unscaled signal is the task-stage
+            # indicator and must not decay with the shaping anneal.
+            unscaled_shaped_reward = (
                 jnp.zeros_like(raw_reward)
                 if shaped_by_agent is None
                 else jnp.asarray(shaped_by_agent, dtype=jnp.float32)[
                     lanes, current.ego_roles
                 ]
-                * shaping
             )
+            shaped_reward = unscaled_shaped_reward * shaping
             next_ego_state = observe_after_transition(
                 stepped_ego, action=ego_action, done=done
             )
@@ -553,6 +565,7 @@ def _make_training_rollout_kernel(
                 ego_action,
                 raw_reward,
                 shaped_reward,
+                unscaled_shaped_reward,
                 jnp.asarray(done, dtype=jnp.bool_),
                 old_log_probability,
                 output.value,
@@ -578,6 +591,7 @@ def _make_training_rollout_kernel(
             actions,
             raw_rewards,
             shaped_rewards,
+            unscaled_shaped_rewards,
             dones,
             old_log_probabilities,
             old_values,
@@ -589,18 +603,32 @@ def _make_training_rollout_kernel(
             candidate_raw = raw_rewards[
                 final_snapshots.time_indexes, final_snapshots.lane_indexes
             ]
-            candidate_shaped = shaped_rewards[
+            # Unscaled: the scaled signal is identically zero after the
+            # shaping horizon, which blinded this labelling for the whole
+            # second half of a run.
+            candidate_shaped = unscaled_shaped_rewards[
                 final_snapshots.time_indexes, final_snapshots.lane_indexes
             ]
+            # The ego frame at each candidate, so the label describes the task
+            # situation rather than only whether a reward happened to fire.
+            candidate_frames = final_snapshots.observations[
+                jnp.arange(candidate_count), final_snapshots.ego_roles
+            ]
+            candidate_strata = anchor_task_strata(
+                candidate_raw, candidate_shaped, candidate_frames
+            )
             keep, _ = select_anchor_indexes(
                 jax.random.fold_in(snapshot_key, 7717),
                 time_count=candidate_count,
                 environment_count=1,
                 requested=snapshot_count,
-                strata=anchor_task_strata(candidate_raw, candidate_shaped),
+                strata=candidate_strata,
             )
             final_snapshots = jax.tree_util.tree_map(
                 lambda value: value[keep], final_snapshots
+            )
+            final_snapshots = final_snapshots._replace(
+                task_phase=candidate_strata[keep]
             )
         final_observation = final_state.joint_observations[
             lanes, final_state.ego_roles

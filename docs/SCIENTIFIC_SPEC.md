@@ -43,7 +43,7 @@ Deployment may use only:
 - deterministic behavior statistics computed from observable responses;
 - learned shared/semantic response models;
 - the episode-static categorical posterior;
-- learned current and successor decision emissions.
+- the learned belief-conditioned action value and successor feature model.
 
 Deployment may not use partner run ID, SP/OP label, checkpoint stage, training
 family, hidden simulator state, future observations, counterfactual returns, or

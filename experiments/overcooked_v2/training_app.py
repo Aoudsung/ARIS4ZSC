@@ -22,9 +22,13 @@ from src.delta_zsc.config import (
     OFFICIAL_ACTION_COUNT,
     load_config,
 )
+from src.delta_zsc.contrast import kendall_tau_b
+from src.delta_zsc.losses import DECISION_METRIC_NAMES, latent_composite_loss
+from src.delta_zsc.anchor_buffer import init_anchor_buffer
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.model import DeltaModel, observe_after_transition
 from src.delta_zsc.observation import INTERFACE_EVENT_CLASSES
+from src.delta_zsc.official_initializer import initialize_base_from_official
 from src.delta_zsc.optimizer import init_adam
 from src.delta_zsc.partners import build_training_partner_pool, make_static_partner_functions
 from src.delta_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
@@ -45,9 +49,10 @@ from src.delta_zsc.storage import (
     write_json,
 )
 from src.delta_zsc.training import (
-    component_embedding_channel_gradient_diagnostics,
     environment_minibatch_schedule,
+    init_latent_optimizer,
     make_training_update_kernel,
+    update_contrast_channel,
 )
 from src.delta_zsc.types import TrainState
 
@@ -488,15 +493,12 @@ def _final_decision_audit(
     lane = anchors.lane_indexes
     predicted = output.expected_decision_values[time, lane]
     target = anchors.evaluation_returns_by_action
-    predicted_order = jnp.argsort(jnp.argsort(predicted, axis=-1), axis=-1)
-    target_order = jnp.argsort(jnp.argsort(target, axis=-1), axis=-1)
-    centered_p = predicted_order - jnp.mean(predicted_order, axis=-1, keepdims=True)
-    centered_t = target_order - jnp.mean(target_order, axis=-1, keepdims=True)
-    spearman = jnp.sum(centered_p * centered_t, axis=-1) / jnp.sqrt(
-        jnp.sum(jnp.square(centered_p), axis=-1)
-        * jnp.sum(jnp.square(centered_t), axis=-1)
-        + 1.0e-8
-    )
+    # Kendall tau_b, not Spearman over argsort(argsort(...)).  Every anchor row
+    # of the pre-refactor measurement contained exact ties, and the double
+    # argsort was ranking equal values by index order -- so the reported
+    # correlation was partly an artefact of action numbering.  tau_b puts ties
+    # in the denominator instead of breaking them.
+    spearman = kendall_tau_b(predicted, target, jnp.ones_like(target, dtype=bool))
     chosen = jnp.argmax(predicted, axis=-1)
     oracle = jnp.argmax(target, axis=-1)
     rows = jnp.arange(chosen.shape[0])
@@ -584,7 +586,7 @@ def _final_decision_audit(
 
     return {
         "schema_version": 4,
-        "mean_spearman": float(jnp.mean(spearman)),
+        "mean_kendall_tau_b": float(jnp.mean(spearman)),
         "top_action_agreement": float(
             jnp.mean((chosen == oracle).astype(jnp.float32))
         ),
@@ -667,8 +669,10 @@ def _make_non_anchor_block_kernel(
         runner_state: Any,
         base_params: Any,
         latent_params: Any,
+        target_latent_params: Any,
         base_optimizer_state: Any,
         latent_optimizer_state: Any,
+        anchor_buffer: Any,
         start_update: Any,
         start_environment_steps: Any,
     ):
@@ -676,12 +680,20 @@ def _make_non_anchor_block_kernel(
             runner_state,
             base_params,
             latent_params,
+            target_latent_params,
             base_optimizer_state,
             latent_optimizer_state,
         )
 
         def one(carry: Any, offset: Any):
-            runner, base, latent, base_optimizer, latent_optimizer = carry
+            (
+                runner,
+                base,
+                latent,
+                target,
+                base_optimizer,
+                latent_optimizer,
+            ) = carry
             update_index = jnp.asarray(start_update, dtype=jnp.int32) + offset
             environment_steps = (
                 jnp.asarray(start_environment_steps, dtype=jnp.int32)
@@ -717,12 +729,14 @@ def _make_non_anchor_block_kernel(
             (
                 base,
                 latent,
+                target,
                 base_optimizer,
                 latent_optimizer,
                 metrics,
             ) = update_kernel(
                 base,
                 latent,
+                target,
                 base_optimizer,
                 latent_optimizer,
                 batch,
@@ -732,13 +746,17 @@ def _make_non_anchor_block_kernel(
                 runner,
                 base,
                 latent,
+                target,
                 base_optimizer,
                 latent_optimizer,
             ), metrics
 
-        return jax.lax.scan(
+        core, metrics = jax.lax.scan(
             one, initial, jnp.arange(length, dtype=jnp.int32)
         )
+        # Anchor-free blocks never touch the buffer; it rides through so both
+        # kernels return the same state tuple.
+        return core + (anchor_buffer,), metrics
 
     return kernel
 
@@ -756,19 +774,36 @@ def _make_anchor_update_kernel(
     minibatches_per_epoch: int,
     update_epochs: int,
     gamma: float,
+    fresh_states: int,
+    replay_states: int,
+    model: Any,
 ) -> Any:
     """Compile snapshot rollout, CRN continuations, and update as one kernel."""
 
     import jax
     import jax.numpy as jnp
 
-    @jax.jit
+    from src.delta_zsc.anchor_buffer import (
+        merge_snapshots,
+        push_anchor_buffer,
+        sample_anchor_worlds,
+    )
+
+    # Deliberately *not* jitted as a whole.  The rollout, the anchor batch and
+    # the training update are each already a compiled executable; wrapping them
+    # in one more jit makes XLA compile their union as a single HLO module, and
+    # that module's backend compilation was measured at over thirty-five
+    # minutes -- against five and a half minutes for the entire equivalent v4
+    # run.  Composing the three compiled kernels from the host instead costs a
+    # couple of round-trips on the one update in ~130 that carries an anchor.
     def kernel(
         runner_state: Any,
         base_params: Any,
         latent_params: Any,
+        target_latent_params: Any,
         base_optimizer_state: Any,
         latent_optimizer_state: Any,
+        anchor_buffer: Any,
         update_index: Any,
         environment_steps: Any,
     ):
@@ -796,40 +831,79 @@ def _make_anchor_update_kernel(
             curriculum,
             index_key,
         )
+        # Replay reuses the *search* for separable worlds, never a measurement:
+        # every continuation below is re-run from the stored world with the
+        # parameters in force now.
+        measured = snapshots
+        if replay_states:
+            replay_key, root_key = jax.random.split(root_key)
+            drawn, drawn_version = sample_anchor_worlds(
+                anchor_buffer, replay_key, replay_states
+            )
+            measured = merge_snapshots(snapshots, drawn, fresh_states)
+            del drawn_version
         anchors = anchor_kernel(
             root_key,
-            snapshots,
+            measured,
             base_params,
             latent_params,
             jnp.asarray(gamma, dtype=jnp.float32),
         )
+        next_buffer = anchor_buffer
+        if replay_states:
+            next_buffer = push_anchor_buffer(anchor_buffer, snapshots, update_index)
         schedule = environment_minibatch_schedule(
             jax.random.fold_in(loop_key, update_index),
             environment_count=environment_count,
             minibatches_per_epoch=minibatches_per_epoch,
             update_epochs=update_epochs,
         )
+        # The ordinary (anchor-free) update module runs first -- the same
+        # executable the other ~129 updates in every 130 use, so this is a
+        # compilation-cache hit -- and the anchor calibration is applied after
+        # it as its own small module.  Fusing the two put two 256-step
+        # recurrent scans in one HLO module that XLA could not finish
+        # compiling.
         (
             base_params,
             latent_params,
+            target_latent_params,
             base_optimizer_state,
             latent_optimizer_state,
             metrics,
         ) = update_kernel(
             base_params,
             latent_params,
+            target_latent_params,
             base_optimizer_state,
             latent_optimizer_state,
             batch,
-            anchors,
             schedule,
         )
+        latent_params, contrast_state, contrast_metrics = update_contrast_channel(
+            model=model,
+            latent_params=latent_params,
+            base_params=base_params,
+            optimizer_state=latent_optimizer_state["contrast"],
+            batch=batch,
+            anchors=anchors,
+        )
+        latent_optimizer_state = {
+            **latent_optimizer_state,
+            "contrast": contrast_state,
+        }
+        metrics = {
+            **metrics,
+            "latent": {**metrics["latent"], **contrast_metrics},
+        }
         return (
             runner,
             base_params,
             latent_params,
+            target_latent_params,
             base_optimizer_state,
             latent_optimizer_state,
+            next_buffer,
         ), metrics
 
     return kernel
@@ -937,8 +1011,14 @@ def run_training(args: argparse.Namespace) -> None:
     base_params, latent_params = model.init_parameters(
         init_key, semantic_initializer=semantic_initializer
     )
+    sp_initializer = getattr(args, "sp_initializer", None)
+    if sp_initializer:
+        base_params = initialize_base_from_official(base_params, sp_initializer)
     base_optimizer_state = init_adam(base_params)
-    latent_optimizer_state = init_adam(latent_params)
+    latent_optimizer_state = init_latent_optimizer(latent_params)
+    # The target starts as an exact copy: at update zero the slow critic and
+    # the online critic are the same estimate, and Polyak separates them.
+    target_latent_params = jax.tree_util.tree_map(jnp.asarray, latent_params)
     runner = initialize_runner(
         environment=environment,
         model=model,
@@ -950,6 +1030,7 @@ def run_training(args: argparse.Namespace) -> None:
         "stage": "train",
         "method": METHOD_VERSION,
         "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "sp_initializer": str(sp_initializer) if sp_initializer else None,
         "ego_run_id": str(args.ego_run_id),
         "seed_index": int(args.seed_index),
         "run_kind": config.run_kind,
@@ -995,8 +1076,11 @@ def run_training(args: argparse.Namespace) -> None:
     state = TrainState(
         base_params=base_params,
         latent_params=latent_params,
+        target_latent_params=target_latent_params,
         base_optimizer_state=base_optimizer_state,
         latent_optimizer_state=latent_optimizer_state,
+        # Filled once the snapshot kernel exists and its shapes are known.
+        anchor_buffer=None,
         runner_state=runner,
         update_count=jnp.asarray(0, dtype=jnp.int32),
         effective_environment_steps=jnp.asarray(0, dtype=jnp.int32),
@@ -1082,7 +1166,9 @@ def run_training(args: argparse.Namespace) -> None:
             partner_functions=partner_functions,
             partner_parameters=partner_parameters,
             length=config.training.rollout_length,
-            states_per_trigger=config.anchors.states_per_trigger,
+            # The rollout produces the wide pilot candidate set; the anchor
+            # kernel is what narrows it to the measured states.
+            states_per_trigger=config.anchors.pilot_states,
         )
         compiled_anchor_batch = make_anchor_batch_kernel(
             functions=anchor_functions,
@@ -1091,11 +1177,15 @@ def run_training(args: argparse.Namespace) -> None:
             evaluation_replicas=config.anchors.evaluation_replicas,
             horizon=config.method.continuation_horizon,
             collect_successor=(config.method_variant == "delta_active"),
+            states_per_trigger=config.anchors.states_per_trigger,
+            pilot_replicas=config.anchors.pilot_replicas,
         )
+        # Deliberately the anchor-free kernel: see the comment in
+        # _make_anchor_update_kernel.
         with_anchor_update_kernel = make_training_update_kernel(
             model=model,
             total_optimizer_steps=total_optimizer_steps,
-            with_anchors=True,
+            with_anchors=False,
         )
         anchor_update_kernel = _make_anchor_update_kernel(
             rollout_kernel=anchor_rollout_kernel,
@@ -1109,7 +1199,34 @@ def run_training(args: argparse.Namespace) -> None:
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
             gamma=config.ppo.gamma,
+            fresh_states=(
+                config.anchors.pilot_states - config.anchors.replay_states
+            ),
+            replay_states=config.anchors.replay_states,
+            model=model,
         )
+        if config.anchors.replay_states:
+            # Shapes only: eval_shape traces the snapshot kernel without
+            # running a rollout, so the buffer is allocated from the real
+            # structure rather than a hand-copied one that could drift.
+            structure = jax.eval_shape(
+                anchor_rollout_kernel,
+                state.runner_state,
+                state.base_params,
+                state.latent_params,
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jnp.asarray(0.0, dtype=jnp.float32),
+                jax.random.PRNGKey(0),
+            )[2]
+            state = state._replace(
+                anchor_buffer=init_anchor_buffer(
+                    jax.tree_util.tree_map(
+                        lambda leaf: jnp.zeros(leaf.shape, dtype=leaf.dtype),
+                        structure,
+                    ),
+                    config.anchors.buffer_triggers,
+                )
+            )
         anchor_replicas = (
             config.anchors.fit_replicas + config.anchors.evaluation_replicas
         )
@@ -1131,7 +1248,15 @@ def run_training(args: argparse.Namespace) -> None:
                     * config.method.continuation_horizon
                 )
             )
-        anchor_steps_per_trigger = current_anchor_steps + successor_anchor_steps
+        pilot_anchor_steps = (
+            config.anchors.pilot_states
+            * OFFICIAL_ACTION_COUNT
+            * config.anchors.pilot_replicas
+            * config.method.continuation_horizon
+        )
+        anchor_steps_per_trigger = (
+            pilot_anchor_steps + current_anchor_steps + successor_anchor_steps
+        )
 
     def is_anchor_update(update_index: int) -> bool:
         return bool(
@@ -1269,8 +1394,10 @@ def run_training(args: argparse.Namespace) -> None:
                 state.runner_state,
                 state.base_params,
                 state.latent_params,
+                state.target_latent_params,
                 state.base_optimizer_state,
                 state.latent_optimizer_state,
+                state.anchor_buffer,
                 update,
                 host_environment_steps,
             )
@@ -1296,8 +1423,10 @@ def run_training(args: argparse.Namespace) -> None:
                 state.runner_state,
                 state.base_params,
                 state.latent_params,
+                state.target_latent_params,
                 state.base_optimizer_state,
                 state.latent_optimizer_state,
+                state.anchor_buffer,
                 update,
                 host_environment_steps,
             )
@@ -1307,8 +1436,10 @@ def run_training(args: argparse.Namespace) -> None:
             runner,
             base_params,
             latent_params,
+            target_latent_params,
             base_optimizer_state,
             latent_optimizer_state,
+            anchor_buffer,
         ) = core
         next_update = update + count
         next_steps = host_environment_steps + count * rollout_steps
@@ -1319,8 +1450,10 @@ def run_training(args: argparse.Namespace) -> None:
         state = TrainState(
             base_params=base_params,
             latent_params=latent_params,
+            target_latent_params=target_latent_params,
             base_optimizer_state=base_optimizer_state,
             latent_optimizer_state=latent_optimizer_state,
+            anchor_buffer=anchor_buffer,
             runner_state=runner,
             update_count=next_update,
             effective_environment_steps=next_steps,
@@ -1413,17 +1546,22 @@ def run_training(args: argparse.Namespace) -> None:
             state.latent_params,
             jnp.asarray(config.ppo.gamma, dtype=jnp.float32),
         )
-        gradient_alignment = jax.jit(
-            lambda latent, base: component_embedding_channel_gradient_diagnostics(
-                model=model,
-                latent_params=latent,
-                base_params=base,
-                batch=audit_batch,
-                anchors=audit_anchors,
-            )
+        # Decision-side audit on a freshly measured anchor batch.  The oracle
+        # entries are computed against the evaluation replicas, which no loss
+        # reads, and ``anchor_oracle_repeatability`` bounds every other ordering
+        # number in this file: when the fit and evaluation halves of the same
+        # anchor disagree about the best action, nothing measured against the
+        # fit half is skill.
+        decision_audit = jax.jit(
+            lambda latent, base: {
+                name: latent_composite_loss(
+                    model, latent, base, audit_batch, audit_anchors
+                ).metrics[name]
+                for name in DECISION_METRIC_NAMES
+            }
         )(state.latent_params, state.base_params)
-        gradient_alignment = jax.tree_util.tree_map(
-            jax.block_until_ready, gradient_alignment
+        decision_audit = jax.tree_util.tree_map(
+            jax.block_until_ready, decision_audit
         )
         audit_replicas = (
             config.anchors.fit_replicas + config.anchors.evaluation_replicas
@@ -1446,8 +1584,15 @@ def run_training(args: argparse.Namespace) -> None:
                     * config.method.continuation_horizon
                 )
             )
+        audit_pilot_steps = (
+            config.anchors.pilot_states
+            * OFFICIAL_ACTION_COUNT
+            * config.anchors.pilot_replicas
+            * config.method.continuation_horizon
+        )
         audit_steps = (
             config.environment.num_envs * config.training.rollout_length
+            + audit_pilot_steps
             + audit_current_steps
             + audit_successor_steps
         )
@@ -1474,9 +1619,7 @@ def run_training(args: argparse.Namespace) -> None:
                     batch=audit_batch,
                     anchors=audit_anchors,
                 ),
-                "component_embedding_gradient_alignment": _host_converted(
-                    gradient_alignment
-                ),
+                "decision_channel": _host_converted(decision_audit),
                 "environment_steps": final_environment_steps,
             },
         )

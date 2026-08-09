@@ -178,11 +178,20 @@ fails conditions 2 and 4.
 
 ## 14. Approximation boundary
 
-v4 is not a full Bayes-adaptive POMDP solver. The delayed head predicts one
-reaction window, and successor decision values integrate one registered base
-bridge plus the horizon-`H` continuation. VOI values only the first decision at
-`t+2` after that response, and its incremental control contribution is
-discounted by `gamma^2`. It does not recursively price all future information.
+v5 is not a full Bayes-adaptive POMDP solver. The delayed head predicts one
+reaction window, and successor values integrate one registered base bridge plus
+the horizon-`H` continuation. VOI values only the first decision at `t+2` after
+that response, and its incremental control contribution is discounted by
+`gamma^2`. It does not recursively price all future information.
+
+The successor state entering VOI is a *learned prediction*
+`chi(x_t, b_t, a_t, y)` of the `t+2` encoder features, not the simulated world.
+Its error is therefore method error, and it is reported rather than assumed
+away: the audit records the successor model's held-out feature error against
+the "nothing moves in two steps" identity baseline, and the gap between the
+critic evaluated at the predicted landing state and at the realised one. A
+successor model that cannot beat the identity baseline contributes nothing that
+VOI could use, and the reported numbers say so directly.
 
 The method also assumes the episode-static latent is an adequate summary of
 partner-relevant convention uncertainty. Continuous within-partner adaptation
@@ -196,7 +205,9 @@ The implementation does not prove:
 - recovery of partner identity or training algorithm;
 - unique latent semantics;
 - calibrated posterior from entropy alone;
-- real-return improvement from mirror adaptation without accurate values;
+- real-return improvement from mirror adaptation without accurate values --
+  the same-world mirror improvement against the held-out anchor replicas is the
+  measurement that bears on this, and it is a reported diagnostic, not a claim;
 - SOTA performance without formal frozen matrices;
 - exact long-horizon active planning;
 - independence of behavior statistics from partner history.

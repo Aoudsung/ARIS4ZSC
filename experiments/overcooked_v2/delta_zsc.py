@@ -61,6 +61,15 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--resume", action="store_true")
     train.add_argument("--require-cuda", action="store_true")
     train.add_argument("--semantic-initializer")
+    train.add_argument(
+        "--sp-initializer",
+        help=(
+            "Official SP checkpoint directory whose task encoder, recurrent "
+            "cell and heads initialise base_params. The instantaneous partner "
+            "and posterior input rows start at zero, so training begins from a "
+            "policy numerically identical to that checkpoint."
+        ),
+    )
     train.set_defaults(function=run_training)
 
     preflight = commands.add_parser("cuda-preflight")
@@ -69,6 +78,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--seed-index", type=int, default=-1)
     preflight.add_argument("--output", required=True)
     preflight.add_argument("--semantic-initializer")
+    preflight.add_argument("--sp-initializer")
     preflight.set_defaults(function=run_cuda_preflight)
 
     policy_manifest = commands.add_parser("build-policy-manifest")

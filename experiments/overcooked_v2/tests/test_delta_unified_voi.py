@@ -89,7 +89,7 @@ def test_probe_conditioned_successor_utility_is_required_and_jittable() -> None:
     assert value.shape == (1, 2)
     assert bool(jnp.all(jnp.isfinite(value)))
     assert float(jnp.max(value) - jnp.min(value)) > 1.0e-3
-    with pytest.raises(ValueError, match="probe-conditioned successor"):
+    with pytest.raises(ValueError, match="must be probe-conditioned"):
         myopic_value_of_information_details(
             jnp.asarray([[0.5, 0.5]]),
             prediction,

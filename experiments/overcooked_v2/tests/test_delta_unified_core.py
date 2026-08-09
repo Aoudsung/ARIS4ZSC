@@ -45,17 +45,27 @@ def test_all_registered_configs_load_and_method_has_three_fields() -> None:
         }
 
 
-def test_action_contrast_basis_is_orthonormal_and_offset_invariant() -> None:
+def test_pairwise_contrasts_are_offset_invariant() -> None:
+    """What replaced the orthonormal contrast basis.
+
+    The basis existed to give the five-dimensional Gaussian decision likelihood
+    an offset-invariant coordinate system.  The target is now the action
+    differences themselves, which carry that invariance directly.
+    """
+
     import jax.numpy as jnp
 
-    from src.delta_zsc.decision_model import action_contrast_matrix
+    from src.delta_zsc.contrast import pairwise_contrasts_from_replicas
 
-    basis = np.asarray(action_contrast_matrix(6))
-    np.testing.assert_allclose(basis.T @ basis, np.eye(5), atol=1e-6)
-    np.testing.assert_allclose(np.ones(6) @ basis, 0.0, atol=1e-6)
-    values = jnp.asarray([[1, 2, 3, 4, 5, 6]], dtype=jnp.float32)
+    replicas = jnp.asarray([[[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]])
+    mask = jnp.ones((1, 3), dtype=bool)
+    base = pairwise_contrasts_from_replicas(replicas, mask)
+    shifted = pairwise_contrasts_from_replicas(replicas + 100.0, mask)
     np.testing.assert_allclose(
-        np.asarray(values @ basis), np.asarray((values + 100.0) @ basis), atol=1e-5
+        np.asarray(base.mean), np.asarray(shifted.mean), atol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(base.mean)[0, 1, 0], 1.0, atol=1e-6
     )
 
 
@@ -176,10 +186,15 @@ def test_decision_parameters_cannot_change_online_belief() -> None:
     state = observe_after_transition(
         state, action=jnp.asarray([0, 1]), done=jnp.asarray([False, False])
     )
+    # Neither decision-side head may touch the posterior: the belief is formed
+    # from the response likelihood alone, and a critic or successor model that
+    # could move it would be reading its own training signal back into the
+    # filter.
     changed = dict(latent)
-    changed["decision"] = jax.tree_util.tree_map(
-        lambda value: value + 10.0, latent["decision"]
-    )
+    for name in ("belief_value", "successor_feature"):
+        changed[name] = jax.tree_util.tree_map(
+            lambda value: value + 10.0, latent[name]
+        )
     _, original = model.step(base, latent, state, observation)
     _, modified = model.step(base, changed, state, observation)
     np.testing.assert_allclose(
@@ -187,16 +202,16 @@ def test_decision_parameters_cannot_change_online_belief() -> None:
     )
 
 
-def test_v4_response_and_decision_residuals_are_component_centered() -> None:
+def test_response_and_component_value_residuals_are_centered() -> None:
+    """Component axes carry contrast only; the shared level lives elsewhere."""
+
     import jax
     import jax.numpy as jnp
 
-    from src.delta_zsc.decision_model import decision_predict, successor_decision_predict
+    from src.delta_zsc.model import DeltaModel, component_action_values
     from src.delta_zsc.response_model import response_predict
 
     config = _small_config("delta_active")
-    from src.delta_zsc.model import DeltaModel
-
     model = DeltaModel(config, (5, 5, 39), 6)
     _, latent = model.init_parameters(jax.random.PRNGKey(81))
     frame = jnp.zeros((2, 5, 5, 39), dtype=jnp.float32)
@@ -211,42 +226,22 @@ def test_v4_response_and_decision_residuals_are_component_centered() -> None:
     np.testing.assert_allclose(
         np.asarray(jnp.sum(event_residual, axis=-2)), 0.0, atol=2.0e-6
     )
-    decision = decision_predict(
-        latent["decision"],
-        latent["component_embeddings"],
+
+    policy = jnp.full((2, 6), 1.0 / 6.0)
+    means, spread = component_action_values(
+        latent,
         jnp.zeros((2, 16), dtype=jnp.float32),
         jnp.zeros((2, 8), dtype=jnp.float32),
         behavior,
+        policy,
+        4,
     )
+    assert means.shape == (2, 4, 6)
+    assert spread.shape == (2, 4, 6)
+    # Each component's action values are centred under the acting policy, so
+    # the component axis cannot smuggle in a state-level offset.
     np.testing.assert_allclose(
-        np.asarray(jnp.sum(decision.component_residuals, axis=-2)),
-        0.0,
-        atol=2.0e-6,
-    )
-    np.testing.assert_allclose(
-        np.asarray(jnp.sum(decision.component_residuals, axis=-1)),
-        0.0,
-        atol=2.0e-6,
-    )
-    np.testing.assert_allclose(
-        np.asarray(decision.variances),
-        np.asarray(jnp.broadcast_to(decision.variances[..., :1, :], decision.variances.shape)),
-        atol=1.0e-6,
-    )
-    probes = jnp.broadcast_to(jnp.arange(6, dtype=jnp.int32), (2, 6))
-    successor = successor_decision_predict(
-        latent["decision"],
-        latent["component_embeddings"],
-        jnp.zeros((2, 16), dtype=jnp.float32),
-        jnp.zeros((2, 8), dtype=jnp.float32),
-        behavior,
-        probes,
-    )
-    assert successor.means.shape == (2, 6, 4, 6)
-    np.testing.assert_allclose(
-        np.asarray(jnp.sum(successor.component_residuals, axis=-2)),
-        0.0,
-        atol=2.0e-6,
+        np.asarray(jnp.sum(means * policy[:, None, :], axis=-1)), 0.0, atol=1.0e-5
     )
 
 

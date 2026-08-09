@@ -12,11 +12,8 @@ from typing import Any
 
 from .behavior_statistics import behavior_features, update_behavior_statistics
 from .belief_filter import episode_static_prior, filter_update
-from .decision_model import (
-    decision_predict,
-    init_decision_params,
-    successor_decision_predict,
-)
+from .belief_value import init_belief_value_params
+from .successor_feature import init_successor_feature_params
 from .nn import tree_stop_gradient
 from .observation import extract_response_target
 from .response_model import (
@@ -41,12 +38,13 @@ def init_latent_params(
     action_count: int,
     action_embedding_dim: int,
     hidden_dim: int,
+    value_ensemble_size: int = 4,
     semantic_event_bias: Any | None = None,
 ) -> dict[str, Any]:
     import jax
     import jax.numpy as jnp
 
-    keys = jax.random.split(key, 4)
+    keys = jax.random.split(key, 6)
     ingredient_count = (int(observation_shape[-1]) - 27) // 4
     inventory_factor_count = ingredient_count + 2
     return {
@@ -76,15 +74,26 @@ def init_latent_params(
             hidden_dim=hidden_dim,
             semantic_event_bias=semantic_event_bias,
         ),
-        "decision": init_decision_params(
-            keys[3],
+        "belief_value": init_belief_value_params(
+            keys[4],
             task_dim=task_dim,
             instant_dim=instant_dim,
             behavior_dim=behavior_dim,
-            component_embedding_dim=component_embedding_dim,
-            action_embedding_dim=action_embedding_dim,
+            component_count=component_count,
             hidden_dim=hidden_dim,
             action_count=action_count,
+            ensemble_size=value_ensemble_size,
+        ),
+        "successor_feature": init_successor_feature_params(
+            keys[5],
+            task_dim=task_dim,
+            instant_dim=instant_dim,
+            behavior_dim=behavior_dim,
+            component_count=component_count,
+            action_count=action_count,
+            action_embedding_dim=action_embedding_dim,
+            hidden_dim=hidden_dim,
+            ensemble_size=value_ensemble_size,
         ),
     }
 
@@ -140,57 +149,8 @@ def observe_response(
     )
 
 
-def predict_decision(
-    params: dict[str, Any],
-    task_features: Any,
-    instant_partner: Any,
-    statistics: Any,
-) -> Any:
-    return decision_predict(
-        params["decision"],
-        params["component_embeddings"],
-        tree_stop_gradient(task_features),
-        tree_stop_gradient(instant_partner),
-        behavior_features(statistics),
-    )
-
-
-def predict_successor_decision(
-    params: dict[str, Any],
-    task_features: Any,
-    instant_partner: Any,
-    statistics: Any,
-    probe_actions: Any,
-) -> Any:
-    return successor_decision_predict(
-        params["decision"],
-        params["component_embeddings"],
-        tree_stop_gradient(task_features),
-        tree_stop_gradient(instant_partner),
-        behavior_features(statistics),
-        probe_actions,
-    )
-
-
-def predict_probe_response(
-    params: dict[str, Any],
-    frame: Any,
-    statistics: Any,
-    probe_actions: Any,
-) -> Any:
-    return probe_response_predict(
-        params["probe_response"],
-        params["component_embeddings"],
-        frame,
-        behavior_features(statistics),
-        probe_actions,
-    )
-
-
 __all__ = [
     "init_latent_params",
     "observe_response",
-    "predict_decision",
     "predict_probe_response",
-    "predict_successor_decision",
 ]

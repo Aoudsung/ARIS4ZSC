@@ -180,37 +180,85 @@ If no semantic factor is observed, every `ell_sem_t(k)=0` and the posterior is
 unchanged. Shared occurrence factors are excluded exactly, not approximately.
 Decision and delayed-probe observations never update online belief.
 
-## 10. Current decision emission
+## 10. Belief-conditioned action value
 
-Each component predicts centered all-action returns using
-
-\[
-\mu_k(x)=\mu_0(x)+\Delta\mu_k(x),\qquad
-\sum_k\Delta\mu_k(x)=0.
-\]
-
-Both the shared mean and residual are centered across actions. Model variance
-is predicted once by the shared branch and broadcast across components, so a
-component cannot win the mixture by altering only its uncertainty.
-
-Action returns are scored in the orthonormal five-dimensional Helmert contrast
-subspace. The Gaussian covariance is the projected shared model variance plus
-the full CRN measurement covariance.
-
-## 11. Probe-conditioned successor decision emission
-
-For each forced probe `a`, a second decision head predicts
+The decision side estimates one quantity: the raw-return action value under the
+current posterior,
 
 \[
-\mu^a_k(a')
+Q_\psi(x_t,b_t,a)=V_\psi(x_t,b_t)+A_\psi(x_t,b_t,a),\qquad
+\sum_a \pi_0(a\mid x_t,b_t)\,A_\psi(x_t,b_t,a)=0.
 \]
 
-for every candidate decision action `a'` at `t+2`. Its input is the legal
-pre-probe state and a learned probe-action embedding. It integrates the probe
-transition and one unforced collection-time-base bridge, after which the
-delayed response is observable.
+The value head carries the state's level and the advantage carries only the
+action contrast the mirror step consumes. `E` advantage heads share a trunk and
+differ in initialisation; their spread is *reported*, never fitted, because a
+variance the objective can shrink measures nothing.
 
-The CRN target is constructed as follows:
+Component-conditional values are the same function at each one-hot posterior,
+\(Q_\psi(x_t,e_k,\cdot)\). There is no separately parameterised component head.
+The previous formulation predicted `K` centered component means under a Gaussian
+mixture likelihood; measured with frozen parameters, holding both residual
+branches at zero changed the fitted training NLL by 0.082 of 7.55, so the
+decomposition was not identified by the data. Each anchor observes one real
+partner's return vector, never `K` of them, and no cross-component paired
+counterfactual exists to recover it from.
+
+Two channels train \(\psi\), both on raw task reward so that they estimate the
+same quantity:
+
+1. **TD(lambda) on every rollout step.** Every step supplies
+   \((x_t,b_t,a_t,r_t,x_{t+1},b_{t+1})\). The bootstrap comes from a Polyak
+   target copy \(\bar\psi \leftarrow \tau\psi + (1-\tau)\bar\psi\), so the
+   critic the mirror reads does not chase its own estimation noise. Shaped
+   reward is excluded: the PPO critic keeps it because it is training task
+   competence, but this target must match the anchor contrasts, which accumulate
+   raw reward.
+2. **Pairwise CRN contrast calibration.** See section 11.
+
+## 11. Pairwise CRN action contrasts
+
+The anchor target is the same-replica action *difference*
+
+\[
+\hat\Delta_{ab}=\tfrac1R\sum_r\bigl(G^{(r)}_a-G^{(r)}_b\bigr),
+\]
+
+with the standard error of that difference. Replica `r` of action `a` and
+replica `r` of action `b` share one CRN draw, so the partner, the environment
+noise and the continuation draw cancel before averaging.
+
+Estimating `A` means separately and letting a density explain the vector could
+not separate best from second best on a single anchor: median best-second margin
+0.0004 against median replica standard error 0.0031, no anchor above two
+standard errors, and an exact tie in every row -- so `argmax` was picking a
+winner by index order.
+
+Contrasts enter as a precision-weighted regression on the critic's predicted
+differences. The weight is \(1/(\sigma^2_{ab}+\bar\sigma^2)\) where
+\(\bar\sigma^2\) is the batch's mean contrast variance. Plain inverse-variance
+weighting is wrong here: under CRN, two actions whose continuations re-merge
+give bit-identical returns and therefore zero sample variance, which would hand
+"these two actions are exactly equal" near-unbounded weight. Adding the pooled
+variance bounds the weight above, leaves well-measured pairs at
+\(1/\sigma^2_{ab}\) asymptotically, and introduces no tunable constant.
+
+Nothing is thresholded away. Unresolvable pairs still train "these two actions
+are close", which is the honest content of the measurement.
+
+## 11a. Two-tier anchor measurement
+
+Every candidate world receives a cheap low-replica pilot pass; only the states
+whose largest pairwise SNR is highest are measured at the registered replica
+budget. Selection is on the pilot's own replicas and the retained states are
+measured again under fresh keys, so the contrasts that reach the loss are not
+the ones that won the selection. What selection biases is which states the
+decision head trains on -- deliberately, as the task-stage stratification also
+does -- not the value measured at them.
+
+## 11b. Probe-conditioned successor state
+
+For each forced probe `a`, the CRN target is constructed as follows:
 
 1. clone the sparse pre-action world;
 2. force probe `a` using matched randomness across probe alternatives;
@@ -222,9 +270,37 @@ The CRN target is constructed as follows:
 6. continue for `H` reward-bearing steps under the base policy;
 7. split fit and evaluation replicas before scoring.
 
-Probe and post-response decision actions are traversed by nested `jax.lax.map`, so only
-`anchor_count x replica_count` worlds are live at once. The estimator is the
-same full `A x A` matrix without the materialized `A^2` memory multiplier.
+Probe and post-response decision actions are traversed by nested `jax.lax.map`,
+so only `anchor_count x replica_count` worlds are live at once.
+
+Alongside this, a learned successor model predicts the `t+2` encoder features
+
+\[
+\chi(x_t,b_t,a_t,y)\;\longrightarrow\;(\text{task},\ \text{instant})_{t+2},
+\]
+
+conditioned on the delayed response outcome `y`. It is supervised by the
+encoder's own `t+2` features, taken stop-gradiented, and by the critic's TD
+target at that state. Active VOI then evaluates \(Q_\psi\) at the predicted
+landing state rather than at the current one: pricing a probe at the current
+state charges it two steps of delay and credits it with none of the position
+those steps buy.
+
+**Registered approximation.** The model is trained on the *observed* `y`, but at
+VOI time the successor is evaluated once per probe at the expected outcome
+\(\bar y_a = E[y \mid a]\), not once per enumerated outcome:
+
+\[
+E_y\bigl[Q_\psi(\chi(y))\bigr]\;\approx\;Q_\psi(\chi(\bar y_a)).
+\]
+
+Enumerating a landing state per outcome means a
+`[time, lane, probe, 66, component]` tensor -- 52 million critic rows at the
+registered formal shape, tens of gigabytes, which the final audit materialises
+across every timestep. The quantity is well defined; the materialisation is
+not. What the approximation assumes is that the landing state varies smoothly
+in the response, **not** that the response is unimportant: the posterior VOI
+prices is still integrated over all sixty-six outcomes exactly.
 
 ## 12. Delayed probe-response emission
 
@@ -340,7 +416,7 @@ but never added to control reward.
 - `base`: shared PPO task policy only;
 - `response_only`: shared/semantic immediate response prediction and legal
   posterior, no decision adaptation;
-- `delta_passive`: current decision emission and passive mirror adaptation;
+- `delta_passive`: belief-conditioned critic and passive robust mirror adaptation;
 - `delta_active`: all v4 channels, successor decision, and delayed exact VOI.
 
 Only `K`, `H`, and `delta` are registered scientific method fields. Network

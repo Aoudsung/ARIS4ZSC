@@ -5,7 +5,7 @@ OvercookedV2 Test-Time Protocol Formation benchmark.
 
 Active identity:
 
-- `METHOD_VERSION = delta_episode_static_centered_residual_delayed_exact_voi_v4`
+- `METHOD_VERSION = delta_belief_conditioned_raw_return_pairwise_crn_v5`
 - `CONFIG_VERSION = 3`
 - `CHECKPOINT_SCHEMA_VERSION = 4`
 - `MANIFEST_VERSION = 2`
