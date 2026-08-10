@@ -6,8 +6,9 @@ Date: 2026-08-10
 
 This report validates source contracts for
 `delta_belief_conditioned_raw_return_pairwise_crn_v5` and the implemented
-`test_time_wide` workflow. It does not claim benchmark performance. Earlier
-CUDA pilots are not v5 evidence.
+config-selected workflow, including descriptive development execution on
+`test_time_wide` and `grounded_coord_ring`. It does not claim benchmark
+performance. Earlier CUDA pilots are not v5 evidence.
 
 ## Artifact identity
 
@@ -33,7 +34,7 @@ not a substitute for the real CUDA execution.
 `validation/run_contract_validation.sh` covers:
 
 - active source compilation and Python 3.10 grammar compatibility;
-- all seven registered configurations across both layouts;
+- all nine registered configurations across the supported layouts;
 - the root CLI and all 19 subcommand help paths;
 - workflow parsing and the single active namespace;
 - absence of active retired implementation imports and identifiers;
@@ -44,11 +45,11 @@ not a substitute for the real CUDA execution.
 ### Isolated pytest regression
 
 `validation/run_all_isolated_tests.py` runs every top-level test in a fresh,
-bounded CPU process. The final run completed in 328.753525 seconds:
+bounded CPU process. The final run completed in 545.621862 seconds:
 
-- discovered: 82;
-- executed: 82;
-- passed: 82;
+- discovered: 83;
+- executed: 83;
+- passed: 83;
 - failed: 0;
 - timed out: 0.
 
@@ -58,19 +59,19 @@ Per-file distribution:
 |---|---:|
 | `test_delta_belief_value.py` | 19 |
 | `test_delta_unified_cli.py` | 4 |
-| `test_delta_unified_core.py` | 15 |
+| `test_delta_unified_core.py` | 16 |
 | `test_delta_unified_manifest.py` | 4 |
 | `test_delta_unified_repository.py` | 7 |
 | `test_delta_unified_runner_storage.py` | 6 |
 | `test_delta_unified_training.py` | 12 |
 | `test_delta_unified_voi.py` | 4 |
 | `test_delta_v4_semantics.py` | 11 |
-| **Total** | **82** |
+| **Total** | **83** |
 
 The machine-readable per-test record is
 `validation/ISOLATED_TEST_RESULTS.json`.
 
-## `test_time_wide` layout contracts established locally
+## Layout contracts and development execution
 
 The executed tests and static checks establish:
 
@@ -116,6 +117,20 @@ contains 800 unique raw-return rows. Means were 24.625 (`base`), -2.825
 `delta_active-base=(-14.60, -34.05)`. Active DELTA improved on response-only in
 both seeds, but both semantic arms remained below base. These are descriptive
 development observations, not H1/H2/H3 or SOTA evidence.
+
+The same fixed execution path completed a `grounded_coord_ring` pilot with a
+new ten-run Official SP population, six development-support parents, two
+calibration parents and two held-out parents. The first engineering attempt
+exposed an Official logging callback that requires a local CPU device under
+CUDA-only execution; reusing the existing callback-disable context fixed that
+boundary, and the preserved second attempt completed all checkpoints. The six
+development runs and matched-key evaluations produced 800 finite rows per arm.
+Means were -5.700 (`base`), -26.775 (`response_only`) and -4.938
+(`delta_active`). Paired seed differences were
+`delta_active-response_only=(16.91, 26.76)`,
+`response_only-base=(-34.73, -7.43)` and
+`delta_active-base=(-17.81, 19.34)`. This is also descriptive two-seed evidence;
+it did not run `delta_passive` and therefore does not establish H2.
 
 ## Exact-VOI synthetic acceptance
 

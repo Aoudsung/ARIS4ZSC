@@ -307,13 +307,18 @@ full H1/H2/H3 or SOTA.
 ## Validation boundary
 
 Local regression and synthetic diagnostics establish implementation contracts,
-not benchmark performance. v5 has completed one two-seed, SP-only development
-pilot on the `test_time_wide` layout. In the final-code rerun,
-`delta_active-response_only` was +1.35 and +4.90 across the two seeds, while
-`response_only-base` was -15.95 and -38.95 and `delta_active-base` was -14.60
-and -34.05. The pilot did not include `delta_passive`, so it is not registered
-H2 or a paper population matrix. The formal ten-seed protocol across both
-layouts has not been run, so H1/H2/H3 and SOTA remain unestablished.
+not benchmark performance. v5 has completed two two-seed, SP-only development
+pilots through the same config-selected path. On `test_time_wide`, the
+final-code paired differences were
+`delta_active-response_only=(1.35, 4.90)`,
+`response_only-base=(-15.95, -38.95)` and
+`delta_active-base=(-14.60, -34.05)`. On `grounded_coord_ring`, the
+corresponding differences were `delta_active-response_only=(16.91, 26.76)`,
+`response_only-base=(-34.73, -7.43)` and
+`delta_active-base=(-17.81, 19.34)`. Neither pilot included `delta_passive`, so
+neither is registered H2 or a paper population matrix. The formal ten-seed
+protocol across both registered layouts has not been run, so H1/H2/H3 and SOTA
+remain unestablished.
 
 See:
 
