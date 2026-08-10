@@ -27,9 +27,9 @@ artifacts and executable regression evidence. The active identity is
 | Partner panel disjointness | `manifest.py`, `delta_manifest_app.py` | support, calibration, development coverage, confirmatory | manifest construction and lineage tests |
 | Seed-index SP initialization | `official_initializer.py`, `development_matrix_app.py` | seed `s` maps to support `run-s/ckpt_final` | SP transplant and 55-command matrix tests |
 | Exact development budget | `development_matrix_app._anchor_budget` | pilot + current + successor transitions | passive/active/extra-budget tests |
-| Initializer collector layout configs | `delta_unified_{wide,grounded_coord_ring}_initializer_collector.yaml` | development protocol, base variant, anchors disabled | nine-config contract test |
+| Initializer collector layout configs | `delta_unified_{wide,grounded_coord_ring}_initializer_collector.yaml` | development protocol, base variant, anchors disabled | ten-config contract test |
 | Formal seed discipline | `training_app.run_training`, `run_cuda_preflight` | formal `0..9`; engineering `-1` only in preflight | CLI/training entry tests |
-| Formal execution shape | `config.FORMAL_NUM_ENVS`, `training_app.py` | 256 lanes and peak memory below 40,000 MiB | config and formal-entry tests; real CUDA execution pending |
+| Formal execution shape | `config.FORMAL_NUM_ENVS`, `training_app.py` | 128 lanes and peak memory below 40,000 MiB | config and formal-entry tests; real CUDA execution pending |
 | Official upstream assets | `upstream_app.py`, `upstream_pipeline_app.py` | config-selected layout, preassigned roots, support/panels/baselines/FCP lineage | CLI and repository registration; server execution pending |
 | Policy manifest v2 | `baseline_app.py`, `evaluation_app.build_policy_manifest` | ordered run paths plus parent/co-training lineage | manifest/evaluation CLI tests |
 | Paper population evaluator | `evaluation_app._run_population_matrix` | directed `(10,10,500)`, root 42 | population statistics and CLI tests |
