@@ -1,6 +1,6 @@
 {
   "artifact_schema_version": 3,
-  "artifact_name": "DELTA-ZSC v5 Wide experiment source package",
+  "artifact_name": "DELTA-ZSC v5 experiment source package",
   "created_date": "2026-08-09",
   "source_repository": "Aoudsung/ARIS4ZSC",
   "source_branch": "zsc_v8",
@@ -22,19 +22,19 @@
     "value_clamp": false
   },
   "local_validation": {
-    "date": "2026-08-09",
+    "date": "2026-08-10",
     "python": "3.13.1",
     "jax": "0.4.38",
     "numpy": "2.5.1",
     "backend": "cpu",
     "test_files": 9,
-    "tests_discovered": 82,
-    "tests_executed": 82,
-    "tests_passed": 82,
+    "tests_discovered": 83,
+    "tests_executed": 83,
+    "tests_passed": 83,
     "tests_failed": 0,
     "tests_timed_out": 0,
     "compile": "passed",
-    "registered_configs_loaded": 7,
+    "registered_configs_loaded": 9,
     "cli_subcommands_smoked": 19,
     "workflow_yaml": "passed",
     "namespace_audit": "passed",
@@ -44,7 +44,7 @@
     "python_3_10_grammar": "passed",
     "dependency_lock_alignment": "passed",
     "local_absolute_path_scan": "passed",
-    "tests_duration_seconds": 324.950409,
+    "tests_duration_seconds": 545.621862,
     "isolated_test_result_complete": true
   },
   "scientific_execution_status": {

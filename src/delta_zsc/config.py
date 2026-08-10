@@ -54,6 +54,7 @@ OFFICIAL_UPDATE_EPOCHS = 4
 
 RUN_KINDS = ("mechanical", "development", "formal")
 LAYOUTS = ("test_time_simple", "test_time_wide")
+SUPPORTED_LAYOUTS = (*LAYOUTS, "grounded_coord_ring")
 METHOD_VARIANTS = (
     "history_rnn",
     "base",
@@ -383,7 +384,7 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError(f"method_variant must be one of {METHOD_VARIANTS}.")
     if config.run_kind == "formal" and config.method_variant != "delta_active":
         raise ValueError("The confirmatory method is DELTA-active.")
-    if config.environment.layout not in LAYOUTS:
+    if config.environment.layout not in SUPPORTED_LAYOUTS:
         raise ValueError("Unknown OvercookedV2 layout.")
     if config.environment.agent_view_size != 2:
         raise ValueError("Official protocol uses view radius two.")
@@ -582,6 +583,7 @@ __all__ = [
     "FORMAL_NUM_ENVS",
     "FORMAL_PEAK_MEMORY_LIMIT_BYTES",
     "LAYOUTS",
+    "SUPPORTED_LAYOUTS",
     "MANIFEST_VERSION",
     "METHOD_VARIANTS",
     "METHOD_VERSION",

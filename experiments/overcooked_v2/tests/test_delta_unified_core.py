@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 from pathlib import Path
 
@@ -29,12 +30,12 @@ def _small_config(variant: str = "delta_active"):
 
 
 def test_all_registered_configs_load_and_method_has_three_fields() -> None:
-    from src.delta_zsc.config import load_config
+    from src.delta_zsc.config import LAYOUTS, SUPPORTED_LAYOUTS, load_config
 
     files = sorted(
         Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml")
     )
-    assert len(files) == 7
+    assert len(files) == 9
     for path in files:
         kind = path.stem.rsplit("_", 1)[-1]
         if kind == "collector":
@@ -45,6 +46,49 @@ def test_all_registered_configs_load_and_method_has_three_fields() -> None:
             "continuation_horizon",
             "adaptation_kl_budget",
         }
+
+    ring = load_config(
+        Path(
+            "experiments/overcooked_v2/configs/"
+            "delta_unified_grounded_coord_ring_development.yaml"
+        ),
+        run_kind="development",
+    )
+    assert ring.environment.layout == "grounded_coord_ring"
+    assert ring.environment.indicate_successful_delivery is True
+    assert ring.environment.layout in SUPPORTED_LAYOUTS
+    assert ring.environment.layout not in LAYOUTS
+
+
+def test_official_training_wraps_the_official_entrypoint_callbacks() -> None:
+    source = Path("experiments/overcooked_v2/official_training.py").read_text()
+    module = ast.parse(source)
+    main = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "main"
+    )
+    callback_contexts = [
+        node
+        for node in ast.walk(main)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id
+            == "_cuda_only_official_debug_callbacks_disabled"
+            for item in node.items
+        )
+    ]
+    assert len(callback_contexts) == 1
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "official_main"
+        and node.func.attr == "main"
+        for node in ast.walk(callback_contexts[0])
+    )
 
 
 def test_pairwise_contrasts_are_offset_invariant() -> None:

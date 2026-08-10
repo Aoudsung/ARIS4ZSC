@@ -7,11 +7,11 @@ Official; only the copied config metadata is normalized to JSON-like strings
 at the storage boundary.
 
 The Official entrypoint also vmaps every population member resident on one GPU
-at once.  The registered ten-run Wide population does not fit on an L40 in that
-form.  This wrapper keeps the one root-key split and the Official train
-function unchanged, but scans population members in batches of one run per
-visible device.  This is an execution-layout change only: run order, PRNG keys,
-budgets, parameters and checkpoint selection are identical.
+at once.  A ten-run Official population does not fit on an L40 in that form.
+This wrapper keeps the one root-key split and the Official train function
+unchanged, but scans population members in batches of one run per visible
+device.  This is an execution-layout change only: run order, PRNG keys, budgets,
+parameters and checkpoint selection are identical.
 
 Two Official modules reach the storage boundary and each holds its own
 module-level reference to ``store_checkpoint``: ``ppo.main`` for the SP/OP/FCP
@@ -26,6 +26,10 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 from typing import Any
+
+from experiments.overcooked_v2.official_adapter import (
+    _cuda_only_official_debug_callbacks_disabled,
+)
 
 
 def _paths_as_strings(value: Any) -> Any:
@@ -117,7 +121,8 @@ def main() -> None:
     official_main.store_checkpoint = store_checkpoint
     official_run.mini_batch_pmap = _memory_bounded_population_map
     official_state_sample.store_checkpoint = store_checkpoint
-    official_main.main()
+    with _cuda_only_official_debug_callbacks_disabled():
+        official_main.main()
 
 
 if __name__ == "__main__":

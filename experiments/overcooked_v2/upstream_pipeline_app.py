@@ -209,6 +209,7 @@ def _run_official_population(
             "experiments.overcooked_v2.official_training",
             f"+experiment={experiment}",
             f"+env={layout}",
+            "++env.ENV_KWARGS.indicate_successful_delivery=true",
             f"SEED={int(root_seed)}",
             f"NUM_CHECKPOINTS={int(checkpoint_count)}",
             "VISUALIZE=false",

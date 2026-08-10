@@ -281,6 +281,11 @@ and uses 256 formal environments. Exact without-replacement anchor selection
 uses a bounded-state Floyd sampler, so the registered 256-lane shape no longer
 requires a full 65,536-element random sort on L40 hardware.
 
+`grounded_coord_ring` uses the same config-selected execution path and its
+Official `5x5x39` local observation. It is available for descriptive
+development experiments; the registered formal claim remains defined on
+`test_time_simple` and `test_time_wide`.
+
 `run-upstream` reads the layout from its config and constructs the support, calibration,
 development-coverage, confirmatory, baseline and FCP-source populations with
 preassigned root seeds and lineage records. Development and formal seed `s`

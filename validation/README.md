@@ -28,7 +28,7 @@ Run:
 bash validation/run_contract_validation.sh
 ```
 
-It checks active-source compilation, Python 3.10 grammar, seven registered
+It checks active-source compilation, Python 3.10 grammar, nine registered
 configs, the root CLI and 19 subcommands, workflow parsing, namespace and
 dependency contracts, credential/local-path scans, source formatting and the
 deterministic 66-outcome delayed-VOI diagnostic.

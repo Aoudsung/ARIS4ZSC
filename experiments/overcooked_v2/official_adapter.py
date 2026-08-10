@@ -26,6 +26,7 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from src.delta_zsc.config import (
+    SUPPORTED_LAYOUTS,
     OFFICIAL_CORRECT_DELIVERY_REWARD,
     OFFICIAL_NUM_MINIBATCHES,
     OFFICIAL_OP_NUM_ENVS,
@@ -337,7 +338,7 @@ def compose_official_baseline_config(
 
     if method not in OFFICIAL_BASELINE_EXPERIMENTS:
         raise ValueError(f"Unknown Official baseline method: {method}")
-    if layout not in {"test_time_simple", "test_time_wide"}:
+    if layout not in SUPPORTED_LAYOUTS:
         raise ValueError(f"Unknown Official layout: {layout}")
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -345,6 +346,7 @@ def compose_official_baseline_config(
     overrides = [
         f"+experiment={OFFICIAL_BASELINE_EXPERIMENTS[method]}",
         f"+env={layout}",
+        "++env.ENV_KWARGS.indicate_successful_delivery=true",
         f"SEED={OFFICIAL_TRAINING_ROOT_SEED}",
         "NUM_CHECKPOINTS=1",
         "VISUALIZE=false",
