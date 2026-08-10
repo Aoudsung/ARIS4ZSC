@@ -132,7 +132,7 @@ The `test_time_wide` implementation now includes:
 - uniform registered partner sampling for the complete training run;
 - exact development extra-budget accounting including pilot continuations;
 - a seed-index SP initializer mapping shared by paired variants;
-- the registered 256-environment formal shape and exact bounded-state Floyd
+- the 128-environment formal shape and exact bounded-state Floyd
   anchor sampling that removes the prior L40 full-sort compile blocker;
 - formal seed `0..9` enforcement with `-1` reserved for the CUDA engineering
   command;

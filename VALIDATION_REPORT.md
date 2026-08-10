@@ -34,7 +34,7 @@ not a substitute for the real CUDA execution.
 `validation/run_contract_validation.sh` covers:
 
 - active source compilation and Python 3.10 grammar compatibility;
-- all nine registered configurations across the supported layouts;
+- all ten registered configurations across the supported layouts;
 - the root CLI and all 19 subcommand help paths;
 - workflow parsing and the single active namespace;
 - absence of active retired implementation imports and identifiers;
@@ -45,11 +45,11 @@ not a substitute for the real CUDA execution.
 ### Isolated pytest regression
 
 `validation/run_all_isolated_tests.py` runs every top-level test in a fresh,
-bounded CPU process. The final run completed in 545.621862 seconds:
+bounded CPU process. The final run completed in 316.511451 seconds:
 
-- discovered: 83;
-- executed: 83;
-- passed: 83;
+- discovered: 84;
+- executed: 84;
+- passed: 84;
 - failed: 0;
 - timed out: 0.
 
@@ -58,7 +58,7 @@ Per-file distribution:
 | Test file | Count |
 |---|---:|
 | `test_delta_belief_value.py` | 19 |
-| `test_delta_unified_cli.py` | 4 |
+| `test_delta_unified_cli.py` | 5 |
 | `test_delta_unified_core.py` | 16 |
 | `test_delta_unified_manifest.py` | 4 |
 | `test_delta_unified_repository.py` | 7 |
@@ -66,7 +66,7 @@ Per-file distribution:
 | `test_delta_unified_training.py` | 12 |
 | `test_delta_unified_voi.py` | 4 |
 | `test_delta_v4_semantics.py` | 11 |
-| **Total** | **83** |
+| **Total** | **84** |
 
 The machine-readable per-test record is
 `validation/ISOLATED_TEST_RESULTS.json`.
@@ -85,7 +85,7 @@ The executed tests and static checks establish:
   SP initializer shared by every paired variant;
 - ordinary formal training accepts exactly seed indexes `0..9`, while the CUDA
   engineering command alone may use `-1`;
-- formal shape uses 256 environments and Floyd exact without-replacement
+- formal shape uses 128 environments and Floyd exact without-replacement
   anchor selection;
 - calibration, development coverage and confirmatory parent/co-training
   lineages are disjoint at the manifest boundary;
@@ -155,7 +155,7 @@ The following remain server work and are not represented as passed:
    FCP populations for the `test_time_wide` layout;
 2. the full fitted K=2/4/8 semantic-initializer set for that layout beyond the
    pilot K=4 artifact;
-3. real 256-lane CUDA compilation, memory and throughput on the target L40;
+3. real 128-lane CUDA compilation, memory and throughput on the target L40;
 4. the 55-run development matrix for the `test_time_wide` layout;
 5. ten final DELTA deployments for that layout;
 6. five paper population cubes and six common-partner matrices;

@@ -275,16 +275,18 @@ intervention, baselines, resource accounting, and claim assembly.
 
 ## Layout-selected execution
 
-The `test_time_wide` layout reads the Official `5x5x43` local observation, samples the
-registered support manifest uniformly over mechanism, family, stage and run,
-and uses 256 formal environments. Exact without-replacement anchor selection
-uses a bounded-state Floyd sampler, so the registered 256-lane shape no longer
-requires a full 65,536-element random sort on L40 hardware.
+The `test_time_wide` layout reads the Official `5x5x43` local observation and samples
+the registered support manifest uniformly over mechanism, family, stage and run.
+DELTA formal training uses 128 environments with 256-step rollouts. Exact
+without-replacement anchor selection uses a bounded-state Floyd sampler, so the
+formal shape does not require a full random sort over the rollout grid on L40
+hardware.
 
 `grounded_coord_ring` uses the same config-selected execution path and its
 Official `5x5x39` local observation. It is available for descriptive
-development experiments; the registered formal claim remains defined on
-`test_time_simple` and `test_time_wide`.
+development experiments and paper-compatible population evaluation; the
+registered full H1/H2/H3 claim remains defined on `test_time_simple` and
+`test_time_wide`.
 
 `run-upstream` reads the layout from its config and constructs the support, calibration,
 development-coverage, confirmatory, baseline and FCP-source populations with

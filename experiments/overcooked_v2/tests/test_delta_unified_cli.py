@@ -36,6 +36,47 @@ def test_population_statistics_use_diagonal_and_ordered_off_diagonal_rows() -> N
     assert observed["gap_point"] == 16.5
 
 
+def test_delta_only_population_summary_uses_layout_paper_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import experiments.overcooked_v2.evaluation_app as evaluation_app
+
+    cube = np.full((10, 10, 500), 2.0, dtype=np.float64)
+    for index in range(10):
+        cube[index, index] = 10.0
+
+    monkeypatch.setattr(
+        evaluation_app,
+        "_validated_population_cube",
+        lambda unused_directory, method: (
+            {
+                "layout": "grounded_coord_ring",
+                "root_seed": 42,
+                "method": method,
+            },
+            cube,
+            {(0, 0, 0): (1, 2)},
+        ),
+    )
+    output = tmp_path / "paper-comparison"
+    evaluation_app.summarize_population_matrices(
+        SimpleNamespace(
+            evaluation=[f"delta-active={tmp_path / 'delta-evaluation'}"],
+            output=str(output),
+        )
+    )
+
+    summary = read_json(output / "population_matrix_summary.json")
+    rows = {row["method"]: row for row in summary["methods"]}
+    assert summary["comparison_mode"] == "paper_reference"
+    assert summary["evaluated_methods"] == ["delta-active"]
+    assert rows["fcp"]["paper_xp_verbatim"] == "6±46"
+    assert rows["fcp"]["reproduced_xp_point"] is None
+    assert rows["delta-active"]["reproduced_sp_point"] == 10.0
+    assert rows["delta-active"]["reproduced_xp_point"] == 2.0
+    assert rows["delta-active"]["reproduced_gap_point"] == 8.0
+
+
 def _partner_row(checkpoint: Path, index: int) -> dict:
     return {
         "run_id": f"partner-{index}",

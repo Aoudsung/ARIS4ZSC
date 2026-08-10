@@ -35,7 +35,7 @@ def test_all_registered_configs_load_and_method_has_three_fields() -> None:
     files = sorted(
         Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml")
     )
-    assert len(files) == 9
+    assert len(files) == 10
     for path in files:
         kind = path.stem.rsplit("_", 1)[-1]
         if kind == "collector":
@@ -58,6 +58,17 @@ def test_all_registered_configs_load_and_method_has_three_fields() -> None:
     assert ring.environment.indicate_successful_delivery is True
     assert ring.environment.layout in SUPPORTED_LAYOUTS
     assert ring.environment.layout not in LAYOUTS
+
+    ring_formal = load_config(
+        Path(
+            "experiments/overcooked_v2/configs/"
+            "delta_unified_grounded_coord_ring_formal.yaml"
+        ),
+        run_kind="formal",
+    )
+    assert ring_formal.environment.layout == "grounded_coord_ring"
+    assert ring_formal.environment.num_envs == 128
+    assert ring_formal.evaluation.episodes_per_pairing == 500
 
 
 def test_official_training_wraps_the_official_entrypoint_callbacks() -> None:

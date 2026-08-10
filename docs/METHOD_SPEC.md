@@ -261,7 +261,7 @@ does -- not the value measured at them.
 
 Candidate indexes are drawn exactly without replacement by Floyd sampling.
 Its state scales with the requested anchor count rather than the full
-`rollout_length x environment_count` grid. At the formal `256x256` shape this
+`rollout_length x environment_count` grid. At the formal `256x128` shape this
 avoids the full random sort that exceeded the L40 shared-memory limit while
 preserving the same uniform subset distribution.
 
@@ -304,7 +304,7 @@ E_y\bigl[Q_\psi(\chi(y))\bigr]\;\approx\;Q_\psi(\chi(\bar y_a)).
 \]
 
 Enumerating a landing state per outcome means a
-`[time, lane, probe, 66, component]` tensor -- 52 million critic rows at the
+`[time, lane, probe, 66, component]` tensor -- 26 million critic rows at the
 registered formal shape, tens of gigabytes, which the final audit materialises
 across every timestep. The quantity is well defined; the materialisation is
 not. What the approximation assumes is that the landing state varies smoothly
@@ -440,7 +440,7 @@ and run for the complete run; observed performance never changes those
 probabilities. Formal seed `s in 0..9` initializes the base policy from
 development-support SP parent `s`. Development seed `s in 0..4` uses the same
 mapping, and every variant at that seed receives the same parent parameters.
-The initializer collector and the 256-lane CUDA engineering run use parent 0.
+The initializer collector and the 128-lane CUDA engineering run use parent 0.
 
 These paths and their parent/co-training lineage are recorded in run identity.
 They do not become deployment inputs. The upstream jobs, initializer,

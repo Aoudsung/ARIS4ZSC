@@ -601,7 +601,7 @@ def select_anchor_indexes(
         # Floyd's exact without-replacement sampler uses O(requested) state.
         # ``jax.random.choice(..., replace=False)`` lowers to a full random
         # sort over ``time_count * environment_count``.  At the registered
-        # 256x256 formal shape that sort requested 128 KiB of block shared
+        # former 256x256 formal shape that sort requested 128 KiB of block shared
         # memory, exceeding the L40's 101,376-byte limit even though DELTA only
         # needs 256 candidates.  Floyd's construction samples the same uniform
         # subset while never materialising or sorting all 65,536 positions.

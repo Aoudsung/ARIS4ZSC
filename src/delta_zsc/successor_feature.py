@@ -155,7 +155,7 @@ def expected_outcome_encoding(prediction: Any, belief: Any) -> Any:
     VOI integrates all sixty-six outcomes exactly for the *posterior*.  The
     landing state is a different matter: enumerating a successor per outcome
     means a ``[time, lane, probe, 66, component]`` tensor, which at the
-    registered formal shape is 52 million critic rows and tens of gigabytes --
+    registered formal shape is 26 million critic rows and tens of gigabytes --
     the quantity is fine, the materialisation is not.
 
     Evaluating the successor at the expected outcome instead is a first-order

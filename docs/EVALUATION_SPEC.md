@@ -90,6 +90,10 @@ explicitly disable OP ingredient permutation. The two estimands are never
 combined or substituted for one another. A result from either layout alone
 cannot close the both-layout hypotheses or invoke the full claim builder.
 
+The paper-compatible estimator also supports `grounded_coord_ring` as a
+single-layout Table 2 extension. Its published reference row is selected by
+layout; it does not expand the registered Simple/Wide formal claim.
+
 ## 6. H2 and H3
 
 H2 uses paired development seeds for `delta_passive - response_only`; both

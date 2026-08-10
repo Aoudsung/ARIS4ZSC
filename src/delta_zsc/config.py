@@ -72,7 +72,7 @@ class RunBudget:
     checkpoint_interval_environment_steps: int
 
 
-FORMAL_NUM_ENVS = 256
+FORMAL_NUM_ENVS = 128
 FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 1024 * 1024
 
 RUN_BUDGETS: Mapping[str, RunBudget] = {

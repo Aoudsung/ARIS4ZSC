@@ -12,10 +12,10 @@ Date: 2026-08-10
 | Delayed response and exact 66-outcome VOI | implemented and locally tested | delayed-window and synthetic VOI tests |
 | Semantic initializer K=2/4/8 | implemented and locally tested | initializer/provenance tests |
 | `test_time_wide` `5x5x43` observation | implemented and locally tested | layout-derived channel-block tests |
-| `grounded_coord_ring` `5x5x39` development layout | implemented and server-executed | generic config-selected path and two-seed pilot |
+| `grounded_coord_ring` `5x5x39` layout | development pilot executed; formal paper config added | generic config-selected path |
 | Uniform registered partner sampling | implemented and locally tested | sampler and training-wiring tests |
 | Config-selected development matrix | implemented | 55 cells per layout with seed-index SP initialization and full pilot/current/successor cost |
-| Formal CUDA shape | implemented | 256 lanes, Floyd anchor sampling, `<40,000 MiB` execution rule |
+| Formal CUDA shape | implemented | 128 lanes, Floyd anchor sampling, `<40,000 MiB` execution rule |
 | Official upstream DAG | implemented | config-selected layout with support/panels/baselines/FCP populations and lineage ledgers |
 | Paper population evaluator | implemented and locally tested | `(10,10,500)`, root 42, directed SP/XP cells |
 | Common-partner evaluator | implemented and locally tested | `(10,16,2,500)`, root 0, five baselines plus DELTA |
@@ -23,9 +23,9 @@ Date: 2026-08-10
 ## Validation status
 
 - Active source compilation and contract validation: passed.
-- Nine registered configurations are present.
+- Ten registered configurations are present, including Grounded Ring formal population evaluation.
 - Root CLI plus 19 subcommands are present.
-- Isolated CPU regression: 83/83 passed with no failure or timeout; details are
+- Isolated CPU regression: 84/84 passed with no failure or timeout; details are
   recorded in `VALIDATION_REPORT.md`.
 - No local source check is scientific performance evidence.
 
@@ -39,7 +39,7 @@ Date: 2026-08-10
 | Held-out two-parent SP evaluations | completed on both layouts: 800 episodes per arm with matched keys |
 | Full Official upstream populations for either layout | deferred; not part of these pilots |
 | Fitted semantic initializers | pilot K=4 artifacts completed; full K=2/4/8 sets deferred |
-| Real 256-lane CUDA execution | not yet executed |
+| Real 128-lane v5 CUDA execution | not yet executed |
 | 55-run development matrices | not yet executed |
 | Ten-run DELTA populations | not yet executed |
 | Paper/common-partner evaluations | not yet executed |

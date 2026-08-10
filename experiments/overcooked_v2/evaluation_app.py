@@ -47,11 +47,24 @@ PAPER_MATRIX_METHODS = (
     FORMAL_METHOD_LABEL,
 )
 PAPER_TABLE_VALUES = {
-    "sp": ("194±12", "-30±96", "220±31"),
-    "state-augmented": ("137±82", "-12±72", "142±81"),
-    "op": ("175±54", "-11±42", "193±61"),
-    "fcp": ("95±56", "23±40", "68±50"),
-    FORMAL_METHOD_LABEL: ("n/a", "n/a", "n/a"),
+    "grounded_coord_ring": {
+        "sp": ("164±10", "-12±75", "175±28"),
+        "state-augmented": ("165±7", "-16±65", "183±26"),
+        "op": ("121±36", "-9±21", "131±37"),
+        "fcp": ("86±34", "6±46", "79±29"),
+    },
+    "test_time_simple": {
+        "sp": ("145±22", "-81±99", "220±26"),
+        "state-augmented": ("161±18", "-55±103", "230±53"),
+        "op": ("121±37", "-3±51", "131±50"),
+        "fcp": ("35±44", "6±29", "25±47"),
+    },
+    "test_time_wide": {
+        "sp": ("194±12", "-30±96", "220±31"),
+        "state-augmented": ("137±82", "-12±72", "142±81"),
+        "op": ("175±54", "-11±42", "193±61"),
+        "fcp": ("95±56", "23±40", "68±50"),
+    },
 }
 
 
@@ -868,15 +881,22 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
     for value in args.evaluation:
         method, raw_path = value.split("=", 1)
         directories[method] = Path(raw_path).resolve()
-    if set(directories) != set(PAPER_MATRIX_METHODS):
-        raise ValueError("Paper matrix summary requires SP, SA, OP, FCP, and DELTA-active.")
+    supplied_methods = set(directories)
+    if supplied_methods not in (
+        {FORMAL_METHOD_LABEL},
+        set(PAPER_MATRIX_METHODS),
+    ):
+        raise ValueError(
+            "Paper matrix summary requires DELTA-active alone or the complete "
+            "SP, SA, OP, FCP, and DELTA-active reproduction."
+        )
 
-    rows = []
     cell_rows = []
+    statistics_by_method = {}
     layout = None
     root_seed = None
     environment_keys = None
-    for method in PAPER_MATRIX_METHODS:
+    for method in (method for method in PAPER_MATRIX_METHODS if method in directories):
         summary, cube, current_environment_keys = _validated_population_cube(
             directories[method], method
         )
@@ -892,22 +912,7 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
         ):
             raise ValueError("Population matrices differ in layout or key schedule.")
         statistics = _population_statistics(cube)
-        paper_sp, paper_xp, paper_gap = PAPER_TABLE_VALUES[method]
-        rows.append(
-            {
-                "method": method,
-                "paper_sp_verbatim": paper_sp,
-                "reproduced_sp_point": statistics["sp_point"],
-                "paper_xp_verbatim": paper_xp,
-                "reproduced_xp_point": statistics["xp_point"],
-                "paper_gap_verbatim": paper_gap,
-                "reproduced_gap_point": statistics["gap_point"],
-                "sd_sp_diag10": statistics["sd_sp_diag10"],
-                "sd_xp_rows10": statistics["sd_xp_rows10"],
-                "sd_gap_rows10": statistics["sd_gap_rows10"],
-                "sd_xp_cells90": statistics["sd_xp_cells90"],
-            }
-        )
+        statistics_by_method[method] = statistics
         for left_index, current in enumerate(statistics["cell_means"]):
             for right_index, value in enumerate(current):
                 cell_rows.append(
@@ -919,6 +924,43 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
                         "mean_raw_return": value,
                     }
                 )
+
+    paper_values = PAPER_TABLE_VALUES[str(layout)]
+    rows = []
+    for method in PAPER_MATRIX_METHODS:
+        statistics = statistics_by_method.get(method)
+        paper_sp, paper_xp, paper_gap = paper_values.get(
+            method, ("n/a", "n/a", "n/a")
+        )
+        rows.append(
+            {
+                "method": method,
+                "paper_sp_verbatim": paper_sp,
+                "reproduced_sp_point": (
+                    None if statistics is None else statistics["sp_point"]
+                ),
+                "paper_xp_verbatim": paper_xp,
+                "reproduced_xp_point": (
+                    None if statistics is None else statistics["xp_point"]
+                ),
+                "paper_gap_verbatim": paper_gap,
+                "reproduced_gap_point": (
+                    None if statistics is None else statistics["gap_point"]
+                ),
+                "sd_sp_diag10": (
+                    None if statistics is None else statistics["sd_sp_diag10"]
+                ),
+                "sd_xp_rows10": (
+                    None if statistics is None else statistics["sd_xp_rows10"]
+                ),
+                "sd_gap_rows10": (
+                    None if statistics is None else statistics["sd_gap_rows10"]
+                ),
+                "sd_xp_cells90": (
+                    None if statistics is None else statistics["sd_xp_cells90"]
+                ),
+            }
+        )
 
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -940,10 +982,26 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
         "|---|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
+        reproduced_sp = row["reproduced_sp_point"]
+        reproduced_xp = row["reproduced_xp_point"]
+        reproduced_gap = row["reproduced_gap_point"]
         markdown.append(
-            "| {method} | {paper_sp_verbatim} | {reproduced_sp_point:.6f} | "
-            "{paper_xp_verbatim} | {reproduced_xp_point:.6f} | "
-            "{paper_gap_verbatim} | {reproduced_gap_point:.6f} |".format(**row)
+            "| {method} | {paper_sp} | {reproduced_sp} | {paper_xp} | "
+            "{reproduced_xp} | {paper_gap} | {reproduced_gap} |".format(
+                method=row["method"],
+                paper_sp=row["paper_sp_verbatim"],
+                reproduced_sp=(
+                    "—" if reproduced_sp is None else f"{reproduced_sp:.6f}"
+                ),
+                paper_xp=row["paper_xp_verbatim"],
+                reproduced_xp=(
+                    "—" if reproduced_xp is None else f"{reproduced_xp:.6f}"
+                ),
+                paper_gap=row["paper_gap_verbatim"],
+                reproduced_gap=(
+                    "—" if reproduced_gap is None else f"{reproduced_gap:.6f}"
+                ),
+            )
         )
     markdown.extend(
         (
@@ -963,6 +1021,14 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
             "layout": layout,
             "root_seed": root_seed,
             "methods": rows,
+            "evaluated_methods": [
+                method for method in PAPER_MATRIX_METHODS if method in directories
+            ],
+            "comparison_mode": (
+                "paper_reference"
+                if supplied_methods == {FORMAL_METHOD_LABEL}
+                else "full_local_reproduction"
+            ),
             "table_csv": {"path": str(table_path)},
             "table_markdown": {"path": str(markdown_path)},
             "cell_means_csv": {"path": str(cells_path)},

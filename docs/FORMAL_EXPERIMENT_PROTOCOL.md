@@ -33,7 +33,7 @@ partner labels and is part of run identity.
 ## 3. Base PPO
 
 - ordinary environment steps: 29,949,952;
-- environments: 256;
+- environments: 128;
 - rollout length: 256;
 - update epochs: 4;
 - minibatches: 64;
@@ -120,6 +120,11 @@ environment keys and use non-permuted OP observations.
 Running Wide alone reports only Wide components of the hypotheses. It does not
 invoke `formal-claim` or establish full H1/H2/H3 or SOTA.
 
+`grounded_coord_ring` may use the same formal training budget and paper
+population estimator for a direct comparison with its published Table 2 row.
+That single-layout extension is reported separately and does not enter the
+registered Simple/Wide H1/H2/H3 claim.
+
 ## 8. Required artifacts
 
 Every formal run preserves:
@@ -140,7 +145,7 @@ Every formal run preserves:
 
 A CUDA preflight is engineering evidence only. It must exercise:
 
-- one visible CUDA GPU, the formal 256-environment shape and peak memory below
+- one visible CUDA GPU, the formal 128-environment shape and peak memory below
   40,000 MiB;
 - real Official reset/step and fixed partner checkpoints;
 - semantic initializer loading;
@@ -151,7 +156,7 @@ A CUDA preflight is engineering evidence only. It must exercise:
 - finite exact VOI, action-wise VOI spread, mirror KL, and posterior metrics.
 
 Anchor-index sampling uses exact without-replacement Floyd sampling, so the
-formal shape does not materialize a full random sort of all 65,536 rollout
+formal shape does not materialize a full random sort of all 32,768 rollout
 positions. The engineering run verifies that shape on the actual server GPU.
 
 The upstream assets, initializer, engineering execution, development matrix,
