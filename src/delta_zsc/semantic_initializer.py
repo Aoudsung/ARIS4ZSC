@@ -1,4 +1,4 @@
-"""Unsupervised spectral-simplex initialization for DELTA v4 semantics.
+"""Unsupervised spectral-simplex initialization for DELTA v5 semantics.
 
 The initializer is fitted only from episode-level residual interface-event
 vectors.  Partner IDs, SP/OP labels, returns, and privileged deployment facts
@@ -296,7 +296,7 @@ def load_semantic_initializer(
         metadata.get("artifact_type") != "delta_semantic_component_initializer"
         or int(metadata.get("version", -1)) != SEMANTIC_INITIALIZER_SCHEMA_VERSION
     ):
-        raise ValueError("Semantic initializer schema differs from DELTA v4.")
+        raise ValueError("Semantic initializer schema differs from DELTA v5.")
     if metadata.get("uses_partner_labels") is not False:
         raise ValueError(
             "Semantic initializer must explicitly certify that partner labels "

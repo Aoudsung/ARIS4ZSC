@@ -67,7 +67,9 @@ def _batch(model, base, latent, *, time_count: int = 4, lanes: int = 4):
         old_log_probabilities=categorical_log_probability(
             output.base_policy_logits[:-1], actions
         ),
-        old_values=output.value[:-1],
+        old_values=output.value,
+        advantages=jnp.zeros((time_count, lanes)),
+        returns=jnp.zeros((time_count, lanes)),
         ppo_mask=jnp.ones((time_count, lanes)),
         beliefs=output.belief,
         initial_policy_state=model.initial_state(lanes),
@@ -552,3 +554,183 @@ def test_raw_value_channel_trains_without_any_anchor() -> None:
         )
     )
     assert norm > 0.0
+
+
+def test_ppo_advantage_is_fixed_across_candidate_parameters() -> None:
+    """The advantage must not move while it is being optimised.
+
+    PPO takes its surrogate ratio against the collection-time policy, so the
+    advantage has to be computed once from the collection-time critic and held
+    fixed for every epoch and minibatch -- which is what the Official
+    implementation does.  This loss used to recompute GAE from whichever
+    candidate critic the optimiser currently held, so each minibatch optimised
+    a slightly different objective and the value target was a regression onto
+    the network doing the regressing.  Identical hyperparameters do not make
+    that the same algorithm.
+
+    Evaluating the loss at two different parameter trees must therefore report
+    the same advantage.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.losses import ppo_loss
+
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
+    # A materially different critic: perturb every base parameter.
+    other = jax.tree_util.tree_map(lambda leaf: leaf + 0.5, base)
+
+    first = ppo_loss(model, base, latent, batch)
+    second = ppo_loss(model, other, latent, batch)
+
+    assert float(first.metrics["gae_advantage_mean"]) == float(
+        second.metrics["gae_advantage_mean"]
+    )
+    assert float(first.metrics["gae_target_mean"]) == float(
+        second.metrics["gae_target_mean"]
+    )
+    # And the value head really did move, so the test is not vacuous.
+    assert float(first.metrics["ppo_value"]) != float(second.metrics["ppo_value"])
+
+
+def test_rollout_batch_carries_the_terminal_bootstrap_value() -> None:
+    """A fixed GAE cannot be reconstructed without the T+1-th value."""
+
+    import jax.numpy as jnp
+
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
+    steps = int(jnp.asarray(batch.rewards).shape[0])
+    assert int(jnp.asarray(batch.old_values).shape[0]) == steps + 1
+    assert int(jnp.asarray(batch.advantages).shape[0]) == steps
+    assert int(jnp.asarray(batch.returns).shape[0]) == steps
+
+
+def _official_calculate_gae(rewards, dones, values, last_value, gamma, gae_lambda):
+    """_calculate_gae from the pinned Official ippo.py, transcribed.
+
+    Kept as an independent transcription rather than a call into the Official
+    package: the point is to catch DELTA's estimator drifting away from the
+    reference, and a shared implementation could not.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    def _get_advantages(carry, transition):
+        gae, next_value = carry
+        done, value, reward = transition
+        delta = reward + gamma * next_value * (1 - done) - value
+        gae = delta + gamma * gae_lambda * (1 - done) * gae
+        return (gae, value), gae
+
+    _, advantages = jax.lax.scan(
+        _get_advantages,
+        (jnp.zeros_like(last_value), last_value),
+        (dones, values, rewards),
+        reverse=True,
+        unroll=16,
+    )
+    return advantages, advantages + values
+
+
+def test_gae_matches_the_official_implementation() -> None:
+    """DELTA's advantage must be the Official one, not merely a plausible one.
+
+    Identical hyperparameters do not make two implementations the same
+    algorithm; this loss previously recomputed GAE from the candidate critic
+    inside every minibatch, which no hyperparameter check would have caught.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.losses import generalized_advantage_estimation
+
+    steps, lanes = 24, 5
+    key = jax.random.PRNGKey(0)
+    rewards = jax.random.normal(jax.random.fold_in(key, 1), (steps, lanes))
+    values = jax.random.normal(jax.random.fold_in(key, 2), (steps + 1, lanes))
+    dones = (
+        jax.random.uniform(jax.random.fold_in(key, 3), (steps, lanes)) < 0.15
+    )
+    gamma, lam = 0.99, 0.95
+
+    ours_adv, ours_ret = generalized_advantage_estimation(
+        rewards=rewards, dones=dones, values=values, gamma=gamma, gae_lambda=lam
+    )
+    theirs_adv, theirs_ret = _official_calculate_gae(
+        rewards,
+        dones.astype(jnp.float32),
+        values[:-1],
+        values[-1],
+        gamma,
+        lam,
+    )
+    np.testing.assert_allclose(
+        np.asarray(ours_adv), np.asarray(theirs_adv), atol=1e-5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        np.asarray(ours_ret), np.asarray(theirs_ret), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_ppo_loss_terms_match_the_official_formulas() -> None:
+    """Actor, value and entropy terms must be the Official ones.
+
+    Transcribed from the pinned _loss_fn: clipped surrogate on a
+    std-normalised advantage, value loss as the max of clipped and unclipped
+    squared error against the fixed target, entropy subtracted with its
+    coefficient.
+    """
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.losses import categorical_log_probability, ppo_loss
+
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
+    cfg = model.config.ppo
+
+    result = ppo_loss(model, base, latent, batch)
+
+    # Recompute the Official way from the same rollout.
+    _, output = model.sequence(
+        base, latent, batch.initial_policy_state, batch.observations,
+        batch.previous_actions, batch.episode_starts,
+        compute_latent=False, execute_adaptation=False, beliefs=batch.beliefs,
+    )
+    logits, value = output.base_policy_logits[:-1], output.value[:-1]
+    gae = jnp.asarray(batch.advantages, jnp.float32)
+    targets = jnp.asarray(batch.returns, jnp.float32)
+    gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+
+    log_prob = categorical_log_probability(logits, batch.actions)
+    ratio = jnp.exp(log_prob - batch.old_log_probabilities)
+    actor = -jnp.minimum(
+        ratio * gae,
+        jnp.clip(ratio, 1 - cfg.clip_epsilon, 1 + cfg.clip_epsilon) * gae,
+    ).mean()
+
+    old_value = jnp.asarray(batch.old_values, jnp.float32)[:-1]
+    clipped = old_value + jnp.clip(
+        value - old_value, -cfg.value_clip_epsilon, cfg.value_clip_epsilon
+    )
+    value_loss = 0.5 * jnp.maximum(
+        jnp.square(value - targets), jnp.square(clipped - targets)
+    ).mean()
+
+    logp = jax.nn.log_softmax(logits, axis=-1)
+    entropy = (-jnp.sum(jnp.exp(logp) * logp, axis=-1)).mean()
+
+    np.testing.assert_allclose(float(result.metrics["ppo_actor"]), float(actor), atol=1e-5)
+    np.testing.assert_allclose(float(result.metrics["ppo_value"]), float(value_loss), atol=1e-5)
+    np.testing.assert_allclose(float(result.metrics["ppo_entropy"]), float(entropy), atol=1e-5)
+    np.testing.assert_allclose(
+        float(result.total),
+        float(actor + cfg.value_weight * value_loss - cfg.entropy_weight * entropy),
+        atol=1e-5,
+    )

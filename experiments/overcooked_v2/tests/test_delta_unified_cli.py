@@ -4,45 +4,130 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 from experiments.overcooked_v2.delta_zsc import _parser
-from src.delta_zsc.config import FORMAL_METHOD_LABEL, OFFICIAL_BASELINE_METHODS
+from src.delta_zsc.config import (
+    FORMAL_METHOD_LABEL,
+    MANIFEST_VERSION,
+    OFFICIAL_BASELINE_METHODS,
+)
 from src.delta_zsc.storage import read_json, write_json
 
 
-def _evaluation_fixture(root: Path, method: str, value: float) -> Path:
+def test_population_statistics_use_diagonal_and_ordered_off_diagonal_rows() -> None:
+    from experiments.overcooked_v2.evaluation_app import _population_statistics
+
+    cell_means = np.asarray(
+        [
+            [10.0, 1.0, 2.0],
+            [3.0, 20.0, 4.0],
+            [5.0, 6.0, 30.0],
+        ]
+    )
+    cube = np.repeat(cell_means[:, :, None], 2, axis=2)
+    observed = _population_statistics(cube)
+
+    np.testing.assert_allclose(observed["sp_diagonal"], [10.0, 20.0, 30.0])
+    np.testing.assert_allclose(observed["xp_rows"], [1.5, 3.5, 5.5])
+    np.testing.assert_allclose(observed["gap_rows"], [8.5, 16.5, 24.5])
+    assert observed["sp_point"] == 20.0
+    assert observed["xp_point"] == 3.5
+    assert observed["gap_point"] == 16.5
+
+
+def _partner_row(checkpoint: Path, index: int) -> dict:
+    return {
+        "run_id": f"partner-{index}",
+        "role": "confirmatory",
+        "checkpoint": str(checkpoint),
+        "parent_training_run_id": f"confirmatory-parent-{index}",
+        "generation_mechanism": "fixture",
+        "checkpoint_stage": 1.0,
+        "hyperparameter_family": "fixture",
+        "seed": index,
+        "seed_index": index,
+        "jax_prng_key": [0, index],
+        "owner_seed_index": None,
+        "co_training_group_id": None,
+        "partner_type_id": None,
+    }
+
+
+def _evaluation_fixture(
+    root: Path,
+    method: str,
+    value: float,
+    *,
+    partner_manifest: Path,
+) -> Path:
     directory = root / method
     directory.mkdir(parents=True)
     raw = directory / "episode_returns.jsonl"
     rows = []
     for ego in range(2):
         for partner in range(2):
-            rows.append(
-                {
-                    "layout": "test_time_simple",
-                    "method": method,
-                    "ego_run_index": ego,
-                    "ego_run_id": f"{method}-run-{ego}",
-                    "partner_run_index": partner,
-                    "partner_run_id": f"partner-{partner}",
-                    "partner_mechanism": "fixture",
-                    "ego_role": 0,
-                    "episode_index": 0,
-                    "raw_return": float(value + ego + partner),
-                }
-            )
+            for role in range(2):
+                rows.append(
+                    {
+                        "evaluation_mode": "common_partner",
+                        "layout": "test_time_simple",
+                        "method": method,
+                        "ego_run_index": ego,
+                        "ego_run_id": f"{method}-run-{ego}",
+                        "partner_run_index": partner,
+                        "partner_run_id": f"partner-{partner}",
+                        "partner_mechanism": "fixture",
+                        "ego_role": role,
+                        "episode_index": 0,
+                        "environment_key": [ego + partner, role],
+                        "raw_return": float(value + ego + partner + role),
+                    }
+                )
     raw.write_text(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
         encoding="utf-8",
     )
+    policy_manifest = directory / "policy_manifest.json"
+    write_json(
+        policy_manifest,
+        {
+            "version": 2,
+            "method": method,
+            "layout": "test_time_simple",
+            "policy_kind": "official_checkpoint",
+            "runs": [
+                {
+                    "run_index": index,
+                    "run_id": f"{method}-run-{index}",
+                    "policy": str(directory / f"policy-{index}"),
+                    "identity": {
+                        "parent_training_run_id": f"{method}-parent-{index}",
+                        "co_training_group_id": None,
+                    },
+                }
+                for index in range(2)
+            ],
+            "training_lineage": [],
+        },
+    )
     write_json(
         directory / "evaluation_summary.json",
         {
-            "version": 1,
+            "version": 2,
             "artifact_type": "delta_raw_evaluation",
+            "evaluation_mode": "common_partner",
             "layout": "test_time_simple",
             "method": method,
             "mean_return": float(value),
             "episode_count": len(rows),
+            "root_seed": 0,
+            "key_schedule": (
+                "fold_in_root_by_ego_partner_then_role_then_split_episode_keys"
+            ),
+            "observation_protocol": "default_non_permuted",
+            "policy_manifest": {"path": str(policy_manifest)},
+            "partner_manifest": {"path": str(partner_manifest)},
             "raw": {"path": str(raw)},
             "resource_ledger": {},
         },
@@ -51,14 +136,32 @@ def _evaluation_fixture(root: Path, method: str, value: float) -> Path:
 
 
 def test_summarize_evaluations_cli_wires_seed_and_writes_h1_summary(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
+    import experiments.overcooked_v2.evaluation_app as evaluation_app
+
+    monkeypatch.setattr(evaluation_app, "FORMAL_COMMON_EGO_RUNS", 2)
+    monkeypatch.setattr(evaluation_app, "FORMAL_COMMON_PARTNER_RUNS", 2)
+    monkeypatch.setattr(evaluation_app, "FORMAL_EVALUATION_EPISODES", 1)
+    partner_manifest = tmp_path / "partner_manifest.json"
+    write_json(
+        partner_manifest,
+        {
+            "version": MANIFEST_VERSION,
+            "layout": "test_time_simple",
+            "runs": [
+                _partner_row(tmp_path / f"partner-{index}", index)
+                for index in range(2)
+            ],
+        },
+    )
     methods = (FORMAL_METHOD_LABEL, *OFFICIAL_BASELINE_METHODS)
     directories = {
         method: _evaluation_fixture(
             tmp_path / "evaluations",
             method,
             40.0 if method == FORMAL_METHOD_LABEL else 0.0,
+            partner_manifest=partner_manifest,
         )
         for method in methods
     }
@@ -146,6 +249,7 @@ def test_development_matrix_launches_every_cell_in_a_fresh_process(
             require_cuda=True,
             skip_manifest_file_check=True,
             semantic_initializer=str(tmp_path / "initializers"),
+            sp_initializer_root=str(tmp_path / "sp-initializers"),
         )
     )
     assert len(commands) == 55
@@ -153,3 +257,8 @@ def test_development_matrix_launches_every_cell_in_a_fresh_process(
     assert all("--resume" in command for command in commands)
     assert all("--require-cuda" in command for command in commands)
     assert all("--semantic-initializer" in command for command in commands)
+    assert all("--sp-initializer" in command for command in commands)
+    for command in commands:
+        seed = int(command[command.index("--seed-index") + 1])
+        checkpoint = command[command.index("--sp-initializer") + 1]
+        assert checkpoint.endswith(f"run-{seed}/ckpt_final")

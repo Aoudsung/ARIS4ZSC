@@ -60,6 +60,32 @@ def _categorical_log_probability(logits: Any, actions: Any) -> Any:
     )[..., 0]
 
 
+
+def _fixed_advantages(batch_rewards, batch_shaped, dones, values, config):
+    """Compute the PPO advantage once, from collection-time values.
+
+    Official PPO computes advantages, targets after the rollout and holds
+    them fixed across every update epoch and minibatch.  Doing it inside the
+    loss instead -- against whichever candidate critic the optimiser currently
+    holds -- is a different algorithm, whatever the hyperparameters say.
+    """
+
+    import jax.numpy as jnp
+
+    from .losses import generalized_advantage_estimation
+
+    reward = jnp.asarray(batch_rewards, dtype=jnp.float32) + jnp.asarray(
+        batch_shaped, dtype=jnp.float32
+    )
+    return generalized_advantage_estimation(
+        rewards=reward,
+        dones=dones,
+        values=jnp.asarray(values, dtype=jnp.float32),
+        gamma=float(config.ppo.gamma),
+        gae_lambda=float(config.ppo.gae_lambda),
+    )
+
+
 def collect_rollout(
     *,
     state: RunnerState,
@@ -284,6 +310,9 @@ def collect_rollout(
     # The posterior the actor actually saw, kept alongside the observations so
     # PPO replays the behaviour policy rather than a re-derived one.
     beliefs = jnp.concatenate((rows["belief"], final_output.belief[None]), axis=0)
+    dense_advantages, dense_returns = _fixed_advantages(
+        rows["raw_reward"], rows["shaped_reward"], rows["done"], values, model.config
+    )
     batch = RolloutBatch(
         observations=observations,
         response_next_observations=rows["response_next_observation"],
@@ -294,7 +323,9 @@ def collect_rollout(
         shaped_rewards=rows["shaped_reward"],
         dones=rows["done"],
         old_log_probabilities=rows["old_log_probability"],
-        old_values=values[:-1],
+        old_values=values,
+        advantages=dense_advantages,
+        returns=dense_returns,
         ppo_mask=jnp.ones((steps, count), dtype=jnp.float32),
         beliefs=beliefs,
         initial_policy_state=initial_policy_state,
@@ -394,13 +425,9 @@ def _make_training_rollout_kernel(
         base_params: Any,
         latent_params: Any,
         shaping_factor: Any,
-        partner_curriculum: Any,
         snapshot_key: Any,
     ) -> tuple[RunnerState, RolloutBatch, AnchorSnapshots | None]:
         shaping = jnp.asarray(shaping_factor, dtype=jnp.float32)
-        # Forwarded into the partner functions' otherwise unused parameter slot,
-        # where the static pool reads it as its stage-curriculum progress.
-        curriculum = jnp.asarray(partner_curriculum, dtype=jnp.float32)
         initial_policy_state = state.ego_policy_state
         if snapshot_count:
             from .anchors import select_anchor_indexes
@@ -537,7 +564,7 @@ def _make_training_rollout_kernel(
                 stepped_ego, action=ego_action, done=done
             )
             next_partner_state = partner_functions.observe(
-                curriculum,
+                partner_parameters,
                 stepped_partner,
                 partner_context,
                 partner_observation,
@@ -646,6 +673,12 @@ def _make_training_rollout_kernel(
             compute_decision=False,
             execute_adaptation=False,
         )
+        sparse_values = jnp.concatenate(
+            (old_values, final_output.value[None]), axis=0
+        )
+        sparse_advantages, sparse_returns = _fixed_advantages(
+            raw_rewards, shaped_rewards, dones, sparse_values, model.config
+        )
         batch = RolloutBatch(
             observations=jnp.concatenate(
                 (ego_observations, final_observation[None]), axis=0
@@ -670,7 +703,9 @@ def _make_training_rollout_kernel(
             shaped_rewards=shaped_rewards,
             dones=dones,
             old_log_probabilities=old_log_probabilities,
-            old_values=old_values,
+            old_values=sparse_values,
+            advantages=sparse_advantages,
+            returns=sparse_returns,
             ppo_mask=jnp.ones((steps, count), dtype=jnp.float32),
             beliefs=jnp.concatenate(
                 (step_beliefs, final_output.belief[None]), axis=0

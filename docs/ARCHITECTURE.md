@@ -185,8 +185,8 @@ These are compile-time paths, not learned gates.
 
 - method: `delta_belief_conditioned_raw_return_pairwise_crn_v5`;
 - config schema: 3;
-- checkpoint schema: 4;
-- deployment bundle: 3;
+- checkpoint schema: 5;
+- deployment bundle: 4;
 - manifest schema: 2;
 - semantic initializer schema: 1.
 
@@ -194,8 +194,8 @@ Training identity includes the resolved initializer mapping and source path.
 Development/formal semantic variants reject a missing initializer and validate
 its method version, layout, K, calibration role, event count, and parent-lineage
 disjointness from the DELTA training support. Mechanical checks and pure
-base/history collection runs may use the deterministic fallback. v3 DELTA
-state is not loaded.
+base/history collection runs may use the deterministic fallback. v4 and earlier
+DELTA state is not loaded.
 
 ## 11. Active and historical boundaries
 

@@ -106,30 +106,27 @@ def peak_device_memory_bytes() -> int:
     larger card for no reason connected to the experiment.
     """
 
-    try:
-        import jax
+    import jax
 
-        values = []
-        for device in jax.devices():
-            stats = device.memory_stats() or {}
-            for key in ("peak_bytes_in_use", "bytes_in_use"):
-                if key in stats:
-                    values.append(int(stats[key]))
-        return max(values, default=0)
-    except Exception:
+    devices = [device for device in jax.devices() if device.platform == "gpu"]
+    if not devices:
         return 0
+    values = []
+    for device in devices:
+        stats = device.memory_stats() or {}
+        for key in ("peak_bytes_in_use", "bytes_in_use"):
+            if key in stats:
+                values.append(int(stats[key]))
+    return max(values)
 
 
 __all__ = ["ResourceLedger", "parameter_count", "peak_device_memory_bytes"]
 
 
 def gpu_device_count() -> int:
-    try:
-        import jax
+    import jax
 
-        return sum(str(device.platform).lower() == "gpu" for device in jax.devices())
-    except Exception:
-        return 0
+    return sum(str(device.platform).lower() == "gpu" for device in jax.devices())
 
 
 def gpu_hours_for_wall_seconds(

@@ -1,4 +1,4 @@
-# THEORY — DELTA-ZSC v4 guarantees, identifiability, and limits
+# THEORY — DELTA-ZSC v5 guarantees, identifiability, and limits
 
 `authoritative: true`
 
@@ -31,7 +31,7 @@ Then
 \frac{b(i)p_{sem}(y\mid i)}{b(j)p_{sem}(y\mid j)},
 \]
 
-because `p_sh` cancels. v4 enforces this cancellation structurally by removing
+because `p_sh` cancels. v5 enforces this cancellation structurally by removing
 the component axis from occurrence heads and by passing only semantic log
 probabilities to `filter_update`. Therefore high-frequency partner-independent
 no-change events cannot create a component winner.
@@ -63,29 +63,33 @@ it does not assert that those directions are true partner identities. The
 simplex gives all components equal norm and pairwise symmetric starting
 geometry, avoiding a privileged random winner.
 
-## 5. Three proper predictive channels
+## 5. Proper response channels and direct decision supervision
 
-Each channel term is a mean negative log probability of observations generated
-under the registered conditional model. A fixed sum of proper scores remains a
-proper composite score for those marginals. Separate normalization changes
+Each shared or semantic response term is a mean negative log probability of
+observations generated under the registered conditional model. Their fixed sum
+is a proper composite score for those marginals. Separate normalization changes
 channel scale but not the optimum of an individual channel and prevents sample
 frequency from becoming an implicit coefficient.
 
-Because the three marginals share parameters and a latent variable, their
-optima can conflict. The final anchor audit computes exact semantic and
-decision gradient norms and their cosine on the shared component embeddings.
-These diagnostics reveal conflict without gating training or tripling the full
-optimizer backward pass.
+The belief-conditioned critic is supervised by raw-reward TD(lambda) and
+pairwise CRN action differences, which directly target state level and action
+ordering rather than fitting a return density. The successor objectives target
+the observed `t+2` encoder state and its value consistency. Every present term
+has coefficient one; no fitted variance, tuning weight or effect threshold is
+introduced.
 
-## 6. Decision contrast likelihood
+## 6. Belief-conditioned decision identification
 
-Centered six-action returns lie in the five-dimensional subspace orthogonal to
-the all-ones vector. The Helmert basis is orthonormal on that subspace, so
-projecting targets, means, and covariance loses only the unidentifiable common
-offset. With at least six fit replicas, the sample covariance can be full rank
-five before numerical jitter. The shared model variance keeps component
-likelihood differences tied to predicted means rather than component-specific
-uncertainty.
+Each trajectory supplies `(x_t,b_t,a_t,r_t,x_{t+1},b_{t+1})`, so the marginal
+raw-return value conditioned on the legal posterior is observed through
+ordinary temporal-difference targets. Sparse all-action anchors identify
+pairwise action differences. Same-replica differencing removes common CRN noise;
+the pooled pair variance bounds the precision of exact or near-exact ties
+without a tunable floor. A dueling parameterization places common state level
+in the value head and centers the action advantage under the acting policy.
+
+The ensemble heads report action-order disagreement. Their spread is not a
+trainable variance and does not create another objective.
 
 ## 7. CRN successor estimand
 
@@ -150,7 +154,7 @@ If every component has the same successor action-value vector, `V^a` is
 independent of belief and VOI is zero even if the response identifies the
 component perfectly. Conversely, action-independent response information can
 produce the same positive VOI for every probe and therefore no active policy
-change. v4 consequently reports action-wise VOI spread, information-gain
+change. v5 consequently reports action-wise VOI spread, information-gain
 spread, and active/passive policy total variation in addition to their means.
 
 ## 12. Mirror-policy guarantee
@@ -169,7 +173,7 @@ labels. Scientific usefulness requires all of the following empirical links:
 
 1. semantic component distributions differ;
 2. legal histories select different mixtures for different partners;
-3. component decision residuals induce different action orderings;
+3. those legal-belief changes induce different critic action orderings;
 4. the correct belief has higher same-world continuation value than a shuffled
    belief.
 
@@ -208,6 +212,6 @@ The implementation does not prove:
 - real-return improvement from mirror adaptation without accurate values --
   the same-world mirror improvement against the held-out anchor replicas is the
   measurement that bears on this, and it is a reported diagnostic, not a claim;
-- SOTA performance without formal frozen matrices;
+- SOTA performance without complete formal matrices;
 - exact long-horizon active planning;
 - independence of behavior statistics from partner history.

@@ -1,4 +1,4 @@
-# EVALUATION_SPEC — DELTA-ZSC v4 development and inference
+# EVALUATION_SPEC — DELTA-ZSC v5 development and inference
 
 `authoritative: true`
 
@@ -55,24 +55,40 @@ Paired cells must record:
 - base initialization identity;
 - environment, partner, anchor-index, and minibatch root seeds;
 - semantic initializer identity;
-- action/reward/partner-member stream hashes where applicable;
+- observed action/reward/partner-member streams where pairing requires them;
+- the actual two-word environment keys for every evaluation episode;
 - resolved config and source method identity.
 
 PPO-side development metrics are descriptive unless replicated across paired
 runs. Posterior/mechanism claims must be supported by independent partner-run
 aggregation rather than a single final anchor batch.
 
-## 5. Confirmatory performance
+## 5. Two formal evaluation estimands
 
-Frozen `delta_active` is evaluated against Official SP, OP, State-Augmented,
-FCP, and a capacity-matched IPPO-Large when lineage and resource artifacts are
-available. Every ego run is crossed with every confirmatory partner run in both
-roles.
+The paper-compatible population estimator evaluates SP, State-Augmented, OP,
+FCP and DELTA-active separately. For each method, the same ordered ten-run
+population is used on the left and right of a `(10,10,500)` raw-return cube.
+The ten diagonal cells define SP and the ninety directed off-diagonal cells
+define XP. Root seed 42 is split into Official SP/cross branches before fixed
+cell enumeration. Its output extends Table 2; the public paper does not expose
+the aggregation that produced its printed error terms, so locally named
+dispersion measures are reported separately.
+
+The common-partner estimator evaluates final-checkpoint `delta_active` against
+Official SP, OP, State-Augmented, FCP, and a capacity-matched IPPO-Large. Every
+ten-run ego population is crossed with the same sixteen confirmatory partner
+runs in both roles for 500 episodes, producing `(10,16,2,500)` rows per method.
+Root seed 0 and the exact key schedule are shared across all six methods.
 
 Raw episode rows are reduced to an ego-run x partner-run matrix. The bootstrap
 independently resamples ego and partner nodes. H1 uses an intersection-union
 rule: on each layout, every baseline contrast needs a one-sided 95% lower bound
 above zero and a point estimate of at least 20.
+
+Both evaluators use the same Official environment and policy adapters and
+explicitly disable OP ingredient permutation. The two estimands are never
+combined or substituted for one another. A result from either layout alone
+cannot close the both-layout hypotheses or invoke the full claim builder.
 
 ## 6. H2 and H3
 
@@ -112,9 +128,9 @@ The calibration/posterior application reports:
 - pooled SP/OP event distribution and total variation;
 - initializer singular values and conditional oracle gain.
 
-No diagnostic threshold gates benchmark evaluation. These measurements localize
-model error and prevent a partner-independent global winner from being
-misreported as inference.
+No diagnostic result controls execution of benchmark evaluation or any later
+job. These measurements localize model error and prevent a
+partner-independent global winner from being misreported as inference.
 
 ## 9. Resource accounting
 
@@ -142,4 +158,4 @@ simulator transitions are still charged.
 - replacing raw return with response NLL or VOI;
 - promoting a null active increment into an unregistered claim;
 - combining layouts so one masks failure on the other;
-- reusing v3 DELTA checkpoints or results as v4 runs.
+- reusing v4 or earlier DELTA checkpoints or results as v5 runs.

@@ -8,7 +8,8 @@ The substrate is OvercookedV2 Test-Time Protocol Formation with 400-step
 episodes, six ego actions, view radius two, negative rewards, random initial
 positions, recipe resampling after delivery, and successful-delivery indication.
 `test_time_simple` and `test_time_wide` are separate layouts; neither may hide
-failure on the other.
+failure on the other. The pinned local observation has 39 channels on Simple
+and 43 channels on Wide.
 
 ## 2. Scientific problem
 
@@ -17,17 +18,17 @@ best action. The problem is not to identify the teammate's training algorithm.
 It is to learn, from legal interaction history alone, an uncertainty state that
 supports better decisions while retaining one shared task policy.
 
-Because the frozen partner is constant within an episode, DELTA v4 represents
+Because the teammate checkpoint is constant within an episode, DELTA v5 represents
 an exchangeable episode-level latent `z_e`. The legal posterior is
 
 \[
 b_t(z)=p(z_e=z\mid H_t),
 \]
 
-and its current decision value is
+and its current decision value is learned directly from that posterior:
 
 \[
-\bar Q_t(a)=\sum_zb_t(z)\mu_z(x_t,a).
+Q_\psi(x_t,b_t,a).
 \]
 
 For active DELTA, candidate probes also receive the value of a delayed partner
@@ -51,25 +52,24 @@ manifest lineage.
 
 ## 4. Unified latent semantics
 
-A component is exchangeable and is defined jointly by:
+A component is exchangeable and is defined by:
 
-1. a conditional semantic response distribution;
-2. a centered current action-value residual;
-3. for active DELTA, a delayed probe-response distribution and a centered
-   probe-successor action-value residual.
+1. a conditional immediate semantic response distribution;
+2. for active DELTA, a conditional delayed probe-response distribution.
 
 Shared occurrence heads model pooled visibility/change frequencies but do not
 define component semantics and cannot alter posterior odds.
 
 A component is scientifically useful only when legal semantic evidence selects
-it differently across partners and its decision residual changes action
-ordering. Posterior entropy reduction alone is not evidence of adaptation.
+it differently across partners and the resulting posterior changes action
+ordering in the belief-conditioned raw-return critic. Posterior entropy
+reduction alone is not evidence of adaptation.
 
 ## 5. Primary hypotheses
 
-### H1 — frozen performance
+### H1 — final-checkpoint performance
 
-On both Simple and Wide, frozen `delta_active` exceeds every registered
+On both Simple and Wide, final-checkpoint `delta_active` exceeds every registered
 same-protocol baseline. For each contrast, the one-sided crossed-node bootstrap
 lower bound must be positive and the point estimate must be at least one
 correct delivery, 20 raw-return points.
@@ -124,14 +124,14 @@ required mechanism evidence.
 
 ## 8. Required mechanism measurements
 
-Every v4 study reports:
+Every v5 study reports:
 
 - immediate and delayed shared/semantic NLL and counts;
 - component event Jensen-Shannon separation;
 - posterior entropy and response-induced filter KL;
 - belief separation by partner run/mechanism and within-episode phase drift;
-- current and successor top-action agreement, regret, and component action
-  disagreement;
+- current and successor top-action agreement, regret, pairwise sign agreement,
+  and critic-ensemble action disagreement;
 - exact VOI, information gain, their action-wise spread, and negative numerical
   fraction;
 - active/passive policy total variation and greedy disagreement;
@@ -150,6 +150,19 @@ The project does not claim:
 - calibration from a sharp posterior alone;
 - causal partner labels from spectral directions;
 - guaranteed real-return improvement from approximate decision values;
-- SOTA performance before frozen ten-seed Simple/Wide evaluation;
+- SOTA performance before complete ten-seed Simple/Wide evaluation;
 - that behavior statistics contain no partner information;
-- that v3 development results are evidence for v4.
+- that v4 or earlier development results are evidence for v5.
+
+## 10. Single-layout result boundary
+
+Each configured layout reports two separate estimands. The
+paper-compatible population matrix contains ten final policies crossed as a
+directed `(10,10,500)` raw-return cube. The common-partner comparison contains
+ten egos, sixteen independent confirmatory partners, both ego roles and 500
+episodes per pairing. These objects are never substituted for one another.
+
+A completed run for one layout may report that layout's component of H1, H2
+and H3. It cannot
+close the both-layout hypotheses, invoke the repository's full claim builder,
+or support a SOTA statement without the corresponding Simple result.

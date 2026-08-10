@@ -1,15 +1,15 @@
-# DELTA-ZSC v4 protocol index
+# DELTA-ZSC v5 protocol index
 
 These are the only authoritative active documents.
 
 | Question | Authority |
 |---|---|
 | What scientific problem and hypotheses are registered? | `SCIENTIFIC_SPEC.md` |
-| What is the exact v4 algorithm? | `METHOD_SPEC.md` |
+| What is the exact v5 algorithm? | `METHOD_SPEC.md` |
 | What is proved, approximated, or not claimed? | `THEORY.md` |
 | Which equation maps to which source file? | `ARCHITECTURE.md` |
 | Which comparisons and statistics are valid? | `EVALUATION_SPEC.md` |
-| Which numerical settings are frozen? | `FORMAL_EXPERIMENT_PROTOCOL.md` |
+| Which numerical settings are registered? | `FORMAL_EXPERIMENT_PROTOCOL.md` |
 | What is the execution order? | `RESEARCH_PROGRAM.md` |
 | What is the bounded development matrix? | `research/DEVELOPMENT_MATRIX.md` |
 | What is preregistered statistically? | `research/STATISTICAL_PREREGISTRATION.md` |

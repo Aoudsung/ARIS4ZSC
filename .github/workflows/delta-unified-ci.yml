@@ -64,6 +64,8 @@ jobs:
           from src.delta_zsc.config import load_config
           for path in sorted(Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml")):
               run_kind = path.stem.rsplit("_", 1)[-1]
+              if run_kind == "collector":
+                  run_kind = "development"
               load_config(path, run_kind=run_kind)
               print(path)
           PY
@@ -72,10 +74,10 @@ jobs:
           python -m experiments.overcooked_v2.delta_zsc --help
           for command in \
             build-partner-manifest validate-partner-manifest train cuda-preflight \
-            build-policy-manifest evaluate summarize-evaluations \
+            build-policy-manifest evaluate summarize-evaluations summarize-population-matrices \
             build-semantic-initializer posterior-diagnostics belief-intervention run-development-matrix \
             evaluate-development-matrix summarize-development-matrix \
-            train-baseline resource-report formal-claim; do
+            train-baseline train-official-parent run-upstream resource-report formal-claim; do
             python -m experiments.overcooked_v2.delta_zsc "${command}" --help
           done
       - name: Enforce one active scientific namespace

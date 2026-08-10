@@ -1,4 +1,4 @@
-# FORMAL_EXPERIMENT_PROTOCOL — Frozen DELTA-ZSC v4 contract
+# FORMAL_EXPERIMENT_PROTOCOL — Registered DELTA-ZSC v5 contract
 
 `authoritative: true`
 
@@ -12,7 +12,8 @@
 - random initial positions: enabled;
 - recipe resampling after delivery: enabled;
 - successful-delivery indicator: enabled;
-- Official source identity: fixed in `src/delta_zsc/config.py`.
+- local observation shape: `5x5x39` on Simple and `5x5x43` on Wide;
+- Official source identity: registered in `src/delta_zsc/config.py`.
 
 ## 2. Confirmatory method
 
@@ -86,7 +87,12 @@ Training support contains independent SP and OP parents with checkpoints at
 0.0, 0.5, and 1.0. Sampling is uniform over mechanism, family, stage, and run.
 Formal support requires at least ten independent parents per mechanism.
 
-Initializer calibration, posterior calibration, and confirmatory panels are
+Formal DELTA seed `s` uses development-support SP parent `s` as its base-policy
+initializer. Development variants use the same mapping for seeds `0..4`; all
+variants sharing a seed receive the same initializer. The engineering
+collector and CUDA execution use parent 0.
+
+Initializer calibration, development coverage, and confirmatory panels are
 parent- and co-training-lineage disjoint from support and from each other.
 Partner manifests are owner-free. Heuristics remain test-only.
 
@@ -103,6 +109,16 @@ Partner manifests are owner-free. Heuristics remain test-only.
 - material effect: 20 raw-return points.
 
 Simple and Wide are inferred separately and combined only by intersection.
+
+The paper-compatible population estimand is a directed `(10,10,500)` cube for
+SP, State-Augmented, OP, FCP and DELTA-active. It uses root seed 42, the
+Official split into SP/cross branches, and the fixed ordered-cell enumeration.
+The common-partner estimand is `(10,16,2,500)` for DELTA-active and all five
+registered baselines, using root seed 0. Both paths save the actual two-word
+environment keys and use non-permuted OP observations.
+
+Running Wide alone reports only Wide components of the hypotheses. It does not
+invoke `formal-claim` or establish full H1/H2/H3 or SOTA.
 
 ## 8. Required artifacts
 
@@ -124,7 +140,9 @@ Every formal run preserves:
 
 A CUDA preflight is engineering evidence only. It must exercise:
 
-- real Official reset/step and frozen partner checkpoints;
+- one visible CUDA GPU, the formal 256-environment shape and peak memory below
+  40,000 MiB;
+- real Official reset/step and fixed partner checkpoints;
 - semantic initializer loading;
 - one legal delayed response window;
 - one current and successor anchor trigger;
@@ -132,5 +150,12 @@ A CUDA preflight is engineering evidence only. It must exercise:
 - checkpoint save/restore and deployment export;
 - finite exact VOI, action-wise VOI spread, mirror KL, and posterior metrics.
 
-No formal claim is eligible until the ten-run frozen matrices and all lineage
-checks are complete.
+Anchor-index sampling uses exact without-replacement Floyd sampling, so the
+formal shape does not materialize a full random sort of all 65,536 rollout
+positions. The engineering run verifies that shape on the actual server GPU.
+
+The upstream assets, initializer, engineering execution, development matrix,
+formal runs and evaluations execute as one dependency graph. Diagnostic or
+return values are reported but never release, block or alter a later job.
+Formal claims require complete ten-run matrices and lineage records on both
+layouts.

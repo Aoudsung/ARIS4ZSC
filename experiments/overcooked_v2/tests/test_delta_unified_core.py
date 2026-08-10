@@ -34,9 +34,11 @@ def test_all_registered_configs_load_and_method_has_three_fields() -> None:
     files = sorted(
         Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml")
     )
-    assert len(files) == 6
+    assert len(files) == 7
     for path in files:
         kind = path.stem.rsplit("_", 1)[-1]
+        if kind == "collector":
+            kind = "development"
         config = load_config(path, run_kind=kind)
         assert set(config.method.__dataclass_fields__) == {
             "latent_components",
@@ -348,3 +350,81 @@ def test_delayed_probe_target_uses_second_action_and_masks_terminal_windows() ->
     assert float(invalid.valid_mask) == 0.0
     assert float(invalid.interface_available) == 0.0
     assert float(invalid.interface_changed) == 0.0
+
+
+def test_manifest_mechanisms_normalise_to_the_registered_names() -> None:
+    """The names the manifest carries must reach the names comparisons use.
+
+    Posterior diagnostics keyed its per-mechanism distributions on the raw
+    manifest string ("rnn-sp") and then looked up the registered name ("sp").
+    The lookup never matched, so both SP/OP total variations were ``None`` in
+    every artifact ever produced -- silently, because ``None`` is a legitimate
+    value when a panel holds a single mechanism.
+    """
+
+    from src.delta_zsc.manifest import normalized_mechanism
+
+    assert normalized_mechanism("rnn-sp") == "sp"
+    assert normalized_mechanism("rnn-op") == "op"
+    assert normalized_mechanism("rnn-sa") == "sa"
+    assert normalized_mechanism("rnn-fcp") == "fcp"
+
+
+def test_posterior_diagnostics_keys_distributions_by_canonical_name() -> None:
+    """Guard the exact line that made the total variations unreachable."""
+
+    from pathlib import Path
+
+    source = Path("experiments/overcooked_v2/calibration_app.py").read_text()
+    head, separator, tail = source.partition("sp_op_tv = None")
+    assert separator, "the SP/OP total variation block moved"
+    assert 'normalized_mechanism(row["partner_mechanism"])' in head
+    assert '"sp" in by_mechanism and "op" in by_mechanism' in tail
+
+
+def test_task_channel_blocks_derive_from_the_ingredient_count() -> None:
+    """Block offsets must follow the layout, not a three-ingredient constant.
+
+    These were absolute constants (20/29/34/39), correct only for a
+    three-ingredient layout.  Two of the six registered layouts carry four
+    ingredients and 43 channels, and one of them is a ``wide`` layout the
+    formal protocol requires -- so the registered wide experiment could not
+    have run.
+    """
+
+    from src.delta_zsc.observation import task_channel_blocks
+
+    three = task_channel_blocks(39)
+    assert three == {
+        "static": (20, 29),
+        "dynamic": (29, 34),
+        "recipe": (34, 39),
+    }, "three-ingredient offsets must reproduce the historical constants exactly"
+
+    four = task_channel_blocks(43)
+    assert four["static"] == (22, 32)
+    assert four["dynamic"] == (32, 38)
+    # The environment's own _get_obs_shape undercounts, so the local frame stops
+    # one channel into the recipe block.  The bound is clipped to what exists
+    # rather than returning an index that would silently read past the end.
+    assert four["recipe"] == (38, 43)
+
+    for channels in (39, 43):
+        blocks = task_channel_blocks(channels)
+        assert blocks["static"][1] == blocks["dynamic"][0]
+        assert blocks["dynamic"][1] == blocks["recipe"][0]
+        assert blocks["recipe"][1] <= channels
+
+
+def test_response_extraction_accepts_a_four_ingredient_frame() -> None:
+    """The extractor pinned itself to 5x5x39 and rejected wide layouts."""
+
+    import jax.numpy as jnp
+
+    from src.delta_zsc.observation import decode_local_task_state
+
+    for channels, dynamic_width in ((39, 5), (43, 6)):
+        frame = jnp.zeros((2, 5, 5, channels), dtype=jnp.float32)
+        state = decode_local_task_state(frame)
+        assert state.dynamic.shape[-1] == dynamic_width
+        assert state.static.shape[-1] > 0 and state.recipe.shape[-1] > 0

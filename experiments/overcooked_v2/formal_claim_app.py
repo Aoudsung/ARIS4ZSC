@@ -53,7 +53,7 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
         diagnostics[layout] = read_json(diagnostic_paths[layout])
         if (
             official[layout].get("artifact_type") != "delta_official_summary"
-            or official[layout].get("version") != 2
+            or official[layout].get("version") != 3
             or official[layout].get("layout") != layout
         ):
             raise ValueError(f"Official summary identity differs on {layout}.")
@@ -72,8 +72,8 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
             raise ValueError(f"Belief intervention identity differs on {layout}.")
         if (
             diagnostics[layout].get("artifact_type")
-            != "delta_v4_posterior_predictive_diagnostics"
-            or diagnostics[layout].get("version") != 4
+            != "delta_v5_posterior_predictive_diagnostics"
+            or diagnostics[layout].get("version") != 5
             or diagnostics[layout].get("layout") != layout
             or diagnostics[layout].get("claim_role") != "diagnostic_only"
         ):

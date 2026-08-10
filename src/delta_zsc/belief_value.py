@@ -85,12 +85,21 @@ def init_belief_value_params(
         "trunk": init_mlp(keys[0], (inputs, int(hidden_dim), int(hidden_dim))),
         "value": init_linear(keys[1], int(hidden_dim), 1, scale=1.0),
     }
-    # Independent advantage heads on a shared trunk.  Sharing the trunk keeps
-    # the parameter count near the head it replaces; the heads differ only in
-    # initialisation, which is what makes their spread informative.
+    # Each advantage member gets its **own** trunk.  They previously shared one,
+    # to keep the parameter count near the head this replaced -- but members
+    # that share a trunk, see identical data and minimise an identical loss
+    # agree with each other whether or not the data supports the advantage.
+    # Measured on a trained deployment that produced a dispersion/|advantage|
+    # ratio of 0.30, i.e. a z-score above three, while the CRN measurement could
+    # resolve only 5-15% of action pairs.  A spread that confident is not an
+    # uncertainty estimate, and the mirror step that consumed it moved a
+    # competent policy a full KL budget on evidence that did not exist.
     for member in range(int(ensemble_size)):
+        params[f"advantage_trunk_{member}"] = init_mlp(
+            keys[2 + 2 * member], (inputs, int(hidden_dim), int(hidden_dim))
+        )
         params[f"advantage_{member}"] = init_linear(
-            keys[2 + member], int(hidden_dim), int(action_count), scale=0.01
+            keys[3 + 2 * member], int(hidden_dim), int(action_count), scale=0.01
         )
     return params
 
@@ -124,8 +133,21 @@ def belief_value_predict(
     hidden = mlp(params["trunk"], features, final_activation=True)
     value = linear(params["value"], hidden)[..., 0]
 
-    members = sorted(name for name in params if name.startswith("advantage_"))
-    raw = jnp.stack([linear(params[name], hidden) for name in members], axis=0)
+    members = sorted(
+        int(name.rsplit("_", 1)[1])
+        for name in params
+        if name.startswith("advantage_") and not name.startswith("advantage_trunk_")
+    )
+    raw = jnp.stack(
+        [
+            linear(
+                params[f"advantage_{m}"],
+                mlp(params[f"advantage_trunk_{m}"], features, final_activation=True),
+            )
+            for m in members
+        ],
+        axis=0,
+    )
     if policy_probabilities is None:
         baseline = jnp.mean(raw, axis=-1, keepdims=True)
     else:

@@ -1,4 +1,4 @@
-# DEVELOPMENT_MATRIX — Registered DELTA-ZSC v4 matrix
+# DEVELOPMENT_MATRIX — Registered DELTA-ZSC v5 matrix
 
 `authoritative: true`
 
@@ -22,14 +22,23 @@ development cells do not silently fall back to an unfitted simplex.
 | base_extra | no | no | no | no | reallocated to PPO |
 
 The core rows have equal ordinary PPO interaction. Extra controls add the exact
-charged current/successor continuation transition count to PPO and receive no
-counterfactual labels.
+charged pilot, current and successor continuation transition count to PPO and
+receive no counterfactual labels.
+
+The main block is `7 variants x 5 seeds = 35` runs. K sensitivity adds
+`2 variants x 2 additional K values x 5 seeds = 20` runs, for exactly 55 runs
+per layout.
 
 ## K sensitivity
 
 Only passive and active DELTA are run for `K=2` and `K=8`; the main `K=4` runs
 are reused. Initializer construction uses the same residual data but projects a
 simplex with the registered K.
+
+Development seed `s` initializes every variant and K value from the same
+development-support SP parent `s`. Partner sampling remains uniform over the
+registered mechanism, family, stage and run probabilities throughout each
+training run.
 
 ## Pre-specified contrasts
 
@@ -57,3 +66,7 @@ High posterior sharpness with low partner separation is a failed global winner,
 not successful inference. Positive information gain with zero VOI spread is not
 active probing. Low decision loss without held-out return gain localizes failure
 to policy conversion or distribution shift.
+
+These diagnostics are interpreted after the registered matrix is complete.
+None changes the variants, losses, budgets, partner distribution or scheduling
+of downstream jobs.

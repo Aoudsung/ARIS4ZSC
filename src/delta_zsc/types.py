@@ -1,4 +1,4 @@
-"""Immutable PyTree-compatible records for DELTA-ZSC v4.
+"""Immutable PyTree-compatible records for DELTA-ZSC v5.
 
 The deployable state contains only legal interaction history.  Privileged
 counterfactual observations appear exclusively in :class:`AnchorBatch`; they
@@ -190,6 +190,8 @@ class RolloutBatch(NamedTuple):
     dones: Any
     old_log_probabilities: Any
     old_values: Any
+    advantages: Any
+    returns: Any
     ppo_mask: Any
     beliefs: Any
     initial_policy_state: PolicyState

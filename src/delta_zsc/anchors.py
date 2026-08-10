@@ -1,7 +1,7 @@
 """Sparse CRN current and probe-conditioned successor decision observations.
 
 Anchors are consumed once in the same outer update that collected them.  The
-v4 active target forces a probe at time t, advances one collection-time-base
+The active target forces a probe at time t, advances one collection-time-base
 bridge step while the teammate can react, then forces every candidate decision
 action at time t+2 and continues with the collection-time base policy. Rewards
 at the probe and bridge transitions are excluded from the decision matrix.
@@ -202,6 +202,7 @@ def collect_all_action_continuations(
     evaluation_replicas: int,
     horizon: int,
     gamma: float,
+    forced_steps: int = 1,
 ) -> tuple[Any, Any, Any, Any]:
     """Return current-state all-action fit/evaluation means and replicas."""
 
@@ -219,6 +220,7 @@ def collect_all_action_continuations(
         replicas=int(fit_replicas) + int(evaluation_replicas),
         horizon=horizon,
         gamma=gamma,
+        forced_steps=forced_steps,
     )
     fit_replica = values[..., : int(fit_replicas)]
     evaluation_replica = values[..., int(fit_replicas) :]
@@ -241,6 +243,7 @@ def _all_action_replica_returns(
     replicas: int,
     horizon: int,
     gamma: float,
+    forced_steps: int = 1,
 ) -> Any:
     """``[state, action, replica]`` CRN continuation returns.
 
@@ -283,7 +286,13 @@ def _all_action_replica_returns(
             base_params=base_params,
             latent_params=latent_params,
             forced_actions=forced_actions,
-            force=(step == 0),
+            # ``forced_steps`` holds the intervention for a while instead of a
+            # single step.  With a one-step force the branches return to the
+            # same policy immediately and re-merge, which is why every anchor
+            # row contained exact ties and no pair reached two standard errors:
+            # the estimand itself is nearly flat, so no number of replicas can
+            # separate it.  Default 1 keeps the registered behaviour.
+            force=(step < int(forced_steps)),
         )
         return branch, returns + (
             jnp.asarray(gamma, dtype=jnp.float32) ** jnp.asarray(step, dtype=jnp.float32)
@@ -589,7 +598,29 @@ def select_anchor_indexes(
     if not 0 < int(requested) <= total:
         raise ValueError("Requested anchor count is outside the rollout.")
     if strata is None:
-        flat = jax.random.choice(key, total, shape=(int(requested),), replace=False)
+        # Floyd's exact without-replacement sampler uses O(requested) state.
+        # ``jax.random.choice(..., replace=False)`` lowers to a full random
+        # sort over ``time_count * environment_count``.  At the registered
+        # 256x256 formal shape that sort requested 128 KiB of block shared
+        # memory, exceeding the L40's 101,376-byte limit even though DELTA only
+        # needs 256 candidates.  Floyd's construction samples the same uniform
+        # subset while never materialising or sorting all 65,536 positions.
+        sample_count = int(requested)
+        initial = jnp.full((sample_count,), -1, dtype=jnp.int32)
+
+        def add_one(index: int, selected: Any) -> Any:
+            upper = total - sample_count + index
+            draw = jax.random.randint(
+                jax.random.fold_in(key, index),
+                (),
+                0,
+                upper + 1,
+                dtype=jnp.int32,
+            )
+            value = jnp.where(jnp.any(selected == draw), upper, draw)
+            return selected.at[index].set(value)
+
+        flat = jax.lax.fori_loop(0, sample_count, add_one, initial)
         return flat // int(environment_count), flat % int(environment_count)
 
     labels = jnp.asarray(strata, dtype=jnp.int32).reshape((total,))

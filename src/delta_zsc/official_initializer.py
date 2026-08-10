@@ -50,7 +50,13 @@ def load_official_parameters(checkpoint_path: str) -> dict[str, Any]:
 
     import orbax.checkpoint as ocp
 
-    restored = ocp.PyTreeCheckpointer().restore(str(checkpoint_path))
+    checkpointer = ocp.PyTreeCheckpointer()
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        checkpointer.metadata(str(checkpoint_path))
+    )
+    restored = checkpointer.restore(
+        str(checkpoint_path), restore_args=restore_args
+    )
     payload = restored["params"]
     # Official checkpoints are written either as ``params`` or as the nested
     # ``params/params`` Flax emits; both appear across the baseline families.

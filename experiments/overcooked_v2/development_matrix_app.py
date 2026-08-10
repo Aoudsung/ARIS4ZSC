@@ -85,6 +85,10 @@ def _initializer_for_component_count(
     )
 
 
+def _sp_initializer_for_seed(root: str | Path, seed_index: int) -> Path:
+    return Path(root).resolve() / f"run-{int(seed_index)}" / "ckpt_final"
+
+
 def _anchor_budget(
     payload: Mapping[str, Any], *, method_variant: str | None = None
 ) -> int:
@@ -103,11 +107,17 @@ def _anchor_budget(
     actions = OFFICIAL_ACTION_COUNT
     replicas = int(anchors["fit_replicas"]) + int(anchors["evaluation_replicas"])
     horizon = int(method["continuation_horizon"])
+    pilot = (
+        int(anchors["pilot_states"])
+        * actions
+        * int(anchors["pilot_replicas"])
+        * horizon
+    )
     current = states * actions * replicas * horizon
     successor = 0
     if variant == "delta_active":
         successor = states * actions * replicas * (2 + actions * horizon)
-    per_trigger = current + successor
+    per_trigger = pilot + current + successor
     return triggers * per_trigger
 
 
@@ -216,6 +226,7 @@ def run_development_matrix(args: argparse.Namespace) -> None:
             "Development matrix requires the fitted K=2/4/8 semantic "
             "initializer root."
         )
+    sp_initializer_root = Path(args.sp_initializer_root).resolve()
     seeds = tuple(int(value) for value in args.seed_index)
     if tuple(sorted(seeds)) != DEVELOPMENT_SEEDS:
         raise ValueError("Development matrix uses seed indexes 0..4 exactly once.")
@@ -262,6 +273,12 @@ def run_development_matrix(args: argparse.Namespace) -> None:
                             ),
                         )
                     )
+                command.extend(
+                    (
+                        "--sp-initializer",
+                        str(_sp_initializer_for_seed(sp_initializer_root, seed)),
+                    )
+                )
                 if bool(args.skip_manifest_file_check):
                     command.append("--skip-manifest-file-check")
                 # Each matrix cell owns one process so JAX executables, the GPU
@@ -291,6 +308,7 @@ def run_development_matrix(args: argparse.Namespace) -> None:
             if initializer_root is None
             else str(Path(initializer_root).resolve())
         ),
+        "sp_initializer_root": str(sp_initializer_root),
         "seeds": list(seeds),
         "main_k4_variants": list(MAIN_VARIANTS),
         "k_sensitivity_variants": list(K_SENSITIVITY_VARIANTS),
@@ -305,6 +323,7 @@ def run_development_matrix(args: argparse.Namespace) -> None:
             "source_config": result["source_config"],
             "partner_manifest": result["partner_manifest"],
             "semantic_initializer_root": result["semantic_initializer_root"],
+            "sp_initializer_root": result["sp_initializer_root"],
         },
     )
     write_json(output / "development_matrix.json", result)

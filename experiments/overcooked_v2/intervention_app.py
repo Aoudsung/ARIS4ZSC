@@ -90,10 +90,6 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
                 pool=pool,
                 probabilities=jnp.asarray([1.0]),
                 run_ids=jnp.asarray([0]),
-                # Single member: the curriculum reweighting is the identity.
-                checkpoint_stages=jnp.asarray([1.0]),
-                group_indexes=jnp.asarray([0]),
-                group_count=1,
             )
             environment = VectorEnvironment.create(config)
             root = jax.random.fold_in(

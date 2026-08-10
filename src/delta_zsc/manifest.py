@@ -77,7 +77,12 @@ def validate_partner_manifest(manifest: PartnerManifest) -> None:
         if row.jax_prng_key is not None and len(row.jax_prng_key) != 2:
             raise ValueError(f"Partner {row.run_id} JAX key must have two words.")
     # Scientific panels must not share parent or co-training lineage.
-    active = ("development_support", "calibration", "confirmatory")
+    active = (
+        "development_support",
+        "calibration",
+        "development_coverage",
+        "confirmatory",
+    )
     by_role = {role: manifest.by_role(role) for role in active}
     for left_index, left_role in enumerate(active):
         for right_role in active[left_index + 1 :]:

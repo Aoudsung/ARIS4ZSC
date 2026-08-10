@@ -6,6 +6,13 @@ host object.  The training computation and checkpoint parameters remain
 Official; only the copied config metadata is normalized to JSON-like strings
 at the storage boundary.
 
+The Official entrypoint also vmaps every population member resident on one GPU
+at once.  The registered ten-run Wide population does not fit on an L40 in that
+form.  This wrapper keeps the one root-key split and the Official train
+function unchanged, but scans population members in batches of one run per
+visible device.  This is an execution-layout change only: run order, PRNG keys,
+budgets, parameters and checkpoint selection are identical.
+
 Two Official modules reach the storage boundary and each holds its own
 module-level reference to ``store_checkpoint``: ``ppo.main`` for the SP/OP/FCP
 path, and ``ppo.state_sample_run`` for the state-augmented path, which
@@ -33,10 +40,47 @@ def _paths_as_strings(value: Any) -> Any:
     return value
 
 
+def _memory_bounded_population_map(function: Any, device_count: int) -> Any:
+    """Map Official population runs one per visible device at a time."""
+
+    import jax
+
+    def mapped(*args: Any, **kwargs: Any) -> Any:
+        outer_size = jax.tree_util.tree_leaves((args, kwargs))[0].shape[0]
+        if int(outer_size) == int(device_count):
+            return jax.pmap(function)(*args, **kwargs)
+
+        sequential_batches = int(outer_size) // int(device_count)
+        batched_args, batched_kwargs = jax.tree_util.tree_map(
+            lambda value: value.reshape(
+                (sequential_batches, int(device_count), *value.shape[1:])
+            ),
+            (args, kwargs),
+        )
+
+        def run_batch(unused: None, batch: Any) -> tuple[None, Any]:
+            batch_args, batch_kwargs = batch
+            return None, jax.pmap(function)(*batch_args, **batch_kwargs)
+
+        unused, result = jax.lax.scan(
+            run_batch,
+            None,
+            (batched_args, batched_kwargs),
+        )
+        del unused
+        return jax.tree_util.tree_map(
+            lambda value: value.reshape((int(outer_size), *value.shape[2:])),
+            result,
+        )
+
+    return mapped
+
+
 def main() -> None:
     import orbax.checkpoint as ocp
     from flax.training import orbax_utils
     from overcooked_v2_experiments.ppo import main as official_main
+    from overcooked_v2_experiments.ppo import run as official_run
     from overcooked_v2_experiments.ppo import state_sample_run as official_state_sample
     from overcooked_v2_experiments.ppo.utils.store import _get_checkpoint_dir
 
@@ -71,6 +115,7 @@ def main() -> None:
         )
 
     official_main.store_checkpoint = store_checkpoint
+    official_run.mini_batch_pmap = _memory_bounded_population_map
     official_state_sample.store_checkpoint = store_checkpoint
     official_main.main()
 

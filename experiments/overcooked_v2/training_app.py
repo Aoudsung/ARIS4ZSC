@@ -18,6 +18,7 @@ from src.delta_zsc.anchors import (
 )
 from src.delta_zsc.config import (
     CHECKPOINT_SCHEMA_VERSION,
+    FORMAL_PEAK_MEMORY_LIMIT_BYTES,
     METHOD_VERSION,
     OFFICIAL_ACTION_COUNT,
     load_config,
@@ -650,7 +651,6 @@ def _make_non_anchor_block_kernel(
     block_length: int,
     rollout_steps: int,
     shaping_horizon: int,
-    curriculum_horizon: int,
     environment_count: int,
     minibatches_per_epoch: int,
     update_epochs: int,
@@ -705,18 +705,11 @@ def _make_non_anchor_block_kernel(
                 / jnp.asarray(shaping_horizon, dtype=jnp.float32),
                 0.0,
             )
-            curriculum = jnp.clip(
-                environment_steps.astype(jnp.float32)
-                / jnp.asarray(curriculum_horizon, dtype=jnp.float32),
-                0.0,
-                1.0,
-            )
             runner, batch, unused_snapshots = rollout_kernel(
                 runner,
                 base,
                 latent,
                 shaping,
-                curriculum,
                 loop_key,
             )
             del unused_snapshots
@@ -769,7 +762,6 @@ def _make_anchor_update_kernel(
     loop_key: Any,
     rollout_steps: int,
     shaping_horizon: int,
-    curriculum_horizon: int,
     environment_count: int,
     minibatches_per_epoch: int,
     update_epochs: int,
@@ -817,18 +809,11 @@ def _make_anchor_update_kernel(
             loop_key, 100_000 + jnp.asarray(update_index, dtype=jnp.int32)
         )
         index_key, root_key = jax.random.split(anchor_key)
-        curriculum = jnp.clip(
-            jnp.asarray(environment_steps, dtype=jnp.float32)
-            / jnp.asarray(curriculum_horizon, dtype=jnp.float32),
-            0.0,
-            1.0,
-        )
         runner, batch, snapshots = rollout_kernel(
             runner_state,
             base_params,
             latent_params,
             shaping,
-            curriculum,
             index_key,
         )
         # Replay reuses the *search* for separable worlds, never a measurement:
@@ -915,6 +900,11 @@ def run_training(args: argparse.Namespace) -> None:
 
     started = time.perf_counter()
     config = load_config(args.config, run_kind=args.run_kind)
+    seed_index = int(args.seed_index)
+    engineering_preflight = bool(getattr(args, "engineering_preflight", False))
+    if config.run_kind == "formal" and seed_index not in range(10):
+        if not (engineering_preflight and seed_index == -1):
+            raise ValueError("Formal training seed index must be one of 0..9.")
     if config.run_kind == "formal" or bool(getattr(args, "require_cuda", False)):
         devices = [device for device in jax.devices() if device.platform == "gpu"]
         if len(devices) != 1:
@@ -941,26 +931,10 @@ def run_training(args: argparse.Namespace) -> None:
         [member.checkpoint for member in members],
         parent_training_run_ids=[member.parent_training_run_id for member in members],
     )
-    # Group by (mechanism, hyperparameter family) so the stage curriculum can
-    # renormalise inside a group and leave the registered mechanism balance
-    # untouched.
-    group_keys = sorted({(m.mechanism, m.hyperparameter_family) for m in members})
-    group_lookup = {key: index for index, key in enumerate(group_keys)}
     partner_functions = make_static_partner_functions(
         pool=frozen_pool,
         probabilities=np.asarray([member.probability for member in members], dtype=np.float32),
         run_ids=np.arange(len(members), dtype=np.int32),
-        checkpoint_stages=np.asarray(
-            [member.checkpoint_stage for member in members], dtype=np.float32
-        ),
-        group_indexes=np.asarray(
-            [
-                group_lookup[(member.mechanism, member.hyperparameter_family)]
-                for member in members
-            ],
-            dtype=np.int32,
-        ),
-        group_count=len(group_keys),
     )
     partner_parameters = None
     environment = VectorEnvironment.create(config)
@@ -985,7 +959,7 @@ def run_training(args: argparse.Namespace) -> None:
         initializer_path = None
         if require_fitted_initializer:
             raise RuntimeError(
-                "Development/formal DELTA v4 semantic variants require "
+                "Development/formal DELTA v5 semantic variants require "
                 "--semantic-initializer built from the lineage-disjoint "
                 "calibration panel."
             )
@@ -1129,10 +1103,6 @@ def run_training(args: argparse.Namespace) -> None:
     host_update_count = int(np.asarray(state.update_count))
     host_environment_steps = int(np.asarray(state.effective_environment_steps))
     shaping_horizon = max(int(config.upstream.reward_shaping_horizon), 1)
-    # The partner curriculum reaches the registered uniform mixture at the same
-    # point the Official shaping schedule reaches zero, so the run has one
-    # "training wheels are off" boundary rather than two.
-    curriculum_horizon = shaping_horizon
     checkpoint_updates = max(
         int(config.training.checkpoint_interval_environment_steps) // rollout_steps,
         1,
@@ -1194,7 +1164,6 @@ def run_training(args: argparse.Namespace) -> None:
             loop_key=loop_key,
             rollout_steps=rollout_steps,
             shaping_horizon=shaping_horizon,
-            curriculum_horizon=curriculum_horizon,
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
@@ -1214,7 +1183,6 @@ def run_training(args: argparse.Namespace) -> None:
                 state.runner_state,
                 state.base_params,
                 state.latent_params,
-                jnp.asarray(0.0, dtype=jnp.float32),
                 jnp.asarray(0.0, dtype=jnp.float32),
                 jax.random.PRNGKey(0),
             )[2]
@@ -1298,7 +1266,6 @@ def run_training(args: argparse.Namespace) -> None:
             block_length=length,
             rollout_steps=rollout_steps,
             shaping_horizon=shaping_horizon,
-            curriculum_horizon=curriculum_horizon,
             environment_count=config.environment.num_envs,
             minibatches_per_epoch=config.training.minibatches_per_epoch,
             update_epochs=config.ppo.update_epochs,
@@ -1492,6 +1459,12 @@ def run_training(args: argparse.Namespace) -> None:
         }
     )
     state = state._replace(resource_ledger=ledger.to_mapping())
+    if (
+        config.run_kind == "formal"
+        and ledger.peak_memory_bytes >= FORMAL_PEAK_MEMORY_LIMIT_BYTES
+    ):
+        write_json(output / "resource_ledger.json", ledger.to_mapping())
+        raise RuntimeError("Formal DELTA peak device memory must remain below 40,000 MiB.")
 
     deployment_directory = output / "final_deployment"
     if deployment_directory.exists() and any(deployment_directory.iterdir()):
@@ -1533,9 +1506,6 @@ def run_training(args: argparse.Namespace) -> None:
             state.base_params,
             state.latent_params,
             jnp.asarray(0.0, dtype=jnp.float32),
-            # The audit measures the finished policy against the registered
-            # partner mixture, so the curriculum is at its end point.
-            jnp.asarray(1.0, dtype=jnp.float32),
             audit_index_key,
         )
         del audit_runner
@@ -1610,8 +1580,8 @@ def run_training(args: argparse.Namespace) -> None:
         write_json(
             audit_path,
             {
-                "version": 4,
-                "artifact_type": "delta_v4_final_decision_audit",
+                "version": 5,
+                "artifact_type": "delta_v5_final_decision_audit",
                 **_final_decision_audit(
                     model=model,
                     base_params=state.base_params,
@@ -1656,10 +1626,13 @@ __all__ = ["run_cuda_preflight", "run_training"]
 
 def run_cuda_preflight(args: argparse.Namespace) -> None:
     """Execute one registered real-partner mechanical update and persistence round trip."""
+    if int(args.seed_index) != -1:
+        raise ValueError("CUDA preflight uses the engineering seed index -1.")
     args.maximum_updates = 1
     args.force_anchor = True
     args.require_cuda = True
     args.resume = False
+    args.engineering_preflight = True
     run_training(args)
     output = Path(args.output).resolve()
     deployment = output / "final_deployment"

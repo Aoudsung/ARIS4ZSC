@@ -1,6 +1,6 @@
 """Exact Bayesian value of the delayed compact probe-response marginal.
 
-DELTA v4 enumerates ``(visibility, interface_available, interface_changed,
+DELTA v5 enumerates ``(visibility, interface_available, interface_changed,
 interface_event)`` exactly: two unavailable outcomes, two available/no-change
 outcomes, and sixty-two structured-change outcomes.  The posterior is valued
 with a probe-conditioned successor decision matrix, never the current-state

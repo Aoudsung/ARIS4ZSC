@@ -32,6 +32,7 @@ def test_advantage_is_centered_under_the_acting_policy() -> None:
 
     prediction = belief_value_predict(params, task, instant, behavior, belief, policy)
     weighted = jnp.sum(prediction.advantage_mean * policy, axis=-1)
+    assert all(f"advantage_trunk_{member}" in params for member in range(3))
     np.testing.assert_allclose(np.asarray(weighted), 0.0, atol=1.0e-5)
     assert prediction.ensemble_advantage.shape == (3, lanes, 6)
     np.testing.assert_allclose(

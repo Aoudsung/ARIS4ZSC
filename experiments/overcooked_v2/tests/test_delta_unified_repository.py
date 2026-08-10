@@ -21,6 +21,8 @@ ACTIVE_APPS = {
     "official_training.py",
     "resource_report_app.py",
     "training_app.py",
+    "upstream_app.py",
+    "upstream_pipeline_app.py",
 }
 
 

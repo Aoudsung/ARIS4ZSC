@@ -96,52 +96,65 @@ def robust_mirror_policy_logits(
     uncertainty_penalty: float,
     iterations: int = 48,
 ) -> tuple[Any, Any, Any]:
-    """Improve against a conservative lower bound on the advantage.
+    """Move as far as the evidence supports, never further than the budget.
 
-    ``mirror_policy_logits`` treats any ordering as actionable: because the
-    constrained optimum is invariant to positive rescaling of ``Q``, a contrast
-    of 1e-4 and a contrast of 10 produce the same policy, only a different dual
-    temperature.  Measured on the pre-refactor anchors, no action pair was
-    separated by even two standard errors, yet the solver still spent the full
-    0.04 KL budget on every active step.
+    ``mirror_policy_logits`` solves for the temperature that makes the KL
+    *equal* the budget, so it is invariant to positive rescaling of the
+    advantage: a contrast of 1e-4 and a contrast of 10 produce the same policy.
+    The previous version of this function shrank the advantage by its
+    dispersion and then handed the result to that same solver, which promptly
+    rescaled the shrinkage away.  Measured on a trained deployment, the two
+    solvers spent bit-identical KL in **100%** of states -- 0.04000 both -- even
+    though the conservative bound had zeroed 16% of the advantages.  The
+    deployment therefore pushed a competent base policy a full 0.04 KL every
+    step on an advantage whose median magnitude was 0.014 and whose measured
+    resolvable-pair fraction was 5-15%.
 
-    This objective replaces the raw inner product with
+    The temperature now has a floor set by the advantage's own uncertainty:
 
-        (pi - pi0)^T Abar  -  beta * sqrt((pi - pi0)^T Sigma (pi - pi0))
+        eta = max(eta_budget, beta * dispersion)
 
-    using the ensemble dispersion as a diagonal Sigma.  Where the advantage is
-    well determined the first term dominates and the step is unchanged; where
-    the ensemble disagrees the penalty cancels the unproven improvement and the
-    solution stays near the base policy.  It is a continuous lower bound, not a
-    gate: nothing is thresholded on or off.
+    At ``eta = beta * sigma`` the exponent is the advantage's z-score divided
+    by ``beta``, so the policy moves in proportion to how many standard
+    deviations of evidence there are.  Where the advantage is well determined
+    the budget temperature is the larger of the two and behaviour is unchanged;
+    where it is noise, the step shrinks toward the base policy on its own.  The
+    KL constraint still holds -- the realised KL can only fall below the
+    budget, never rise above it.
     """
 
+    import jax
     import jax.nn
     import jax.numpy as jnp
 
+    base = jnp.asarray(base_logits, dtype=jnp.float32)
     mean = jnp.asarray(advantage_mean, dtype=jnp.float32)
     dispersion = jnp.asarray(advantage_dispersion, dtype=jnp.float32)
     beta = jnp.asarray(uncertainty_penalty, dtype=jnp.float32)
-    base = jnp.asarray(base_logits, dtype=jnp.float32)
-    reference = jax.nn.softmax(base, axis=-1)
 
-    # Shrink each advantage toward zero by its own uncertainty and clamp there.
-    # Subtracting a signed penalty outright would be wrong twice over: the dual
-    # solver is invariant to positive rescaling, so a uniformly shrunk vector
-    # would still spend the whole budget, and once the dispersion exceeds the
-    # mean the signed subtraction flips the ordering and *increases* the
-    # magnitude.  Clamping at zero is the lower confidence bound: an action the
-    # ensemble cannot separate from the baseline contributes nothing, and when
-    # no action survives the vector is constant and the solver's no-signal
-    # branch returns the base policy unchanged.
-    conservative = jnp.sign(mean) * jnp.maximum(
-        jnp.abs(mean) - beta * jnp.abs(dispersion), 0.0
-    )
-    del reference
-    return mirror_policy_logits(
-        base, conservative, kl_budget=kl_budget, iterations=iterations
+    # The budget temperature, from the unmodified dual solve.
+    _, _, eta_budget = mirror_policy_logits(
+        base, mean, kl_budget=kl_budget, iterations=iterations
     )
 
+    # One evidence scale per state: the advantage is a vector, the temperature
+    # is a scalar, and a per-action temperature would not be a temperature.
+    evidence = beta * jnp.mean(dispersion, axis=-1)
+    eta = jnp.maximum(eta_budget, evidence)
+
+    centred = mean - jnp.mean(mean, axis=-1, keepdims=True)
+    base_logp = jax.nn.log_softmax(base, axis=-1)
+    logits = base_logp + centred / jnp.maximum(eta, 1.0e-30)[..., None]
+    logp = jax.nn.log_softmax(logits, axis=-1)
+    kl = jnp.sum(jnp.exp(logp) * (logp - base_logp), axis=-1)
+
+    no_signal = jnp.max(centred, axis=-1) - jnp.min(centred, axis=-1) < 1.0e-7
+    inactive = no_signal | (float(kl_budget) <= 0.0) | ~jnp.isfinite(eta_budget)
+    return (
+        jnp.where(inactive[..., None], base, logits),
+        jnp.where(inactive, 0.0, kl),
+        jnp.where(inactive, jnp.inf, eta),
+    )
 
 
 __all__ = [

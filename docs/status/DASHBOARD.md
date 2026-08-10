@@ -1,58 +1,68 @@
-# DELTA-ZSC v4 status dashboard
+# DELTA-ZSC v5 status dashboard
 
-Date: 2026-08-06
+Date: 2026-08-10
 
 ## Active source status
 
 | Item | Status | Evidence |
 |---|---|---|
-| Method identity | complete | config 3, checkpoint schema 4, package 0.6.0 |
-| Episode-static latent | implemented and locally tested | `belief_filter.py`; core filter test |
-| Shared occurrence / component semantic split | implemented and locally tested | `response_model.py`; posterior-isolation tests |
-| Centered response and decision residuals | implemented and locally tested | response/decision centering test |
-| Spectral-simplex initializer | implemented and locally tested | initializer/provenance tests |
-| Three separately normalized proper-score channels | implemented and locally tested | v4 objective test |
-| Delayed causal probe response | implemented and locally tested | delayed-window tests |
-| Probe-conditioned t+2 CRN decision target | implemented and locally tested | successor-anchor tests |
-| Exact 66-outcome delayed VOI | implemented and locally tested | VOI tests and synthetic artifact |
-| One committed base bridge after an active probe | implemented and locally tested | active bridge test |
-| Final action-selectivity audit | implemented and locally tested | final-audit broadcasting regression |
-| Versioned deployment/checkpoint round trip | implemented and locally tested | storage/deployment test |
+| Method identity | implemented | config 3, checkpoint schema 5, deployment schema 4, package 0.6.0 |
+| Episode-static response posterior | implemented and locally tested | filter persistence/reset tests |
+| Belief-conditioned raw-return critic | implemented and locally tested | dense TD(lambda), pairwise-CRN and mirror-policy tests |
+| Delayed response and exact 66-outcome VOI | implemented and locally tested | delayed-window and synthetic VOI tests |
+| Semantic initializer K=2/4/8 | implemented and locally tested | initializer/provenance tests |
+| `test_time_wide` `5x5x43` observation | implemented and locally tested | layout-derived channel-block tests |
+| Uniform registered partner sampling | implemented and locally tested | sampler and training-wiring tests |
+| Config-selected development matrix | implemented | 55 cells per layout with seed-index SP initialization and full pilot/current/successor cost |
+| Formal CUDA shape | implemented | 256 lanes, Floyd anchor sampling, `<40,000 MiB` execution rule |
+| Official upstream DAG | implemented | config-selected layout with support/panels/baselines/FCP populations and lineage ledgers |
+| Paper population evaluator | implemented and locally tested | `(10,10,500)`, root 42, directed SP/XP cells |
+| Common-partner evaluator | implemented and locally tested | `(10,16,2,500)`, root 0, five baselines plus DELTA |
 
 ## Validation status
 
-- Active source compilation: passed.
-- Six registered configurations: passed.
-- Root CLI plus 16 subcommand help paths: passed.
-- Namespace/workflow/credential contracts: passed.
-- Isolated local CPU pytest suite: `50/50` passed, zero failures, zero
-  timeouts; per-test evidence is recorded in
-  `validation/ISOLATED_TEST_RESULTS.json`.
-- Exact delayed-VOI synthetic acceptance: passed.
+- Active source compilation and contract validation: passed.
+- Seven registered configurations are present.
+- Root CLI plus 19 subcommands are present.
+- Isolated CPU regression: 82/82 passed with no failure or timeout; details are
+  recorded in `VALIDATION_REPORT.md`.
+- No local source check is scientific performance evidence.
 
 ## Empirical status
 
-| Stage | Status |
+| Work | Status |
 |---|---|
-| Real fitted initializer from calibration lineages | not generated in this source package |
-| Real Official-checkpoint v4 mechanical run | not executed |
-| CUDA memory/throughput acceptance | not executed |
-| Paired five-seed development matrix | not executed |
-| Formal ten-run Simple/Wide matrix | not executed |
-| H1/H2/H3 evidence | not generated |
-| SOTA claim | closed |
+| `test_time_wide` SP-only ten-run parent population | completed on the isolated server copy |
+| Two-seed `base/response_only/delta_active` pilot | completed: six development runs |
+| Held-out two-parent SP evaluation | completed: 800 episodes per arm with matched keys |
+| Full Official upstream populations for this layout | deferred; not part of the current pilot |
+| Fitted semantic initializer for this layout | pilot K=4 artifact completed; full K=2/4/8 set deferred |
+| Real 256-lane CUDA execution | not yet executed |
+| 55-run development matrix for this layout | not yet executed |
+| Ten-run DELTA population for this layout | not yet executed |
+| Paper/common-partner evaluations for this layout | not yet executed |
+| Layout-side H1/H2/H3 components | not generated |
+| Full H1/H2/H3 or SOTA claim | unavailable: `test_time_simple` was not run |
 
-The three-seed v3 CUDA pilot remains historical failure evidence. Its return,
-posterior and VOI measurements cannot be reported as v4 results.
+## Completed pilot path
 
-## Next executable scientific path
+The completed server pilot is deliberately smaller than the implemented full
+workflow. It trained one ten-run Official SP population, preassigned six parent
+runs to training, two to the unlabeled K=4 initializer and two to held-out
+measurement, then ran paired seeds 0 and 1 for `base`, `response_only` and
+`delta_active`. All three arms used the same two held-out SP parents, roles and
+environment keys.
 
-1. Build lineage-disjoint fitted semantic initializers for Simple and Wide at
-   K=2/4/8.
-2. Run the one-update CUDA mechanical path and archive its resource ledger.
-3. Execute the bounded paired development matrix.
-4. Inspect partner separation, filter KL, component event JS, successor action
-   ordering, VOI action spread and active/passive policy TV together with raw
-   return.
-5. Proceed to formal training only under the registered protocol; no local
-   source test acts as a performance gate or substitute result.
+The final-code rerun produced held-out raw-return means of `base=24.625`,
+`response_only=-2.825`, and `delta_active=0.300`. Paired seed differences were
+`delta_active-response_only=(1.35, 4.90)`,
+`response_only-base=(-15.95, -38.95)`, and
+`delta_active-base=(-14.60, -34.05)`. Active DELTA improved on response-only in
+both seeds, while both semantic arms remained substantially below base.
+
+The 55-run matrix, OP/SA/FCP populations, formal DELTA population, paper cube,
+16-partner common evaluation and claim/resource synthesis were not part of this
+pilot and were not started. The pilot did not invoke `formal-claim`.
+
+These are two-seed SP-only development observations, not registered H2,
+Table 2, H1/H2/H3 or SOTA evidence.

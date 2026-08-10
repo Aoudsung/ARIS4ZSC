@@ -695,9 +695,12 @@ def restore_official_checkpoint(
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     import orbax.checkpoint as ocp
 
-    restored = ocp.PyTreeCheckpointer().restore(
-        str(Path(checkpoint_path).resolve())
+    path = str(Path(checkpoint_path).resolve())
+    checkpointer = ocp.PyTreeCheckpointer()
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        checkpointer.metadata(path)
     )
+    restored = checkpointer.restore(path, restore_args=restore_args)
     return restored["config"], restored["params"]
 
 
@@ -883,6 +886,7 @@ class VectorEnvironment:
             indicate_successful_delivery=(
                 config.environment.indicate_successful_delivery
             ),
+            op_ingredient_permutations=False,
         )
         return cls(
             environment=environment,

@@ -1,4 +1,4 @@
-"""Proper objectives for DELTA v4's two parameter owners."""
+"""Response and decision objectives for DELTA v5's two parameter owners."""
 
 from __future__ import annotations
 
@@ -212,21 +212,20 @@ def ppo_loss(
     )
     logits = output.base_policy_logits[:-1]
     value = output.value
-    reward = jnp.asarray(batch.rewards, dtype=jnp.float32) + jnp.asarray(
-        batch.shaped_rewards, dtype=jnp.float32
-    )
-    advantages, returns = generalized_advantage_estimation(
-        rewards=reward,
-        dones=batch.dones,
-        values=jax.lax.stop_gradient(value),
-        gamma=model.config.ppo.gamma,
-        gae_lambda=model.config.ppo.gae_lambda,
-    )
+    # Fixed at collection time.  Recomputing the advantage here from the
+    # candidate critic -- as this function used to -- means every minibatch and
+    # every epoch optimises a different objective, and the value target becomes
+    # a regression onto the very network being regressed.
+    advantages = jnp.asarray(batch.advantages, dtype=jnp.float32)
+    returns = jnp.asarray(batch.returns, dtype=jnp.float32)
     mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
     if bool(model.config.ppo.normalize_advantages):
+        # std + eps, matching the Official normalisation exactly.  The
+        # previous sqrt(variance + eps) differs whenever the spread is
+        # small, which is precisely the regime this task sits in.
         mean = _masked_mean(advantages, mask)
         variance = _masked_mean(jnp.square(advantages - mean), mask)
-        advantages = (advantages - mean) / jnp.sqrt(variance + 1.0e-8)
+        advantages = (advantages - mean) / (jnp.sqrt(variance) + 1.0e-8)
 
     new_logp = categorical_log_probability(logits, batch.actions)
     ratio = jnp.exp(new_logp - jnp.asarray(batch.old_log_probabilities))
@@ -238,7 +237,7 @@ def ppo_loss(
     actor = -_masked_mean(
         jnp.minimum(ratio * advantages, clipped_ratio * advantages), mask
     )
-    old_value = jnp.asarray(batch.old_values, dtype=jnp.float32)
+    old_value = jnp.asarray(batch.old_values, dtype=jnp.float32)[:-1]
     current_value = value[:-1]
     value_clipped = old_value + jnp.clip(
         current_value - old_value,
@@ -267,7 +266,10 @@ def ppo_loss(
             "ppo_entropy": entropy,
             "ppo_sampled_action_kl": approximate_kl,
             "ppo_ratio_mean": _masked_mean(ratio, mask),
-            "ppo_return_mean": _masked_mean(returns, mask),
+            # The mean GAE *target*, not an episode return.  Naming it
+            # "return" invited exactly the misreading it got.
+            "gae_target_mean": _masked_mean(returns, mask),
+            "gae_advantage_mean": _masked_mean(advantages, mask),
         },
     )
 
@@ -740,7 +742,7 @@ def latent_composite_loss(
     target_latent_params: Any = None,
     include_contrast: bool = True,
 ) -> LossResult:
-    """Channel-normalized proper score for the unified v4 latent model.
+    """Response proper scores and direct decision losses for DELTA v5.
 
     Each independently sampled measurement channel contributes its own mean
     negative log probability with a fixed coefficient of one.  Consequently

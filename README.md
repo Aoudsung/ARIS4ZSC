@@ -1,23 +1,23 @@
-# DELTA-ZSC v4: Episode-Static Decision-Relevant Adaptation
+# DELTA-ZSC v5: Belief-Conditioned Raw-Return Adaptation
 
-This repository contains the unified DELTA-ZSC v4 implementation for the
+This repository contains the unified DELTA-ZSC v5 implementation for the
 OvercookedV2 Test-Time Protocol Formation benchmark.
 
 Active identity:
 
 - `METHOD_VERSION = delta_belief_conditioned_raw_return_pairwise_crn_v5`
 - `CONFIG_VERSION = 3`
-- `CHECKPOINT_SCHEMA_VERSION = 4`
+- `CHECKPOINT_SCHEMA_VERSION = 5`
 - `MANIFEST_VERSION = 2`
 - package version: `0.6.0`
 - active namespace: `src/delta_zsc/`
 - active CLI: `python -m experiments.overcooked_v2.delta_zsc`
 
-v4 checkpoints, optimizer state, semantic-initializer metadata, and deployment
-bundles are intentionally incompatible with v3 DELTA artifacts. Official SP/OP
-parent checkpoints and version-2 partner manifests remain valid. The v3 CUDA
-runs remain failure-diagnostic evidence only and cannot be resumed or included
-in v4 scientific summaries.
+v5 checkpoints, optimizer state, semantic-initializer metadata, and deployment
+bundles are intentionally incompatible with v4 and earlier DELTA artifacts.
+Official parent checkpoints and version-2 partner manifests remain valid.
+Earlier CUDA runs remain failure-diagnostic evidence only and cannot be
+resumed or included in v5 scientific summaries.
 
 The retired DEPI v8 implementation is preserved under
 `legacy/implementation_v8/`; historical documents are under `docs/legacy/`.
@@ -34,18 +34,23 @@ legal local history
     -> shared occurrence prediction
     -> component-semantic response likelihood
     -> episode-static Bayes posterior b_t(z)
-    -> shared decision baseline + centered component decision residual
+    -> belief-conditioned raw-return value Q(x_t,b_t,a)
+    -> dense TD(lambda) fit + sparse pairwise-CRN action calibration
     -> KL-constrained mirror policy
     -> optional delayed-response Bayesian VOI
 ```
 
 The latent components are not partner IDs or algorithm labels. A component is
-useful only when it jointly predicts a legal semantic response difference and a
-different action-value residual.
+useful only when legal semantic response evidence selects it differently across
+partners and the resulting belief changes action ordering in the shared value
+model.
 
-## What changed in v4
+## Active v5 design
 
-v4 repairs the failure mode measured in v3: a trainable physical-time
+v5 retains the episode-static response model introduced after the v3 failure
+and replaces the unidentifiable component-wise return mixture with the quantity
+the trajectories actually observe: raw return conditioned on legal belief.
+A trainable physical-time
 transition erased sparse evidence, high-frequency no-change factors could
 create a partner-independent component winner, near-symmetric output heads
 learned a pooled response instead of component semantics, and immediate
@@ -61,10 +66,11 @@ The active implementation therefore makes six coupled changes.
    change are predicted and scored by shared heads with no component axis.
    Only conditional geometry and structured interface event type can change
    the posterior.
-3. **Centered residual emissions.** Every semantic response and decision head
-   is `shared baseline + zero-mean component residual`. Residuals receive both
-   a context path and a direct component-embedding skip with standard fan-in
-   initialization. Decision variance is shared across components.
+3. **Centered response residuals and a belief-conditioned critic.** Semantic
+   response heads are `shared baseline + zero-mean component residual`.
+   Decision value is a dueling raw-return function of task state, current
+   partner evidence and the complete posterior, with an ensemble spread used
+   only as a diagnostic.
 4. **Unlabeled spectral-simplex initialization.** A fixed label-free
    Rademacher projection makes every frame coordinate available to a
    cross-fitted pooled event model without introducing a privileged label or
@@ -73,10 +79,10 @@ The active implementation therefore makes six coupled changes.
    directions are found by SVD, and a centered regular simplex initializes the
    event residuals. SP/OP labels and partner IDs are never used to construct the
    initializer. A parent-disjoint label oracle is emitted only as a diagnostic.
-5. **Channel-normalized proper score.** Shared response, semantic response, and
-   decision observations each contribute their own mean negative log
-   likelihood with fixed coefficient one. Rollout length and anchor frequency
-   therefore cannot silently become loss weights.
+5. **Direct decision supervision.** Every rollout step supplies a raw-reward
+   TD(lambda) target. Sparse all-action continuations calibrate pairwise action
+   differences with their measured CRN uncertainty. No objective weight or
+   effect threshold is introduced.
 6. **Delayed active estimand.** Passive filtering keeps the legal immediate
    response. Active VOI uses a separate two-step response head for
    `o[t+1] -> o[t+2]`, after the teammate has had one opportunity to react to
@@ -149,13 +155,10 @@ only departures from that pooled prediction. A direct embedding-to-output path
 prevents the component difference from being multiplied away by a near-zero
 shared output map.
 
-The same decomposition is used for current and probe-successor decision
-emissions:
-
-\[
-\mu_k(x,a)=\mu_0(x,a)+\Delta\mu_k(x,a),\qquad
-\sum_k\Delta\mu_k(x,a)=0.
-\]
+Decision value is not decomposed into separately fitted component heads. The
+same critic is evaluated at the current posterior for control and at one-hot
+component beliefs when exact delayed-response VOI needs component-conditional
+utilities.
 
 ## Exact delayed active VOI
 
@@ -186,7 +189,7 @@ For each candidate probe `a`, the decision head predicts a post-response matrix
 The current control value is
 
 \[
-Q^{active}_t(a)=\sum_k b_t(k)\mu^{current}_k(a)
+Q^{active}_t(a)=Q_\psi(x_t,b_t,a)
 +\gamma^2\operatorname{VOI}(a).
 \]
 
@@ -209,20 +212,21 @@ collect rollout D_n and sparse CRN anchors C_n with base omega_n
     -> update base omega_n with PPO minibatches from D_n
 ```
 
-The latent objective is
+The latent transaction is
 
 \[
-L_{latent}=L_{shared}+L_{semantic}+L_{decision},
+L_{latent}=L_{shared\ NLL}+L_{semantic\ NLL}
++L_{raw\ TD}+L_{pairwise\ CRN}+L_{successor},
 \]
 
-where each term is independently normalized by its own actual observation
-count. `response_only` omits decision observations; `delta_passive` uses current
-all-action anchors; `delta_active` additionally uses delayed response and
-probe-successor anchors.
+with fixed coefficient one for each present term. Response scores are normalized
+by their own actual observation counts. `response_only` omits decision terms;
+`delta_passive` uses dense raw-reward targets and current all-action anchors;
+`delta_active` additionally uses delayed response and successor measurements.
 
 ## Semantic initializer workflow
 
-A development or formal v4 run that trains semantic latent parameters
+A development or formal v5 run that trains semantic latent parameters
 (`response_only`, `delta_passive`, or `delta_active`) requires a versioned,
 fitted initializer artifact. The
 `--deployment` argument is a previously completed *development collection*
@@ -264,16 +268,47 @@ training-lineage-overlapping initializer.
 python -m experiments.overcooked_v2.delta_zsc --help
 ```
 
-The CLI covers partner-manifest construction, semantic initialization, CUDA
-preflight, training, development matrices, evaluation, posterior diagnostics,
-belief intervention, baselines, resource accounting, and formal-claim assembly.
+The CLI has 19 subcommands covering partner-manifest construction, Official
+upstream assets, semantic initialization, CUDA preflight, training, development
+matrices, both evaluation estimands, posterior diagnostics, belief
+intervention, baselines, resource accounting, and claim assembly.
+
+## Layout-selected execution
+
+The `test_time_wide` layout reads the Official `5x5x43` local observation, samples the
+registered support manifest uniformly over mechanism, family, stage and run,
+and uses 256 formal environments. Exact without-replacement anchor selection
+uses a bounded-state Floyd sampler, so the registered 256-lane shape no longer
+requires a full 65,536-element random sort on L40 hardware.
+
+`run-upstream` reads the layout from its config and constructs the support, calibration,
+development-coverage, confirmatory, baseline and FCP-source populations with
+preassigned root seeds and lineage records. Development and formal seed `s`
+start from support SP parent `s`; all variants at one development seed use the
+same parent. Execution is one continuous dependency graph. Diagnostic or return
+values do not decide whether later jobs run.
+IPPO-Large is not an upstream asset: train it with `train-baseline` after the
+corresponding DELTA deployments exist.
+
+Evaluation preserves two different objects for each layout:
+
+- the paper-compatible `(10,10,500)` directed population cube, rooted at 42;
+- the common-partner `(10,16,2,500)` matrix, rooted at 0.
+
+Both use final checkpoints, raw team return, actual two-word environment keys
+and non-permuted OP observations. Results from one layout alone do not establish
+full H1/H2/H3 or SOTA.
 
 ## Validation boundary
 
 Local regression and synthetic diagnostics establish implementation contracts,
-not benchmark performance. v4 has not been trained on the formal ten-seed
-Simple/Wide protocol in this source package. The old v3 pilot remains evidence
-for why v4 was required, not evidence that v4 improves return.
+not benchmark performance. v5 has completed one two-seed, SP-only development
+pilot on the `test_time_wide` layout. In the final-code rerun,
+`delta_active-response_only` was +1.35 and +4.90 across the two seeds, while
+`response_only-base` was -15.95 and -38.95 and `delta_active-base` was -14.60
+and -34.05. The pilot did not include `delta_passive`, so it is not registered
+H2 or a paper population matrix. The formal ten-seed protocol across both
+layouts has not been run, so H1/H2/H3 and SOTA remain unestablished.
 
 See:
 

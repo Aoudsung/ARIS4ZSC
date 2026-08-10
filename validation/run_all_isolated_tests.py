@@ -64,7 +64,7 @@ def write_results(records: list[dict[str, object]], *, started: float, complete:
     }
     RESULT_JSON.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
-        "DELTA v4 isolated local CPU regression",
+        "DELTA v5 isolated local CPU regression",
         f"python={payload['python_version']}",
         f"jax={payload['jax_version']}",
         f"numpy={payload['numpy_version']}",

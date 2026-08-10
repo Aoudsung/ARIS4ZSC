@@ -13,12 +13,50 @@ PARTNER_INVENTORY_FACTOR_CLASSES = 2
 INTERFACE_EVENT_CLASSES = 31
 OTHER_MULTI_EVENT = 30
 
-STATIC_CHANNEL_START = 20
-STATIC_CHANNEL_END = 29
-DYNAMIC_CHANNEL_START = 29
-DYNAMIC_CHANNEL_END = 34
-RECIPE_CHANNEL_START = 34
-RECIPE_CHANNEL_END = 39
+AGENT_POSITION_LAYERS = 1
+AGENT_DIRECTION_LAYERS = 4
+STATIC_OBJECT_LAYERS = 6
+
+
+def task_channel_blocks(channel_count: int) -> dict[str, tuple[int, int]]:
+    """Where the task blocks sit, for a layout with any ingredient count.
+
+    These were absolute constants (20/29/34/39), which are the correct offsets
+    for a three-ingredient layout and wrong for every other.  Two of the six
+    registered layouts -- ``test_time_wide`` and ``demo_cook_wide`` -- carry
+    four ingredients and 43 channels, and ``wide`` is one of the two layouts
+    the formal protocol requires, so the registered wide experiment could not
+    have run at all.
+
+    The Official concatenation order is::
+
+        agent(1 + 4 + (n+2)) | other(same) | static(6) | piles(n)
+        | ingredients(n+2) | recipe(n+2) | pot timer | delivery flag
+
+    DELTA's ``static`` block is the environment's static objects *and* the
+    ingredient piles; its ``dynamic`` block is the ingredient layers.  The
+    naming predates this function and is kept so the interface extractor reads
+    the same fields as before.
+
+    The recipe block is clipped to the channels the observation actually has.
+    On a four-ingredient layout the environment's own ``_get_obs_shape``
+    undercounts, so the local frame stops one channel into the recipe block --
+    an upstream defect, reported here by returning the truncated bound rather
+    than an index that would raise.
+    """
+
+    channels = int(channel_count)
+    ingredients = ingredient_count(channels)
+    agent_block = AGENT_POSITION_LAYERS + AGENT_DIRECTION_LAYERS + ingredients + 2
+    static_start = 2 * agent_block
+    dynamic_start = static_start + STATIC_OBJECT_LAYERS + ingredients
+    recipe_start = dynamic_start + ingredients + 2
+    recipe_end = min(recipe_start + ingredients + 2, channels)
+    return {
+        "static": (static_start, dynamic_start),
+        "dynamic": (dynamic_start, recipe_start),
+        "recipe": (recipe_start, recipe_end),
+    }
 
 ACTION_RIGHT = 0
 ACTION_DOWN = 1
@@ -107,12 +145,16 @@ def decode_local_task_state(observation: Any) -> LocalTaskState:
     import jax.numpy as jnp
 
     value = jnp.asarray(observation, dtype=jnp.float32)
-    if value.shape[-3:] != (5, 5, 39):
-        raise ValueError("Interface responses require the registered 5x5x39 frame.")
+    if tuple(value.shape[-3:-1]) != (5, 5):
+        raise ValueError("Interface responses require the 5x5 local frame.")
+    blocks = task_channel_blocks(value.shape[-1])
+    static_start, static_end = blocks["static"]
+    dynamic_start, dynamic_end = blocks["dynamic"]
+    recipe_start, recipe_end = blocks["recipe"]
     return LocalTaskState(
-        static=value[..., STATIC_CHANNEL_START:STATIC_CHANNEL_END],
-        dynamic=value[..., DYNAMIC_CHANNEL_START:DYNAMIC_CHANNEL_END],
-        recipe=value[..., RECIPE_CHANNEL_START:RECIPE_CHANNEL_END],
+        static=value[..., static_start:static_end],
+        dynamic=value[..., dynamic_start:dynamic_end],
+        recipe=value[..., recipe_start:recipe_end],
     )
 
 
@@ -151,9 +193,10 @@ def ego_situation(observation: Any) -> tuple[Any, Any, Any, Any]:
     holding = jnp.where(plate_mass > 0.5, 2, holding)
     holding = jnp.where(dish_mass > 0.5, 3, holding)
 
-    dynamic = value[..., DYNAMIC_CHANNEL_START:DYNAMIC_CHANNEL_END]
+    blocks = task_channel_blocks(value.shape[-1])
+    dynamic = value[..., blocks["dynamic"][0] : blocks["dynamic"][1]]
     pot_active = jnp.sum(dynamic, axis=(-3, -2, -1)) > 0.5
-    recipe = value[..., RECIPE_CHANNEL_START:RECIPE_CHANNEL_END]
+    recipe = value[..., blocks["recipe"][0] : blocks["recipe"][1]]
     recipe_visible = jnp.sum(recipe, axis=(-3, -2, -1)) > 0.5
     return holding, partner_visibility(value), pot_active, recipe_visible
 
@@ -416,6 +459,7 @@ __all__ = [
     "align_egocentric_frames",
     "EGO_HOLDING_CLASSES",
     "decode_local_task_state",
+    "task_channel_blocks",
     "ego_situation",
     "extract_interface_target",
     "extract_probe_response_target",

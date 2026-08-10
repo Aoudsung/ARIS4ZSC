@@ -1,4 +1,4 @@
-"""Unified DELTA-ZSC v4 model and deployment transition.
+"""Unified DELTA-ZSC v5 model and deployment transition.
 
 ``base_params`` own task competence and are trained only by on-policy PPO.
 ``latent_params`` own the episode-static semantic response, delayed probe

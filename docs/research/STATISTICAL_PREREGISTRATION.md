@@ -1,10 +1,10 @@
-# STATISTICAL_PREREGISTRATION — DELTA-ZSC v4
+# STATISTICAL_PREREGISTRATION — DELTA-ZSC v5
 
 `authoritative: true`
 
-## Frozen before confirmatory evaluation
+## Registered before confirmatory evaluation
 
-- v4 method/source identity and schemas;
+- v5 method/source identity and schemas;
 - Simple/Wide configs and semantic initializer artifacts;
 - training, initializer-calibration, posterior-calibration, and confirmatory
   partner manifests;
@@ -39,15 +39,17 @@ Using paired development seed means, estimate
 J(\text{delta-passive})-J(\text{response-only}).
 \]
 
-Both layouts require a 95% interval lower endpoint above zero. H2 is
-confirmatory only after H1.
+Both layouts require a 95% interval lower endpoint above zero. The closed claim
+hierarchy interprets H2 after H1, but H2 execution and reporting do not wait on
+or change in response to H1.
 
 ## H3
 
 At same-world anchors, compare source continuation value of correct-belief and
 task-matched shuffled-belief mirror policies. Bootstrap ego and partner nodes.
-Both layouts require a one-sided lower bound above zero. H3 is confirmatory only
-after H1 and H2.
+Both layouts require a one-sided lower bound above zero. The closed claim
+hierarchy interprets H3 after H1 and H2, but all intervention jobs execute on
+the preassigned schedule regardless of those results.
 
 ## Secondary active result
 
@@ -66,8 +68,8 @@ and full resources. None may replace the primary endpoint.
 
 ## Missingness and failures
 
-A missing run is not replaced by another seed. A rerun keeps the immutable
-identity. Exclusion requires pre-existing mechanical invalidity such as an
+A missing run is not replaced by another seed. Infrastructure continuation
+keeps the same recorded identity. Exclusion requires pre-existing mechanical invalidity such as an
 unreadable checkpoint, lineage mismatch, non-finite state, malformed initializer,
 or incomplete raw artifact. Poor performance, uniform belief, or zero active
 increment are never exclusion criteria.

@@ -1,17 +1,17 @@
-# RESEARCH_PROGRAM — Direct execution path for DELTA-ZSC v4
+# RESEARCH_PROGRAM — Direct execution path for DELTA-ZSC v5
 
 The objective is benchmark superiority supported by a falsifiable mechanism
 chain. Engineering acceptance certifies experiment validity; it is not a
 reason to postpone end-to-end runs.
 
-## 1. Source and semantic-initializer acceptance
+## 1. Source and semantic-initializer execution
 
-For the exact v4 commit:
+For the recorded v5 source revision:
 
 1. run compilation, configuration, CLI, repository-boundary, core, VOI,
    semantic, training, runner/storage, and manifest tests;
-2. generate the v4 synthetic exact-VOI artifact;
-3. build one initializer per layout from the frozen calibration panel;
+2. generate the v5 synthetic exact-VOI artifact;
+3. build one initializer per layout from the registered calibration panel;
 4. verify initializer centering, singular values, unlabeled construction, and
    parent-disjoint conditional oracle artifact;
 5. execute one real CUDA mechanical update with current and successor anchors,
@@ -30,23 +30,28 @@ post-hoc variants. Read results in this causal order:
 6. total-interaction controls and bounded K sensitivity;
 7. resource and numerical diagnostics.
 
-The v4 mechanism is considered operational only when:
+Interpret the mechanism with all of the following evidence together:
 
 - component event distributions are non-identical;
 - beliefs differ by partner more than by episode phase alone;
-- component decision residuals alter action ordering;
+- legal-belief changes alter the shared critic's action ordering;
 - same-world belief intervention has positive empirical value;
 - active VOI has action-wise spread and changes the passive policy when its
   secondary contribution is claimed.
 
-These are interpretation requirements, not training gates.
+These are interpretation criteria. Their values do not change losses,
+variants, budgets or downstream execution.
 
 ## 3. Formal execution
 
-Freeze source, configs, initializer artifacts, manifests, and seeds. Train ten
-`delta_active` runs per layout and all registered baselines under the Official
-protocol. Produce full ego x partner x role matrices, resource ledgers,
-posterior diagnostics, final current/successor audits, and belief interventions.
+Record source, configs, initializer artifacts, manifests and seeds in every run
+identity. Train ten `delta_active` runs per layout and all registered baselines
+under the Official protocol. Produce the paper population cubes, full ego x
+partner x role matrices, resource ledgers, posterior diagnostics, final
+current/successor audits and belief interventions.
+
+Execution follows data dependencies continuously. Diagnostics are reported in
+parallel with performance evidence and never act as stage-release decisions.
 
 ## 4. Paper decision
 

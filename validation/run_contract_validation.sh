@@ -36,9 +36,11 @@ from src.delta_zsc.config import (
 from src.delta_zsc.semantic_initializer import SEMANTIC_INITIALIZER_SCHEMA_VERSION
 
 paths = sorted(Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml"))
-assert len(paths) == 6, paths
+assert len(paths) == 7, paths
 for path in paths:
     run_kind = path.stem.rsplit("_", 1)[-1]
+    if run_kind == "collector":
+        run_kind = "development"
     config = load_config(path, run_kind=run_kind)
     assert config.version == CONFIG_VERSION
     print(path, config.version, config.method_variant, config.method)
@@ -75,10 +77,10 @@ PY
 python -m experiments.overcooked_v2.delta_zsc --help >/dev/null
 for command in \
   build-partner-manifest validate-partner-manifest train cuda-preflight \
-  build-policy-manifest evaluate summarize-evaluations \
+  build-policy-manifest evaluate summarize-evaluations summarize-population-matrices \
   build-semantic-initializer posterior-diagnostics belief-intervention run-development-matrix \
   evaluate-development-matrix summarize-development-matrix \
-  train-baseline resource-report formal-claim; do
+  train-baseline train-official-parent run-upstream resource-report formal-claim; do
   python -m experiments.overcooked_v2.delta_zsc "${command}" --help >/dev/null
 done
 
@@ -108,7 +110,7 @@ credential_patterns = (
     re.compile(r"AKIA[0-9A-Z]{16}"),
 )
 for path in Path(".").rglob("*"):
-    if not path.is_file() or {".git", "__pycache__", ".pytest_cache"} & set(path.parts):
+    if not path.is_file() or {".git", ".venv", "__pycache__", ".pytest_cache"} & set(path.parts):
         continue
     try:
         text = path.read_text(encoding="utf-8")

@@ -23,11 +23,9 @@ import yaml
 
 CONFIG_VERSION = 3
 METHOD_VERSION = "delta_belief_conditioned_raw_return_pairwise_crn_v5"
-# Schema version 2 dropped every checksum/fingerprint field: artifacts are
-# identified by run id and path, never by a digest.  Version 5 added the
-# belief-conditioned critic to the latent tree; a v4 checkpoint has no
-# ``belief_value`` subtree and must fail closed rather than deploy a policy
-# whose decision head is missing.
+# Version 5 added the belief-conditioned critic to the latent tree. A v4
+# checkpoint has no ``belief_value`` subtree and must fail closed rather than
+# deploy a policy whose decision head is missing.
 CHECKPOINT_SCHEMA_VERSION = 5
 MANIFEST_VERSION = 2
 FORMAL_METHOD_LABEL = "delta-active"
@@ -73,27 +71,8 @@ class RunBudget:
     checkpoint_interval_environment_steps: int
 
 
-FORMAL_NUM_ENVS = 128
-"""Formal vector width, reduced from the registered 256.
-
-At 256 the CRN anchor kernel asks CUDA for 131072 bytes of shared memory per
-block and the L40 this runs on offers 101376, so the anchor update fails to
-compile -- reproduced by cuda-preflight and unaffected by
-``--xla_gpu_enable_triton_gemm=false`` or ``--xla_gpu_autotune_level=0``.  A
-bisection over the anchor kernel put the ceiling between 192 and 256.
-
-128 is the largest width that clears both that ceiling and every registered
-divisibility rule: 29_949_952 total steps and the 1_048_576 anchor interval are
-whole multiples of 128*256, and 128 divides the 64 minibatches per epoch.  Every
-other registered number is therefore unchanged; only the width moves.
-
-This is a deviation from the registered protocol, not a neutral engineering
-knob.  Halving the width doubles the update count (457 -> 914) and halves the
-per-update sample, so the optimisation trajectory differs even at identical
-total steps.  Results produced this way must not be reported as the registered
-Official protocol.  Restore 256 on hardware with >=128 KiB of shared memory per
-block (Hopper and later).
-"""
+FORMAL_NUM_ENVS = 256
+FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 1024 * 1024
 
 RUN_BUDGETS: Mapping[str, RunBudget] = {
     "mechanical": RunBudget(4, 1_024, 1, 1_024),
@@ -600,6 +579,8 @@ def validate_config(config: RunConfig) -> None:
 __all__ = [
     "CHECKPOINT_SCHEMA_VERSION",
     "CONFIG_VERSION",
+    "FORMAL_NUM_ENVS",
+    "FORMAL_PEAK_MEMORY_LIMIT_BYTES",
     "LAYOUTS",
     "MANIFEST_VERSION",
     "METHOD_VARIANTS",

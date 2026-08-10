@@ -225,8 +225,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         length=4,
     )
     compact_runner, compact_batch, no_snapshots = compact(
-        runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0),
-        jax.random.PRNGKey(0)
+        runner, base, latent, jnp.asarray(0.25), jax.random.PRNGKey(0)
     )
     assert no_snapshots is None
     assert _same_tree(legacy_runner, compact_runner)
@@ -243,7 +242,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         states_per_trigger=2,  # pilot candidates, narrowed to 1 below
     )
     sparse_runner, sparse_batch, snapshots = sparse(
-        runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0), index_key
+        runner, base, latent, jnp.asarray(0.25), index_key
     )
     assert _same_tree(legacy_runner, sparse_runner)
     assert _same_tree(legacy_batch, sparse_batch)
@@ -489,8 +488,7 @@ def test_pilot_narrows_the_measured_anchor_set() -> None:
         states_per_trigger=4,
     )
     _, _, snapshots = rollout(
-        runner, base, latent, jnp.asarray(0.25), jnp.asarray(0.0),
-        jax.random.PRNGKey(1)
+        runner, base, latent, jnp.asarray(0.25), jax.random.PRNGKey(1)
     )
     assert snapshots.time_indexes.shape == (4,)
 
@@ -519,3 +517,23 @@ def test_pilot_narrows_the_measured_anchor_set() -> None:
         for t, l in zip(snapshots.time_indexes, snapshots.lane_indexes)
     }
     assert kept in candidates
+
+
+def test_formal_anchor_candidate_sampler_is_exactly_without_replacement() -> None:
+    import jax
+    import numpy as np
+
+    from src.delta_zsc.anchors import select_anchor_indexes
+
+    time, lane = jax.jit(
+        lambda key: select_anchor_indexes(
+            key,
+            time_count=256,
+            environment_count=256,
+            requested=256,
+        )
+    )(jax.random.PRNGKey(7))
+    flat = np.asarray(time) * 256 + np.asarray(lane)
+    assert flat.shape == (256,)
+    assert len(np.unique(flat)) == 256
+    assert np.all((0 <= flat) & (flat < 256 * 256))

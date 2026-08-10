@@ -1,4 +1,4 @@
-"""Episode-static shared-latent coordination model for DELTA v4.
+"""Episode-static shared-latent coordination model for DELTA v5.
 
 Immediate semantic responses update the legal posterior. Shared occurrence
 factors are predicted but cannot change component responsibilities. Delayed

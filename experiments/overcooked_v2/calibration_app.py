@@ -1,4 +1,4 @@
-"""Calibration and posterior-predictive diagnostics for DELTA-ZSC v4."""
+"""Calibration and posterior-predictive diagnostics for DELTA-ZSC v5."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.delta_zsc.config import METHOD_VERSION, OFFICIAL_ACTION_COUNT, load_config
-from src.delta_zsc.manifest import load_partner_manifest
+from src.delta_zsc.manifest import load_partner_manifest, normalized_mechanism
 from src.delta_zsc.observation import (
     INTERFACE_EVENT_CLASSES,
     extract_probe_response_target,
@@ -357,11 +357,6 @@ def build_semantic_initializer(args: argparse.Namespace) -> None:
             pool=pool,
             probabilities=jnp.asarray([1.0]),
             run_ids=jnp.asarray([0]),
-            # One member: the stage curriculum renormalises within its single
-            # group and is therefore the identity here.
-            checkpoint_stages=jnp.asarray([1.0]),
-            group_indexes=jnp.asarray([0]),
-            group_count=1,
         )
         environment = VectorEnvironment.create(config)
         runner = initialize_runner(
@@ -561,7 +556,7 @@ def build_semantic_initializer(args: argparse.Namespace) -> None:
         output / "semantic_initializer_summary.json",
         {
             "version": 1,
-            "artifact_type": "delta_v4_semantic_initializer_summary",
+            "artifact_type": "delta_v5_semantic_initializer_summary",
             "initializers": artifacts,
             "event_count": int(labels.size),
             "episode_count": int(len(rows)),
@@ -595,9 +590,21 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
         expected_layout=config.environment.layout,
         verify_files=not bool(args.skip_manifest_file_check),
     )
-    runs = manifest.by_role("calibration")
+    # The calibration panel is single-mechanism by construction, so the
+    # cross-mechanism total variations below are undefined on it.  The
+    # development-support panel is the one DELTA trains against and carries
+    # both SP and OP, which is what makes "do different partners respond
+    # differently" answerable at all.  The confirmatory panel stays closed:
+    # reading it during development is exactly what panel disjointness forbids.
+    role = str(getattr(args, "partner_role", None) or "calibration")
+    if role not in {"calibration", "development_support"}:
+        raise ValueError(
+            "Posterior diagnostics may read the calibration or "
+            "development-support panel only."
+        )
+    runs = manifest.by_role(role)
     if not runs:
-        raise ValueError("Calibration panel is empty.")
+        raise ValueError(f"Partner panel {role!r} is empty.")
     per_run = []
     steps = 0
     for index, run in enumerate(runs):
@@ -609,11 +616,6 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
             pool=pool,
             probabilities=jnp.asarray([1.0]),
             run_ids=jnp.asarray([0]),
-            # One member: the stage curriculum renormalises within its single
-            # group and is therefore the identity here.
-            checkpoint_stages=jnp.asarray([1.0]),
-            group_indexes=jnp.asarray([0]),
-            group_count=1,
         )
         environment = VectorEnvironment.create(config)
         runner = initialize_runner(
@@ -998,8 +1000,19 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
     )
     by_mechanism = {}
     outcome_by_mechanism = {}
-    for mechanism in sorted({row["partner_mechanism"] for row in per_run}):
-        rows = [row for row in per_run if row["partner_mechanism"] == mechanism]
+    # Keyed by the canonical mechanism name.  The manifest carries "rnn-sp" /
+    # "rnn-op" while every registered comparison in this codebase uses "sp" /
+    # "op"; keying on the raw string made the two total variations below
+    # unreachable -- they were None in every artifact ever produced, including
+    # the formal ones, because "sp" was never a key.
+    for mechanism in sorted(
+        {normalized_mechanism(row["partner_mechanism"]) for row in per_run}
+    ):
+        rows = [
+            row
+            for row in per_run
+            if normalized_mechanism(row["partner_mechanism"]) == mechanism
+        ]
         weights = np.asarray([row["interface_event_count"] for row in rows], dtype=np.float64)
         distributions = np.asarray(
             [row["interface_event_distribution"] for row in rows], dtype=np.float64
@@ -1049,8 +1062,8 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
     write_json(
         output_dir / "posterior_predictive_diagnostics.json",
         {
-            "version": 4,
-            "artifact_type": "delta_v4_posterior_predictive_diagnostics",
+            "version": 5,
+            "artifact_type": "delta_v5_posterior_predictive_diagnostics",
             "method": METHOD_VERSION,
             "layout": config.environment.layout,
             "claim_role": "diagnostic_only",

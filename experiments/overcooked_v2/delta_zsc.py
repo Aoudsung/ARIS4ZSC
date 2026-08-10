@@ -14,12 +14,19 @@ from .development_matrix_app import (
     run_development_matrix,
     summarize_development_matrix,
 )
-from .evaluation_app import build_policy_manifest, run_evaluation, summarize_evaluations
+from .evaluation_app import (
+    build_policy_manifest,
+    run_evaluation,
+    summarize_evaluations,
+    summarize_population_matrices,
+)
 from .formal_claim_app import build_formal_claim_report
 from .intervention_app import run_belief_value_intervention
 from .delta_manifest_app import build_partner_manifest, validate_partner_manifest_command
 from .resource_report_app import run_resource_report
 from .training_app import run_cuda_preflight, run_training
+from .upstream_app import train_official_parent
+from .upstream_pipeline_app import run_upstream
 
 
 def _common_run(parser: argparse.ArgumentParser) -> None:
@@ -88,15 +95,28 @@ def _parser() -> argparse.ArgumentParser:
         "--policy-kind", choices=("delta_deployment", "official_checkpoint"), required=True
     )
     policy_manifest.add_argument("--policy", action="append", required=True)
+    policy_manifest.add_argument("--training-lineage-manifest")
     policy_manifest.add_argument("--run-count", type=int, required=True)
     policy_manifest.add_argument("--output", required=True)
     policy_manifest.set_defaults(function=build_policy_manifest)
 
     evaluate = commands.add_parser("evaluate")
-    _common_run(evaluate)
-    evaluate.add_argument("--policy-manifest", required=True)
+    evaluate.add_argument("--config", required=True)
+    evaluate.add_argument(
+        "--run-kind", choices=("mechanical", "development", "formal"), required=True
+    )
+    evaluate.add_argument(
+        "--evaluation-mode",
+        choices=("common_partner", "population_matrix"),
+        default="common_partner",
+    )
+    evaluate.add_argument("--partner-manifest")
+    evaluate.add_argument("--skip-manifest-file-check", action="store_true")
+    evaluate.add_argument("--policy-manifest")
+    evaluate.add_argument("--left-policy-manifest")
+    evaluate.add_argument("--right-policy-manifest")
     evaluate.add_argument("--partner-role", default="confirmatory")
-    evaluate.add_argument("--seed", type=int, default=0)
+    evaluate.add_argument("--seed", type=int)
     evaluate.add_argument("--output", required=True)
     evaluate.set_defaults(function=run_evaluation)
 
@@ -106,6 +126,11 @@ def _parser() -> argparse.ArgumentParser:
     summarize.add_argument("--seed", type=int, default=0)
     summarize.add_argument("--output", required=True)
     summarize.set_defaults(function=summarize_evaluations)
+
+    population_summary = commands.add_parser("summarize-population-matrices")
+    population_summary.add_argument("--evaluation", action="append", required=True)
+    population_summary.add_argument("--output", required=True)
+    population_summary.set_defaults(function=summarize_population_matrices)
 
     initializer = commands.add_parser("build-semantic-initializer")
     _common_run(initializer)
@@ -129,6 +154,13 @@ def _parser() -> argparse.ArgumentParser:
     diagnostics = commands.add_parser("posterior-diagnostics")
     _common_run(diagnostics)
     diagnostics.add_argument("--deployment", required=True)
+    diagnostics.add_argument(
+        "--partner-role",
+        choices=("calibration", "development_support"),
+        default="calibration",
+        help=("Confirmatory is deliberately not offered: reading it during "
+              "development is what panel disjointness forbids."),
+    )
     diagnostics.add_argument("--output", required=True)
     diagnostics.set_defaults(function=run_posterior_predictive_diagnostics)
 
@@ -145,6 +177,7 @@ def _parser() -> argparse.ArgumentParser:
     matrix.add_argument("--resume", action="store_true")
     matrix.add_argument("--require-cuda", action="store_true")
     matrix.add_argument("--semantic-initializer", required=True)
+    matrix.add_argument("--sp-initializer-root", required=True)
     matrix.set_defaults(function=run_development_matrix)
 
     matrix_eval = commands.add_parser("evaluate-development-matrix")
@@ -172,6 +205,24 @@ def _parser() -> argparse.ArgumentParser:
     baseline.add_argument("--shared-training-ledger")
     baseline.add_argument("--training-lineage-manifest")
     baseline.set_defaults(function=run_official_baseline)
+
+    parent = commands.add_parser("train-official-parent")
+    parent.add_argument("--config", required=True)
+    parent.add_argument(
+        "--run-kind", choices=("mechanical", "development", "formal"), required=True
+    )
+    parent.add_argument("--method", choices=("sp", "op"), required=True)
+    parent.add_argument("--root-seed", type=int, required=True)
+    parent.add_argument("--population-size", type=int, required=True)
+    parent.add_argument("--seed-index", type=int, required=True)
+    parent.add_argument("--parent-training-run-id", required=True)
+    parent.add_argument("--output", required=True)
+    parent.set_defaults(function=train_official_parent)
+
+    upstream = commands.add_parser("run-upstream")
+    upstream.add_argument("--config", required=True)
+    upstream.add_argument("--output", required=True)
+    upstream.set_defaults(function=run_upstream)
 
     resources = commands.add_parser("resource-report")
     resources.add_argument("--ledger", action="append", required=True)

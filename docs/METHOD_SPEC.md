@@ -1,4 +1,4 @@
-# METHOD_SPEC — Unified DELTA-ZSC v4 algorithm
+# METHOD_SPEC — Unified DELTA-ZSC v5 algorithm
 
 `authoritative: true`
 
@@ -68,12 +68,15 @@ The direct response reads partner visibility and, when visible, relative
 position, direction, inventory, and visible-at-both-ends inventory change.
 
 The interface extractor uses two candidate frame alignments: successful ego
-movement and stationary ego. Static channels 20:29 must match on exactly one
-candidate overlap. `stay/interact` use only the stationary candidate. For
+movement and stationary ego. Channel blocks are derived from the ingredient
+count encoded by the Official observation shape. Simple uses static/dynamic/
+recipe starts `20/29/34` in a 39-channel frame; Wide uses `22/32/38` in a
+43-channel frame. Static channels must match on exactly one candidate overlap.
+`stay/interact` use only the stationary candidate. For
 `interact`, the ego-facing cell is removed before dynamic comparison. Ambiguous
 or failed alignment is unavailable. Cross-episode transitions are masked.
 
-Dynamic channels 29:34 produce:
+The derived dynamic block produces:
 
 - interface availability `M`;
 - change indicator `C`;
@@ -198,7 +201,7 @@ variance the objective can shrink measures nothing.
 Component-conditional values are the same function at each one-hot posterior,
 \(Q_\psi(x_t,e_k,\cdot)\). There is no separately parameterised component head.
 The previous formulation predicted `K` centered component means under a Gaussian
-mixture likelihood; measured with frozen parameters, holding both residual
+mixture likelihood; measured with fixed parameters, holding both residual
 branches at zero changed the fitted training NLL by 0.082 of 7.55, so the
 decomposition was not identified by the data. Each anchor observes one real
 partner's return vector, never `K` of them, and no cross-component paired
@@ -255,6 +258,12 @@ measured again under fresh keys, so the contrasts that reach the loss are not
 the ones that won the selection. What selection biases is which states the
 decision head trains on -- deliberately, as the task-stage stratification also
 does -- not the value measured at them.
+
+Candidate indexes are drawn exactly without replacement by Floyd sampling.
+Its state scales with the requested anchor count rather than the full
+`rollout_length x environment_count` grid. At the formal `256x256` shape this
+avoids the full random sort that exceeded the L40 shared-memory limit while
+preserving the same uniform subset distribution.
 
 ## 11b. Probe-conditioned successor state
 
@@ -321,31 +330,32 @@ The delayed head predicts shared visibility/availability/change and a
 component-semantic 31-class event. It is trained only for `delta_active` and is
 never inserted into deployment history after the fact.
 
-## 13. Three channel-normalized proper scores
+## 13. Response proper scores and direct decision objectives
 
-Immediate and delayed shared observations form one shared channel; immediate
-and delayed semantic observations form one semantic channel; current and
-successor CRN observations form one decision channel:
+Immediate and delayed shared observations form one shared proper-score channel;
+immediate and delayed semantic observations form one semantic proper-score
+channel:
 
 \[
 L_{sh}=-\frac{\sum\log p_{sh}}{N_{sh}},\qquad
-L_{sem}=-\frac{\sum\log p_{sem}}{N_{sem}},\qquad
-L_{dec}=-\frac{\sum\log p_{dec}}{N_{dec}}.
+L_{sem}=-\frac{\sum\log p_{sem}}{N_{sem}}.
 \]
 
-The registered latent objective is
+Decision value is supervised directly by raw-reward TD(lambda) on every rollout
+step and by measured pairwise CRN differences on anchor updates. Active DELTA
+also fits the two-step successor feature and its value consistency. The
+registered latent transaction is
 
 \[
-L_{latent}=L_{sh}+L_{sem}+L_{dec}.
+L_{latent}=L_{sh}+L_{sem}+L_{raw\ TD}+L_{pairwise\ CRN}+L_{successor}.
 \]
 
-Every present channel has fixed coefficient one. A missing channel contributes
+Every present term has fixed coefficient one; an inapplicable term contributes
 zero. No tunable auxiliary weight, entropy term, separation loss, pseudo-label,
 or partner classifier is introduced. The optimizer reports the composite and
-parameter-group gradient norms. Exact semantic/decision channel norms and
-cosine are computed report-only on the shared component embeddings in the final
-anchor audit; they never rescale the objective or replicate the complete
-training backward graph.
+parameter-group gradient norms. Exact semantic/decision norms and cosine are
+computed report-only in the final anchor audit; they never rescale the
+objective or replicate the complete training backward graph.
 
 ## 14. Alternating estimator transaction
 
@@ -417,8 +427,23 @@ but never added to control reward.
 - `response_only`: shared/semantic immediate response prediction and legal
   posterior, no decision adaptation;
 - `delta_passive`: belief-conditioned critic and passive robust mirror adaptation;
-- `delta_active`: all v4 channels, successor decision, and delayed exact VOI.
+- `delta_active`: all v5 channels, successor decision, and delayed exact VOI.
 
 Only `K`, `H`, and `delta` are registered scientific method fields. Network
 widths, optimizer settings, fixed initializer norm, replica counts, and budgets
 are engineering or measurement settings.
+
+## 18. Registered partner and initializer binding
+
+Training samples the partner manifest uniformly over mechanism, family, stage
+and run for the complete run; observed performance never changes those
+probabilities. Formal seed `s in 0..9` initializes the base policy from
+development-support SP parent `s`. Development seed `s in 0..4` uses the same
+mapping, and every variant at that seed receives the same parent parameters.
+The initializer collector and the 256-lane CUDA engineering run use parent 0.
+
+These paths and their parent/co-training lineage are recorded in run identity.
+They do not become deployment inputs. The upstream jobs, initializer,
+engineering execution, development matrix, formal training and evaluation form
+one dependency graph; no diagnostic value or development return controls
+whether a downstream dependency is scheduled.

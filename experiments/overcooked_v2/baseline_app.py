@@ -17,6 +17,7 @@ import sys
 import time
 from typing import Any, Mapping
 
+from .evaluation_app import POLICY_MANIFEST_VERSION
 from .official_adapter import (
     OFFICIAL_BASELINE_EXPERIMENTS,
     OfficialNetwork,
@@ -130,7 +131,7 @@ def _validate_fcp_population(
             if {path.name for path in current} != {"ckpt_0", "ckpt_1", "ckpt_final"}:
                 raise ValueError(f"FCP parent {run} must preserve three checkpoints.")
             checkpoints.extend(current)
-    expected_checkpoints = {str(path) for path in checkpoints}
+    expected_checkpoints = {str(path.resolve()) for path in checkpoints}
     population_rows = [row for row in lineage if row["role"] == "fcp_population_checkpoint"]
     if len(population_rows) != 240 or {
         str(row["checkpoint"]) for row in population_rows
@@ -139,6 +140,9 @@ def _validate_fcp_population(
     parent_ids = {str(row["parent_training_run_id"]) for row in population_rows}
     if len(parent_ids) != 80:
         raise ValueError("FCP population must contain 80 independent SP parent runs.")
+    groups = {str(row["co_training_group_id"]) for row in population_rows}
+    if len(groups) != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("FCP population lineage must identify ten co-training groups.")
     minimum = 80 * OFFICIAL_SP_TOTAL_TIMESTEPS
     if ledger.total_training_simulator_steps < minimum:
         raise ValueError("FCP population ledger omits Official SP parent training cost.")
@@ -151,7 +155,7 @@ def _official_command(
     *,
     method: str,
     layout: str,
-    output: Path,
+    hydra_root: Path,
     fcp_population: Path | None,
     ippo_large_dimension: int | None,
 ) -> list[str]:
@@ -169,7 +173,7 @@ def _official_command(
         "VISUALIZE=false",
         "TUNE=false",
         "wandb.WANDB_MODE=disabled",
-        f"hydra.run.dir={output / 'official_hydra'}",
+        f"hydra.run.dir={hydra_root}",
         "hydra.job.chdir=true",
     ]
     if method == "fcp":
@@ -361,11 +365,16 @@ def run_official_baseline(args: argparse.Namespace) -> None:
         "capacity_match": capacity_match,
     }
     ensure_run_identity(output, identity)
+    if (output / "resource_ledger.json").is_file():
+        return
     write_json(output / "official_config.json", resolved)
+    attempts = output / "official_hydra"
+    attempt_index = len(tuple(attempts.glob("attempt-*")))
+    hydra_root = attempts / f"attempt-{attempt_index:02d}"
     command = _official_command(
         method=method,
         layout=layout,
-        output=output,
+        hydra_root=hydra_root,
         fcp_population=fcp_population,
         ippo_large_dimension=(
             None if capacity_match is None else capacity_match["hidden_dimension"]
@@ -373,15 +382,37 @@ def run_official_baseline(args: argparse.Namespace) -> None:
     )
     write_json(output / "official_command.json", {"argv": command})
     started = time.perf_counter()
-    subprocess.run(command, cwd=output, check=True)
+    repository = Path(__file__).resolve().parents[2]
+    subprocess.run(command, cwd=repository, check=True)
     training_wall_seconds = time.perf_counter() - started
 
-    checkpoints = tuple(sorted(output.rglob("ckpt_final")))
+    checkpoints = tuple(sorted(hydra_root.rglob("ckpt_final")))
     if len(checkpoints) != OFFICIAL_TRAINING_RUN_COUNT:
         raise RuntimeError(
             f"Official {method} produced {len(checkpoints)} final checkpoints; expected 10."
         )
     counts = []
+    if method == "state-augmented":
+        co_training_groups = [f"{method}-{layout}-shared-population"] * len(checkpoints)
+    elif method == "fcp":
+        registered_groups = sorted(
+            {
+                str(row["co_training_group_id"])
+                for row in lineage
+                if row["role"] == "fcp_population_checkpoint"
+            }
+        )
+        group_by_directory = {
+            f"fcp_{index:02d}": group
+            for index, group in enumerate(registered_groups)
+        }
+        co_training_groups = [
+            group_by_directory[path.name]
+            for path in fcp_population.iterdir()
+            if path.is_dir() and path.name.startswith("fcp_")
+        ]
+    else:
+        co_training_groups = [None] * len(checkpoints)
     runs = []
     for index, checkpoint in enumerate(checkpoints):
         _, params = restore_official_checkpoint(checkpoint)
@@ -393,7 +424,7 @@ def run_official_baseline(args: argparse.Namespace) -> None:
                 "policy": str(checkpoint),
                 "identity": {
                     "parent_training_run_id": f"{method}-{layout}-{index:02d}",
-                    "co_training_group_id": None,
+                    "co_training_group_id": co_training_groups[index],
                 },
             }
         )
@@ -472,7 +503,7 @@ def run_official_baseline(args: argparse.Namespace) -> None:
             {
                 "checkpoint": row["policy"],
                 "parent_training_run_id": row["identity"]["parent_training_run_id"],
-                "co_training_group_id": None,
+                "co_training_group_id": row["identity"]["co_training_group_id"],
                 "role": "formal_ego",
             }
             for row in runs
@@ -481,7 +512,7 @@ def run_official_baseline(args: argparse.Namespace) -> None:
     write_json(
         output / "policy_manifest.json",
         {
-            "version": 1,
+            "version": POLICY_MANIFEST_VERSION,
             "method": method,
             "layout": layout,
             "policy_kind": "official_checkpoint",
