@@ -134,6 +134,7 @@ def collect_rollout(
             "response_only",
             "delta_passive",
             "delta_active",
+            "delta_active_blind_actor",
         }
         stepped_ego, output = model.step(
             base_params,
@@ -279,6 +280,7 @@ def collect_rollout(
         "response_only",
         "delta_passive",
         "delta_active",
+        "delta_active_blind_actor",
     }
     _, final_output = model.step(
         base_params,
@@ -385,6 +387,7 @@ def _make_training_rollout_kernel(
         "response_only",
         "delta_passive",
         "delta_active",
+        "delta_active_blind_actor",
     }
 
     def select_lanes(tree: Any, lane_indexes: Any) -> Any:

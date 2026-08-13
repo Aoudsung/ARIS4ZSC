@@ -24,6 +24,25 @@ from .evaluation_app import POLICY_MANIFEST_VERSION
 from .official_adapter import restore_official_checkpoint, validate_official_runtime
 
 
+STATE_AUGMENTED_NUM_ENVS = 128
+"""Parallel environments for a state-augmented upstream population.
+
+The Official default is 256 (model/rnn.yaml).  State-augmented is the only
+method whose population trains as one ``pmap(vmap(train_jit))`` over all ten
+runs at once, so its peak scales with run_count * NUM_ENVS rather than NUM_ENVS
+alone -- and its run_count cannot be lowered, because the state-collection pass
+asserts that run_count**2 divides ten.  At 256 the wide layout asked for a
+single 17.4 GiB block and died on an otherwise empty 46 GiB L40; simple fits at
+256 because it carries 39 observation channels against wide's 43.
+
+Halving the environments halves that peak and leaves everything else -- total
+timesteps, minibatch count, learning rate schedule -- at the Official values.
+It applies to every layout driven through this pipeline, so it is a disclosed
+deviation from the Official state-augmented configuration wherever it is used.
+Registered 2026-08-12 by user decision, after the panel count itself was raised
+from four to ten for the assertion above.
+"""
+
 UPSTREAM_ROOT_SEEDS = {
     "support_sp": 11_042,
     "support_op": 11_043,
@@ -222,6 +241,10 @@ def _run_official_population(
             command.append(f"+FCP={fcp_population}")
         else:
             command.append(f"NUM_SEEDS={int(run_count)}")
+        if method == "state-augmented":
+            command.append(
+                f"++model.NUM_ENVS={int(STATE_AUGMENTED_NUM_ENVS)}"
+            )
         elapsed = _run_logged(
             command, output=output, name=f"training-attempt-{attempt_index:02d}"
         )
@@ -537,17 +560,31 @@ def run_upstream(args: argparse.Namespace) -> None:
         root_seed=UPSTREAM_ROOT_SEEDS["panel_op"], run_count=10,
         checkpoint_count=1, parent_prefix=f"{layout}-panel-op", output=panel_op,
     )
+    # The Official state-augmented trainer collects states over every ordered
+    # pairing of the population and hardcodes ten mini-batches for that pass
+    # (state_sample_run.py: num_rollouts=10, state_step_size=10, and
+    # scanned_mini_batch_map(..., 10)).  The outer dimension is run_count
+    # squared, so run_count=4 gives 16 and trips "outer_dim 16 must be divisible
+    # by num_mini_batches 10".  No panel of four can satisfy that assertion --
+    # the count has to make run_count**2 divisible by ten, and ten is the
+    # smallest such value as well as what the Official configs use themselves.
+    #
+    # Registered at four until 2026-08-12, when the wide upstream first
+    # exercised this path.  Simple never did: its state-augmented checkpoints
+    # were trained standalone with NUM_SEEDS=10 and the partner manifest then
+    # drew four of them.  Consequence to disclose: wide's two state-augmented
+    # panels hold ten runs where simple's hold four.
     _run_official_population(
         method="state-augmented", layout=layout,
-        root_seed=UPSTREAM_ROOT_SEEDS["coverage_sa"], run_count=4,
+        root_seed=UPSTREAM_ROOT_SEEDS["coverage_sa"], run_count=10,
         checkpoint_count=1, parent_prefix=f"{layout}-coverage-sa", output=coverage_sa,
-        co_training_groups=[f"{layout}-coverage-sa-shared-population"] * 4,
+        co_training_groups=[f"{layout}-coverage-sa-shared-population"] * 10,
     )
     _run_official_population(
         method="state-augmented", layout=layout,
-        root_seed=UPSTREAM_ROOT_SEEDS["confirmatory_sa"], run_count=4,
+        root_seed=UPSTREAM_ROOT_SEEDS["confirmatory_sa"], run_count=10,
         checkpoint_count=1, parent_prefix=f"{layout}-confirmatory-sa", output=confirmatory_sa,
-        co_training_groups=[f"{layout}-confirmatory-sa-shared-population"] * 4,
+        co_training_groups=[f"{layout}-confirmatory-sa-shared-population"] * 10,
     )
 
     baseline_fcp_population, baseline_fcp_lineage, baseline_fcp_ledger = (

@@ -357,6 +357,7 @@ class DeltaModel:
         compute_decision: bool = True,
         execute_adaptation: bool = True,
         precomputed_base: tuple[Any, Any, Any, Any, Any] | None = None,
+        actor_belief_override: str | None = None,
     ) -> tuple[PolicyState, ModelOutput]:
         """Advance one legal observation and form the deployment policy."""
 
@@ -421,7 +422,24 @@ class DeltaModel:
         del unused_target
         # Detached: PPO reaches base_params through this input and must not
         # reach latent_params, which only the predictive score may train.
+        #
+        # The blind-actor ablation feeds the prior here while every other
+        # consumer of the posterior -- the critic, the mirror, the decision
+        # channel, the response score -- still receives the real ``next_belief``.
+        # It isolates the cost of the actor input from the value of acting on
+        # the belief.
         actor_belief = jax.lax.stop_gradient(next_belief)
+        if str(self.config.method_variant) == "delta_active_blind_actor":
+            actor_belief = uniform_belief(tuple(start.shape), components)
+        elif actor_belief_override == "uniform":
+            # Diagnostic only.  The posterior is still filtered, still emitted
+            # and still read by the critic; the actor alone stops seeing it, so
+            # "the actor consumes b_t" can be measured apart from "b_t exists".
+            actor_belief = uniform_belief(tuple(start.shape), components)
+        elif actor_belief_override is not None:
+            raise ValueError(
+                f"Unknown actor_belief_override: {actor_belief_override!r}"
+            )
         if precomputed_base is None:
             next_task, task, instant, base_logits, value = base_policy_step(
                 base_params,
@@ -492,7 +510,7 @@ class DeltaModel:
         action_values = expected_values
         variant = str(self.config.method_variant)
         next_pending = jnp.zeros_like(pending_continuation, dtype=jnp.bool_)
-        if bool(execute_adaptation) and variant == "delta_active":
+        if bool(execute_adaptation) and variant in ("delta_active", "delta_active_blind_actor"):
             actions = jnp.broadcast_to(
                 jnp.arange(self.action_count, dtype=jnp.int32),
                 lead + (self.action_count,),
@@ -628,7 +646,7 @@ class DeltaModel:
             active_information_gain=information_gain,
             active_probe_eligible=(
                 (~pending_continuation)
-                if bool(execute_adaptation) and variant == "delta_active"
+                if bool(execute_adaptation) and variant in ("delta_active", "delta_active_blind_actor")
                 else jnp.zeros(lead, dtype=jnp.bool_)
             ),
             adaptation_kl=adaptation_kl,

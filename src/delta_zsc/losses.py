@@ -807,7 +807,8 @@ def latent_composite_loss(
     successor_loss = jnp.asarray(0.0, dtype=jnp.float32)
     successor_metrics: dict[str, Any] = {}
     uses_probe_channel = (
-        model.config.method_variant == "delta_active" and batch.actions.shape[0] >= 2
+        model.config.method_variant in {"delta_active", "delta_active_blind_actor"}
+        and batch.actions.shape[0] >= 2
     )
     if uses_probe_channel:
         invalid = jnp.asarray(batch.dones[:-1], dtype=jnp.bool_) | jnp.asarray(
@@ -894,7 +895,11 @@ def latent_composite_loss(
     value_loss = jnp.asarray(0.0, dtype=jnp.float32)
     contrast_loss = jnp.asarray(0.0, dtype=jnp.float32)
     decision_metrics = zero_decision_metrics()
-    trains_decision = model.config.method_variant in {"delta_passive", "delta_active"}
+    trains_decision = model.config.method_variant in {
+        "delta_passive",
+        "delta_active",
+        "delta_active_blind_actor",
+    }
     uses_decision_channel = trains_decision and anchors is not None
     decision_metrics = {**decision_metrics, **successor_metrics}
     if trains_decision:

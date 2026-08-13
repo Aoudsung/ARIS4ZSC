@@ -944,6 +944,7 @@ def run_training(args: argparse.Namespace) -> None:
         "response_only",
         "delta_passive",
         "delta_active",
+        "delta_active_blind_actor",
     }
     require_fitted_initializer = (
         config.run_kind in {"development", "formal"} and semantic_variant
@@ -1109,7 +1110,7 @@ def run_training(args: argparse.Namespace) -> None:
     )
     anchor_enabled = bool(
         config.anchors.enabled
-        and config.method_variant in {"delta_passive", "delta_active"}
+        and config.method_variant in {"delta_passive", "delta_active", "delta_active_blind_actor"}
     )
     anchor_updates = (
         int(config.anchors.interval_environment_steps) // rollout_steps
@@ -1146,7 +1147,7 @@ def run_training(args: argparse.Namespace) -> None:
             fit_replicas=config.anchors.fit_replicas,
             evaluation_replicas=config.anchors.evaluation_replicas,
             horizon=config.method.continuation_horizon,
-            collect_successor=(config.method_variant == "delta_active"),
+            collect_successor=(config.method_variant in ("delta_active", "delta_active_blind_actor")),
             states_per_trigger=config.anchors.states_per_trigger,
             pilot_replicas=config.anchors.pilot_replicas,
         )
@@ -1205,7 +1206,7 @@ def run_training(args: argparse.Namespace) -> None:
             * config.method.continuation_horizon
         )
         successor_anchor_steps = 0
-        if config.method_variant == "delta_active":
+        if config.method_variant in ("delta_active", "delta_active_blind_actor"):
             successor_anchor_steps = (
                 config.anchors.states_per_trigger
                 * OFFICIAL_ACTION_COUNT
@@ -1543,7 +1544,7 @@ def run_training(args: argparse.Namespace) -> None:
             * config.method.continuation_horizon
         )
         audit_successor_steps = 0
-        if config.method_variant == "delta_active":
+        if config.method_variant in ("delta_active", "delta_active_blind_actor"):
             audit_successor_steps = (
                 config.anchors.states_per_trigger
                 * OFFICIAL_ACTION_COUNT

@@ -22,8 +22,17 @@ def _tree_select(mask: Any, selected: Any, alternative: Any) -> Any:
 class OfficialDELTAPolicy:
     """Duck-typed OvercookedV2 ``AbstractPolicy`` implementation."""
 
-    def __init__(self, deployment: Deployment):
+    def __init__(
+        self,
+        deployment: Deployment,
+        *,
+        force_base: bool = False,
+        actor_belief_override: str | None = None,
+    ):
         self.deployment = deployment
+        # Diagnostic switches; both default to the deployed behaviour.
+        self.force_base = bool(force_base)
+        self.actor_belief_override = actor_belief_override
 
     def init_hstate(self, batch_size: int, key: Any | None = None) -> Any:
         del key
@@ -51,6 +60,8 @@ class OfficialDELTAPolicy:
             state=current,
             observation=observation,
             keys=keys,
+            force_base=self.force_base,
+            actor_belief_override=self.actor_belief_override,
         )
         del unused_output, unused_logp
         next_state = stepped._replace(

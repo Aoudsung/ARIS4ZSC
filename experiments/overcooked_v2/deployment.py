@@ -138,6 +138,7 @@ def deployment_action(
     observation: Any,
     keys: Any,
     force_base: bool = False,
+    actor_belief_override: str | None = None,
 ) -> tuple[Any, Any, Any, Any]:
     import jax
     import jax.numpy as jnp
@@ -148,6 +149,7 @@ def deployment_action(
         state,
         observation,
         execute_adaptation=not bool(force_base),
+        actor_belief_override=actor_belief_override,
     )
     logits = output.base_policy_logits if bool(force_base) else output.policy_logits
     key_array = jnp.asarray(keys)

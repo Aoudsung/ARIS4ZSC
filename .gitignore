@@ -36,3 +36,9 @@ results/
 *.tar
 *.tar.gz
 *.zip
+
+# XLA compilation and autotune caches, and driver logs.  The compilation
+# cache alone reached 5.2 GB during the wide upstream run.
+.jax_cache/
+xla_gpu_per_fusion_autotune_cache_dir/
+*.log

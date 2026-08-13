@@ -61,7 +61,19 @@ METHOD_VARIANTS = (
     "response_only",
     "delta_passive",
     "delta_active",
+    "delta_active_blind_actor",
 )
+"""``delta_active_blind_actor`` is a diagnostic ablation, not a method.
+
+It is ``delta_active`` in every respect -- the latent model trains, anchors are
+measured, the mirror adapts -- except that the actor reads the uninformative
+prior instead of ``b_t``.  It exists to separate two costs that are currently
+confounded: conditioning the policy on an inferred posterior, and acting on the
+value that posterior implies.  Measured across two layouts, ``response_only``
+sits about 24 raw-return points below ``base`` while the full package never
+beats ``base``, which is consistent with the belief input itself being the
+expense and the mirror being a partial repair.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +85,23 @@ class RunBudget:
 
 
 FORMAL_NUM_ENVS = 128
+"""Parallel environments in a formal rollout.
+
+Registered at 256 until 2026-08-11.  At 256 the PPO minibatch puts four
+environments in the base-policy weight-gradient dot, XLA applies split-K 16 to
+the resulting [1028, 196]^T x [1028, 256], and the Triton kernel for the
+batched [16, 196, 256] form asks 131,072 bytes of shared memory against the
+101,376 an L40 block allows -- so the formal update could not launch at all.
+Thirteen XLA flags and three source rewrites failed to move it; the development
+budget compiles because it does not take that split-K path.
+
+Halving this keeps every registered divisor intact -- rollout 32,768 steps,
+29,949,952 / 32,768 = 914 updates, anchors every 32 updates, 128 % 64 = 0 --
+and the same total environment steps.  It does change the optimisation: two
+environments per minibatch instead of four, and 233,984 optimizer steps instead
+of 116,992.  That is a protocol change, decided by the user on 2026-08-11, and
+it must be disclosed with any result computed under it.
+"""
 FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 1024 * 1024
 
 RUN_BUDGETS: Mapping[str, RunBudget] = {
