@@ -25,12 +25,10 @@ from .evaluation_app import build_policy_manifest, run_evaluation
 
 
 MAIN_VARIANTS = (
-    "history_rnn",
     "base",
     "response_only",
     "delta_passive",
     "delta_active",
-    "history_rnn_extra",
     "base_extra",
 )
 K_SENSITIVITY_VARIANTS = ("delta_passive", "delta_active")
@@ -86,7 +84,9 @@ def _initializer_for_component_count(
 
 
 def _sp_initializer_for_seed(root: str | Path, seed_index: int) -> Path:
-    return Path(root).resolve() / f"run-{int(seed_index)}" / "ckpt_final"
+    # Keep the registered run alias in the supplied path.  ``ckpt_final`` may
+    # itself be a symlink whose resolved Orbax target has no seed component.
+    return Path(root) / f"run-{int(seed_index)}" / "ckpt_final"
 
 
 def _anchor_budget(
@@ -138,7 +138,7 @@ def _write_variant_config(
         else 0
     )
     # Controls without a decision emission never collect anchors.
-    if payload["method_variant"] in {"history_rnn", "base", "response_only"}:
+    if payload["method_variant"] in {"base", "response_only"}:
         payload["anchors"]["enabled"] = False
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
@@ -182,7 +182,7 @@ def _validate_training_entries(entries: list[Mapping[str, Any]]) -> None:
             base_ppo = {
                 int(by_variant[name]["ego_policy_steps"])
                 for name in (
-                    "history_rnn", "base", "response_only", "delta_passive", "delta_active"
+                    "base", "response_only", "delta_passive", "delta_active"
                 )
             }
             if len(base_ppo) != 1:
@@ -201,20 +201,19 @@ def _validate_training_entries(entries: list[Mapping[str, Any]]) -> None:
                     "DELTA-passive must collect current-only anchors and "
                     "DELTA-active must additionally collect successor anchors."
                 )
-            for name in ("history_rnn", "base", "response_only", "history_rnn_extra", "base_extra"):
+            for name in ("base", "response_only", "base_extra"):
                 if int(by_variant[name]["anchor_continuation_steps"]) != 0:
                     raise ValueError(f"{name} must not collect privileged decision anchors.")
             ordinary = next(iter(base_ppo))
-            for name in ("history_rnn_extra", "base_extra"):
-                if (
-                    int(by_variant[name]["ego_policy_steps"])
-                    != ordinary + active_anchor_cost
-                ):
-                    raise ValueError(f"{name} does not reallocate the exact anchor cost to PPO.")
-                if int(by_variant[name]["marginal_training_simulator_steps"]) != int(
-                    by_variant["delta_active"]["marginal_training_simulator_steps"]
-                ):
-                    raise ValueError(f"{name} and DELTA-active total marginal budgets differ.")
+            if (
+                int(by_variant["base_extra"]["ego_policy_steps"])
+                != ordinary + active_anchor_cost
+            ):
+                raise ValueError("base_extra does not reallocate the exact anchor cost to PPO.")
+            if int(by_variant["base_extra"]["marginal_training_simulator_steps"]) != int(
+                by_variant["delta_active"]["marginal_training_simulator_steps"]
+            ):
+                raise ValueError("base_extra and DELTA-active total marginal budgets differ.")
 
 def run_development_matrix(args: argparse.Namespace) -> None:
     source = Path(args.config).resolve()
@@ -432,11 +431,7 @@ def summarize_development_matrix(args: argparse.Namespace) -> None:
         "decision_emission": _paired(k4["delta_passive"], k4["response_only"], 1),
         "active_voi": _paired(k4["delta_active"], k4["delta_passive"], 2),
         "active_vs_base": _paired(k4["delta_active"], k4["base"], 3),
-        "active_vs_history_rnn": _paired(k4["delta_active"], k4["history_rnn"], 4),
-        "active_vs_base_total_budget": _paired(k4["delta_active"], k4["base_extra"], 5),
-        "active_vs_history_total_budget": _paired(
-            k4["delta_active"], k4["history_rnn_extra"], 6
-        ),
+        "active_vs_base_total_budget": _paired(k4["delta_active"], k4["base_extra"], 4),
     }
     layouts = {
         str(read_json(Path(row["directory"]) / "evaluation_summary.json")["layout"])

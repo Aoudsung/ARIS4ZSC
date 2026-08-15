@@ -48,17 +48,9 @@ def test_active_namespace_contains_no_retired_patch_chain() -> None:
 def test_active_tree_contains_only_unified_method_and_registered_apps() -> None:
     assert not Path("src/path_c").exists()
     assert not Path("analysis").exists()
+    assert not Path("legacy").exists()
+    assert not Path("docs/legacy").exists()
     assert {path.name for path in Path("experiments/overcooked_v2").glob("*.py")} == ACTIVE_APPS
-    assert Path("legacy/implementation_v8/src/path_c/model.py").is_file()
-    assert Path("legacy/implementation_v8/experiments/overcooked_v2/path_c.py").is_file()
-    assert Path(
-        "legacy/implementation_v8/experiments/overcooked_v2/configs/depi_simple_formal.yaml"
-    ).is_file()
-    assert Path(
-        "legacy/implementation_v8/analysis/l0_dimension_localization/l0_nn_partition_discriminant.py"
-    ).is_file()
-    assert Path("docs/legacy/v8/status/DECISION_LOG.md").is_file()
-    assert Path("docs/legacy/v8/status/EVIDENCE_LEDGER.md").is_file()
     assert {path.name for path in Path("docs/status").glob("*.md")} == {"DASHBOARD.md"}
 
 
@@ -87,13 +79,12 @@ def test_requirements_match_pyproject_runtime_dependencies_exactly() -> None:
     }
     assert requirements == project_dependencies
 
-def test_only_unified_workflow_is_active_and_method_identity_is_v4() -> None:
+def test_only_unified_workflow_is_active_and_method_identity_is_v6() -> None:
     workflows = {path.name for path in Path(".github/workflows").glob("*.yml")}
     assert workflows == {"delta-unified-ci.yml"}
-    assert Path("legacy/implementation_v8/.github/workflows/depi-ci.yml").is_file()
     from src.delta_zsc.config import METHOD_VERSION
 
-    assert METHOD_VERSION == "delta_belief_conditioned_raw_return_pairwise_crn_v5"
+    assert METHOD_VERSION == "delta_self_consistent_decision_grounded_residual_v6"
 
 
 def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
@@ -103,8 +94,7 @@ def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
         Path("docs/METHOD_SPEC.md"),
         Path("docs/THEORY.md"),
         Path("docs/ARCHITECTURE.md"),
-        Path("docs/EVALUATION_SPEC.md"),
-        Path("docs/FORMAL_EXPERIMENT_PROTOCOL.md"),
+        Path("docs/RESEARCH_PLAN.md"),
     )
     text = "\n".join(path.read_text(encoding="utf-8") for path in active).lower()
     assert "expected cross log likelihood" not in text
@@ -115,3 +105,8 @@ def test_authoritative_docs_describe_only_exact_bayes_voi() -> None:
     assert "episode-static" in text
     assert "centered residual" in text
     assert "delayed" in text
+    assert "immutable" in text
+    assert "self-play" in text
+    assert "cross-play" in text
+    assert "reference-relative" in text
+    assert "version: 4" in text

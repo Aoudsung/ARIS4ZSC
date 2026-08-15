@@ -1,4 +1,4 @@
-# THEORY — DELTA-ZSC v5 guarantees, identifiability, and limits
+# THEORY — DELTA-ZSC v6 guarantees, identifiability, and limits
 
 `authoritative: true`
 
@@ -31,7 +31,7 @@ Then
 \frac{b(i)p_{sem}(y\mid i)}{b(j)p_{sem}(y\mid j)},
 \]
 
-because `p_sh` cancels. v5 enforces this cancellation structurally by removing
+because `p_sh` cancels. v6 enforces this cancellation structurally by removing
 the component axis from occurrence heads and by passing only semantic log
 probabilities to `filter_update`. Therefore high-frequency partner-independent
 no-change events cannot create a component winner.
@@ -154,7 +154,7 @@ If every component has the same successor action-value vector, `V^a` is
 independent of belief and VOI is zero even if the response identifies the
 component perfectly. Conversely, action-independent response information can
 produce the same positive VOI for every probe and therefore no active policy
-change. v5 consequently reports action-wise VOI spread, information-gain
+change. v6 consequently reports action-wise VOI spread, information-gain
 spread, and active/passive policy total variation in addition to their means.
 
 ## 12. Mirror-policy guarantee
@@ -164,6 +164,13 @@ For finite action values and `delta>0`, maximizing expected supplied value under
 active boundary when required. This guarantees optimality only for the supplied
 model-based values. Real-return improvement requires accurate response and
 decision models.
+
+v6 performs a second exponential-geodesic projection after composing residual
+and mirror/VOI logits. Deterministic bisection selects the largest interpolation
+coefficient whose forward KL to the immutable reference is within `delta`.
+This directly proves the final executed bound; it does not rely on a triangle
+inequality, which KL does not possess. The bound constrains policy movement but
+does not by itself prove preservation of return.
 
 ## 13. Identifiability boundary
 
@@ -182,7 +189,7 @@ fails conditions 2 and 4.
 
 ## 14. Approximation boundary
 
-v5 is not a full Bayes-adaptive POMDP solver. The delayed head predicts one
+v6 is not a full Bayes-adaptive POMDP solver. The delayed head predicts one
 reaction window, and successor values integrate one registered base bridge plus
 the horizon-`H` continuation. VOI values only the first decision at `t+2` after
 that response, and its incremental control contribution is discounted by

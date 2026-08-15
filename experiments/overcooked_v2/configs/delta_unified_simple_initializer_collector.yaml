@@ -1,11 +1,11 @@
 version: 4
-method_variant: delta_active
+method_variant: base
 method:
   latent_components: 4
   continuation_horizon: 128
   adaptation_kl_budget: 0.04
 environment:
-  layout: test_time_wide
+  layout: test_time_simple
   agent_view_size: 2
   indicate_successful_delivery: true
   negative_rewards: true
@@ -38,7 +38,7 @@ latent_optimizer:
   gradient_clip_norm: 0.25
   adam_epsilon: 1.0e-05
 anchors:
-  enabled: true
+  enabled: false
   interval_environment_steps: 147456
   states_per_trigger: 16
   fit_replicas: 8

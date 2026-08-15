@@ -36,7 +36,7 @@ from src.delta_zsc.config import (
 from src.delta_zsc.semantic_initializer import SEMANTIC_INITIALIZER_SCHEMA_VERSION
 
 paths = sorted(Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml"))
-assert len(paths) == 10, paths
+assert len(paths) == 11, paths
 for path in paths:
     run_kind = path.stem.rsplit("_", 1)[-1]
     if run_kind == "collector":
@@ -119,7 +119,7 @@ for path in Path(".").rglob("*"):
     for pattern in credential_patterns:
         if pattern.search(text):
             raise AssertionError(f"credential pattern {pattern.pattern!r} in {path}")
-    if "legacy" in path.parts or path.as_posix() == "validation/run_contract_validation.sh":
+    if path.as_posix() == "validation/run_contract_validation.sh":
         continue
     for marker in ("/Users/", "/mnt/workspace/", "/mnt/data/"):
         if marker in text:

@@ -476,7 +476,7 @@ def _validate_official_baseline_config(
         raise ValueError(f"Official {method} must train ten runs.")
 
 
-def _validate_official_config(
+def _validate_official_recipe(
     resolved: Mapping[str, Any],
     *,
     config: Any,
@@ -563,10 +563,6 @@ def _validate_official_config(
             raise ValueError(f"Official environment config changed {name}.")
     if algorithm == "rnn-op" and list(kwargs.get("op_ingredient_permutations", ())) != [0, 1]:
         raise ValueError("Official Other-Play symmetry is not enabled.")
-    if int(resolved.get("SEED", -1)) != OFFICIAL_TRAINING_ROOT_SEED:
-        raise ValueError("Official training root seed must be 42.")
-    if int(resolved.get("NUM_SEEDS", -1)) != OFFICIAL_TRAINING_RUN_COUNT:
-        raise ValueError("Official training population must contain ten keys.")
     if not 0 <= int(seed_index) < OFFICIAL_TRAINING_RUN_COUNT:
         raise ValueError("Official seed_index must lie in 0..9.")
     steps_per_update = int(model["NUM_ENVS"]) * int(model["NUM_STEPS"])
@@ -577,6 +573,27 @@ def _validate_official_config(
         raise ValueError(
             "Mechanical upstream budget must contain whole vectorized updates."
         )
+
+
+def _validate_official_config(
+    resolved: Mapping[str, Any],
+    *,
+    config: Any,
+    algorithm: str,
+    seed_index: int,
+) -> None:
+    """Validate the registered Official population-training configuration."""
+
+    _validate_official_recipe(
+        resolved,
+        config=config,
+        algorithm=algorithm,
+        seed_index=seed_index,
+    )
+    if int(resolved.get("SEED", -1)) != OFFICIAL_TRAINING_ROOT_SEED:
+        raise ValueError("Official training root seed must be 42.")
+    if int(resolved.get("NUM_SEEDS", -1)) != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("Official training population must contain ten keys.")
 
 
 def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
@@ -596,11 +613,11 @@ def validate_official_partner_checkpoint(
     algorithm: str,
     seed_index: int,
 ) -> None:
-    """Bind one DEPI support checkpoint to its claimed Official recipe."""
+    """Bind one DELTA reference checkpoint to its claimed Official SP recipe."""
 
     checkpoint_config, unused_params = restore_official_checkpoint(checkpoint_path)
     del unused_params
-    _validate_official_config(
+    _validate_official_recipe(
         checkpoint_config,
         config=config,
         algorithm=algorithm,

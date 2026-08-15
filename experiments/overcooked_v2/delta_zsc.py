@@ -70,11 +70,10 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--semantic-initializer")
     train.add_argument(
         "--sp-initializer",
+        required=True,
         help=(
-            "Official SP checkpoint directory whose task encoder, recurrent "
-            "cell and heads initialise base_params. The instantaneous partner "
-            "and posterior input rows start at zero, so training begins from a "
-            "policy numerically identical to that checkpoint."
+            "Seed-matched Official SP checkpoint directory embedded as the "
+            "immutable reference actor. The trainable residual starts at zero."
         ),
     )
     train.set_defaults(function=run_training)
@@ -85,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--seed-index", type=int, default=-1)
     preflight.add_argument("--output", required=True)
     preflight.add_argument("--semantic-initializer")
-    preflight.add_argument("--sp-initializer")
+    preflight.add_argument("--sp-initializer", required=True)
     preflight.set_defaults(function=run_cuda_preflight)
 
     policy_manifest = commands.add_parser("build-policy-manifest")
@@ -117,6 +116,11 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--right-policy-manifest")
     evaluate.add_argument("--partner-role", default="confirmatory")
     evaluate.add_argument("--seed", type=int)
+    evaluate.add_argument(
+        "--execution-mode",
+        choices=("reference_only", "residual", "passive", "active"),
+        default="active",
+    )
     evaluate.add_argument("--output", required=True)
     evaluate.set_defaults(function=run_evaluation)
 

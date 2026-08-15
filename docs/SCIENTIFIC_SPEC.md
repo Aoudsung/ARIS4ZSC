@@ -18,7 +18,7 @@ best action. The problem is not to identify the teammate's training algorithm.
 It is to learn, from legal interaction history alone, an uncertainty state that
 supports better decisions while retaining one shared task policy.
 
-Because the teammate checkpoint is constant within an episode, DELTA v5 represents
+Because a frozen teammate checkpoint is constant within an episode, DELTA v6 represents
 an exchangeable episode-level latent `z_e`. The legal posterior is
 
 \[
@@ -34,6 +34,11 @@ Q_\psi(x_t,b_t,a).
 For active DELTA, candidate probes also receive the value of a delayed partner
 response under a probe-conditioned successor decision matrix.
 
+Task competence is anchored by an immutable, seed-matched Official-SP
+reference actor. A zero-initialized residual learns shared and belief-dependent
+coordination changes, while every executed residual/mirror policy is finally
+projected into the registered KL ball around that reference.
+
 ## 3. Legal deployment information
 
 Deployment may use only:
@@ -45,6 +50,10 @@ Deployment may use only:
 - learned shared/semantic response models;
 - the episode-static categorical posterior;
 - the learned belief-conditioned action value and successor feature model.
+
+The immutable reference consumes the same complete local observation exposed
+to the Official policy. This is legal local information; it is not hidden
+partner state or identity metadata.
 
 Deployment may not use partner run ID, SP/OP label, checkpoint stage, training
 family, hidden simulator state, future observations, counterfactual returns, or
@@ -110,11 +119,10 @@ required mechanism evidence.
 
 ## 7. Required controls
 
-- `history_rnn`: generic recurrent-history capacity;
-- `base`: task competence without latent adaptation;
+- `base`: full-frame recurrent task competence without latent adaptation;
 - `response_only`: legal response posterior without decision adaptation;
-- `history_rnn_extra` and `base_extra`: spend anchor simulator cost on ordinary
-  PPO interaction;
+- `base_extra`: spends active DELTA's anchor simulator cost on ordinary PPO
+  interaction;
 - `K in {2,4,8}`: bounded capacity sensitivity;
 - synthetic uninformative, decision-revealing, and
   identifiable-but-decision-irrelevant exact-VOI cases;
@@ -124,7 +132,7 @@ required mechanism evidence.
 
 ## 8. Required mechanism measurements
 
-Every v5 study reports:
+Every v6 study reports:
 
 - immediate and delayed shared/semantic NLL and counts;
 - component event Jensen-Shannon separation;
@@ -135,7 +143,8 @@ Every v5 study reports:
 - exact VOI, information gain, their action-wise spread, and negative numerical
   fraction;
 - active/passive policy total variation and greedy disagreement;
-- report-only semantic/decision component-embedding gradient norms and cosine;
+- response-component gradient norm and the verified zero decision gradient into
+  the detached grounding coordinate;
 - semantic initializer singular values, source lineage, and conditional oracle
   gain.
 
@@ -152,7 +161,9 @@ The project does not claim:
 - guaranteed real-return improvement from approximate decision values;
 - SOTA performance before complete ten-seed Simple/Wide evaluation;
 - that behavior statistics contain no partner information;
-- that v4 or earlier development results are evidence for v5.
+- that v5 or earlier development results are evidence for v6;
+- that an immutable reference or a KL bound alone guarantees SP recovery;
+- that the v6 development targets have already been achieved.
 
 ## 10. Single-layout result boundary
 

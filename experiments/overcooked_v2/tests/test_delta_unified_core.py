@@ -5,6 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 def _small_config(variant: str = "delta_active"):
@@ -30,12 +31,25 @@ def _small_config(variant: str = "delta_active"):
 
 
 def test_all_registered_configs_load_and_method_has_three_fields() -> None:
-    from src.delta_zsc.config import LAYOUTS, SUPPORTED_LAYOUTS, load_config
+    from src.delta_zsc.config import (
+        LAYOUTS,
+        METHOD_VARIANTS,
+        SUPPORTED_LAYOUTS,
+        load_config,
+    )
+
+    assert METHOD_VARIANTS == (
+        "base",
+        "response_only",
+        "delta_passive",
+        "delta_active",
+        "delta_active_blind_actor",
+    )
 
     files = sorted(
         Path("experiments/overcooked_v2/configs").glob("delta_unified_*.yaml")
     )
-    assert len(files) == 10
+    assert len(files) == 11
     for path in files:
         kind = path.stem.rsplit("_", 1)[-1]
         if kind == "collector":
@@ -46,6 +60,17 @@ def test_all_registered_configs_load_and_method_has_three_fields() -> None:
             "continuation_horizon",
             "adaptation_kl_budget",
         }
+
+    simple_collector = load_config(
+        Path(
+            "experiments/overcooked_v2/configs/"
+            "delta_unified_simple_initializer_collector.yaml"
+        ),
+        run_kind="development",
+    )
+    assert simple_collector.environment.layout == "test_time_simple"
+    assert simple_collector.method_variant == "base"
+    assert simple_collector.anchors.enabled is False
 
     ring = load_config(
         Path(
@@ -100,6 +125,96 @@ def test_official_training_wraps_the_official_entrypoint_callbacks() -> None:
         and node.func.attr == "main"
         for node in ast.walk(callback_contexts[0])
     )
+
+
+def test_official_sp_reference_accepts_independent_population_orchestration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from experiments.overcooked_v2 import official_adapter
+    from src.delta_zsc.config import load_config
+
+    config = load_config(
+        Path(
+            "experiments/overcooked_v2/configs/"
+            "delta_unified_simple_formal.yaml"
+        ),
+        run_kind="formal",
+    )
+    checkpoint_config = {
+        "model": {
+            "TYPE": "RNN",
+            "FC_DIM_SIZE": 128,
+            "GRU_HIDDEN_DIM": 128,
+            "TOTAL_TIMESTEPS": 30_000_000,
+            "REW_SHAPING_HORIZON": 15_000_000,
+            "NUM_ENVS": 256,
+            "NUM_STEPS": 256,
+            "UPDATE_EPOCHS": 4,
+            "NUM_MINIBATCHES": 64,
+            "LR": 0.00025,
+            "LR_WARMUP": 0.05,
+            "ANNEAL_LR": True,
+            "MAX_GRAD_NORM": 0.25,
+            "CLIP_EPS": 0.2,
+            "VF_COEF": 0.5,
+            "GAMMA": 0.99,
+            "GAE_LAMBDA": 0.95,
+            "ENT_COEF": 0.01,
+        },
+        "env": {
+            "ENV_KWARGS": {
+                "layout": "test_time_simple",
+                "agent_view_size": 2,
+                "negative_rewards": True,
+                "random_agent_positions": True,
+                "sample_recipe_on_delivery": True,
+                "indicate_successful_delivery": True,
+            }
+        },
+        # These describe how the checkpoint population was generated, not the
+        # SP actor recipe or its final training budget.
+        "SEED": 201,
+        "NUM_SEEDS": 1,
+    }
+    monkeypatch.setattr(
+        official_adapter,
+        "restore_official_checkpoint",
+        lambda unused_path: (checkpoint_config, {}),
+    )
+    official_adapter.validate_official_partner_checkpoint(
+        "run-7/ckpt_final",
+        config=config,
+        algorithm="rnn-sp",
+        seed_index=7,
+    )
+
+    changed_budget = {
+        **checkpoint_config,
+        "model": {
+            **checkpoint_config["model"],
+            "TOTAL_TIMESTEPS": 29_000_000,
+        },
+    }
+    monkeypatch.setattr(
+        official_adapter,
+        "restore_official_checkpoint",
+        lambda unused_path: (changed_budget, {}),
+    )
+    with pytest.raises(ValueError, match="TOTAL_TIMESTEPS"):
+        official_adapter.validate_official_partner_checkpoint(
+            "run-7/ckpt_final",
+            config=config,
+            algorithm="rnn-sp",
+            seed_index=7,
+        )
+
+    with pytest.raises(ValueError, match="root seed"):
+        official_adapter._validate_official_config(
+            checkpoint_config,
+            config=config,
+            algorithm="rnn-sp",
+            seed_index=7,
+        )
 
 
 def test_pairwise_contrasts_are_offset_invariant() -> None:
@@ -197,11 +312,11 @@ def test_model_executes_all_variants_with_one_shared_interface() -> None:
     from src.delta_zsc.model import DeltaModel
 
     for variant in (
-        "history_rnn",
         "base",
         "response_only",
         "delta_passive",
         "delta_active",
+        "delta_active_blind_actor",
     ):
         config = _small_config(variant)
         model = DeltaModel(config, (5, 5, 39), 6)
@@ -218,7 +333,11 @@ def test_model_executes_all_variants_with_one_shared_interface() -> None:
         )
         assert output.active_voi.shape == (3, 6)
         assert bool(jnp.all(jnp.isfinite(output.policy_logits)))
-        if variant in {"delta_passive", "delta_active"}:
+        if variant in {
+            "delta_passive",
+            "delta_active",
+            "delta_active_blind_actor",
+        }:
             assert float(jnp.max(output.adaptation_kl)) <= 0.04001
         else:
             np.testing.assert_allclose(

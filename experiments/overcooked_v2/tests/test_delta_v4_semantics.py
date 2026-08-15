@@ -223,6 +223,7 @@ def test_three_channel_objective_is_exact_sum_of_normalized_channels() -> None:
         advantages=jnp.zeros((time, lanes)),
         returns=jnp.zeros((time, lanes)),
         ppo_mask=jnp.ones((time, lanes)),
+        policy_group=jnp.ones((time, lanes), dtype=jnp.int32),
         beliefs=jnp.full((time + 1, lanes, 4), 0.25),
         initial_policy_state=model.initial_state(lanes),
     )
@@ -597,4 +598,3 @@ def test_final_audit_component_event_js_reduces_probe_axis_before_anchor_mask():
     eligibility = jnp.asarray([1.0, 0.0, 1.0, 0.0, 1.0])
     aggregate = jnp.sum(eligibility * value) / jnp.sum(eligibility)
     assert jnp.isfinite(aggregate)
-

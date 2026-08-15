@@ -181,7 +181,7 @@ information gain and exact-VOI floating-point diagnostics are emitted.
 
 **Registered acceptance case.** A response that identifies the latent component
 while leaving the optimal action unchanged yields information gain approximately
-`0.69` and VOI exactly `0`
+`0.69` and VOI within the registered floating-point tolerance of `0`
 (`validation/voi_synthetic_diagnostics.json`). This case fixes the operational
 meaning of "decision-relevant" for the paper.
 
@@ -325,9 +325,8 @@ evidential basis for the contribution boundary above.
 | Control | Shares with DELTA | Varies | Alternative explanation it addresses |
 |---|---|---|---|
 | `response_only` | filter, transition, behaviour statistics, PPO, partner distribution, evaluator | decision channel | the gain follows from teammate prediction alone |
-| `history_rnn` | PPO, partner distribution, evaluator | recurrent access to partner history | generic recurrent capacity accounts for the gain |
-| `base` | PPO, partner distribution, evaluator | latent machinery entirely | task competence accounts for the gain |
-| `history_rnn_extra`, `base_extra` | PPO, partner distribution, evaluator | anchor simulator cost reallocated to PPO interaction | additional simulator budget accounts for the gain |
+| `base` | full-frame recurrent reference, PPO, partner distribution, evaluator | latent machinery entirely | task competence accounts for the gain |
+| `base_extra` | PPO, partner distribution, evaluator | anchor simulator cost reallocated to PPO interaction | additional simulator budget accounts for the gain |
 | `K` in `{2, 4, 8}` | everything | latent capacity | the result depends on a particular capacity choice |
 
 A positive H2 under these controls locates the effect in the decision channel,

@@ -1,4 +1,4 @@
-"""Response and decision objectives for DELTA v5's two parameter owners."""
+"""Response and decision objectives for DELTA v6's parameter owners."""
 
 from __future__ import annotations
 
@@ -219,23 +219,13 @@ def ppo_loss(
     advantages = jnp.asarray(batch.advantages, dtype=jnp.float32)
     returns = jnp.asarray(batch.returns, dtype=jnp.float32)
     mask = jnp.asarray(batch.ppo_mask, dtype=jnp.float32)
-    if bool(model.config.ppo.normalize_advantages):
-        # std + eps, matching the Official normalisation exactly.  The
-        # previous sqrt(variance + eps) differs whenever the spread is
-        # small, which is precisely the regime this task sits in.
-        mean = _masked_mean(advantages, mask)
-        variance = _masked_mean(jnp.square(advantages - mean), mask)
-        advantages = (advantages - mean) / (jnp.sqrt(variance) + 1.0e-8)
-
+    group = jnp.asarray(batch.policy_group, dtype=jnp.int32)
     new_logp = categorical_log_probability(logits, batch.actions)
     ratio = jnp.exp(new_logp - jnp.asarray(batch.old_log_probabilities))
     clipped_ratio = jnp.clip(
         ratio,
         1.0 - float(model.config.ppo.clip_epsilon),
         1.0 + float(model.config.ppo.clip_epsilon),
-    )
-    actor = -_masked_mean(
-        jnp.minimum(ratio * advantages, clipped_ratio * advantages), mask
     )
     old_value = jnp.asarray(batch.old_values, dtype=jnp.float32)[:-1]
     current_value = value[:-1]
@@ -247,16 +237,60 @@ def ppo_loss(
     value_error = jnp.maximum(
         jnp.square(current_value - returns), jnp.square(value_clipped - returns)
     )
-    value_loss = 0.5 * _masked_mean(value_error, mask)
-    entropy = _masked_mean(categorical_entropy(logits), mask)
-    approximate_kl = 0.5 * _masked_mean(
-        jnp.square(new_logp - batch.old_log_probabilities), mask
-    )
+    entropy_values = categorical_entropy(logits)
+    sampled_kl = 0.5 * jnp.square(new_logp - batch.old_log_probabilities)
+
+    def one_group(group_index: int):
+        group_mask = mask * (group == int(group_index)).astype(jnp.float32)
+        current_advantages = advantages
+        if bool(model.config.ppo.normalize_advantages):
+            mean = _masked_mean(current_advantages, group_mask)
+            variance = _masked_mean(
+                jnp.square(current_advantages - mean), group_mask
+            )
+            current_advantages = (current_advantages - mean) / (
+                jnp.sqrt(variance) + 1.0e-8
+            )
+        actor = -_masked_mean(
+            jnp.minimum(
+                ratio * current_advantages,
+                clipped_ratio * current_advantages,
+            ),
+            group_mask,
+        )
+        value_loss = 0.5 * _masked_mean(value_error, group_mask)
+        entropy = _masked_mean(entropy_values, group_mask)
+        total = (
+            actor
+            + float(model.config.ppo.value_weight) * value_loss
+            - float(model.config.ppo.entropy_weight) * entropy
+        )
+        return (
+            total,
+            actor,
+            value_loss,
+            entropy,
+            _masked_mean(sampled_kl, group_mask),
+            _masked_mean(ratio, group_mask),
+            _masked_mean(returns, group_mask),
+            _masked_mean(current_advantages, group_mask),
+        )
+
+    sp = one_group(0)
+    xp = one_group(1)
+    # Minimax actor/value protection with minimum-group entropy.  Selecting the
+    # complete larger group objective would let its entropy term favour the
+    # lower-entropy group; the formulation below keeps every constituent's
+    # worst-group direction explicit and introduces no coefficient.
+    actor = jnp.maximum(sp[1], xp[1])
+    value_loss = jnp.maximum(sp[2], xp[2])
+    entropy = jnp.minimum(sp[3], xp[3])
     total = (
         actor
         + float(model.config.ppo.value_weight) * value_loss
         - float(model.config.ppo.entropy_weight) * entropy
     )
+    approximate_kl = jnp.maximum(sp[4], xp[4])
     return LossResult(
         total=total,
         metrics={
@@ -265,11 +299,19 @@ def ppo_loss(
             "ppo_value": value_loss,
             "ppo_entropy": entropy,
             "ppo_sampled_action_kl": approximate_kl,
-            "ppo_ratio_mean": _masked_mean(ratio, mask),
+            "ppo_ratio_mean": 0.5 * (sp[5] + xp[5]),
+            "ppo_sp_total": sp[0],
+            "ppo_xp_total": xp[0],
+            "ppo_sp_actor": sp[1],
+            "ppo_xp_actor": xp[1],
+            "ppo_sp_value": sp[2],
+            "ppo_xp_value": xp[2],
+            "ppo_sp_entropy": sp[3],
+            "ppo_xp_entropy": xp[3],
             # The mean GAE *target*, not an episode return.  Naming it
             # "return" invited exactly the misreading it got.
-            "gae_target_mean": _masked_mean(returns, mask),
-            "gae_advantage_mean": _masked_mean(advantages, mask),
+            "gae_target_mean": 0.5 * (sp[6] + xp[6]),
+            "gae_advantage_mean": 0.5 * (sp[7] + xp[7]),
         },
     )
 
@@ -311,6 +353,7 @@ def raw_task_value_loss(
         output.behavior_features,
         jax.lax.stop_gradient(output.belief),
         policy,
+        latent_params["component_embeddings"],
     )
     values = prediction.value_mean
     # Bootstrap from the slow target copy.  The online critic is also the thing
@@ -326,6 +369,7 @@ def raw_task_value_loss(
             jax.lax.stop_gradient(output.behavior_features),
             jax.lax.stop_gradient(output.belief),
             policy,
+            target_params["component_embeddings"],
         ).value_mean
     targets = jax.lax.stop_gradient(
         td_lambda_targets(
@@ -389,6 +433,7 @@ def pairwise_crn_contrast_loss(
         output.behavior_features[time, lane],
         jax.lax.stop_gradient(output.belief[time, lane]),
         policy,
+        latent_params["component_embeddings"],
     )
     contrast = PairwiseContrast(
         mean=anchors.contrast_mean,
@@ -518,6 +563,7 @@ def successor_belief_value_loss(
         output.behavior_features,
         jax.lax.stop_gradient(output.belief),
         policy,
+        latent_params["component_embeddings"],
     )
     # A successor at ``t`` lands on state ``t+2``, and TD targets exist for
     # states ``0..T-1`` only -- the final row is the bootstrap state, not an
@@ -554,6 +600,7 @@ def successor_belief_value_loss(
         output.behavior_features[2 : 2 + steps],
         jax.lax.stop_gradient(output.belief[2 : 2 + steps]),
         policy[2 : 2 + steps],
+        latent_params["component_embeddings"],
     )
     window = valid[:steps]
     loss = _masked_mean(huber(predicted.value_mean - target), window)
@@ -608,6 +655,7 @@ def _anchor_oracle_diagnostics(
         output.behavior_features[time, lane],
         output.belief[time, lane],
         policy,
+        latent_params["component_embeddings"],
     )
     advantage = jax.lax.stop_gradient(prediction.advantage_mean)
     legal = jnp.asarray(anchors.action_mask, dtype=jnp.bool_)
@@ -688,6 +736,7 @@ def latent_contrast_loss(
     model: Any,
     latent_params: Any,
     base_params: Any,
+    feature_latent_params: Any,
     batch: RolloutBatch,
     anchors: AnchorBatch,
 ) -> LossResult:
@@ -712,7 +761,7 @@ def latent_contrast_loss(
     # pass is most of the graph.
     _, output = model.sequence(
         jax.lax.stop_gradient(base_params),
-        jax.lax.stop_gradient(latent_params),
+        jax.lax.stop_gradient(feature_latent_params),
         batch.initial_policy_state,
         batch.observations,
         batch.previous_actions,
@@ -742,7 +791,7 @@ def latent_composite_loss(
     target_latent_params: Any = None,
     include_contrast: bool = True,
 ) -> LossResult:
-    """Response proper scores and direct decision losses for DELTA v5.
+    """Response proper scores and direct decision losses for DELTA v6.
 
     Each independently sampled measurement channel contributes its own mean
     negative log probability with a fixed coefficient of one.  Consequently
@@ -887,9 +936,10 @@ def latent_composite_loss(
     #
     # Both gradients reach only ``latent_params["belief_value"]``.  The task
     # features, the instant partner encoding, the posterior and the acting
-    # policy all enter stop-gradiented, and the head does not read the component
-    # embeddings.  The response channels above and this one are therefore
-    # disjoint optimisation problems that share an Adam state, which is why the
+    # policy all enter stop-gradiented, and the head reads the component
+    # embeddings only through a detached posterior-weighted coordinate.  The
+    # response channels above and this one are therefore disjoint optimisation
+    # problems: decision gradients shape only ``belief_value``.  Their
     # differing units -- nats against raw return -- need no relative weight and
     # must not be given one.
     value_loss = jnp.asarray(0.0, dtype=jnp.float32)

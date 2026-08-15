@@ -21,12 +21,12 @@ from typing import Any, Mapping
 import yaml
 
 
-CONFIG_VERSION = 3
-METHOD_VERSION = "delta_belief_conditioned_raw_return_pairwise_crn_v5"
-# Version 5 added the belief-conditioned critic to the latent tree. A v4
-# checkpoint has no ``belief_value`` subtree and must fail closed rather than
-# deploy a policy whose decision head is missing.
-CHECKPOINT_SCHEMA_VERSION = 5
+CONFIG_VERSION = 4
+METHOD_VERSION = "delta_self_consistent_decision_grounded_residual_v6"
+# Version 6 splits the deployable actor into an immutable Official-SP
+# reference and a trainable residual/value tree, and checkpoints a second
+# recurrent state for the fixed self-play lanes.
+CHECKPOINT_SCHEMA_VERSION = 6
 MANIFEST_VERSION = 2
 FORMAL_METHOD_LABEL = "delta-active"
 OFFICIAL_BASELINE_METHODS = (
@@ -56,7 +56,6 @@ RUN_KINDS = ("mechanical", "development", "formal")
 LAYOUTS = ("test_time_simple", "test_time_wide")
 SUPPORTED_LAYOUTS = (*LAYOUTS, "grounded_coord_ring")
 METHOD_VARIANTS = (
-    "history_rnn",
     "base",
     "response_only",
     "delta_passive",
@@ -67,12 +66,11 @@ METHOD_VARIANTS = (
 
 It is ``delta_active`` in every respect -- the latent model trains, anchors are
 measured, the mirror adapts -- except that the actor reads the uninformative
-prior instead of ``b_t``.  It exists to separate two costs that are currently
-confounded: conditioning the policy on an inferred posterior, and acting on the
-value that posterior implies.  Measured across two layouts, ``response_only``
-sits about 24 raw-return points below ``base`` while the full package never
-beats ``base``, which is consistent with the belief input itself being the
-expense and the mirror being a partial repair.
+prior instead of ``b_t``.  It exists to separate two costs that were
+confounded in the historical v5 diagnostic runs: conditioning the policy on an
+inferred posterior, and acting on the value that posterior implies.  Those v5
+returns motivated the ablation; they are not evidence about the active v6
+package.
 """
 
 
@@ -96,18 +94,20 @@ Thirteen XLA flags and three source rewrites failed to move it; the development
 budget compiles because it does not take that split-K path.
 
 Halving this keeps every registered divisor intact -- rollout 32,768 steps,
-29,949,952 / 32,768 = 914 updates, anchors every 32 updates, 128 % 64 = 0 --
-and the same total environment steps.  It does change the optimisation: two
-environments per minibatch instead of four, and 233,984 optimizer steps instead
-of 116,992.  That is a protocol change, decided by the user on 2026-08-11, and
-it must be disclosed with any result computed under it.
+29,949,952 / 32,768 = 914 updates and anchors every 32 updates -- and the same
+total environment steps.  v6 retains the 64 registered formal minibatches and
+pairs one self-play lane with one cross-play lane in every optimizer step.
+The 128-lane change remains a protocol revision decided on 2026-08-11 and must
+be disclosed with any result computed under it.
 """
 FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 1024 * 1024
 
 RUN_BUDGETS: Mapping[str, RunBudget] = {
     "mechanical": RunBudget(4, 1_024, 1, 1_024),
     "development": RunBudget(32, 1_228_800, 8, 98_304),
-    "formal": RunBudget(FORMAL_NUM_ENVS, 29_949_952, 64, 29_949_952),
+    "formal": RunBudget(
+        FORMAL_NUM_ENVS, 29_949_952, OFFICIAL_NUM_MINIBATCHES, 29_949_952
+    ),
 }
 
 
@@ -473,6 +473,10 @@ def validate_config(config: RunConfig) -> None:
         raise ValueError("Rollout length must be positive.")
     if config.environment.num_envs % config.training.minibatches_per_epoch:
         raise ValueError("Environment lanes must divide into minibatches.")
+    if config.environment.num_envs % 4:
+        raise ValueError("Mixed self/cross-play requires lane counts divisible by four.")
+    if (config.environment.num_envs // 2) % config.training.minibatches_per_epoch:
+        raise ValueError("Each policy group must divide into paired minibatches.")
     base_steps = config.training.environment_steps - config.training.extra_ppo_environment_steps
     rollout_steps = config.environment.num_envs * config.training.rollout_length
     if base_steps % rollout_steps:

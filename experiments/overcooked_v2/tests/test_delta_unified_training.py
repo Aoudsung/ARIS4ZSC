@@ -71,12 +71,16 @@ def _batch(model, base, latent, *, time_count: int = 4, lanes: int = 4):
         advantages=jnp.zeros((time_count, lanes)),
         returns=jnp.zeros((time_count, lanes)),
         ppo_mask=jnp.ones((time_count, lanes)),
+        policy_group=jnp.broadcast_to(
+            (jnp.arange(lanes) >= lanes // 2).astype(jnp.int32),
+            (time_count, lanes),
+        ),
         beliefs=output.belief,
         initial_policy_state=model.initial_state(lanes),
     )
 
 
-def _anchors():
+def _anchors(*, lane_offset: int = 2):
     import jax.numpy as jnp
 
     from src.delta_zsc.types import AnchorBatch
@@ -97,7 +101,9 @@ def _anchors():
     )
     return AnchorBatch(
         time_indexes=jnp.asarray([1, 2], dtype=jnp.int32),
-        lane_indexes=jnp.asarray([0, 1], dtype=jnp.int32),
+        lane_indexes=jnp.asarray(
+            [int(lane_offset), int(lane_offset) + 1], dtype=jnp.int32
+        ),
         contrast_mean=contrast.mean,
         contrast_standard_error=contrast.standard_error,
         contrast_valid=contrast.valid,
@@ -136,6 +142,7 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
     import jax
 
     from src.delta_zsc.optimizer import init_adam
+    from src.delta_zsc.base_policy import trainable_base_params
     from src.delta_zsc.training import (
         environment_minibatch_schedule,
         init_latent_optimizer,
@@ -162,7 +169,7 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
         base_params=base,
         latent_params=latent,
         target_latent_params=latent,
-        base_optimizer_state=init_adam(base),
+        base_optimizer_state=init_adam(trainable_base_params(base)),
         latent_optimizer_state=init_latent_optimizer(latent),
         batch=batch,
         anchors=_anchors(),
@@ -202,6 +209,7 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
         model=model,
         latent_params=updated_latent,
         base_params=updated_base,
+        feature_latent_params=latent,
         optimizer_state=init_latent_optimizer(latent)["contrast"],
         batch=batch,
         anchors=_anchors(),
@@ -215,6 +223,195 @@ def test_base_and_latent_updates_are_separate_finite_transactions() -> None:
     # accumulation across updates cannot silently drop the measured ones.
     for name in DECISION_METRIC_NAMES:
         assert name in metrics["latent"]
+
+
+def test_anchor_kernel_folds_post_contrast_critic_into_polyak_target(
+    monkeypatch,
+) -> None:
+    """The sparse correction must reach the target before the next TD step."""
+
+    from collections import namedtuple
+    import importlib
+
+    import jax.numpy as jnp
+
+    training_app = importlib.import_module(
+        "experiments.overcooked_v2.training_app"
+    )
+    anchors_type = namedtuple("TestAnchors", ("lane_indexes",))
+    observed = {}
+
+    def fake_schedule(*args, **kwargs):
+        del args, kwargs
+        return "paired-schedule"
+
+    def fake_slice(batch, indexes):
+        observed["slice"] = (batch, np.asarray(indexes))
+        return "xp-batch"
+
+    def fake_contrast(**kwargs):
+        observed["contrast"] = kwargs
+        return (
+            "contrast-calibrated-latent",
+            "contrast-state-after",
+            {"latent_contrast_update_applied": jnp.asarray(1.0)},
+        )
+
+    def fake_polyak(target, online):
+        observed["polyak"] = (target, online)
+        return "target-after-contrast"
+
+    monkeypatch.setattr(training_app, "environment_minibatch_schedule", fake_schedule)
+    monkeypatch.setattr(training_app, "slice_rollout_lanes", fake_slice)
+    monkeypatch.setattr(training_app, "update_contrast_channel", fake_contrast)
+    monkeypatch.setattr(training_app, "polyak_update", fake_polyak)
+
+    def rollout_kernel(*args):
+        del args
+        return "runner-after-rollout", "whole-batch", "snapshots"
+
+    def anchor_kernel(key, snapshots, base, latent, gamma):
+        del key, gamma
+        observed["anchor_collection"] = (snapshots, base, latent)
+        return anchors_type(lane_indexes=jnp.asarray([2, 3], dtype=jnp.int32))
+
+    def update_kernel(base, latent, target, base_state, latent_state, batch, schedule):
+        observed["ordinary_update"] = (
+            base,
+            latent,
+            target,
+            base_state,
+            latent_state,
+            batch,
+            schedule,
+        )
+        return (
+            "ppo-updated-base",
+            "ordinary-updated-latent",
+            "ordinary-updated-target",
+            "base-state-after",
+            {"contrast": "contrast-state-before"},
+            {"ppo": {}, "latent": {"ordinary": jnp.asarray(1.0)}},
+        )
+
+    kernel = training_app._make_anchor_update_kernel(
+        rollout_kernel=rollout_kernel,
+        anchor_kernel=anchor_kernel,
+        update_kernel=update_kernel,
+        loop_key=jnp.asarray([0, 1], dtype=jnp.uint32),
+        rollout_steps=4,
+        shaping_horizon=10,
+        environment_count=4,
+        minibatches_per_epoch=1,
+        update_epochs=1,
+        gamma=0.99,
+        fresh_states=2,
+        replay_states=0,
+        model=object(),
+    )
+    state, metrics = kernel(
+        "runner-before",
+        "collection-base",
+        "collection-latent",
+        "target-before",
+        "base-state-before",
+        {"contrast": "old-contrast-state"},
+        "buffer",
+        jnp.asarray(0, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+
+    assert observed["anchor_collection"] == (
+        "snapshots",
+        "collection-base",
+        "collection-latent",
+    )
+    assert observed["ordinary_update"][-1] == "paired-schedule"
+    assert observed["slice"][0] == "whole-batch"
+    np.testing.assert_array_equal(observed["slice"][1], np.asarray([2, 3]))
+    assert observed["contrast"]["base_params"] == "collection-base"
+    assert observed["contrast"]["feature_latent_params"] == "collection-latent"
+    assert observed["contrast"]["latent_params"] == "ordinary-updated-latent"
+    assert observed["contrast"]["batch"] == "xp-batch"
+    np.testing.assert_array_equal(
+        observed["contrast"]["anchors"].lane_indexes, np.asarray([0, 1])
+    )
+    assert observed["polyak"] == (
+        "ordinary-updated-target",
+        "contrast-calibrated-latent",
+    )
+    assert state[2] == "contrast-calibrated-latent"
+    assert state[3] == "target-after-contrast"
+    assert state[5]["contrast"] == "contrast-state-after"
+    assert float(metrics["latent"]["latent_contrast_update_applied"]) == 1.0
+
+
+def test_zero_residual_is_exact_reference_and_ppo_cannot_move_reference() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.base_policy import trainable_base_params
+    from src.delta_zsc.optimizer import init_adam
+    from src.delta_zsc.training import update_base_policy
+
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
+    _, initial = model.sequence(
+        base,
+        latent,
+        batch.initial_policy_state,
+        batch.observations,
+        batch.previous_actions,
+        batch.episode_starts,
+        compute_latent=False,
+        execute_adaptation=False,
+        beliefs=batch.beliefs,
+    )
+    np.testing.assert_allclose(
+        np.asarray(initial.base_policy_logits),
+        np.asarray(initial.reference_policy_logits),
+        atol=0.0,
+    )
+    moved_batch = batch._replace(
+        advantages=jnp.arange(batch.actions.size, dtype=jnp.float32).reshape(
+            batch.actions.shape
+        )
+    )
+    updated, _, _ = update_base_policy(
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        optimizer_state=init_adam(trainable_base_params(base)),
+        batch=moved_batch,
+        total_optimizer_steps=10,
+    )
+    assert _same_tree(updated["reference"], base["reference"])
+    assert not _same_tree(updated["trainable"], base["trainable"])
+
+
+def test_paired_minibatch_schedule_covers_each_group_once_per_epoch() -> None:
+    import jax
+    import numpy as np
+
+    from src.delta_zsc.training import environment_minibatch_schedule
+
+    schedule = np.asarray(
+        environment_minibatch_schedule(
+            jax.random.PRNGKey(91),
+            environment_count=32,
+            minibatches_per_epoch=8,
+            update_epochs=3,
+        )
+    )
+    assert schedule.shape == (3, 8, 4)
+    for epoch in schedule:
+        for row in epoch:
+            assert np.sum(row < 16) == 2
+            assert np.sum(row >= 16) == 2
+        np.testing.assert_array_equal(np.sort(epoch[:, :2].reshape(-1)), np.arange(16))
+        np.testing.assert_array_equal(
+            np.sort(epoch[:, 2:].reshape(-1)), np.arange(16, 32)
+        )
 
 
 
@@ -247,6 +444,8 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
     monkeypatch.setattr(training, "update_base_policy", fake_base)
     monkeypatch.setattr(training, "slice_rollout_lanes", lambda batch, indexes: batch)
 
+    _, model, base, latent = _setup()
+    batch = _batch(model, base, latent)
     result = training.training_update(
         model=object(),
         base_params=jnp.asarray(0.0),
@@ -254,9 +453,9 @@ def test_outer_transaction_commits_latent_before_ppo(monkeypatch) -> None:
         target_latent_params=jnp.asarray(0.0),
         base_optimizer_state=jnp.asarray(0.0),
         latent_optimizer_state=jnp.asarray(0.0),
-        batch=object(),
-        anchors=object(),
-        schedule=jnp.zeros((1, 1, 1), dtype=jnp.int32),
+        batch=batch,
+        anchors=None,
+        schedule=jnp.zeros((1, 1, 2), dtype=jnp.int32),
         total_optimizer_steps=1,
     )
     assert events == ["latent", "ppo"]
@@ -308,15 +507,14 @@ def test_batched_base_policy_sequence_matches_step_replay() -> None:
 
     def one(carry, values):
         observation, episode_start, belief = values
-        next_carry, task, instant, logits, value = base_policy_step(
+        next_carry, task, instant, reference, residual, logits, value = base_policy_step(
             base,
             carry,
             observation,
             episode_start,
             belief,
-            mask_partner_history=True,
         )
-        return next_carry, (task, instant, logits, value)
+        return next_carry, (task, instant, reference, residual, logits, value)
 
     reference_carry, reference = jax.lax.scan(
         one, initial, (observations, starts, beliefs)
@@ -327,25 +525,63 @@ def test_batched_base_policy_sequence_matches_step_replay() -> None:
         observations,
         starts,
         beliefs,
-        mask_partner_history=True,
     )
     (
         actual_carry,
         unused_task_carries,
         actual_task,
         actual_instant,
+        actual_reference,
+        actual_residual,
         actual_logits,
         actual_value,
     ) = actual
     del unused_task_carries
     for left, right in zip(
-        (actual_carry, actual_task, actual_instant, actual_logits, actual_value),
+        (
+            actual_carry,
+            actual_task,
+            actual_instant,
+            actual_reference,
+            actual_residual,
+            actual_logits,
+            actual_value,
+        ),
         (reference_carry, *reference),
         strict=True,
     ):
         np.testing.assert_allclose(
             np.asarray(left), np.asarray(right), rtol=2.0e-5, atol=2.0e-5
         )
+
+
+def test_immutable_reference_reads_complete_legal_observation_history() -> None:
+    """Every v6 variant must preserve the Official actor's observation input."""
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.base_policy import base_policy_step
+    from src.delta_zsc.observation import partner_channel_indexes
+
+    _, model, base, _ = _setup("base")
+    observation = jax.random.normal(
+        jax.random.PRNGKey(91), (1, 5, 5, 39), dtype=jnp.float32
+    )
+    partner_channel = partner_channel_indexes(39)[0]
+    changed = observation.at[:, 2, 2, partner_channel].add(10.0)
+    carry = model.initial_state(1).task_carry
+    belief = jnp.full((1, 4), 0.25, dtype=jnp.float32)
+    start = jnp.ones((1,), dtype=jnp.bool_)
+
+    _, changed_task, _, _, _, _, _ = base_policy_step(
+        base, carry, changed, start, belief
+    )
+    _, baseline_task, _, _, _, _, _ = base_policy_step(
+        base, carry, observation, start, belief
+    )
+
+    assert not np.array_equal(np.asarray(changed_task), np.asarray(baseline_task))
 
 
 def test_batched_filter_sequence_matches_online_steps() -> None:
@@ -706,25 +942,42 @@ def test_ppo_loss_terms_match_the_official_formulas() -> None:
     logits, value = output.base_policy_logits[:-1], output.value[:-1]
     gae = jnp.asarray(batch.advantages, jnp.float32)
     targets = jnp.asarray(batch.returns, jnp.float32)
-    gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+    groups = jnp.asarray(batch.policy_group)
+    normalized = []
+    for group in (0, 1):
+        selected = gae[:, groups[0] == group]
+        normalized.append((selected - selected.mean()) / (selected.std() + 1e-8))
+    gae = jnp.concatenate(normalized, axis=1)
 
     log_prob = categorical_log_probability(logits, batch.actions)
     ratio = jnp.exp(log_prob - batch.old_log_probabilities)
-    actor = -jnp.minimum(
+    actor_rows = -jnp.minimum(
         ratio * gae,
         jnp.clip(ratio, 1 - cfg.clip_epsilon, 1 + cfg.clip_epsilon) * gae,
-    ).mean()
+    )
 
     old_value = jnp.asarray(batch.old_values, jnp.float32)[:-1]
     clipped = old_value + jnp.clip(
         value - old_value, -cfg.value_clip_epsilon, cfg.value_clip_epsilon
     )
-    value_loss = 0.5 * jnp.maximum(
+    value_rows = 0.5 * jnp.maximum(
         jnp.square(value - targets), jnp.square(clipped - targets)
-    ).mean()
+    )
 
     logp = jax.nn.log_softmax(logits, axis=-1)
-    entropy = (-jnp.sum(jnp.exp(logp) * logp, axis=-1)).mean()
+    entropy_rows = -jnp.sum(jnp.exp(logp) * logp, axis=-1)
+    actor = jnp.maximum(
+        actor_rows[:, groups[0] == 0].mean(),
+        actor_rows[:, groups[0] == 1].mean(),
+    )
+    value_loss = jnp.maximum(
+        value_rows[:, groups[0] == 0].mean(),
+        value_rows[:, groups[0] == 1].mean(),
+    )
+    entropy = jnp.minimum(
+        entropy_rows[:, groups[0] == 0].mean(),
+        entropy_rows[:, groups[0] == 1].mean(),
+    )
 
     np.testing.assert_allclose(float(result.metrics["ppo_actor"]), float(actor), atol=1e-5)
     np.testing.assert_allclose(float(result.metrics["ppo_value"]), float(value_loss), atol=1e-5)

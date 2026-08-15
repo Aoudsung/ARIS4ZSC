@@ -1,4 +1,4 @@
-"""DELTA v5 immediate and delayed response emissions.
+"""DELTA v6 immediate and delayed response emissions.
 
 Occurrence factors are shared across latent components.  Conditional semantic
 factors use a pooled baseline plus a centered component residual, with both a

@@ -71,6 +71,7 @@ def init_belief_value_params(
     instant_dim: int,
     behavior_dim: int,
     component_count: int,
+    component_embedding_dim: int,
     hidden_dim: int,
     action_count: int,
     ensemble_size: int,
@@ -79,7 +80,17 @@ def init_belief_value_params(
 
     if int(ensemble_size) < 1:
         raise ValueError("The belief-conditioned critic needs at least one member.")
-    inputs = int(task_dim) + int(instant_dim) + int(behavior_dim) + int(component_count)
+    # The grounded coordinate is the posterior-weighted response-component
+    # embedding.  It is detached at every call: the existing TD/CRN score may
+    # shape only this critic, never the response model that defines the modes.
+    grounding_dim = int(component_embedding_dim)
+    inputs = (
+        int(task_dim)
+        + int(instant_dim)
+        + int(behavior_dim)
+        + int(component_count)
+        + grounding_dim
+    )
     keys = jax.random.split(key, 2 + 2 * int(ensemble_size))
     params: dict[str, Any] = {
         "trunk": init_mlp(keys[0], (inputs, int(hidden_dim), int(hidden_dim))),
@@ -111,6 +122,7 @@ def belief_value_predict(
     behavior_features: Any,
     belief: Any,
     policy_probabilities: Any | None = None,
+    component_embeddings: Any | None = None,
 ) -> BeliefConditionedValue:
     """Evaluate the critic under the posterior the actor is conditioned on.
 
@@ -119,14 +131,26 @@ def belief_value_predict(
     special case and keeps the head usable before a policy is available.
     """
 
+    import jax
     import jax.numpy as jnp
+
+    posterior = jnp.asarray(belief, dtype=jnp.float32)
+    if component_embeddings is None:
+        grounded = posterior
+    else:
+        embeddings = jax.lax.stop_gradient(
+            jnp.asarray(component_embeddings, dtype=jnp.float32)
+        )
+        grounded = posterior @ embeddings
+    grounded = jax.lax.stop_gradient(grounded)
 
     features = jnp.concatenate(
         (
             jnp.asarray(task_features, dtype=jnp.float32),
             jnp.asarray(instant_partner, dtype=jnp.float32),
             jnp.asarray(behavior_features, dtype=jnp.float32),
-            jnp.asarray(belief, dtype=jnp.float32),
+            posterior,
+            grounded,
         ),
         axis=-1,
     )

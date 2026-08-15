@@ -1,4 +1,4 @@
-"""Calibration and posterior-predictive diagnostics for DELTA-ZSC v5."""
+"""Calibration and posterior-predictive diagnostics for DELTA-ZSC v6."""
 
 from __future__ import annotations
 
@@ -556,7 +556,7 @@ def build_semantic_initializer(args: argparse.Namespace) -> None:
         output / "semantic_initializer_summary.json",
         {
             "version": 1,
-            "artifact_type": "delta_v5_semantic_initializer_summary",
+            "artifact_type": "delta_v6_semantic_initializer_summary",
             "initializers": artifacts,
             "event_count": int(labels.size),
             "episode_count": int(len(rows)),
@@ -1062,8 +1062,8 @@ def run_posterior_predictive_diagnostics(args: argparse.Namespace) -> None:
     write_json(
         output_dir / "posterior_predictive_diagnostics.json",
         {
-            "version": 5,
-            "artifact_type": "delta_v5_posterior_predictive_diagnostics",
+            "version": 6,
+            "artifact_type": "delta_v6_posterior_predictive_diagnostics",
             "method": METHOD_VERSION,
             "layout": config.environment.layout,
             "claim_role": "diagnostic_only",

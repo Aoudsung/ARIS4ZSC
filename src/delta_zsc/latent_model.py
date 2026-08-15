@@ -1,4 +1,4 @@
-"""Episode-static shared-latent coordination model for DELTA v5.
+"""Episode-static shared-latent coordination model for DELTA v6.
 
 Immediate semantic responses update the legal posterior. Shared occurrence
 factors are predicted but cannot change component responsibilities. Delayed
@@ -80,6 +80,7 @@ def init_latent_params(
             instant_dim=instant_dim,
             behavior_dim=behavior_dim,
             component_count=component_count,
+            component_embedding_dim=component_embedding_dim,
             hidden_dim=hidden_dim,
             action_count=action_count,
             ensemble_size=value_ensemble_size,

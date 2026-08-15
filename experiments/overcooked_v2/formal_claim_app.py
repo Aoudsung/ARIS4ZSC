@@ -54,12 +54,15 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
         if (
             official[layout].get("artifact_type") != "delta_official_summary"
             or official[layout].get("version") != 3
+            or official[layout].get("method") != METHOD_VERSION
+            or official[layout].get("execution_mode") != "active"
             or official[layout].get("layout") != layout
         ):
             raise ValueError(f"Official summary identity differs on {layout}.")
         if (
             development[layout].get("artifact_type") != "delta_development_summary"
             or development[layout].get("version") != 2
+            or development[layout].get("method") != METHOD_VERSION
             or development[layout].get("layout") != layout
         ):
             raise ValueError(f"Development summary identity differs on {layout}.")
@@ -67,13 +70,16 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
             intervention[layout].get("artifact_type")
             != "delta_belief_value_intervention"
             or intervention[layout].get("version") != 2
+            or intervention[layout].get("method") != METHOD_VERSION
+            or intervention[layout].get("execution_mode") != "active"
             or intervention[layout].get("layout") != layout
         ):
             raise ValueError(f"Belief intervention identity differs on {layout}.")
         if (
             diagnostics[layout].get("artifact_type")
-            != "delta_v5_posterior_predictive_diagnostics"
-            or diagnostics[layout].get("version") != 5
+            != "delta_v6_posterior_predictive_diagnostics"
+            or diagnostics[layout].get("version") != 6
+            or diagnostics[layout].get("method") != METHOD_VERSION
             or diagnostics[layout].get("layout") != layout
             or diagnostics[layout].get("claim_role") != "diagnostic_only"
         ):
@@ -130,7 +136,7 @@ def build_formal_claim_report(args: argparse.Namespace) -> None:
     claims = {
         "H1_performance": {
             "statement": (
-                "Frozen DELTA-active exceeds the strongest registered same-protocol "
+                "Frozen DELTA-active exceeds every registered same-protocol "
                 "baseline by at least one delivery on both Official layouts."
             ),
             "eligible": True,

@@ -175,10 +175,59 @@ def test_mock_end_to_end_rollout_and_anchor_use_base_policy() -> None:
         evaluation_replicas=2,
         horizon=2,
         gamma=0.99,
+        xp_lanes_only=True,
     )
     assert anchors.fit_returns_by_action.shape == (2, 6)
     assert anchors.probe_fit_returns_by_action.shape == (2, 6, 6)
     assert anchors.probe_action_mask.shape == (2, 6, 6)
+
+
+def test_generic_rollout_keeps_frozen_partners_and_training_self_state_is_independent() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.runner import collect_rollout, initialize_runner
+
+    _, model, base, latent = _model()
+    environment = MockEnvironment()
+    partner = _partner_functions()
+    runner = initialize_runner(
+        environment=environment,
+        model=model,
+        partner_functions=partner,
+        random_key=jax.random.PRNGKey(17),
+    )
+    frozen, frozen_batch, _ = collect_rollout(
+        state=runner,
+        length=2,
+        environment=environment,
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        partner_functions=partner,
+        partner_parameters=None,
+        official_shaping_factor=0.0,
+        record_anchors=False,
+    )
+    np.testing.assert_allclose(np.asarray(frozen_batch.policy_group), 1.0, atol=0.0)
+    assert _same_tree(frozen.self_policy_state, runner.self_policy_state)
+
+    mixed, mixed_batch, _ = collect_rollout(
+        state=runner,
+        length=2,
+        environment=environment,
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        partner_functions=partner,
+        partner_parameters=None,
+        official_shaping_factor=0.0,
+        record_anchors=False,
+        mixed_training_partners=True,
+    )
+    expected = jnp.broadcast_to(jnp.asarray([0, 0, 1, 1]), (2, 4))
+    np.testing.assert_array_equal(np.asarray(mixed_batch.policy_group), np.asarray(expected))
+    assert not _same_tree(mixed.self_policy_state, runner.self_policy_state)
 
 
 def test_sparse_anchor_rollout_matches_full_recording() -> None:
@@ -216,6 +265,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         partner_parameters=None,
         official_shaping_factor=0.25,
         record_anchors=True,
+        mixed_training_partners=True,
     )
     compact = make_compact_training_rollout_kernel(
         environment=environment,
@@ -269,6 +319,7 @@ def test_sparse_anchor_rollout_matches_full_recording() -> None:
         gamma=0.99,
         pilot_states=2,
         pilot_replicas=2,
+        xp_lanes_only=True,
     )
     sparse_anchor_kernel = make_anchor_batch_kernel(
         functions=functions,
@@ -325,6 +376,7 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         load_deployment,
     )
     from src.delta_zsc.optimizer import init_adam
+    from src.delta_zsc.base_policy import trainable_base_params
     from src.delta_zsc.semantic_initializer import deterministic_simplex_initializer
     from src.delta_zsc.storage import load_latest_checkpoint, save_checkpoint
     from src.delta_zsc.types import TrainState
@@ -343,7 +395,7 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
         base,
         latent,
         latent,
-        init_adam(base),
+        init_adam(trainable_base_params(base)),
         init_latent_optimizer(latent),
         None,
         runner,
@@ -376,6 +428,115 @@ def test_checkpoint_and_deployment_round_trip(tmp_path: Path) -> None:
     assert _same_tree(loaded.latent_params, latent)
     assert loaded.semantic_initializer["uses_partner_labels"] is False
     assert loaded.semantic_initializer["event_component_bias_shape"] == [4, 31]
+    assert loaded.execution_mode == "active"
+
+    import json
+
+    descriptor = bundle / "deployment_bundle.json"
+    payload = json.loads(descriptor.read_text(encoding="utf-8"))
+    payload["version"] = 4
+    descriptor.write_text(json.dumps(payload), encoding="utf-8")
+    import pytest
+
+    with pytest.raises(ValueError, match="method/schema identity"):
+        load_deployment(bundle)
+
+
+def test_all_deployment_modes_preserve_reference_kl_and_passive_probe_state() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.overcooked_v2.deployment import (
+        Deployment,
+        EXECUTION_MODES,
+        deployment_action,
+    )
+    from src.delta_zsc.losses import categorical_log_probability
+    from src.delta_zsc.mirror_policy import (
+        MIRROR_UNCERTAINTY_PENALTY,
+        categorical_kl_from_logits,
+        project_policy_logits,
+        robust_mirror_policy_logits,
+    )
+
+    config, model, base, latent = _model()
+    # Exercise the projection rather than relying on the exact-zero residual at
+    # initialization.  The immutable reference subtree itself is unchanged.
+    trainable = base["trainable"]
+    residual = trainable["residual_actor"]
+    base = {
+        **base,
+        "trainable": {
+            **trainable,
+            "residual_actor": {
+                **residual,
+                "bias": jnp.asarray(
+                    [12.0, -12.0, 8.0, -8.0, 4.0, -4.0], dtype=jnp.float32
+                ),
+            },
+        },
+    }
+    deployment = Deployment(
+        ego_run_id="fixture",
+        config=config,
+        model=model,
+        base_params=base,
+        latent_params=latent,
+        execution_mode="active",
+        semantic_initializer={},
+    )
+    observation = jnp.zeros((1, 5, 5, 39), dtype=jnp.float32)
+    keys = jax.random.split(jax.random.PRNGKey(91), 1)
+    budget = float(config.method.adaptation_kl_budget)
+
+    for mode in EXECUTION_MODES:
+        stepped, action, output, logp = deployment_action(
+            deployment=deployment,
+            state=model.initial_state(1),
+            observation=observation,
+            keys=keys,
+            execution_mode=mode,
+        )
+        if mode == "reference_only":
+            selected = output.reference_policy_logits
+        elif mode == "residual":
+            selected = output.base_policy_logits
+        elif mode == "passive":
+            mirror, _, _ = robust_mirror_policy_logits(
+                output.base_policy_logits,
+                output.expected_decision_values,
+                output.expected_decision_variances**0.5,
+                kl_budget=budget,
+                uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
+            )
+            selected, _, _ = project_policy_logits(
+                output.reference_policy_logits,
+                mirror,
+                kl_budget=budget,
+            )
+        else:
+            selected = output.policy_logits
+
+        expected_logp = categorical_log_probability(selected, action)
+        np.testing.assert_allclose(
+            np.asarray(logp), np.asarray(expected_logp), atol=1.0e-6
+        )
+        final_kl = categorical_kl_from_logits(
+            selected, output.reference_policy_logits
+        )
+        assert float(jnp.max(final_kl)) <= budget + 1.0e-5
+        if mode == "passive":
+            assert not bool(stepped.probe_continuation_pending[0])
+
+    assert bool(
+        deployment_action(
+            deployment=deployment,
+            state=model.initial_state(1),
+            observation=observation,
+            keys=keys,
+            execution_mode="active",
+        )[0].probe_continuation_pending[0]
+    )
 
 
 def test_final_v4_audit_reduces_probe_axis_before_anchor_mask() -> None:

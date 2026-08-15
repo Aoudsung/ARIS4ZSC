@@ -1,4 +1,4 @@
-"""Unified DELTA-ZSC v5 model and deployment transition.
+"""Unified DELTA-ZSC v6 model and deployment transition.
 
 ``base_params`` own task competence and are trained only by on-policy PPO.
 ``latent_params`` own the episode-static semantic response, delayed probe
@@ -24,6 +24,7 @@ from .belief_value import belief_value_predict
 from .latent_model import init_latent_params, observe_response
 from .mirror_policy import (
     MIRROR_UNCERTAINTY_PENALTY,
+    project_policy_logits,
     mirror_policy_logits,
     robust_mirror_policy_logits,
 )
@@ -145,6 +146,7 @@ def component_action_values(
         spread(behavior_features),
         identity,
         spread(policy_probabilities),
+        latent_params["component_embeddings"],
     )
     return prediction.advantage_mean, prediction.advantage_dispersion()
 
@@ -223,6 +225,7 @@ def successor_action_values(
         per_component(spread(behavior_features)),
         identity,
         per_component(spread(policy_probabilities)),
+        latent_params["component_embeddings"],
     )
     return prediction.advantage_mean
 
@@ -302,7 +305,10 @@ class DeltaModel:
         next_task: Any,
         task: Any,
         instant: Any,
+        reference_logits: Any,
+        residual_logits: Any,
         base_logits: Any,
+        base_kl: Any,
         value: Any,
         observation: Any,
     ) -> tuple[PolicyState, ModelOutput]:
@@ -325,6 +331,8 @@ class DeltaModel:
         return next_state, ModelOutput(
             task_features=task,
             instant_partner=instant,
+            reference_policy_logits=reference_logits,
+            residual_policy_logits=residual_logits,
             base_policy_logits=base_logits,
             policy_logits=base_logits,
             value=value,
@@ -339,10 +347,11 @@ class DeltaModel:
             component_successor_decision_means=successor.means,
             component_successor_decision_variances=successor.variances,
             expected_decision_values=zero_action,
+            expected_decision_variances=zero_action,
             active_voi=zero_action,
             active_information_gain=zero_action,
             active_probe_eligible=jnp.zeros(lead, dtype=jnp.bool_),
-            adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
+            adaptation_kl=base_kl,
             adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
         )
 
@@ -356,8 +365,7 @@ class DeltaModel:
         compute_latent: bool = True,
         compute_decision: bool = True,
         execute_adaptation: bool = True,
-        precomputed_base: tuple[Any, Any, Any, Any, Any] | None = None,
-        actor_belief_override: str | None = None,
+        precomputed_base: tuple[Any, Any, Any, Any, Any, Any, Any] | None = None,
     ) -> tuple[PolicyState, ModelOutput]:
         """Advance one legal observation and form the deployment policy."""
 
@@ -366,7 +374,6 @@ class DeltaModel:
 
         start = jnp.asarray(state.episode_start, dtype=jnp.bool_)
         components = int(self.config.method.latent_components)
-        mask_history = self.config.method_variant != "history_rnn"
         pending_continuation = jnp.where(
             start,
             jnp.zeros_like(start, dtype=jnp.bool_),
@@ -378,27 +385,51 @@ class DeltaModel:
         # produces, so this ordering is available; the critic still runs after,
         # since it consumes the actor's task and instant features.
         if not bool(compute_latent):
-            # Execution modes without a latent pass (history_rnn, base, PPO
-            # replay of those) have no posterior.  Feed the uninformative prior
+            # Execution modes without a latent pass (base and its PPO replay)
+            # have no posterior.  Feed the uninformative prior
             # so the actor input keeps one fixed shape across every mode.
             actor_belief = uniform_belief(tuple(start.shape), components)
             if precomputed_base is None:
-                next_task, task, instant, base_logits, value = base_policy_step(
+                (
+                    next_task,
+                    task,
+                    instant,
+                    reference_logits,
+                    residual_logits,
+                    base_logits,
+                    value,
+                ) = base_policy_step(
                     base_params,
                     state.task_carry,
                     observation,
                     start,
                     actor_belief,
-                    mask_partner_history=mask_history,
                 )
             else:
-                next_task, task, instant, base_logits, value = precomputed_base
+                (
+                    next_task,
+                    task,
+                    instant,
+                    reference_logits,
+                    residual_logits,
+                    base_logits,
+                    value,
+                ) = precomputed_base
+            base_logits, base_kl, unused_projection = project_policy_logits(
+                reference_logits,
+                base_logits,
+                kl_budget=self.config.method.adaptation_kl_budget,
+            )
+            del unused_projection
             return self._empty_output(
                 state=state,
                 next_task=next_task,
                 task=task,
                 instant=instant,
+                reference_logits=reference_logits,
+                residual_logits=residual_logits,
                 base_logits=base_logits,
+                base_kl=base_kl,
                 value=value,
                 observation=observation,
             )
@@ -429,28 +460,40 @@ class DeltaModel:
         # It isolates the cost of the actor input from the value of acting on
         # the belief.
         actor_belief = jax.lax.stop_gradient(next_belief)
-        if str(self.config.method_variant) == "delta_active_blind_actor":
+        if self.config.method_variant == "delta_active_blind_actor":
             actor_belief = uniform_belief(tuple(start.shape), components)
-        elif actor_belief_override == "uniform":
-            # Diagnostic only.  The posterior is still filtered, still emitted
-            # and still read by the critic; the actor alone stops seeing it, so
-            # "the actor consumes b_t" can be measured apart from "b_t exists".
-            actor_belief = uniform_belief(tuple(start.shape), components)
-        elif actor_belief_override is not None:
-            raise ValueError(
-                f"Unknown actor_belief_override: {actor_belief_override!r}"
-            )
         if precomputed_base is None:
-            next_task, task, instant, base_logits, value = base_policy_step(
+            (
+                next_task,
+                task,
+                instant,
+                reference_logits,
+                residual_logits,
+                base_logits,
+                value,
+            ) = base_policy_step(
                 base_params,
                 state.task_carry,
                 observation,
                 start,
                 actor_belief,
-                mask_partner_history=mask_history,
             )
         else:
-            next_task, task, instant, base_logits, value = precomputed_base
+            (
+                next_task,
+                task,
+                instant,
+                reference_logits,
+                residual_logits,
+                base_logits,
+                value,
+            ) = precomputed_base
+        base_logits, base_kl, unused_projection = project_policy_logits(
+            reference_logits,
+            base_logits,
+            kl_budget=self.config.method.adaptation_kl_budget,
+        )
+        del unused_projection
         statistics = behavior_features(next_behavior)
         if bool(execute_adaptation) and not bool(compute_decision):
             raise ValueError("Deployment adaptation requires the decision emission.")
@@ -471,6 +514,7 @@ class DeltaModel:
                 statistics,
                 next_belief,
                 jax.nn.softmax(base_logits, axis=-1),
+                latent_params["component_embeddings"],
             )
             expected_values = critic.advantage_mean
             expected_dispersion = critic.advantage_dispersion()
@@ -510,7 +554,10 @@ class DeltaModel:
         action_values = expected_values
         variant = str(self.config.method_variant)
         next_pending = jnp.zeros_like(pending_continuation, dtype=jnp.bool_)
-        if bool(execute_adaptation) and variant in ("delta_active", "delta_active_blind_actor"):
+        if bool(execute_adaptation) and variant in {
+            "delta_active",
+            "delta_active_blind_actor",
+        }:
             actions = jnp.broadcast_to(
                 jnp.arange(self.action_count, dtype=jnp.int32),
                 lead + (self.action_count,),
@@ -560,8 +607,8 @@ class DeltaModel:
                 float(self.config.ppo.gamma) ** 2
             ) * raw_voi
             (
-                candidate_logits,
-                candidate_kl,
+                mirror_logits,
+                unused_mirror_kl,
                 candidate_temperature,
             ) = robust_mirror_policy_logits(
                 base_logits,
@@ -571,15 +618,18 @@ class DeltaModel:
                 uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
             )
             active_lane = ~pending_continuation
-            policy_logits = jnp.where(
-                active_lane[..., None], candidate_logits, base_logits
+            candidate_logits = jnp.where(
+                active_lane[..., None], mirror_logits, base_logits
             )
+            policy_logits, adaptation_kl, unused_projection = project_policy_logits(
+                reference_logits,
+                candidate_logits,
+                kl_budget=self.config.method.adaptation_kl_budget,
+            )
+            del unused_mirror_kl, unused_projection
             active_voi = jnp.where(active_lane[..., None], raw_voi, zero_action)
             information_gain = jnp.where(
                 active_lane[..., None], raw_information_gain, zero_action
-            )
-            adaptation_kl = jnp.where(
-                active_lane, candidate_kl, jnp.zeros_like(candidate_kl)
             )
             adaptation_temperature = jnp.where(
                 active_lane,
@@ -601,8 +651,8 @@ class DeltaModel:
             next_pending = active_lane
         elif bool(execute_adaptation) and variant == "delta_passive":
             (
-                policy_logits,
-                adaptation_kl,
+                mirror_logits,
+                unused_mirror_kl,
                 adaptation_temperature,
             ) = robust_mirror_policy_logits(
                 base_logits,
@@ -611,9 +661,15 @@ class DeltaModel:
                 kl_budget=self.config.method.adaptation_kl_budget,
                 uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
             )
+            policy_logits, adaptation_kl, unused_projection = project_policy_logits(
+                reference_logits,
+                mirror_logits,
+                kl_budget=self.config.method.adaptation_kl_budget,
+            )
+            del unused_mirror_kl, unused_projection
         else:
             policy_logits = base_logits
-            adaptation_kl = jnp.zeros(lead, dtype=jnp.float32)
+            adaptation_kl = base_kl
             adaptation_temperature = jnp.full(lead, jnp.inf, dtype=jnp.float32)
 
         next_state = PolicyState(
@@ -628,6 +684,8 @@ class DeltaModel:
         return next_state, ModelOutput(
             task_features=task,
             instant_partner=instant,
+            reference_policy_logits=reference_logits,
+            residual_policy_logits=residual_logits,
             base_policy_logits=base_logits,
             policy_logits=policy_logits,
             value=value,
@@ -642,11 +700,13 @@ class DeltaModel:
             component_successor_decision_means=successor.means,
             component_successor_decision_variances=successor.variances,
             expected_decision_values=expected_values,
+            expected_decision_variances=jnp.square(expected_dispersion),
             active_voi=active_voi,
             active_information_gain=information_gain,
             active_probe_eligible=(
                 (~pending_continuation)
-                if bool(execute_adaptation) and variant in ("delta_active", "delta_active_blind_actor")
+                if bool(execute_adaptation)
+                and variant in {"delta_active", "delta_active_blind_actor"}
                 else jnp.zeros(lead, dtype=jnp.bool_)
             ),
             adaptation_kl=adaptation_kl,
@@ -697,6 +757,8 @@ class DeltaModel:
             task_carries,
             task_features,
             instant,
+            reference_logits,
+            residual_logits,
             base_logits,
             value,
         ) = base_policy_sequence(
@@ -705,8 +767,13 @@ class DeltaModel:
             observations,
             episode_starts,
             replay_beliefs,
-            mask_partner_history=(self.config.method_variant != "history_rnn"),
         )
+        base_logits, base_kl, unused_projection = project_policy_logits(
+            reference_logits,
+            base_logits,
+            kl_budget=self.config.method.adaptation_kl_budget,
+        )
+        del unused_projection
         if not bool(compute_latent):
             lead = tuple(base_logits.shape[:-1])
             components = int(self.config.method.latent_components)
@@ -732,6 +799,8 @@ class DeltaModel:
             return final_state, ModelOutput(
                 task_features=task_features,
                 instant_partner=instant,
+                reference_policy_logits=reference_logits,
+                residual_policy_logits=residual_logits,
                 base_policy_logits=base_logits,
                 policy_logits=base_logits,
                 value=value,
@@ -746,10 +815,11 @@ class DeltaModel:
                 component_successor_decision_means=successor.means,
                 component_successor_decision_variances=successor.variances,
                 expected_decision_values=zero_action,
+                expected_decision_variances=zero_action,
                 active_voi=zero_action,
                 active_information_gain=zero_action,
                 active_probe_eligible=jnp.zeros(lead, dtype=jnp.bool_),
-                adaptation_kl=jnp.zeros(lead, dtype=jnp.float32),
+                adaptation_kl=base_kl,
                 adaptation_temperature=jnp.full(lead, jnp.inf, dtype=jnp.float32),
             )
 
@@ -761,6 +831,8 @@ class DeltaModel:
                 next_task,
                 task,
                 current_instant,
+                current_reference_logits,
+                current_residual_logits,
                 current_logits,
                 current_value,
             ) = values
@@ -772,7 +844,15 @@ class DeltaModel:
             # ones the behaviour policy produced, so reuse them.  Without them
             # the actor must be re-evaluated against the recursive posterior.
             reuse = (
-                (next_task, task, current_instant, current_logits, current_value)
+                (
+                    next_task,
+                    task,
+                    current_instant,
+                    current_reference_logits,
+                    current_residual_logits,
+                    current_logits,
+                    current_value,
+                )
                 if beliefs is not None
                 else None
             )
@@ -797,6 +877,8 @@ class DeltaModel:
                 task_carries,
                 task_features,
                 instant,
+                reference_logits,
+                residual_logits,
                 base_logits,
                 value,
             ),

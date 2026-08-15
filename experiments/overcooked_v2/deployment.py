@@ -20,7 +20,8 @@ from src.delta_zsc.storage import write_json
 from src.delta_zsc.semantic_initializer import SEMANTIC_INITIALIZER_SCHEMA_VERSION
 
 
-DEPLOYMENT_BUNDLE_VERSION = 4
+DEPLOYMENT_BUNDLE_VERSION = 5
+EXECUTION_MODES = ("reference_only", "residual", "passive", "active")
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,7 @@ class Deployment:
     model: DeltaModel
     base_params: Any
     latent_params: Any
+    execution_mode: str
     semantic_initializer: Mapping[str, Any]
 
 
@@ -43,11 +45,14 @@ def export_deployment_bundle(
     latent_params: Any,
     source_training_run: str | Path,
     semantic_initializer: Mapping[str, Any],
+    execution_mode: str = "active",
 ) -> Path:
     root = Path(directory).resolve()
     if root.exists() and any(root.iterdir()):
         raise RuntimeError(f"Deployment directory is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
+    if execution_mode not in EXECUTION_MODES:
+        raise ValueError(f"execution_mode must be one of {EXECUTION_MODES}.")
     parameters = {"base_params": base_params, "latent_params": latent_params}
     params_path = root / "params.pkl"
     with params_path.open("wb") as handle:
@@ -60,6 +65,7 @@ def export_deployment_bundle(
             "method": METHOD_VERSION,
             "ego_run_id": str(ego_run_id),
             "method_variant": config.method_variant,
+            "execution_mode": str(execution_mode),
             "config": config.to_mapping(),
             "observation_shape": [int(value) for value in observation_shape],
             "action_count": int(OFFICIAL_ACTION_COUNT),
@@ -83,6 +89,7 @@ def load_deployment(directory: str | Path) -> Deployment:
         "method",
         "ego_run_id",
         "method_variant",
+        "execution_mode",
         "config",
         "observation_shape",
         "action_count",
@@ -110,6 +117,8 @@ def load_deployment(directory: str | Path) -> Deployment:
     config = run_config_from_mapping(payload["config"])
     if config.method_variant != payload["method_variant"]:
         raise ValueError("Deployment method variant differs.")
+    if payload["execution_mode"] not in EXECUTION_MODES:
+        raise ValueError("Deployment execution mode differs.")
     params_path = root / str(payload["params"])
     with params_path.open("rb") as handle:
         parameters = pickle.load(handle)
@@ -123,6 +132,7 @@ def load_deployment(directory: str | Path) -> Deployment:
         model=DeltaModel(config, shape, action_count),
         base_params=parameters["base_params"],
         latent_params=parameters["latent_params"],
+        execution_mode=str(payload["execution_mode"]),
         semantic_initializer=dict(initializer),
     )
 
@@ -138,20 +148,51 @@ def deployment_action(
     observation: Any,
     keys: Any,
     force_base: bool = False,
-    actor_belief_override: str | None = None,
+    execution_mode: str | None = None,
 ) -> tuple[Any, Any, Any, Any]:
     import jax
     import jax.numpy as jnp
 
+    mode = (
+        "residual"
+        if bool(force_base)
+        else str(deployment.execution_mode if execution_mode is None else execution_mode)
+    )
+    if mode not in EXECUTION_MODES:
+        raise ValueError(f"execution_mode must be one of {EXECUTION_MODES}.")
+    # Passive is computed below from a non-adapting model step.  Letting an
+    # active DELTA model adapt here and merely replacing its logits would still
+    # mutate ``probe_continuation_pending``, contaminating the passive rollout.
+    execute_adaptation = mode == "active"
     stepped, output = deployment.model.step(
         deployment.base_params,
         deployment.latent_params,
         state,
         observation,
-        execute_adaptation=not bool(force_base),
-        actor_belief_override=actor_belief_override,
+        execute_adaptation=execute_adaptation,
     )
-    logits = output.base_policy_logits if bool(force_base) else output.policy_logits
+    if mode == "reference_only":
+        logits = output.reference_policy_logits
+    elif mode == "residual":
+        logits = output.base_policy_logits
+    elif mode == "passive":
+        from src.delta_zsc.mirror_policy import project_policy_logits, robust_mirror_policy_logits
+        from src.delta_zsc.mirror_policy import MIRROR_UNCERTAINTY_PENALTY
+
+        mirror, _, _ = robust_mirror_policy_logits(
+            output.base_policy_logits,
+            output.expected_decision_values,
+            output.expected_decision_variances ** 0.5,
+            kl_budget=deployment.config.method.adaptation_kl_budget,
+            uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
+        )
+        logits, _, _ = project_policy_logits(
+            output.reference_policy_logits,
+            mirror,
+            kl_budget=deployment.config.method.adaptation_kl_budget,
+        )
+    else:
+        logits = output.policy_logits
     key_array = jnp.asarray(keys)
     if key_array.ndim == 1:
         action = jax.random.categorical(key_array, logits)
@@ -171,6 +212,7 @@ def observe_deployment_after_transition(
 
 __all__ = [
     "Deployment",
+    "EXECUTION_MODES",
     "deployment_action",
     "export_deployment_bundle",
     "load_deployment",

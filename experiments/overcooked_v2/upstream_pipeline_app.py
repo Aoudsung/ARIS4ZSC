@@ -30,17 +30,19 @@ STATE_AUGMENTED_NUM_ENVS = 128
 The Official default is 256 (model/rnn.yaml).  State-augmented is the only
 method whose population trains as one ``pmap(vmap(train_jit))`` over all ten
 runs at once, so its peak scales with run_count * NUM_ENVS rather than NUM_ENVS
-alone -- and its run_count cannot be lowered, because the state-collection pass
-asserts that run_count**2 divides ten.  At 256 the wide layout asked for a
-single 17.4 GiB block and died on an otherwise empty 46 GiB L40; simple fits at
-256 because it carries 39 observation channels against wide's 43.
+alone -- and its run count cannot be lowered, because the state-collection pass
+requires run_count**2 to be divisible by ten.  At 256 the wide layout asked for
+a single 17.4 GiB block and died on an otherwise empty 46 GiB L40; simple fits
+at 256 because it carries 39 observation channels against wide's 43.
 
-Halving the environments halves that peak and leaves everything else -- total
-timesteps, minibatch count, learning rate schedule -- at the Official values.
-It applies to every layout driven through this pipeline, so it is a disclosed
-deviation from the Official state-augmented configuration wherever it is used.
-Registered 2026-08-12 by user decision, after the panel count itself was raised
-from four to ten for the assertion above.
+Halving the environments halves that peak.  Total timesteps, minibatch count
+and the learning-rate schedule definition remain unchanged, while the number
+of optimizer updates doubles.  This disclosed Official-protocol deviation is
+limited to the development-coverage and confirmatory partner-source
+populations built here; the registered State-Augmented baseline still uses the
+Official 256 environments through ``baseline_app``.  Registered 2026-08-12 by
+user decision, after each source population was raised from four to ten runs
+for the divisibility contract above.
 """
 
 UPSTREAM_ROOT_SEEDS = {
@@ -172,6 +174,9 @@ def _run_official_population(
         if co_training_groups is not None
         else [None] * int(run_count)
     )
+    state_augmented_num_envs = (
+        STATE_AUGMENTED_NUM_ENVS if method == "state-augmented" else None
+    )
     identity = {
         "stage": "official-population",
         "method": method,
@@ -184,6 +189,7 @@ def _run_official_population(
         "fcp_population": None if fcp_population is None else str(fcp_population),
         "shared_ledger": None if shared_ledger is None else str(shared_ledger),
         "external_training_lineage": list(external_lineage),
+        "state_augmented_num_envs": state_augmented_num_envs,
     }
     output.mkdir(parents=True, exist_ok=True)
     ensure_run_identity(output, identity)
@@ -359,6 +365,7 @@ def _run_official_population(
             "method": method,
             "layout": layout,
             "root_seed": int(root_seed),
+            "state_augmented_num_envs": state_augmented_num_envs,
             "runs": records,
             "policy_manifest": {"path": str(policy_manifest)},
             "resource_ledger": {"path": str(output / "resource_ledger.json")},
@@ -570,10 +577,10 @@ def run_upstream(args: argparse.Namespace) -> None:
     # smallest such value as well as what the Official configs use themselves.
     #
     # Registered at four until 2026-08-12, when the wide upstream first
-    # exercised this path.  Simple never did: its state-augmented checkpoints
-    # were trained standalone with NUM_SEEDS=10 and the partner manifest then
-    # drew four of them.  Consequence to disclose: wide's two state-augmented
-    # panels hold ten runs where simple's hold four.
+    # exercised this path.  Both layouts now train ten runs in each source
+    # population to satisfy the Official state-sampling shape; the final
+    # development-coverage and confirmatory panels still register only runs
+    # 0..3 below.
     _run_official_population(
         method="state-augmented", layout=layout,
         root_seed=UPSTREAM_ROOT_SEEDS["coverage_sa"], run_count=10,

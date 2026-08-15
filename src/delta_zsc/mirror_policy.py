@@ -74,6 +74,70 @@ def mirror_policy_logits(
     return final_logits, final_kl, eta
 
 
+def project_policy_logits(
+    reference_logits: Any,
+    candidate_logits: Any,
+    *,
+    kl_budget: float,
+    iterations: int = 48,
+) -> tuple[Any, Any, Any]:
+    """Project arbitrary candidate logits into the reference forward-KL ball.
+
+    The exponential interpolation
+
+    ``pi_alpha proportional pi_ref * exp(alpha * (log pi_cand-log pi_ref))``
+
+    traces the e-geodesic from the immutable reference to the candidate.  A
+    deterministic bisection chooses the largest ``alpha in [0,1]`` whose
+    ``KL(pi_alpha || pi_ref)`` does not exceed the registered budget.
+    """
+
+    import jax
+    import jax.nn
+    import jax.numpy as jnp
+
+    reference = jnp.asarray(reference_logits, dtype=jnp.float32)
+    candidate = jnp.asarray(candidate_logits, dtype=jnp.float32)
+    delta = float(kl_budget)
+    if delta < 0.0:
+        raise ValueError("KL budget must be non-negative.")
+    reference_logp = jax.nn.log_softmax(reference, axis=-1)
+    candidate_logp = jax.nn.log_softmax(candidate, axis=-1)
+    direction = candidate_logp - reference_logp
+
+    def at(alpha: Any) -> tuple[Any, Any]:
+        logits = reference_logp + alpha[..., None] * direction
+        logp = jax.nn.log_softmax(logits, axis=-1)
+        probability = jnp.exp(logp)
+        kl = jnp.sum(probability * (logp - reference_logp), axis=-1)
+        return logits, kl
+
+    candidate_kl = categorical_kl_from_logits(candidate, reference)
+    lead = candidate_kl.shape
+    low = jnp.zeros(lead, dtype=jnp.float32)
+    high = jnp.ones(lead, dtype=jnp.float32)
+
+    def one(_: int, bounds: tuple[Any, Any]) -> tuple[Any, Any]:
+        lo, hi = bounds
+        middle = 0.5 * (lo + hi)
+        _, kl = at(middle)
+        return jnp.where(kl <= delta, middle, lo), jnp.where(kl <= delta, hi, middle)
+
+    low, high = jax.lax.fori_loop(0, int(iterations), one, (low, high))
+    alpha = jnp.where(candidate_kl <= delta, 1.0, low)
+    alpha = jax.lax.stop_gradient(alpha)
+    logits, kl = at(alpha)
+    inactive = delta <= 0.0
+    logits = jnp.where(inactive, reference, logits)
+    kl = jnp.where(inactive, 0.0, kl)
+    alpha = jnp.where(inactive, 0.0, alpha)
+    # Logits are defined only up to an additive constant.  Preserve the
+    # candidate's convention when it is already feasible so diagnostic modes
+    # and zero-residual identity are exact, not merely distribution-equivalent.
+    logits = jnp.where((candidate_kl <= delta)[..., None], candidate, logits)
+    return logits, kl, alpha
+
+
 
 
 MIRROR_UNCERTAINTY_PENALTY = 1.0
@@ -160,5 +224,6 @@ def robust_mirror_policy_logits(
 __all__ = [
     "categorical_kl_from_logits",
     "mirror_policy_logits",
+    "project_policy_logits",
     "robust_mirror_policy_logits",
 ]

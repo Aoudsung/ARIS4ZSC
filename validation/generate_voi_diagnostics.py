@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate deterministic DELTA v5 exact-VOI acceptance diagnostics."""
+"""Generate deterministic DELTA v6 exact-VOI acceptance diagnostics."""
 
 from __future__ import annotations
 
@@ -83,8 +83,8 @@ def main() -> None:
     assert identity_information > 0.1
 
     payload = {
-        "version": 5,
-        "artifact_type": "delta_v5_delayed_exact_voi_synthetic_acceptance",
+        "version": 6,
+        "artifact_type": "delta_v6_delayed_exact_voi_synthetic_acceptance",
         "method": METHOD_VERSION,
         "outcome_count": outcome_count,
         "maximum_component_outcome_mass_error": mass_error,

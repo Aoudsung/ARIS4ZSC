@@ -1,4 +1,4 @@
-# ARCHITECTURE — DELTA-ZSC v5 equation-to-code map
+# ARCHITECTURE — DELTA-ZSC v6 equation-to-code map
 
 `authoritative: true`
 
@@ -6,7 +6,7 @@
 
 | Object | Active implementation |
 |---|---|
-| task recurrent actor-critic | `src/delta_zsc/base_policy.py` |
+| immutable Official actor + residual/value branch | `src/delta_zsc/base_policy.py` |
 | direct/interface response extraction | `src/delta_zsc/observation.py` |
 | legal Beta history statistics | `src/delta_zsc/behavior_statistics.py` |
 | episode-static prior and Bayes correction | `src/delta_zsc/belief_filter.py` |
@@ -39,13 +39,12 @@ value, which `belief_value.py` models.
 
 ## 2. Parameter ownership
 
-`base_params` own:
+`base_params["reference"]` owns the embedded Official frame encoder, GRU,
+actor trunk and actor head. It is deployable state but not an optimizer owner.
 
-- task frame encoder;
-- task GRU;
-- instantaneous partner encoder;
-- base actor logits;
-- base value function.
+`base_params["trainable"]` owns the instantaneous partner encoder,
+zero-initialized residual actor and value branch. PPO and its Adam state contain
+only this subtree.
 
 `latent_params` own:
 
@@ -54,9 +53,9 @@ value, which `belief_value.py` models.
 - delayed probe-response model;
 - belief-conditioned critic and successor feature model.
 
-The trees are disjoint and have separate Adam states. PPO receives a
-stop-gradient latent tree and executes `compute_latent=False`. The latent loss
-receives a stop-gradient base tree.
+The trainable base and latent trees are disjoint and have separate Adam states.
+PPO receives a stop-gradient latent tree. The latent loss receives a
+stop-gradient base tree. The reference has neither optimizer state nor gradient.
 
 ## 3. Runtime state
 
@@ -68,6 +67,7 @@ receives a stop-gradient base tree.
 - previous local observation;
 - previous ego action;
 - episode-start flag.
+- active-probe continuation flag.
 
 It contains no partner ID, counterfactual return, hidden environment state,
 future response, semantic initializer metadata, or decision anchor.
@@ -76,7 +76,7 @@ future response, semantic initializer metadata, or decision anchor.
 
 `DeltaModel.step` executes:
 
-1. base task update on current observation;
+1. immutable Official task update from the complete legal local frame;
 2. episode-static prior reset/persistence;
 3. immediate response extraction from stored previous observation and action;
 4. shared and semantic response prediction;
@@ -85,8 +85,10 @@ future response, semantic initializer metadata, or decision anchor.
 7. belief-conditioned action values;
 8. optional delayed probe-response and successor-state action values;
 9. exact VOI for `delta_active`;
-10. passive or active mirror policy;
-11. storage of the current observation for the next legal response.
+10. residual/reference projection;
+11. passive or active mirror policy;
+12. final reference-relative projection;
+13. storage of the current observation for the next legal response.
 
 The executed action and terminal flag are inserted only after the environment
 transition by `observe_after_transition`.
@@ -115,6 +117,7 @@ The decision side is one belief-conditioned critic in dueling form:
 
 ```text
 task features + instantaneous partner + behavior + posterior
+    + stopgrad(posterior-weighted full component embedding)
     -> shared trunk -> state value
                     -> E independent advantage heads
 advantage is centered under the acting policy; the ensemble spread is
@@ -130,11 +133,22 @@ quantity:
 - precision-weighted regression of its action *differences* onto the measured
   same-replica CRN contrasts, whenever an anchor batch exists.
 
+The sparse contrast executable updates the post-TD critic parameters while its
+detached feature replay uses the collection-time base and latent trees. The
+measured continuation and the posterior-conditioned state representation are
+therefore from one estimator snapshot.
+
 The successor model predicts the `t+2` features under a probe and its observed
 delayed response, so active VOI evaluates the critic where the decision is
 actually made rather than at the current state.
 
 ## 7. Training data alignment
+
+Training lanes are fixed as first-half self-play and second-half frozen
+cross-play. The self partner has an independent `PolicyState`. PPO reads both
+groups through paired minibatches; all latent and anchor channels slice to the
+second half before estimation. The generic `collect_rollout` leaves mixed mode
+off, so diagnostic partner panels stay frozen.
 
 A rollout stores `T+1` legal observations and `T` terminal-aware response-next
 frames. Immediate response target `t` is:
@@ -183,22 +197,24 @@ These are compile-time paths, not learned gates.
 
 ## 10. Artifact and schema boundary
 
-- method: `delta_belief_conditioned_raw_return_pairwise_crn_v5`;
-- config schema: 3;
-- checkpoint schema: 5;
-- deployment bundle: 4;
+- method: `delta_self_consistent_decision_grounded_residual_v6`;
+- config schema: 4;
+- checkpoint schema: 6;
+- deployment bundle: 5;
+- evaluation schema: 3;
 - manifest schema: 2;
 - semantic initializer schema: 1.
 
 Training identity includes the resolved initializer mapping and source path.
 Development/formal semantic variants reject a missing initializer and validate
 its method version, layout, K, calibration role, event count, and parent-lineage
-disjointness from the DELTA training support. Mechanical checks and pure
-base/history collection runs may use the deterministic fallback. v4 and earlier
-DELTA state is not loaded.
+disjointness from the DELTA training support. The semantic initializer may use
+its deterministic fallback only where that existing semantic contract permits
+it; the Official-SP actor initializer is mandatory for every v6 training
+entry. v5 and earlier DELTA state is not loaded.
 
 ## 11. Active and historical boundaries
 
 Only `src/delta_zsc/` and the applications listed by the repository test are
-active. `legacy/implementation_v8/`, `docs/legacy/`, and retired workflows are
-read-only history. Active package discovery excludes retired namespaces.
+active. All DEPI v8 and earlier code, documents and workflows have been
+removed from the tree; nothing historical defines the active method.

@@ -42,6 +42,7 @@ def initialize_runner(
         environment_state=environment_state,
         joint_observations=observations,
         ego_policy_state=model.initial_state(count),
+        self_policy_state=model.initial_state(count),
         partner_state=partner_functions.initial_state(count, partner_key),
         partner_episode_start=jnp.ones((count,), dtype=jnp.bool_),
         ego_roles=official_ego_roles(count),
@@ -99,13 +100,15 @@ def collect_rollout(
     official_shaping_factor: float,
     record_anchors: bool,
     use_deployment_policy: bool = False,
+    mixed_training_partners: bool = False,
 ) -> tuple[RunnerState, RolloutBatch, Mapping[str, Any]]:
     """Collect one time-major rollout.
 
-    Training calls this with ``use_deployment_policy=False``.  Consequently the
-    PPO sample and the continuation policy behind every CRN anchor are exactly
-    the base policy.  Evaluation may explicitly request the analytic DELTA
-    deployment policy without changing the estimator used during training.
+    This generic diagnostic collector keeps every lane on its supplied frozen
+    partner unless ``mixed_training_partners`` is explicitly enabled.  The
+    compiled training kernels below always use the fixed half-self/half-frozen
+    layout; calibration and intervention callers therefore cannot accidentally
+    substitute a moving self snapshot for their frozen partner panel.
     """
 
     import jax
@@ -117,6 +120,11 @@ def collect_rollout(
     count = int(environment.num_envs)
     initial_policy_state = state.ego_policy_state
     lanes = jnp.arange(count, dtype=jnp.int32)
+    self_lane = (
+        lanes < count // 2
+        if bool(mixed_training_partners)
+        else jnp.zeros((count,), dtype=jnp.bool_)
+    )
 
     def one(current: RunnerState, unused_time: Any):
         del unused_time
@@ -164,6 +172,20 @@ def collect_rollout(
             )
         )
         del unused_partner_value
+        if bool(mixed_training_partners):
+            stepped_self, self_output = model.step(
+                base_params,
+                latent_params,
+                current.self_policy_state,
+                partner_observation,
+                compute_latent=compute_latent,
+                compute_decision=False,
+                execute_adaptation=False,
+            )
+            self_action = jax.vmap(
+                lambda key, logits: jax.random.categorical(key, logits)
+            )(partner_keys, self_output.base_policy_logits)
+            partner_action = jnp.where(self_lane, self_action, partner_action)
         ego_first = jnp.stack((ego_action, partner_action), axis=-1)
         partner_first = jnp.stack((partner_action, ego_action), axis=-1)
         joint_action = jnp.where(
@@ -231,10 +253,16 @@ def collect_rollout(
             done,
             partner_response_next,
         )
+        next_self_state = current.self_policy_state
+        if bool(mixed_training_partners):
+            next_self_state = observe_after_transition(
+                stepped_self, action=self_action, done=done
+            )
         next_state = RunnerState(
             environment_state=next_environment_state,
             joint_observations=next_joint_observations,
             ego_policy_state=next_ego_state,
+            self_policy_state=next_self_state,
             partner_state=next_partner_state,
             partner_episode_start=jnp.asarray(done, dtype=jnp.bool_),
             ego_roles=current.ego_roles,
@@ -329,6 +357,9 @@ def collect_rollout(
         advantages=dense_advantages,
         returns=dense_returns,
         ppo_mask=jnp.ones((steps, count), dtype=jnp.float32),
+        policy_group=jnp.broadcast_to(
+            (~self_lane).astype(jnp.int32), (steps, count)
+        ),
         beliefs=beliefs,
         initial_policy_state=initial_policy_state,
     )
@@ -372,17 +403,18 @@ def _make_training_rollout_kernel(
     snapshot_count = int(anchor_snapshot_count)
     if steps <= 0:
         raise ValueError("Rollout length must be positive.")
-    if snapshot_count < 0 or snapshot_count > steps * count:
+    if snapshot_count < 0 or snapshot_count > steps * (count // 2):
         raise ValueError("Anchor snapshot count is outside the rollout.")
     # Oversample candidates so the post-rollout stratification has something to
     # choose between.  Four is enough to reach the rarer task stages without
     # making the snapshot arrays a meaningful fraction of the full recording
     # this path exists to avoid.
-    candidate_count = min(snapshot_count * 4, steps * count)
+    candidate_count = min(snapshot_count * 4, steps * (count // 2))
     environment_step = getattr(
         environment, "step_training_fast_with_keys", environment.step_with_keys
     )
     lanes = jnp.arange(count, dtype=jnp.int32)
+    self_lane = lanes < count // 2
     compute_latent = model.config.method_variant in {
         "response_only",
         "delta_passive",
@@ -439,12 +471,13 @@ def _make_training_rollout_kernel(
             # stage at each one is not known yet.  Capture a wider uniform
             # candidate set and keep the stratified subset afterwards, once the
             # rewards that label the stages exist.
-            time_indexes, lane_indexes = select_anchor_indexes(
+            time_indexes, local_lane_indexes = select_anchor_indexes(
                 snapshot_key,
                 time_count=steps,
-                environment_count=count,
+                environment_count=count // 2,
                 requested=candidate_count,
             )
+            lane_indexes = local_lane_indexes + count // 2
             snapshots = AnchorSnapshots(
                 time_indexes=time_indexes,
                 lane_indexes=lane_indexes,
@@ -511,6 +544,19 @@ def _make_training_rollout_kernel(
                 partner_keys,
             )
             del unused_partner_value
+            stepped_self, self_output = model.step(
+                base_params,
+                latent_params,
+                current.self_policy_state,
+                partner_observation,
+                compute_latent=compute_latent,
+                compute_decision=False,
+                execute_adaptation=False,
+            )
+            self_action = jax.vmap(
+                lambda key, logits: jax.random.categorical(key, logits)
+            )(partner_keys, self_output.base_policy_logits)
+            partner_action = jnp.where(self_lane, self_action, partner_action)
             ego_first = jnp.stack((ego_action, partner_action), axis=-1)
             partner_first = jnp.stack((partner_action, ego_action), axis=-1)
             joint_action = jnp.where(
@@ -576,10 +622,14 @@ def _make_training_rollout_kernel(
                 done,
                 partner_response_next,
             )
+            next_self_state = observe_after_transition(
+                stepped_self, action=self_action, done=done
+            )
             next_state = RunnerState(
                 environment_state=next_environment_state,
                 joint_observations=next_joint_observations,
                 ego_policy_state=next_ego_state,
+                self_policy_state=next_self_state,
                 partner_state=next_partner_state,
                 partner_episode_start=jnp.asarray(done, dtype=jnp.bool_),
                 ego_roles=current.ego_roles,
@@ -710,6 +760,9 @@ def _make_training_rollout_kernel(
             advantages=sparse_advantages,
             returns=sparse_returns,
             ppo_mask=jnp.ones((steps, count), dtype=jnp.float32),
+            policy_group=jnp.broadcast_to(
+                (~self_lane).astype(jnp.int32), (steps, count)
+            ),
             beliefs=jnp.concatenate(
                 (step_beliefs, final_output.belief[None]), axis=0
             ),

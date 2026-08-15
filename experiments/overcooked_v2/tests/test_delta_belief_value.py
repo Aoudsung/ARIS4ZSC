@@ -19,6 +19,7 @@ def test_advantage_is_centered_under_the_acting_policy() -> None:
         instant_dim=4,
         behavior_dim=6,
         component_count=4,
+        component_embedding_dim=4,
         hidden_dim=16,
         action_count=6,
         ensemble_size=3,
@@ -60,6 +61,7 @@ def test_belief_changes_the_predicted_contrast() -> None:
         instant_dim=4,
         behavior_dim=6,
         component_count=4,
+        component_embedding_dim=4,
         hidden_dim=16,
         action_count=6,
         ensemble_size=2,
@@ -78,6 +80,49 @@ def test_belief_changes_the_predicted_contrast() -> None:
         np.asarray(left.advantage_mean) - np.asarray(right.advantage_mean)
     ).max()
     assert difference > 1.0e-6
+
+
+def test_grounding_uses_full_detached_component_embedding() -> None:
+    """Decision scores may train the critic, never the response coordinates."""
+
+    import jax
+    import jax.numpy as jnp
+
+    from src.delta_zsc.belief_value import belief_value_predict, init_belief_value_params
+
+    params = init_belief_value_params(
+        jax.random.PRNGKey(8),
+        task_dim=3,
+        instant_dim=2,
+        behavior_dim=2,
+        component_count=4,
+        component_embedding_dim=7,
+        hidden_dim=8,
+        action_count=6,
+        ensemble_size=2,
+    )
+    belief = jnp.asarray([[0.1, 0.2, 0.3, 0.4]], dtype=jnp.float32)
+    embeddings = jax.random.normal(jax.random.PRNGKey(9), (4, 7))
+
+    def score(current_params, current_embeddings):
+        prediction = belief_value_predict(
+            current_params,
+            jnp.ones((1, 3)),
+            jnp.ones((1, 2)),
+            jnp.ones((1, 2)),
+            belief,
+            component_embeddings=current_embeddings,
+        )
+        return jnp.sum(jnp.square(prediction.advantage_mean))
+
+    parameter_gradients, embedding_gradients = jax.grad(score, argnums=(0, 1))(
+        params, embeddings
+    )
+    assert any(
+        bool(jnp.any(jnp.abs(leaf) > 0.0))
+        for leaf in jax.tree_util.tree_leaves(parameter_gradients)
+    )
+    np.testing.assert_allclose(np.asarray(embedding_gradients), 0.0, atol=0.0)
 
 
 def test_same_replica_differencing_cancels_shared_noise() -> None:
@@ -375,30 +420,34 @@ def test_sp_transplant_copies_every_official_parameter() -> None:
     )
     official = _official_tree(jax.random.PRNGKey(1))
     moved = transplant_official_base_params(base, official)
+    reference = moved["reference"]
 
     for index in range(6):
         np.testing.assert_allclose(
-            np.asarray(moved["task_conv"][index]["kernel"]),
+            np.asarray(reference["task_conv"][index]["kernel"]),
             np.asarray(official["CNN_0"][f"Conv_{index}"]["kernel"]),
         )
     np.testing.assert_allclose(
-        np.asarray(moved["task_dense"]["kernel"]),
+        np.asarray(reference["task_dense"]["kernel"]),
         np.asarray(official["CNN_0"]["Dense_0"]["kernel"]),
     )
     np.testing.assert_allclose(
-        np.asarray(moved["actor"]["kernel"]), np.asarray(official["Dense_1"]["kernel"])
+        np.asarray(reference["actor"]["kernel"]), np.asarray(official["Dense_1"]["kernel"])
     )
     np.testing.assert_allclose(
-        np.asarray(moved["value"]["kernel"]), np.asarray(official["Dense_3"]["kernel"])
+        np.asarray(moved["trainable"]["value"]["kernel"]),
+        np.asarray(base["trainable"]["value"]["kernel"]),
     )
     # The task rows carry the Official actor; the instant and posterior rows
     # start at zero, so the transplanted policy *is* the Official policy.
-    kernel = np.asarray(moved["actor_trunk"]["kernel"])
+    kernel = np.asarray(reference["actor_trunk"]["kernel"])
     np.testing.assert_allclose(
         kernel[:128], np.asarray(official["Dense_0"]["kernel"])
     )
-    np.testing.assert_allclose(kernel[128:], 0.0)
-    assert kernel.shape == (128 + 64 + 4, 128)
+    assert kernel.shape == (128, 128)
+    np.testing.assert_allclose(
+        np.asarray(moved["trainable"]["residual_actor"]["kernel"]), 0.0
+    )
 
 
 def test_sp_transplant_rejects_a_shape_mismatch() -> None:
@@ -422,6 +471,52 @@ def test_sp_transplant_rejects_a_shape_mismatch() -> None:
     official = _official_tree(jax.random.PRNGKey(1), actions=5)
     with pytest.raises(ValueError, match="Dense_1/kernel"):
         transplant_official_base_params(base, official)
+
+
+def test_initializer_seed_is_read_from_the_unresolved_run_alias(tmp_path) -> None:
+    from src.delta_zsc.official_initializer import initializer_seed_index
+
+    target = tmp_path / "orbax-target"
+    target.mkdir()
+    alias_root = tmp_path / "run-3"
+    alias_root.mkdir()
+    alias = alias_root / "ckpt_final"
+    alias.symlink_to(target, target_is_directory=True)
+
+    assert initializer_seed_index(str(alias)) == 3
+    assert initializer_seed_index(str(target)) is None
+
+
+def test_official_parameter_loader_resolves_a_relative_cli_path(
+    tmp_path, monkeypatch
+) -> None:
+    import orbax.checkpoint as ocp
+
+    from src.delta_zsc.official_initializer import load_official_parameters
+
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    observed = []
+
+    class Checkpointer:
+        def metadata(self, path):
+            observed.append(path)
+            return "metadata"
+
+        def restore(self, path, *, restore_args):
+            observed.append(path)
+            assert restore_args == "restore-args"
+            return {"params": {"leaf": 1}}
+
+    monkeypatch.setattr(ocp, "PyTreeCheckpointer", Checkpointer)
+    monkeypatch.setattr(
+        ocp.checkpoint_utils,
+        "construct_restore_args",
+        lambda metadata: "restore-args" if metadata == "metadata" else None,
+    )
+    monkeypatch.chdir(tmp_path)
+    assert load_official_parameters("checkpoint") == {"leaf": 1}
+    assert observed == [str(checkpoint.resolve()), str(checkpoint.resolve())]
 
 
 def test_delta_gru_matches_the_official_recurrent_cell() -> None:
@@ -464,6 +559,104 @@ def test_delta_gru_matches_the_official_recurrent_cell() -> None:
         np.asarray(gru_step(params, carry, value)),
         np.asarray(official(carry, value)),
         atol=1.0e-6,
+    )
+
+
+def test_transplanted_reference_matches_official_flax_sequence() -> None:
+    """Full-frame zero-residual DELTA is the pinned Official actor function."""
+
+    import jax
+    import jax.numpy as jnp
+
+    from overcooked_v2_experiments.ppo.models.rnn import (
+        ActorCriticRNN,
+        ScannedRNN,
+    )
+
+    from src.delta_zsc.base_policy import base_policy_sequence, init_base_params
+    from src.delta_zsc.official_initializer import transplant_official_base_params
+
+    official_model = ActorCriticRNN(
+        6,
+        config={
+            "ACTIVATION": "relu",
+            "FC_DIM_SIZE": 128,
+            "GRU_HIDDEN_DIM": 128,
+        },
+    )
+    observations = jax.random.normal(
+        jax.random.PRNGKey(61), (6, 3, 5, 5, 39), dtype=jnp.float32
+    )
+    starts = jnp.asarray(
+        [
+            [True, True, True],
+            [False, False, False],
+            [False, True, False],
+            [False, False, False],
+            [True, False, False],
+            [False, False, True],
+        ],
+        dtype=jnp.bool_,
+    )
+    official_carry = ScannedRNN.initialize_carry(3, 128)
+    official_variables = official_model.init(
+        jax.random.PRNGKey(62), official_carry, (observations, starts)
+    )
+    expected_carry, expected_distribution, unused_value = official_model.apply(
+        official_variables, official_carry, (observations, starts)
+    )
+    del unused_value
+
+    base = init_base_params(
+        jax.random.PRNGKey(63),
+        observation_shape=(5, 5, 39),
+        task_hidden_dim=128,
+        task_embedding_dim=128,
+        instant_partner_dim=64,
+        action_count=6,
+        component_count=4,
+    )
+    base = transplant_official_base_params(base, official_variables["params"])
+    beliefs = jnp.full(starts.shape + (4,), 0.25, dtype=jnp.float32)
+    (
+        actual_carry,
+        unused_task_carries,
+        unused_task_features,
+        unused_instant,
+        actual_reference_logits,
+        actual_residual_logits,
+        actual_base_logits,
+        unused_delta_value,
+    ) = base_policy_sequence(
+        base,
+        official_carry,
+        observations,
+        starts,
+        beliefs,
+    )
+    del (
+        unused_task_carries,
+        unused_task_features,
+        unused_instant,
+        unused_delta_value,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(actual_carry), np.asarray(expected_carry), rtol=1.0e-6, atol=1.0e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(jax.nn.softmax(actual_reference_logits, axis=-1)),
+        np.asarray(expected_distribution.probs),
+        rtol=1.0e-6,
+        atol=1.0e-7,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(jnp.argmax(actual_reference_logits, axis=-1)),
+        np.asarray(expected_distribution.mode()),
+    )
+    np.testing.assert_array_equal(np.asarray(actual_residual_logits), 0.0)
+    np.testing.assert_array_equal(
+        np.asarray(actual_base_logits), np.asarray(actual_reference_logits)
     )
 
 

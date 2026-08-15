@@ -155,18 +155,25 @@ def environment_minibatch_schedule(
     import jax
     import jax.numpy as jnp
 
-    if int(environment_count) % int(minibatches_per_epoch):
-        raise ValueError("Environment lanes must divide into minibatches.")
-    lanes = int(environment_count) // int(minibatches_per_epoch)
+    if int(environment_count) % 4:
+        raise ValueError("Mixed SP/XP training requires a lane count divisible by four.")
+    group_count = int(environment_count) // 2
+    if group_count % int(minibatches_per_epoch):
+        raise ValueError("Each policy group must divide into paired minibatches.")
+    lanes = group_count // int(minibatches_per_epoch)
     keys = jax.random.split(key, int(update_epochs))
-    return jnp.stack(
-        [
-            jax.random.permutation(item, int(environment_count)).reshape(
-                (int(minibatches_per_epoch), lanes)
-            )
-            for item in keys
-        ]
-    )
+
+    def one(item: Any) -> Any:
+        sp_key, xp_key = jax.random.split(item)
+        sp = jax.random.permutation(sp_key, group_count).reshape(
+            (int(minibatches_per_epoch), lanes)
+        )
+        xp = jax.random.permutation(xp_key, group_count).reshape(
+            (int(minibatches_per_epoch), lanes)
+        ) + group_count
+        return jnp.concatenate((sp, xp), axis=-1)
+
+    return jnp.stack([one(item) for item in keys])
 
 
 @partial(jax.jit, static_argnames=("model", "total_optimizer_steps"))
@@ -179,18 +186,28 @@ def update_base_policy(
     batch: RolloutBatch,
     total_optimizer_steps: int,
 ) -> tuple[Any, Any, Mapping[str, Any]]:
+    from .base_policy import trainable_base_params, with_trainable_base_params
+
+    fixed = base_params
+    trainable = trainable_base_params(base_params)
+
     def objective(candidate: Any):
-        loss = ppo_loss(model, candidate, latent_params, batch)
+        loss = ppo_loss(
+            model,
+            with_trainable_base_params(fixed, candidate),
+            latent_params,
+            batch,
+        )
         return loss.total, loss.metrics
 
-    (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(base_params)
+    (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(trainable)
     learning_rate = ppo_learning_rate(
         config=model.config,
         optimizer_step=optimizer_state.count,
         total_optimizer_steps=total_optimizer_steps,
     )
     updated, next_state, gradient_norm = adam_update(
-        base_params,
+        trainable,
         gradients,
         optimizer_state,
         learning_rate=learning_rate,
@@ -205,7 +222,10 @@ def update_base_policy(
         & jnp.isfinite(gradient_norm)
         & jnp.all(jnp.stack([jnp.all(jnp.isfinite(leaf)) for leaf in leaves]))
     )
-    committed_params = jax.lax.cond(finite, lambda _: updated, lambda _: base_params, None)
+    committed_trainable = jax.lax.cond(
+        finite, lambda _: updated, lambda _: trainable, None
+    )
+    committed_params = with_trainable_base_params(base_params, committed_trainable)
     committed_state = jax.lax.cond(finite, lambda _: next_state, lambda _: optimizer_state, None)
     return committed_params, committed_state, {
         **metrics,
@@ -237,7 +257,7 @@ def update_latent_model(
     moment estimates, not ones that have decayed to zero in between.
     """
 
-    if model.config.method_variant in {"base", "history_rnn"}:
+    if model.config.method_variant == "base":
         return latent_params, target_latent_params, optimizer_state, {
             "latent_composite_nll": 0.0,
             "latent_response_nll": 0.0,
@@ -365,6 +385,7 @@ def update_contrast_channel(
     model: Any,
     latent_params: Any,
     base_params: Any,
+    feature_latent_params: Any,
     optimizer_state: Any,
     batch: RolloutBatch,
     anchors: AnchorBatch,
@@ -385,7 +406,14 @@ def update_contrast_channel(
     import jax.numpy as jnp
 
     def objective(candidate: Any):
-        result = latent_contrast_loss(model, candidate, base_params, batch, anchors)
+        result = latent_contrast_loss(
+            model,
+            candidate,
+            base_params,
+            feature_latent_params,
+            batch,
+            anchors,
+        )
         return result.total, result.metrics
 
     (_, metrics), gradients = jax.value_and_grad(objective, has_aux=True)(
@@ -442,6 +470,20 @@ def training_update(
 
     import jax.numpy as jnp
 
+    xp_indexes = jnp.arange(
+        batch.actions.shape[1] // 2,
+        batch.actions.shape[1],
+        dtype=jnp.int32,
+    )
+    latent_batch = slice_rollout_lanes(batch, xp_indexes)
+    latent_anchors = (
+        None
+        if anchors is None
+        else anchors._replace(
+            lane_indexes=anchors.lane_indexes - batch.actions.shape[1] // 2
+        )
+    )
+
     (
         current_latent,
         current_target,
@@ -453,8 +495,8 @@ def training_update(
         base_params=base_params,
         target_latent_params=target_latent_params,
         optimizer_state=latent_optimizer_state,
-        batch=batch,
-        anchors=anchors,
+        batch=latent_batch,
+        anchors=latent_anchors,
     )
 
     flat = jnp.asarray(schedule).reshape((-1, schedule.shape[-1]))

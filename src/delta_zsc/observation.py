@@ -97,14 +97,6 @@ def partner_channel_indexes(channel_count: int) -> tuple[int, ...]:
     return tuple(range(block, 2 * block))
 
 
-def task_only_observation(observation: Any) -> Any:
-    import jax.numpy as jnp
-
-    value = jnp.asarray(observation, dtype=jnp.float32)
-    channels = jnp.asarray(partner_channel_indexes(value.shape[-1]), dtype=jnp.int32)
-    return value.at[..., channels].set(0.0)
-
-
 def instantaneous_partner_observation(observation: Any) -> Any:
     import jax.numpy as jnp
 
@@ -468,5 +460,4 @@ __all__ = [
     "instantaneous_partner_observation",
     "partner_channel_indexes",
     "partner_visibility",
-    "task_only_observation",
 ]

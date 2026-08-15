@@ -1,11 +1,21 @@
-"""Task-competence policy trained only by on-policy PPO."""
+"""Immutable Official-SP reference plus a trainable residual/value branch."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from .nn import gru_step, init_gru, init_linear, init_mlp, layer_normalize, linear, mlp
-from .observation import instantaneous_partner_observation, task_only_observation
+from .nn import (
+    gru_step,
+    init_gru,
+    init_layer_norm,
+    init_linear,
+    init_mlp,
+    init_orthogonal,
+    layer_normalize,
+    linear,
+    mlp,
+)
+from .observation import instantaneous_partner_observation
 
 
 OFFICIAL_CONV_STACK = (
@@ -16,15 +26,7 @@ OFFICIAL_CONV_STACK = (
     ((3, 3), 32),
     ((3, 3), 32),
 )
-"""The pinned OvercookedV2 observation encoder, layer for layer.
-
-The previous encoder flattened the 5x5x39 frame and ran two dense layers over
-it.  That discards the spatial structure the whole observation is built around,
-and it is not the network the Official baselines use -- so a DELTA run and its
-own baseline differed in feature extractor as well as in method, and no
-Official checkpoint could initialise it.
-
-"""
+"""The pinned OvercookedV2 encoder, layer for layer."""
 
 
 def init_base_params(
@@ -37,19 +39,21 @@ def init_base_params(
     action_count: int,
     component_count: int,
 ) -> dict[str, Any]:
+    """Initialise reference-shaped placeholders and trainable residual/value trees.
+
+    The reference placeholders are replaced by the required Official SP
+    checkpoint before a run starts.  They live inside ``base_params`` so a
+    deployment is self-contained, but the optimiser receives only the
+    ``trainable`` subtree.
+    """
+
     import jax
+    import jax.numpy as jnp
 
-    from .nn import init_conv, init_layer_norm, init_orthogonal
-
-    keys = jax.random.split(key, 8 + len(OFFICIAL_CONV_STACK))
-    # Derive the instantaneous branch size by applying the pinned channel rule.
+    from .nn import init_conv
     from .observation import partner_channel_indexes
 
-    partner_dim = int(
-        observation_shape[0]
-        * observation_shape[1]
-        * len(partner_channel_indexes(observation_shape[-1]))
-    )
+    keys = jax.random.split(key, 10 + len(OFFICIAL_CONV_STACK))
     channels = int(observation_shape[-1])
     convolutions = []
     for index, (kernel_size, features) in enumerate(OFFICIAL_CONV_STACK):
@@ -61,35 +65,60 @@ def init_base_params(
         channels = features
     spatial = int(observation_shape[0]) * int(observation_shape[1]) * channels
     offset = len(OFFICIAL_CONV_STACK)
-
-    # The actor reads the response-only posterior alongside the task features.
-    # Without it PPO optimises a single policy against the *marginal* over
-    # partners, and protocol-dependent actions cancel in the averaged advantage.
-    combined = int(task_hidden_dim) + int(instant_partner_dim) + int(component_count)
-    return {
+    reference = {
         "task_conv": tuple(convolutions),
         "task_dense": init_orthogonal(
             keys[offset], spatial, int(task_embedding_dim), scale=2.0**0.5
         ),
         "task_norm": init_layer_norm(int(task_embedding_dim)),
-        "task_gru": init_gru(keys[offset + 1], int(task_embedding_dim), int(task_hidden_dim)),
-        "instant_encoder": init_mlp(
-            keys[offset + 2],
-            (partner_dim, int(instant_partner_dim), int(instant_partner_dim)),
+        "task_gru": init_gru(
+            keys[offset + 1], int(task_embedding_dim), int(task_hidden_dim)
         ),
         "actor_trunk": init_orthogonal(
-            keys[offset + 3], combined, int(task_hidden_dim), scale=2.0**0.5
+            keys[offset + 2], int(task_hidden_dim), int(task_hidden_dim), scale=2.0**0.5
         ),
         "actor": init_orthogonal(
-            keys[offset + 4], int(task_hidden_dim), int(action_count), scale=0.01
-        ),
-        "value_trunk": init_orthogonal(
-            keys[offset + 5], combined, int(task_hidden_dim), scale=2.0**0.5
-        ),
-        "value": init_orthogonal(
-            keys[offset + 6], int(task_hidden_dim), 1, scale=1.0
+            keys[offset + 3], int(task_hidden_dim), int(action_count), scale=0.01
         ),
     }
+
+    partner_dim = int(
+        observation_shape[0]
+        * observation_shape[1]
+        * len(partner_channel_indexes(observation_shape[-1]))
+    )
+    combined = int(task_hidden_dim) + int(instant_partner_dim) + int(component_count)
+    residual = init_linear(keys[offset + 5], combined, int(action_count), scale=0.01)
+    residual = {
+        "kernel": jnp.zeros_like(residual["kernel"]),
+        "bias": jnp.zeros_like(residual["bias"]),
+    }
+    trainable = {
+        "instant_encoder": init_mlp(
+            keys[offset + 4],
+            (partner_dim, int(instant_partner_dim), int(instant_partner_dim)),
+        ),
+        "residual_actor": residual,
+        "value_trunk": init_orthogonal(
+            keys[offset + 6], combined, int(task_hidden_dim), scale=2.0**0.5
+        ),
+        "value": init_orthogonal(
+            keys[offset + 7], int(task_hidden_dim), 1, scale=1.0
+        ),
+    }
+    return {"reference": reference, "trainable": trainable}
+
+
+def trainable_base_params(base_params: dict[str, Any]) -> dict[str, Any]:
+    """Return the only subtree PPO may update or allocate Adam state for."""
+
+    return base_params["trainable"]
+
+
+def with_trainable_base_params(
+    base_params: dict[str, Any], trainable: dict[str, Any]
+) -> dict[str, Any]:
+    return {"reference": base_params["reference"], "trainable": trainable}
 
 
 def encode_task_frame(params: dict[str, Any], frame: Any) -> Any:
@@ -108,12 +137,29 @@ def encode_task_frame(params: dict[str, Any], frame: Any) -> Any:
     return layer_norm(params["task_norm"], embedding)
 
 
-def _heads(params: dict[str, Any], features: Any) -> tuple[Any, Any]:
+def _heads(
+    reference: dict[str, Any], trainable: dict[str, Any], task: Any, instant: Any, belief: Any
+) -> tuple[Any, Any, Any, Any]:
     import jax.nn
+    import jax.numpy as jnp
 
-    actor = jax.nn.relu(linear(params["actor_trunk"], features))
-    critic = jax.nn.relu(linear(params["value_trunk"], features))
-    return linear(params["actor"], actor), linear(params["value"], critic)[..., 0]
+    reference_hidden = jax.nn.relu(linear(reference["actor_trunk"], task))
+    reference_logits = linear(reference["actor"], reference_hidden)
+    posterior = jnp.asarray(belief, dtype=jnp.float32)
+    uniform = jnp.full_like(posterior, 1.0 / posterior.shape[-1])
+    entropy = -jnp.sum(
+        posterior * jnp.log(jnp.maximum(posterior, 1.0e-30)), axis=-1
+    )
+    confidence = 1.0 - entropy / jnp.log(
+        jnp.asarray(posterior.shape[-1], dtype=jnp.float32)
+    )
+    innovation = confidence[..., None] * (posterior - uniform)
+    residual_features = jnp.concatenate((task, instant, innovation), axis=-1)
+    value_features = jnp.concatenate((task, instant, posterior), axis=-1)
+    residual_logits = linear(trainable["residual_actor"], residual_features)
+    critic = jax.nn.relu(linear(trainable["value_trunk"], value_features))
+    value = linear(trainable["value"], critic)[..., 0]
+    return reference_logits, residual_logits, reference_logits + residual_logits, value
 
 
 def base_policy_step(
@@ -122,39 +168,34 @@ def base_policy_step(
     observation: Any,
     episode_start: Any,
     belief: Any,
-    *,
-    mask_partner_history: bool,
-) -> tuple[Any, Any, Any, Any, Any]:
-    """Advance the actor one step conditioned on the current partner posterior.
-
-    ``belief`` is the response-only posterior ``b_t = P(z | h_t)``.  It arrives
-    already detached: PPO trains only ``base_params`` through it, so the
-    two-estimator boundary is unchanged.
-    """
+) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+    """Advance the immutable full-frame SP reference and residual actor once."""
 
     import jax.numpy as jnp
 
-    frame = (
-        task_only_observation(observation)
-        if bool(mask_partner_history)
-        else jnp.asarray(observation, dtype=jnp.float32)
-    )
+    reference = params["reference"]
+    trainable = params["trainable"]
     start = jnp.asarray(episode_start, dtype=jnp.bool_)
     carry = jnp.where(start[..., None], jnp.zeros_like(task_carry), task_carry)
-    task_embedding = encode_task_frame(params, frame)
-    next_carry = gru_step(params["task_gru"], carry, task_embedding)
-    task_features = next_carry
-
+    task_embedding = encode_task_frame(reference, observation)
+    next_carry = gru_step(reference["task_gru"], carry, task_embedding)
     partner = instantaneous_partner_observation(observation)
     partner_flat = partner.reshape(partner.shape[:-3] + (-1,))
     instant = layer_normalize(
-        mlp(params["instant_encoder"], partner_flat, final_activation=True)
+        mlp(trainable["instant_encoder"], partner_flat, final_activation=True)
     )
-    posterior = jnp.asarray(belief, dtype=jnp.float32)
-    logits, value = _heads(
-        params, jnp.concatenate((task_features, instant, posterior), axis=-1)
+    reference_logits, residual_logits, logits, value = _heads(
+        reference, trainable, next_carry, instant, belief
     )
-    return next_carry, task_features, instant, logits, value
+    return (
+        next_carry,
+        next_carry,
+        instant,
+        reference_logits,
+        residual_logits,
+        logits,
+        value,
+    )
 
 
 def base_policy_sequence(
@@ -163,53 +204,45 @@ def base_policy_sequence(
     observations: Any,
     episode_starts: Any,
     beliefs: Any,
-    *,
-    mask_partner_history: bool,
-) -> tuple[Any, Any, Any, Any, Any, Any]:
-    """Evaluate a time-major base policy with only the GRU left in a scan.
-
-    The observation encoders and policy/value heads are stateless.  Evaluating
-    them over the complete ``time x lane`` array is mathematically identical
-    to calling :func:`base_policy_step` at every time, but turns hundreds of
-    tiny matrix multiplications into a handful of large ones.  Only the task
-    GRU has a genuine temporal dependency and therefore remains sequential.
-    """
+) -> tuple[Any, Any, Any, Any, Any, Any, Any, Any]:
+    """Evaluate a time-major reference/residual policy with one GRU scan."""
 
     import jax
     import jax.numpy as jnp
 
+    reference = params["reference"]
+    trainable = params["trainable"]
     observation = jnp.asarray(observations, dtype=jnp.float32)
-    frame = (
-        task_only_observation(observation)
-        if bool(mask_partner_history)
-        else observation
-    )
-    task_embeddings = encode_task_frame(params, frame)
-
+    task_embeddings = encode_task_frame(reference, observation)
     partner = instantaneous_partner_observation(observation)
     partner_flat = partner.reshape(partner.shape[:-3] + (-1,))
     instant = layer_normalize(
-        mlp(params["instant_encoder"], partner_flat, final_activation=True)
+        mlp(trainable["instant_encoder"], partner_flat, final_activation=True)
     )
 
     def recurrent_step(carry: Any, values: tuple[Any, Any]):
         embedding, episode_start = values
         start = jnp.asarray(episode_start, dtype=jnp.bool_)
-        reset_carry = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
-        next_carry = gru_step(params["task_gru"], reset_carry, embedding)
+        reset = jnp.where(start[..., None], jnp.zeros_like(carry), carry)
+        next_carry = gru_step(reference["task_gru"], reset, embedding)
         return next_carry, next_carry
 
-    final_carry, task_carries = jax.lax.scan(
-        recurrent_step,
-        initial_task_carry,
-        (task_embeddings, episode_starts),
+    final_carry, task_features = jax.lax.scan(
+        recurrent_step, initial_task_carry, (task_embeddings, episode_starts)
     )
-    task_features = task_carries
-    posterior = jnp.asarray(beliefs, dtype=jnp.float32)
-    logits, value = _heads(
-        params, jnp.concatenate((task_features, instant, posterior), axis=-1)
+    reference_logits, residual_logits, logits, value = _heads(
+        reference, trainable, task_features, instant, beliefs
     )
-    return final_carry, task_carries, task_features, instant, logits, value
+    return (
+        final_carry,
+        task_features,
+        task_features,
+        instant,
+        reference_logits,
+        residual_logits,
+        logits,
+        value,
+    )
 
 
 __all__ = [
@@ -218,4 +251,6 @@ __all__ = [
     "base_policy_step",
     "encode_task_frame",
     "init_base_params",
+    "trainable_base_params",
+    "with_trainable_base_params",
 ]

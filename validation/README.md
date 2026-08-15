@@ -1,4 +1,4 @@
-# DELTA-ZSC v5 validation artifacts
+# DELTA-ZSC v6 validation artifacts
 
 ## Isolated local regression
 
@@ -13,9 +13,9 @@ The runner writes `ISOLATED_TEST_RESULTS.json` and
 
 ```text
 complete=true
-discovered=82
-executed=82
-passed=82
+discovered=98
+executed=98
+passed=98
 failed=0
 timed_out=0
 ```
@@ -28,7 +28,7 @@ Run:
 bash validation/run_contract_validation.sh
 ```
 
-It checks active-source compilation, Python 3.10 grammar, nine registered
+It checks active-source compilation, Python 3.10 grammar, ten registered
 configs, the root CLI and 19 subcommands, workflow parsing, namespace and
 dependency contracts, credential/local-path scans, source formatting and the
 deterministic 66-outcome delayed-VOI diagnostic.

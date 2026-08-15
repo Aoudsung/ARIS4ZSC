@@ -29,7 +29,11 @@ from src.delta_zsc.anchor_buffer import init_anchor_buffer
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.model import DeltaModel, observe_after_transition
 from src.delta_zsc.observation import INTERFACE_EVENT_CLASSES
-from src.delta_zsc.official_initializer import initialize_base_from_official
+from src.delta_zsc.official_initializer import (
+    initialize_base_from_official,
+    initializer_seed_index,
+)
+from src.delta_zsc.base_policy import trainable_base_params
 from src.delta_zsc.optimizer import init_adam
 from src.delta_zsc.partners import build_training_partner_pool, make_static_partner_functions
 from src.delta_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
@@ -53,6 +57,8 @@ from src.delta_zsc.training import (
     environment_minibatch_schedule,
     init_latent_optimizer,
     make_training_update_kernel,
+    polyak_update,
+    slice_rollout_lanes,
     update_contrast_channel,
 )
 from src.delta_zsc.types import TrainState
@@ -843,12 +849,14 @@ def _make_anchor_update_kernel(
             minibatches_per_epoch=minibatches_per_epoch,
             update_epochs=update_epochs,
         )
-        # The ordinary (anchor-free) update module runs first -- the same
-        # executable the other ~129 updates in every 130 use, so this is a
-        # compilation-cache hit -- and the anchor calibration is applied after
-        # it as its own small module.  Fusing the two put two 256-step
-        # recurrent scans in one HLO module that XLA could not finish
-        # compiling.
+        # The ordinary module commits response/TD first, then PPO, and the
+        # sparse contrast is applied afterward as its own small executable.
+        # Its target still uses collection-time base_params: anchors and replay
+        # must describe the same continuation policy.  Fusing both executables
+        # put two 256-step recurrent scans in one HLO module that XLA could not
+        # finish compiling.
+        collection_base_params = base_params
+        collection_latent_params = latent_params
         (
             base_params,
             latent_params,
@@ -865,18 +873,34 @@ def _make_anchor_update_kernel(
             batch,
             schedule,
         )
+        xp_start = int(environment_count) // 2
+        xp_batch = slice_rollout_lanes(
+            batch,
+            jnp.arange(xp_start, int(environment_count), dtype=jnp.int32),
+        )
+        xp_anchors = anchors._replace(
+            lane_indexes=anchors.lane_indexes - xp_start
+        )
         latent_params, contrast_state, contrast_metrics = update_contrast_channel(
             model=model,
             latent_params=latent_params,
-            base_params=base_params,
+            base_params=collection_base_params,
+            feature_latent_params=collection_latent_params,
             optimizer_state=latent_optimizer_state["contrast"],
-            batch=batch,
-            anchors=anchors,
+            batch=xp_batch,
+            anchors=xp_anchors,
         )
         latent_optimizer_state = {
             **latent_optimizer_state,
             "contrast": contrast_state,
         }
+        # Contrast corrects the online critic after its ordinary Polyak commit.
+        # Fold that sparse correction into the slow target before the next TD
+        # update; otherwise each anchor correction is omitted from the target
+        # until a later ordinary update happens to copy it indirectly.
+        target_latent_params = polyak_update(
+            target_latent_params, latent_params
+        )
         metrics = {
             **metrics,
             "latent": {**metrics["latent"], **contrast_metrics},
@@ -960,7 +984,7 @@ def run_training(args: argparse.Namespace) -> None:
         initializer_path = None
         if require_fitted_initializer:
             raise RuntimeError(
-                "Development/formal DELTA v5 semantic variants require "
+                "Development/formal DELTA v6 semantic variants require "
                 "--semantic-initializer built from the lineage-disjoint "
                 "calibration panel."
             )
@@ -983,22 +1007,26 @@ def run_training(args: argparse.Namespace) -> None:
     )
     root = _training_key(int(args.seed_index))
     init_key, runner_key, loop_key = jax.random.split(root, 3)
-    base_params, latent_params = model.init_parameters(
+    initialized_base_params, initialized_latent_params = model.init_parameters(
         init_key, semantic_initializer=semantic_initializer
     )
     sp_initializer = getattr(args, "sp_initializer", None)
-    if sp_initializer:
-        base_params = initialize_base_from_official(base_params, sp_initializer)
-    base_optimizer_state = init_adam(base_params)
-    latent_optimizer_state = init_latent_optimizer(latent_params)
-    # The target starts as an exact copy: at update zero the slow critic and
-    # the online critic are the same estimate, and Polyak separates them.
-    target_latent_params = jax.tree_util.tree_map(jnp.asarray, latent_params)
-    runner = initialize_runner(
-        environment=environment,
-        model=model,
-        partner_functions=partner_functions,
-        random_key=runner_key,
+    if not sp_initializer:
+        raise ValueError("DELTA v6 requires --sp-initializer.")
+    initializer_seed = initializer_seed_index(sp_initializer)
+    expected_initializer_seed = 0 if seed_index == -1 else seed_index
+    if initializer_seed != expected_initializer_seed:
+        raise ValueError(
+            "--sp-initializer must be the seed-matched run-<seed>/ckpt_final; "
+            "engineering seed -1 uses run-0."
+        )
+    from .official_adapter import validate_official_partner_checkpoint
+
+    validate_official_partner_checkpoint(
+        sp_initializer,
+        config=config,
+        algorithm="rnn-sp",
+        seed_index=expected_initializer_seed,
     )
     output = Path(args.output).resolve()
     identity = {
@@ -1046,26 +1074,17 @@ def run_training(args: argparse.Namespace) -> None:
         upstream_partner_steps=upstream_steps,
         shared_gpu_hours=upstream_gpu_hours,
         shared_wall_clock_hours=upstream_wall_clock_hours,
-        deployable_parameters=parameter_count(base_params) + parameter_count(latent_params),
-    )
-    state = TrainState(
-        base_params=base_params,
-        latent_params=latent_params,
-        target_latent_params=target_latent_params,
-        base_optimizer_state=base_optimizer_state,
-        latent_optimizer_state=latent_optimizer_state,
-        # Filled once the snapshot kernel exists and its shapes are known.
-        anchor_buffer=None,
-        runner_state=runner,
-        update_count=jnp.asarray(0, dtype=jnp.int32),
-        effective_environment_steps=jnp.asarray(0, dtype=jnp.int32),
-        resource_ledger=ledger.to_mapping(),
+        deployable_parameters=(
+            parameter_count(initialized_base_params)
+            + parameter_count(initialized_latent_params)
+        ),
     )
     checkpoint_identity = {
         "method": METHOD_VERSION,
         "config": config.to_mapping(),
         "partner_manifest_run_ids": [row.run_id for row in manifest.runs],
         "seed_index": int(args.seed_index),
+        "sp_initializer": str(sp_initializer),
         "semantic_initializer": semantic_initializer.to_mapping(),
     }
     if bool(getattr(args, "resume", False)):
@@ -1082,6 +1101,36 @@ def run_training(args: argparse.Namespace) -> None:
                 gpu_hours=upstream_gpu_hours,
                 wall_clock_hours=upstream_wall_clock_hours,
             )
+        )
+    else:
+        initialized_base_params = initialize_base_from_official(
+            initialized_base_params, sp_initializer
+        )
+        base_params = initialized_base_params
+        latent_params = initialized_latent_params
+        base_optimizer_state = init_adam(trainable_base_params(base_params))
+        latent_optimizer_state = init_latent_optimizer(latent_params)
+        # The target starts as an exact copy: at update zero the slow critic and
+        # the online critic are the same estimate, and Polyak separates them.
+        target_latent_params = jax.tree_util.tree_map(jnp.asarray, latent_params)
+        runner = initialize_runner(
+            environment=environment,
+            model=model,
+            partner_functions=partner_functions,
+            random_key=runner_key,
+        )
+        state = TrainState(
+            base_params=base_params,
+            latent_params=latent_params,
+            target_latent_params=target_latent_params,
+            base_optimizer_state=base_optimizer_state,
+            latent_optimizer_state=latent_optimizer_state,
+            # Filled once the snapshot kernel exists and its shapes are known.
+            anchor_buffer=None,
+            runner_state=runner,
+            update_count=jnp.asarray(0, dtype=jnp.int32),
+            effective_environment_steps=jnp.asarray(0, dtype=jnp.int32),
+            resource_ledger=ledger.to_mapping(),
         )
     rollout_steps = config.environment.num_envs * config.training.rollout_length
     total_updates = config.training.environment_steps // rollout_steps
@@ -1110,7 +1159,8 @@ def run_training(args: argparse.Namespace) -> None:
     )
     anchor_enabled = bool(
         config.anchors.enabled
-        and config.method_variant in {"delta_passive", "delta_active", "delta_active_blind_actor"}
+        and config.method_variant
+        in {"delta_passive", "delta_active", "delta_active_blind_actor"}
     )
     anchor_updates = (
         int(config.anchors.interval_environment_steps) // rollout_steps
@@ -1147,7 +1197,10 @@ def run_training(args: argparse.Namespace) -> None:
             fit_replicas=config.anchors.fit_replicas,
             evaluation_replicas=config.anchors.evaluation_replicas,
             horizon=config.method.continuation_horizon,
-            collect_successor=(config.method_variant in ("delta_active", "delta_active_blind_actor")),
+            collect_successor=(
+                config.method_variant
+                in {"delta_active", "delta_active_blind_actor"}
+            ),
             states_per_trigger=config.anchors.states_per_trigger,
             pilot_replicas=config.anchors.pilot_replicas,
         )
@@ -1175,7 +1228,7 @@ def run_training(args: argparse.Namespace) -> None:
             replay_states=config.anchors.replay_states,
             model=model,
         )
-        if config.anchors.replay_states:
+        if config.anchors.replay_states and not bool(getattr(args, "resume", False)):
             # Shapes only: eval_shape traces the snapshot kernel without
             # running a rollout, so the buffer is allocated from the real
             # structure rather than a hand-copied one that could drift.
@@ -1206,7 +1259,7 @@ def run_training(args: argparse.Namespace) -> None:
             * config.method.continuation_horizon
         )
         successor_anchor_steps = 0
-        if config.method_variant in ("delta_active", "delta_active_blind_actor"):
+        if config.method_variant in {"delta_active", "delta_active_blind_actor"}:
             successor_anchor_steps = (
                 config.anchors.states_per_trigger
                 * OFFICIAL_ACTION_COUNT
@@ -1523,14 +1576,18 @@ def run_training(args: argparse.Namespace) -> None:
         # number in this file: when the fit and evaluation halves of the same
         # anchor disagree about the best action, nothing measured against the
         # fit half is skill.
-        decision_audit = jax.jit(
-            lambda latent, base: {
-                name: latent_composite_loss(
-                    model, latent, base, audit_batch, audit_anchors
-                ).metrics[name]
-                for name in DECISION_METRIC_NAMES
-            }
-        )(state.latent_params, state.base_params)
+        def decision_metrics(latent, base, batch, anchors):
+            metrics = latent_composite_loss(
+                model, latent, base, batch, anchors
+            ).metrics
+            return {name: metrics[name] for name in DECISION_METRIC_NAMES}
+
+        decision_audit = jax.jit(decision_metrics)(
+            state.latent_params,
+            state.base_params,
+            audit_batch,
+            audit_anchors,
+        )
         decision_audit = jax.tree_util.tree_map(
             jax.block_until_ready, decision_audit
         )
@@ -1544,7 +1601,7 @@ def run_training(args: argparse.Namespace) -> None:
             * config.method.continuation_horizon
         )
         audit_successor_steps = 0
-        if config.method_variant in ("delta_active", "delta_active_blind_actor"):
+        if config.method_variant in {"delta_active", "delta_active_blind_actor"}:
             audit_successor_steps = (
                 config.anchors.states_per_trigger
                 * OFFICIAL_ACTION_COUNT
@@ -1582,7 +1639,7 @@ def run_training(args: argparse.Namespace) -> None:
             audit_path,
             {
                 "version": 5,
-                "artifact_type": "delta_v5_final_decision_audit",
+                "artifact_type": "delta_v6_final_decision_audit",
                 **_final_decision_audit(
                     model=model,
                     base_params=state.base_params,

@@ -792,6 +792,7 @@ def collect_anchor_batch(
     collect_successor: bool = True,
     pilot_states: int | None = None,
     pilot_replicas: int = 0,
+    xp_lanes_only: bool = False,
 ) -> AnchorBatch:
     import jax
     import jax.numpy as jnp
@@ -805,13 +806,16 @@ def collect_anchor_batch(
     # The oversample factor must key off the same count the sparse runner
     # uses, which is the pilot candidate set, not the measured set.
     piloted = int(states_per_trigger if pilot_states is None else pilot_states)
-    candidate_count = min(piloted * 4, time_count * environment_count)
-    candidate_time, candidate_lane = select_anchor_indexes(
+    xp_count = environment_count // 2 if bool(xp_lanes_only) else environment_count
+    lane_offset = environment_count - xp_count
+    candidate_count = min(piloted * 4, time_count * xp_count)
+    candidate_time, local_lane = select_anchor_indexes(
         index_key,
         time_count=time_count,
-        environment_count=environment_count,
+        environment_count=xp_count,
         requested=candidate_count,
     )
+    candidate_lane = local_lane + lane_offset
     candidate_frames = records["joint_observations"][
         candidate_time,
         candidate_lane,

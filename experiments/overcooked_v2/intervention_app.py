@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from src.delta_zsc.anchors import collect_anchor_batch
-from src.delta_zsc.config import OFFICIAL_ACTION_COUNT, load_config
+from src.delta_zsc.config import METHOD_VERSION, OFFICIAL_ACTION_COUNT, load_config
 from src.delta_zsc.manifest import load_partner_manifest
 from src.delta_zsc.mirror_policy import mirror_policy_logits
 from src.delta_zsc.partners import make_static_partner_functions
@@ -197,6 +197,7 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
         output_dir,
         {
             "stage": "belief-value-intervention",
+            "method": METHOD_VERSION,
             "layout": config.environment.layout,
             "deployments": deployment_sources,
             "partner_manifest": {"path": str(manifest_path)},
@@ -217,6 +218,8 @@ def run_belief_value_intervention(args: argparse.Namespace) -> None:
         {
             "version": 2,
             "artifact_type": "delta_belief_value_intervention",
+            "method": METHOD_VERSION,
+            "execution_mode": "active",
             "layout": config.environment.layout,
             "estimand": (
                 "same-source-world expected return of correct legal-history "

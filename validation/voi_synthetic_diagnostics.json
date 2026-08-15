@@ -1,5 +1,5 @@
 {
-  "artifact_type": "delta_v5_delayed_exact_voi_synthetic_acceptance",
+  "artifact_type": "delta_v6_delayed_exact_voi_synthetic_acceptance",
   "decision_revealing_response": {
     "information_gain": [
       [
@@ -25,7 +25,7 @@
     ]
   },
   "maximum_component_outcome_mass_error": 1.7881393432617188e-07,
-  "method": "delta_belief_conditioned_raw_return_pairwise_crn_v5",
+  "method": "delta_self_consistent_decision_grounded_residual_v6",
   "outcome_count": 66,
   "uninformative_response": {
     "information_gain": [
@@ -40,5 +40,5 @@
     ]
   },
   "validation_status": "generated_locally",
-  "version": 5
+  "version": 6
 }

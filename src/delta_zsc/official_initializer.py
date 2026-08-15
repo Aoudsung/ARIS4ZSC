@@ -1,39 +1,11 @@
-"""Initialise DELTA's base policy from a trained Official checkpoint.
-
-DELTA's ``base_params`` own task competence and nothing else, and they are
-trained by the same PPO the Official baselines use on the same observation.
-Starting them from noise means the first several million steps are spent
-rediscovering how to cook -- and, worse for this method, the anchor measurement
-during that period asks "does the action choice matter here?" of a policy for
-which it usually does not.  A random policy's continuations re-merge, the CRN
-contrasts collapse to zero, and the decision channel is fitted to noise before
-the task is learned.
-
-Every Official parameter maps onto exactly one DELTA parameter, because the
-encoder, recurrent cell and heads are now the pinned Official ones.  The only
-DELTA inputs with no Official counterpart are the instantaneous partner
-encoding and the response-only posterior; both enter the actor and value trunks
-as additional input rows, and those rows are initialised to **zero**.
-
-The *weights* are an exact copy.  The *inputs* are not, and the difference
-matters: every variant except ``history_rnn`` feeds the task encoder a
-partner-masked frame -- ``task_only_observation`` zeroes the teammate's
-channels, because the teammate may reach the policy only through the legal
-response channel -- whereas the Official checkpoint was trained on the full
-frame.  A transplanted encoder therefore runs slightly off the distribution it
-was fitted to.  It still carries most of its competence across (measured on a
-development run: shaped return 24.8 at the first update against the partner
-mixture, against -0.7 from random initialisation), but this is not the identity
-and should not be described as one.
-
-The Official convex combination is ``h' = (1-z) n + z h`` and DELTA's gate is
-written the same way, so the recurrent transplant is a direct copy with no sign
-correction.
-"""
+"""Bind DELTA's immutable reference actor to an Official SP checkpoint."""
 
 from __future__ import annotations
 
+from pathlib import Path
+import re
 from typing import Any
+
 
 OFFICIAL_CONV_KEYS = (
     "Conv_0",
@@ -46,189 +18,191 @@ OFFICIAL_CONV_KEYS = (
 
 
 def load_official_parameters(checkpoint_path: str) -> dict[str, Any]:
-    """Restore the ``params`` subtree of an Official PPO checkpoint."""
-
     import orbax.checkpoint as ocp
 
+    checkpoint = str(Path(checkpoint_path).resolve())
     checkpointer = ocp.PyTreeCheckpointer()
     restore_args = ocp.checkpoint_utils.construct_restore_args(
-        checkpointer.metadata(str(checkpoint_path))
+        checkpointer.metadata(checkpoint)
     )
-    restored = checkpointer.restore(
-        str(checkpoint_path), restore_args=restore_args
-    )
+    restored = checkpointer.restore(checkpoint, restore_args=restore_args)
     payload = restored["params"]
-    # Official checkpoints are written either as ``params`` or as the nested
-    # ``params/params`` Flax emits; both appear across the baseline families.
     while isinstance(payload, dict) and set(payload) == {"params"}:
         payload = payload["params"]
     return payload
 
 
-def transplant_official_base_params(
-    base_params: dict[str, Any], official: dict[str, Any]
+def _official_reference(
+    expected: dict[str, Any], official: dict[str, Any]
 ) -> dict[str, Any]:
-    """Overwrite DELTA's task-competence parameters with Official ones.
-
-    Raises if any shape disagrees.  A silent partial transplant would produce a
-    policy that is neither Official nor freshly initialised, and nothing
-    downstream could tell which.
-    """
-
     import jax.numpy as jnp
 
     cnn = official["CNN_0"]
     gru = official["ScannedRNN_0"]["GRUCell_1"]
     norm = official["LayerNorm_0"]
 
-    def check(name: str, value: Any, expected: Any) -> Any:
+    def check(name: str, value: Any, target: Any) -> Any:
         array = jnp.asarray(value, dtype=jnp.float32)
-        if array.shape != jnp.asarray(expected).shape:
+        if array.shape != jnp.asarray(target).shape:
             raise ValueError(
                 f"Official parameter {name} has shape {array.shape}, "
-                f"but DELTA expects {jnp.asarray(expected).shape}."
+                f"but DELTA expects {jnp.asarray(target).shape}."
             )
         return array
 
-    convolutions = tuple(
-        {
-            "kernel": check(
-                f"CNN_0/{key}/kernel",
-                cnn[key]["kernel"],
-                base_params["task_conv"][index]["kernel"],
-            ),
-            "bias": check(
-                f"CNN_0/{key}/bias",
-                cnn[key]["bias"],
-                base_params["task_conv"][index]["bias"],
-            ),
-        }
-        for index, key in enumerate(OFFICIAL_CONV_KEYS)
-    )
-
-    def pad_rows(official_kernel: Any, target: Any, name: str) -> Any:
-        """Place an Official kernel in the task rows; zero the new inputs.
-
-        DELTA's trunks read ``[task features | instant partner | posterior]``.
-        Only the first block existed in the Official policy, so the remaining
-        rows start at zero and the transplanted actor is exactly the Official
-        actor until PPO moves them.
-        """
-
-        source = jnp.asarray(official_kernel, dtype=jnp.float32)
-        destination = jnp.zeros_like(jnp.asarray(target, dtype=jnp.float32))
-        if source.shape[0] > destination.shape[0] or (
-            source.shape[1] != destination.shape[1]
-        ):
-            raise ValueError(
-                f"Official kernel {name} of shape {source.shape} does not fit "
-                f"DELTA's {destination.shape}."
-            )
-        return destination.at[: source.shape[0]].set(source)
-
     return {
-        **base_params,
-        "task_conv": convolutions,
+        "task_conv": tuple(
+            {
+                "kernel": check(
+                    f"CNN_0/{key}/kernel",
+                    cnn[key]["kernel"],
+                    expected["task_conv"][index]["kernel"],
+                ),
+                "bias": check(
+                    f"CNN_0/{key}/bias",
+                    cnn[key]["bias"],
+                    expected["task_conv"][index]["bias"],
+                ),
+            }
+            for index, key in enumerate(OFFICIAL_CONV_KEYS)
+        ),
         "task_dense": {
             "kernel": check(
                 "CNN_0/Dense_0/kernel",
                 cnn["Dense_0"]["kernel"],
-                base_params["task_dense"]["kernel"],
+                expected["task_dense"]["kernel"],
             ),
             "bias": check(
                 "CNN_0/Dense_0/bias",
                 cnn["Dense_0"]["bias"],
-                base_params["task_dense"]["bias"],
+                expected["task_dense"]["bias"],
             ),
         },
         "task_norm": {
             "scale": check(
-                "LayerNorm_0/scale", norm["scale"], base_params["task_norm"]["scale"]
+                "LayerNorm_0/scale", norm["scale"], expected["task_norm"]["scale"]
             ),
             "bias": check(
-                "LayerNorm_0/bias", norm["bias"], base_params["task_norm"]["bias"]
+                "LayerNorm_0/bias", norm["bias"], expected["task_norm"]["bias"]
             ),
         },
         "task_gru": {
             "input_reset": {
-                "kernel": jnp.asarray(gru["ir"]["kernel"], dtype=jnp.float32),
-                "bias": jnp.asarray(gru["ir"]["bias"], dtype=jnp.float32),
+                "kernel": check(
+                    "GRUCell_1/ir/kernel",
+                    gru["ir"]["kernel"],
+                    expected["task_gru"]["input_reset"]["kernel"],
+                ),
+                "bias": check(
+                    "GRUCell_1/ir/bias",
+                    gru["ir"]["bias"],
+                    expected["task_gru"]["input_reset"]["bias"],
+                ),
             },
             "input_update": {
-                "kernel": jnp.asarray(gru["iz"]["kernel"], dtype=jnp.float32),
-                "bias": jnp.asarray(gru["iz"]["bias"], dtype=jnp.float32),
+                "kernel": check(
+                    "GRUCell_1/iz/kernel",
+                    gru["iz"]["kernel"],
+                    expected["task_gru"]["input_update"]["kernel"],
+                ),
+                "bias": check(
+                    "GRUCell_1/iz/bias",
+                    gru["iz"]["bias"],
+                    expected["task_gru"]["input_update"]["bias"],
+                ),
             },
             "input_candidate": {
-                "kernel": jnp.asarray(gru["in"]["kernel"], dtype=jnp.float32),
-                "bias": jnp.asarray(gru["in"]["bias"], dtype=jnp.float32),
-            },
-            # Flax gives the two gate hidden projections no bias of their own.
-            "hidden_reset": {
-                "kernel": jnp.asarray(gru["hr"]["kernel"], dtype=jnp.float32),
-                "bias": jnp.zeros_like(
-                    jnp.asarray(base_params["task_gru"]["hidden_reset"]["bias"])
+                "kernel": check(
+                    "GRUCell_1/in/kernel",
+                    gru["in"]["kernel"],
+                    expected["task_gru"]["input_candidate"]["kernel"],
                 ),
+                "bias": check(
+                    "GRUCell_1/in/bias",
+                    gru["in"]["bias"],
+                    expected["task_gru"]["input_candidate"]["bias"],
+                ),
+            },
+            "hidden_reset": {
+                "kernel": check(
+                    "GRUCell_1/hr/kernel",
+                    gru["hr"]["kernel"],
+                    expected["task_gru"]["hidden_reset"]["kernel"],
+                ),
+                "bias": jnp.zeros_like(expected["task_gru"]["hidden_reset"]["bias"]),
             },
             "hidden_update": {
-                "kernel": jnp.asarray(gru["hz"]["kernel"], dtype=jnp.float32),
-                "bias": jnp.zeros_like(
-                    jnp.asarray(base_params["task_gru"]["hidden_update"]["bias"])
+                "kernel": check(
+                    "GRUCell_1/hz/kernel",
+                    gru["hz"]["kernel"],
+                    expected["task_gru"]["hidden_update"]["kernel"],
                 ),
+                "bias": jnp.zeros_like(expected["task_gru"]["hidden_update"]["bias"]),
             },
             "hidden_candidate": {
-                "kernel": jnp.asarray(gru["hn"]["kernel"], dtype=jnp.float32),
-                "bias": jnp.asarray(gru["hn"]["bias"], dtype=jnp.float32),
+                "kernel": check(
+                    "GRUCell_1/hn/kernel",
+                    gru["hn"]["kernel"],
+                    expected["task_gru"]["hidden_candidate"]["kernel"],
+                ),
+                "bias": check(
+                    "GRUCell_1/hn/bias",
+                    gru["hn"]["bias"],
+                    expected["task_gru"]["hidden_candidate"]["bias"],
+                ),
             },
         },
         "actor_trunk": {
-            "kernel": pad_rows(
+            "kernel": check(
+                "Dense_0/kernel",
                 official["Dense_0"]["kernel"],
-                base_params["actor_trunk"]["kernel"],
-                "Dense_0",
+                expected["actor_trunk"]["kernel"],
             ),
             "bias": check(
                 "Dense_0/bias",
                 official["Dense_0"]["bias"],
-                base_params["actor_trunk"]["bias"],
+                expected["actor_trunk"]["bias"],
             ),
         },
         "actor": {
             "kernel": check(
                 "Dense_1/kernel",
                 official["Dense_1"]["kernel"],
-                base_params["actor"]["kernel"],
+                expected["actor"]["kernel"],
             ),
             "bias": check(
-                "Dense_1/bias",
-                official["Dense_1"]["bias"],
-                base_params["actor"]["bias"],
-            ),
-        },
-        "value_trunk": {
-            "kernel": pad_rows(
-                official["Dense_2"]["kernel"],
-                base_params["value_trunk"]["kernel"],
-                "Dense_2",
-            ),
-            "bias": check(
-                "Dense_2/bias",
-                official["Dense_2"]["bias"],
-                base_params["value_trunk"]["bias"],
-            ),
-        },
-        "value": {
-            "kernel": check(
-                "Dense_3/kernel",
-                official["Dense_3"]["kernel"],
-                base_params["value"]["kernel"],
-            ),
-            "bias": check(
-                "Dense_3/bias",
-                official["Dense_3"]["bias"],
-                base_params["value"]["bias"],
+                "Dense_1/bias", official["Dense_1"]["bias"], expected["actor"]["bias"]
             ),
         },
     }
+
+
+def transplant_official_base_params(
+    base_params: dict[str, Any], official: dict[str, Any]
+) -> dict[str, Any]:
+    """Replace only the immutable reference; preserve zero residual/value state."""
+
+    if set(base_params) != {"reference", "trainable"}:
+        raise ValueError("DELTA v6 base parameters must contain reference/trainable trees.")
+    return {
+        "reference": _official_reference(base_params["reference"], official),
+        "trainable": base_params["trainable"],
+    }
+
+
+def initializer_seed_index(checkpoint_path: str) -> int | None:
+    """Read the registered ``run-<seed>/ckpt_final`` initializer convention."""
+
+    # Inspect the path the caller supplied.  ``ckpt_final`` is commonly a
+    # symlink into an Orbax directory whose target no longer contains the
+    # registered ``run-<seed>`` alias; resolving first would erase the seed
+    # identity we are checking.
+    path = Path(checkpoint_path)
+    for part in reversed(path.parts):
+        match = re.fullmatch(r"run-(\d+)", part)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def initialize_base_from_official(
@@ -242,6 +216,7 @@ def initialize_base_from_official(
 __all__ = [
     "OFFICIAL_CONV_KEYS",
     "initialize_base_from_official",
+    "initializer_seed_index",
     "load_official_parameters",
     "transplant_official_base_params",
 ]

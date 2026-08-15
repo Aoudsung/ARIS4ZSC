@@ -1,4 +1,4 @@
-# METHOD_SPEC — Unified DELTA-ZSC v5 algorithm
+# METHOD_SPEC — Unified DELTA-ZSC v6 algorithm
 
 `authoritative: true`
 
@@ -18,19 +18,40 @@ Training has three observation channels:
 
 Counterfactual returns and partner lineage never enter deployment state.
 
-## 2. Base task policy
+## 2. Immutable reference and residual task policy
 
-`base_params` contain one recurrent task actor-critic. Explicit teammate
-semantic channels are masked from the recurrent task input; a separate
-memoryless encoder reads current teammate geometry. `history_rnn` disables this
-history mask as a capacity control.
+`base_params` contain two ownership subtrees:
 
-All training rollout actions and unforced anchor transitions use the
-collection-time base policy. Current anchors force their measured action.
-Active anchors force the probe, execute one unforced base bridge while the
-teammate reacts, then force the measured post-response action at `t+2`. PPO is
-therefore on-policy with respect to the base policy and independent of latent
-parameters.
+- `reference`: the complete seed-matched Official-SP task encoder, GRU, actor
+  trunk and actor head, embedded in checkpoints and deployments but absent from
+  every optimizer state;
+- `trainable`: the instantaneous-partner encoder, zero-initialized residual
+  actor and value branch.
+
+For every registered variant, the reference reads the complete legal local
+observation exactly as its Official source actor did. Its recurrent state and
+action distribution are therefore the source Official policy's function, not
+merely the result of copying its weights into a changed input pipeline. With
+residual parameters zero, base logits equal reference logits exactly. The
+residual reads frozen task features, legal
+current geometry and confidence-gated belief innovation
+
+\[
+\rho(b_t)(b_t-u),\qquad
+\rho(b)=1-H(b)/\log K.
+\]
+
+Before collection, candidate base logits are projected into
+`KL(pi_base || pi_ref) <= delta`. All rollout actions and unforced anchor
+transitions use that collection-time base policy. Current anchors force their
+measured action. Active anchors force the probe, execute one unforced base
+bridge, then force the post-response action at `t+2`.
+
+Training lanes are fixed: the first half use a stop-gradient snapshot of the
+current base policy as teammate and the second half use frozen manifest
+partners. The two sides have independent recurrent states. Generic calibration
+and intervention rollouts do not enable the mixed layout and therefore remain
+frozen-partner-only.
 
 ## 3. Legal behavior statistics
 
@@ -219,6 +240,17 @@ same quantity:
    raw reward.
 2. **Pairwise CRN contrast calibration.** See section 11.
 
+The critic input also contains the detached structural coordinate
+
+\[
+g_t=\operatorname{stopgrad}\!\left(\sum_k b_t(k)e_k\right),
+\]
+
+using the full response-component embedding `e_k`. Existing TD and CRN scores
+may therefore shape the critic's use of response semantics, but their gradients
+cannot alter the response embeddings or online posterior. This is a
+parameterization of the existing critic, not an auxiliary grounding loss.
+
 ## 11. Pairwise CRN action contrasts
 
 The anchor target is the same-replica action *difference*
@@ -327,8 +359,9 @@ physical effect of the ego continuation action. The window is invalid if either
 intervening transition is terminal.
 
 The delayed head predicts shared visibility/availability/change and a
-component-semantic 31-class event. It is trained only for `delta_active` and is
-never inserted into deployment history after the fact.
+component-semantic 31-class event. It is trained only for `delta_active` and
+its diagnostic `delta_active_blind_actor` ablation, and is never inserted into
+deployment history after the fact.
 
 ## 13. Response proper scores and direct decision objectives
 
@@ -371,8 +404,18 @@ For rollout `D_n`, anchors `C_n`, base tree `omega_n`, and latent tree
 \]
 
 The latent transaction is committed before any PPO minibatch changes
-`omega_n`. Anchor labels and base features therefore refer to the same
-collection-time policy.
+`omega_n`. It receives only the frozen cross-play half of `D_n`; CRN anchor
+states and contrast calibration also come only from that half. The sparse
+contrast step updates the already TD-updated critic, but reconstructs its
+detached task, behavior and posterior features with collection-time
+`(omega_n, Theta_n)`. Anchor labels and conditioning features therefore refer
+to the same collection policy and belief model, and the episode-static latent
+never observes a moving self-play teammate.
+
+PPO sees both halves. Every minibatch contains equal SP and XP lanes. Advantages
+are normalized separately. Actor and value objectives select the worse group;
+entropy selects the smaller group entropy. The Official reference subtree is
+not an optimization variable.
 
 ## 15. Passive mirror adaptation
 
@@ -392,6 +435,11 @@ D_{KL}(\pi\Vert\pi_0)\le\delta.
 
 The solution is `pi_eta(a) proportional pi_0(a) exp(Q(a)/eta)` with deterministic
 bisection on `eta`.
+
+After passive or active improvement, a final reference-relative projection is
+performed. Because KL has no triangle inequality, this final projection—not a
+sum of intermediate budgets—establishes
+`KL(pi_exec || pi_ref) <= delta`.
 
 ## 16. Exact delayed-response active VOI
 
@@ -422,12 +470,13 @@ but never added to control reward.
 
 ## 17. Variants
 
-- `history_rnn`: generic recurrent capacity control;
-- `base`: shared PPO task policy only;
+- `base`: full-frame recurrent Official reference plus shared PPO residual only;
 - `response_only`: shared/semantic immediate response prediction and legal
   posterior, no decision adaptation;
 - `delta_passive`: belief-conditioned critic and passive robust mirror adaptation;
-- `delta_active`: all v5 channels, successor decision, and delayed exact VOI.
+- `delta_active`: all v6 channels, successor decision, and delayed exact VOI;
+- `delta_active_blind_actor`: diagnostic active path whose residual actor reads
+  the uninformative prior while latent estimation and mirror control remain on.
 
 Only `K`, `H`, and `delta` are registered scientific method fields. Network
 widths, optimizer settings, fixed initializer norm, replica counts, and budgets
