@@ -539,6 +539,92 @@ def test_all_deployment_modes_preserve_reference_kl_and_passive_probe_state() ->
     )
 
 
+def test_decision_chain_replays_modes_and_posterior_paths_on_matched_keys() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from experiments.overcooked_v2.intervention_app import (
+        _decision_chain,
+        _episode_shuffled_belief,
+        _latent_history,
+        _sample_actions,
+    )
+    from src.delta_zsc.model import EXECUTION_MODES
+    from src.delta_zsc.runner import collect_rollout, initialize_runner
+
+    config, model, base, latent = _model()
+    environment = MockEnvironment()
+    partner = _partner_functions()
+    reference_environment_keys = None
+    for mode_index, mode in enumerate(EXECUTION_MODES):
+        runner = initialize_runner(
+            environment=environment,
+            model=model,
+            partner_functions=partner,
+            random_key=jax.random.PRNGKey(92),
+        )
+        _, batch, records = collect_rollout(
+            state=runner,
+            length=2,
+            environment=environment,
+            model=model,
+            base_params=base,
+            latent_params=latent,
+            partner_functions=partner,
+            partner_parameters=None,
+            official_shaping_factor=0.0,
+            record_anchors=True,
+            use_deployment_policy=True,
+            execution_mode=mode,
+        )
+        history = _latent_history(
+            model=model,
+            base_params=base,
+            latent_params=latent,
+            batch=batch,
+        )
+        chain = _decision_chain(
+            model=model,
+            base_params=base,
+            latent_params=latent,
+            initial_task_carry=batch.initial_policy_state.task_carry,
+            observations=batch.observations[:-1],
+            episode_starts=batch.episode_starts[:-1],
+            behavior=history.behavior_features,
+            belief=history.belief,
+        )
+        replay = _sample_actions(
+            records["ego_action_keys"], chain["final_policy_logits"][mode_index]
+        )
+        np.testing.assert_array_equal(np.asarray(replay), np.asarray(batch.actions))
+        np.testing.assert_allclose(
+            np.asarray(chain["final_policy_logits"][mode_index]),
+            np.asarray(records["deployment_policy_logits"]),
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+        assert chain["final_policy_logits"].shape == (4, 2, 4, 6)
+        assert float(jnp.max(chain["final_reference_kl"])) <= (
+            config.method.adaptation_kl_budget + 1.0e-5
+        )
+        current_keys = np.asarray(records["environment_keys"])
+        if reference_environment_keys is None:
+            reference_environment_keys = current_keys
+        else:
+            np.testing.assert_array_equal(current_keys, reference_environment_keys)
+
+    posterior = np.asarray(history.belief)
+    shuffled = _episode_shuffled_belief(
+        posterior,
+        np.asarray(batch.episode_starts[:-1]),
+        seed=0,
+    )
+    assert shuffled.shape == posterior.shape
+    np.testing.assert_allclose(
+        np.sort(shuffled, axis=0), np.sort(posterior, axis=0), atol=0.0
+    )
+
+
 def test_final_v4_audit_reduces_probe_axis_before_anchor_mask() -> None:
     """Final report accepts [anchor, probe, K, event] logits without broadcasting."""
 

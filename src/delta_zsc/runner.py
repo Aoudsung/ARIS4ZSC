@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping, NamedTuple
 
-from .model import observe_after_transition
+from .model import execution_policy_logits, observe_after_transition
 from .types import AnchorSnapshots, RolloutBatch, RunnerState
 
 
@@ -100,6 +100,7 @@ def collect_rollout(
     official_shaping_factor: float,
     record_anchors: bool,
     use_deployment_policy: bool = False,
+    execution_mode: str | None = None,
     mixed_training_partners: bool = False,
 ) -> tuple[RunnerState, RolloutBatch, Mapping[str, Any]]:
     """Collect one time-major rollout.
@@ -144,6 +145,7 @@ def collect_rollout(
             "delta_active",
             "delta_active_blind_actor",
         }
+        selected_mode = "active" if execution_mode is None else str(execution_mode)
         stepped_ego, output = model.step(
             base_params,
             latent_params,
@@ -151,10 +153,18 @@ def collect_rollout(
             ego_observation,
             compute_latent=compute_latent,
             compute_decision=bool(use_deployment_policy),
-            execute_adaptation=bool(use_deployment_policy),
+            execute_adaptation=(
+                bool(use_deployment_policy) and selected_mode == "active"
+            ),
         )
         behavior_logits = (
-            output.policy_logits if bool(use_deployment_policy) else output.base_policy_logits
+            execution_policy_logits(
+                output,
+                selected_mode,
+                kl_budget=model.config.method.adaptation_kl_budget,
+            )
+            if bool(use_deployment_policy)
+            else output.base_policy_logits
         )
         ego_action = jax.vmap(
             lambda key, logits: jax.random.categorical(key, logits)
@@ -288,12 +298,14 @@ def collect_rollout(
             "old_log_probability": old_log_probability,
             "old_value": output.value,
             "base_policy_logits": output.base_policy_logits,
-            "deployment_policy_logits": output.policy_logits,
+            "deployment_policy_logits": behavior_logits,
             "belief": output.belief,
             "active_voi": output.active_voi,
             "active_information_gain": output.active_information_gain,
             "active_probe_eligible": output.active_probe_eligible,
             "adaptation_kl": output.adaptation_kl,
+            "ego_action_keys": ego_keys,
+            "environment_keys": environment_keys,
         }
         return next_state, row
 
@@ -310,6 +322,7 @@ def collect_rollout(
         "delta_active",
         "delta_active_blind_actor",
     }
+    selected_mode = "active" if execution_mode is None else str(execution_mode)
     _, final_output = model.step(
         base_params,
         latent_params,
@@ -317,7 +330,9 @@ def collect_rollout(
         final_observation,
         compute_latent=compute_latent,
         compute_decision=bool(use_deployment_policy),
-        execute_adaptation=bool(use_deployment_policy),
+        execute_adaptation=(
+            bool(use_deployment_policy) and selected_mode == "active"
+        ),
     )
     observations = jnp.concatenate(
         (rows["ego_observation"], final_observation[None]), axis=0

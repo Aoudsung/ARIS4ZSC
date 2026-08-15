@@ -21,7 +21,11 @@ from .evaluation_app import (
     summarize_population_matrices,
 )
 from .formal_claim_app import build_formal_claim_report
-from .intervention_app import run_belief_value_intervention
+from .intervention_app import (
+    run_belief_value_intervention,
+    run_decision_chain_audit,
+    summarize_decision_chain_audit,
+)
 from .delta_manifest_app import build_partner_manifest, validate_partner_manifest_command
 from .resource_report_app import run_resource_report
 from .training_app import run_cuda_preflight, run_training
@@ -173,6 +177,28 @@ def _parser() -> argparse.ArgumentParser:
     intervention.add_argument("--deployment", action="append", required=True)
     intervention.add_argument("--output", required=True)
     intervention.set_defaults(function=run_belief_value_intervention)
+
+    decision_audit = commands.add_parser("decision-chain-audit")
+    _common_run(decision_audit)
+    decision_audit.add_argument("--deployment", action="append", required=True)
+    decision_audit.add_argument(
+        "--partner-role",
+        choices=("development_support",),
+        default="development_support",
+    )
+    decision_audit.add_argument("--seed", type=int, default=0)
+    decision_audit.add_argument("--trajectory-steps", type=int, default=256)
+    decision_audit.add_argument("--anchor-states", type=int, default=240)
+    decision_audit.add_argument("--output", required=True)
+    decision_audit.set_defaults(function=run_decision_chain_audit)
+
+    decision_report = commands.add_parser("summarize-decision-chain-audit")
+    decision_report.add_argument("--audit", required=True)
+    decision_report.add_argument("--evaluation", action="append", required=True)
+    decision_report.add_argument("--bootstrap-replicates", type=int, default=9_999)
+    decision_report.add_argument("--seed", type=int, default=0)
+    decision_report.add_argument("--output", required=True)
+    decision_report.set_defaults(function=summarize_decision_chain_audit)
 
     matrix = commands.add_parser("run-development-matrix")
     _common_run(matrix)

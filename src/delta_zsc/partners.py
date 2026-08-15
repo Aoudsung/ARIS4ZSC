@@ -211,10 +211,85 @@ def make_static_partner_functions(
     return PartnerFunctions(initial_state, step, observe, run_id, diagnostics)
 
 
+def make_fixed_partner_functions(
+    *,
+    pool: Any,
+    member_indexes: Any,
+    run_ids: Any,
+) -> PartnerFunctions:
+    """Keep one declared frozen partner on each diagnostic rollout lane."""
+
+    import jax
+    import jax.numpy as jnp
+
+    members = jnp.asarray(member_indexes, dtype=jnp.int32)
+    identifiers = jnp.asarray(run_ids, dtype=jnp.int32)
+
+    def initial_state(batch_size: int, key: Any) -> StaticPartnerState:
+        del key
+        if int(batch_size) != int(members.shape[0]):
+            raise ValueError("Fixed partner lanes differ from the rollout batch.")
+        return StaticPartnerState(
+            carry=pool.initial_carry(int(batch_size)),
+            member=members,
+        )
+
+    def step(
+        parameters: Any,
+        state: StaticPartnerState,
+        observations: Any,
+        episode_start: Any,
+        keys: Any,
+    ):
+        del parameters
+        action, carry = pool.step_with_keys(
+            state.member, observations, state.carry, episode_start, keys
+        )
+        return action, StaticPartnerState(carry, state.member), state.member, jnp.zeros_like(
+            action, dtype=jnp.float32
+        )
+
+    def observe(
+        parameters: Any,
+        state: StaticPartnerState,
+        context: Any,
+        observations: Any,
+        actions: Any,
+        rewards: Any,
+        dones: Any,
+        next_observations: Any,
+    ):
+        del parameters, context, observations, actions, rewards, next_observations
+        done = jnp.asarray(dones, dtype=jnp.bool_)
+        fresh = pool.initial_carry(int(done.shape[0]))
+
+        def reset(new: Any, old: Any) -> Any:
+            mask = done.reshape(done.shape + (1,) * (jnp.ndim(old) - done.ndim))
+            return jnp.where(mask, new, old)
+
+        carry = jax.tree_util.tree_map(reset, fresh, state.carry)
+        return StaticPartnerState(carry, state.member)
+
+    def run_id(parameters: Any, state: StaticPartnerState, context: Any):
+        del parameters, context
+        return identifiers[state.member]
+
+    def diagnostics(parameters: Any, state: StaticPartnerState, context: Any):
+        del parameters, context
+        return {
+            "source": jnp.full(state.member.shape, 1, dtype=jnp.int32),
+            "member": state.member,
+            "run_id": identifiers[state.member],
+        }
+
+    return PartnerFunctions(initial_state, step, observe, run_id, diagnostics)
+
+
 __all__ = [
     "PartnerPoolMember",
     "StaticPartnerContext",
     "StaticPartnerState",
     "build_training_partner_pool",
+    "make_fixed_partner_functions",
     "make_static_partner_functions",
 ]

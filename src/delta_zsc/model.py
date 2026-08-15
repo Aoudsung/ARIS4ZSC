@@ -45,6 +45,9 @@ from .types import (
 )
 
 
+EXECUTION_MODES = ("reference_only", "residual", "passive", "active")
+
+
 def _zero_response(
     lead: tuple[int, ...], components: int, factors: int
 ) -> ResponsePrediction:
@@ -228,6 +231,44 @@ def successor_action_values(
         latent_params["component_embeddings"],
     )
     return prediction.advantage_mean
+
+
+def execution_policy_logits(
+    output: ModelOutput,
+    execution_mode: str,
+    *,
+    kl_budget: float,
+) -> Any:
+    """Select one of the four deployment policies from one model step.
+
+    The model output contains the immutable reference, the trained residual
+    policy, the belief-conditioned critic and (when requested) the active
+    policy.  Keeping the selection here gives the Official evaluator, generic
+    diagnostic rollout and deployment API exactly the same execution surface.
+    """
+
+    mode = str(execution_mode)
+    if mode == "reference_only":
+        return output.reference_policy_logits
+    if mode == "residual":
+        return output.base_policy_logits
+    if mode == "passive":
+        mirror, _, _ = robust_mirror_policy_logits(
+            output.base_policy_logits,
+            output.expected_decision_values,
+            output.expected_decision_variances ** 0.5,
+            kl_budget=kl_budget,
+            uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
+        )
+        projected, _, _ = project_policy_logits(
+            output.reference_policy_logits,
+            mirror,
+            kl_budget=kl_budget,
+        )
+        return projected
+    if mode == "active":
+        return output.policy_logits
+    raise ValueError(f"execution_mode must be one of {EXECUTION_MODES}.")
 
 
 
@@ -907,4 +948,11 @@ def observe_after_transition(
     )
 
 
-__all__ = ["DeltaModel", "observe_after_transition"]
+__all__ = [
+    "DeltaModel",
+    "EXECUTION_MODES",
+    "component_action_values",
+    "execution_policy_logits",
+    "observe_after_transition",
+    "successor_action_values",
+]

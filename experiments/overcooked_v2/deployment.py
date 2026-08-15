@@ -15,15 +15,17 @@ from src.delta_zsc.config import (
     run_config_from_mapping,
 )
 from src.delta_zsc.losses import categorical_log_probability
-from src.delta_zsc.model import DeltaModel, observe_after_transition
+from src.delta_zsc.model import (
+    DeltaModel,
+    EXECUTION_MODES,
+    execution_policy_logits,
+    observe_after_transition,
+)
 from src.delta_zsc.storage import write_json
 from src.delta_zsc.semantic_initializer import SEMANTIC_INITIALIZER_SCHEMA_VERSION
 
 
 DEPLOYMENT_BUNDLE_VERSION = 5
-EXECUTION_MODES = ("reference_only", "residual", "passive", "active")
-
-
 @dataclass(frozen=True, slots=True)
 class Deployment:
     ego_run_id: str
@@ -171,28 +173,11 @@ def deployment_action(
         observation,
         execute_adaptation=execute_adaptation,
     )
-    if mode == "reference_only":
-        logits = output.reference_policy_logits
-    elif mode == "residual":
-        logits = output.base_policy_logits
-    elif mode == "passive":
-        from src.delta_zsc.mirror_policy import project_policy_logits, robust_mirror_policy_logits
-        from src.delta_zsc.mirror_policy import MIRROR_UNCERTAINTY_PENALTY
-
-        mirror, _, _ = robust_mirror_policy_logits(
-            output.base_policy_logits,
-            output.expected_decision_values,
-            output.expected_decision_variances ** 0.5,
-            kl_budget=deployment.config.method.adaptation_kl_budget,
-            uncertainty_penalty=MIRROR_UNCERTAINTY_PENALTY,
-        )
-        logits, _, _ = project_policy_logits(
-            output.reference_policy_logits,
-            mirror,
-            kl_budget=deployment.config.method.adaptation_kl_budget,
-        )
-    else:
-        logits = output.policy_logits
+    logits = execution_policy_logits(
+        output,
+        mode,
+        kl_budget=deployment.config.method.adaptation_kl_budget,
+    )
     key_array = jnp.asarray(keys)
     if key_array.ndim == 1:
         action = jax.random.categorical(key_array, logits)
