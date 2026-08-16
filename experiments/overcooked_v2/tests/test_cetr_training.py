@@ -383,12 +383,14 @@ def test_cross_fitting_uses_the_opposite_fold_tail_weights() -> None:
         parent_count=2,
     )
     # Fold A ranks parent 0 below parent 1; fold B reverses that ranking.
-    # A lanes therefore receive q^B=[0,2], while B lanes receive q^A=[2,0].
+    # A lanes therefore receive q^B/p0=[0,2], while B lanes receive q^A/p0=[2,0].
     np.testing.assert_allclose(
         np.asarray(weights),
         [1.0] * 8 + [0.0, 2.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0],
     )
-    np.testing.assert_allclose(float(metrics["tail_objective"]), 12.0)
+    # Cross-fitted monitor: 0.5 * (q^A.J^B + q^B.J^A)
+    #   = 0.5 * ([1,0].[8,2] + [0,1].[1,4]) = 0.5 * (8 + 4) = 6.
+    np.testing.assert_allclose(float(metrics["tail_objective"]), 6.0)
 
 
 def test_missing_fold_support_does_not_renormalize_observed_lanes() -> None:

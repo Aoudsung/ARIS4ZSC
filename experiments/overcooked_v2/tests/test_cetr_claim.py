@@ -195,7 +195,7 @@ def test_crossed_bootstrap_resamples_both_axes(monkeypatch):
     monkeypatch.setattr(claim_app, "OFFICIAL_BOOTSTRAP_REPLICATES", 4)
     monkeypatch.setattr(claim_app.np.random, "default_rng", lambda seed: FixedRng())
     result = claim_app._bootstrap_external(
-        np.asarray([[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 8.0], [0.0, 0.0, 0.0, 0.0]]),
+        np.arange(12, dtype=np.float64).reshape(3, 4),
         np.zeros((3, 4), dtype=np.float64),
         statistic="mean",
         seed=7,
@@ -215,7 +215,7 @@ def test_sp_pairing_requires_all_seeds_and_reports_hand_calculated_differences(t
     monkeypatch.setattr(claim_app, "OFFICIAL_BOOTSTRAP_REPLICATES", 8)
     args = _claim_inputs(tmp_path, external_delta=10.0, sp_delta=1.0)
     args.reference_sp = args.reference_sp[:-1]
-    with pytest.raises(ValueError, match="ten reference artifacts"):
+    with pytest.raises(ValueError, match="reference artifact count differs"):
         claim_app.build_claim(args)
 
 
