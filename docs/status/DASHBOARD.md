@@ -6,11 +6,11 @@ Status: implementation reset after the V6 DELTA retirement.
 |---|---|
 | Active method identity | implemented in [`src/cetr_zsc/config.py`](../../src/cetr_zsc/config.py): `constrained_episodic_tail_robust_zsc_v1` |
 | Active configuration contract | implemented; registered values are owned by [`src/cetr_zsc/config.py`](../../src/cetr_zsc/config.py) (`version: 5`) |
-| CETR package boundary | in progress |
-| CETR model, risk, losses, runner, partners, and training modules | in progress |
-| Overcooked CETR CLI and application integration | in progress |
-| Reference-SP measurement and derived `tau_SP` artifact | in progress |
-| Development-support and confirmatory lineage-disjoint panels | in progress |
+| CETR package boundary | implemented |
+| CETR model, risk, losses, runner, partners, and training modules | implemented; cetr-ci green on 2026-08-16 (37/37 isolated CPU tests, compile gate, config validation, CLI smoke, namespace gate) |
+| Overcooked CETR CLI and application integration | implemented; 14-subcommand smoke passes in CI |
+| Reference-SP measurement and derived `tau_SP` artifact | `measure-reference-sp` command implemented; no artifact produced yet (server-side) |
+| Development-support and confirmatory lineage-disjoint panels | audited 2026-08-16: **not satisfied on the server** — FCP support parents absent, no unified four-mechanism manifest, seed-matched Official-SP final checkpoint paths unconfirmed (see the parent-directory experiment report) |
 | Formal training | not started |
 | Formal held-out external evaluation | not started |
 | CETR performance claim | none |
