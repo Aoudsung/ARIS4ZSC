@@ -87,7 +87,7 @@ def test_ppo_learning_rate_has_registered_warmup_and_cosine_endpoints() -> None:
     np.testing.assert_allclose(
         float(ppo_learning_rate(config=config, optimizer_step=9, total_optimizer_steps=10)),
         expected_final,
-        rtol=1e-6,
+        rtol=1e-5,  # schedule computes in float32; closed form is float64
     )
 
 

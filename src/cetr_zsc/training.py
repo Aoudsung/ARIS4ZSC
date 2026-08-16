@@ -149,9 +149,13 @@ def slice_episode_lanes(batch: EpisodeBatch, indexes: Any) -> EpisodeBatch:
     import jax.numpy as jnp
 
     lane_indexes = jnp.asarray(indexes, dtype=jnp.int32)
-    lane_count = int(batch.actions.shape[1])
-    self_count = lane_count // 2
-    self_indexes = lane_indexes[lane_indexes < self_count]
+    # environment_minibatch_schedule builds every minibatch row as
+    # [self-play lanes..., external lanes...] with equal counts, and the
+    # self-play companion arrays are dimensioned by global self-play lane
+    # position, so the companion slice is a positional split of the row.
+    # Boolean masking here would be non-concrete under jit.
+    half = int(lane_indexes.shape[0]) // 2
+    self_indexes = lane_indexes[:half]
 
     return batch._replace(
         observations=batch.observations[:, lane_indexes],
