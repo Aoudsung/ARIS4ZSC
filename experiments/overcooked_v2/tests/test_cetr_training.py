@@ -76,8 +76,19 @@ def test_ppo_learning_rate_has_registered_warmup_and_cosine_endpoints() -> None:
             adam_epsilon=1.0e-5,
         )
     )
+    import math
+
+    # The registered schedule (warmup then cosine) reaches zero only at
+    # progress 1, i.e. one step past the last real optimizer step; the final
+    # real step sees the cosine value at (total-1-warmup)/(total-warmup).
+    warmup = int(0.2 * 10)
+    expected_final = 0.5 * 1.0 * (1.0 + math.cos(math.pi * (9 - warmup) / (10 - warmup)))
     assert float(ppo_learning_rate(config=config, optimizer_step=0, total_optimizer_steps=10)) == 0.5
-    assert float(ppo_learning_rate(config=config, optimizer_step=9, total_optimizer_steps=10)) == 0.0
+    np.testing.assert_allclose(
+        float(ppo_learning_rate(config=config, optimizer_step=9, total_optimizer_steps=10)),
+        expected_final,
+        rtol=1e-6,
+    )
 
 
 def test_minibatch_schedule_pairs_and_covers_each_stream() -> None:

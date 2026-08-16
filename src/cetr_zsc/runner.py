@@ -227,7 +227,9 @@ def collect_episodes(
         environment_keys = jax.random.split(environment_root, lane_count)
 
         ego_observation = current_observations[lane_indexes, ego_roles]
-        self_observation = current_observations[:self_count, 1 - self_roles]
+        self_observation = current_observations[
+            lane_indexes[:self_count], 1 - self_roles
+        ]
         next_ego_carry, ego_logits, ego_value = model.step(
             params,
             current_ego_carry,
