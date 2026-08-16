@@ -104,6 +104,40 @@ def test_formal_pool_requires_all_mechanisms_and_exact_parent_count() -> None:
         )
 
 
+def test_formal_pool_has_registered_parent_member_and_probability_counts() -> None:
+    from src.cetr_zsc.partners import build_training_partner_pool
+
+    pool = build_training_partner_pool(
+        _config(run_kind="formal"),
+        _manifest(parents_per_mechanism=4),
+    )
+    assert len(pool.parent_ids) == 16
+    assert len(pool.members) == 48
+    assert pool.parent_nominal_weights == (1.0 / 16.0,) * 16
+    assert all(member.probability == pytest.approx(1.0 / 48.0) for member in pool.members)
+    assert pool.parent_ids == tuple(
+        f"{mechanism}-parent-{index}"
+        for mechanism in ("fcp", "op", "sa", "sp")
+        for index in range(4)
+    )
+
+
+def test_training_pool_rejects_parent_id_reused_across_mechanisms() -> None:
+    from dataclasses import replace
+
+    from src.cetr_zsc.manifest import PartnerManifest
+    from src.cetr_zsc.partners import build_training_partner_pool
+
+    rows = list(_manifest(parents_per_mechanism=4).runs)
+    source = rows[12]  # first OP row after the four SP parents
+    rows[12] = replace(source, parent_training_run_id="sp-parent-0")
+    with pytest.raises(ValueError, match="globally unique"):
+        build_training_partner_pool(
+            _config(run_kind="formal"),
+            PartnerManifest("test_time_simple", tuple(rows)),
+        )
+
+
 def test_pool_rejects_unknown_mechanism_stage_owner_duplicate_and_missing_stage() -> None:
     from src.cetr_zsc.manifest import PartnerManifest
     from src.cetr_zsc.partners import build_training_partner_pool

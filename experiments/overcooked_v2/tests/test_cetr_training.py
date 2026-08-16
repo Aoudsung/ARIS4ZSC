@@ -340,7 +340,7 @@ def test_prepare_episode_batch_normalizes_once_before_lane_slicing() -> None:
 
     from src.cetr_zsc.training import prepare_episode_batch, slice_episode_lanes
 
-    _, _, _, batch = _model_and_batch()
+    _, _, batch = _model_and_batch()
     advantages = jnp.arange(16, dtype=jnp.float32).reshape(4, 4)
     sp_advantages = jnp.asarray([[20.0, 30.0], [40.0, 50.0], [60.0, 70.0], [80.0, 90.0]])
     prepared = prepare_episode_batch(
@@ -363,4 +363,130 @@ def test_prepare_episode_batch_normalizes_once_before_lane_slicing() -> None:
     np.testing.assert_array_equal(
         np.asarray(sliced.sp_other_advantages),
         np.asarray(prepared.sp_other_advantages[:, indexes[:2]]),
+    )
+
+
+def test_cross_fitting_uses_the_opposite_fold_tail_weights() -> None:
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.training import compute_tail_weights
+
+    batch = _batch_for_weights()._replace(
+        episode_return=jnp.asarray(
+            [0.0] * 8 + [1.0, 4.0, 8.0, 2.0, 1.0, 4.0, 8.0, 2.0],
+            dtype=jnp.float32,
+        )
+    )
+    weights, metrics = compute_tail_weights(
+        batch,
+        parent_nominal_weights=(0.5, 0.5),
+        parent_count=2,
+    )
+    # Fold A ranks parent 0 below parent 1; fold B reverses that ranking.
+    # A lanes therefore receive q^B=[0,2], while B lanes receive q^A=[2,0].
+    np.testing.assert_allclose(
+        np.asarray(weights),
+        [1.0] * 8 + [0.0, 2.0, 2.0, 0.0, 0.0, 2.0, 2.0, 0.0],
+    )
+    np.testing.assert_allclose(float(metrics["tail_objective"]), 12.0)
+
+
+def test_missing_fold_support_does_not_renormalize_observed_lanes() -> None:
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.training import compute_tail_weights
+
+    batch = _batch_for_weights()._replace(
+        lane_fold=jnp.asarray([-1] * 8 + [0] * 8, dtype=jnp.int32),
+        episode_return=jnp.asarray(
+            [0.0] * 8 + [1.0, 4.0, 1.0, 4.0, 1.0, 4.0, 1.0, 4.0],
+            dtype=jnp.float32,
+        ),
+    )
+    weights, _ = compute_tail_weights(
+        batch,
+        parent_nominal_weights=(0.5, 0.5),
+        parent_count=2,
+    )
+    # The absent fold has no support, so its cross-fitted q is zero rather than
+    # becoming a nonzero distribution over the observed subset.
+    np.testing.assert_array_equal(np.asarray(weights)[8:], np.zeros(8, dtype=np.float32))
+
+
+def test_training_prepares_once_before_the_first_lane_slice(monkeypatch) -> None:
+    import jax
+    import jax.numpy as jnp
+
+    import src.cetr_zsc.training as training
+    from src.cetr_zsc.optimizer import init_adam
+    from src.cetr_zsc.training import environment_minibatch_schedule, make_training_update_kernel
+
+    model, params, batch = _model_and_batch()
+    calls: list[str] = []
+    original_prepare = training.prepare_episode_batch
+    original_slice = training.slice_episode_lanes
+
+    def spy_prepare(value):
+        calls.append("prepare")
+        return original_prepare(value)
+
+    def spy_slice(value, indexes):
+        calls.append("slice")
+        return original_slice(value, indexes)
+
+    monkeypatch.setattr(training, "prepare_episode_batch", spy_prepare)
+    monkeypatch.setattr(training, "slice_episode_lanes", spy_slice)
+    schedule = environment_minibatch_schedule(
+        jax.random.PRNGKey(36),
+        environment_count=4,
+        minibatches_per_epoch=1,
+        update_epochs=1,
+    )
+    kernel = make_training_update_kernel(model=model, total_optimizer_steps=1)
+    kernel(params, init_adam(params), batch, schedule, jnp.asarray(0.0, dtype=jnp.float32))
+    assert calls.count("prepare") == 1
+    assert calls.count("slice") >= 1
+    assert calls.index("prepare") < calls.index("slice")
+
+
+def test_lane_weights_change_the_primal_parameter_update() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.optimizer import init_adam
+    from src.cetr_zsc.training import make_training_update_kernel
+
+    model, params, batch = _model_and_batch()
+    advantages = jnp.asarray(
+        [[0.0, 0.0, 1.0, 2.0]] * 4,
+        dtype=jnp.float32,
+    )
+    batch = batch._replace(
+        advantages=advantages,
+        sp_other_advantages=jnp.zeros_like(batch.sp_other_advantages),
+    )
+    kernel = make_training_update_kernel(model=model, total_optimizer_steps=1)
+    schedule = jnp.asarray([[[0, 1, 2, 3]]], dtype=jnp.int32)
+    first, _, _ = kernel(
+        params,
+        init_adam(params),
+        batch._replace(lane_weight=jnp.ones((4,), dtype=jnp.float32)),
+        schedule,
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    second, _, _ = kernel(
+        params,
+        init_adam(params),
+        batch._replace(
+            lane_weight=jnp.asarray([1.0, 1.0, 0.0, 1.0], dtype=jnp.float32)
+        ),
+        schedule,
+        jnp.asarray(0.0, dtype=jnp.float32),
+    )
+    assert any(
+        not np.array_equal(np.asarray(left), np.asarray(right))
+        for left, right in zip(
+            jax.tree_util.tree_leaves(first),
+            jax.tree_util.tree_leaves(second),
+        )
     )

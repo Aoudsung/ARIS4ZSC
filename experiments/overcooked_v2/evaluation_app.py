@@ -31,6 +31,18 @@ from .official_policy import OfficialCetrPolicy
 POLICY_MANIFEST_VERSION = 2
 EVALUATION_SCHEMA_VERSION = 3
 PAPER_MATRIX_ROOT_SEED = 42
+
+
+def population_sp_keys() -> Any:
+    import jax
+
+    sp_root, unused_xp_root = jax.random.split(
+        jax.random.PRNGKey(PAPER_MATRIX_ROOT_SEED), 2
+    )
+    del unused_xp_root
+    return jax.random.split(sp_root, OFFICIAL_TRAINING_RUN_COUNT)
+
+
 FORMAL_COMMON_EGO_RUNS = OFFICIAL_TRAINING_RUN_COUNT
 FORMAL_COMMON_PARTNER_RUNS = 16
 FORMAL_EVALUATION_EPISODES = 500
@@ -396,11 +408,12 @@ def _run_population_matrix(
         _load_policy(row, right_manifest["policy_kind"])
         for row in right_runs
     ]
-    sp_root, xp_root = jax.random.split(jax.random.PRNGKey(root_seed), 2)
+    unused_sp_root, xp_root = jax.random.split(jax.random.PRNGKey(root_seed), 2)
+    del unused_sp_root
     xp_pairs = tuple(permutations(range(10), 2))
     sp_pairs = tuple((index, index) for index in range(10))
     xp_keys = jax.random.split(xp_root, len(xp_pairs))
-    sp_keys = jax.random.split(sp_root, len(sp_pairs))
+    sp_keys = population_sp_keys()
 
     rows = []
     for cell_type, pairs, keys in (

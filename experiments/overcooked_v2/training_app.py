@@ -17,6 +17,7 @@ from src.cetr_zsc.config import (
     FORMAL_PEAK_MEMORY_LIMIT_BYTES,
     METHOD_VERSION,
     OFFICIAL_ACTION_COUNT,
+    OFFICIAL_TRAINING_ROOT_SEED,
     load_config,
 )
 from src.cetr_zsc.manifest import load_partner_manifest
@@ -118,8 +119,8 @@ def _load_reference_sp(
         raise ValueError("Reference-SP artifact seed differs from the training seed.")
     if int(payload["episodes_per_pairing"]) != int(config.evaluation.episodes_per_pairing):
         raise ValueError("Reference-SP artifact episode count differs from the config.")
-    if int(payload["evaluation_root_seed"]) != int(config.evaluation.evaluation_seed):
-        raise ValueError("Reference-SP artifact evaluation seed differs from the config.")
+    if int(payload["evaluation_root_seed"]) != int(OFFICIAL_TRAINING_ROOT_SEED):
+        raise ValueError("Reference-SP artifact population-matrix root seed differs.")
     tau = float(payload["tau_sp"])
     if not np.isfinite(tau):
         raise ValueError("Reference-SP artifact tau is not finite.")
@@ -195,6 +196,7 @@ def _make_ledger(
     training_gpu_hours: float = 0.0,
     training_wall_hours: float = 0.0,
     deployable_parameters: int = 0,
+    training_only_parameters: int = 0,
     inference_latency_ms: float = 0.0,
 ) -> ResourceLedger:
     return ResourceLedger(
@@ -205,6 +207,7 @@ def _make_ledger(
         training_wall_clock_hours=float(training_wall_hours),
         shared_wall_clock_hours=float(upstream_wall_hours),
         deployable_parameters=int(deployable_parameters),
+        training_only_parameters=int(training_only_parameters),
         inference_latency_ms=float(inference_latency_ms),
     )
 
@@ -320,7 +323,11 @@ def run_training(args: argparse.Namespace) -> None:
                 upstream_steps=upstream_steps,
                 upstream_gpu_hours=upstream_gpu_hours,
                 upstream_wall_hours=upstream_wall_hours,
+                ego_steps=int(np.asarray(state.effective_environment_steps)),
                 deployable_parameters=parameter_count(actor_parameters(params)),
+                training_only_parameters=parameter_count(
+                    {"value_trunk": params["value_trunk"], "value": params["value"]}
+                ),
             ).to_mapping()
         )
 
@@ -441,6 +448,13 @@ def run_training(args: argparse.Namespace) -> None:
     ledger = ResourceLedger(
         **{
             **{name: getattr(ledger, name) for name in ResourceLedger.__dataclass_fields__},
+            "ego_policy_steps": int(environment_steps),
+            "training_only_parameters": parameter_count(
+                {
+                    "value_trunk": state.params["value_trunk"],
+                    "value": state.params["value"],
+                }
+            ),
             "peak_memory_bytes": max(int(ledger.peak_memory_bytes), peak_memory),
         }
     )

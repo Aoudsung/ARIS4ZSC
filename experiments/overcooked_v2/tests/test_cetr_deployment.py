@@ -28,7 +28,7 @@ def test_actor_only_bundle_separates_provenance_and_has_strict_schema(tmp_path: 
         export_deployment_bundle,
         load_deployment,
     )
-    from src.cetr_zsc.config import load_config
+    from src.cetr_zsc.config import CHECKPOINT_SCHEMA_VERSION, load_config
     from src.cetr_zsc.model import CetrModel
     from src.cetr_zsc.storage import read_json, write_json
 
@@ -69,6 +69,7 @@ def test_actor_only_bundle_separates_provenance_and_has_strict_schema(tmp_path: 
 
     descriptor = read_json(bundle / "deployment_bundle.json")
     assert descriptor["version"] == DEPLOYMENT_BUNDLE_VERSION == 7
+    assert descriptor["checkpoint_schema_version"] == CHECKPOINT_SCHEMA_VERSION == 8
     assert set(descriptor) == {
         "version",
         "checkpoint_schema_version",
@@ -91,6 +92,22 @@ def test_actor_only_bundle_separates_provenance_and_has_strict_schema(tmp_path: 
         json.dumps(descriptor), encoding="utf-8"
     )
     with pytest.raises(ValueError, match="schema"):
+        load_deployment(bundle)
+
+    descriptor.pop("unexpected")
+    descriptor["version"] = 6
+    (bundle / "deployment_bundle.json").write_text(
+        json.dumps(descriptor), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="method/schema"):
+        load_deployment(bundle)
+
+    descriptor["version"] = 7
+    descriptor["checkpoint_schema_version"] = 6
+    (bundle / "deployment_bundle.json").write_text(
+        json.dumps(descriptor), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="method/schema"):
         load_deployment(bundle)
 
 

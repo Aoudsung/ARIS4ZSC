@@ -42,6 +42,7 @@ def build_training_partner_pool(config: Any, manifest: Any) -> PartnerPool:
     stage_slots = {stage: index for index, stage in enumerate(stages)}
 
     grouped: dict[str, dict[str, dict[float, Any]]] = {}
+    parent_mechanisms: dict[str, str] = {}
     for row in rows:
         mechanism = normalized_mechanism(row.generation_mechanism)
         if mechanism not in TRAINING_SUPPORT_MECHANISMS:
@@ -52,6 +53,13 @@ def build_training_partner_pool(config: Any, manifest: Any) -> PartnerPool:
         if row.owner_seed_index is not None:
             raise ValueError("Training support partners must be owner-free.")
         parent_id = str(row.parent_training_run_id)
+        previous_mechanism = parent_mechanisms.setdefault(parent_id, mechanism)
+        if previous_mechanism != mechanism:
+            raise ValueError(
+                "Training support parent_training_run_id must be globally unique "
+                f"across mechanisms; parent {parent_id} appears under "
+                f"{previous_mechanism} and {mechanism}."
+            )
         by_parent = grouped.setdefault(mechanism, {})
         by_stage = by_parent.setdefault(parent_id, {})
         if by_stage and parent_id in by_parent and stage in by_stage:

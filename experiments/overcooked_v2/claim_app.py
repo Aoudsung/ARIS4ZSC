@@ -9,12 +9,16 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from src.cetr_zsc.config import FORMAL_METHOD_LABEL, TAIL_MASS
-from src.cetr_zsc.manifest import load_partner_manifest
+from src.cetr_zsc.config import (
+    FORMAL_METHOD_LABEL,
+    OFFICIAL_BOOTSTRAP_REPLICATES,
+    OFFICIAL_FORMAL_PARENTS_PER_MECHANISM,
+    OFFICIAL_TRAINING_RUN_COUNT,
+    TAIL_MASS,
+    TRAINING_SUPPORT_MECHANISMS,
+)
+from src.cetr_zsc.manifest import load_partner_manifest, normalized_mechanism
 from src.cetr_zsc.storage import read_json, write_json
-
-
-BOOTSTRAP_REPLICATES = 9_999
 
 
 def _artifact_payload(value: str | Path, *, preferred: tuple[str, ...]) -> Mapping[str, Any]:
@@ -55,7 +59,9 @@ def _ego_index(row: Mapping[str, Any]) -> int:
     )
 
 
-def _common_units(summary: Mapping[str, Any]) -> dict[tuple[int, str], float]:
+def _common_units(
+    summary: Mapping[str, Any],
+) -> dict[tuple[int, str, str], float]:
     if summary.get("evaluation_mode") != "common_partner":
         raise ValueError("Claim external inputs must be common-partner evaluations.")
     raw = summary.get("raw")
@@ -69,23 +75,34 @@ def _common_units(summary: Mapping[str, Any]) -> dict[tuple[int, str], float]:
         expected_layout=str(summary["layout"]),
         verify_files=False,
     )
-    parent_by_run = {str(run.run_id): str(run.parent_training_run_id) for run in manifest.runs}
-    totals: dict[tuple[int, str], list[float]] = {}
+    parent_by_run = {
+        str(run.run_id): (
+            str(run.parent_training_run_id),
+            normalized_mechanism(run.generation_mechanism),
+        )
+        for run in manifest.runs
+    }
+    totals: dict[tuple[int, str, str], list[float]] = {}
     for row in _read_jsonl(raw_path):
         partner_id = str(row["partner_run_id"])
         if partner_id not in parent_by_run:
             raise ValueError(f"Evaluation row references an unknown partner: {partner_id}")
-        key = (_ego_index(row), parent_by_run[partner_id])
+        parent, mechanism = parent_by_run[partner_id]
+        key = (_ego_index(row), parent, mechanism)
         totals.setdefault(key, []).append(float(row["raw_return"]))
     if not totals:
         raise ValueError("Evaluation artifact contains no external observations.")
     return {key: float(np.mean(values)) for key, values in totals.items()}
 
 
-def _merge_evaluations(values: list[str]) -> tuple[dict[tuple[int, str], float], list[Mapping[str, Any]]]:
+def _merge_evaluations(
+    values: list[str],
+    *,
+    expected_method: str | None = None,
+) -> tuple[dict[tuple[int, str, str], float], list[Mapping[str, Any]]]:
     if not values:
         raise ValueError("At least one evaluation artifact is required.")
-    merged: dict[tuple[int, str], list[float]] = {}
+    merged: dict[tuple[int, str, str], list[float]] = {}
     summaries = []
     for value in values:
         summary = _evaluation_summary(value)
@@ -93,30 +110,74 @@ def _merge_evaluations(values: list[str]) -> tuple[dict[tuple[int, str], float],
         method = str(summary.get("method", ""))
         if not method:
             raise ValueError("Evaluation summary lacks method identity.")
+        if expected_method is not None and method != expected_method:
+            raise ValueError(
+                f"Evaluation summary method must equal {expected_method!r}."
+            )
         for key, result in _common_units(summary).items():
             merged.setdefault(key, []).append(result)
     return {key: float(np.mean(result)) for key, result in merged.items()}, summaries
 
 
-def _matrix(units: Mapping[tuple[int, str], float]) -> tuple[np.ndarray, tuple[int, ...], tuple[str, ...]]:
+def _matrix(
+    units: Mapping[tuple[int, str, str], float],
+) -> tuple[np.ndarray, tuple[int, ...], tuple[str, ...]]:
     egos = tuple(sorted({key[0] for key in units}))
-    parents = tuple(sorted({key[1] for key in units}))
-    if not egos or len(parents) < 2:
-        raise ValueError("External claim input lacks enough ego runs or parent lineages.")
-    expected = {(ego, parent) for ego in egos for parent in parents}
+    if egos != tuple(range(OFFICIAL_TRAINING_RUN_COUNT)):
+        raise ValueError("Formal external claim input requires registered ego run indexes.")
+
+    mechanism_by_parent: dict[str, str] = {}
+    for _, parent, mechanism in units:
+        previous = mechanism_by_parent.setdefault(parent, mechanism)
+        if previous != mechanism:
+            raise ValueError(
+                "Formal parent lineage appears under multiple mechanisms."
+            )
+    observed_mechanisms = set(mechanism_by_parent.values())
+    parents_by_mechanism = {
+        mechanism: {
+            parent for parent, observed in mechanism_by_parent.items()
+            if observed == mechanism
+        }
+        for mechanism in TRAINING_SUPPORT_MECHANISMS
+    }
+    if observed_mechanisms != set(TRAINING_SUPPORT_MECHANISMS) or any(
+        len(parents) != OFFICIAL_FORMAL_PARENTS_PER_MECHANISM
+        for parents in parents_by_mechanism.values()
+    ):
+        raise ValueError(
+            "Formal external claim input requires the registered parent count "
+            "for every mechanism."
+        )
+    parents = tuple(sorted(mechanism_by_parent))
+    expected_parent_count = (
+        len(TRAINING_SUPPORT_MECHANISMS) * OFFICIAL_FORMAL_PARENTS_PER_MECHANISM
+    )
+    if len(parents) != expected_parent_count:
+        raise ValueError(
+            "Formal external claim input requires the registered parent-lineage count."
+        )
+    expected = {
+        (ego, parent, mechanism_by_parent[parent])
+        for ego in egos
+        for parent in parents
+    }
     if set(units) != expected:
         raise ValueError("External evaluation cells are incomplete.")
     values = np.asarray(
-        [[float(units[(ego, parent)]) for parent in parents] for ego in egos],
+        [
+            [float(units[(ego, parent, mechanism_by_parent[parent])]) for parent in parents]
+            for ego in egos
+        ],
         dtype=np.float64,
     )
     return values, egos, parents
 
 
 def _cvar50(values: np.ndarray) -> float:
-    count = max(1, int(np.ceil(values.shape[1] * float(TAIL_MASS))))
-    ordered = np.sort(values, axis=1)[:, :count]
-    return float(np.mean(ordered))
+    parent_returns = np.mean(values, axis=0)
+    count = max(1, int(np.ceil(parent_returns.size * float(TAIL_MASS))))
+    return float(np.mean(np.sort(parent_returns)[:count]))
 
 
 def _bootstrap_external(
@@ -135,8 +196,8 @@ def _bootstrap_external(
         if statistic == "mean"
         else float(_cvar50(left) - _cvar50(right))
     )
-    draws = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
-    for index in range(BOOTSTRAP_REPLICATES):
+    draws = np.empty(OFFICIAL_BOOTSTRAP_REPLICATES, dtype=np.float64)
+    for index in range(OFFICIAL_BOOTSTRAP_REPLICATES):
         selected_ego = rng.integers(0, ego_count, size=ego_count)
         selected_parent = rng.integers(0, parent_count, size=parent_count)
         crossed_left = left[np.ix_(selected_ego, selected_parent)]
@@ -149,7 +210,7 @@ def _bootstrap_external(
         "estimate": point,
         "interval_95": [float(value) for value in np.quantile(draws, (0.025, 0.975))],
         "lcb95": float(np.quantile(draws, 0.05)),
-        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+        "bootstrap_replicates": OFFICIAL_BOOTSTRAP_REPLICATES,
         "bootstrap_unit": "ego_run_x_parent_lineage",
     }
 
@@ -176,19 +237,21 @@ def _population_diagonal(value: str | Path) -> np.ndarray:
 
 def _bootstrap_sp(differences: np.ndarray, *, seed: int = 0) -> Mapping[str, Any]:
     values = np.asarray(differences, dtype=np.float64)
-    if values.ndim != 1 or values.size != 10:
-        raise ValueError("SP claim requires exactly ten paired seed differences.")
+    if values.ndim != 1 or values.size != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError(
+            "SP claim requires one paired difference for every registered ego run."
+        )
     rng = np.random.default_rng(int(seed))
     point = float(np.mean(values))
-    draws = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
-    for index in range(BOOTSTRAP_REPLICATES):
+    draws = np.empty(OFFICIAL_BOOTSTRAP_REPLICATES, dtype=np.float64)
+    for index in range(OFFICIAL_BOOTSTRAP_REPLICATES):
         selected = rng.integers(0, values.size, size=values.size)
         draws[index] = float(np.mean(values[selected]))
     return {
         "estimate": point,
         "interval_95": [float(value) for value in np.quantile(draws, (0.025, 0.975))],
         "lcb95": float(np.quantile(draws, 0.05)),
-        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+        "bootstrap_replicates": OFFICIAL_BOOTSTRAP_REPLICATES,
         "bootstrap_unit": "seed",
     }
 
@@ -268,11 +331,21 @@ def _markdown(report: Mapping[str, Any]) -> str:
 
 
 def build_claim(args: argparse.Namespace) -> None:
-    cetr_units, cetr_summaries = _merge_evaluations(list(args.cetr_evaluation))
-    baseline_units, baseline_summaries = _merge_evaluations(list(args.baseline_evaluation))
+    cetr_units, cetr_summaries = _merge_evaluations(
+        list(args.cetr_evaluation), expected_method=FORMAL_METHOD_LABEL
+    )
+    baseline_units, baseline_summaries = _merge_evaluations(
+        list(args.baseline_evaluation)
+    )
     cetr_values, cetr_egos, cetr_parents = _matrix(cetr_units)
     fcp_values, fcp_egos, fcp_parents = _matrix(baseline_units)
-    if cetr_egos != fcp_egos or cetr_parents != fcp_parents:
+    cetr_parent_mechanisms = {key[1]: key[2] for key in cetr_units}
+    fcp_parent_mechanisms = {key[1]: key[2] for key in baseline_units}
+    if (
+        cetr_egos != fcp_egos
+        or cetr_parents != fcp_parents
+        or cetr_parent_mechanisms != fcp_parent_mechanisms
+    ):
         raise ValueError("CETR and FCP evaluations do not share the same panel cells.")
 
     baseline_methods = {str(summary.get("method")) for summary in baseline_summaries}
@@ -281,14 +354,14 @@ def build_claim(args: argparse.Namespace) -> None:
 
     diagonals = [_population_diagonal(value) for value in args.cetr_population]
     diagonal = np.concatenate(diagonals)
-    if diagonal.size != 10:
-        raise ValueError("CETR population SP diagonal must contain ten run indexes.")
+    if diagonal.size != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("CETR population SP diagonal size differs from registration.")
     reference_payloads = [
         _artifact_payload(value, preferred=("reference_sp.json",))
         for value in args.reference_sp
     ]
-    if len(reference_payloads) != 10:
-        raise ValueError("SP claim requires ten reference artifacts, one per seed.")
+    if len(reference_payloads) != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("SP claim reference artifact count differs from registration.")
     by_seed: dict[int, Mapping[str, Any]] = {}
     for payload in reference_payloads:
         if (
@@ -302,15 +375,15 @@ def build_claim(args: argparse.Namespace) -> None:
         if seed in by_seed:
             raise ValueError(f"Reference-SP seed index is duplicated: {seed}")
         by_seed[seed] = payload
-    if set(by_seed) != set(range(10)):
+    if set(by_seed) != set(range(OFFICIAL_TRAINING_RUN_COUNT)):
         raise ValueError(
             "SP claim requires exactly one reference artifact for each seed index 0..9."
         )
     sp_differences = np.asarray(
-        [float(diagonal[seed]) - float(by_seed[seed]["tau_sp"]) for seed in range(10)],
+        [float(diagonal[seed]) - float(by_seed[seed]["tau_sp"]) for seed in range(OFFICIAL_TRAINING_RUN_COUNT)],
         dtype=np.float64,
     )
-    tau_sp = float(np.mean([float(by_seed[seed]["tau_sp"]) for seed in range(10)]))
+    tau_sp = float(np.mean([float(by_seed[seed]["tau_sp"]) for seed in range(OFFICIAL_TRAINING_RUN_COUNT)]))
 
     contrasts = {
         "j_ext_mean": _bootstrap_external(cetr_values, fcp_values, statistic="mean"),
@@ -345,9 +418,16 @@ def build_claim(args: argparse.Namespace) -> None:
             "ego_run_index": int(ego),
             "ego_run_id": str(ego),
             "parent_lineage": str(parent),
-            "cetr_return": float(cetr_units[(ego, parent)]),
-            "fcp_return": float(baseline_units[(ego, parent)]),
-            "difference": float(cetr_units[(ego, parent)] - baseline_units[(ego, parent)]),
+            "cetr_return": float(
+                cetr_units[(ego, parent, cetr_parent_mechanisms[parent])]
+            ),
+            "fcp_return": float(
+                baseline_units[(ego, parent, fcp_parent_mechanisms[parent])]
+            ),
+            "difference": float(
+                cetr_units[(ego, parent, cetr_parent_mechanisms[parent])]
+                - baseline_units[(ego, parent, fcp_parent_mechanisms[parent])]
+            ),
         }
         for ego in cetr_egos
         for parent in cetr_parents
@@ -359,13 +439,13 @@ def build_claim(args: argparse.Namespace) -> None:
             "tau_sp": float(by_seed[seed]["tau_sp"]),
             "difference": float(sp_differences[seed]),
         }
-        for seed in range(10)
+        for seed in range(OFFICIAL_TRAINING_RUN_COUNT)
     ]
     report = {
         "version": 1,
         "artifact_type": "cetr_claim_report",
         "method": FORMAL_METHOD_LABEL,
-        "bootstrap_replicates": BOOTSTRAP_REPLICATES,
+        "bootstrap_replicates": OFFICIAL_BOOTSTRAP_REPLICATES,
         "estimates": {
             "cetr": {
                 "j_ext_mean": float(np.mean(cetr_values)),
@@ -378,7 +458,7 @@ def build_claim(args: argparse.Namespace) -> None:
             },
             "reference_tau_sp": tau_sp,
             "reference_tau_sp_by_seed": [
-                float(by_seed[seed]["tau_sp"]) for seed in range(10)
+                float(by_seed[seed]["tau_sp"]) for seed in range(OFFICIAL_TRAINING_RUN_COUNT)
             ],
         },
         "contrasts": contrasts,

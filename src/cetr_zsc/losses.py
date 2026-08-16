@@ -69,7 +69,8 @@ def cetr_ppo_loss(
     The external actor term is an ordinary average over every time/lane replay
     entry from external lanes.  Lane weights are broadcast over time but are
     not renormalized by their sum, so the term estimates
-    ``sum_g q_g * (within-group mean surrogate)``.
+    ``sum_g q_g * (within-group mean surrogate)``.  The ``approx_action_kl``
+    metric is the sampled-action approximation ``0.5 * mean((logp gap)^2)``.
     """
 
     import jax
@@ -187,7 +188,7 @@ def cetr_ppo_loss(
         axis=1,
     )
     ratio_mean = jnp.mean(all_ratio)
-    sampled_action_kl = 0.5 * jnp.mean(jnp.square(all_log_gap))
+    approx_action_kl = 0.5 * jnp.mean(jnp.square(all_log_gap))
 
     episode_return = jax.lax.stop_gradient(
         jnp.asarray(batch.episode_return, dtype=jnp.float32)
@@ -224,7 +225,7 @@ def cetr_ppo_loss(
             "value_loss": value_loss,
             "entropy": entropy,
             "ratio_mean": ratio_mean,
-            "sampled_action_kl": sampled_action_kl,
+            "approx_action_kl": approx_action_kl,
             "dual_lambda": multiplier,
             "sp_return_mean": sp_return_mean,
             "external_return_mean": external_return_mean,

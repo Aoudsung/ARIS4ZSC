@@ -58,6 +58,9 @@ OFFICIAL_SP_NUM_ENVS = 256
 OFFICIAL_OP_NUM_ENVS = 64
 OFFICIAL_NUM_MINIBATCHES = 64
 OFFICIAL_UPDATE_EPOCHS = 4
+OFFICIAL_EVALUATION_EPISODES_PER_PAIRING = 500
+OFFICIAL_BOOTSTRAP_REPLICATES = 9_999
+OFFICIAL_FORMAL_PARENTS_PER_MECHANISM = 4
 
 TAIL_DENSITY_RATIO_CAP = 2.0
 """Cap on q_g / p0_g in the partner uncertainty set.  Method identity."""
@@ -429,11 +432,13 @@ def validate_config(config: RunConfig) -> None:
         ):
             raise ValueError("Formal vectorized training budget differs from registration.")
         if (
-            config.evaluation.episodes_per_pairing != 500
-            or config.evaluation.bootstrap_replicates != 9_999
+            config.evaluation.episodes_per_pairing
+            != OFFICIAL_EVALUATION_EPISODES_PER_PAIRING
+            or config.evaluation.bootstrap_replicates != OFFICIAL_BOOTSTRAP_REPLICATES
             or not config.evaluation.evaluate_both_roles
-            or config.evaluation.minimum_ego_runs != 10
-            or config.evaluation.minimum_partner_runs_per_mechanism != 4
+            or config.evaluation.minimum_ego_runs != OFFICIAL_TRAINING_RUN_COUNT
+            or config.evaluation.minimum_partner_runs_per_mechanism
+            != OFFICIAL_FORMAL_PARENTS_PER_MECHANISM
             or config.evaluation.evaluation_seed != OFFICIAL_EVALUATION_ROOT_SEED
             or config.evaluation.one_sided_alpha != 0.05
         ):
@@ -466,7 +471,10 @@ __all__ = [
     "OFFICIAL_ACTION_COUNT",
     "OFFICIAL_CORRECT_DELIVERY_REWARD",
     "OFFICIAL_EPISODE_STEPS",
+    "OFFICIAL_BOOTSTRAP_REPLICATES",
+    "OFFICIAL_EVALUATION_EPISODES_PER_PAIRING",
     "OFFICIAL_EVALUATION_ROOT_SEED",
+    "OFFICIAL_FORMAL_PARENTS_PER_MECHANISM",
     "OFFICIAL_NUM_MINIBATCHES",
     "OFFICIAL_OP_NUM_ENVS",
     "OFFICIAL_OP_TOTAL_TIMESTEPS",

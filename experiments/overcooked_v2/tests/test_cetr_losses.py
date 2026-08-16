@@ -109,6 +109,8 @@ def test_cetr_ppo_loss_is_finite_with_real_model() -> None:
     result = cetr_ppo_loss(model, params, batch, jnp.asarray(0.3))
     assert bool(jnp.isfinite(result.total))
     assert all(bool(jnp.isfinite(value)) for value in result.metrics.values())
+    assert "approx_action_kl" in result.metrics
+    assert "sampled_action_kl" not in result.metrics
 
 
 def test_zero_external_weights_zero_external_actor_term() -> None:
@@ -175,3 +177,73 @@ def test_cetr_ppo_loss_consumes_prepared_advantages_without_rescaling() -> None:
     np.testing.assert_allclose(
         np.asarray(result.metrics["actor_external"]), np.asarray(expected), atol=2.0e-5
     )
+
+
+class _TwoActionGradientModel:
+    def __init__(self):
+        self.config = SimpleNamespace(
+            ppo=SimpleNamespace(
+                clip_epsilon=0.2,
+                value_clip_epsilon=0.2,
+                value_weight=0.0,
+                entropy_weight=0.0,
+            )
+        )
+
+    def initial_carry(self, batch_size: int):
+        import jax.numpy as jnp
+
+        return jnp.zeros((int(batch_size), 1), dtype=jnp.float32)
+
+    def sequence(self, params, carry, observations, episode_starts):
+        import jax.numpy as jnp
+
+        del carry, episode_starts
+        logits = jnp.broadcast_to(
+            params["logits"], (observations.shape[0], observations.shape[1], 2)
+        )
+        values = jnp.zeros(observations.shape[:2], dtype=jnp.float32)
+        return logits, values
+
+
+def test_dual_sp_gradient_includes_both_self_play_sides_with_zero_external_weights() -> None:
+    import jax
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.losses import cetr_ppo_loss
+    from src.cetr_zsc.types import EpisodeBatch
+
+    model = _TwoActionGradientModel()
+    batch = EpisodeBatch(
+        observations=jnp.zeros((1, 4, 1), dtype=jnp.float32),
+        actions=jnp.zeros((1, 4), dtype=jnp.int32),
+        old_log_probabilities=jnp.full((1, 4), -jnp.log(2.0)),
+        old_values=jnp.zeros((1, 4), dtype=jnp.float32),
+        rewards=jnp.zeros((1, 4), dtype=jnp.float32),
+        dones=jnp.ones((1, 4), dtype=jnp.bool_),
+        value_targets=jnp.zeros((1, 4), dtype=jnp.float32),
+        sp_other_value_targets=jnp.zeros((1, 2), dtype=jnp.float32),
+        advantages=jnp.asarray([[1.0, 3.0, 0.0, 0.0]], dtype=jnp.float32),
+        sp_other_advantages=jnp.asarray([[5.0, 7.0]], dtype=jnp.float32),
+        episode_starts=jnp.ones((1, 4), dtype=jnp.bool_),
+        sp_other_observations=jnp.zeros((1, 2, 1), dtype=jnp.float32),
+        sp_other_actions=jnp.zeros((1, 2), dtype=jnp.int32),
+        sp_other_old_log_probabilities=jnp.full((1, 2), -jnp.log(2.0)),
+        sp_other_old_values=jnp.zeros((1, 2), dtype=jnp.float32),
+        lane_stream=jnp.asarray([0, 0, 1, 1], dtype=jnp.int32),
+        lane_parent=jnp.asarray([-1, -1, 0, 1], dtype=jnp.int32),
+        lane_fold=jnp.asarray([-1, -1, 0, 1], dtype=jnp.int32),
+        lane_weight=jnp.zeros((4,), dtype=jnp.float32),
+        episode_return=jnp.zeros((4,), dtype=jnp.float32),
+        ego_roles=jnp.zeros((4,), dtype=jnp.int32),
+        member_index=jnp.arange(4, dtype=jnp.int32),
+    )
+    params = {"logits": jnp.zeros((2,), dtype=jnp.float32)}
+    gradient = jax.grad(
+        lambda candidate: cetr_ppo_loss(
+            model, candidate, batch, jnp.asarray(2.0, dtype=jnp.float32)
+        ).total
+    )(params)["logits"]
+    # At zero logits, d log p(action 0)/d logits=[1/2,-1/2].  The four
+    # self-play advantages have mean (1+3+5+7)/4=4, so lambda=2 gives [-4,4].
+    np.testing.assert_allclose(np.asarray(gradient), np.asarray([-4.0, 4.0]), atol=2.0e-6)

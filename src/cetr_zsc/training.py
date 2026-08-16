@@ -318,8 +318,8 @@ def training_update(
 ) -> tuple[Any, Any, Mapping[str, Any]]:
     """Apply every scheduled minibatch in one scan.
 
-    The registered schedule supplies exactly one self-play lane and one external
-    lane per minibatch.  When a minibatch contains no self-play lane, the
+    The registered schedule gives each minibatch equal coverage of self-play
+    and external lanes.  When a minibatch contains no self-play lane, the
     companion arrays are sliced to length zero; the paired schedule prevents
     that case in supported training.
     """

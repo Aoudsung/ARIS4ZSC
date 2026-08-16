@@ -92,6 +92,33 @@ class _ToyOfficialPool:
         return jnp.zeros((observations.shape[0],), dtype=jnp.int32), carry
 
 
+class _PrematureEnvironment:
+    num_envs = 4
+    episode_steps = 3
+
+    def reset_with_keys(self, keys):
+        import jax.numpy as jnp
+
+        count = int(keys.shape[0])
+        return (
+            jnp.zeros((count,), dtype=jnp.int32),
+            jnp.zeros((count, 2, 5, 5, 26), dtype=jnp.float32),
+        )
+
+    def step_training_fast_with_keys(self, state, joint_actions, keys):
+        import jax.numpy as jnp
+
+        del joint_actions, keys
+        done = jnp.ones((self.num_envs,), dtype=jnp.bool_)
+        return (
+            state,
+            jnp.zeros((self.num_envs, 2, 5, 5, 26), dtype=jnp.float32),
+            jnp.zeros((self.num_envs,), dtype=jnp.float32),
+            done,
+            {"raw_rewards_by_agent": jnp.zeros((self.num_envs, 2), dtype=jnp.float32)},
+        )
+
+
 def test_vector_environment_collects_one_complete_self_and_external_episode() -> None:
     import jax
 
@@ -123,6 +150,25 @@ def test_vector_environment_collects_one_complete_self_and_external_episode() ->
     assert float(metrics["final_done_fraction"]) == 1.0
     assert np.all(np.isfinite(np.asarray(batch.episode_return)))
     assert np.all(np.isfinite(np.asarray(batch.old_log_probabilities)))
+
+
+def test_collection_metrics_expose_premature_done_signal() -> None:
+    import jax
+
+    from src.cetr_zsc.runner import collect_episodes, make_static_partner_functions
+
+    partner_functions = make_static_partner_functions(
+        pool_metadata=_pool(), official_pool=_ToyOfficialPool()
+    )
+    _, _, metrics = collect_episodes(
+        environment=_PrematureEnvironment(),
+        model=_ToyModel(),
+        params=None,
+        partner_functions=partner_functions,
+        random_key=jax.random.PRNGKey(24),
+        update_index=0,
+    )
+    assert float(metrics["premature_done_count"]) > 0.0
 
 
 def test_external_lane_assignment_covers_fold_role_and_rotates_stage() -> None:
