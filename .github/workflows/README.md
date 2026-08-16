@@ -1,6 +1,6 @@
 # Active workflow boundary
 
-`delta-unified-ci.yml` is the only active scientific workflow. The complete
-superseded DEPI v8 source package, experiment applications, configurations,
-workflow, and tests are preserved under `legacy/implementation_v8/` for
-historical reproducibility and are not permitted to define the current method.
+`cetr-ci.yml` is the only active scientific workflow. Superseded method
+packages, workflows, and documents have been removed from the active tree;
+historical revisions remain available only in git history and do not define
+CETR.

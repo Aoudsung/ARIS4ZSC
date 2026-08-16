@@ -1,139 +1,163 @@
-# THEORY — Finite guarantees and explicit limits
+# THEORY — CETR-ZSC guarantees, approximations, and limits
 
 `authoritative: true`
 
-## 1. Exact filter relative to the learned model
+This document separates algebraic properties of the CETR contract from
+finite-sample approximations and empirical claims. It introduces no new
+experiment evidence. Registered numerical fields are owned by
+[`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py).
 
-Given a normalized previous belief, row-stochastic transition `T`, and finite
-component response likelihoods, the update in `belief_filter.py` is exactly the
-categorical Chapman-Kolmogorov prediction followed by Bayes correction. The
-result is normalized and non-negative. This is an implementation theorem about
-the registered latent model, not a claim that its components are true human
-protocols.
+## 1. Parent-level lower-half risk
 
-## 2. Proper composite latent score
-
-The response and CRN decision channels are conditionally independent given the
-same component. Their summed negative log likelihood is a proper composite
-predictive score for the registered factorization. Normalization by `N_y+N_A`
-changes estimator scale, not its optimum. No arbitrary auxiliary-loss weights
-are required.
-
-## 3. Mirror-policy solution
-
-For fixed base policy `pi_0`, finite action values `Q`, and KL radius
-`delta>0`, the constrained objective
+For fixed parent estimates `\widehat J_g` and nominal masses `p_{0,g}`, the
+finite optimization problem
 
 \[
-\max_\pi \langle\pi,Q\rangle
-\quad\text{s.t.}\quad D_{KL}(\pi\Vert\pi_0)\le\delta
+\min_{q\in\Delta}\sum_g q_g\widehat J_g
+\quad\text{s.t.}\quad
+0\le q_g\le 2p_{0,g}
 \]
 
-has the exponential-tilting solution
+is a linear program. Sorting parent estimates in ascending order and filling the
+available mass under each cap gives an optimizer. Under a uniform nominal mass
+and an even number of independent parents, its value is the mean of the worst
+half of those parents. This is the algebraic meaning of the lower-half CVaR
+contract; it is not a claim about an infinite population.
+
+The cap prevents all adversarial mass from concentrating on one parent. It also
+means that a single noisy parent cannot have unlimited influence. Neither fact
+proves that the resulting policy will be robust on an unseen distribution.
+
+## 2. Cross-fitting boundary
+
+Double cross-fitting uses completed returns from one fold to determine tail
+weights for the other fold. Therefore an episode's own observed return is not
+used both to select its tail membership and to supply its own weighted update.
+The monitored cross-fitted tail value is
+`0.5 * (q^A · J_hat^B + q^B · J_hat^A)`. This blocks the direct self-selection
+path in the finite batch estimator; it does not create new data.
+
+External lanes are deterministically parent-complete, so no observed-subset
+re-normalization is part of the estimator. Cross-fitting does not make the
+estimate automatically unbiased under arbitrary adaptive sampling, does not
+remove parent-level dependence, and does not create new independent data. Its
+guarantee is an ordering property of the estimator, not a generalization
+theorem.
+
+## 3. Complete episodic return and fixed advantages
+
+The method's target is the complete undiscounted raw return-to-go of one complete
+episode. Once collected, the return-to-go and scalar-baseline advantage are fixed
+for the whole PPO transaction. `prepare_episode_batch` applies exactly one
+shared normalization to the complete batch before minibatch slicing; no
+parent-wise, mechanism-wise, or minibatch-wise normalization is performed.
+Shared normalization preserves a common scale across self-play and external
+samples; it does not prove that PPO follows the exact gradient of the population
+lower-tail objective.
+
+The scalar value baseline is a control variate for policy-gradient variance. It
+has no deployment role and no authority to change the action distribution. A
+well-fitted baseline therefore cannot by itself establish better coordination.
+
+## 4. Self-play composition gradient
+
+If both agents in a self-play episode use `\pi_\theta` and have independent
+recurrent carries, differentiating the joint trajectory likelihood includes both
+sides' log-probability terms. The resulting estimator is the bilateral gradient
+of the self-composition return `J(\pi_\theta,\pi_\theta)` for the sampled
+trajectory distribution, subject to the usual policy-gradient regularity
+conditions. A one-sided snapshot update would estimate a different problem; that
+former V6 construction is retired and is not part of CETR.
+
+This identity does not imply low-variance gradients, global optimization, or
+self-play improvement after an arbitrary PPO step.
+
+## 5. Lagrangian and dual update
+
+For a fixed policy, the constrained objective has Lagrangian
 
 \[
-\pi_\eta(a)\propto\pi_0(a)e^{Q(a)/\eta}.
+\mathcal L(\theta,\lambda)=
+\rho_{\mathrm{ext}}(\theta)+
+\lambda(J_{\mathrm{SP}}(\theta)-\tau_{\mathrm{SP}}),
+\quad \lambda\ge0.
 \]
 
-KL decreases monotonically with `eta`; bisection therefore returns the unique
-boundary solution when the constraint is active. The code tests the achieved KL
-numerically.
-
-This guarantees improvement only for the supplied model-based objective. A
-real-return guarantee additionally requires accurate action values.
-
-## 4. Non-negativity of exact decision VOI
-
-Let
+The projected update
 
 \[
-V(b)=\max_a\sum_kb_k\mu_k(a).
+\lambda^+=[\lambda+\eta(\tau_{\mathrm{SP}}-\widehat J_{\mathrm{SP}})]_+
 \]
 
-`V` is the maximum of linear functions and is therefore convex. A Bayes
-posterior is a martingale, so
+increases pressure when measured self-play is below target and leaves the dual
+variable nonnegative. Reusing the actor learning-rate schedule defines the
+registered dual step. This is a standard primal-dual construction, not a proof
+of convergence for the non-convex recurrent PPO problem and not a guarantee that
+finite-run self-play satisfies the constraint.
 
-\[
-\mathbb E_y[b^{y}]=\bar b.
-\]
+## 6. Reference-derived target
 
-Jensen's inequality gives
+The target `\tau_SP` is a measured return of a seed-matched Official-SP reference
+under the registered evaluation protocol. It is not a manually selected
+threshold and has no artificial tolerance. This removes a hidden tuning degree
+of freedom from the method definition, but the estimate still has measurement
+error and does not guarantee that a trainable actor can attain it.
 
-\[
-\mathbb E_y[V(b^y)]-V(\bar b)\ge0.
-\]
+The version-2 reference artifact binds a resolved absolute source checkpoint,
+and training requires textual equality with the resolved initializer path. The
+engineering preflight maps seed `-1` to the seed-0 initializer and τ artifact.
+The reference initializes the actor, derives the target, and supplies a frozen
+audit baseline. It is not a deployment ensemble or a policy correction.
 
-The implementation records the raw deterministic quadrature estimate and uses
-its non-negative part for control because finite quadrature can violate the
-inequality slightly.
+## 7. Legal information and deployment
 
-## 5. Decision relevance, not identity information
+The deployment state is a recurrent carry derived from the local observation and
+ego action history, together with the episode boundary. The actor therefore
+implements a partner-agnostic mapping from legal local history to actions.
+Training-only parent groups, `q`, cross-fitting folds, `lambda`, reference
+metadata, and counterfactual returns are not in this state. This is an
+information-boundary property of the architecture, not evidence that local
+history is uninformative.
 
-If all components induce the same action-value vector, then `V(b)` is independent
-of `b`; hence VOI is exactly zero even when the response perfectly identifies
-the component. More generally, information that only separates components with
-identical optimal decision value has zero decision VOI. This property is covered
-by a synthetic test where information gain is positive but VOI is zero.
+The lineage-disjoint panel is an evaluation design. It does not become a runtime
+feature and does not prove universal out-of-distribution robustness.
 
-## 6. Deterministic quadrature consistency
+## 8. What is exact, what is approximate
 
-For the finite discrete response model, inverse-CDF integration with a
-low-discrepancy sequence converges to the response expectation as sample count
-increases. DELTA Rao-Blackwellizes both binary factors: visibility is summed
-exactly, and inventory-change is summed exactly whenever it is legally
-observable. Source components are also summed exactly. Only the remaining
-position/direction/inventory integral is approximated. The `S/2` versus `S`
-prefix difference is a convergence diagnostic, not a probabilistic confidence
-interval or a formal error bound.
+Exact or structural within the contract:
 
-## 7. Scope of the local-stationarity surrogate
+- the finite lower-half risk optimizer for supplied parent return estimates;
+- the bilateral form of the self-play likelihood gradient;
+- the nonnegative projection in the dual update;
+- the absence of training-only group, tail, and lineage fields from deployment;
+- the single actor and scalar-baseline parameter ownership described in the
+  method contract.
 
-The true one-step Bayes-adaptive value may use a response- and probe-dependent
-future utility matrix `mu^{a,y}`. The standard model uses a shared local matrix
-`mu`. Suppose
+Approximate or empirical:
 
-\[
-\sup_{a,y,k,a'}|\mu^{a,y}_k(a')-\mu_k(a')|\le\epsilon_{drift}.
-\]
+- parent returns and `q` are estimated from finite completed episodes;
+- cross-fitting reduces estimator reuse but does not remove sampling error;
+- PPO and the recurrent function approximation only approximately optimize the
+  constrained objective;
+- the measured reference target is a finite estimate of reference self-play;
+- held-out external mean and lower-half CVaR estimate performance on the
+  registered confirmatory panel, not every possible partner;
+- the population `10×10` matrix estimates a supplementary ordered population
+  object and is not the external-parent estimand.
 
-For any belief, the corresponding optimal values differ by at most
-`epsilon_drift`; applying this to both posterior and prior terms yields
+## 9. Explicit non-claims
 
-\[
-|\mathrm{VOI}_{true}(a)-\mathrm{VOI}_{local}(a)|
-\le 2\epsilon_{drift}.
-\]
+CETR does not prove:
 
-Thus the active term is well-founded when decision-equivalent action ordering
-changes slowly over the one-response horizon. The repository does not infer
-that condition from entropy and does not claim exact long-horizon planning.
-The public VOI API already accepts probe-conditioned future utilities for a
-future extension that supplies them with valid training observations.
+- recovery of partner identity, algorithm, mechanism, or hidden state;
+- unique semantic protocols or a latent partner taxonomy;
+- convergence or global optimality of the primal-dual PPO procedure;
+- that a lower-half training objective guarantees every individual partner;
+- that reference initialization guarantees self-play non-inferiority;
+- that panel-level improvement is SOTA or universal robustness;
+- that a population matrix validates the held-out external estimand;
+- any performance result before the formal confirmatory artifacts exist.
 
-## 8. Error decomposition for adapted performance
-
-The difference between the ideal and implemented adapted objective can be
-decomposed into:
-
-1. response-model error;
-2. posterior filtering error inherited from that model;
-3. decision-emission error;
-4. local-stationarity error;
-5. deterministic quadrature error;
-6. KL projection restriction.
-
-The architecture exposes diagnostics for response NLL, held-out decision
-ordering, posterior entropy, raw/clamped VOI, information gain, quadrature
-prefix error, and achieved KL. These measurements diagnose failure but do not
-become additional training gates.
-
-## 9. What is not proved
-
-No theorem in this repository establishes:
-
-- universal ZSC generalization to arbitrary partners;
-- global return improvement under misspecified emissions;
-- semantic identifiability of latent components beyond permutation;
-- exact recovery of teammate intent;
-- exact solution of the full partially observable stochastic game;
-- SOTA performance without confirmatory raw results.
+The former V6 posterior, continuation-anchor, mirror, and VOI machinery was
+retired. No theorem or evidence in this document depends on those deleted
+mechanisms.

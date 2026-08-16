@@ -25,7 +25,8 @@ import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
-from src.delta_zsc.config import (
+from src.cetr_zsc.config import (
+    SUPPORTED_LAYOUTS,
     OFFICIAL_CORRECT_DELIVERY_REWARD,
     OFFICIAL_NUM_MINIBATCHES,
     OFFICIAL_OP_NUM_ENVS,
@@ -49,7 +50,7 @@ def _cuda_only_official_debug_callbacks_disabled() -> Any:
 
     The fixed Official trainer contains ``jax.debug.print`` calls and a
     ``jax.debug.callback(wandb.log, ...)``. JAX 0.4.38 places those host
-    callback operands on a local CPU device; a fail-closed DEPI worker with
+    callback operands on a local CPU device; a fail-closed CETR worker with
     ``JAX_PLATFORMS=cuda`` intentionally exposes no such device. The callbacks
     are observational logging side effects and do not feed a value, random key,
     gradient, parameter, or checkpoint back into the training graph.
@@ -222,7 +223,7 @@ def _official_symbol(module: str, name: str) -> Any:
 
     # The pinned Official commit predates NumPy 2 and imports ``np.Inf``.
     # Keep the compatibility shim at the integration boundary so neither the
-    # Official checkout nor DEPI's numerical code is silently rewritten.
+    # Official checkout nor CETR's numerical code is silently rewritten.
     import numpy as np
 
     if not hasattr(np, "Inf"):
@@ -288,7 +289,7 @@ def compose_official_config(
             != int(config.training.environment_steps)
         ):
             raise ValueError(
-                "Mechanical upstream and DEPI trajectory budgets must match; "
+                "Mechanical upstream and CETR trajectory budgets must match; "
                 "use the dedicated mechanical E2E config."
             )
         model = dict(result["model"])
@@ -337,7 +338,7 @@ def compose_official_baseline_config(
 
     if method not in OFFICIAL_BASELINE_EXPERIMENTS:
         raise ValueError(f"Unknown Official baseline method: {method}")
-    if layout not in {"test_time_simple", "test_time_wide"}:
+    if layout not in SUPPORTED_LAYOUTS:
         raise ValueError(f"Unknown Official layout: {layout}")
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf
@@ -345,6 +346,7 @@ def compose_official_baseline_config(
     overrides = [
         f"+experiment={OFFICIAL_BASELINE_EXPERIMENTS[method]}",
         f"+env={layout}",
+        "++env.ENV_KWARGS.indicate_successful_delivery=true",
         f"SEED={OFFICIAL_TRAINING_ROOT_SEED}",
         "NUM_CHECKPOINTS=1",
         "VISUALIZE=false",
@@ -474,7 +476,7 @@ def _validate_official_baseline_config(
         raise ValueError(f"Official {method} must train ten runs.")
 
 
-def _validate_official_config(
+def _validate_official_recipe(
     resolved: Mapping[str, Any],
     *,
     config: Any,
@@ -561,10 +563,6 @@ def _validate_official_config(
             raise ValueError(f"Official environment config changed {name}.")
     if algorithm == "rnn-op" and list(kwargs.get("op_ingredient_permutations", ())) != [0, 1]:
         raise ValueError("Official Other-Play symmetry is not enabled.")
-    if int(resolved.get("SEED", -1)) != OFFICIAL_TRAINING_ROOT_SEED:
-        raise ValueError("Official training root seed must be 42.")
-    if int(resolved.get("NUM_SEEDS", -1)) != OFFICIAL_TRAINING_RUN_COUNT:
-        raise ValueError("Official training population must contain ten keys.")
     if not 0 <= int(seed_index) < OFFICIAL_TRAINING_RUN_COUNT:
         raise ValueError("Official seed_index must lie in 0..9.")
     steps_per_update = int(model["NUM_ENVS"]) * int(model["NUM_STEPS"])
@@ -575,6 +573,27 @@ def _validate_official_config(
         raise ValueError(
             "Mechanical upstream budget must contain whole vectorized updates."
         )
+
+
+def _validate_official_config(
+    resolved: Mapping[str, Any],
+    *,
+    config: Any,
+    algorithm: str,
+    seed_index: int,
+) -> None:
+    """Validate the registered Official population-training configuration."""
+
+    _validate_official_recipe(
+        resolved,
+        config=config,
+        algorithm=algorithm,
+        seed_index=seed_index,
+    )
+    if int(resolved.get("SEED", -1)) != OFFICIAL_TRAINING_ROOT_SEED:
+        raise ValueError("Official training root seed must be 42.")
+    if int(resolved.get("NUM_SEEDS", -1)) != OFFICIAL_TRAINING_RUN_COUNT:
+        raise ValueError("Official training population must contain ten keys.")
 
 
 def official_checkpoint_layout(config: Mapping[str, Any]) -> str:
@@ -594,11 +613,11 @@ def validate_official_partner_checkpoint(
     algorithm: str,
     seed_index: int,
 ) -> None:
-    """Bind one DEPI support checkpoint to its claimed Official recipe."""
+    """Bind one CETR reference checkpoint to its claimed Official SP recipe."""
 
     checkpoint_config, unused_params = restore_official_checkpoint(checkpoint_path)
     del unused_params
-    _validate_official_config(
+    _validate_official_recipe(
         checkpoint_config,
         config=config,
         algorithm=algorithm,
@@ -695,9 +714,12 @@ def restore_official_checkpoint(
 ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     import orbax.checkpoint as ocp
 
-    restored = ocp.PyTreeCheckpointer().restore(
-        str(Path(checkpoint_path).resolve())
+    path = str(Path(checkpoint_path).resolve())
+    checkpointer = ocp.PyTreeCheckpointer()
+    restore_args = ocp.checkpoint_utils.construct_restore_args(
+        checkpointer.metadata(path)
     )
+    restored = checkpointer.restore(path, restore_args=restore_args)
     return restored["config"], restored["params"]
 
 
@@ -883,6 +905,7 @@ class VectorEnvironment:
             indicate_successful_delivery=(
                 config.environment.indicate_successful_delivery
             ),
+            op_ingredient_permutations=False,
         )
         return cls(
             environment=environment,
@@ -1018,6 +1041,70 @@ class VectorEnvironment:
             },
         )
 
+    def step_training_fast_with_keys(
+        self, state: Any, joint_actions: Any, keys: Any
+    ) -> tuple[Any, Any, Any, Any, Mapping[str, Any]]:
+        """Training step without evaluation events or unconditional resets.
+
+        The transition keys and terminal transition are identical to
+        :meth:`step_with_keys`.  A batched reset is evaluated only when at
+        least one lane is done; per-lane selection still preserves exact
+        behavior if lanes ever terminate asynchronously.
+        """
+
+        import jax
+        import jax.numpy as jnp
+
+        split = jax.vmap(lambda item: jax.random.split(item, 2))(keys)
+        action_mapping = {
+            "agent_0": joint_actions[:, 0],
+            "agent_1": joint_actions[:, 1],
+        }
+        terminal_observations, terminal_state, rewards, dones, environment_info = (
+            jax.vmap(self.environment.step_env)(split[:, 0], state, action_mapping)
+        )
+        done = jnp.asarray(dones["__all__"], dtype=jnp.bool_)
+
+        def reset_if_needed(reset_keys: Any):
+            reset_observations, reset_state = jax.vmap(self.environment.reset)(
+                reset_keys
+            )
+            return (
+                _select_done(done, reset_observations, terminal_observations),
+                _select_done(done, reset_state, terminal_state),
+            )
+
+        def keep_terminal(unused_reset_keys: Any):
+            del unused_reset_keys
+            return terminal_observations, terminal_state
+
+        observations, next_state = jax.lax.cond(
+            jnp.any(done), reset_if_needed, keep_terminal, split[:, 1]
+        )
+        raw_by_agent = jnp.stack(
+            (rewards["agent_0"], rewards["agent_1"]), axis=-1
+        ).astype(jnp.float32)
+        shaped = environment_info.get("shaped_reward")
+        if not isinstance(shaped, Mapping):
+            raise RuntimeError(
+                "Locked OvercookedV2 environment did not return shaped_reward."
+            )
+        official_shaped_by_agent = jnp.stack(
+            (shaped["agent_0"], shaped["agent_1"]), axis=-1
+        ).astype(jnp.float32)
+        return (
+            next_state,
+            _stack_observations(observations),
+            jnp.asarray(rewards["agent_0"], dtype=jnp.float32),
+            done,
+            {
+                "terminal_observations": _stack_observations(
+                    terminal_observations
+                ),
+                "raw_rewards_by_agent": raw_by_agent,
+                "official_shaped_rewards_by_agent": official_shaped_by_agent,
+            },
+        )
 
 @dataclass(frozen=True, slots=True)
 class FrozenPartnerPool:
@@ -1169,7 +1256,7 @@ class FrozenPartnerPool:
         carry: Any,
         episode_start: Any,
     ) -> tuple[Any, Any, Any]:
-        """Return the exact Official recurrent logits for DEPI initialization.
+        """Return the exact Official recurrent logits for CETR initialization.
 
         This is a training-only observation/carry surface.  It neither samples
         an action nor exposes a partner identifier to the deployable policy.

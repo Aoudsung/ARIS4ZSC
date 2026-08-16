@@ -1,20 +1,34 @@
-# Unified DELTA-ZSC status dashboard
+# CETR-ZSC status dashboard
 
-Updated: 2026-08-05. This page reports implementation status only; it does not
-turn engineering validation into scientific evidence.
+Status: first scientific-audit repair group and application-layer repair landed; formal launch remains blocked by server-panel prerequisites.
 
-| Track | Status | Meaning |
-|---|---|---|
-| Unified method | implemented | one response-decision latent model, response-only filter, separate base/latent optimizers, analytic KL adaptation, and deterministic Bayesian VOI |
-| VOI | implemented and core-tested | exact visibility/event marginalization, Halton integration of remaining response factors, all-component likelihood, exact Bayes update, decision value, information-gain diagnostic, and nested-prefix error |
-| Active code boundary | implemented | only `src/delta_zsc/` and the unified CLI remain in the active tree; the full DEPI v8 source/apps/configs/workflow/tests and historical analysis are archived under `legacy/implementation_v8/`; old decision/evidence ledgers are under `docs/legacy/v8/` |
-| Local CPU regression | passed | all active files compile; 26 tests across six isolated test files pass in the available local JAX runtime |
-| Mocked end-to-end path | passed | rollout, base PPO update, latent update, sparse anchors, checkpoint/deployment round trip and KL/VOI outputs are finite |
-| Registered Python 3.10 install | specified, not executed in this local runtime | `pyproject.toml` and CI pin the formal environment |
-| Real Official/CUDA preflight | workflow ready, not executed here | requires the pinned external benchmark packages, real checkpoints, lineage-bound manifest and self-hosted GPU |
-| Development evidence | not generated | no paired five-seed Simple/Wide matrix is included in this source package |
-| Formal evidence | not generated | no H1/H2/H3 or SOTA claim is made by the repository alone |
+| Item | Status |
+|---|---|
+| Active method identity | implemented in [`src/cetr_zsc/config.py`](../../src/cetr_zsc/config.py): `constrained_episodic_tail_robust_zsc_v1` |
+| Active configuration contract | implemented; registered values are owned by [`src/cetr_zsc/config.py`](../../src/cetr_zsc/config.py) (`version: 6`, checkpoint schema `8`) |
+| CETR package boundary | first audit repair group landed: whole-episode estimand, complete deterministic external coverage, fold/role cross-fitting, and one pre-minibatch shared normalization are contracted |
+| CETR model, risk, losses, runner, partners, and training modules | package repair landed; no performance evidence is implied |
+| Overcooked CETR CLI and application integration | application-layer repair landed: τ artifact v2 binding, seed-`-1` preflight mapping, crossed claim statistics, exact FCP baseline gate, and actor-only deployment bundle |
+| cetr-ci | green on 2026-08-16 after both remediation rounds (73 isolated CPU tests, compile gate, config validation, 14-subcommand CLI smoke, namespace gate); CUDA preflight remains dispatch-gated |
+| Reference-SP measurement and derived `tau_SP` artifact | version-2 path landed; `source_checkpoint` is resolved and must equal the resolved `--sp-initializer`; no formal artifact has been measured yet |
+| Formal launch prerequisites | server-panel gap: FCP support parents, one unified manifest, normalized seed-checkpoint paths, and measured `tau` artifacts are still required |
+| Development-support and confirmatory lineage-disjoint panels | audited 2026-08-16: **not satisfied on the server** — FCP support parents absent, no unified four-mechanism manifest, seed-matched Official-SP final checkpoint paths unconfirmed (see the parent-directory experiment report) |
+| Deployment contract | target bundle version `7`: actor parameter subtree only; reference artifact and training manifest move to same-directory `provenance.json` |
+| Formal training | not started |
+| Formal held-out external evaluation | not started |
+| CETR performance claim | none |
+| CETR evidence | none |
+| CETR training results | none — **CETR 尚无训练结果** |
+| V6 DELTA / DEPI implementation | retired and removed from the active tree; prior revisions remain only in git history |
 
-The next executable action is the real CUDA mechanical preflight followed by
-the paired development matrix. These are direct end-to-end runs, not additional
-method gates.
+The active deployment contract is a single partner-agnostic recurrent actor whose
+runtime reads local observation/history only. Parent groups, tail weights,
+cross-fitting folds, and the SP dual are training-only. The primary confirmatory
+object is the lineage-disjoint held-out external-partner panel; the population
+matrix is supplementary. Evaluation summaries are descriptive; only `claim` may
+produce GO/NO-GO/INCONCLUSIVE, using crossed external bootstrap and paired
+seed-level SP differences against exactly the FCP method set.
+
+No compilation, mechanical check, development artifact, or historical V6 result
+is a CETR performance claim. Formal runs have not begun, and there is currently
+no CETR return evidence to summarize.

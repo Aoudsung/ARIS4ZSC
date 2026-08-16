@@ -1,0 +1,498 @@
+"""Single configuration authority for CETR-ZSC.
+
+CETR-ZSC (constrained episodic tail-robust zero-shot coordination) fixes its
+entire scientific method in code:
+
+* the external-partner objective is the parent-level lower-half CVaR of
+  completed raw episodic returns, with uncertainty set
+  ``0 <= q_g <= TAIL_DENSITY_RATIO_CAP * p0_g``;
+* the self-play constraint target tau_SP is *derived* from the measured
+  self-play return of the seed-matched Official-SP reference -- it is never a
+  configured scalar;
+* the training signal is the complete undiscounted 400-step raw episodic
+  return-to-go, so every rollout is exactly one whole episode.
+
+There is no ``method`` block in the YAML: the v6 method scalars retired with
+its machinery, and the tail constants below are method identity, not sweepable
+settings.  What remains in YAML is engineering and sample-size design.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import json
+from pathlib import Path
+from typing import Any, Mapping
+
+import yaml
+
+
+CONFIG_VERSION = 6
+METHOD_VERSION = "constrained_episodic_tail_robust_zsc_v1"
+# Version 8 checkpoints hold one fully trainable actor-critic tree, the SP dual
+# variable, and the measured reference-SP artifact binding.  No per-episode
+# semantic state, no separate target network, and no measurement buffers exist.
+# Version 6 configurations and version 8 checkpoints reject pre-revision artifacts.
+CHECKPOINT_SCHEMA_VERSION = 8
+MANIFEST_VERSION = 2
+FORMAL_METHOD_LABEL = "cetr-zsc"
+OFFICIAL_BASELINE_METHODS = (
+    "sp",
+    "state-augmented",
+    "op",
+    "fcp",
+    "ippo-large",
+)
+OFFICIAL_SOURCE_COMMIT = "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e"
+OFFICIAL_PROTOCOL_VERSION = "overcooked_v2_iclr2025_5ce1707_v1"
+OFFICIAL_CORRECT_DELIVERY_REWARD = 20.0
+OFFICIAL_ACTION_COUNT = 6
+OFFICIAL_EPISODE_STEPS = 400
+OFFICIAL_EVALUATION_ROOT_SEED = 0
+OFFICIAL_TRAINING_ROOT_SEED = 42
+OFFICIAL_TRAINING_RUN_COUNT = 10
+OFFICIAL_ROLLOUT_LENGTH = 256
+OFFICIAL_SP_TOTAL_TIMESTEPS = 30_000_000
+OFFICIAL_OP_TOTAL_TIMESTEPS = 50_000_000
+OFFICIAL_SP_NUM_ENVS = 256
+OFFICIAL_OP_NUM_ENVS = 64
+OFFICIAL_NUM_MINIBATCHES = 64
+OFFICIAL_UPDATE_EPOCHS = 4
+OFFICIAL_EVALUATION_EPISODES_PER_PAIRING = 500
+OFFICIAL_BOOTSTRAP_REPLICATES = 9_999
+OFFICIAL_FORMAL_PARENTS_PER_MECHANISM = 4
+
+TAIL_DENSITY_RATIO_CAP = 2.0
+"""Cap on q_g / p0_g in the partner uncertainty set.  Method identity."""
+
+TAIL_MASS = 0.5
+"""Total adversarial mass over the worst parents; cap = 1 / TAIL_MASS.  Method
+identity.  With uniform p0 over an even parent count M the induced objective is
+the mean return of the worst M/2 independent parents."""
+
+TRAINING_SUPPORT_MECHANISMS = ("sp", "op", "sa", "fcp")
+"""Mechanisms admitted to the CETR development-support training panel.
+
+The actor never reads these labels; they only define the mechanism-uniform
+nominal sampling distribution p0.  Heuristic families remain test-only.
+"""
+
+RUN_KINDS = ("mechanical", "development", "formal")
+LAYOUTS = ("test_time_simple", "test_time_wide")
+SUPPORTED_LAYOUTS = (*LAYOUTS, "grounded_coord_ring")
+
+
+@dataclass(frozen=True, slots=True)
+class RunBudget:
+    num_envs: int
+    environment_steps: int
+    minibatches_per_epoch: int
+    checkpoint_interval_environment_steps: int
+
+
+FORMAL_NUM_ENVS = 128
+"""Parallel environments in a formal rollout.
+
+Retained from the v6 registration: at 256 lanes the PPO minibatch matmul takes
+an XLA split-K path whose Triton kernel exceeds the L40 shared-memory block,
+so the formal update could not launch at all.  Halving the lanes keeps every
+registered divisor intact.  What changes under CETR is the rollout length:
+each lane now runs exactly one whole 400-step episode per update, so the
+formal budget is 128 x 400 x 584 = 29,900,800 environment steps.  The
+29,949,952-step v6 budget cannot be expressed in whole 400-step vector
+episodes; the 0.16% difference from the Official 30M protocol is disclosed
+with any result computed under this registration.
+"""
+
+FORMAL_UPDATE_COUNT = 584
+FORMAL_PEAK_MEMORY_LIMIT_BYTES = 40_000 * 1024 * 1024
+
+RUN_BUDGETS: Mapping[str, RunBudget] = {
+    # Mechanical: 2 whole-episode updates of 4 lanes, exercising the full
+    # collect -> tail-weight -> primal -> dual transaction end to end.
+    "mechanical": RunBudget(4, 3_200, 2, 1_600),
+    # Development support has one parent per mechanism; formal support is
+    # fixed at 4 mechanisms x 4 independent parents = 16 parents.
+    # Development: 96 whole-episode updates of 32 lanes; the 1,228,800-step
+    # total matches the v6 development budget exactly.
+    "development": RunBudget(32, 1_228_800, 8, 102_400),
+    "formal": RunBudget(
+        FORMAL_NUM_ENVS,
+        FORMAL_NUM_ENVS * OFFICIAL_EPISODE_STEPS * FORMAL_UPDATE_COUNT,
+        OFFICIAL_NUM_MINIBATCHES,
+        FORMAL_NUM_ENVS * OFFICIAL_EPISODE_STEPS * FORMAL_UPDATE_COUNT,
+    ),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentConfig:
+    layout: str
+    agent_view_size: int
+    indicate_successful_delivery: bool
+    negative_rewards: bool
+    random_agent_positions: bool
+    sample_recipe_on_delivery: bool
+    episode_steps: int
+    num_envs: int
+
+
+@dataclass(frozen=True, slots=True)
+class ModelConfig:
+    task_hidden_dim: int
+    task_embedding_dim: int
+
+
+@dataclass(frozen=True, slots=True)
+class PPOConfig:
+    """Engineering settings for the clipped surrogate estimator.
+
+    No gamma or gae_lambda exists here: the training estimand is the complete
+    undiscounted episodic return-to-go, so there is no bootstrapping constant
+    to register.  Entropy and value coefficients are the standard Official PPO
+    engineering terms, not method scalars.
+    """
+
+    update_epochs: int
+    learning_rate: float
+    gradient_clip_norm: float
+    clip_epsilon: float
+    value_clip_epsilon: float
+    entropy_weight: float
+    value_weight: float
+    lr_warmup_fraction: float
+    anneal_learning_rate: bool
+    adam_epsilon: float
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingConfig:
+    rollout_length: int
+    environment_steps: int
+    minibatches_per_epoch: int
+    checkpoint_interval_environment_steps: int
+
+
+@dataclass(frozen=True, slots=True)
+class PartnerPoolConfig:
+    checkpoint_stages: tuple[float, ...]
+    mechanism_uniform_sampling: bool
+    heuristic_family_test_only: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationConfig:
+    episodes_per_pairing: int
+    bootstrap_replicates: int
+    evaluation_seed: int
+    evaluate_both_roles: bool
+    minimum_ego_runs: int
+    minimum_partner_runs_per_mechanism: int
+    minimum_effect: float
+    one_sided_alpha: float
+
+
+@dataclass(frozen=True, slots=True)
+class UpstreamConfig:
+    total_timesteps: int
+    reward_shaping_horizon: int
+    checkpoint_progress: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OfficialProtocolConfig:
+    protocol_version: str
+    source_commit: str
+    training_root_seed: int
+    training_run_count: int
+    evaluation_root_seed: int
+    evaluation_episodes_per_pairing: int
+
+
+@dataclass(frozen=True, slots=True)
+class RunConfig:
+    version: int
+    run_kind: str
+    environment: EnvironmentConfig
+    model: ModelConfig
+    ppo: PPOConfig
+    training: TrainingConfig
+    partner_pool: PartnerPoolConfig
+    evaluation: EvaluationConfig
+    upstream: UpstreamConfig
+    official_protocol: OfficialProtocolConfig
+
+    def to_mapping(self) -> Mapping[str, Any]:
+        return asdict(self)
+
+
+_TOP_LEVEL_FIELDS = {
+    "version",
+    "environment",
+    "model",
+    "ppo",
+    "training",
+    "partner_pool",
+    "evaluation",
+    "upstream",
+    "official_protocol",
+}
+
+
+def _exact_fields(payload: Any, fields: set[str], label: str) -> dict[str, Any]:
+    if not isinstance(payload, Mapping) or set(payload) != fields:
+        observed = set(payload) if isinstance(payload, Mapping) else type(payload).__name__
+        raise ValueError(
+            f"{label} fields differ. expected={sorted(fields)!r}, observed={observed!r}"
+        )
+    return dict(payload)
+
+
+def load_config(path: str | Path, *, run_kind: str) -> RunConfig:
+    if run_kind not in RUN_KINDS:
+        raise ValueError(f"run_kind must be one of {RUN_KINDS}.")
+    source = Path(path).resolve()
+    raw = yaml.safe_load(source.read_text(encoding="utf-8"))
+    payload = _exact_fields(raw, _TOP_LEVEL_FIELDS, "configuration")
+    if int(payload["version"]) != CONFIG_VERSION:
+        raise ValueError(f"Active CETR config version is {CONFIG_VERSION}.")
+    budget = RUN_BUDGETS[run_kind]
+    training_raw = _exact_fields(payload["training"], {"rollout_length"}, "training")
+    environment_raw = _exact_fields(
+        payload["environment"],
+        set(EnvironmentConfig.__dataclass_fields__) - {"num_envs"},
+        "environment",
+    )
+    model_raw = _exact_fields(payload["model"], set(ModelConfig.__dataclass_fields__), "model")
+    ppo_raw = _exact_fields(payload["ppo"], set(PPOConfig.__dataclass_fields__), "ppo")
+    pool_raw = _exact_fields(
+        payload["partner_pool"], set(PartnerPoolConfig.__dataclass_fields__), "partner_pool"
+    )
+    evaluation_raw = _exact_fields(
+        payload["evaluation"], set(EvaluationConfig.__dataclass_fields__), "evaluation"
+    )
+    upstream_raw = _exact_fields(
+        payload["upstream"], set(UpstreamConfig.__dataclass_fields__), "upstream"
+    )
+    protocol_raw = _exact_fields(
+        payload["official_protocol"],
+        set(OfficialProtocolConfig.__dataclass_fields__),
+        "official_protocol",
+    )
+    config = RunConfig(
+        version=CONFIG_VERSION,
+        run_kind=run_kind,
+        environment=EnvironmentConfig(**environment_raw, num_envs=budget.num_envs),
+        model=ModelConfig(**model_raw),
+        ppo=PPOConfig(**ppo_raw),
+        training=TrainingConfig(
+            rollout_length=int(training_raw["rollout_length"]),
+            environment_steps=budget.environment_steps,
+            minibatches_per_epoch=budget.minibatches_per_epoch,
+            checkpoint_interval_environment_steps=budget.checkpoint_interval_environment_steps,
+        ),
+        partner_pool=PartnerPoolConfig(
+            checkpoint_stages=tuple(float(v) for v in pool_raw["checkpoint_stages"]),
+            mechanism_uniform_sampling=bool(pool_raw["mechanism_uniform_sampling"]),
+            heuristic_family_test_only=bool(pool_raw["heuristic_family_test_only"]),
+        ),
+        evaluation=EvaluationConfig(**evaluation_raw),
+        upstream=UpstreamConfig(
+            total_timesteps=int(upstream_raw["total_timesteps"]),
+            reward_shaping_horizon=int(upstream_raw["reward_shaping_horizon"]),
+            checkpoint_progress=tuple(float(v) for v in upstream_raw["checkpoint_progress"]),
+        ),
+        official_protocol=OfficialProtocolConfig(**protocol_raw),
+    )
+    validate_config(config)
+    return config
+
+
+def run_config_from_mapping(payload: Mapping[str, Any]) -> RunConfig:
+    if not isinstance(payload, Mapping):
+        raise ValueError("Resolved config must be a mapping.")
+    config = RunConfig(
+        version=int(payload["version"]),
+        run_kind=str(payload["run_kind"]),
+        environment=EnvironmentConfig(**payload["environment"]),
+        model=ModelConfig(**payload["model"]),
+        ppo=PPOConfig(**payload["ppo"]),
+        training=TrainingConfig(**payload["training"]),
+        partner_pool=PartnerPoolConfig(
+            **{
+                **payload["partner_pool"],
+                "checkpoint_stages": tuple(payload["partner_pool"]["checkpoint_stages"]),
+            }
+        ),
+        evaluation=EvaluationConfig(**payload["evaluation"]),
+        upstream=UpstreamConfig(**{**payload["upstream"], "checkpoint_progress": tuple(payload["upstream"]["checkpoint_progress"])}),
+        official_protocol=OfficialProtocolConfig(**payload["official_protocol"]),
+    )
+    validate_config(config)
+    normalized = json.loads(json.dumps(config.to_mapping(), sort_keys=True))
+    if normalized != dict(payload):
+        raise ValueError("Resolved config does not round-trip exactly.")
+    return config
+
+
+def validate_config(config: RunConfig) -> None:
+    if config.version != CONFIG_VERSION:
+        raise ValueError("Config version differs.")
+    if config.run_kind not in RUN_KINDS:
+        raise ValueError("Unknown run kind.")
+    if config.environment.layout not in SUPPORTED_LAYOUTS:
+        raise ValueError("Unknown OvercookedV2 layout.")
+    if config.environment.agent_view_size != 2:
+        raise ValueError("Official protocol uses view radius two.")
+    if config.environment.episode_steps != OFFICIAL_EPISODE_STEPS:
+        raise ValueError("Official protocol uses 400-step episodes.")
+    if not all(
+        (
+            config.environment.indicate_successful_delivery,
+            config.environment.negative_rewards,
+            config.environment.random_agent_positions,
+            config.environment.sample_recipe_on_delivery,
+        )
+    ):
+        raise ValueError("Environment flags differ from Official.")
+    # The whole-episode contract: the training estimand is the completed
+    # episodic return, so one rollout must be exactly one episode.
+    if config.training.rollout_length != config.environment.episode_steps:
+        raise ValueError("CETR rollouts are exactly one whole episode.")
+    if config.environment.num_envs % 4:
+        raise ValueError(
+            "SP/external streams and external lane pairs require divisibility by four."
+        )
+    if (config.environment.num_envs // 2) % config.training.minibatches_per_epoch:
+        raise ValueError("Each stream must divide into paired minibatches.")
+    rollout_steps = config.environment.num_envs * config.training.rollout_length
+    if config.training.environment_steps % rollout_steps:
+        raise ValueError("Training budget must contain whole vector episodes.")
+    if config.training.checkpoint_interval_environment_steps % rollout_steps:
+        raise ValueError("Checkpoint intervals must align with vector episodes.")
+    if min(config.model.task_hidden_dim, config.model.task_embedding_dim) <= 0:
+        raise ValueError("Model dimensions must be positive.")
+    if config.ppo.update_epochs <= 0:
+        raise ValueError("PPO update epochs must be positive.")
+    if config.ppo.learning_rate <= 0.0:
+        raise ValueError("PPO learning rate must be positive.")
+    if not 0.0 <= config.ppo.lr_warmup_fraction < 1.0:
+        raise ValueError("PPO warm-up fraction must lie in [0,1).")
+    if config.ppo.adam_epsilon <= 0.0:
+        raise ValueError("Adam epsilon must be positive.")
+    if min(config.ppo.clip_epsilon, config.ppo.value_clip_epsilon) <= 0.0:
+        raise ValueError("PPO clipping radii must be positive.")
+    if min(config.ppo.entropy_weight, config.ppo.value_weight) < 0.0:
+        raise ValueError("PPO entropy/value weights must be non-negative.")
+    if config.ppo.gradient_clip_norm <= 0.0:
+        raise ValueError("Gradient clip norm must be positive.")
+    if tuple(config.partner_pool.checkpoint_stages) != (0.0, 0.5, 1.0):
+        raise ValueError("Partner checkpoint stages are fixed at 0/0.5/1.")
+    if not config.partner_pool.mechanism_uniform_sampling:
+        raise ValueError("Training partner mechanisms must be sampled uniformly.")
+    if not config.partner_pool.heuristic_family_test_only:
+        raise ValueError("Heuristics remain test-only.")
+    if min(
+        config.evaluation.episodes_per_pairing,
+        config.evaluation.bootstrap_replicates,
+        config.evaluation.minimum_ego_runs,
+        config.evaluation.minimum_partner_runs_per_mechanism,
+    ) <= 0:
+        raise ValueError("Evaluation sample sizes must be positive.")
+    if not 0.0 < config.evaluation.one_sided_alpha < 1.0:
+        raise ValueError("Evaluation one-sided alpha must lie in (0,1).")
+    if config.evaluation.minimum_effect != OFFICIAL_CORRECT_DELIVERY_REWARD:
+        raise ValueError("Material effect is one correct delivery (20 points).")
+    if config.upstream.total_timesteps <= 0 or config.upstream.reward_shaping_horizon < 0:
+        raise ValueError("Upstream budgets are invalid.")
+    if tuple(config.upstream.checkpoint_progress) != (0.0, 0.5, 1.0):
+        raise ValueError("Upstream checkpoint progress is fixed at 0/0.5/1.")
+    if config.run_kind == "formal":
+        formal_ppo = {
+            "update_epochs": 4,
+            "learning_rate": 0.00025,
+            "gradient_clip_norm": 0.25,
+            "clip_epsilon": 0.2,
+            "value_clip_epsilon": 0.2,
+            "entropy_weight": 0.01,
+            "value_weight": 0.5,
+            "lr_warmup_fraction": 0.05,
+            "anneal_learning_rate": True,
+            "adam_epsilon": 1.0e-5,
+        }
+        for name, expected in formal_ppo.items():
+            if getattr(config.ppo, name) != expected:
+                raise ValueError(f"Formal PPO field {name} must equal {expected!r}.")
+        if (
+            config.environment.num_envs != FORMAL_NUM_ENVS
+            or config.training.rollout_length != OFFICIAL_EPISODE_STEPS
+            or config.training.environment_steps
+            != FORMAL_NUM_ENVS * OFFICIAL_EPISODE_STEPS * FORMAL_UPDATE_COUNT
+            or config.training.minibatches_per_epoch != OFFICIAL_NUM_MINIBATCHES
+        ):
+            raise ValueError("Formal vectorized training budget differs from registration.")
+        if (
+            config.evaluation.episodes_per_pairing
+            != OFFICIAL_EVALUATION_EPISODES_PER_PAIRING
+            or config.evaluation.bootstrap_replicates != OFFICIAL_BOOTSTRAP_REPLICATES
+            or not config.evaluation.evaluate_both_roles
+            or config.evaluation.minimum_ego_runs != OFFICIAL_TRAINING_RUN_COUNT
+            or config.evaluation.minimum_partner_runs_per_mechanism
+            != OFFICIAL_FORMAL_PARENTS_PER_MECHANISM
+            or config.evaluation.evaluation_seed != OFFICIAL_EVALUATION_ROOT_SEED
+            or config.evaluation.one_sided_alpha != 0.05
+        ):
+            raise ValueError("Formal evaluation registration differs.")
+
+    expected_protocol = {
+        "protocol_version": OFFICIAL_PROTOCOL_VERSION,
+        "source_commit": OFFICIAL_SOURCE_COMMIT,
+        "training_root_seed": OFFICIAL_TRAINING_ROOT_SEED,
+        "training_run_count": OFFICIAL_TRAINING_RUN_COUNT,
+        "evaluation_root_seed": OFFICIAL_EVALUATION_ROOT_SEED,
+        "evaluation_episodes_per_pairing": config.evaluation.episodes_per_pairing,
+    }
+    for name, expected in expected_protocol.items():
+        if getattr(config.official_protocol, name) != expected:
+            raise ValueError(f"Official protocol field {name} differs.")
+
+
+__all__ = [
+    "CHECKPOINT_SCHEMA_VERSION",
+    "CONFIG_VERSION",
+    "FORMAL_METHOD_LABEL",
+    "FORMAL_NUM_ENVS",
+    "FORMAL_PEAK_MEMORY_LIMIT_BYTES",
+    "FORMAL_UPDATE_COUNT",
+    "LAYOUTS",
+    "SUPPORTED_LAYOUTS",
+    "MANIFEST_VERSION",
+    "METHOD_VERSION",
+    "OFFICIAL_ACTION_COUNT",
+    "OFFICIAL_CORRECT_DELIVERY_REWARD",
+    "OFFICIAL_EPISODE_STEPS",
+    "OFFICIAL_BOOTSTRAP_REPLICATES",
+    "OFFICIAL_EVALUATION_EPISODES_PER_PAIRING",
+    "OFFICIAL_EVALUATION_ROOT_SEED",
+    "OFFICIAL_FORMAL_PARENTS_PER_MECHANISM",
+    "OFFICIAL_NUM_MINIBATCHES",
+    "OFFICIAL_OP_NUM_ENVS",
+    "OFFICIAL_OP_TOTAL_TIMESTEPS",
+    "OFFICIAL_PROTOCOL_VERSION",
+    "OFFICIAL_ROLLOUT_LENGTH",
+    "OFFICIAL_SOURCE_COMMIT",
+    "OFFICIAL_SP_NUM_ENVS",
+    "OFFICIAL_SP_TOTAL_TIMESTEPS",
+    "OFFICIAL_TRAINING_ROOT_SEED",
+    "OFFICIAL_TRAINING_RUN_COUNT",
+    "OFFICIAL_UPDATE_EPOCHS",
+    "RUN_BUDGETS",
+    "RUN_KINDS",
+    "TAIL_DENSITY_RATIO_CAP",
+    "TAIL_MASS",
+    "TRAINING_SUPPORT_MECHANISMS",
+    "RunConfig",
+    "load_config",
+    "run_config_from_mapping",
+    "validate_config",
+]

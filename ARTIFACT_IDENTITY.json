@@ -1,35 +1,42 @@
 {
-  "artifact_schema_version": 1,
-  "artifact_name": "DELTA-ZSC unified VOI v2 final source package",
-  "created_date": "2026-08-05",
-  "source_reconstruction_base_commit": "149f588d733be48722eea3bff844922f1ed885cc",
-  "active_method_version": "delta_joint_response_decision_mirror_voi_v2",
-  "config_version": 1,
-  "checkpoint_schema_version": 1,
-  "manifest_version": 1,
-  "official_source_commit": "5ce1707cf31c1c115e6f6ba96db7bc9cc80a850e",
-  "active_namespace": "src.delta_zsc",
-  "active_cli": "python -m experiments.overcooked_v2.delta_zsc",
+  "artifact_schema_version": 5,
+  "artifact_name": "CETR-ZSC experiment source package",
+  "created_date": "2026-08-16",
+  "source_repository": "Aoudsung/ARIS4ZSC",
+  "source_branch": "zsc_v8",
+  "active_method_version": "constrained_episodic_tail_robust_zsc_v1",
+  "package_version": "0.7.0",
+  "config_version": 5,
+  "checkpoint_schema_version": 7,
+  "deployment_bundle_version": 6,
+  "manifest_version": 2,
+  "active_namespace": "src.cetr_zsc",
+  "active_cli": "python -m experiments.overcooked_v2.cetr_zsc",
+  "actor_contract": "partner_agnostic_recurrent_actor_with_local_observation_history_only",
+  "training_partner_contract": "lineage_disjoint_support_and_confirmatory_panels_with_cross_fitting",
+  "tail_objective": "parent_level_lower_half_cvar_over_completed_raw_episodic_returns",
+  "self_play_constraint": "reference_derived_tau_sp_with_primal_dual_update",
+  "deployment_inputs": [
+    "local_observation",
+    "local_action_history",
+    "episode_boundaries"
+  ],
   "local_validation": {
-    "python": "3.13.5",
-    "jax": "0.9.0.1",
-    "numpy": "2.3.5",
-    "backend": "cpu",
-    "test_files": 6,
-    "tests_passed": 26,
-    "compile": "passed",
-    "registered_configs_loaded": 6,
-    "cli_subcommands_smoked": 15,
-    "workflow_yaml": "passed",
-    "namespace_audit": "passed",
-    "credential_pattern_scan": "passed"
+    "status": "not_run_in_this_migration",
+    "execution_policy": "No interpreter, project code, package manager, compiler, or test runner was executed.",
+    "source_review": "completed by text-level inspection"
   },
-  "formal_execution_status": {
-    "registered_python_3_10_install": "not_run_in_local_container",
-    "real_official_partner_checkpoint_execution": "not_run_in_local_container",
-    "real_cuda_mechanical_preflight": "not_run_in_local_container",
-    "development_matrix": "not_generated",
+  "scientific_execution_status": {
+    "cuda_mechanical_preflight": "not_run",
+    "development_matrix": "not_run",
     "formal_hypothesis_results": "not_generated",
-    "sota_claim": false
+    "performance_claim": false
+  },
+  "compatibility": {
+    "prior_version_checkpoints": "incompatible; historical source remains only in git history",
+    "prior_version_optimizer_and_replay_state": "incompatible; historical source remains only in git history",
+    "prior_version_deployments": "incompatible; historical source remains only in git history",
+    "official_sp_op_parent_checkpoints": "compatible",
+    "partner_manifest_version_2": "compatible"
   }
 }

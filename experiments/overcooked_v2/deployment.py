@@ -1,33 +1,102 @@
-"""Self-contained deployment bundle for unified DELTA-ZSC."""
+"""Strict CETR-ZSC deployment bundle and single execution path."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-from pathlib import Path
 import pickle
-from typing import Any
+from pathlib import Path
+from typing import Any, Mapping
 
-from src.delta_zsc.config import (
+from src.cetr_zsc.config import (
     CHECKPOINT_SCHEMA_VERSION,
     METHOD_VERSION,
+    OFFICIAL_ACTION_COUNT,
     run_config_from_mapping,
 )
-from src.delta_zsc.losses import categorical_log_probability
-from src.delta_zsc.model import DeltaModel, observe_after_transition
-from src.delta_zsc.storage import write_json
+from src.cetr_zsc.model import CetrModel, actor_parameters, actor_step
+from src.cetr_zsc.storage import read_json, write_json
+from src.cetr_zsc.types import PolicyState
 
 
-DEPLOYMENT_BUNDLE_VERSION = 2
+DEPLOYMENT_BUNDLE_VERSION = 7
+_REFERENCE_FIELDS = {
+    "artifact_type",
+    "version",
+    "layout",
+    "seed_index",
+    "tau_sp",
+    "episodes_per_pairing",
+    "evaluation_root_seed",
+    "source_checkpoint",
+}
+_PROVENANCE_FIELDS = {"reference_sp_artifact", "training_parent_manifest"}
+_ACTOR_FIELDS = {
+    "task_conv",
+    "task_dense",
+    "task_norm",
+    "task_gru",
+    "actor_trunk",
+    "actor",
+}
+_BUNDLE_FIELDS = {
+    "version",
+    "checkpoint_schema_version",
+    "method",
+    "ego_run_id",
+    "config",
+    "observation_shape",
+    "action_count",
+    "params",
+    "source_training_run",
+    "provenance",
+}
 
 
 @dataclass(frozen=True, slots=True)
 class Deployment:
     ego_run_id: str
     config: Any
-    model: DeltaModel
-    base_params: Any
-    latent_params: Any
+    model: CetrModel
+    params: Mapping[str, Any]
+    provenance_path: Path
+
+
+def _reference_artifact(value: Mapping[str, Any] | str | Path) -> Mapping[str, Any]:
+    payload = read_json(value) if isinstance(value, (str, Path)) else value
+    if not isinstance(payload, Mapping) or set(payload) != _REFERENCE_FIELDS:
+        raise ValueError("Reference-SP artifact schema differs.")
+    if payload.get("artifact_type") != "cetr_reference_sp" or int(payload["version"]) != 2:
+        raise ValueError("Reference-SP artifact identity differs.")
+    if not isinstance(payload.get("layout"), str):
+        raise ValueError("Reference-SP artifact layout is missing.")
+    if not isinstance(payload.get("source_checkpoint"), str):
+        raise ValueError("Reference-SP artifact source checkpoint is missing.")
+    if not isinstance(payload.get("tau_sp"), (int, float)):
+        raise ValueError("Reference-SP artifact tau is not numeric.")
+    return dict(payload)
+
+
+def _training_parent_manifest(source_training_run: Path) -> Mapping[str, Any]:
+    for name in ("partner_manifest.json", "training_parent_manifest.json"):
+        candidate = source_training_run / name
+        if candidate.is_file():
+            payload = read_json(candidate)
+            if not isinstance(payload, Mapping):
+                raise ValueError("Training parent manifest is not a JSON object.")
+            return {"path": str(candidate.resolve()), "manifest": dict(payload)}
+    return {"path": str((source_training_run / "partner_manifest.json").resolve())}
+
+
+def _validate_parent_manifest(value: Any) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) not in ({"path"}, {"path", "manifest"})
+        or not str(value["path"])
+    ):
+        raise ValueError("Deployment parent-manifest binding differs.")
+    if "manifest" in value and not isinstance(value["manifest"], Mapping):
+        raise ValueError("Deployment parent-manifest payload differs.")
+    return dict(value)
 
 
 def export_deployment_bundle(
@@ -36,18 +105,30 @@ def export_deployment_bundle(
     ego_run_id: str,
     config: Any,
     observation_shape: tuple[int, ...],
-    base_params: Any,
-    latent_params: Any,
+    params: Any,
     source_training_run: str | Path,
+    reference_sp_artifact: Mapping[str, Any] | str | Path,
 ) -> Path:
     root = Path(directory).resolve()
     if root.exists() and any(root.iterdir()):
         raise RuntimeError(f"Deployment directory is not empty: {root}")
     root.mkdir(parents=True, exist_ok=True)
-    parameters = {"base_params": base_params, "latent_params": latent_params}
+    reference = _reference_artifact(reference_sp_artifact)
+    source = Path(source_training_run).resolve()
+    provenance = {
+        "reference_sp_artifact": reference,
+        "training_parent_manifest": _training_parent_manifest(source),
+    }
+    export_params = (
+        actor_parameters(params)
+        if isinstance(params, Mapping) and "value" in params
+        else params
+    )
     params_path = root / "params.pkl"
     with params_path.open("wb") as handle:
-        pickle.dump(parameters, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(export_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    provenance_path = root / "provenance.json"
+    write_json(provenance_path, provenance)
     write_json(
         root / "deployment_bundle.json",
         {
@@ -55,12 +136,12 @@ def export_deployment_bundle(
             "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
             "method": METHOD_VERSION,
             "ego_run_id": str(ego_run_id),
-            "method_variant": config.method_variant,
             "config": config.to_mapping(),
             "observation_shape": [int(value) for value in observation_shape],
-            "action_count": int(6),
+            "action_count": int(OFFICIAL_ACTION_COUNT),
             "params": params_path.name,
-            "source_training_run": str(Path(source_training_run).resolve()),
+            "source_training_run": str(source),
+            "provenance": provenance_path.name,
         },
     )
     return root
@@ -71,20 +152,8 @@ def load_deployment(directory: str | Path) -> Deployment:
     payload_path = root / "deployment_bundle.json"
     if not payload_path.is_file():
         raise FileNotFoundError(payload_path)
-    payload = json.loads(payload_path.read_text(encoding="utf-8"))
-    required = {
-        "version",
-        "checkpoint_schema_version",
-        "method",
-        "ego_run_id",
-        "method_variant",
-        "config",
-        "observation_shape",
-        "action_count",
-        "params",
-        "source_training_run",
-    }
-    if not isinstance(payload, dict) or set(payload) != required:
+    payload = read_json(payload_path)
+    if not isinstance(payload, Mapping) or set(payload) != _BUNDLE_FIELDS:
         raise ValueError("Deployment bundle schema differs.")
     if (
         int(payload["version"]) != DEPLOYMENT_BUNDLE_VERSION
@@ -93,68 +162,101 @@ def load_deployment(directory: str | Path) -> Deployment:
     ):
         raise ValueError("Deployment method/schema identity differs.")
     config = run_config_from_mapping(payload["config"])
-    if config.method_variant != payload["method_variant"]:
-        raise ValueError("Deployment method variant differs.")
-    params_path = root / str(payload["params"])
+    if str(payload["ego_run_id"]) == "" or str(payload["source_training_run"]) == "":
+        raise ValueError("Deployment run binding is empty.")
+    provenance_name = str(payload["provenance"])
+    provenance_path = root / provenance_name
+    if provenance_name != Path(provenance_name).name or not provenance_path.is_file():
+        raise ValueError("Deployment provenance binding differs.")
+    provenance = read_json(provenance_path)
+    if not isinstance(provenance, Mapping) or set(provenance) != _PROVENANCE_FIELDS:
+        raise ValueError("Deployment provenance schema differs.")
+    reference = _reference_artifact(provenance["reference_sp_artifact"])
+    if str(reference["layout"]) != str(config.environment.layout):
+        raise ValueError("Deployment reference-SP layout differs from the config.")
+    _validate_parent_manifest(provenance["training_parent_manifest"])
+    shape_value = payload["observation_shape"]
+    if (
+        not isinstance(shape_value, list)
+        or not shape_value
+        or any(int(value) <= 0 for value in shape_value)
+    ):
+        raise ValueError("Deployment observation shape differs.")
+    shape = tuple(int(value) for value in shape_value)
+    if int(payload["action_count"]) != OFFICIAL_ACTION_COUNT:
+        raise ValueError("Deployment action count differs.")
+    params_name = str(payload["params"])
+    params_path = root / params_name
+    if params_name != Path(params_name).name or not params_path.is_file():
+        raise ValueError("Deployment parameter binding differs.")
     with params_path.open("rb") as handle:
-        parameters = pickle.load(handle)
-    if set(parameters) != {"base_params", "latent_params"}:
-        raise ValueError("Deployment parameter tree differs.")
-    shape = tuple(int(value) for value in payload["observation_shape"])
-    action_count = int(payload["action_count"])
+        params = pickle.load(handle)
+    if not isinstance(params, Mapping) or set(params) != _ACTOR_FIELDS:
+        raise ValueError("Deployment parameters must contain the actor subtree only.")
+    model = CetrModel(config, shape, OFFICIAL_ACTION_COUNT)
     return Deployment(
         ego_run_id=str(payload["ego_run_id"]),
         config=config,
-        model=DeltaModel(config, shape, action_count),
-        base_params=parameters["base_params"],
-        latent_params=parameters["latent_params"],
+        model=model,
+        params=params,
+        provenance_path=provenance_path,
     )
 
 
-def reset_deployment_state(deployment: Deployment, *, batch_size: int) -> Any:
-    return deployment.model.initial_state(int(batch_size))
-
-
-def deployment_action(
-    *,
-    deployment: Deployment,
-    state: Any,
-    observation: Any,
-    keys: Any,
-    force_base: bool = False,
-) -> tuple[Any, Any, Any, Any]:
+def reset_deployment_state(deployment: Deployment, batch_size: int) -> PolicyState:
     import jax
     import jax.numpy as jnp
 
-    stepped, output = deployment.model.step(
-        deployment.base_params,
-        deployment.latent_params,
-        state,
-        observation,
+    size = int(batch_size)
+    carry = jax.tree_util.tree_map(
+        lambda value: jnp.zeros_like(value), deployment.model.initial_carry(size)
     )
-    logits = output.base_policy_logits if bool(force_base) else output.policy_logits
+    return PolicyState(
+        carry=carry,
+        episode_start=jnp.ones((size,), dtype=jnp.bool_),
+    )
+
+
+def deployment_action(
+    deployment: Deployment,
+    state: PolicyState,
+    observation: Any,
+    keys: Any,
+) -> tuple[PolicyState, Any, Any]:
+    import jax
+    import jax.numpy as jnp
+
+    observations = jnp.asarray(observation, dtype=jnp.float32)
+    if observations.ndim == len(deployment.model.observation_shape):
+        observations = observations[None, ...]
+    next_carry, logits = actor_step(
+        deployment.params,
+        state.carry,
+        observations,
+        state.episode_start,
+    )
+    logits = jnp.asarray(logits)
     key_array = jnp.asarray(keys)
     if key_array.ndim == 1:
-        action = jax.random.categorical(key_array, logits)
-    else:
-        action = jax.vmap(lambda key, current: jax.random.categorical(key, current))(
-            key_array, logits
-        )
-    log_probability = categorical_log_probability(logits, action)
-    return stepped, action, output, log_probability
-
-
-def observe_deployment_after_transition(
-    state: Any, *, action: Any, done: Any
-) -> Any:
-    return observe_after_transition(state, action=action, done=done)
+        key_array = jax.random.split(key_array, int(observations.shape[0]))
+    actions = jax.vmap(
+        lambda key, current: jax.random.categorical(key, current)
+    )(key_array, logits)
+    log_probability = jax.nn.log_softmax(logits, axis=-1)[
+        jnp.arange(actions.shape[0]), actions
+    ]
+    next_state = PolicyState(
+        carry=next_carry,
+        episode_start=jnp.zeros_like(state.episode_start, dtype=jnp.bool_),
+    )
+    return next_state, actions, log_probability
 
 
 __all__ = [
+    "DEPLOYMENT_BUNDLE_VERSION",
     "Deployment",
     "deployment_action",
     "export_deployment_bundle",
     "load_deployment",
-    "observe_deployment_after_transition",
     "reset_deployment_state",
 ]

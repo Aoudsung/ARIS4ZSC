@@ -1,31 +1,29 @@
-# Validation artifacts
+# CETR-ZSC validation entry points
 
-`run_contract_validation.sh` reproduces the non-benchmark acceptance suite:
-active compilation, all registered configuration loads, every CLI help path,
-workflow YAML parsing, active/legacy namespace checks, and the synthetic VOI
-diagnostic.
+## Isolated local regression
 
-JAX test files are deliberately executed one at a time through
-`run_isolated_test.sh`. This mirrors CI and prevents a CPU worker from retaining
-multiple large compilation caches:
+The repository runner discovers every top-level test function in
+`experiments/overcooked_v2/tests/test_cetr_*.py` and runs each in a fresh
+bounded CPU process:
 
 ```bash
-validation/run_isolated_test.sh experiments/overcooked_v2/tests/test_delta_unified_voi.py
-validation/run_isolated_test.sh experiments/overcooked_v2/tests/test_delta_unified_core.py
-validation/run_isolated_test.sh experiments/overcooked_v2/tests/test_delta_unified_training.py
-validation/run_isolated_test.sh experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py
-validation/run_isolated_test.sh experiments/overcooked_v2/tests/test_delta_unified_manifest.py
-validation/run_isolated_test.sh experiments/overcooked_v2/tests/test_delta_unified_repository.py
+python validation/run_all_isolated_tests.py
 ```
 
-`generate_voi_diagnostics.py` writes `voi_synthetic_diagnostics.json`. Its three
-registered cases distinguish decision value from mere identifiability:
+The runner writes `ISOLATED_TEST_RESULTS.json` and
+`LOCAL_TEST_RESULTS.txt`. These generated outputs are not source-tree evidence
+and are absent until a user intentionally runs the runner.
 
-- no response information: VOI = 0 and information gain = 0;
-- response reveals a decision-relevant component: VOI > 0;
-- response reveals component identity but all components have the same action
-  ordering/value: information gain > 0 while VOI = 0.
+## Contract validation
 
-These are implementation acceptance artifacts, not benchmark results. The real
-Official/CUDA preflight requires the pinned Python 3.10 environment, a
-lineage-bound partner manifest, real checkpoints, and a self-hosted GPU.
+The former version-specific contract script was removed because it only
+validated retired implementation paths, configurations, diagnostics, and CLI
+commands. The active contracts are protected by
+`experiments/overcooked_v2/tests/test_cetr_repository.py` and the CETR CI
+workflow.
+
+## Evidence boundary
+
+Source-level checks certify repository wiring only. They do not establish
+Official upstream assets, fitted initializers, real CUDA memory or throughput,
+development return, formal return, or any performance claim.

@@ -1,109 +1,64 @@
-# DELTA-ZSC VOI v2 validation report
+# CETR-ZSC validation report
 
-Date: 2026-08-05
+Date: 2026-08-16
 
 ## Scope
 
-This report covers the final source package, completed VOI v2, estimator
-boundaries, mocked end-to-end mechanics, configuration/CLI contracts, active
-namespace isolation, and artifact integrity. It does not contain or imply
-formal OvercookedV2 performance evidence.
+This report records the source-tree migration to
+`constrained_episodic_tail_robust_zsc_v1`. It covers repository boundaries,
+active package identity, application entry points, workflow wiring, and
+text-level import/reference review. It does not establish training returns,
+CUDA execution, formal evaluation, or benchmark superiority.
 
-## Local validation environment
+The retired V6 method and its implementation are intentionally absent from the
+active tree. Historical source, contracts, and results remain recoverable from
+git history only; no historical artifact defines CETR.
 
-- Python: 3.13.5
-- JAX: 0.9.0.1, CPU backend
-- NumPy: 2.3.5
-- Formal registered environment: Python 3.10, JAX/JAXLIB 0.4.38 and pinned
-  Official OvercookedV2 dependencies in `pyproject.toml`
+## Active artifact identity
 
-The local environment differs from the formal environment. Tests were therefore
-run as isolated CPU processes. The GitHub workflow installs and checks the
-registered Python 3.10 dependency set; the optional self-hosted job performs a
-real CUDA mechanical preflight.
+- package version: `0.7.0`;
+- configuration contract: `version: 6`;
+- checkpoint schema: `8`;
+- deployment bundle version: `7` (actor parameter subtree only; provenance is same-directory);
+- reference-SP artifact version: `2` (resolved absolute `source_checkpoint` binding);
+- partner manifest version: `2`;
+- method identity: `src/cetr_zsc/config.py`;
+- command entry point: `python -m experiments.overcooked_v2.cetr_zsc`.
 
-## Regression results
+## Source-level changes established by inspection
 
-| Test file | Result | Tests |
-|---|---:|---:|
-| `test_delta_unified_voi.py` | passed | 7 |
-| `test_delta_unified_core.py` | passed | 6 |
-| `test_delta_unified_training.py` | passed | 4 |
-| `test_delta_unified_runner_storage.py` | passed | 2 |
-| `test_delta_unified_manifest.py` | passed | 1 |
-| `test_delta_unified_repository.py` | passed | 6 |
-| **Total** | **passed** | **26** |
+- the retired scientific package, applications, tests, configurations, contract
+  script, diagnostic generator, and Python caches were removed;
+- the active application set is CETR-only and the active workflow is
+  `.github/workflows/cetr-ci.yml`;
+- the repository protection test now checks the CETR namespace, exact active
+  file sets, package/dependency identity, workflow identity, and authoritative
+  CETR documents;
+- the CI configuration loads `cetr_*.yaml`, compiles the CETR package, smokes
+  the CETR CLI and its 14 subcommands, and passes the required reference-SP and
+  initializer artifacts to the fail-closed CUDA preflight;
+- the first audit repair group establishes complete-episode returns, deterministic
+  external parent coverage, fold×role cross-fitting, and one shared normalization
+  on the complete batch before minibatch slicing;
+- the application-layer repair is landed: seed-`-1` preflight mapping, version-2
+  τ artifact path equality, crossed claim bootstrap, exact FCP baseline selection,
+  and actor-only deployment provenance;
+- `validation/run_all_isolated_tests.py` discovers only `test_cetr_*.py` and
+  labels its output as CETR.
 
-The tests cover deterministic multidimensional Halton construction,
-uninformative/revealing/decision-irrelevant response cases, exact binary
-marginalization, probe-conditioned JIT execution, exact filtering, KL
-satisfaction, all method variants, belief independence from decision-only
-parameters, separate finite base/latent updates, latent-before-PPO transaction
-ordering, response-only exclusion of decision anchors, legal rollout and CRN
-anchor collection, base-only training behavior, checkpoint/deployment round
-trip, manifest lineage, and active/legacy repository boundaries.
+## Verification boundary
 
-## Synthetic VOI acceptance values
+Per the current documentation-only requirement, no Python interpreter, project
+code, package manager, compiler, or test runner was executed. Verification was
+limited to Read/Grep/Glob inspection and documentation edits.
 
-`validation/voi_synthetic_diagnostics.json` records:
+Consequently, this report does not claim that the test suite, compile gate,
+workflow parser, CLI smoke commands, configuration loader, or CUDA preflight
+has run successfully after the migration.
 
-- uninformative response: VOI `0.0`, information gain `0.0`, quadrature error
-  `0.0`;
-- decision-revealing response: VOI approximately `0.999329`, information gain
-  approximately `0.690129`;
-- component-identifying but decision-irrelevant response: information gain
-  approximately `0.690129`, VOI `0.0`.
+## Not established
 
-This directly checks that active DELTA values information only through its
-consequence for action choice, not through partner identifiability itself.
-
-## Contract validation
-
-- Active source and experiment applications compile successfully.
-- All six registered Simple/Wide mechanical/development/formal configurations
-  load and pass exact-field validation.
-- All 15 CLI subcommands and the top-level CLI parse their help paths.
-- `.github/workflows/delta-unified-ci.yml` parses as YAML and contains the CPU
-  acceptance and optional self-hosted CUDA jobs.
-- `src/path_c/` and the old root analysis track are absent from the active tree.
-- Active applications contain no `src.path_c` import.
-- Retired comparator/separation/context-dropout/capability/gradient-routing/
-  decision-regret/cross-log-likelihood tokens are absent from `src/delta_zsc`.
-- No credential-like private-key, GitHub-token, or AWS-key pattern was found.
-- The complete old package, applications, configs, tests, workflow, analysis,
-  and status ledgers remain available only under explicit legacy paths.
-
-## Configuration identity
-
-The six registered configurations are
-
-`experiments/overcooked_v2/configs/delta_unified_{simple,wide}_{development,formal,mechanical}.yaml`.
-
-Configuration identity is the resolved configuration itself, not a digest of it.
-Every run writes its complete resolved config into `run_identity.json`, into the
-checkpoint descriptor identity, and into `deployment_bundle.json`; `ensure_run_identity`
-refuses to reuse an output directory whose recorded config differs. Changing a
-configuration therefore still changes the experiment identity, and the difference is
-readable rather than opaque.
-
-## Not executed in this container
-
-The following require resources not present in the local runtime and are not
-represented as passed:
-
-1. editable installation under the exact registered Python 3.10 dependency
-   environment;
-2. restoration and execution of real Official partner checkpoints;
-3. the self-hosted single-GPU CUDA mechanical preflight;
-4. paired five-seed Simple/Wide development matrices;
-5. ten-run formal training/evaluation and H1/H2/H3 inference.
-
-The repository provides executable commands and a fail-closed workflow for
-these operations. Their absence prevents a performance or SOTA claim, but does
-not invalidate the CPU-side implementation acceptance described above.
-
-## Source identity
-
-The source of record is the git history of this repository: a revision is named
-by its commit, not by a checksum manifest. `SOURCE_MANIFEST_SHA256.txt` and the
-ZIP checksum sidecar were removed together with every other digest in the tree.
+- CUDA mechanical preflight or peak-memory acceptance;
+- development-support artifacts or confirmatory evaluation artifacts;
+- formal ten-seed training or held-out external evaluation;
+- any CETR performance result, GO/NO-GO decision, or SOTA claim.

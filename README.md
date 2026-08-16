@@ -1,176 +1,91 @@
-# DELTA-ZSC: Decision-Relevant Bayesian Adaptation for Zero-Shot Coordination
+# CETR-ZSC
 
-This repository contains the unified DELTA-ZSC implementation for the
-OvercookedV2 Test-Time Protocol Formation benchmark.
+This repository contains the active CETR-ZSC (constrained episodic tail-robust
+zero-shot coordination) implementation for the OvercookedV2 Test-Time Protocol
+Formation benchmark.
 
-Active identity:
+The active method identity is defined only by
+[`src/cetr_zsc/config.py`](src/cetr_zsc/config.py):
 
-- `METHOD_VERSION = delta_joint_response_decision_mirror_voi_v2`
-- `CONFIG_VERSION = 1`
-- `CHECKPOINT_SCHEMA_VERSION = 1`
-- `MANIFEST_VERSION = 1`
-- active Python namespace: `src/delta_zsc/`
-- active CLI: `python -m experiments.overcooked_v2.delta_zsc`
+- `METHOD_VERSION = constrained_episodic_tail_robust_zsc_v1`
+- active configuration contract: `version: 6`
+- active package root: `src/cetr_zsc/`
+- active CLI entry point: `experiments/overcooked_v2/cetr_zsc.py`
 
-The complete previous DEPI v8 source package, experiment applications,
-configurations, workflow, and tests are preserved under
-`legacy/implementation_v8/`. They are historical evidence and do not define
-the current method.
+Registered budgets, seeds, schemas, and sample sizes are not duplicated here;
+[`src/cetr_zsc/config.py`](src/cetr_zsc/config.py) is the sole authority.
 
-## One scientific principle
+## Method in one page
 
-DELTA treats observable teammate responses and sparse counterfactual action
-returns as two observation channels of one exchangeable latent coordination
-mode:
+CETR trains one partner-agnostic recurrent actor, initialized from a
+seed-matched Official-SP actor and then trained as one complete actor tree. The
+external target is parent-level lower-half CVaR over completed raw episodic
+returns. Its self-play performance is an explicit reference-derived constraint,
+implemented with a dual variable rather than a hand-tuned tolerance or loss
+weight.
+
+Training uses the complete undiscounted raw return-to-go. External parents are
+assigned deterministically with full fold×role coverage on every update, and
+checkpoint stages rotate by update and lane slot. Parent tail weights are
+computed from completed episode returns with double cross-fitting; the complete
+`EpisodeBatch` is normalized exactly once before minibatch slicing, with no
+observed-subset re-normalization. Self-play uses the same current policy on both
+sides with independent recurrent carries, so its gradient is the bilateral
+self-composition gradient. A scalar value baseline exists only to reduce
+policy-gradient variance.
+
+Deployment is deliberately small:
 
 ```text
-legal local history
-    -> response-only Bayesian belief b_t(z)
-    -> latent-conditioned action-return model Q_z(a)
-    -> KL-constrained mirror improvement
-    -> optional decision-relevant value of the next response
+local observation and recurrent history
+    -> one CNN-to-GRU actor
+    -> action
 ```
 
-There is one shared base actor-critic, not one actor or critic per partner type.
-The latent components are exchangeable coordination modes, not partner IDs,
-algorithms, or a finite taxonomy of collaborators.
+Partner IDs, algorithm labels, checkpoint metadata, parent groups, co-training
+lineage, `q`, the SP dual, hidden simulator state, future responses, and
+counterfactual returns are not deployment inputs. Deployment bundle version 7
+contains only the actor parameter subtree; the reference artifact and training
+manifest are same-directory provenance records, including `provenance.json`,
+for audit binding rather than runtime use.
 
-## Training and deployment boundary
+## Evaluation boundary
 
-Two estimators are deliberately separated:
+The primary question is held-out external-partner robustness. The confirmatory
+panel is lineage-disjoint from development support in both parent and
+co-training lineage. The primary report contains external mean, external
+lower-half CVaR, and self-play minus the reference-derived target. The `10×10`
+population matrix is supplementary and does not replace the confirmatory
+estimand.
 
-1. `base_params` are optimized by on-policy recurrent PPO only. Training
-   rollouts and counterfactual continuations always use the base policy.
-2. `latent_params` are optimized by one composite proper predictive score over
-   response observations and sparse CRN all-action return observations.
+The decisive comparison is Official-SP, Official-OP, Official-FCP, the retired
+V6 DELTA-active result as a historical comparator, and CETR-ZSC. Evaluation
+summaries are descriptive; the unique `claim` entry point compares CETR against
+exactly `{"fcp"}` using crossed ego-run/parent-lineage bootstrap and paired
+seed-index self-play differences. GO, NO-GO, and INCONCLUSIVE are defined in
+`docs/SCIENTIFIC_SPEC.md` and `docs/RESEARCH_PLAN.md`. No performance claim
+exists until the registered formal runs and raw evaluation artifacts are
+complete. **CETR 尚无训练结果。**
 
-Each outer update is an explicit alternating transaction. The latent update
-first consumes the rollout and anchors under the exact collection-time base
-parameter tree; only after that transaction is committed do PPO minibatches
-change the base policy. Thus no decision emission is trained against CRN
-returns generated by a different continuation policy.
+## Repository contracts
 
-At deployment the two estimates are combined analytically. The base policy is
-updated inside a fixed KL ball using posterior expected action values. No
-auxiliary adaptation actor, comparator, pseudo-label router, capability GRU,
-separation loss, or gradient-routing table remains.
+- [`docs/PROTOCOL_INDEX.md`](docs/PROTOCOL_INDEX.md) maps questions to the only
+  authoritative documents.
+- [`docs/METHOD_SPEC.md`](docs/METHOD_SPEC.md) defines the objective, contracts,
+  training transaction, and legal information boundary.
+- [`docs/SCIENTIFIC_SPEC.md`](docs/SCIENTIFIC_SPEC.md) defines the registered
+  problem, panels, endpoints, and decision rules.
+- [`docs/THEORY.md`](docs/THEORY.md) separates exact algebra from approximation
+  and non-claims.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) maps equations to CETR source
+  files and application entry points.
+- [`docs/RESEARCH_PLAN.md`](docs/RESEARCH_PLAN.md) defines panel disjointness and
+  the decisive experiment.
+- [`docs/status/DASHBOARD.md`](docs/status/DASHBOARD.md) records implementation
+  and evidence status.
+- [`IMPLEMENTATION_MATRIX.md`](IMPLEMENTATION_MATRIX.md) traces requirements to
+  code.
 
-## Completed active VOI
-
-For each candidate probe action, DELTA constructs its full factorized teammate
-response distribution. Visibility is summed exactly; position, direction and
-inventory are integrated by a deterministic multidimensional Halton rule; and
-observable inventory-change is summed exactly. Every resulting outcome is
-scored under every latent component, followed by an exact categorical Bayes
-update. DELTA then evaluates how much the updated belief improves the best
-latent-conditioned decision:
-
-\[
-\widehat{\mathrm{VOI}}_S(a)
-=
-\mathcal Q^{\rm RB}_S\!\left[
-V\!\left(b^{a,Y};\mu^a\right)
-\right]
--
-V\!\left(\bar b;\mu^a\right),
-\]
-Here `Q_S^RB` denotes exact summation over source components, visibility, and
-legal inventory-change outcomes, with Halton integration only over the
-remaining categorical product. This is not an entropy bonus or an expected-cross-log-likelihood proxy. Expected
-information gain is reported separately and never added to reward. The active
-policy uses `max(VOI_raw, 0)` only to suppress finite-quadrature negative noise.
-The nested `S/2` versus `S` Halton-prefix difference is emitted as a numerical
-convergence diagnostic and never gates the policy.
-
-The registered implementation is a one-response, decision-equivalence VOI. It
-supports probe-conditioned future utility matrices, while the standard
-OvercookedV2 path uses a local-stationarity surrogate. The exact scope and its
-error bound are stated in `docs/THEORY.md`; the code does not claim to solve the
-full Bayes-adaptive POMDP.
-
-## Scientific method fields
-
-Only three configuration fields define the method:
-
-```yaml
-method:
-  latent_components: 4
-  continuation_horizon: 128
-  adaptation_kl_budget: 0.04
-```
-
-`K` is latent capacity, `H` defines the CRN decision-return estimand, and
-`delta` bounds deployment deviation from the base policy. Network widths,
-optimizer values, quadrature samples, rollout counts, and bootstrap replicates
-are engineering or measurement settings, not additional mechanisms.
-
-## Registered variants
-
-- `history_rnn`: full recurrent history reference.
-- `base`: task-only recurrence plus memoryless current-partner geometry.
-- `response_only`: learns the response latent model but does not adapt actions.
-- `delta_passive`: response belief + decision emission + KL mirror adaptation.
-- `delta_active`: passive DELTA + deterministic Bayesian response VOI.
-
-`history_rnn_extra` and `base_extra` exist only in the development matrix and
-reallocate the exact anchor simulator cost to additional PPO interaction.
-
-## Authoritative documents
-
-1. `docs/SCIENTIFIC_SPEC.md` — problem, legal information, hypotheses and non-claims.
-2. `docs/METHOD_SPEC.md` — executable mathematical specification.
-3. `docs/THEORY.md` — finite guarantees, VOI scope and limitations.
-4. `docs/ARCHITECTURE.md` — equation-to-code and parameter ownership map.
-5. `docs/EVALUATION_SPEC.md` — development and confirmatory statistics.
-6. `docs/FORMAL_EXPERIMENT_PROTOCOL.md` — frozen numerical protocol.
-
-## Installation
-
-The formal environment is Python 3.10 with the pinned dependencies in
-`pyproject.toml` and the Official OvercookedV2 source commit recorded by the
-configuration contract.
-
-```bash
-python3.10 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-## Core verification
-
-```bash
-python -m compileall -q src/delta_zsc experiments/overcooked_v2
-pytest -q experiments/overcooked_v2/tests/test_delta_unified_voi.py
-pytest -q experiments/overcooked_v2/tests/test_delta_unified_core.py
-pytest -q experiments/overcooked_v2/tests/test_delta_unified_training.py
-pytest -q experiments/overcooked_v2/tests/test_delta_unified_runner_storage.py
-pytest -q experiments/overcooked_v2/tests/test_delta_unified_manifest.py
-pytest -q experiments/overcooked_v2/tests/test_delta_unified_repository.py
-python -m experiments.overcooked_v2.delta_zsc --help
-```
-
-The six test files are run in separate processes in CI to avoid retaining
-multiple large JAX compilation caches in one CPU worker.
-
-## Main commands
-
-```bash
-python -m experiments.overcooked_v2.delta_zsc build-partner-manifest --help
-python -m experiments.overcooked_v2.delta_zsc validate-partner-manifest --help
-python -m experiments.overcooked_v2.delta_zsc train --help
-python -m experiments.overcooked_v2.delta_zsc cuda-preflight --help
-python -m experiments.overcooked_v2.delta_zsc run-development-matrix --help
-python -m experiments.overcooked_v2.delta_zsc evaluate --help
-python -m experiments.overcooked_v2.delta_zsc posterior-diagnostics --help
-python -m experiments.overcooked_v2.delta_zsc belief-intervention --help
-python -m experiments.overcooked_v2.delta_zsc resource-report --help
-python -m experiments.overcooked_v2.delta_zsc formal-claim --help
-```
-
-## Evidence status
-
-The repository implements and tests the method and artifact chain. It does not
-contain formal benchmark results and therefore makes no SOTA claim by itself.
-Only frozen Simple/Wide matrices generated under the registered protocol may be
-used for paper-level performance claims.
+V6 DELTA and DEPI are retired and removed from the active tree. Their prior code,
+contracts, and results are historical only and are preserved by git history; no
+historical artifact defines CETR.
