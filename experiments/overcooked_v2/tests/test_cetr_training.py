@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, NamedTuple
 
 import numpy as np
+
+from src.cetr_zsc.config import ModelConfig, PPOConfig
+
+
+@dataclass(frozen=True, slots=True)
+class _TestConfig:
+    """Hashable config stand-in: CetrModel is a jit static argument, and a
+    SimpleNamespace config would make the model unhashable."""
+
+    model: ModelConfig
+    ppo: PPOConfig
 
 
 def _batch_for_weights():
@@ -208,11 +220,10 @@ def _model_and_batch():
     import jax
     import jax.numpy as jnp
 
-    from src.cetr_zsc.config import ModelConfig, PPOConfig
     from src.cetr_zsc.model import CetrModel
     from src.cetr_zsc.types import EpisodeBatch
 
-    config = SimpleNamespace(
+    config = _TestConfig(
         model=ModelConfig(task_hidden_dim=128, task_embedding_dim=128),
         ppo=PPOConfig(
             update_epochs=1,
