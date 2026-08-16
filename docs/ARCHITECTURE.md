@@ -1,220 +1,142 @@
-# ARCHITECTURE — DELTA-ZSC v6 equation-to-code map
+# ARCHITECTURE — CETR-ZSC equation-to-code map
 
 `authoritative: true`
 
-## 1. Scientific object map
+The active source boundary is the CETR package and its Overcooked integration.
+The method identity and registered values live in
+[`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py). The paths below are the
+only active equation-to-code targets in this contract; V6 DELTA paths are
+retired and are not wrappers or fallback implementations.
 
-| Object | Active implementation |
+## 1. Equation and object map
+
+| Equation or object | Active implementation |
 |---|---|
-| immutable Official actor + residual/value branch | `src/delta_zsc/base_policy.py` |
-| direct/interface response extraction | `src/delta_zsc/observation.py` |
-| legal Beta history statistics | `src/delta_zsc/behavior_statistics.py` |
-| episode-static prior and Bayes correction | `src/delta_zsc/belief_filter.py` |
-| shared occurrence / centered semantic emissions | `src/delta_zsc/response_model.py` |
-| unlabeled spectral-simplex artifact | `src/delta_zsc/semantic_initializer.py` |
-| belief-conditioned raw-return value | `src/delta_zsc/belief_value.py` |
-| pairwise CRN action contrasts | `src/delta_zsc/contrast.py` |
-| two-step successor features | `src/delta_zsc/successor_feature.py` |
-| anchor world buffer | `src/delta_zsc/anchor_buffer.py` |
-| Official SP transplant | `src/delta_zsc/official_initializer.py` |
-| unified legal state transition | `src/delta_zsc/latent_model.py`, `model.py` |
-| exact delayed 66-outcome VOI | `src/delta_zsc/bayes_voi.py` |
-| analytic KL mirror policy | `src/delta_zsc/mirror_policy.py` |
-| current/successor CRN anchors | `src/delta_zsc/anchors.py` |
-| channel-normalized losses | `src/delta_zsc/losses.py` |
-| optimizer transaction | `src/delta_zsc/training.py` |
-| vector rollout and sparse snapshots | `src/delta_zsc/runner.py` |
-| training, audit, deployment export | `experiments/overcooked_v2/training_app.py` |
-| initializer and posterior diagnostics | `experiments/overcooked_v2/calibration_app.py` |
-| one active CLI | `experiments/overcooked_v2/delta_zsc.py` |
+| method identity, config schema, method constants and run identity | `src/cetr_zsc/config.py` |
+| Official-isomorphic CNN-to-GRU actor and scalar value baseline | `src/cetr_zsc/model.py` |
+| parent nominal distribution `p0`, lower-half set `Q`, and closed-form `q*` | `src/cetr_zsc/risk.py` |
+| complete raw return-to-go, fixed advantages, shared normalization, PPO and dual terms | `src/cetr_zsc/losses.py` |
+| whole-episode collection and self-composition streams | `src/cetr_zsc/runner.py` |
+| parent manifests, mechanism strata, stage grouping, and lineage-disjoint panels | `src/cetr_zsc/partners.py` |
+| cross-fitting, primal-dual transaction ordering, and train-state updates | `src/cetr_zsc/training.py` |
+| active CLI and command dispatch | `experiments/overcooked_v2/cetr_zsc.py` |
+| training orchestration and checkpoint scheduling | `experiments/overcooked_v2/training_app.py` |
+| raw evaluation rows, external mean/tail and self-play measurements | `experiments/overcooked_v2/evaluation_app.py` |
+| GO/NO-GO/INCONCLUSIVE claim builder | `experiments/overcooked_v2/claim_app.py` |
+| seed-matched Official-SP measurement and derived `tau_SP` artifact | `experiments/overcooked_v2/reference_sp_app.py` |
+| legal deployment bundle and `o_t,h_t -> pi_theta -> a_t` runtime | `experiments/overcooked_v2/deployment.py` |
 
-There is deliberately no active `transition.py`: physical-time latent dynamics
-were removed in v4.  There is no active `decision_model.py` either: the
-component-wise Gaussian return mixture was removed in v5.  Holding its component
-residuals at zero moved the fitted training NLL by 1.1%, so the K component
-means were not identified by the data -- one shared function explained
-essentially the whole likelihood, and the ordering metrics it produced sat at
-chance.  What the trajectories do identify is the belief-conditioned marginal
-value, which `belief_value.py` models.
+## 2. Objective wiring
 
-## 2. Parameter ownership
+The risk module owns the finite parent-level calculation
 
-`base_params["reference"]` owns the embedded Official frame encoder, GRU,
-actor trunk and actor head. It is deployable state but not an optimizer owner.
+\[
+\widehat\rho_{\mathrm{ext}}
+ =\min_{q\in\mathcal Q_{1/2}(p_0)}
+   \sum_g q_g\widehat J_g,
+\qquad
+\mathcal Q_{1/2}(p_0)=
+ \{q\in\Delta:0\le q_g\le2p_{0,g}\}.
+\]
 
-`base_params["trainable"]` owns the instantaneous partner encoder,
-zero-initialized residual actor and value branch. PPO and its Adam state contain
-only this subtree.
+`src/cetr_zsc/partners.py` supplies parent identity for training and evaluation
+bookkeeping only. `src/cetr_zsc/risk.py` groups checkpoint stages under their
+parent and returns weights; it never adds parent metadata to the actor input.
 
-`latent_params` own:
+The losses module combines the risk-weighted external policy-gradient estimator
+with the bilateral self-play contribution and the scalar-baseline variance
+reduction term:
 
-- shared component embeddings;
-- immediate response model;
-- delayed probe-response model;
-- belief-conditioned critic and successor feature model.
+\[
+\mathcal L(\theta,\lambda)=
+\rho_{\mathrm{ext}}(\theta)+
+\lambda(J_{\mathrm{SP}}(\theta)-\tau_{\mathrm{SP}}).
+\]
 
-The trainable base and latent trees are disjoint and have separate Adam states.
-PPO receives a stop-gradient latent tree. The latent loss receives a
-stop-gradient base tree. The reference has neither optimizer state nor gradient.
+`src/cetr_zsc/training.py` enforces the order: collect completed episodes,
+compute cross-fitted weights, compute and freeze full-return advantages, perform
+one primal PPO update, then perform one projected dual update. It does not merge
+the dual state into deployment parameters.
 
-## 3. Runtime state
+## 3. Model and deployment state
 
-`PolicyState` contains only:
+`src/cetr_zsc/model.py` contains one partner-agnostic recurrent actor with the
+Official CNN-to-GRU structure and one scalar value baseline. Both self-play
+sides use the same actor parameters but independent recurrent carries. The value
+baseline is used only during training and is not an action correction.
 
-- task recurrent carry;
-- episode-static categorical belief;
-- six Beta statistics;
-- previous local observation;
-- previous ego action;
-- episode-start flag.
-- active-probe continuation flag.
+`experiments/overcooked_v2/deployment.py` exports only the actor and its legal
+recurrent carry. Its runtime graph is
 
-It contains no partner ID, counterfactual return, hidden environment state,
-future response, semantic initializer metadata, or decision anchor.
+\[
+(o_t,h_t)\longrightarrow\pi_\theta\longrightarrow a_t.
+\]
 
-## 4. Immediate step order
+It does not consume parent groups, `p0`, `q`, cross-fitting folds, `lambda`,
+reference metadata, partner IDs, hidden state, future responses, or
+counterfactual returns. These fields remain in training/evaluation artifacts,
+not in deployment state.
 
-`DeltaModel.step` executes:
+## 4. Training data flow
 
-1. immutable Official task update from the complete legal local frame;
-2. episode-static prior reset/persistence;
-3. immediate response extraction from stored previous observation and action;
-4. shared and semantic response prediction;
-5. semantic-only Bayes correction;
-6. legal statistics update;
-7. belief-conditioned action values;
-8. optional delayed probe-response and successor-state action values;
-9. exact VOI for `delta_active`;
-10. residual/reference projection;
-11. passive or active mirror policy;
-12. final reference-relative projection;
-13. storage of the current observation for the next legal response.
+`src/cetr_zsc/runner.py` collects complete episodes. It records raw rewards,
+terminal boundaries, actor log probabilities, scalar-baseline outputs, and the
+independent self-play stream needed for the bilateral self-composition gradient.
+There is no cross-episode continuation target.
 
-The executed action and terminal flag are inserted only after the environment
-transition by `observe_after_transition`.
+`src/cetr_zsc/training.py` assigns external lanes to two cross-fitting folds.
+Completed parent returns from fold A produce weights for fold B and vice versa.
+All collected samples then receive one shared advantage normalization. The
+normalization is not repeated per parent or per mechanism.
 
-## 5. Response model topology
-
-Both immediate and delayed models have:
+The training transaction is intentionally narrow:
 
 ```text
-full frame -> frame MLP
-legal behavior features + ego/probe action embedding
-    -> shared context trunk
-        -> shared occurrence heads
-        -> component trunk(shared context, component embedding)
-            -> context residual
-component embedding -> direct residual skip
-shared semantic logits + centered(context + skip + initializer bias)
+collect complete episodes
+    -> estimate parent returns
+    -> cross-fit lower-half q weights
+    -> compute/freeze full-return advantages
+    -> one primal PPO update
+    -> one dual update
 ```
 
-Immediate semantic heads cover position, direction, inventory, and event.
-Delayed semantic prediction contains the event head required by active VOI.
+No posterior, latent response branch, active probe path, continuation anchor,
+mirror policy, group-wise maximization loss, or snapshot-only self-play path is
+part of the active architecture. Those V6 mechanisms were retired rather than
+hidden behind compatibility switches.
 
-## 6. Decision topology
+## 5. Partner and panel flow
 
-The decision side is one belief-conditioned critic in dueling form:
+`src/cetr_zsc/partners.py` defines the training-support mechanism mixture and
+parent-level lineage records. The development-support panel and confirmatory
+panel are disjoint in both parent and co-training lineage. A checkpoint stage
+belongs to its parent and cannot be counted as an independent parent.
 
-```text
-task features + instantaneous partner + behavior + posterior
-    + stopgrad(posterior-weighted full component embedding)
-    -> shared trunk -> state value
-                    -> E independent advantage heads
-advantage is centered under the acting policy; the ensemble spread is
-reported, never trained
-```
+`experiments/overcooked_v2/reference_sp_app.py` measures the seed-matched
+Official-SP reference and writes the artifact from which `tau_SP` is derived.
+The reference artifact is an input to training identity and audit, never to the
+runtime action path.
 
-Component-conditional values are the same critic evaluated at each one-hot
-posterior, so `[...,K,A]` is a read-out rather than a separately parameterised
-head. Two channels train it, both on raw task reward so they estimate one
-quantity:
+## 6. Evaluation and claim flow
 
-- TD(lambda) on every rollout step, bootstrapping from a Polyak target copy;
-- precision-weighted regression of its action *differences* onto the measured
-  same-replica CRN contrasts, whenever an anchor batch exists.
+`experiments/overcooked_v2/evaluation_app.py` consumes the common policy and
+partner manifests and reports raw complete-episode returns, external mean,
+parent-level lower-half CVaR, and self-play minus the reference-derived target.
+It preserves ego/partner role and lineage units.
 
-The sparse contrast executable updates the post-TD critic parameters while its
-detached feature replay uses the collection-time base and latent trees. The
-measured continuation and the posterior-conditioned state representation are
-therefore from one estimator snapshot.
+`experiments/overcooked_v2/claim_app.py` applies the pre-registered GO,
+NO-GO, and INCONCLUSIVE rules without selecting a favorable checkpoint or
+replacing a missing seed. The `10×10` population matrix is an explicitly
+supplementary analysis and does not replace the lineage-disjoint confirmatory
+estimand.
 
-The successor model predicts the `t+2` features under a probe and its observed
-delayed response, so active VOI evaluates the critic where the decision is
-actually made rather than at the current state.
+## 7. Artifact and historical boundary
 
-## 7. Training data alignment
+`src/cetr_zsc/config.py` is the sole identity authority for the active
+configuration. `training_app.py`, `evaluation_app.py`, `reference_sp_app.py`,
+`deployment.py`, and `claim_app.py` must bind resolved config and lineage fields
+by name, not by copied constants.
 
-Training lanes are fixed as first-half self-play and second-half frozen
-cross-play. The self partner has an independent `PolicyState`. PPO reads both
-groups through paired minibatches; all latent and anchor channels slice to the
-second half before estimation. The generic `collect_rollout` leaves mixed mode
-off, so diagnostic partner panels stay frozen.
-
-A rollout stores `T+1` legal observations and `T` terminal-aware response-next
-frames. Immediate response target `t` is:
-
-```text
-observations[t] -> response_next_observations[t] under actions[t]
-```
-
-Delayed probe target `t` is:
-
-```text
-probe input: observations[t], actions[t]
-response: response_next_observations[t] -> response_next_observations[t+1]
-alignment/exclusion action: actions[t+1]
-valid: not dones[t] and not dones[t+1]
-```
-
-This indexing is encoded in `RolloutBatch` and tested directly.
-
-## 8. Anchor memory boundary
-
-Current anchors materialize `N x A x R` worlds. Active anchors traverse the
-probe axis, one unforced base bridge, and the post-response decision-action axis
-with nested `lax.map`; only `N x R` worlds are live. Returned arrays are still
-complete:
-
-- current fit/evaluation means `[N,A]`;
-- current replicas `[N,A,R]`;
-- successor means `[N,P,A]`;
-- successor replicas `[N,P,A,R]`;
-- covariance `[N,5,5]` and `[N,P,5,5]`;
-- validity masks.
-
-## 9. Static execution paths
-
-- PPO replay: `compute_latent=False`, `execute_adaptation=False`;
-- response/decision MLE replay: `compute_latent=True`,
-  `execute_adaptation=False`;
-- current anchors: forced measured action, then base policy;
-- active successor anchors: forced probe, one base bridge, forced `t+2`
-  decision action, then base policy;
-- evaluation/deployment: `compute_latent=True`,
-  `execute_adaptation=True`.
-
-These are compile-time paths, not learned gates.
-
-## 10. Artifact and schema boundary
-
-- method: `delta_self_consistent_decision_grounded_residual_v6`;
-- config schema: 4;
-- checkpoint schema: 6;
-- deployment bundle: 5;
-- evaluation schema: 3;
-- manifest schema: 2;
-- semantic initializer schema: 1.
-
-Training identity includes the resolved initializer mapping and source path.
-Development/formal semantic variants reject a missing initializer and validate
-its method version, layout, K, calibration role, event count, and parent-lineage
-disjointness from the DELTA training support. The semantic initializer may use
-its deterministic fallback only where that existing semantic contract permits
-it; the Official-SP actor initializer is mandatory for every v6 training
-entry. v5 and earlier DELTA state is not loaded.
-
-## 11. Active and historical boundaries
-
-Only `src/delta_zsc/` and the applications listed by the repository test are
-active. All DEPI v8 and earlier code, documents and workflows have been
-removed from the tree; nothing historical defines the active method.
+The former V6/DEPI implementation is removed from the active tree and retained
+only in git history. No active import, fallback, or deployment bundle may load
+its checkpoints or reinterpret its schemas as CETR artifacts.

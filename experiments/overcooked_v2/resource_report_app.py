@@ -1,4 +1,4 @@
-"""Aggregate marginal, shared, amortized, and fully-loaded DELTA costs."""
+"""Aggregate marginal, shared, amortized, and fully-loaded CETR costs."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ from typing import Any
 
 import numpy as np
 
-from src.delta_zsc.resources import ResourceLedger
-from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
+from src.cetr_zsc.resources import ResourceLedger
+from src.cetr_zsc.storage import ensure_run_identity, read_json, write_json
 
 
 def _read(path: Path) -> ResourceLedger:
@@ -99,7 +99,7 @@ def run_resource_report(args: argparse.Namespace) -> None:
     ensure_run_identity(
         output,
         {
-            "stage": "delta-resource-report",
+            "stage": "cetr-resource-report",
             "sources": sources,
         },
     )
@@ -107,7 +107,7 @@ def run_resource_report(args: argparse.Namespace) -> None:
         output / "resource_report.json",
         {
             "version": 1,
-            "artifact_type": "delta_resource_report",
+            "artifact_type": "cetr_resource_report",
             "accounting_rule": (
                 "shared upstream cost appears in every ego ledger for disclosure, "
                 "but is counted once per reproduced study and amortized over ego runs"
@@ -121,7 +121,7 @@ def run_resource_report(args: argparse.Namespace) -> None:
         writer.writeheader()
         writer.writerows(rows)
     lines = [
-        "# DELTA-ZSC resource report",
+        "# CETR-ZSC resource report",
         "",
         "| Method | Ego runs | Marginal/ego | Shared | Amortized/ego | Post-training | Fully loaded steps | Fully loaded GPU-h | Peak memory | Deploy params | Inference ms |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",

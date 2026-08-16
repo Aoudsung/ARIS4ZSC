@@ -1,25 +1,29 @@
-# DELTA-ZSC v6 status dashboard
+# CETR-ZSC status dashboard
 
-Date: 2026-08-14
+Status: implementation reset after the V6 DELTA retirement.
 
 | Item | Status |
 |---|---|
-| Method/config/checkpoint/deployment identity | implemented: v6 / 4 / 6 / 5 |
-| Full-frame immutable seed-matched Official-SP reference | implemented and sequence-equivalence tested |
-| Zero residual and trainable value branch | implemented and CPU-tested |
-| Fixed 50/50 self/cross-play training lanes | implemented and CPU-tested |
-| Paired group-normalized minimax PPO | implemented and CPU-tested |
-| XP-only latent, successor and anchor channels | implemented and CPU-tested |
-| Detached full response-coordinate critic grounding | implemented and CPU-tested |
-| Final reference-relative KL projection | implemented and CPU-tested |
-| Reference/residual/passive/active evaluation modes | implemented |
-| Episode-static response posterior and exact 66-outcome VOI | retained and CPU-tested |
-| Real 128-lane v6 CUDA preflight | passed on one L40; peak 1,436.18 MiB |
-| Paired v6 development matrix | Simple 45-cell run in progress |
-| Formal v6 Simple/Wide runs | not run |
-| H1/H2/H3 or SOTA claim | unavailable |
+| Active method identity | implemented in [`src/cetr_zsc/config.py`](../../src/cetr_zsc/config.py): `constrained_episodic_tail_robust_zsc_v1` |
+| Active configuration contract | implemented; registered values are owned by [`src/cetr_zsc/config.py`](../../src/cetr_zsc/config.py) (`version: 5`) |
+| CETR package boundary | in progress |
+| CETR model, risk, losses, runner, partners, and training modules | in progress |
+| Overcooked CETR CLI and application integration | in progress |
+| Reference-SP measurement and derived `tau_SP` artifact | in progress |
+| Development-support and confirmatory lineage-disjoint panels | in progress |
+| Formal training | not started |
+| Formal held-out external evaluation | not started |
+| CETR performance claim | none |
+| CETR evidence | none |
+| CETR training results | none — **CETR 尚无训练结果** |
+| V6 DELTA / DEPI implementation | retired and removed from the active tree; prior revisions remain only in git history |
 
-Earlier v5 return measurements diagnose why the base actor had to be revised;
-they are not v6 performance evidence. Proposed SP/XP targets are unachieved.
-The completed CUDA preflight is engineering execution evidence only; it does
-not contribute a return result to any hypothesis.
+The active deployment contract is a single partner-agnostic recurrent actor whose
+runtime reads local observation/history only. Parent groups, tail weights,
+cross-fitting folds, and the SP dual are training-only. The primary confirmatory
+object is the lineage-disjoint held-out external-partner panel; the population
+matrix is supplementary.
+
+No compilation, mechanical check, development artifact, or historical V6 result
+is a CETR performance claim. Formal runs have not begun, and there is currently
+no CETR return evidence to summarize.

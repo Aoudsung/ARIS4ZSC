@@ -7,9 +7,9 @@ from pathlib import Path
 import time
 from typing import Any
 
-from src.delta_zsc.config import load_config
-from src.delta_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
-from src.delta_zsc.storage import ensure_run_identity, write_json
+from src.cetr_zsc.config import load_config
+from src.cetr_zsc.resources import ResourceLedger, parameter_count, peak_device_memory_bytes
+from src.cetr_zsc.storage import ensure_run_identity, write_json
 
 from .official_adapter import (
     compose_official_config,

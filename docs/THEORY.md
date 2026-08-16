@@ -1,224 +1,153 @@
-# THEORY — DELTA-ZSC v6 guarantees, identifiability, and limits
+# THEORY — CETR-ZSC guarantees, approximations, and limits
 
 `authoritative: true`
 
-## 1. Exact episode-static filtering
+This document separates algebraic properties of the CETR contract from
+finite-sample approximations and empirical claims. It introduces no new
+experiment evidence. Registered numerical fields are owned by
+[`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py).
 
-Given a normalized prior `b`, finite semantic log likelihoods `ell_k`, and no
-episode boundary, `belief_filter.py` returns
+## 1. Parent-level lower-half risk
 
-\[
-\operatorname{softmax}(\log b+\ell).
-\]
-
-At an episode boundary it replaces `b` by the uniform prior before correction
-and suppresses the fictitious cross-episode response. The implementation is an
-exact categorical Bayes update for the registered episode-static model. It is
-not a claim that a component equals a unique human protocol.
-
-## 2. Shared factors cannot alter posterior odds
-
-Suppose the complete response likelihood factorizes as
+For fixed parent estimates `\widehat J_g` and nominal masses `p_{0,g}`, the
+finite optimization problem
 
 \[
-p(y\mid k)=p_{sh}(y^{occ})p_{sem}(y^{sem}\mid k).
+\min_{q\in\Delta}\sum_g q_g\widehat J_g
+\quad\text{s.t.}\quad
+0\le q_g\le 2p_{0,g}
 \]
 
-Then
+is a linear program. Sorting parent estimates in ascending order and filling the
+available mass under each cap gives an optimizer. Under a uniform nominal mass
+and an even number of independent parents, its value is the mean of the worst
+half of those parents. This is the algebraic meaning of the lower-half CVaR
+contract; it is not a claim about an infinite population.
+
+The cap prevents all adversarial mass from concentrating on one parent. It also
+means that a single noisy parent cannot have unlimited influence. Neither fact
+proves that the resulting policy will be robust on an unseen distribution.
+
+## 2. Cross-fitting boundary
+
+Double cross-fitting uses completed returns from one fold to determine tail
+weights for the other fold. Therefore an episode's own observed return is not
+used both to select its tail membership and to supply its own weighted update.
+This blocks the direct self-selection path in the finite batch estimator.
+
+Cross-fitting does not make the estimate automatically unbiased under arbitrary
+adaptive sampling, does not remove parent-level dependence, and does not create
+new independent data. Its guarantee is an ordering property of the estimator,
+not a generalization theorem.
+
+## 3. Complete episodic return and fixed advantages
+
+The method's target is the complete undiscounted raw return-to-go of one complete
+episode. Once collected, the return-to-go and scalar-baseline advantage are fixed
+for the whole PPO transaction. Shared normalization preserves a common scale
+across self-play and external samples; it does not prove that PPO follows the
+exact gradient of the population lower-tail objective.
+
+The scalar value baseline is a control variate for policy-gradient variance. It
+has no deployment role and no authority to change the action distribution. A
+well-fitted baseline therefore cannot by itself establish better coordination.
+
+## 4. Self-play composition gradient
+
+If both agents in a self-play episode use `\pi_\theta` and have independent
+recurrent carries, differentiating the joint trajectory likelihood includes both
+sides' log-probability terms. The resulting estimator is the bilateral gradient
+of the self-composition return `J(\pi_\theta,\pi_\theta)` for the sampled
+trajectory distribution, subject to the usual policy-gradient regularity
+conditions. A one-sided snapshot update would estimate a different problem; that
+former V6 construction is retired and is not part of CETR.
+
+This identity does not imply low-variance gradients, global optimization, or
+self-play improvement after an arbitrary PPO step.
+
+## 5. Lagrangian and dual update
+
+For a fixed policy, the constrained objective has Lagrangian
 
 \[
-\frac{b'(i)}{b'(j)}=
-\frac{b(i)p_{sem}(y\mid i)}{b(j)p_{sem}(y\mid j)},
+\mathcal L(\theta,\lambda)=
+\rho_{\mathrm{ext}}(\theta)+
+\lambda(J_{\mathrm{SP}}(\theta)-\tau_{\mathrm{SP}}),
+\quad \lambda\ge0.
 \]
 
-because `p_sh` cancels. v6 enforces this cancellation structurally by removing
-the component axis from occurrence heads and by passing only semantic log
-probabilities to `filter_update`. Therefore high-frequency partner-independent
-no-change events cannot create a component winner.
-
-## 3. Centered residual decomposition
-
-For component logits `L_k=L_0+Delta_k` with `sum_k Delta_k=0`, the component
-mean is exactly `L_0`. Shared prediction and specialization are identifiable as
-separate parameter roles: changing all components equally cannot be represented
-by the residual branch, and changing only the pooled baseline cannot create a
-posterior likelihood ratio.
-
-Centering does not guarantee useful specialization by itself. It removes the
-specific pooled-offset degeneracy and supplies first-order component paths. The
-semantic predictive score still decides whether residual differences persist.
-
-## 4. Spectral-simplex initializer properties
-
-The initializer is centered because both the regular simplex vertices and the
-final bias are zero mean over components. It is label-free because its inputs
-are only episode-grouped event residuals after cross-fitted pooled prediction.
-Every frame coordinate participates through a fixed Rademacher projection whose
-dimension and seed are stored in the artifact; behavior and action features are
-uncompressed. Partner IDs and SP/OP labels are absent from the construction
-function and artifact contract.
-
-SVD chooses directions of greatest unexplained episode-level event variation;
-it does not assert that those directions are true partner identities. The
-simplex gives all components equal norm and pairwise symmetric starting
-geometry, avoiding a privileged random winner.
-
-## 5. Proper response channels and direct decision supervision
-
-Each shared or semantic response term is a mean negative log probability of
-observations generated under the registered conditional model. Their fixed sum
-is a proper composite score for those marginals. Separate normalization changes
-channel scale but not the optimum of an individual channel and prevents sample
-frequency from becoming an implicit coefficient.
-
-The belief-conditioned critic is supervised by raw-reward TD(lambda) and
-pairwise CRN action differences, which directly target state level and action
-ordering rather than fitting a return density. The successor objectives target
-the observed `t+2` encoder state and its value consistency. Every present term
-has coefficient one; no fitted variance, tuning weight or effect threshold is
-introduced.
-
-## 6. Belief-conditioned decision identification
-
-Each trajectory supplies `(x_t,b_t,a_t,r_t,x_{t+1},b_{t+1})`, so the marginal
-raw-return value conditioned on the legal posterior is observed through
-ordinary temporal-difference targets. Sparse all-action anchors identify
-pairwise action differences. Same-replica differencing removes common CRN noise;
-the pooled pair variance bounds the precision of exact or near-exact ties
-without a tunable floor. A dueling parameterization places common state level
-in the value head and centers the action advantage under the acting policy.
-
-The ensemble heads report action-order disagreement. Their spread is not a
-trainable variance and does not create another objective.
-
-## 7. CRN successor estimand
-
-For a probe `a` and post-response action `a'`, the registered target is the
-discounted return beginning at `t+2`, where `a'` is forced after one unforced
-collection-time-base bridge. Rewards on both the probe and bridge transitions
-are excluded. Matched roots and step IDs make noise common across probe and
-decision alternatives. Sequential `lax.map` changes only execution memory,
-not the random variables or estimator.
-
-The successor predictor conditions on the pre-probe legal state and probe. It
-therefore models an expectation over the stochastic probe successor, the
-unforced bridge action, the teammate reaction, and environment transition; it
-is not a deterministic simulator-state value oracle.
-
-## 8. Delayed response causal timing
-
-In the simultaneous-action environment, the partner action at time `t` cannot
-condition on ego action `a_t`. The earliest policy reaction is the partner
-action selected at `t+1`. Therefore the delayed target compares the
-intermediate and delayed observations. Removing the second ego action's direct
-physical effect leaves a legal observable response attributable to the joint
-successor dynamics under the registered continuation distribution.
-
-This target is causal with respect to probe timing but remains observational:
-other state changes and partner stochasticity are integrated by the learned
-conditional distribution.
-
-## 9. Exact 66-outcome normalization
-
-The delayed compact outcome distribution contains:
-
-- two `availability=0` outcomes;
-- two `availability=1, change=0` outcomes;
-- sixty-two `availability=1, change=1` event outcomes.
-
-Shared Bernoulli factors are broadcast across components; the 31-class event is
-normalized per component. Summing the 66 exponentiated log probabilities equals
-one for every probe and component up to floating-point error.
-
-## 10. Non-negativity of exact decision VOI
-
-For fixed probe-conditioned successor matrix `mu^a`,
+The projected update
 
 \[
-V^a(b)=\max_{a'}\sum_k b(k)\mu^a_k(a')
+\lambda^+=[\lambda+\eta(\tau_{\mathrm{SP}}-\widehat J_{\mathrm{SP}})]_+
 \]
 
-is convex in `b`. A Bayes posterior is a martingale under the predictive outcome
-distribution, so Jensen's inequality gives
+increases pressure when measured self-play is below target and leaves the dual
+variable nonnegative. Reusing the actor learning-rate schedule defines the
+registered dual step. This is a standard primal-dual construction, not a proof
+of convergence for the non-convex recurrent PPO problem and not a guarantee that
+finite-run self-play satisfies the constraint.
 
-\[
-\mathbb E_y[V^a(b^{a,y})]-V^a(b)\ge0.
-\]
+## 6. Reference-derived target
 
-The code sums all 66 outcomes exactly. Negative values can therefore only be
-floating-point artifacts or malformed inputs; they are reported, not modified.
+The target `\tau_SP` is a measured return of a seed-matched Official-SP reference
+under the registered evaluation protocol. It is not a manually selected
+threshold and has no artificial tolerance. This removes a hidden tuning degree
+of freedom from the method definition, but the estimate still has measurement
+error and does not guarantee that a trainable actor can attain it.
 
-## 11. Information is not decision value
+The reference initializes the actor, derives the target, and supplies a frozen
+audit baseline. It is not a deployment ensemble or a policy correction.
 
-If every component has the same successor action-value vector, `V^a` is
-independent of belief and VOI is zero even if the response identifies the
-component perfectly. Conversely, action-independent response information can
-produce the same positive VOI for every probe and therefore no active policy
-change. v6 consequently reports action-wise VOI spread, information-gain
-spread, and active/passive policy total variation in addition to their means.
+## 7. Legal information and deployment
 
-## 12. Mirror-policy guarantee
+The deployment state is a recurrent carry derived from the local observation and
+ego action history, together with the episode boundary. The actor therefore
+implements a partner-agnostic mapping from legal local history to actions.
+Training-only parent groups, `q`, cross-fitting folds, `lambda`, reference
+metadata, and counterfactual returns are not in this state. This is an
+information-boundary property of the architecture, not evidence that local
+history is uninformative.
 
-For finite action values and `delta>0`, maximizing expected supplied value under
-`D_KL(pi||pi0)<=delta` has the exponential-tilt solution. Bisection finds the
-active boundary when required. This guarantees optimality only for the supplied
-model-based values. Real-return improvement requires accurate response and
-decision models.
+The lineage-disjoint panel is an evaluation design. It does not become a runtime
+feature and does not prove universal out-of-distribution robustness.
 
-v6 performs a second exponential-geodesic projection after composing residual
-and mirror/VOI logits. Deterministic bisection selects the largest interpolation
-coefficient whose forward KL to the immutable reference is within `delta`.
-This directly proves the final executed bound; it does not rely on a triangle
-inequality, which KL does not possess. The bound constrains policy movement but
-does not by itself prove preservation of return.
+## 8. What is exact, what is approximate
 
-## 13. Identifiability boundary
+Exact or structural within the contract:
 
-Finite mixtures are permutation-invariant. Centering and simplex initialization
-remove a harmful symmetric fixed point but do not establish unique semantic
-labels. Scientific usefulness requires all of the following empirical links:
+- the finite lower-half risk optimizer for supplied parent return estimates;
+- the bilateral form of the self-play likelihood gradient;
+- the nonnegative projection in the dual update;
+- the absence of training-only group, tail, and lineage fields from deployment;
+- the single actor and scalar-baseline parameter ownership described in the
+  method contract.
 
-1. semantic component distributions differ;
-2. legal histories select different mixtures for different partners;
-3. those legal-belief changes induce different critic action orderings;
-4. the correct belief has higher same-world continuation value than a shuffled
-   belief.
+Approximate or empirical:
 
-Posterior sharpness alone is insufficient; a partner-independent global winner
-fails conditions 2 and 4.
+- parent returns and `q` are estimated from finite completed episodes;
+- cross-fitting reduces estimator reuse but does not remove sampling error;
+- PPO and the recurrent function approximation only approximately optimize the
+  constrained objective;
+- the measured reference target is a finite estimate of reference self-play;
+- held-out external mean and lower-half CVaR estimate performance on the
+  registered confirmatory panel, not every possible partner;
+- the population `10×10` matrix estimates a supplementary ordered population
+  object and is not the external-parent estimand.
 
-## 14. Approximation boundary
+## 9. Explicit non-claims
 
-v6 is not a full Bayes-adaptive POMDP solver. The delayed head predicts one
-reaction window, and successor values integrate one registered base bridge plus
-the horizon-`H` continuation. VOI values only the first decision at `t+2` after
-that response, and its incremental control contribution is discounted by
-`gamma^2`. It does not recursively price all future information.
+CETR does not prove:
 
-The successor state entering VOI is a *learned prediction*
-`chi(x_t, b_t, a_t, y)` of the `t+2` encoder features, not the simulated world.
-Its error is therefore method error, and it is reported rather than assumed
-away: the audit records the successor model's held-out feature error against
-the "nothing moves in two steps" identity baseline, and the gap between the
-critic evaluated at the predicted landing state and at the realised one. A
-successor model that cannot beat the identity baseline contributes nothing that
-VOI could use, and the reported numbers say so directly.
+- recovery of partner identity, algorithm, mechanism, or hidden state;
+- unique semantic protocols or a latent partner taxonomy;
+- convergence or global optimality of the primal-dual PPO procedure;
+- that a lower-half training objective guarantees every individual partner;
+- that reference initialization guarantees self-play non-inferiority;
+- that panel-level improvement is SOTA or universal robustness;
+- that a population matrix validates the held-out external estimand;
+- any performance result before the formal confirmatory artifacts exist.
 
-The method also assumes the episode-static latent is an adequate summary of
-partner-relevant convention uncertainty. Continuous within-partner adaptation
-that cannot be represented by legal history features and `K` exchangeable
-residual modes remains model error.
-
-## 15. Explicit non-claims
-
-The implementation does not prove:
-
-- recovery of partner identity or training algorithm;
-- unique latent semantics;
-- calibrated posterior from entropy alone;
-- real-return improvement from mirror adaptation without accurate values --
-  the same-world mirror improvement against the held-out anchor replicas is the
-  measurement that bears on this, and it is a reported diagnostic, not a claim;
-- SOTA performance without complete formal matrices;
-- exact long-horizon active planning;
-- independence of behavior statistics from partner history.
+The former V6 posterior, continuation-anchor, mirror, and VOI machinery was
+retired. No theorem or evidence in this document depends on those deleted
+mechanisms.

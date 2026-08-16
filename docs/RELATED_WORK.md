@@ -1,6 +1,10 @@
-# RELATED_WORK — Provenance and contribution boundary
+# RELATED_WORK — Retired DELTA provenance (historical)
 
 `authoritative: false`
+
+> This document describes the retired V6 method for historical provenance only.
+> It is not an active CETR specification, implementation guide, or evidence source.
+
 
 ## Purpose
 

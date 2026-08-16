@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aris4zsc"
-version = "0.6.0"
-description = "Unified DELTA-ZSC response-decision Bayesian coordination experiments"
+version = "0.7.0"
+description = "CETR-ZSC constrained episodic tail-robust zero-shot coordination experiments"
 requires-python = ">=3.10,<3.11"
 dependencies = [
   "numpy>=1.24,<2",
@@ -37,5 +37,5 @@ dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src.delta_zsc*", "experiments.overcooked_v2*"]
+include = ["src.cetr_zsc*", "experiments.overcooked_v2*"]
 namespaces = true

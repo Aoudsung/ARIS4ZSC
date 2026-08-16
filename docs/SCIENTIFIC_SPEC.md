@@ -1,179 +1,211 @@
-# SCIENTIFIC_SPEC — Decision-relevant episode-static adaptation
+# SCIENTIFIC_SPEC — held-out external-partner robustness
 
 `authoritative: true`
 
 ## 1. Registered substrate
 
-The substrate is OvercookedV2 Test-Time Protocol Formation with 400-step
-episodes, six ego actions, view radius two, negative rewards, random initial
-positions, recipe resampling after delivery, and successful-delivery indication.
-`test_time_simple` and `test_time_wide` are separate layouts; neither may hide
-failure on the other. The pinned local observation has 39 channels on Simple
-and 43 channels on Wide.
+The substrate is the OvercookedV2 Test-Time Protocol Formation benchmark. The
+active layouts, observation contract, episode protocol, action space, environment
+randomization, and all sample-size registrations are defined in
+[`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py). The active resolved
+configuration is `version: 5`; this document does not duplicate the registered
+budget or seed tables.
 
 ## 2. Scientific problem
 
-A previously unseen teammate may express a convention that changes the ego's
-best action. The problem is not to identify the teammate's training algorithm.
-It is to learn, from legal interaction history alone, an uncertainty state that
-supports better decisions while retaining one shared task policy.
+A single deployed policy must coordinate with external teammates whose concrete
+parameters and training lineage were not available during training. The primary
+question is whether one partner-agnostic recurrent actor can improve the mean
+and lower tail of complete raw episodic return on a lineage-disjoint held-out
+external-partner panel while preserving reference-level self-play.
 
-Because a frozen teammate checkpoint is constant within an episode, DELTA v6 represents
-an exchangeable episode-level latent `z_e`. The legal posterior is
+The registered question is the main-report choice A: held-out external-partner
+robustness. Training-support performance and a population cross-play matrix are
+not substitutes for this estimand.
 
-\[
-b_t(z)=p(z_e=z\mid H_t),
-\]
-
-and its current decision value is learned directly from that posterior:
-
-\[
-Q_\psi(x_t,b_t,a).
-\]
-
-For active DELTA, candidate probes also receive the value of a delayed partner
-response under a probe-conditioned successor decision matrix.
-
-Task competence is anchored by an immutable, seed-matched Official-SP
-reference actor. A zero-initialized residual learns shared and belief-dependent
-coordination changes, while every executed residual/mirror policy is finally
-projected into the registered KL ball around that reference.
-
-## 3. Legal deployment information
-
-Deployment may use only:
-
-- local observation history;
-- previously executed ego actions;
-- episode boundaries;
-- deterministic behavior statistics computed from observable responses;
-- learned shared/semantic response models;
-- the episode-static categorical posterior;
-- the learned belief-conditioned action value and successor feature model.
-
-The immutable reference consumes the same complete local observation exposed
-to the Official policy. This is legal local information; it is not hidden
-partner state or identity metadata.
-
-Deployment may not use partner run ID, SP/OP label, checkpoint stage, training
-family, hidden simulator state, future observations, counterfactual returns, or
-manifest lineage.
-
-## 4. Unified latent semantics
-
-A component is exchangeable and is defined by:
-
-1. a conditional immediate semantic response distribution;
-2. for active DELTA, a conditional delayed probe-response distribution.
-
-Shared occurrence heads model pooled visibility/change frequencies but do not
-define component semantics and cannot alter posterior odds.
-
-A component is scientifically useful only when legal semantic evidence selects
-it differently across partners and the resulting posterior changes action
-ordering in the belief-conditioned raw-return critic. Posterior entropy
-reduction alone is not evidence of adaptation.
-
-## 5. Primary hypotheses
-
-### H1 — final-checkpoint performance
-
-On both Simple and Wide, final-checkpoint `delta_active` exceeds every registered
-same-protocol baseline. For each contrast, the one-sided crossed-node bootstrap
-lower bound must be positive and the point estimate must be at least one
-correct delivery, 20 raw-return points.
-
-### H2 — decision-emission contribution
-
-At fixed `K=4`, partner distribution, base budget, architecture, seed, and
-panel:
+The method identity under test is
+`constrained_episodic_tail_robust_zsc_v1`. Its objective is
 
 \[
-J(\text{delta_passive})>J(\text{response_only})
+\max_\theta\ \rho_{\mathrm{ext}}(\theta)
+\quad\text{s.t.}\quad
+J_{\mathrm{SP}}(\theta)\ge\tau_{\mathrm{SP}},
 \]
 
-on both layouts. This isolates current decision supervision and mirror
-adaptation from response prediction alone.
+where `\rho_ext` is the parent-level lower-half risk objective and `\tau_SP` is
+derived from the measured seed-matched Official-SP reference. The complete
+objective and estimator ordering are authoritative in `METHOD_SPEC.md`.
 
-### H3 — causal value of the legal belief
+## 3. Legal deployment information boundary
 
-Holding source world, base logits, learned decision matrix, and CRN outcomes
-fixed, the correct legal-history belief must produce higher empirical
-continuation value than a task-matched shuffled belief:
+The deployed actor may read only:
+
+- the current local observation;
+- its own previously executed action history;
+- its recurrent carry derived from that local history;
+- episode-start and terminal boundaries.
+
+The deployment policy may not read or reconstruct partner run ID, algorithm,
+checkpoint stage, family or mechanism label, parent group, co-training lineage,
+hidden simulator state, future observation, counterfactual return, or any
+manifest field. It has no online partner classifier, posterior, VOI controller,
+partner-specific adapter, or deployment critic.
+
+The following are training-only variables and are never part of deployment
+state or action selection:
+
+- parent groups and mechanism strata;
+- nominal and adversarial parent weights `p0` and `q`;
+- cross-fitting fold membership;
+- the measured reference target `\tau_SP`;
+- the adaptive Lagrange multiplier `\lambda`;
+- partner manifests, lineage records, and checkpoint metadata.
+
+Thus the legal deployment path is exactly local observation/history into one
+recurrent actor and then an action. The boundary is about information, not about
+whether a local observation happens to contain behaviorally informative events.
+
+## 4. Registered hypotheses
+
+### H1 — external mean and lower-tail robustness
+
+On each configured layout, CETR is compared with the registered baselines on the
+held-out external panel. The two primary external endpoints are
 
 \[
-\mathbb E[(\pi_b-\pi_{\tilde b})^TG_{source}]>0
+J_{\mathrm{ext,mean}}(\theta),
+\qquad
+J_{\mathrm{ext,CVaR50}}(\theta),
 \]
 
-on both layouts.
+where the second is the empirical parent-level lower-half CVaR induced by the
+uncertainty set in `METHOD_SPEC.md`. The unit of inference is an independent ego
+run crossed with an independent held-out parent lineage; repeated episodes within
+a pairing are repeated measurements, not independent ZSC nodes.
 
-Claims are evaluated in the closed order `H1 -> H2 -> H3`.
+### H2 — self-play non-inferiority
 
-## 6. Secondary active question
+CETR must preserve the measured reference-level self-play target. The endpoint is
 
-`delta_active - delta_passive` measures whether delayed action-selective
-response value improves zero-shot cross-play. It is pre-registered and reported
-regardless of sign. Mean VOI or information gain cannot establish active
-control; action-wise VOI spread and active/passive policy divergence are
-required mechanism evidence.
+\[
+J_{\mathrm{SP}}(\theta)-\tau_{\mathrm{SP}}.
+\]
 
-## 7. Required controls
+The target is reference-derived, has no manually chosen tolerance band, and is
+reported with its uncertainty interval.
 
-- `base`: full-frame recurrent task competence without latent adaptation;
-- `response_only`: legal response posterior without decision adaptation;
-- `base_extra`: spends active DELTA's anchor simulator cost on ordinary PPO
-  interaction;
-- `K in {2,4,8}`: bounded capacity sensitivity;
-- synthetic uninformative, decision-revealing, and
-  identifiable-but-decision-irrelevant exact-VOI cases;
-- parent-disjoint conditional oracle diagnostic for residual event information;
-- shared-occurrence posterior-independence test;
-- episode-static reset/persistence test.
+### H3 — external robustness under a single actor
 
-## 8. Required mechanism measurements
+The combined claim concerns one partner-agnostic actor satisfying both the
+external lower-tail objective and the self-play constraint. A high external
+mean alone is insufficient if the lower tail fails; a high lower tail alone is
+insufficient if self-play falls below the reference contract.
 
-Every v6 study reports:
+## 5. Panel and estimand boundary
 
-- immediate and delayed shared/semantic NLL and counts;
-- component event Jensen-Shannon separation;
-- posterior entropy and response-induced filter KL;
-- belief separation by partner run/mechanism and within-episode phase drift;
-- current and successor top-action agreement, regret, pairwise sign agreement,
-  and critic-ensemble action disagreement;
-- exact VOI, information gain, their action-wise spread, and negative numerical
-  fraction;
-- active/passive policy total variation and greedy disagreement;
-- response-component gradient norm and the verified zero decision gradient into
-  the detached grounding coordinate;
-- semantic initializer singular values, source lineage, and conditional oracle
-  gain.
+The development-support panel supplies the training distribution over SP, OP,
+SA, and FCP mechanisms. Its parents are grouped by independent parent lineage;
+checkpoint stages within one parent remain one group. Nominal mechanism mass and
+within-mechanism parent mass are defined by `config.py`.
 
-None is a substitute for raw return.
+The confirmatory panel is held out from training and development decisions. Every
+confirmatory parent and its co-training lineage is parent- and lineage-disjoint
+from development_support. A co-training population is not split between the two
+sides. The trained actor therefore encounters the confirmatory partner parameters
+and their lineage only at evaluation time.
 
-## 9. Non-claims
+The population `10×10` matrix is a supplementary report object. It can describe
+the ordered population behavior of the final policies, but it is not the primary
+external-partner estimand and cannot replace the lineage-disjoint confirmatory
+panel.
 
-The project does not claim:
+## 6. Decisive comparison
 
-- recovery of true partner identity or a unique protocol taxonomy;
-- exact long-horizon Bayes-adaptive planning;
-- calibration from a sharp posterior alone;
-- causal partner labels from spectral directions;
-- guaranteed real-return improvement from approximate decision values;
-- SOTA performance before complete ten-seed Simple/Wide evaluation;
-- that behavior statistics contain no partner information;
-- that v5 or earlier development results are evidence for v6;
-- that an immutable reference or a KL bound alone guarantees SP recovery;
-- that the v6 development targets have already been achieved.
+The decisive experiment compares, under matched layout, evaluation keys, ego
+training cost, and upstream partner cost:
 
-## 10. Single-layout result boundary
+- Official-SP;
+- Official-OP;
+- Official-FCP;
+- the retired V6 DELTA-active result as a historical comparator only;
+- CETR-ZSC.
 
-Each configured layout reports two separate estimands. The
-paper-compatible population matrix contains ten final policies crossed as a
-directed `(10,10,500)` raw-return cube. The common-partner comparison contains
-ten egos, sixteen independent confirmatory partners, both ego roles and 500
-episodes per pairing. These objects are never substituted for one another.
+The V6 comparator is not an active method, is not reimplemented by this contract,
+and cannot be used to define CETR identity. All exact seeds, run counts,
+episodes per pairing, bootstrap settings, and resource budgets are registered
+in `config.py`.
 
-A completed run for one layout may report that layout's component of H1, H2
-and H3. It cannot
-close the both-layout hypotheses, invoke the repository's full claim builder,
-or support a SOTA statement without the corresponding Simple result.
+Report for every method and layout:
+
+- `J_ext,mean` on the held-out external panel;
+- `J_ext,CVaR50` on independent parent groups;
+- `J_SP − τ_SP`;
+- raw episode rows, role balance, lineage records, and resource accounting.
+
+The population matrix is supplementary. No checkpoint is selected because it has
+the best observed score, no failed seed is replaced, and no formal result is
+restarted under a changed method.
+
+## 7. Decision rules
+
+The decision is made against FCP on the confirmatory held-out external panel.
+The lower confidence bound is the registered one-sided run/parent inference
+specified by `config.py`.
+
+### GO
+
+CETR receives GO only if all three conditions hold:
+
+\[
+\operatorname{LCB}_{95}\left[
+J_{\mathrm{ext,mean}}^{\mathrm{CETR}}-
+J_{\mathrm{ext,mean}}^{\mathrm{FCP}}
+\right]>0,
+\]
+
+\[
+\operatorname{LCB}_{95}\left[
+J_{\mathrm{ext,CVaR50}}^{\mathrm{CETR}}-
+J_{\mathrm{ext,CVaR50}}^{\mathrm{FCP}}
+\right]>0,
+\]
+
+\[
+\operatorname{LCB}_{95}\left[
+J_{\mathrm{SP}}^{\mathrm{CETR}}-\tau_{\mathrm{SP}}
+\right]\ge 0.
+\]
+
+### NO-GO
+
+NO-GO is declared if either the self-play constraint is below target with an
+interval excluding zero, or CETR fails to improve both held-out external mean
+and lower-half CVaR relative to FCP. The scientific conclusion is then that
+this single partner-agnostic robust policy did not jointly preserve reference-
+level self-play and improve held-out external robustness. The response-latent,
+VOI, or other retired V6 mechanisms are not reintroduced as a rescue.
+
+### INCONCLUSIVE
+
+If the self-play constraint is supported but the external mean or lower-tail
+contrast interval crosses zero, the result is INCONCLUSIVE. The registered
+response is to increase confirmatory episode counts under the existing contract,
+not to alter the method, retune the tail, change the panel, or select another
+checkpoint.
+
+## 8. Non-claims
+
+This specification does not claim:
+
+- recovery of a teammate's identity, algorithm, or hidden state;
+- universal robustness outside the registered held-out panel;
+- that parent-level lower-half risk equals population cross-play;
+- global optimality or convergence of PPO or the primal-dual iteration;
+- that the self-play target is guaranteed before formal evaluation;
+- SOTA performance or any performance gain before the decisive experiment;
+- that the retired V6 evidence is CETR evidence;
+- that training-only `q`, `lambda`, parent groups, or lineage metadata are legal
+deployment information.
+
+No training result or performance claim exists until the registered runs and
+raw evaluation artifacts are complete.

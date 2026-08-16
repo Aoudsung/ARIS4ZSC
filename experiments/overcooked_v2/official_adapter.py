@@ -25,7 +25,7 @@ import sys
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
-from src.delta_zsc.config import (
+from src.cetr_zsc.config import (
     SUPPORTED_LAYOUTS,
     OFFICIAL_CORRECT_DELIVERY_REWARD,
     OFFICIAL_NUM_MINIBATCHES,
@@ -50,7 +50,7 @@ def _cuda_only_official_debug_callbacks_disabled() -> Any:
 
     The fixed Official trainer contains ``jax.debug.print`` calls and a
     ``jax.debug.callback(wandb.log, ...)``. JAX 0.4.38 places those host
-    callback operands on a local CPU device; a fail-closed DEPI worker with
+    callback operands on a local CPU device; a fail-closed CETR worker with
     ``JAX_PLATFORMS=cuda`` intentionally exposes no such device. The callbacks
     are observational logging side effects and do not feed a value, random key,
     gradient, parameter, or checkpoint back into the training graph.
@@ -223,7 +223,7 @@ def _official_symbol(module: str, name: str) -> Any:
 
     # The pinned Official commit predates NumPy 2 and imports ``np.Inf``.
     # Keep the compatibility shim at the integration boundary so neither the
-    # Official checkout nor DEPI's numerical code is silently rewritten.
+    # Official checkout nor CETR's numerical code is silently rewritten.
     import numpy as np
 
     if not hasattr(np, "Inf"):
@@ -289,7 +289,7 @@ def compose_official_config(
             != int(config.training.environment_steps)
         ):
             raise ValueError(
-                "Mechanical upstream and DEPI trajectory budgets must match; "
+                "Mechanical upstream and CETR trajectory budgets must match; "
                 "use the dedicated mechanical E2E config."
             )
         model = dict(result["model"])
@@ -613,7 +613,7 @@ def validate_official_partner_checkpoint(
     algorithm: str,
     seed_index: int,
 ) -> None:
-    """Bind one DELTA reference checkpoint to its claimed Official SP recipe."""
+    """Bind one CETR reference checkpoint to its claimed Official SP recipe."""
 
     checkpoint_config, unused_params = restore_official_checkpoint(checkpoint_path)
     del unused_params
@@ -1106,37 +1106,6 @@ class VectorEnvironment:
             },
         )
 
-    def step_anchor_terminal_with_keys(
-        self, state: Any, joint_actions: Any, keys: Any
-    ) -> tuple[Any, Any, Any, Any, Mapping[str, Any]]:
-        """Terminal continuation step with no reset or evaluation diagnostics."""
-
-        import jax
-        import jax.numpy as jnp
-
-        # Preserve the registered CRN transition key: the legacy full step
-        # uses the first half of this split for ``step_env``.
-        split = jax.vmap(lambda item: jax.random.split(item, 2))(keys)
-        action_mapping = {
-            "agent_0": joint_actions[:, 0],
-            "agent_1": joint_actions[:, 1],
-        }
-        observations, next_state, rewards, dones, unused_info = jax.vmap(
-            self.environment.step_env
-        )(split[:, 0], state, action_mapping)
-        del unused_info
-        raw_by_agent = jnp.stack(
-            (rewards["agent_0"], rewards["agent_1"]), axis=-1
-        ).astype(jnp.float32)
-        return (
-            next_state,
-            _stack_observations(observations),
-            jnp.asarray(rewards["agent_0"], dtype=jnp.float32),
-            jnp.asarray(dones["__all__"], dtype=jnp.bool_),
-            {"raw_rewards_by_agent": raw_by_agent},
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class FrozenPartnerPool:
     network: OfficialNetwork
@@ -1287,7 +1256,7 @@ class FrozenPartnerPool:
         carry: Any,
         episode_start: Any,
     ) -> tuple[Any, Any, Any]:
-        """Return the exact Official recurrent logits for DEPI initialization.
+        """Return the exact Official recurrent logits for CETR initialization.
 
         This is a training-only observation/carry surface.  It neither samples
         an action nor exposes a partner identifier to the deployable policy.

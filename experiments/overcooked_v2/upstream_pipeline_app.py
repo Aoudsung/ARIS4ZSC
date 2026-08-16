@@ -11,15 +11,15 @@ import sys
 import time
 from typing import Any, Mapping, Sequence
 
-from src.delta_zsc.config import (
+from src.cetr_zsc.config import (
     OFFICIAL_OP_TOTAL_TIMESTEPS,
     OFFICIAL_SP_TOTAL_TIMESTEPS,
     load_config,
 )
-from src.delta_zsc.resources import ResourceLedger, parameter_count
-from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
+from src.cetr_zsc.resources import ResourceLedger, parameter_count
+from src.cetr_zsc.storage import ensure_run_identity, read_json, write_json
 
-from .delta_manifest_app import build_partner_manifest
+from .partner_manifest_app import build_partner_manifest
 from .evaluation_app import POLICY_MANIFEST_VERSION
 from .official_adapter import restore_official_checkpoint, validate_official_runtime
 
@@ -264,7 +264,7 @@ def _run_official_population(
             if run_root is None
             else run_root / f"run_{index}"
         )
-        # Expose the seed-index path consumed by the DELTA initializer mapping.
+        # Expose the seed-index path consumed by the CETR initializer mapping.
         # The Official trainer nests its run directories below a timestamped
         # Hydra root, while the experiment workflow addresses the same
         # parents as ``run-<seed>/ckpt_final``.  One directory link keeps those
@@ -451,7 +451,7 @@ def _baseline_command(
     command = [
         sys.executable,
         "-m",
-        "experiments.overcooked_v2.delta_zsc",
+        "experiments.overcooked_v2.cetr_zsc",
         "train-baseline",
         "--method",
         method,

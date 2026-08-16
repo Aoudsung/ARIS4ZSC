@@ -1,52 +1,57 @@
-# DELTA-ZSC v6 validation report
+# CETR-ZSC validation report
 
-Date: 2026-08-14
+Date: 2026-08-16
 
 ## Scope
 
-This report covers source-level engineering validation for
-`delta_self_consistent_decision_grounded_residual_v6`. It does not establish
-SP, XP, H1/H2/H3 or benchmark superiority.
+This report records the source-tree migration to
+`constrained_episodic_tail_robust_zsc_v1`. It covers repository boundaries,
+active package identity, application entry points, workflow wiring, and
+text-level import/reference review. It does not establish training returns,
+CUDA execution, formal evaluation, or benchmark superiority.
+
+The retired V6 method and its implementation are intentionally absent from the
+active tree. Historical source, contracts, and results remain recoverable from
+git history only; no historical artifact defines CETR.
 
 ## Active artifact identity
 
-- config schema: 4;
-- checkpoint schema: 6;
-- deployment bundle: 5;
-- evaluation schema: 3;
-- partner/policy manifest: 2;
-- semantic initializer: 1;
-- Official source revision: registered in `src/delta_zsc/config.py`.
+- package version: `0.7.0`;
+- configuration contract: `version: 5`;
+- checkpoint schema: `7`;
+- deployment bundle version: `6`;
+- partner manifest version: `2`;
+- method identity: `src/cetr_zsc/config.py`;
+- command entry point: `python -m experiments.overcooked_v2.cetr_zsc`.
 
-## Locally established
+## Source-level changes established by inspection
 
-The CPU suite covers compilation, configuration and repository boundaries;
-immutable-reference/zero-residual ownership;
-full-frame sequence equivalence to the actual Official Flax actor, including
-episode resets and action probabilities; paired SP/XP minibatches;
-group-normalized minimax PPO; independent self-partner recurrence; frozen-only
-generic rollouts; XP-only anchor index handling; detached full-embedding critic
-grounding; checkpoint/deployment rejection; exact 66-outcome VOI; and the
-existing legal-information, seed, lineage and estimator-order contracts.
+- the retired scientific package, applications, tests, configurations, contract
+  script, diagnostic generator, and Python caches were removed;
+- the active application set is CETR-only and the active workflow is
+  `.github/workflows/cetr-ci.yml`;
+- the repository protection test now checks the CETR namespace, exact active
+  file sets, package/dependency identity, workflow identity, and authoritative
+  CETR documents;
+- the CI configuration loads `cetr_*.yaml`, compiles the CETR package, smokes
+  the CETR CLI and its 14 subcommands, and passes the required reference-SP and
+  initializer artifacts to the fail-closed CUDA preflight;
+- `validation/run_all_isolated_tests.py` discovers only `test_cetr_*.py` and
+  labels its output as CETR.
 
-The final exact counts and command outcomes are regenerated during the final
-validation run and recorded in `ARTIFACT_IDENTITY.json` and the validation
-artifacts.
+## Verification boundary
 
-## Server-established engineering execution
+Per the migration requirement, no Python interpreter, project code, package
+manager, compiler, or test runner was executed. Verification was limited to
+file operations, Read/Grep/Glob inspection, and `git status --short`.
 
-The Simple formal-shape CUDA preflight completed on one L40 with 128 lanes. It
-executed 32,768 ordinary PPO steps, 1,477,632 anchor continuation steps and a
-fresh 1,510,400-step final decision audit. The recorded peak device memory was
-1,436.18 MiB, below the registered 40,000 MiB ceiling. This establishes CUDA
-execution and persistence only; it is not performance evidence.
+Consequently, this report does not claim that the test suite, compile gate,
+workflow parser, CLI smoke commands, configuration loader, or CUDA preflight
+has run successfully after the migration.
 
 ## Not established
 
-- a completed v6 paired Simple or Wide development matrix;
-- any achieved SP or XP target;
-- ten-seed formal deployments or evaluations;
-- H1, H2, H3 or a SOTA claim.
-
-Prior v5 pilots remain useful only for diagnosing the base-actor collapse and
-cannot be included as v6 evidence.
+- CUDA mechanical preflight or peak-memory acceptance;
+- development-support artifacts or confirmatory evaluation artifacts;
+- formal ten-seed training or held-out external evaluation;
+- any CETR performance result, GO/NO-GO decision, or SOTA claim.

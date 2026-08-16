@@ -1,4 +1,4 @@
-"""Common-partner and population-matrix evaluation for DELTA-ZSC."""
+"""Common-partner and population-matrix evaluation for CETR-ZSC."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from src.delta_zsc.config import (
+from src.cetr_zsc.config import (
     FORMAL_PEAK_MEMORY_LIMIT_BYTES,
     FORMAL_METHOD_LABEL,
     METHOD_VERSION,
@@ -20,12 +20,12 @@ from src.delta_zsc.config import (
     OFFICIAL_TRAINING_RUN_COUNT,
     load_config,
 )
-from src.delta_zsc.manifest import load_partner_manifest, normalized_mechanism
-from src.delta_zsc.resources import ResourceLedger, peak_device_memory_bytes
-from src.delta_zsc.storage import ensure_run_identity, read_json, write_json
+from src.cetr_zsc.manifest import load_partner_manifest, normalized_mechanism
+from src.cetr_zsc.resources import ResourceLedger, peak_device_memory_bytes
+from src.cetr_zsc.storage import ensure_run_identity, read_json, write_json
 
 from .deployment import load_deployment
-from .official_policy import OfficialDELTAPolicy
+from .official_policy import OfficialCetrPolicy
 
 
 POLICY_MANIFEST_VERSION = 2
@@ -90,7 +90,7 @@ def _load_policy_manifest(path: str | Path, *, layout: str) -> Mapping[str, Any]
         manifest.get("version") != POLICY_MANIFEST_VERSION
         or manifest.get("layout") != layout
         or manifest.get("policy_kind")
-        not in {"delta_deployment", "official_checkpoint"}
+        not in {"cetr_deployment", "official_checkpoint"}
     ):
         raise ValueError("Policy manifest identity differs.")
     runs = manifest.get("runs")
@@ -129,10 +129,10 @@ def build_policy_manifest(args: argparse.Namespace) -> None:
 
     runs = []
     for index, path in enumerate(paths):
-        if kind == "delta_deployment":
+        if kind == "cetr_deployment":
             deployment = load_deployment(path)
             if deployment.config.environment.layout != args.layout:
-                raise ValueError("DELTA deployment layout differs.")
+                raise ValueError("CETR deployment layout differs.")
             identity = read_json(path / "deployment_bundle.json")
             run_id = deployment.ego_run_id
             resource_ledger = None
@@ -169,13 +169,9 @@ def build_policy_manifest(args: argparse.Namespace) -> None:
     )
 
 
-def _load_policy(
-    row: Mapping[str, Any], kind: str, execution_mode: str = "active"
-) -> Any:
-    if kind == "delta_deployment":
-        return OfficialDELTAPolicy(
-            load_deployment(row["policy"]), execution_mode=execution_mode
-        )
+def _load_policy(row: Mapping[str, Any], kind: str) -> Any:
+    if kind == "cetr_deployment":
+        return OfficialCetrPolicy(load_deployment(row["policy"]))
     from .official_adapter import official_policy, restore_official_checkpoint
 
     config, params = restore_official_checkpoint(row["policy"])
@@ -237,19 +233,9 @@ def _run_common_partner(
                 "OP, and FCP parents."
             )
 
-    execution_mode = str(getattr(args, "execution_mode", "active"))
-    if policy_manifest["policy_kind"] == "official_checkpoint" and execution_mode != "active":
-        raise ValueError(
-            "Official checkpoints have no DELTA execution mode; evaluate them "
-            "only in the active comparison surface."
-        )
     environment = VectorEnvironment.create(config).environment
     ego_policies = [
-        _load_policy(
-            row,
-            policy_manifest["policy_kind"],
-            execution_mode=execution_mode,
-        )
+        _load_policy(row, policy_manifest["policy_kind"])
         for row in policy_manifest["runs"]
     ]
     partner_policies = []
@@ -291,7 +277,6 @@ def _run_common_partner(
                             "evaluation_mode": "common_partner",
                             "layout": config.environment.layout,
                             "method": policy_manifest["method"],
-                            "execution_mode": execution_mode,
                             "ego_run_index": ego_index,
                             "ego_run_id": policy_manifest["runs"][ego_index]["run_id"],
                             "partner_run_index": partner_index,
@@ -316,7 +301,6 @@ def _run_common_partner(
         "root_seed": root_seed,
         "key_schedule": COMMON_PARTNER_KEY_SCHEDULE,
         "observation_protocol": "default_non_permuted",
-        "execution_mode": execution_mode,
     }
     ensure_run_identity(output, identity)
     raw = output / "episode_returns.jsonl"
@@ -333,7 +317,7 @@ def _run_common_partner(
         output / "evaluation_summary.json",
         {
             "version": EVALUATION_SCHEMA_VERSION,
-            "artifact_type": "delta_raw_evaluation",
+            "artifact_type": "cetr_raw_evaluation",
             "evaluation_mode": "common_partner",
             "layout": config.environment.layout,
             "method": policy_manifest["method"],
@@ -344,7 +328,6 @@ def _run_common_partner(
             "root_seed": root_seed,
             "key_schedule": COMMON_PARTNER_KEY_SCHEDULE,
             "observation_protocol": "default_non_permuted",
-            "execution_mode": execution_mode,
             "policy_manifest": {"path": str(policy_manifest_path)},
             "partner_manifest": {"path": str(partner_manifest_path)},
             "partner_role": str(args.partner_role),
@@ -410,30 +393,13 @@ def _run_population_matrix(
     if root_seed != PAPER_MATRIX_ROOT_SEED:
         raise ValueError("Paper population matrix uses evaluation root seed 42.")
 
-    execution_mode = str(getattr(args, "execution_mode", "active"))
-    if (
-        left_manifest["policy_kind"] == "official_checkpoint"
-        or right_manifest["policy_kind"] == "official_checkpoint"
-    ) and execution_mode != "active":
-        raise ValueError(
-            "Official checkpoints have no DELTA execution mode; evaluate them "
-            "only in the active comparison surface."
-        )
     environment = VectorEnvironment.create(config).environment
     left_policies = [
-        _load_policy(
-            row,
-            left_manifest["policy_kind"],
-            execution_mode=execution_mode,
-        )
+        _load_policy(row, left_manifest["policy_kind"])
         for row in left_runs
     ]
     right_policies = [
-        _load_policy(
-            row,
-            right_manifest["policy_kind"],
-            execution_mode=execution_mode,
-        )
+        _load_policy(row, right_manifest["policy_kind"])
         for row in right_runs
     ]
     sp_root, xp_root = jax.random.split(jax.random.PRNGKey(root_seed), 2)
@@ -467,7 +433,6 @@ def _run_population_matrix(
                         "evaluation_mode": "population_matrix",
                         "layout": config.environment.layout,
                         "method": left_manifest["method"],
-                        "execution_mode": execution_mode,
                         "cell_type": cell_type,
                         "cell_index": cell_index,
                         "left_run_index": left_index,
@@ -500,7 +465,6 @@ def _run_population_matrix(
         "root_seed": root_seed,
         "key_schedule": POPULATION_KEY_SCHEDULE,
         "observation_protocol": "default_non_permuted",
-        "execution_mode": execution_mode,
     }
     ensure_run_identity(output, identity)
     raw = output / "episode_returns.jsonl"
@@ -515,7 +479,7 @@ def _run_population_matrix(
         population_summary,
         {
             "version": 1,
-            "artifact_type": "delta_population_matrix_summary",
+            "artifact_type": "cetr_population_matrix_summary",
             "layout": config.environment.layout,
             "method": left_manifest["method"],
             "cube_shape": list(cube.shape),
@@ -523,7 +487,6 @@ def _run_population_matrix(
             "root_seed": root_seed,
             "key_schedule": POPULATION_KEY_SCHEDULE,
             "observation_protocol": "default_non_permuted",
-            "execution_mode": execution_mode,
             **statistics,
             "raw": {"path": str(raw)},
         },
@@ -532,7 +495,7 @@ def _run_population_matrix(
         output / "evaluation_summary.json",
         {
             "version": EVALUATION_SCHEMA_VERSION,
-            "artifact_type": "delta_raw_evaluation",
+            "artifact_type": "cetr_raw_evaluation",
             "evaluation_mode": "population_matrix",
             "layout": config.environment.layout,
             "method": left_manifest["method"],
@@ -542,7 +505,6 @@ def _run_population_matrix(
             "root_seed": root_seed,
             "key_schedule": POPULATION_KEY_SCHEDULE,
             "observation_protocol": "default_non_permuted",
-            "execution_mode": execution_mode,
             "left_policy_manifest": {"path": str(left_manifest_path)},
             "right_policy_manifest": {"path": str(right_manifest_path)},
             "raw": {"path": str(raw)},
@@ -661,7 +623,6 @@ def _validate_common_rows(
     *,
     method: str,
     layout: str,
-    execution_mode: str,
     ego_count: int,
     partner_ids: set[str],
     episodes: int,
@@ -688,7 +649,6 @@ def _validate_common_rows(
             row.get("evaluation_mode") != "common_partner"
             or row.get("method") != method
             or row.get("layout") != layout
-            or row.get("execution_mode") != execution_mode
             for row in rows
         )
     ):
@@ -727,7 +687,6 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
     root_seed = None
     key_schedule = None
     observation_protocol = None
-    execution_mode = None
     environment_keys = None
     for value in args.evaluation:
         method, raw_path = value.split("=", 1)
@@ -736,7 +695,7 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
         directory = Path(raw_path).resolve()
         summary = read_json(directory / "evaluation_summary.json")
         if (
-            summary.get("artifact_type") != "delta_raw_evaluation"
+            summary.get("artifact_type") != "cetr_raw_evaluation"
             or summary.get("evaluation_mode") != "common_partner"
             or summary.get("method") != method
         ):
@@ -757,12 +716,10 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
             summary["policy_manifest"]["path"], layout=str(summary["layout"])
         )
         rows = _read_jsonl(Path(summary["raw"]["path"]))
-        current_execution_mode = str(summary["execution_mode"])
         _validate_common_rows(
             rows,
             method=method,
             layout=str(summary["layout"]),
-            execution_mode=current_execution_mode,
             ego_count=FORMAL_COMMON_EGO_RUNS,
             partner_ids=current_partner_ids,
             episodes=FORMAL_EVALUATION_EPISODES,
@@ -789,7 +746,6 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
             root_seed = current_root_seed
             key_schedule = current_key_schedule
             observation_protocol = current_observation_protocol
-            execution_mode = current_execution_mode
             environment_keys = current_environment_keys
         elif (
             current_egos != ego_indexes
@@ -799,7 +755,6 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
             or current_root_seed != root_seed
             or current_key_schedule != key_schedule
             or current_observation_protocol != observation_protocol
-            or current_execution_mode != execution_mode
             or current_environment_keys != environment_keys
         ):
             raise ValueError(
@@ -852,7 +807,7 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
         args.output,
         {
             "version": 3,
-            "artifact_type": "delta_official_summary",
+            "artifact_type": "cetr_official_summary",
             "method": METHOD_VERSION,
             "layout": layout,
             "ego_run_indexes": ego_indexes,
@@ -861,11 +816,10 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
             "evaluation_root_seed": root_seed,
             "key_schedule": key_schedule,
             "observation_protocol": observation_protocol,
-            "execution_mode": execution_mode,
             "means": {name: float(np.mean(value)) for name, value in matrices.items()},
             "strongest_baseline": strongest,
-            "delta_active_vs_strongest": contrasts[strongest],
-            "delta_active_vs_each_baseline": contrasts,
+            "cetr_active_vs_strongest": contrasts[strongest],
+            "cetr_active_vs_each_baseline": contrasts,
             "all_baselines_material_superiority_gate": all_baselines_gate,
             "testing_rule": (
                 "intersection_union: every registered baseline contrast must have "
@@ -883,7 +837,6 @@ def _validated_population_cube(
     summary = read_json(directory / "evaluation_summary.json")
     population = read_json(Path(summary["population_summary"]["path"]))
     rows = _read_jsonl(Path(summary["raw"]["path"]))
-    execution_mode = str(summary["execution_mode"])
     keys = {
         (
             int(row["left_run_index"]),
@@ -905,7 +858,6 @@ def _validated_population_cube(
         or {int(row["right_run_index"]) for row in rows} != set(range(10))
         or {int(row["episode_index"]) for row in rows} != set(range(500))
         or any(len(row.get("environment_key", ())) != 2 for row in rows)
-        or any(row.get("execution_mode") != execution_mode for row in rows)
     ):
         raise ValueError("Population-matrix raw cube is incomplete or duplicated.")
     cube = np.empty((10, 10, 500), dtype=np.float64)
@@ -937,15 +889,14 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
         set(PAPER_MATRIX_METHODS),
     ):
         raise ValueError(
-            "Paper matrix summary requires DELTA-active alone or the complete "
-            "SP, SA, OP, FCP, and DELTA-active reproduction."
+            "Paper matrix summary requires CETR-active alone or the complete "
+            "SP, SA, OP, FCP, and CETR-active reproduction."
         )
 
     cell_rows = []
     statistics_by_method = {}
     layout = None
     root_seed = None
-    execution_mode = None
     environment_keys = None
     for method in (method for method in PAPER_MATRIX_METHODS if method in directories):
         summary, cube, current_environment_keys = _validated_population_cube(
@@ -953,19 +904,16 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
         )
         current_layout = str(summary["layout"])
         current_seed = int(summary["root_seed"])
-        current_execution_mode = str(summary["execution_mode"])
         if layout is None:
             layout, root_seed = current_layout, current_seed
-            execution_mode = current_execution_mode
             environment_keys = current_environment_keys
         elif (
             current_layout != layout
             or current_seed != root_seed
-            or current_execution_mode != execution_mode
             or current_environment_keys != environment_keys
         ):
             raise ValueError(
-                "Population matrices differ in layout, execution mode, or key schedule."
+                "Population matrices differ in layout, seed, or key schedule."
             )
         statistics = _population_statistics(cube)
         statistics_by_method[method] = statistics
@@ -1073,10 +1021,9 @@ def summarize_population_matrices(args: argparse.Namespace) -> None:
         output / "population_matrix_summary.json",
         {
             "version": 1,
-            "artifact_type": "delta_population_matrix_comparison_summary",
+            "artifact_type": "cetr_population_matrix_comparison_summary",
             "layout": layout,
             "root_seed": root_seed,
-            "execution_mode": execution_mode,
             "methods": rows,
             "evaluated_methods": [
                 method for method in PAPER_MATRIX_METHODS if method in directories

@@ -25,12 +25,12 @@ ROOT = Path(__file__).resolve().parents[1]
 TEST_ROOT = ROOT / "experiments" / "overcooked_v2" / "tests"
 RESULT_JSON = ROOT / "validation" / "ISOLATED_TEST_RESULTS.json"
 RESULT_TEXT = ROOT / "validation" / "LOCAL_TEST_RESULTS.txt"
-TIMEOUT_SECONDS = int(os.environ.get("DELTA_TEST_TIMEOUT_SECONDS", "600"))
+TIMEOUT_SECONDS = int(os.environ.get("CETR_TEST_TIMEOUT_SECONDS", "600"))
 
 
 def discover() -> list[str]:
     nodes: list[str] = []
-    for source in sorted(TEST_ROOT.glob("test_delta_*.py")):
+    for source in sorted(TEST_ROOT.glob("test_cetr_*.py")):
         module = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
         relative = source.relative_to(ROOT)
         for item in module.body:
@@ -64,7 +64,7 @@ def write_results(records: list[dict[str, object]], *, started: float, complete:
     }
     RESULT_JSON.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     lines = [
-        "DELTA v6 isolated local CPU regression",
+        "CETR isolated local CPU regression",
         f"python={payload['python_version']}",
         f"jax={payload['jax_version']}",
         f"numpy={payload['numpy_version']}",

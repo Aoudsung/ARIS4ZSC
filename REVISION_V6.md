@@ -1,4 +1,7 @@
-# DELTA-ZSC v6 revision
+# Retired DELTA-ZSC v6 revision (historical)
+
+This document describes a retired method. It is preserved as historical
+context only; CETR identity, contracts, and evidence are defined elsewhere.
 
 ## Observed failure
 

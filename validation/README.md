@@ -1,40 +1,29 @@
-# DELTA-ZSC v6 validation artifacts
+# CETR-ZSC validation entry points
 
 ## Isolated local regression
 
-Run every discovered test function in a fresh bounded CPU process:
+The repository runner discovers every top-level test function in
+`experiments/overcooked_v2/tests/test_cetr_*.py` and runs each in a fresh
+bounded CPU process:
 
 ```bash
 python validation/run_all_isolated_tests.py
 ```
 
 The runner writes `ISOLATED_TEST_RESULTS.json` and
-`LOCAL_TEST_RESULTS.txt`. The current result is:
-
-```text
-complete=true
-discovered=98
-executed=98
-passed=98
-failed=0
-timed_out=0
-```
+`LOCAL_TEST_RESULTS.txt`. These generated outputs are not source-tree evidence
+and are absent until a user intentionally runs the runner.
 
 ## Contract validation
 
-Run:
-
-```bash
-bash validation/run_contract_validation.sh
-```
-
-It checks active-source compilation, Python 3.10 grammar, ten registered
-configs, the root CLI and 19 subcommands, workflow parsing, namespace and
-dependency contracts, credential/local-path scans, source formatting and the
-deterministic 66-outcome delayed-VOI diagnostic.
+The former version-specific contract script was removed because it only
+validated retired implementation paths, configurations, diagnostics, and CLI
+commands. The active contracts are protected by
+`experiments/overcooked_v2/tests/test_cetr_repository.py` and the CETR CI
+workflow.
 
 ## Evidence boundary
 
-These files certify local implementation contracts only. They do not establish
-Official Wide upstream assets, fitted initializers, real CUDA memory or
-throughput, development return, formal Wide return, H1/H2/H3 or SOTA.
+Source-level checks certify repository wiring only. They do not establish
+Official upstream assets, fitted initializers, real CUDA memory or throughput,
+development return, formal return, or any performance claim.

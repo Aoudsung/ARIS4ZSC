@@ -1,9 +1,9 @@
 """Train Official OvercookedV2 baselines and export auditable manifests.
 
-This module is deliberately outside the DELTA algorithm package.  It launches
+This module is deliberately outside the CETR algorithm package.  It launches
 SP, state-augmented, OP, FCP, and the parameter-matched IPPO-Large control
 through the pinned Official training entrypoint, then emits the same immutable
-policy-manifest and resource-ledger interfaces consumed by DELTA evaluation.
+policy-manifest and resource-ledger interfaces consumed by CETR evaluation.
 """
 
 from __future__ import annotations
@@ -28,14 +28,14 @@ from .official_adapter import (
     restore_official_checkpoint,
     validate_official_runtime,
 )
-from src.delta_zsc.config import (
+from src.cetr_zsc.config import (
     OFFICIAL_BASELINE_METHODS,
     OFFICIAL_OP_TOTAL_TIMESTEPS,
     OFFICIAL_SOURCE_COMMIT,
     OFFICIAL_SP_TOTAL_TIMESTEPS,
     OFFICIAL_TRAINING_RUN_COUNT,
 )
-from src.delta_zsc.resources import (
+from src.cetr_zsc.resources import (
     ResourceLedger,
     gpu_device_count,
     gpu_hours_for_wall_seconds,
@@ -43,7 +43,7 @@ from src.delta_zsc.resources import (
     parameter_count,
     peak_device_memory_bytes,
 )
-from src.delta_zsc.storage import (
+from src.cetr_zsc.storage import (
     ensure_run_identity,
     read_json,
     write_json,
@@ -198,11 +198,7 @@ def _deployment_parameter_count(path: str | Path) -> tuple[int, tuple[int, ...]]
     from .deployment import load_deployment
 
     deployment = load_deployment(path)
-    params = {
-        "base_params": deployment.base_params,
-        "latent_params": deployment.latent_params,
-    }
-    return parameter_count(params), tuple(deployment.model.observation_shape)
+    return parameter_count(deployment.params), tuple(deployment.model.observation_shape)
 
 
 def _select_ippo_large_dimension(
@@ -302,9 +298,9 @@ def run_official_baseline(args: argparse.Namespace) -> None:
     )
     capacity_match = None
     if method == "ippo-large":
-        if args.delta_deployment is None:
-            raise ValueError("IPPO-Large requires --delta-deployment.")
-        target_count, observation_shape = _deployment_parameter_count(args.delta_deployment)
+        if args.cetr_deployment is None:
+            raise ValueError("IPPO-Large requires --cetr-deployment.")
+        target_count, observation_shape = _deployment_parameter_count(args.cetr_deployment)
         capacity_match = _select_ippo_large_dimension(
             layout=layout,
             target_parameters=target_count,
@@ -315,8 +311,8 @@ def run_official_baseline(args: argparse.Namespace) -> None:
             hidden_dimension=capacity_match["hidden_dimension"],
         )
     else:
-        if args.delta_deployment is not None:
-            raise ValueError("--delta-deployment is only valid for IPPO-Large.")
+        if args.cetr_deployment is not None:
+            raise ValueError("--cetr-deployment is only valid for IPPO-Large.")
         resolved = compose_official_baseline_config(
             layout=layout,
             method=method,
