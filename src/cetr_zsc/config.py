@@ -27,12 +27,13 @@ from typing import Any, Mapping
 import yaml
 
 
-CONFIG_VERSION = 5
+CONFIG_VERSION = 6
 METHOD_VERSION = "constrained_episodic_tail_robust_zsc_v1"
-# Version 7 checkpoints hold one fully trainable actor-critic tree, the SP dual
+# Version 8 checkpoints hold one fully trainable actor-critic tree, the SP dual
 # variable, and the measured reference-SP artifact binding.  No per-episode
 # semantic state, no separate target network, and no measurement buffers exist.
-CHECKPOINT_SCHEMA_VERSION = 7
+# Version 6 configurations and version 8 checkpoints reject pre-revision artifacts.
+CHECKPOINT_SCHEMA_VERSION = 8
 MANIFEST_VERSION = 2
 FORMAL_METHOD_LABEL = "cetr-zsc"
 OFFICIAL_BASELINE_METHODS = (
@@ -107,6 +108,8 @@ RUN_BUDGETS: Mapping[str, RunBudget] = {
     # Mechanical: 2 whole-episode updates of 4 lanes, exercising the full
     # collect -> tail-weight -> primal -> dual transaction end to end.
     "mechanical": RunBudget(4, 3_200, 2, 1_600),
+    # Development support has one parent per mechanism; formal support is
+    # fixed at 4 mechanisms x 4 independent parents = 16 parents.
     # Development: 96 whole-episode updates of 32 lanes; the 1,228,800-step
     # total matches the v6 development budget exactly.
     "development": RunBudget(32, 1_228_800, 8, 102_400),

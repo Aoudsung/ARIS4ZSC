@@ -61,16 +61,20 @@ def build_training_partner_pool(config: Any, manifest: Any) -> PartnerPool:
         by_stage[stage] = row
 
     mechanisms = tuple(sorted(grouped))
-    if config.run_kind == "formal":
-        required = set(TRAINING_SUPPORT_MECHANISMS)
-        if set(mechanisms) != required:
-            raise ValueError("Formal training support must contain all four mechanisms.")
-        minimum = int(config.evaluation.minimum_partner_runs_per_mechanism)
-        for mechanism in mechanisms:
-            if len(grouped[mechanism]) < minimum:
+    required = set(TRAINING_SUPPORT_MECHANISMS)
+    if set(mechanisms) != required:
+        raise ValueError("Training support must contain all four mechanisms.")
+    required_parents = 4 if config.run_kind == "formal" else 1
+    for mechanism in mechanisms:
+        observed = len(grouped[mechanism])
+        if observed != required_parents:
+            if config.run_kind == "formal":
                 raise ValueError(
-                    f"Formal support needs at least {minimum} parents per mechanism."
+                    "Formal support requires exactly 4 parents per mechanism."
                 )
+            raise ValueError(
+                "Development and mechanical support require exactly 1 parent per mechanism."
+            )
 
     parent_ids: list[str] = []
     parent_mechanisms: list[str] = []

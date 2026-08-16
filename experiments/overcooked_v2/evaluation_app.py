@@ -220,18 +220,12 @@ def _run_common_partner(
     partners = partner_manifest.by_role(str(args.partner_role))
     if not partners:
         raise ValueError("Evaluation partner role is empty.")
+    if policy_manifest["policy_kind"] == "cetr_deployment":
+        _validate_cetr_confirmatory_lineage(policy_manifest, partners)
     if config.run_kind == "formal":
         if str(args.partner_role) != "confirmatory":
             raise ValueError("Formal common-partner evaluation uses the confirmatory panel.")
-        counts: dict[str, int] = {}
-        for run in partners:
-            mechanism = normalized_mechanism(run.generation_mechanism)
-            counts[mechanism] = counts.get(mechanism, 0) + 1
-        if counts != FORMAL_COMMON_MECHANISM_COUNTS:
-            raise ValueError(
-                "Formal confirmatory evaluation requires exactly four SP, SA, "
-                "OP, and FCP parents."
-            )
+        _validate_formal_confirmatory_panel(partners)
 
     environment = VectorEnvironment.create(config).environment
     ego_policies = [
@@ -678,6 +672,65 @@ def _lineage_sets(policy_manifest: Mapping[str, Any]) -> tuple[set[str], set[str
     return parents, groups
 
 
+def _cetr_deployment_lineage(
+    policy_manifest: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    parents: set[str] = set()
+    groups: set[str] = set()
+    for row in policy_manifest["runs"]:
+        deployment = load_deployment(row["policy"])
+        provenance = read_json(deployment.provenance_path)
+        binding = provenance["training_parent_manifest"]
+        manifest = binding.get("manifest")
+        if manifest is None:
+            manifest = read_json(Path(str(binding["path"])).resolve())
+        if not isinstance(manifest, Mapping) or not isinstance(
+            manifest.get("runs"), list
+        ):
+            raise ValueError("CETR deployment provenance lacks training lineage rows.")
+        for lineage in manifest["runs"]:
+            if lineage.get("parent_training_run_id") is not None:
+                parents.add(str(lineage["parent_training_run_id"]))
+            if lineage.get("co_training_group_id") is not None:
+                groups.add(str(lineage["co_training_group_id"]))
+    return parents, groups
+
+
+def _validate_cetr_confirmatory_lineage(
+    policy_manifest: Mapping[str, Any], partners: Any
+) -> None:
+    training_parents, training_groups = _cetr_deployment_lineage(policy_manifest)
+    confirmatory_parents = {str(run.parent_training_run_id) for run in partners}
+    confirmatory_groups = {
+        str(run.co_training_group_id)
+        for run in partners
+        if run.co_training_group_id is not None
+    }
+    if training_parents & confirmatory_parents or training_groups & confirmatory_groups:
+        raise ValueError(
+            "CETR train/confirmatory leakage: deployment training lineage overlaps "
+            "the evaluation partner panel."
+        )
+
+
+def _validate_formal_confirmatory_panel(partners: Any) -> None:
+    parent_ids_by_mechanism: dict[str, set[str]] = {}
+    for run in partners:
+        mechanism = normalized_mechanism(run.generation_mechanism)
+        parent_ids_by_mechanism.setdefault(mechanism, set()).add(
+            str(run.parent_training_run_id)
+        )
+    counts = {
+        mechanism: len(parent_ids)
+        for mechanism, parent_ids in parent_ids_by_mechanism.items()
+    }
+    if counts != FORMAL_COMMON_MECHANISM_COUNTS:
+        raise ValueError(
+            "Formal confirmatory evaluation requires exactly four independent "
+            "parents for each SP, SA, OP, and FCP mechanism."
+        )
+
+
 def summarize_evaluations(args: argparse.Namespace) -> None:
     sources = {}
     matrices = {}
@@ -799,10 +852,6 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
         )
         for index, name in enumerate(baseline_methods)
     }
-    all_baselines_gate = bool(
-        all(float(value["one_sided_lcb"]) > 0.0 for value in contrasts.values())
-        and all(float(value["estimate"]) >= 20.0 for value in contrasts.values())
-    )
     write_json(
         args.output,
         {
@@ -820,10 +869,10 @@ def summarize_evaluations(args: argparse.Namespace) -> None:
             "strongest_baseline": strongest,
             "cetr_active_vs_strongest": contrasts[strongest],
             "cetr_active_vs_each_baseline": contrasts,
-            "all_baselines_material_superiority_gate": all_baselines_gate,
+            "all_baselines_material_superiority_gate": None,
             "testing_rule": (
-                "intersection_union: every registered baseline contrast must have "
-                "one-sided LCB>0 and estimate>=20"
+                "Descriptive summary only; claim_app is the sole registered "
+                "decision entry point."
             ),
             "bootstrap_seed": int(args.seed),
             "sources": sources,

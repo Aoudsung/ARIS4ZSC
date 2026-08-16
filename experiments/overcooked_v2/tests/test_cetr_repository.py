@@ -125,7 +125,7 @@ def test_authoritative_docs_describe_the_cetr_protocol() -> None:
         "self-play",
         "lineage-disjoint",
         "constrained_episodic_tail_robust_zsc_v1",
-        "version: 5",
+        "version: 6",
     ):
         assert marker in text
     assert "expected cross log likelihood" not in text

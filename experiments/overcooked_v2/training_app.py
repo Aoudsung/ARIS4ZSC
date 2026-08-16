@@ -20,7 +20,7 @@ from src.cetr_zsc.config import (
     load_config,
 )
 from src.cetr_zsc.manifest import load_partner_manifest
-from src.cetr_zsc.model import CetrModel
+from src.cetr_zsc.model import CetrModel, actor_parameters
 from src.cetr_zsc.official_init import initialize_from_official, initializer_seed_index
 from src.cetr_zsc.partners import build_training_partner_pool
 from src.cetr_zsc.resources import (
@@ -90,7 +90,13 @@ def _require_cuda() -> None:
         raise RuntimeError("CETR CUDA acceptance requires exactly one visible CUDA device.")
 
 
-def _load_reference_sp(path: str | Path, *, config: Any, seed_index: int) -> Mapping[str, Any]:
+def _load_reference_sp(
+    path: str | Path,
+    *,
+    config: Any,
+    seed_index: int,
+    source_checkpoint: str | Path,
+) -> Mapping[str, Any]:
     payload = read_json(path)
     required = {
         "artifact_type",
@@ -104,7 +110,7 @@ def _load_reference_sp(path: str | Path, *, config: Any, seed_index: int) -> Map
     }
     if not isinstance(payload, Mapping) or set(payload) != required:
         raise ValueError("Reference-SP artifact schema differs.")
-    if payload["artifact_type"] != "cetr_reference_sp" or int(payload["version"]) != 1:
+    if payload["artifact_type"] != "cetr_reference_sp" or int(payload["version"]) != 2:
         raise ValueError("Reference-SP artifact identity differs.")
     if str(payload["layout"]) != str(config.environment.layout):
         raise ValueError("Reference-SP artifact layout differs from the training config.")
@@ -119,6 +125,8 @@ def _load_reference_sp(path: str | Path, *, config: Any, seed_index: int) -> Map
         raise ValueError("Reference-SP artifact tau is not finite.")
     if not str(payload["source_checkpoint"]):
         raise ValueError("Reference-SP artifact source checkpoint is empty.")
+    if Path(str(payload["source_checkpoint"])).resolve() != Path(source_checkpoint).resolve():
+        raise ValueError("Reference-SP artifact source checkpoint differs from --sp-initializer.")
     return dict(payload)
 
 
@@ -209,6 +217,8 @@ def run_training(args: argparse.Namespace) -> None:
     seed_index = int(args.seed_index)
     if seed_index not in range(-1, 10):
         raise ValueError("CETR training seed index must lie in -1..9.")
+    # -1 is engineering-only; its initializer and tau artifact use seed 0.
+    effective_seed = 0 if seed_index == -1 else seed_index
     requires_cuda = config.run_kind == "formal" or bool(getattr(args, "require_cuda", False))
     if requires_cuda:
         _require_cuda()
@@ -233,11 +243,16 @@ def run_training(args: argparse.Namespace) -> None:
     model = CetrModel(config, environment.observation_shape, OFFICIAL_ACTION_COUNT)
 
     reference_path = Path(args.reference_sp_artifact).resolve()
-    reference_sp = _load_reference_sp(reference_path, config=config, seed_index=seed_index)
     initializer_path = Path(args.sp_initializer).resolve()
+    reference_sp = _load_reference_sp(
+        reference_path,
+        config=config,
+        seed_index=effective_seed,
+        source_checkpoint=initializer_path,
+    )
     initializer_seed = int(initializer_seed_index(initializer_path))
-    if initializer_seed != seed_index:
-        raise ValueError("--sp-initializer seed must equal --seed-index.")
+    if initializer_seed != effective_seed:
+        raise ValueError("--sp-initializer seed must equal the effective training seed.")
 
     root_key = _training_key(seed_index)
     init_key, state_key = jax.random.split(root_key)
@@ -305,7 +320,7 @@ def run_training(args: argparse.Namespace) -> None:
                 upstream_steps=upstream_steps,
                 upstream_gpu_hours=upstream_gpu_hours,
                 upstream_wall_hours=upstream_wall_hours,
-                deployable_parameters=parameter_count(params),
+                deployable_parameters=parameter_count(actor_parameters(params)),
             ).to_mapping()
         )
 
@@ -336,7 +351,16 @@ def run_training(args: argparse.Namespace) -> None:
             params=state.params,
             partner_functions=partner_functions,
             random_key=state.random_key,
+            update_index=current_update,
         )
+        collection_host = _host(collection_metrics)
+        if (
+            int(collection_host["premature_done_count"]) != 0
+            or float(collection_host["final_done_fraction"]) != 1.0
+        ):
+            raise RuntimeError(
+                "CETR collection must contain exactly one complete episode per lane."
+            )
         lane_weight, tail_metrics = compute_tail_weights(
             batch,
             pool.parent_nominal_weights,
@@ -383,7 +407,7 @@ def run_training(args: argparse.Namespace) -> None:
         metrics = {
             "update": update,
             "environment_steps": environment_steps,
-            "collection": _host(collection_metrics),
+            "collection": collection_host,
             "tail": _host(tail_metrics),
             "ppo": _host(update_metrics),
             "self_play_return": measured_sp,
@@ -432,7 +456,7 @@ def run_training(args: argparse.Namespace) -> None:
             ego_run_id=str(args.ego_run_id),
             config=config,
             observation_shape=environment.observation_shape,
-            params=state.params,
+            params=actor_parameters(state.params),
             source_training_run=output,
             reference_sp_artifact=reference_sp,
         )
@@ -482,6 +506,8 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def run_cuda_preflight(args: argparse.Namespace) -> None:
+    """Run the engineering-only -1 preflight using seed-0 bindings."""
+
     if int(args.seed_index) != -1:
         raise ValueError("CUDA preflight uses the engineering seed index -1.")
     if str(args.run_kind) != "mechanical":

@@ -76,7 +76,7 @@ def measure_reference_sp(args: argparse.Namespace) -> None:
         output,
         {
             "artifact_type": "cetr_reference_sp",
-            "version": 1,
+            "version": 2,
             "layout": str(config.environment.layout),
             "seed_index": seed_index,
             "tau_sp": float(np.mean(returns)),

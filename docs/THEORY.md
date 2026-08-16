@@ -33,20 +33,27 @@ proves that the resulting policy will be robust on an unseen distribution.
 Double cross-fitting uses completed returns from one fold to determine tail
 weights for the other fold. Therefore an episode's own observed return is not
 used both to select its tail membership and to supply its own weighted update.
-This blocks the direct self-selection path in the finite batch estimator.
+The monitored cross-fitted tail value is
+`0.5 * (q^A · J_hat^B + q^B · J_hat^A)`. This blocks the direct self-selection
+path in the finite batch estimator; it does not create new data.
 
-Cross-fitting does not make the estimate automatically unbiased under arbitrary
-adaptive sampling, does not remove parent-level dependence, and does not create
-new independent data. Its guarantee is an ordering property of the estimator,
-not a generalization theorem.
+External lanes are deterministically parent-complete, so no observed-subset
+re-normalization is part of the estimator. Cross-fitting does not make the
+estimate automatically unbiased under arbitrary adaptive sampling, does not
+remove parent-level dependence, and does not create new independent data. Its
+guarantee is an ordering property of the estimator, not a generalization
+theorem.
 
 ## 3. Complete episodic return and fixed advantages
 
 The method's target is the complete undiscounted raw return-to-go of one complete
 episode. Once collected, the return-to-go and scalar-baseline advantage are fixed
-for the whole PPO transaction. Shared normalization preserves a common scale
-across self-play and external samples; it does not prove that PPO follows the
-exact gradient of the population lower-tail objective.
+for the whole PPO transaction. `prepare_episode_batch` applies exactly one
+shared normalization to the complete batch before minibatch slicing; no
+parent-wise, mechanism-wise, or minibatch-wise normalization is performed.
+Shared normalization preserves a common scale across self-play and external
+samples; it does not prove that PPO follows the exact gradient of the population
+lower-tail objective.
 
 The scalar value baseline is a control variate for policy-gradient variance. It
 has no deployment role and no authority to change the action distribution. A
@@ -96,6 +103,9 @@ threshold and has no artificial tolerance. This removes a hidden tuning degree
 of freedom from the method definition, but the estimate still has measurement
 error and does not guarantee that a trainable actor can attain it.
 
+The version-2 reference artifact binds a resolved absolute source checkpoint,
+and training requires textual equality with the resolved initializer path. The
+engineering preflight maps seed `-1` to the seed-0 initializer and τ artifact.
 The reference initializes the actor, derives the target, and supplies a frozen
 audit baseline. It is not a deployment ensemble or a policy correction.
 

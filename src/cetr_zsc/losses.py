@@ -64,7 +64,7 @@ def cetr_ppo_loss(
     batch: Any,
     dual_lambda: Any,
 ) -> LossResult:
-    """Evaluate the shared-normalization PPO objective.
+    """Evaluate the PPO objective with pre-prepared shared-scale advantages.
 
     The external actor term is an ordinary average over every time/lane replay
     entry from external lanes.  Lane weights are broadcast over time but are
@@ -90,18 +90,20 @@ def cetr_ppo_loss(
         batch.episode_starts[:, :sp_count],
     )
 
-    targets = jax.lax.stop_gradient(return_to_go(batch.rewards))
+    targets = jax.lax.stop_gradient(
+        jnp.asarray(batch.value_targets, dtype=jnp.float32)
+    )
+    sp_targets = jax.lax.stop_gradient(
+        jnp.asarray(batch.sp_other_value_targets, dtype=jnp.float32)
+    )
     old_values = jnp.asarray(batch.old_values, dtype=jnp.float32)
     sp_old_values = jnp.asarray(batch.sp_other_old_values, dtype=jnp.float32)
-    advantages = jax.lax.stop_gradient(targets - old_values)
-    sp_advantages = jax.lax.stop_gradient(
-        targets[:, :sp_count] - sp_old_values
+    normalized_advantages = jax.lax.stop_gradient(
+        jnp.asarray(batch.advantages, dtype=jnp.float32)
     )
-    combined_advantages = jnp.concatenate((advantages, sp_advantages), axis=1)
-    combined_mask = jnp.ones_like(combined_advantages, dtype=jnp.float32)
-    normalized = joint_normalize_advantages(combined_advantages, combined_mask)
-    normalized_advantages = normalized[:, :lane_count]
-    normalized_sp_advantages = normalized[:, lane_count:]
+    normalized_sp_advantages = jax.lax.stop_gradient(
+        jnp.asarray(batch.sp_other_advantages, dtype=jnp.float32)
+    )
 
     old_logp = jnp.asarray(batch.old_log_probabilities, dtype=jnp.float32)
     sp_old_logp = jnp.asarray(
@@ -166,8 +168,8 @@ def cetr_ppo_loss(
         jnp.square(clipped_values - targets),
     )
     sp_value_error = jnp.maximum(
-        jnp.square(current_sp_values - targets[:, :sp_count]),
-        jnp.square(clipped_sp_values - targets[:, :sp_count]),
+        jnp.square(current_sp_values - sp_targets),
+        jnp.square(clipped_sp_values - sp_targets),
     )
     value_loss = 0.5 * jnp.mean(
         jnp.concatenate((value_error, sp_value_error), axis=1)

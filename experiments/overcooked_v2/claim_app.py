@@ -46,7 +46,16 @@ def _read_jsonl(path: str | Path) -> list[Mapping[str, Any]]:
     ]
 
 
-def _common_units(summary: Mapping[str, Any]) -> dict[tuple[str, str], float]:
+def _ego_index(row: Mapping[str, Any]) -> int:
+    for field in ("ego_run_index", "seed_index"):
+        if field in row and row[field] is not None:
+            return int(row[field])
+    raise ValueError(
+        "Evaluation row lacks ego_run_index or seed_index for method alignment."
+    )
+
+
+def _common_units(summary: Mapping[str, Any]) -> dict[tuple[int, str], float]:
     if summary.get("evaluation_mode") != "common_partner":
         raise ValueError("Claim external inputs must be common-partner evaluations.")
     raw = summary.get("raw")
@@ -61,23 +70,22 @@ def _common_units(summary: Mapping[str, Any]) -> dict[tuple[str, str], float]:
         verify_files=False,
     )
     parent_by_run = {str(run.run_id): str(run.parent_training_run_id) for run in manifest.runs}
-    totals: dict[tuple[str, str], list[float]] = {}
+    totals: dict[tuple[int, str], list[float]] = {}
     for row in _read_jsonl(raw_path):
         partner_id = str(row["partner_run_id"])
         if partner_id not in parent_by_run:
             raise ValueError(f"Evaluation row references an unknown partner: {partner_id}")
-        ego_id = str(row.get("ego_run_id", row.get("ego_run_index")))
-        key = (ego_id, parent_by_run[partner_id])
+        key = (_ego_index(row), parent_by_run[partner_id])
         totals.setdefault(key, []).append(float(row["raw_return"]))
     if not totals:
         raise ValueError("Evaluation artifact contains no external observations.")
     return {key: float(np.mean(values)) for key, values in totals.items()}
 
 
-def _merge_evaluations(values: list[str]) -> tuple[dict[tuple[str, str], float], list[Mapping[str, Any]]]:
+def _merge_evaluations(values: list[str]) -> tuple[dict[tuple[int, str], float], list[Mapping[str, Any]]]:
     if not values:
         raise ValueError("At least one evaluation artifact is required.")
-    merged: dict[tuple[str, str], list[float]] = {}
+    merged: dict[tuple[int, str], list[float]] = {}
     summaries = []
     for value in values:
         summary = _evaluation_summary(value)
@@ -90,7 +98,7 @@ def _merge_evaluations(values: list[str]) -> tuple[dict[tuple[str, str], float],
     return {key: float(np.mean(result)) for key, result in merged.items()}, summaries
 
 
-def _matrix(units: Mapping[tuple[str, str], float]) -> tuple[np.ndarray, tuple[str, ...], tuple[str, ...]]:
+def _matrix(units: Mapping[tuple[int, str], float]) -> tuple[np.ndarray, tuple[int, ...], tuple[str, ...]]:
     egos = tuple(sorted({key[0] for key in units}))
     parents = tuple(sorted({key[1] for key in units}))
     if not egos or len(parents) < 2:
@@ -116,11 +124,12 @@ def _bootstrap_external(
     right: np.ndarray,
     *,
     statistic: str,
+    seed: int = 0,
 ) -> Mapping[str, Any]:
     if left.shape != right.shape:
         raise ValueError("CETR and FCP external cells are not aligned.")
-    rng = np.random.default_rng(0)
-    parent_count = left.shape[1]
+    rng = np.random.default_rng(int(seed))
+    ego_count, parent_count = left.shape
     point = (
         float(np.mean(left - right))
         if statistic == "mean"
@@ -128,19 +137,20 @@ def _bootstrap_external(
     )
     draws = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
     for index in range(BOOTSTRAP_REPLICATES):
-        selected = rng.integers(0, parent_count, size=parent_count)
+        selected_ego = rng.integers(0, ego_count, size=ego_count)
+        selected_parent = rng.integers(0, parent_count, size=parent_count)
+        crossed_left = left[np.ix_(selected_ego, selected_parent)]
+        crossed_right = right[np.ix_(selected_ego, selected_parent)]
         if statistic == "mean":
-            draws[index] = float(np.mean((left - right)[:, selected]))
+            draws[index] = float(np.mean(crossed_left - crossed_right))
         else:
-            draws[index] = float(
-                _cvar50(left[:, selected]) - _cvar50(right[:, selected])
-            )
+            draws[index] = float(_cvar50(crossed_left) - _cvar50(crossed_right))
     return {
         "estimate": point,
         "interval_95": [float(value) for value in np.quantile(draws, (0.025, 0.975))],
         "lcb95": float(np.quantile(draws, 0.05)),
         "bootstrap_replicates": BOOTSTRAP_REPLICATES,
-        "bootstrap_unit": "parent_lineage",
+        "bootstrap_unit": "ego_run_x_parent_lineage",
     }
 
 
@@ -164,19 +174,22 @@ def _population_diagonal(value: str | Path) -> np.ndarray:
     return np.asarray(diagonal, dtype=np.float64)
 
 
-def _bootstrap_sp(diagonal: np.ndarray, tau: float) -> Mapping[str, Any]:
-    rng = np.random.default_rng(0)
-    point = float(np.mean(diagonal) - tau)
+def _bootstrap_sp(differences: np.ndarray, *, seed: int = 0) -> Mapping[str, Any]:
+    values = np.asarray(differences, dtype=np.float64)
+    if values.ndim != 1 or values.size != 10:
+        raise ValueError("SP claim requires exactly ten paired seed differences.")
+    rng = np.random.default_rng(int(seed))
+    point = float(np.mean(values))
     draws = np.empty(BOOTSTRAP_REPLICATES, dtype=np.float64)
     for index in range(BOOTSTRAP_REPLICATES):
-        selected = rng.integers(0, diagonal.size, size=diagonal.size)
-        draws[index] = float(np.mean(diagonal[selected]) - tau)
+        selected = rng.integers(0, values.size, size=values.size)
+        draws[index] = float(np.mean(values[selected]))
     return {
         "estimate": point,
         "interval_95": [float(value) for value in np.quantile(draws, (0.025, 0.975))],
         "lcb95": float(np.quantile(draws, 0.05)),
         "bootstrap_replicates": BOOTSTRAP_REPLICATES,
-        "bootstrap_unit": "ego_run",
+        "bootstrap_unit": "seed",
     }
 
 
@@ -246,6 +259,11 @@ def _markdown(report: Mapping[str, Any]) -> str:
         "| {ego_run_id} | {parent_lineage} | {cetr_return:.6f} | {fcp_return:.6f} | {difference:.6f} |".format(**row)
         for row in report["unit_table"]
     )
+    lines.extend(("", "## Per-seed SP differences", "", "| Seed | J_SP | tau_SP | Difference |", "|---:|---:|---:|---:|"))
+    lines.extend(
+        "| {seed_index} | {j_sp:.6f} | {tau_sp:.6f} | {difference:.6f} |".format(**row)
+        for row in report["sp_unit_table"]
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -258,26 +276,46 @@ def build_claim(args: argparse.Namespace) -> None:
         raise ValueError("CETR and FCP evaluations do not share the same panel cells.")
 
     baseline_methods = {str(summary.get("method")) for summary in baseline_summaries}
-    if "fcp" not in baseline_methods and len(baseline_methods) != 1:
-        raise ValueError("Baseline inputs must identify the FCP evaluation.")
+    if baseline_methods != {"fcp"}:
+        raise ValueError("Baseline inputs must identify exactly the FCP evaluation.")
 
     diagonals = [_population_diagonal(value) for value in args.cetr_population]
-    if len({int(value.size) for value in diagonals}) != 1:
-        raise ValueError("CETR population diagonals have different run counts.")
     diagonal = np.concatenate(diagonals)
+    if diagonal.size != 10:
+        raise ValueError("CETR population SP diagonal must contain ten run indexes.")
     reference_payloads = [
         _artifact_payload(value, preferred=("reference_sp.json",))
         for value in args.reference_sp
     ]
+    if len(reference_payloads) != 10:
+        raise ValueError("SP claim requires ten reference artifacts, one per seed.")
+    by_seed: dict[int, Mapping[str, Any]] = {}
     for payload in reference_payloads:
-        if payload.get("artifact_type") != "cetr_reference_sp" or int(payload.get("version", -1)) != 1:
+        if (
+            payload.get("artifact_type") != "cetr_reference_sp"
+            or int(payload.get("version", -1)) != 2
+        ):
             raise ValueError("Reference-SP artifact identity differs.")
-    tau_sp = float(np.mean([float(payload["tau_sp"]) for payload in reference_payloads]))
+        if "seed_index" not in payload:
+            raise ValueError("Reference-SP artifact lacks seed_index for SP pairing.")
+        seed = int(payload["seed_index"])
+        if seed in by_seed:
+            raise ValueError(f"Reference-SP seed index is duplicated: {seed}")
+        by_seed[seed] = payload
+    if set(by_seed) != set(range(10)):
+        raise ValueError(
+            "SP claim requires exactly one reference artifact for each seed index 0..9."
+        )
+    sp_differences = np.asarray(
+        [float(diagonal[seed]) - float(by_seed[seed]["tau_sp"]) for seed in range(10)],
+        dtype=np.float64,
+    )
+    tau_sp = float(np.mean([float(by_seed[seed]["tau_sp"]) for seed in range(10)]))
 
     contrasts = {
         "j_ext_mean": _bootstrap_external(cetr_values, fcp_values, statistic="mean"),
         "j_ext_cvar50": _bootstrap_external(cetr_values, fcp_values, statistic="cvar50"),
-        "j_sp_minus_tau_sp": _bootstrap_sp(diagonal, tau_sp),
+        "j_sp_minus_tau_sp": _bootstrap_sp(sp_differences),
     }
     sp_contrast = contrasts["j_sp_minus_tau_sp"]
     no_go_sp = float(sp_contrast["estimate"]) < 0.0 and float(
@@ -304,6 +342,7 @@ def build_claim(args: argparse.Namespace) -> None:
 
     unit_table = [
         {
+            "ego_run_index": int(ego),
             "ego_run_id": str(ego),
             "parent_lineage": str(parent),
             "cetr_return": float(cetr_units[(ego, parent)]),
@@ -312,6 +351,15 @@ def build_claim(args: argparse.Namespace) -> None:
         }
         for ego in cetr_egos
         for parent in cetr_parents
+    ]
+    sp_unit_table = [
+        {
+            "seed_index": seed,
+            "j_sp": float(diagonal[seed]),
+            "tau_sp": float(by_seed[seed]["tau_sp"]),
+            "difference": float(sp_differences[seed]),
+        }
+        for seed in range(10)
     ]
     report = {
         "version": 1,
@@ -329,12 +377,17 @@ def build_claim(args: argparse.Namespace) -> None:
                 "j_ext_cvar50": _cvar50(fcp_values),
             },
             "reference_tau_sp": tau_sp,
+            "reference_tau_sp_by_seed": [
+                float(by_seed[seed]["tau_sp"]) for seed in range(10)
+            ],
         },
         "contrasts": contrasts,
         "unit_table": unit_table,
+        "sp_unit_table": sp_unit_table,
         "decision": {"status": status, "rule": rule},
         "panel": {
-            "ego_run_ids": list(cetr_egos),
+            "ego_run_indexes": list(cetr_egos),
+            "ego_run_ids": [str(value) for value in cetr_egos],
             "parent_lineages": list(cetr_parents),
             "cetr_evaluations": list(args.cetr_evaluation),
             "baseline_evaluations": list(args.baseline_evaluation),

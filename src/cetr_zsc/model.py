@@ -141,6 +141,37 @@ def encode_task_frame(params: dict[str, Any], frame: Any) -> Any:
     return layer_norm(params["task_norm"], embedding)
 
 
+def actor_parameters(params: dict[str, Any]) -> dict[str, Any]:
+    """Select the parameter subtree used by deployed action inference."""
+
+    names = (
+        "task_conv",
+        "task_dense",
+        "task_norm",
+        "task_gru",
+        "actor_trunk",
+        "actor",
+    )
+    return {name: params[name] for name in names}
+
+
+def actor_step(
+    actor_params: dict[str, Any],
+    carry: Any,
+    observation: Any,
+    episode_start: Any,
+) -> tuple[Any, Any]:
+    """Advance the deployed actor without evaluating the value branch."""
+
+    import jax
+
+    embedding = encode_task_frame(actor_params, observation)
+    next_carry = _step_recurrent(actor_params, carry, embedding, episode_start)
+    actor_hidden = jax.nn.relu(linear(actor_params["actor_trunk"], next_carry))
+    logits = linear(actor_params["actor"], actor_hidden)
+    return next_carry, logits
+
+
 def _actor_value(params: dict[str, Any], carry: Any) -> tuple[Any, Any]:
     import jax
 
@@ -199,4 +230,10 @@ def _model_sequence(
     return logits, values
 
 
-__all__ = ["CetrModel", "OFFICIAL_CONV_STACK", "encode_task_frame"]
+__all__ = [
+    "CetrModel",
+    "OFFICIAL_CONV_STACK",
+    "actor_parameters",
+    "actor_step",
+    "encode_task_frame",
+]

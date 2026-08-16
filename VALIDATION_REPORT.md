@@ -17,9 +17,10 @@ git history only; no historical artifact defines CETR.
 ## Active artifact identity
 
 - package version: `0.7.0`;
-- configuration contract: `version: 5`;
-- checkpoint schema: `7`;
-- deployment bundle version: `6`;
+- configuration contract: `version: 6`;
+- checkpoint schema: `8`;
+- deployment bundle version: `7` (actor parameter subtree only; provenance is same-directory);
+- reference-SP artifact version: `2` (resolved absolute `source_checkpoint` binding);
 - partner manifest version: `2`;
 - method identity: `src/cetr_zsc/config.py`;
 - command entry point: `python -m experiments.overcooked_v2.cetr_zsc`.
@@ -36,14 +37,20 @@ git history only; no historical artifact defines CETR.
 - the CI configuration loads `cetr_*.yaml`, compiles the CETR package, smokes
   the CETR CLI and its 14 subcommands, and passes the required reference-SP and
   initializer artifacts to the fail-closed CUDA preflight;
+- the first audit repair group establishes complete-episode returns, deterministic
+  external parent coverage, fold×role cross-fitting, and one shared normalization
+  on the complete batch before minibatch slicing;
+- the application-layer repair is landed: seed-`-1` preflight mapping, version-2
+  τ artifact path equality, crossed claim bootstrap, exact FCP baseline selection,
+  and actor-only deployment provenance;
 - `validation/run_all_isolated_tests.py` discovers only `test_cetr_*.py` and
   labels its output as CETR.
 
 ## Verification boundary
 
-Per the migration requirement, no Python interpreter, project code, package
-manager, compiler, or test runner was executed. Verification was limited to
-file operations, Read/Grep/Glob inspection, and `git status --short`.
+Per the current documentation-only requirement, no Python interpreter, project
+code, package manager, compiler, or test runner was executed. Verification was
+limited to Read/Grep/Glob inspection and documentation edits.
 
 Consequently, this report does not claim that the test suite, compile gate,
 workflow parser, CLI smoke commands, configuration loader, or CUDA preflight

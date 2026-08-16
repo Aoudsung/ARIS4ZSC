@@ -13,12 +13,12 @@ from src.cetr_zsc.config import (
     OFFICIAL_ACTION_COUNT,
     run_config_from_mapping,
 )
-from src.cetr_zsc.model import CetrModel
+from src.cetr_zsc.model import CetrModel, actor_parameters, actor_step
 from src.cetr_zsc.storage import read_json, write_json
 from src.cetr_zsc.types import PolicyState
 
 
-DEPLOYMENT_BUNDLE_VERSION = 6
+DEPLOYMENT_BUNDLE_VERSION = 7
 _REFERENCE_FIELDS = {
     "artifact_type",
     "version",
@@ -28,6 +28,15 @@ _REFERENCE_FIELDS = {
     "episodes_per_pairing",
     "evaluation_root_seed",
     "source_checkpoint",
+}
+_PROVENANCE_FIELDS = {"reference_sp_artifact", "training_parent_manifest"}
+_ACTOR_FIELDS = {
+    "task_conv",
+    "task_dense",
+    "task_norm",
+    "task_gru",
+    "actor_trunk",
+    "actor",
 }
 _BUNDLE_FIELDS = {
     "version",
@@ -39,8 +48,7 @@ _BUNDLE_FIELDS = {
     "action_count",
     "params",
     "source_training_run",
-    "reference_sp_artifact",
-    "training_parent_manifest",
+    "provenance",
 }
 
 
@@ -49,15 +57,15 @@ class Deployment:
     ego_run_id: str
     config: Any
     model: CetrModel
-    params: Any
-    reference_sp_artifact: Mapping[str, Any]
+    params: Mapping[str, Any]
+    provenance_path: Path
 
 
 def _reference_artifact(value: Mapping[str, Any] | str | Path) -> Mapping[str, Any]:
     payload = read_json(value) if isinstance(value, (str, Path)) else value
     if not isinstance(payload, Mapping) or set(payload) != _REFERENCE_FIELDS:
         raise ValueError("Reference-SP artifact schema differs.")
-    if payload.get("artifact_type") != "cetr_reference_sp" or int(payload["version"]) != 1:
+    if payload.get("artifact_type") != "cetr_reference_sp" or int(payload["version"]) != 2:
         raise ValueError("Reference-SP artifact identity differs.")
     if not isinstance(payload.get("layout"), str):
         raise ValueError("Reference-SP artifact layout is missing.")
@@ -75,8 +83,20 @@ def _training_parent_manifest(source_training_run: Path) -> Mapping[str, Any]:
             payload = read_json(candidate)
             if not isinstance(payload, Mapping):
                 raise ValueError("Training parent manifest is not a JSON object.")
-            return {"path": str(candidate), "manifest": dict(payload)}
-    return {"path": str(source_training_run / "partner_manifest.json")}
+            return {"path": str(candidate.resolve()), "manifest": dict(payload)}
+    return {"path": str((source_training_run / "partner_manifest.json").resolve())}
+
+
+def _validate_parent_manifest(value: Any) -> Mapping[str, Any]:
+    if (
+        not isinstance(value, Mapping)
+        or set(value) not in ({"path"}, {"path", "manifest"})
+        or not str(value["path"])
+    ):
+        raise ValueError("Deployment parent-manifest binding differs.")
+    if "manifest" in value and not isinstance(value["manifest"], Mapping):
+        raise ValueError("Deployment parent-manifest payload differs.")
+    return dict(value)
 
 
 def export_deployment_bundle(
@@ -95,9 +115,20 @@ def export_deployment_bundle(
     root.mkdir(parents=True, exist_ok=True)
     reference = _reference_artifact(reference_sp_artifact)
     source = Path(source_training_run).resolve()
+    provenance = {
+        "reference_sp_artifact": reference,
+        "training_parent_manifest": _training_parent_manifest(source),
+    }
+    export_params = (
+        actor_parameters(params)
+        if isinstance(params, Mapping) and "value" in params
+        else params
+    )
     params_path = root / "params.pkl"
     with params_path.open("wb") as handle:
-        pickle.dump(params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(export_params, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    provenance_path = root / "provenance.json"
+    write_json(provenance_path, provenance)
     write_json(
         root / "deployment_bundle.json",
         {
@@ -110,8 +141,7 @@ def export_deployment_bundle(
             "action_count": int(OFFICIAL_ACTION_COUNT),
             "params": params_path.name,
             "source_training_run": str(source),
-            "reference_sp_artifact": reference,
-            "training_parent_manifest": _training_parent_manifest(source),
+            "provenance": provenance_path.name,
         },
     )
     return root
@@ -134,9 +164,17 @@ def load_deployment(directory: str | Path) -> Deployment:
     config = run_config_from_mapping(payload["config"])
     if str(payload["ego_run_id"]) == "" or str(payload["source_training_run"]) == "":
         raise ValueError("Deployment run binding is empty.")
-    reference = _reference_artifact(payload["reference_sp_artifact"])
+    provenance_name = str(payload["provenance"])
+    provenance_path = root / provenance_name
+    if provenance_name != Path(provenance_name).name or not provenance_path.is_file():
+        raise ValueError("Deployment provenance binding differs.")
+    provenance = read_json(provenance_path)
+    if not isinstance(provenance, Mapping) or set(provenance) != _PROVENANCE_FIELDS:
+        raise ValueError("Deployment provenance schema differs.")
+    reference = _reference_artifact(provenance["reference_sp_artifact"])
     if str(reference["layout"]) != str(config.environment.layout):
         raise ValueError("Deployment reference-SP layout differs from the config.")
+    _validate_parent_manifest(provenance["training_parent_manifest"])
     shape_value = payload["observation_shape"]
     if (
         not isinstance(shape_value, list)
@@ -147,26 +185,21 @@ def load_deployment(directory: str | Path) -> Deployment:
     shape = tuple(int(value) for value in shape_value)
     if int(payload["action_count"]) != OFFICIAL_ACTION_COUNT:
         raise ValueError("Deployment action count differs.")
-    parent_manifest = payload["training_parent_manifest"]
-    if (
-        not isinstance(parent_manifest, Mapping)
-        or set(parent_manifest) not in ({"path"}, {"path", "manifest"})
-        or not str(parent_manifest["path"])
-    ):
-        raise ValueError("Deployment parent-manifest binding differs.")
     params_name = str(payload["params"])
     params_path = root / params_name
     if params_name != Path(params_name).name or not params_path.is_file():
         raise ValueError("Deployment parameter binding differs.")
     with params_path.open("rb") as handle:
         params = pickle.load(handle)
+    if not isinstance(params, Mapping) or set(params) != _ACTOR_FIELDS:
+        raise ValueError("Deployment parameters must contain the actor subtree only.")
     model = CetrModel(config, shape, OFFICIAL_ACTION_COUNT)
     return Deployment(
         ego_run_id=str(payload["ego_run_id"]),
         config=config,
         model=model,
         params=params,
-        reference_sp_artifact=reference,
+        provenance_path=provenance_path,
     )
 
 
@@ -196,13 +229,12 @@ def deployment_action(
     observations = jnp.asarray(observation, dtype=jnp.float32)
     if observations.ndim == len(deployment.model.observation_shape):
         observations = observations[None, ...]
-    next_carry, logits, unused_value = deployment.model.step(
+    next_carry, logits = actor_step(
         deployment.params,
         state.carry,
         observations,
         state.episode_start,
     )
-    del unused_value
     logits = jnp.asarray(logits)
     key_array = jnp.asarray(keys)
     if key_array.ndim == 1:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping, NamedTuple
 
+from .losses import return_to_go
 from .types import EpisodeBatch
 
 
@@ -20,6 +21,7 @@ class PartnerState(NamedTuple):
     member: Any
     parent: Any
     fold: Any
+    role: Any
     stage_slot: Any
 
 
@@ -27,8 +29,37 @@ class PartnerContext(NamedTuple):
     reset_key: Any
 
 
+def external_lane_assignment(
+    ext_lanes: int,
+    parent_count: int,
+    update_index: Any,
+    parent_members: Any,
+) -> tuple[Any, Any, Any, Any]:
+    """Assign every external lane without sampling.
+
+    For E=64,P=16 and E=16,P=4, each parent receives exactly one A0, A1,
+    B0, and B1 lane on every update.  The stage slot rotates with the update
+    and lane block, so all three checkpoints are balanced over time.  The
+    mechanical E=2<P path is intentionally a partial smoke allocation.
+    """
+
+    import jax.numpy as jnp
+
+    count = int(ext_lanes)
+    parents = int(parent_count)
+    lanes = jnp.arange(count, dtype=jnp.int32)
+    parent = jnp.mod(lanes, parents)
+    fold = jnp.mod(lanes // parents, 2)
+    role = jnp.mod(lanes // (2 * parents), 2)
+    slot = lanes // parents
+    stage_slot = jnp.mod(jnp.asarray(update_index, dtype=jnp.int32) + slot, 3)
+    members = jnp.asarray(parent_members, dtype=jnp.int32)
+    member = members[parent, stage_slot]
+    return member, parent, fold, role
+
+
 def make_static_partner_functions(*, pool_metadata: Any, official_pool: Any) -> PartnerFunctions:
-    """Create the paired parent sampler used by external lanes only."""
+    """Create the deterministic parent assignment used by external lanes."""
 
     import jax
     import jax.numpy as jnp
@@ -41,28 +72,26 @@ def make_static_partner_functions(*, pool_metadata: Any, official_pool: Any) -> 
     if parent_members.shape != (parent_count, 3):
         raise ValueError("Every parent must expose three checkpoint slots.")
 
-    def initial_state(ext_lane_count: int, key: Any) -> PartnerState:
+    def initial_state(
+        ext_lane_count: int, key: Any, update_index: Any = 0
+    ) -> PartnerState:
+        del key
         count = int(ext_lane_count)
         if count <= 0 or count % 2:
             raise ValueError("External lane count must be a positive even number.")
-        pair_count = count // 2
-        parent_key, stage_key = jax.random.split(key)
-        parent_pairs = jax.random.categorical(
-            parent_key,
-            jnp.log(jnp.maximum(nominal, 1.0e-30)),
-            shape=(pair_count,),
-        ).astype(jnp.int32)
-        parent = jnp.repeat(parent_pairs, 2)
-        stage_slot = jax.random.randint(
-            stage_key, (count,), 0, 3, dtype=jnp.int32
+        member, parent, fold, role = external_lane_assignment(
+            count, parent_count, update_index, parent_members
         )
-        member = parent_members[parent, stage_slot]
-        fold = jnp.tile(jnp.asarray((0, 1), dtype=jnp.int32), pair_count)
+        stage_slot = jnp.mod(
+            jnp.asarray(update_index, dtype=jnp.int32) + jnp.arange(count) // parent_count,
+            3,
+        )
         return PartnerState(
             carry=official_pool.initial_carry(count),
             member=member,
             parent=parent,
             fold=fold,
+            role=role,
             stage_slot=stage_slot,
         )
 
@@ -86,6 +115,7 @@ def make_static_partner_functions(*, pool_metadata: Any, official_pool: Any) -> 
             member=state.member,
             parent=state.parent,
             fold=state.fold,
+            role=state.role,
             stage_slot=state.stage_slot,
         )
         return (
@@ -105,20 +135,17 @@ def make_static_partner_functions(*, pool_metadata: Any, official_pool: Any) -> 
         dones: Any,
         next_observations: Any,
     ) -> PartnerState:
-        del parameters, observations, actions, rewards, next_observations
-        import jax
+        del parameters, context, observations, actions, rewards, next_observations
         import jax.numpy as jnp
 
         done = jnp.asarray(dones, dtype=jnp.bool_)
-
-        def reset_all(reset_key: Any) -> PartnerState:
-            return initial_state(int(done.shape[0]), reset_key)
-
-        return jax.lax.cond(
-            jnp.any(done),
-            reset_all,
-            lambda unused: state,
-            context.reset_key,
+        return PartnerState(
+            carry=jnp.where(done[..., None], jnp.zeros_like(state.carry), state.carry),
+            member=state.member,
+            parent=state.parent,
+            fold=state.fold,
+            role=state.role,
+            stage_slot=state.stage_slot,
         )
 
     def run_id(parameters: Any, state: PartnerState, context: Any) -> Any:
@@ -137,6 +164,7 @@ def make_static_partner_functions(*, pool_metadata: Any, official_pool: Any) -> 
             "run_id": state.member,
             "parent": state.parent,
             "fold": state.fold,
+            "role": state.role,
             "stage_slot": state.stage_slot,
             "parent_count": jnp.asarray(parent_count, dtype=jnp.int32),
         }
@@ -168,16 +196,19 @@ def collect_episodes(
     params: Any,
     partner_functions: PartnerFunctions,
     random_key: Any,
+    update_index: Any,
 ) -> tuple[Any, EpisodeBatch, Mapping[str, Any]]:
     """Collect one fresh, complete episode on every lane.
 
     The first half of the vector is self-play and the second half is external.
-    External lanes are paired by parent, while each lane receives its own
-    checkpoint-slot draw and its deterministic fold label.
+    Self-play roles alternate; external roles and parent/fold assignments come
+    from ``external_lane_assignment`` for the supplied update index.
     """
 
     import jax
     import jax.numpy as jnp
+
+    update_index = jnp.asarray(update_index, dtype=jnp.int32)
 
     lane_count = int(environment.num_envs)
     steps = int(environment.episode_steps)
@@ -188,8 +219,7 @@ def collect_episodes(
     self_count = lane_count // 2
     external_count = lane_count - self_count
     lane_indexes = jnp.arange(lane_count, dtype=jnp.int32)
-    ego_roles = (lane_indexes % 2).astype(jnp.int32)
-    self_roles = ego_roles[:self_count]
+    self_roles = jnp.mod(jnp.arange(self_count, dtype=jnp.int32), 2)
 
     reset_root = jax.random.fold_in(random_key, 101)
     reset_keys = jax.vmap(
@@ -198,8 +228,10 @@ def collect_episodes(
     environment_state, joint_observations = environment.reset_with_keys(reset_keys)
     partner_root = jax.random.fold_in(random_key, 103)
     initial_partner_state = partner_functions.initial_state(
-        external_count, partner_root
+        external_count, partner_root, update_index
     )
+    external_roles = jnp.asarray(initial_partner_state.role, dtype=jnp.int32)
+    ego_roles = jnp.concatenate((self_roles, external_roles), axis=0)
     ego_carry = model.initial_carry(lane_count)
     self_carry = model.initial_carry(self_count)
     episode_start = jnp.ones((lane_count,), dtype=jnp.bool_)
@@ -359,6 +391,14 @@ def collect_episodes(
         rewards,
         dones,
     ) = rows
+    value_targets = return_to_go(rewards)
+    sp_other_value_targets = value_targets[:, :self_count]
+    advantages = jnp.asarray(value_targets, dtype=jnp.float32) - jnp.asarray(
+        old_values, dtype=jnp.float32
+    )
+    sp_other_advantages = sp_other_value_targets - jnp.asarray(
+        self_old_values, dtype=jnp.float32
+    )
     episode_return = jnp.sum(jnp.asarray(rewards, dtype=jnp.float32), axis=0)
     parent = initial_partner_state.parent
     partner_diagnostics = partner_functions.diagnostics(
@@ -391,6 +431,7 @@ def collect_episodes(
     metrics = {
         "sp_return_mean": jnp.mean(episode_return[:self_count]),
         "external_return_mean": jnp.mean(episode_return[self_count:]),
+        "premature_done_count": jnp.sum(dones[:-1].astype(jnp.float32)),
         "final_done_fraction": jnp.mean(dones[-1].astype(jnp.float32)),
         "external_parent_episode_counts": parent_counts,
         "parent_episode_counts": parent_counts,
@@ -402,6 +443,10 @@ def collect_episodes(
         old_values=old_values,
         rewards=rewards,
         dones=dones,
+        value_targets=value_targets,
+        sp_other_value_targets=sp_other_value_targets,
+        advantages=advantages,
+        sp_other_advantages=sp_other_advantages,
         episode_starts=episode_starts,
         sp_other_observations=self_observations,
         sp_other_actions=self_actions,
@@ -423,5 +468,6 @@ __all__ = [
     "PartnerFunctions",
     "PartnerState",
     "collect_episodes",
+    "external_lane_assignment",
     "make_static_partner_functions",
 ]

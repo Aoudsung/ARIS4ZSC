@@ -68,6 +68,8 @@ def _make_model_and_batch():
     starts = jnp.zeros((time, lanes), dtype=jnp.bool_).at[0].set(True)
     rewards = jnp.arange(time * lanes, dtype=jnp.float32).reshape(time, lanes) / 10.0
     dones = jnp.zeros((time, lanes), dtype=jnp.bool_).at[-1].set(True)
+    value_targets = jnp.flip(jnp.cumsum(jnp.flip(rewards, axis=0), axis=0), axis=0)
+    sp_other_value_targets = value_targets[:, :sp_lanes]
     episode_return = jnp.sum(rewards, axis=0)
     batch = EpisodeBatch(
         observations=observations,
@@ -76,6 +78,10 @@ def _make_model_and_batch():
         old_values=jnp.zeros((time, lanes), dtype=jnp.float32),
         rewards=rewards,
         dones=dones,
+        value_targets=value_targets,
+        sp_other_value_targets=sp_other_value_targets,
+        advantages=value_targets,
+        sp_other_advantages=sp_other_value_targets,
         episode_starts=starts,
         sp_other_observations=sp_observations,
         sp_other_actions=sp_actions,
@@ -133,3 +139,39 @@ def test_zero_dual_multiplier_removes_self_play_actor_from_total() -> None:
         - config.ppo.entropy_weight * result.metrics["entropy"]
     )
     np.testing.assert_allclose(np.asarray(result.total), np.asarray(expected), atol=2.0e-6)
+
+
+def test_cetr_ppo_loss_consumes_prepared_advantages_without_rescaling() -> None:
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.losses import categorical_log_probability, cetr_ppo_loss
+
+    _, model, params, batch = _make_model_and_batch()
+    logits, _ = model.sequence(
+        params,
+        model.initial_carry(4),
+        batch.observations,
+        batch.episode_starts,
+    )
+    sp_logits, _ = model.sequence(
+        params,
+        model.initial_carry(2),
+        batch.sp_other_observations,
+        batch.episode_starts[:, :2],
+    )
+    advantages = jnp.asarray(
+        [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0], [9.0, 10.0, 11.0, 12.0], [13.0, 14.0, 15.0, 16.0], [17.0, 18.0, 19.0, 20.0], [21.0, 22.0, 23.0, 24.0]]
+    )
+    prepared = batch._replace(
+        old_log_probabilities=categorical_log_probability(logits, batch.actions),
+        sp_other_old_log_probabilities=categorical_log_probability(
+            sp_logits, batch.sp_other_actions
+        ),
+        advantages=advantages,
+        sp_other_advantages=jnp.zeros_like(batch.sp_other_advantages),
+    )
+    result = cetr_ppo_loss(model, params, prepared, jnp.asarray(0.0))
+    expected = -jnp.mean(advantages[:, 2:] * jnp.asarray([0.5, 0.25]))
+    np.testing.assert_allclose(
+        np.asarray(result.metrics["actor_external"]), np.asarray(expected), atol=2.0e-5
+    )

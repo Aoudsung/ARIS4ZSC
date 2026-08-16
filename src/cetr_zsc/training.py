@@ -5,9 +5,9 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Any, Mapping
 
-from .losses import cetr_ppo_loss
+from .losses import cetr_ppo_loss, joint_normalize_advantages
 from .optimizer import adam_update, init_adam
-from .risk import lower_half_cvar_weights, renormalize_weights
+from .risk import lower_half_cvar_weights
 from .types import EpisodeBatch, TrainState
 
 
@@ -98,7 +98,6 @@ def compute_tail_weights(
     lane_weight = jnp.ones((lanes,), dtype=jnp.float32)
     fold_means = []
     fold_q = []
-    fold_nominal = []
     fold_observed = []
     fold_max_weight = []
 
@@ -112,24 +111,21 @@ def compute_tail_weights(
         )
         observed = counts > 0.0
         means = jnp.where(observed, sums / jnp.maximum(counts, 1.0), 0.0)
-        q = lower_half_cvar_weights(means, nominal, observed)
-        observed_nominal = renormalize_weights(nominal, observed)
-        safe_ratio = jnp.where(
-            (observed_nominal > 0.0) & (q > 0.0),
-            q / jnp.maximum(observed_nominal, 1.0e-30),
-            0.0,
-        )
+        raw_q = lower_half_cvar_weights(means, nominal)
+        has_fold = jnp.sum(counts) > 0.0
+        q = jnp.where(has_fold, raw_q, jnp.zeros_like(raw_q))
+        safe_ratio = jnp.where(nominal > 0.0, q / nominal, 0.0)
         target = (lane_stream == 1) & (lane_fold == (1 - fold))
         lane_weight = jnp.where(target, safe_ratio[safe_parent], lane_weight)
         target_weights = jnp.where(target, safe_ratio[safe_parent], 0.0)
         fold_means.append(means)
         fold_q.append(q)
-        fold_nominal.append(observed_nominal)
         fold_observed.append(observed)
         fold_max_weight.append(jnp.max(target_weights))
 
-    tail_objective = 0.5 * sum(
-        jnp.sum(q * means) for q, means in zip(fold_q, fold_means)
+    tail_objective = 0.5 * (
+        jnp.sum(fold_q[0] * fold_means[1])
+        + jnp.sum(fold_q[1] * fold_means[0])
     )
     metrics = {
         "tail_objective": tail_objective,
@@ -140,6 +136,25 @@ def compute_tail_weights(
         "tail_weight_max": jnp.max(lane_weight),
     }
     return lane_weight, metrics
+
+
+def prepare_episode_batch(batch: EpisodeBatch) -> EpisodeBatch:
+    """Normalize both policy streams once on the complete collected batch."""
+
+    import jax.numpy as jnp
+
+    combined = jnp.concatenate(
+        (jnp.asarray(batch.advantages, dtype=jnp.float32),
+         jnp.asarray(batch.sp_other_advantages, dtype=jnp.float32)),
+        axis=1,
+    )
+    mask = jnp.ones_like(combined, dtype=jnp.float32)
+    normalized = joint_normalize_advantages(combined, mask)
+    lane_count = int(batch.advantages.shape[1])
+    return batch._replace(
+        advantages=normalized[:, :lane_count],
+        sp_other_advantages=normalized[:, lane_count:],
+    )
 
 
 def slice_episode_lanes(batch: EpisodeBatch, indexes: Any) -> EpisodeBatch:
@@ -164,11 +179,15 @@ def slice_episode_lanes(batch: EpisodeBatch, indexes: Any) -> EpisodeBatch:
         old_values=batch.old_values[:, lane_indexes],
         rewards=batch.rewards[:, lane_indexes],
         dones=batch.dones[:, lane_indexes],
+        value_targets=batch.value_targets[:, lane_indexes],
+        advantages=batch.advantages[:, lane_indexes],
         episode_starts=batch.episode_starts[:, lane_indexes],
         sp_other_observations=batch.sp_other_observations[:, self_indexes],
         sp_other_actions=batch.sp_other_actions[:, self_indexes],
         sp_other_old_log_probabilities=batch.sp_other_old_log_probabilities[:, self_indexes],
         sp_other_old_values=batch.sp_other_old_values[:, self_indexes],
+        sp_other_value_targets=batch.sp_other_value_targets[:, self_indexes],
+        sp_other_advantages=batch.sp_other_advantages[:, self_indexes],
         lane_stream=batch.lane_stream[lane_indexes],
         lane_parent=batch.lane_parent[lane_indexes],
         lane_fold=batch.lane_fold[lane_indexes],
@@ -308,6 +327,7 @@ def training_update(
     import jax
     import jax.numpy as jnp
 
+    prepared_batch = prepare_episode_batch(batch)
     flat_schedule = jnp.asarray(schedule, dtype=jnp.int32).reshape(
         (-1, schedule.shape[-1])
     )
@@ -318,7 +338,7 @@ def training_update(
             model=model,
             params=current_params,
             optimizer_state=current_state,
-            batch=slice_episode_lanes(batch, indexes),
+            batch=slice_episode_lanes(prepared_batch, indexes),
             dual_lambda=dual_lambda,
             total_optimizer_steps=total_optimizer_steps,
         )
@@ -379,6 +399,7 @@ __all__ = [
     "environment_minibatch_schedule",
     "init_training_state",
     "make_training_update_kernel",
+    "prepare_episode_batch",
     "ppo_learning_rate",
     "slice_episode_lanes",
     "training_update",

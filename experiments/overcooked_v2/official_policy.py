@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from .deployment import Deployment, deployment_action, reset_deployment_state
+from src.cetr_zsc.model import actor_step
+
+from .deployment import Deployment, reset_deployment_state
 
 
 def _tree_select(mask: Any, selected: Any, alternative: Any) -> Any:
@@ -26,6 +28,7 @@ def _compute_deployment_action(
     hstate: Any,
     key: Any,
 ) -> tuple[Any, Any]:
+    import jax
     import jax.numpy as jnp
 
     observation = jnp.asarray(obs, dtype=jnp.float32)
@@ -38,15 +41,22 @@ def _compute_deployment_action(
     keys = jnp.asarray(key)
     fresh = reset_deployment_state(deployment, int(observation.shape[0]))
     current = _tree_select(done_value, fresh, hstate)
-    next_state, action, unused_logp = deployment_action(
-        deployment=deployment,
-        state=current,
-        observation=observation,
-        keys=keys,
+    next_carry, logits = actor_step(
+        deployment.params,
+        current.carry,
+        observation,
+        current.episode_start,
     )
-    del unused_logp
-    next_state = next_state._replace(
-        episode_start=jnp.zeros_like(done_value, dtype=jnp.bool_)
+    if keys.ndim == 1:
+        keys = jax.random.split(keys, int(observation.shape[0]))
+    action = jax.vmap(
+        lambda current_key, current_logits: jax.random.categorical(
+            current_key, current_logits
+        )
+    )(keys, logits)
+    next_state = current._replace(
+        carry=next_carry,
+        episode_start=jnp.zeros_like(done_value),
     )
     return (action, next_state) if batched else (action[0], next_state)
 

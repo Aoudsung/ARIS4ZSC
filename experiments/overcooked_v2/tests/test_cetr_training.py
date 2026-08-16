@@ -23,26 +23,30 @@ def _batch_for_weights():
 
     from src.cetr_zsc.types import EpisodeBatch
 
-    lanes = 8
+    lanes = 16
     self_lanes = lanes // 2
-    lane_stream = jnp.asarray([0, 0, 0, 0, 1, 1, 1, 1], dtype=jnp.int32)
-    lane_parent = jnp.asarray([-1, -1, -1, -1, 0, 1, 0, 1], dtype=jnp.int32)
-    lane_fold = jnp.asarray([-1, -1, -1, -1, 0, 0, 1, 1], dtype=jnp.int32)
-    returns = jnp.asarray([0.0, 0.0, 0.0, 0.0, 10.0, 20.0, 30.0, 40.0])
+    lane_stream = jnp.asarray([0] * 8 + [1] * 8, dtype=jnp.int32)
+    lane_parent = jnp.asarray([-1] * 8 + [0, 1, 0, 1, 0, 1, 0, 1], dtype=jnp.int32)
+    lane_fold = jnp.asarray([-1] * 8 + [0, 0, 1, 1, 0, 0, 1, 1], dtype=jnp.int32)
+    returns = jnp.asarray([0.0] * 8 + [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0])
+    zeros = jnp.zeros((1, lanes), dtype=jnp.float32)
+    sp_zeros = jnp.zeros((1, self_lanes), dtype=jnp.float32)
     return EpisodeBatch(
         observations=jnp.zeros((1, lanes, 1), dtype=jnp.float32),
         actions=jnp.zeros((1, lanes), dtype=jnp.int32),
-        old_log_probabilities=jnp.zeros((1, lanes), dtype=jnp.float32),
-        old_values=jnp.zeros((1, lanes), dtype=jnp.float32),
-        rewards=jnp.zeros((1, lanes), dtype=jnp.float32),
+        old_log_probabilities=zeros,
+        old_values=zeros,
+        rewards=zeros,
         dones=jnp.ones((1, lanes), dtype=jnp.bool_),
+        value_targets=zeros,
+        sp_other_value_targets=sp_zeros,
+        advantages=zeros,
+        sp_other_advantages=sp_zeros,
         episode_starts=jnp.ones((1, lanes), dtype=jnp.bool_),
         sp_other_observations=jnp.zeros((1, self_lanes, 1), dtype=jnp.float32),
         sp_other_actions=jnp.zeros((1, self_lanes), dtype=jnp.int32),
-        sp_other_old_log_probabilities=jnp.zeros(
-            (1, self_lanes), dtype=jnp.float32
-        ),
-        sp_other_old_values=jnp.zeros((1, self_lanes), dtype=jnp.float32),
+        sp_other_old_log_probabilities=sp_zeros,
+        sp_other_old_values=sp_zeros,
         lane_stream=lane_stream,
         lane_parent=lane_parent,
         lane_fold=lane_fold,
@@ -62,9 +66,9 @@ def test_compute_tail_weights_matches_two_fold_hand_calculation() -> None:
         parent_count=2,
     )
     np.testing.assert_allclose(
-        np.asarray(weights), [1.0, 1.0, 1.0, 1.0, 2.0, 0.0, 2.0, 0.0]
+        np.asarray(weights), [1.0] * 8 + [2.0, 0.0, 2.0, 0.0, 2.0, 0.0, 2.0, 0.0]
     )
-    np.testing.assert_allclose(float(metrics["tail_objective"]), 20.0)
+    np.testing.assert_allclose(float(metrics["tail_objective"]), 40.0)
     assert float(metrics["fold_0_observed_parent_count"]) == 2.0
     assert float(metrics["fold_1_observed_parent_count"]) == 2.0
     assert float(metrics["tail_weight_max"]) == 2.0
@@ -162,6 +166,7 @@ class _PartnerState(NamedTuple):
     member: Any
     parent: Any
     fold: Any
+    role: Any
     stage_slot: Any
 
 
@@ -170,14 +175,15 @@ def _partner_functions():
 
     from src.cetr_zsc.runner import PartnerFunctions
 
-    def initial_state(batch_size: int, key: Any) -> _PartnerState:
-        del key
+    def initial_state(batch_size: int, key: Any, update_index: Any) -> _PartnerState:
+        del key, update_index
         count = int(batch_size)
         return _PartnerState(
             carry=jnp.zeros((count, 8), dtype=jnp.float32),
             member=jnp.zeros((count,), dtype=jnp.int32),
             parent=jnp.zeros((count,), dtype=jnp.int32),
             fold=jnp.tile(jnp.asarray((0, 1), dtype=jnp.int32), count // 2),
+            role=jnp.zeros((count,), dtype=jnp.int32),
             stage_slot=jnp.zeros((count,), dtype=jnp.int32),
         )
 
@@ -254,6 +260,10 @@ def _model_and_batch():
         old_values=jnp.zeros((time, lanes), dtype=jnp.float32),
         rewards=jnp.zeros((time, lanes), dtype=jnp.float32),
         dones=jnp.zeros((time, lanes), dtype=jnp.bool_).at[-1].set(True),
+        value_targets=jnp.zeros((time, lanes), dtype=jnp.float32),
+        sp_other_value_targets=jnp.zeros((time, self_lanes), dtype=jnp.float32),
+        advantages=jnp.zeros((time, lanes), dtype=jnp.float32),
+        sp_other_advantages=jnp.zeros((time, self_lanes), dtype=jnp.float32),
         episode_starts=jnp.zeros((time, lanes), dtype=jnp.bool_).at[0].set(True),
         sp_other_observations=self_observations,
         sp_other_actions=self_actions,
@@ -293,6 +303,7 @@ def test_mechanical_update_changes_parameters_and_dual_moves_up_below_target() -
         params=params,
         partner_functions=_partner_functions(),
         random_key=jax.random.PRNGKey(34),
+        update_index=0,
     )
     assert float(collection_metrics["final_done_fraction"]) == 1.0
     lane_weight, tail_metrics = compute_tail_weights(
@@ -322,3 +333,34 @@ def test_mechanical_update_changes_parameters_and_dual_moves_up_below_target() -
 
     increased = update_sp_dual(0.0, 1.0, 0.0, 0.1)
     assert float(increased) > 0.0
+
+
+def test_prepare_episode_batch_normalizes_once_before_lane_slicing() -> None:
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.training import prepare_episode_batch, slice_episode_lanes
+
+    _, _, _, batch = _model_and_batch()
+    advantages = jnp.arange(16, dtype=jnp.float32).reshape(4, 4)
+    sp_advantages = jnp.asarray([[20.0, 30.0], [40.0, 50.0], [60.0, 70.0], [80.0, 90.0]])
+    prepared = prepare_episode_batch(
+        batch._replace(
+            advantages=advantages,
+            sp_other_advantages=sp_advantages,
+        )
+    )
+    combined = jnp.concatenate(
+        (prepared.advantages, prepared.sp_other_advantages), axis=1
+    )
+    np.testing.assert_allclose(float(jnp.mean(combined)), 0.0, atol=2.0e-6)
+    np.testing.assert_allclose(float(jnp.var(combined)), 1.0, atol=2.0e-5)
+
+    indexes = jnp.asarray([2, 3, 0, 1], dtype=jnp.int32)
+    sliced = slice_episode_lanes(prepared, indexes)
+    np.testing.assert_array_equal(
+        np.asarray(sliced.advantages), np.asarray(prepared.advantages[:, indexes])
+    )
+    np.testing.assert_array_equal(
+        np.asarray(sliced.sp_other_advantages),
+        np.asarray(prepared.sp_other_advantages[:, indexes[:2]]),
+    )

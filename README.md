@@ -8,7 +8,7 @@ The active method identity is defined only by
 [`src/cetr_zsc/config.py`](src/cetr_zsc/config.py):
 
 - `METHOD_VERSION = constrained_episodic_tail_robust_zsc_v1`
-- active configuration contract: `version: 5`
+- active configuration contract: `version: 6`
 - active package root: `src/cetr_zsc/`
 - active CLI entry point: `experiments/overcooked_v2/cetr_zsc.py`
 
@@ -24,12 +24,15 @@ returns. Its self-play performance is an explicit reference-derived constraint,
 implemented with a dual variable rather than a hand-tuned tolerance or loss
 weight.
 
-Training uses the complete undiscounted raw return-to-go. Parent tail weights are
-computed from completed episode returns with double cross-fitting; advantages are
-fixed at collection and normalized once across all policy samples. Self-play
-uses the same current policy on both sides with independent recurrent carries,
-so its gradient is the bilateral self-composition gradient. A scalar value
-baseline exists only to reduce policy-gradient variance.
+Training uses the complete undiscounted raw return-to-go. External parents are
+assigned deterministically with full fold×role coverage on every update, and
+checkpoint stages rotate by update and lane slot. Parent tail weights are
+computed from completed episode returns with double cross-fitting; the complete
+`EpisodeBatch` is normalized exactly once before minibatch slicing, with no
+observed-subset re-normalization. Self-play uses the same current policy on both
+sides with independent recurrent carries, so its gradient is the bilateral
+self-composition gradient. A scalar value baseline exists only to reduce
+policy-gradient variance.
 
 Deployment is deliberately small:
 
@@ -41,7 +44,10 @@ local observation and recurrent history
 
 Partner IDs, algorithm labels, checkpoint metadata, parent groups, co-training
 lineage, `q`, the SP dual, hidden simulator state, future responses, and
-counterfactual returns are not deployment inputs.
+counterfactual returns are not deployment inputs. Deployment bundle version 7
+contains only the actor parameter subtree; the reference artifact and training
+manifest are same-directory provenance records, including `provenance.json`,
+for audit binding rather than runtime use.
 
 ## Evaluation boundary
 
@@ -53,10 +59,13 @@ population matrix is supplementary and does not replace the confirmatory
 estimand.
 
 The decisive comparison is Official-SP, Official-OP, Official-FCP, the retired
-V6 DELTA-active result as a historical comparator, and CETR-ZSC. GO,
-NO-GO, and INCONCLUSIVE are defined in `docs/SCIENTIFIC_SPEC.md` and
-`docs/RESEARCH_PLAN.md`. No performance claim exists until the registered formal
-runs and raw evaluation artifacts are complete. **CETR 尚无训练结果。**
+V6 DELTA-active result as a historical comparator, and CETR-ZSC. Evaluation
+summaries are descriptive; the unique `claim` entry point compares CETR against
+exactly `{"fcp"}` using crossed ego-run/parent-lineage bootstrap and paired
+seed-index self-play differences. GO, NO-GO, and INCONCLUSIVE are defined in
+`docs/SCIENTIFIC_SPEC.md` and `docs/RESEARCH_PLAN.md`. No performance claim
+exists until the registered formal runs and raw evaluation artifacts are
+complete. **CETR 尚无训练结果。**
 
 ## Repository contracts
 

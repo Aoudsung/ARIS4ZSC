@@ -6,7 +6,7 @@ This plan defines the panel boundary, decisive comparison, inference units, and
 execution order for CETR-ZSC. The sole authority for registered budgets, seeds,
 versions, schema fields, and sample sizes is
 [`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py), whose active contract is
-`version: 5`. This document describes what is compared and how it is decided;
+`version: 6`. This document describes what is compared and how it is decided;
 it does not duplicate the registration table.
 
 ## 1. Scientific contract
@@ -36,14 +36,20 @@ The exact method identity is
 
 `development_support` is the only partner panel used to construct the training
 support distribution. It covers the registered SP, OP, SA, and FCP mechanisms.
-Independent parent runs are the sampling units. All checkpoint stages from one
-parent remain in one parent group and are sampled within that group.
+The formal registration fixes four independent parents per mechanism, hence
+sixteen parent groups and forty-eight stage members, with all three registered
+checkpoint stages retained as members of one parent group; development and
+mechanical configurations use one parent per mechanism. The cardinalities and
+stages are owned by `src/cetr_zsc/config.py`.
 
-The nominal distribution is mechanism-uniform followed by parent-uniform within
-mechanism. The actor never receives the mechanism, parent, stage, or lineage
-label. The panel is used for training-support collection, mechanical checks, and
-development diagnostics; development returns do not redefine the method or
-select the tail constant.
+External lane assignment is deterministic and complete rather than sampled:
+every parent receives the fold×role cells `A0`, `A1`, `B0`, and `B1` on each
+update, and the stage slot is `(update_index + lane_slot) mod 3`. The nominal
+distribution is mechanism-uniform followed by parent-uniform within mechanism.
+The actor never receives the mechanism, parent, stage, or lineage label. There
+is no observed-subset re-normalization. The panel is used for training-support
+collection, mechanical checks, and development diagnostics; development returns
+do not redefine the method or select the tail constant.
 
 ### 2.2 Confirmatory external partners
 
@@ -70,16 +76,17 @@ panel. It is never allowed to mask a failure on the primary external estimand.
 
 Each update follows one end-to-end transaction:
 
-1. collect complete episodes from the configured self-play and external lanes;
+1. freeze the current actor and baseline, then collect complete episodes from the
+   deterministic self-play and fully covered external lanes;
 2. record raw complete-episode returns and scalar-baseline outputs;
-3. assign external parents to cross-fitting folds;
-4. use one fold's completed returns to compute the other fold's lower-half `q`
-   weights;
-5. compute the complete raw return-to-go and freeze advantages;
-6. normalize all policy samples once with one shared normalization;
-7. apply one clipped PPO primal update with the external risk term and SP dual
+3. use each fold's completed parent returns to compute the other fold's
+   lower-half `q` weights;
+4. prepare the complete `EpisodeBatch`, compute/freeze raw return-to-go
+   advantages, and normalize all policy samples exactly once with one shared
+   normalization before minibatch slicing;
+5. apply one clipped PPO primal update with the external risk term and SP dual
    contribution;
-8. apply one projected dual update using the self-play return shortfall.
+6. apply one projected dual update using the self-play return shortfall.
 
 The self-play contribution is bilateral: both agents execute the current policy
 with independent recurrent states. The scalar value baseline only reduces
@@ -121,8 +128,16 @@ score.
 
 ## 5. Statistical decision rules
 
-The confirmatory comparison is CETR against FCP. Confidence bounds use the
-registered one-sided run/parent bootstrap and alpha from `config.py`.
+The confirmatory comparison is CETR against exactly the FCP method set
+`{"fcp"}`. The `claim` command is the unique GO/NO-GO/INCONCLUSIVE entry point;
+`summarize-evaluations` is descriptive and cannot make the decision.
+
+For external mean and lower-half CVaR contrasts, each crossed-bootstrap
+replicate independently resamples both the ego-run axis and the parent-lineage
+axis, while CETR and FCP cells remain aligned by run/seed index. For SP, form the
+paired per-seed differences `d_s = J_SP^(s) - tau_s` and bootstrap-resample the
+seed index. Confidence bounds and the registered alpha are read from
+`src/cetr_zsc/config.py`.
 
 ### 5.1 GO
 
@@ -166,11 +181,12 @@ The implementation sequence is:
    points;
 3. verify whole-episode collection, parent grouping, cross-fitting, the shared
    advantage normalization, bilateral self-play gradient, and dual transaction;
-4. verify deployment contains only local observation/history and the recurrent
-   actor;
-5. freeze development-support and confirmatory manifests with lineage records;
+4. verify the version-2 τ artifact binding, effective seed mapping for preflight,
+   and deployment contains only local observation/history plus the recurrent actor;
+5. freeze development-support and confirmatory manifests with lineage records and
+   complete server checkpoint paths;
 6. run mechanical and development-support checks without reading confirmatory
-   returns;
+   returns, including the fail-closed CUDA preflight;
 7. run the decisive baseline/CETR comparison;
 8. apply the claim builder without changing the registered method.
 

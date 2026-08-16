@@ -8,7 +8,7 @@ CETR-ZSC means constrained episodic tail-robust zero-shot coordination. Its
 active method identity is
 `constrained_episodic_tail_robust_zsc_v1`, and its registered configuration is
 owned by [`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py). The resolved
-configuration contract records `version: 5`; all other registered budgets,
+configuration contract records `version: 6`; all other registered budgets,
 seeds, schema fields, and sample sizes must be read from that module rather than
 copied into this document.
 
@@ -104,8 +104,11 @@ seed-matched Official-SP reference:
 \]
 
 The reference is evaluated with the registered environment and evaluation key
-schedule. There is no artificial tolerance band, hand-tuned threshold, SP
-margin, or configured SP loss weight. The reference has exactly three roles:
+schedule. The `cetr_reference_sp` artifact is version 2: its `source_checkpoint`
+is a resolved absolute path, and training requires that path to be textually
+identical to the resolved `--sp-initializer` path. There is no artificial
+tolerance band, hand-tuned threshold, SP margin, or configured SP loss weight.
+The reference has exactly three roles:
 
 1. initialize the single trainable actor with a seed-matched Official-SP
    checkpoint;
@@ -125,6 +128,17 @@ parent estimates in ascending order and filling mass under `q_g <= 2p_{0,g}`
 until total mass is one. This produces the lower-half tail weights without a
 new objective or a learned partner score.
 
+External lane assignment is deterministic and covers every registered support
+parent on every update. The formal support is the four-mechanism × four
+independent-parent panel registered in `config.py`, yielding sixteen parent
+groups and forty-eight stage members; each parent exposes all registered
+checkpoint stages, which remain one parent group. Development and mechanical
+runs use the corresponding one-parent-per-mechanism support from the same
+configuration authority. For each parent, the four external lanes are the
+fold-by-role cells `A0`, `A1`, `B0`, and `B1`; the stage slot is rotated by
+`(update_index + lane_slot) mod 3`. Parent selection is not random and there is
+no observed-subset re-normalization.
+
 The external risk calculation is deliberately separated from the PPO surrogate.
 The PPO actor loss is an estimator using already-computed risk weights; its
 numerical value is not itself the definition of the worst-parent return. A
@@ -132,12 +146,15 @@ single noisy low-return episode must not determine its own tail membership and
 its update direction. Therefore the external batch is split into two folds:
 
 - fold A completed returns determine `q^A`, which weights only fold B's PPO
-  gradient;
+gradient;
 - fold B completed returns determine `q^B`, which weights only fold A's PPO
-  gradient.
+gradient.
 
-This double cross-fitting is part of the method contract. It is not an optional
-analysis or a post-hoc variance correction.
+The monitored cross-fitted tail value is
+`0.5 * (q^A · J_hat^B + q^B · J_hat^A)`, with each fold's weights evaluated
+against the other fold's parent return estimates. This double cross-fitting is
+part of the method contract. It is not an optional analysis or a post-hoc
+variance correction.
 
 ## 6. Actor, baseline, and training signal
 
@@ -151,8 +168,10 @@ policy-gradient estimator. It is not a deployment critic and it never changes
 the action logits. The policy signal is the complete undiscounted raw
 return-to-go `R_{e,t}`. Advantages are collected from the current policy and
 current scalar baseline, fixed once for the update, and reused unchanged across
-all PPO minibatches and epochs. All self-play and external samples share one
-normalization; group-wise normalization is forbidden because it would erase the
+all PPO minibatches and epochs. `prepare_episode_batch` performs exactly one
+shared normalization on the complete `EpisodeBatch`, before minibatch
+scheduling and slicing. Group-wise, parent-wise, mechanism-wise, and
+minibatch-wise normalization are forbidden because they would erase the
 relative scale supplied by the parent risk weights and the SP dual.
 
 ## 7. Self-play gradient and dual constraint
@@ -191,11 +210,13 @@ the deployment state.
 Each update is one closed primal-dual transaction:
 
 1. freeze the current actor and scalar baseline for collection;
-2. collect complete episodes, with self-play and external lanes arranged as
-   required by the registered panel design;
-3. compute complete raw returns and collection-time advantages;
-4. compute the two cross-fitted parent tail-weight sets;
-5. compute one shared advantage normalization over all policy samples;
+2. collect complete episodes, with deterministic self-play and fully covered
+   external lanes arranged as required by the registered panel design;
+3. compute complete raw episodic returns;
+4. compute the closed-form cross-fitted parent tail-weight sets from those raw
+   returns;
+5. prepare the complete `EpisodeBatch`, compute/fix return-to-go advantages, and
+   apply exactly one shared normalization before any minibatch split;
 6. apply one standard clipped PPO primal update using the external risk weights
    and the self-play constraint contribution;
 7. apply one dual update from the measured self-play batch;
@@ -223,9 +244,13 @@ weights, cross-fitting folds, the reference target, and the dual variable are
 optimization-time variables and are absent from the deployment bundle and
 runtime state.
 
-The scalar value baseline is also absent from action selection. Deployment does
-not contain a posterior update, a partner classifier, an active probe, a VOI
-path, or a second execution policy.
+The scalar value baseline is also absent from action selection. The deployment
+bundle is version 7 and contains only the actor parameter subtree needed by the
+runtime. The reference-SP artifact and training manifest are not deployment
+inputs; they are stored as provenance records in the same bundle directory,
+including `provenance.json`, for audit binding only. Deployment does not contain
+a posterior update, a partner classifier, an active probe, a VOI path, or a
+second execution policy.
 
 ## 10. Retired boundary
 

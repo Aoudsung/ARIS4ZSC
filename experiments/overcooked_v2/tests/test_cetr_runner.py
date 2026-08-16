@@ -108,6 +108,7 @@ def test_vector_environment_collects_one_complete_self_and_external_episode() ->
         params=None,
         partner_functions=partner_functions,
         random_key=jax.random.PRNGKey(23),
+        update_index=0,
     )
 
     assert batch.observations.shape[0] == 400
@@ -122,3 +123,39 @@ def test_vector_environment_collects_one_complete_self_and_external_episode() ->
     assert float(metrics["final_done_fraction"]) == 1.0
     assert np.all(np.isfinite(np.asarray(batch.episode_return)))
     assert np.all(np.isfinite(np.asarray(batch.old_log_probabilities)))
+
+
+def test_external_lane_assignment_covers_fold_role_and_rotates_stage() -> None:
+    import jax.numpy as jnp
+
+    from src.cetr_zsc.runner import external_lane_assignment
+
+    parent_members = jnp.asarray(
+        [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]], dtype=jnp.int32
+    )
+    member, parent, fold, role = external_lane_assignment(
+        16, 4, jnp.asarray(0, dtype=jnp.int32), parent_members
+    )
+    del member
+    for parent_index in range(4):
+        indexes = np.flatnonzero(np.asarray(parent) == parent_index)
+        np.testing.assert_array_equal(
+            np.stack((np.asarray(fold)[indexes], np.asarray(role)[indexes]), axis=1),
+            np.asarray([[0, 0], [1, 0], [0, 1], [1, 1]]),
+        )
+
+    first, unused_parent, unused_fold, unused_role = external_lane_assignment(
+        16, 4, jnp.asarray(0, dtype=jnp.int32), parent_members
+    )
+    second, _, _, _ = external_lane_assignment(
+        16, 4, jnp.asarray(1, dtype=jnp.int32), parent_members
+    )
+    del unused_parent, unused_fold, unused_role
+    np.testing.assert_array_equal(
+        np.asarray(first).reshape(4, 4) % 3,
+        np.asarray([[0] * 4, [1] * 4, [2] * 4, [0] * 4]),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(second).reshape(4, 4) % 3,
+        np.asarray([[1] * 4, [2] * 4, [0] * 4, [1] * 4]),
+    )

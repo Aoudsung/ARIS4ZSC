@@ -8,7 +8,7 @@ The substrate is the OvercookedV2 Test-Time Protocol Formation benchmark. The
 active layouts, observation contract, episode protocol, action space, environment
 randomization, and all sample-size registrations are defined in
 [`src/cetr_zsc/config.py`](../src/cetr_zsc/config.py). The active resolved
-configuration is `version: 5`; this document does not duplicate the registered
+configuration is `version: 6`; this document does not duplicate the registered
 budget or seed tables.
 
 ## 2. Scientific problem
@@ -92,7 +92,10 @@ J_{\mathrm{SP}}(\theta)-\tau_{\mathrm{SP}}.
 \]
 
 The target is reference-derived, has no manually chosen tolerance band, and is
-reported with its uncertainty interval.
+reported with its uncertainty interval. The version-2 `cetr_reference_sp`
+artifact stores a resolved absolute `source_checkpoint`; training requires
+textual equality with the resolved `--sp-initializer` path. Engineering
+preflight seed `-1` uses the seed-0 initializer and τ artifact.
 
 ### H3 — external robustness under a single actor
 
@@ -105,8 +108,16 @@ insufficient if self-play falls below the reference contract.
 
 The development-support panel supplies the training distribution over SP, OP,
 SA, and FCP mechanisms. Its parents are grouped by independent parent lineage;
-checkpoint stages within one parent remain one group. Nominal mechanism mass and
+checkpoint stages within one parent remain one group. The formal support uses
+four mechanisms and four independent parents per mechanism—sixteen parent
+groups with forty-eight stage members—as registered in `config.py`; development
+and mechanical support use one parent per mechanism. Nominal mechanism mass and
 within-mechanism parent mass are defined by `config.py`.
+
+External lanes are deterministic and fully covered on every update: each parent
+receives fold×role cells `A0`, `A1`, `B0`, and `B1`, with checkpoint stage slot
+`(update_index + lane_slot) mod 3`. There is no random parent sampling and no
+observed-subset re-normalization.
 
 The confirmatory panel is held out from training and development decisions. Every
 confirmatory parent and its co-training lineage is parent- and lineage-disjoint
@@ -148,9 +159,15 @@ restarted under a changed method.
 
 ## 7. Decision rules
 
-The decision is made against FCP on the confirmatory held-out external panel.
-The lower confidence bound is the registered one-sided run/parent inference
-specified by `config.py`.
+The decision is made against exactly the FCP method set `{"fcp"}` on the
+confirmatory held-out external panel. `summarize-evaluations` is descriptive
+only; `claim` is the unique GO/NO-GO/INCONCLUSIVE entry point.
+
+External contrasts use crossed bootstrap: within each replicate, the ego-run and
+parent-lineage axes are independently resampled, with methods aligned by
+run/seed index. The SP contrast uses paired per-seed differences
+`d_s = J_SP^(s) − τ_s` and bootstrap resamples seeds. The lower confidence bound
+and all replicate/alpha registrations are read from `config.py`.
 
 ### GO
 

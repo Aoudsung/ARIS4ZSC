@@ -46,10 +46,11 @@ class EpisodeBatch(NamedTuple):
     lanes.
 
     ``old_values`` and ``sp_other_old_values`` are the collection-time value
-    baseline outputs.  Advantages are computed once from them and the complete
-    return-to-go, then held fixed across every PPO epoch and minibatch;
-    recomputing them against the candidate baseline would make each minibatch
-    optimise a different objective.
+    baseline outputs.  ``value_targets`` and ``sp_other_value_targets`` are
+    filled by ``runner.collect_episodes`` from complete return-to-go values.
+    The two advantage arrays are filled there before any lane slicing; training
+    then normalizes both arrays once on the complete batch and holds them fixed
+    across every PPO epoch and minibatch.
     """
 
     observations: Any
@@ -58,6 +59,10 @@ class EpisodeBatch(NamedTuple):
     old_values: Any
     rewards: Any
     dones: Any
+    value_targets: Any
+    sp_other_value_targets: Any
+    advantages: Any
+    sp_other_advantages: Any
     episode_starts: Any
     sp_other_observations: Any
     sp_other_actions: Any
